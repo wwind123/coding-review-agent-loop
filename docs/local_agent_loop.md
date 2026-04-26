@@ -1,15 +1,15 @@
 # Local Coding Review Agent Loop
 
-`coding-review-agent-loop` is a local CLI that orchestrates two coding agents through a GitHub pull request review loop. It shells out to locally authenticated `claude`, `codex`, and `gh` CLIs instead of calling model APIs directly.
+`coding-review-agent-loop` is a local CLI that orchestrates coding agents through a GitHub pull request review loop. It shells out to locally authenticated `claude`, `codex`, and `gh` CLIs instead of calling model APIs directly.
 
 The default flow is:
 
 1. A coder agent creates or updates a PR.
-2. A reviewer agent reviews the PR.
-3. If the reviewer finds blockers, the coder fixes the PR.
-4. The loop repeats until the reviewer approves or `--max-rounds` is reached.
+2. One or more reviewer agents review the PR.
+3. If any reviewer finds blockers, the coder fixes the PR.
+4. The loop repeats until every reviewer approves in the same round or `--max-rounds` is reached.
 
-The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`.
+The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`. Repeat `--reviewer` to require multiple reviewer approvals.
 
 ## Prerequisites
 
@@ -53,6 +53,17 @@ Reverse the direction so Codex creates/fixes and Claude reviews:
 agent-loop task "Refactor the cache layer" \
   --repo OWNER/REPO \
   --coder codex \
+  --reviewer claude \
+  --claude-dir /path/to/claude/worktree \
+  --codex-dir /path/to/codex/worktree
+```
+
+Require both reviewers to approve:
+
+```bash
+agent-loop pr 123 \
+  --repo OWNER/REPO \
+  --reviewer codex \
   --reviewer claude \
   --claude-dir /path/to/claude/worktree \
   --codex-dir /path/to/codex/worktree

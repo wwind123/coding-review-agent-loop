@@ -160,7 +160,7 @@ class AgentLoopConfig:
     claude_dir: Path
     codex_dir: Path
     coder: AgentName
-    reviewer: AgentName
+    reviewer: AgentName | tuple[AgentName, ...]
     base: str
     max_rounds: int
     auto_merge: bool
@@ -178,6 +178,10 @@ class AgentLoopConfig:
     quiet: bool
     log_dir: Path
     progress_interval_seconds: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.reviewer, str):
+            object.__setattr__(self, "reviewer", (self.reviewer,))
 
 
 def log(config: AgentLoopConfig, message: str) -> None:
@@ -225,6 +229,21 @@ def is_clarification_request(text: str) -> bool:
     return bool(CLARIFY_RE.search(text))
 
 
+def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
+    if isinstance(config.reviewer, str):
+        return (config.reviewer,)
+    return config.reviewer
+
+
+def format_agent_list(agents: Sequence[AgentName]) -> str:
+    names = [agent_display_name(agent) for agent in agents]
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{', '.join(names[:-1])}, and {names[-1]}"
+
+
 def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
     if config.allow_shared_dir:
         return
@@ -247,7 +266,7 @@ def ensure_workdir(path: Path, option_name: str) -> None:
 
 
 def ensure_agent_workdirs(config: AgentLoopConfig) -> None:
-    required: set[AgentName] = {config.coder, config.reviewer}
+    required: set[AgentName] = {config.coder, *reviewers(config)}
     if "claude" in required:
         ensure_workdir(config.claude_dir, "--claude-dir")
     if "codex" in required:
@@ -470,7 +489,7 @@ def agent_signature(agent: AgentName) -> str:
 
 
 def build_issue_prompt(issue_number: int, config: AgentLoopConfig) -> str:
-    reviewer_name = agent_display_name(config.reviewer)
+    reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder)
     return f"""Fix GitHub issue #{issue_number} in {config.repo}.
 
@@ -493,7 +512,7 @@ Use blocking here to hand the PR to {reviewer_name} for review. Sign the respons
 
 
 def build_task_prompt(task_text: str, config: AgentLoopConfig) -> str:
-    reviewer_name = agent_display_name(config.reviewer)
+    reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder)
     return f"""You have been given a free-form task to implement in {config.repo}.
 
@@ -557,14 +576,23 @@ Sign your response as:
 """
 
 
-def build_review_prompt(pr_number: int, round_number: int, config: AgentLoopConfig) -> str:
+def build_review_prompt(
+    pr_number: int,
+    round_number: int,
+    config: AgentLoopConfig,
+    *,
+    reviewer: AgentName,
+) -> str:
     coder_name = agent_display_name(config.coder)
-    reviewer_signature = agent_signature(config.reviewer)
+    reviewer_signature = agent_signature(reviewer)
+    reviewer_group = format_agent_list(reviewers(config))
     return f"""Review pull request #{pr_number} in {config.repo} (round {round_number}).
 
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
+All configured reviewers ({reviewer_group}) must approve in the same round for
+the pull request to be considered approved.
 
 End your final response with exactly one marker:
 
@@ -585,7 +613,7 @@ def build_followup_prompt(
     review: str,
     config: AgentLoopConfig,
 ) -> str:
-    reviewer_name = agent_display_name(config.reviewer)
+    reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder)
     return f"""{reviewer_name} reviewed pull request #{pr_number} in {config.repo} and found blocking issues.
 
@@ -822,43 +850,61 @@ def run_pr_loop(
     ensure_agent_workdirs(config)
     log(config, f"Validating PR #{pr_number}")
     validate_open_pr(runner, config=config, pr_number=pr_number)
+    reviewer_session_ids: dict[AgentName, str | None] = {}
+    configured_reviewers = reviewers(config)
+    if reviewer_session_id is not None and configured_reviewers:
+        reviewer_session_ids[configured_reviewers[0]] = reviewer_session_id
 
     for round_number in range(1, config.max_rounds + 1):
-        reviewer_name = agent_display_name(config.reviewer)
         coder_name = agent_display_name(config.coder)
-        log(config, f"Round {round_number}: {reviewer_name} reviewing PR #{pr_number}")
-        review_output, reviewer_session_id = run_agent(
-            runner,
-            agent=config.reviewer,
-            config=config,
-            prompt=build_review_prompt(pr_number, round_number, config),
-            session_id=reviewer_session_id,
-        )
-        if not review_output.strip():
-            raise AgentLoopError(f"{reviewer_name} produced an empty response.")
+        blocking_reviews: list[tuple[str, str]] = []
+        for reviewer in configured_reviewers:
+            reviewer_name = agent_display_name(reviewer)
+            log(config, f"Round {round_number}: {reviewer_name} reviewing PR #{pr_number}")
+            review_output, new_session_id = run_agent(
+                runner,
+                agent=reviewer,
+                config=config,
+                prompt=build_review_prompt(
+                    pr_number,
+                    round_number,
+                    config,
+                    reviewer=reviewer,
+                ),
+                session_id=reviewer_session_ids.get(reviewer),
+            )
+            reviewer_session_ids[reviewer] = new_session_id
+            if not review_output.strip():
+                raise AgentLoopError(f"{reviewer_name} produced an empty response.")
 
-        post_pr_comment(runner, config=config, pr_number=pr_number, body=review_output)
-        review_state = parse_agent_state(review_output)
-        log(config, f"Round {round_number}: {reviewer_name} state is {review_state}")
-        if review_state == "approved":
+            post_pr_comment(runner, config=config, pr_number=pr_number, body=review_output)
+            review_state = parse_agent_state(review_output)
+            log(config, f"Round {round_number}: {reviewer_name} state is {review_state}")
+            if review_state == "blocking":
+                blocking_reviews.append((reviewer_name, review_output))
+
+        if not blocking_reviews:
             run_optional_tests(runner, config)
             if config.auto_merge:
                 wait_for_ci(runner, config, pr_number)
                 merge_pr(runner, config, pr_number)
-            print(f"PR #{pr_number} approved by {reviewer_name}.")
+            print(f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}.")
             return 0
         if round_number == config.max_rounds:
             raise AgentLoopError(
-                f"{reviewer_name} still reported blocking issues after round {round_number}; "
+                f"One or more reviewers still reported blocking issues after round {round_number}; "
                 "human review required."
             )
 
-        log(config, f"Round {round_number}: {coder_name} addressing {reviewer_name} review")
+        combined_review = "\n\n".join(
+            f"{name} review:\n\n{review}" for name, review in blocking_reviews
+        )
+        log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
         coder_output, coder_session_id = run_agent(
             runner,
             agent=config.coder,
             config=config,
-            prompt=build_followup_prompt(pr_number, round_number, review_output, config),
+            prompt=build_followup_prompt(pr_number, round_number, combined_review, config),
             session_id=coder_session_id,
         )
         if not coder_output.strip():
@@ -900,8 +946,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--reviewer",
             choices=("claude", "codex"),
-            default="codex",
-            help="Agent that reviews the PR and gates approval (default: codex).",
+            action="append",
+            default=None,
+            help=(
+                "Agent that reviews the PR and gates approval. Repeat for multiple "
+                "reviewers; all must approve (default: codex)."
+            ),
         )
         subparser.add_argument("--allow-shared-dir", action="store_true")
         subparser.add_argument("--max-rounds", type=int, default=5)
@@ -1043,14 +1093,17 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         raise AgentLoopError("--ci-poll-interval-seconds must be greater than zero.")
     if args.progress_interval_seconds <= 0:
         raise AgentLoopError("--progress-interval-seconds must be greater than zero.")
-    if args.coder == args.reviewer:
+    configured_reviewers = tuple(args.reviewer or ["codex"])
+    if len(set(configured_reviewers)) != len(configured_reviewers):
+        raise AgentLoopError("--reviewer cannot include the same agent more than once.")
+    if len(configured_reviewers) == 1 and args.coder == configured_reviewers[0]:
         raise AgentLoopError("--coder and --reviewer must be different agents.")
     return AgentLoopConfig(
         repo=repo,
         claude_dir=args.claude_dir.resolve(),
         codex_dir=codex_dir,
         coder=args.coder,
-        reviewer=args.reviewer,
+        reviewer=configured_reviewers,
         base=args.base,
         max_rounds=args.max_rounds,
         auto_merge=args.auto_merge,
