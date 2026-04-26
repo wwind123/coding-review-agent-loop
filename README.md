@@ -4,12 +4,39 @@ Local command-line orchestration for a two-agent coding PR review loop.
 
 The tool shells out to your already-authenticated local CLIs (`claude`, `codex`, and `gh`) so it can run from your workstation without GitHub Actions model API keys.
 
-## Install for Development
+## Install / Use
+
+Clone the repo first:
+
+```bash
+gh repo clone wwind123/coding-review-agent-loop
+cd coding-review-agent-loop
+```
+
+Then install the CLI into a local virtual environment:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
+python -m pip install -e .
+agent-loop --help
+```
+
+This installs the `agent-loop` command from your checkout. The tool still
+requires local `gh`, `claude`, and/or `codex` authentication depending on which
+agents you use.
+
+## Develop This Tool
+
+Use this if you are changing `coding-review-agent-loop` itself:
+
+```bash
+gh repo clone wwind123/coding-review-agent-loop
+cd coding-review-agent-loop
+python3 -m venv .venv
+. .venv/bin/activate
 python -m pip install -e '.[dev]'
+python -m pytest
 ```
 
 ## Quick Start
