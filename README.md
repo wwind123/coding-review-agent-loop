@@ -41,9 +41,23 @@ python -m pytest
 
 ## Quick Start
 
+Start from a GitHub issue when you want the agent loop to use the issue title
+and body as the implementation task:
+
 ```bash
 agent-loop issue 123 --repo OWNER/REPO --claude-dir /path/to/claude/repo --codex-dir /path/to/codex/repo
+```
+
+Provide a one-off task directly when there is no issue yet:
+
+```bash
 agent-loop task "Add a health check endpoint" --repo OWNER/REPO --claude-dir /path/to/claude/repo --codex-dir /path/to/codex/repo
+```
+
+Run the loop against an existing pull request when you want another review and
+iteration pass:
+
+```bash
 agent-loop pr 456 --repo OWNER/REPO --claude-dir /path/to/claude/repo --codex-dir /path/to/codex/repo
 ```
 
