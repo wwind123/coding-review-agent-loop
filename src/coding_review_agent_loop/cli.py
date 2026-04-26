@@ -235,6 +235,26 @@ def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
         )
 
 
+def ensure_workdir(path: Path, option_name: str) -> None:
+    if path.exists():
+        if not path.is_dir():
+            raise AgentLoopError(f"{option_name} exists but is not a directory: {path}")
+        return
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AgentLoopError(f"Could not create {option_name} at {path}: {exc}") from exc
+
+
+def ensure_agent_workdirs(config: AgentLoopConfig) -> None:
+    required: set[AgentName] = {config.coder, config.reviewer}
+    if "claude" in required:
+        ensure_workdir(config.claude_dir, "--claude-dir")
+    if "codex" in required:
+        ensure_workdir(config.codex_dir, "--codex-dir")
+    ensure_distinct_workdirs(config)
+
+
 def detect_repo(runner: Runner, cwd: Path, gh_cmd: str) -> str:
     result = runner.run(
         [gh_cmd, "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
@@ -670,7 +690,7 @@ def merge_pr(runner: Runner, config: AgentLoopConfig, pr_number: int) -> None:
 
 
 def run_issue_loop(runner: Runner, *, issue_number: int, config: AgentLoopConfig) -> int:
-    ensure_distinct_workdirs(config)
+    ensure_agent_workdirs(config)
     log(config, f"Validating issue #{issue_number}")
     validate_open_issue(runner, config=config, issue_number=issue_number)
 
@@ -724,7 +744,7 @@ def run_task_loop(
     max_clarification_rounds: int = 3,
     clarification_input=None,
 ) -> int:
-    ensure_distinct_workdirs(config)
+    ensure_agent_workdirs(config)
     if not task_text.strip():
         raise AgentLoopError("Task text is empty; provide a non-empty description.")
     if max_clarification_rounds < 0:
@@ -799,7 +819,7 @@ def run_pr_loop(
     coder_session_id: str | None = None,
     reviewer_session_id: str | None = None,
 ) -> int:
-    ensure_distinct_workdirs(config)
+    ensure_agent_workdirs(config)
     log(config, f"Validating PR #{pr_number}")
     validate_open_pr(runner, config=config, pr_number=pr_number)
 

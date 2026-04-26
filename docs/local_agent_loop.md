@@ -16,7 +16,7 @@ The default coder is Claude and the default reviewer is Codex. Reverse the direc
 - `gh` is installed and authenticated for the target GitHub repository.
 - `claude` is installed and authenticated if either side uses Claude.
 - `codex` is installed and authenticated if either side uses Codex.
-- Use separate clones or worktrees for Claude and Codex to avoid local file conflicts.
+- Use separate clones or worktrees for Claude and Codex to avoid local file conflicts. Missing `--claude-dir` / `--codex-dir` directories are created automatically; paths that already exist as files fail clearly.
 
 ## Usage
 

@@ -115,7 +115,7 @@ def json_dumps(value):
     return json.dumps(value) + "\n"
 
 
-def make_config(tmp_path, **overrides):
+def make_config(tmp_path, *, create_dirs=True, **overrides):
     config = {
         "repo": "OWNER/REPO",
         "claude_dir": tmp_path / "claude",
@@ -141,8 +141,9 @@ def make_config(tmp_path, **overrides):
         "progress_interval_seconds": 30,
     }
     config.update(overrides)
-    config["claude_dir"].mkdir(parents=True, exist_ok=True)
-    config["codex_dir"].mkdir(parents=True, exist_ok=True)
+    if create_dirs:
+        config["claude_dir"].mkdir(parents=True, exist_ok=True)
+        config["codex_dir"].mkdir(parents=True, exist_ok=True)
     return AgentLoopConfig(**config)
 
 
@@ -294,6 +295,35 @@ def test_shared_workdir_requires_explicit_override(tmp_path):
     config = make_config(tmp_path, claude_dir=shared, codex_dir=shared)
 
     with pytest.raises(AgentLoopError, match="same directory"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+
+def test_missing_agent_workdirs_are_created(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"],
+    )
+    claude_dir = tmp_path / "missing" / "claude"
+    codex_dir = tmp_path / "missing" / "codex"
+    config = make_config(
+        tmp_path,
+        claude_dir=claude_dir,
+        codex_dir=codex_dir,
+        coder="codex",
+        reviewer="claude",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert claude_dir.is_dir()
+    assert codex_dir.is_dir()
+
+
+def test_agent_workdir_existing_file_fails_clearly(tmp_path):
+    runner = FakeRunner()
+    claude_path = tmp_path / "claude-file"
+    claude_path.write_text("not a dir", encoding="utf-8")
+    config = make_config(tmp_path, claude_dir=claude_path, create_dirs=False)
+
+    with pytest.raises(AgentLoopError, match="not a directory"):
         run_pr_loop(runner, pr_number=77, config=config)
 
 
