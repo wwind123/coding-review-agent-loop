@@ -1096,7 +1096,7 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
     configured_reviewers = tuple(args.reviewer or ["codex"])
     if len(set(configured_reviewers)) != len(configured_reviewers):
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")
-    if len(configured_reviewers) == 1 and args.coder == configured_reviewers[0]:
+    if args.coder in configured_reviewers:
         raise AgentLoopError("--coder and --reviewer must be different agents.")
     return AgentLoopConfig(
         repo=repo,

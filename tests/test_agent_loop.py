@@ -394,7 +394,7 @@ def test_config_rejects_same_coder_and_reviewer(tmp_path):
         config_from_args(args, runner)
 
 
-def test_config_accepts_multiple_reviewers(tmp_path):
+def test_config_rejects_coder_in_multiple_reviewers(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
         "pr",
@@ -413,9 +413,8 @@ def test_config_accepts_multiple_reviewers(tmp_path):
         str(tmp_path / "codex"),
     ])
 
-    config = config_from_args(args, FakeRunner())
-
-    assert config.reviewer == ("claude", "codex")
+    with pytest.raises(AgentLoopError, match="must be different"):
+        config_from_args(args, FakeRunner())
 
 
 def test_config_rejects_duplicate_reviewers(tmp_path):
