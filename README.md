@@ -68,7 +68,9 @@ agent-loop task "Fix the flaky test" --repo OWNER/REPO --coder codex --reviewer 
 ```
 
 Repeat `--reviewer` to require approvals from multiple reviewers. The PR is
-approved only after every configured reviewer approves in the same round:
+approved only after every configured reviewer approves in the same round. The
+coder may also be listed as a reviewer when you want the same agent to work in
+separate coding and review passes:
 
 ```bash
 agent-loop pr 456 --repo OWNER/REPO --reviewer codex --reviewer claude

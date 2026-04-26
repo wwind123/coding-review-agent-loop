@@ -374,7 +374,7 @@ def test_agent_workdir_existing_file_fails_clearly(tmp_path):
         run_pr_loop(runner, pr_number=77, config=config)
 
 
-def test_config_rejects_same_coder_and_reviewer(tmp_path):
+def test_config_allows_same_coder_and_reviewer(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
         "pr",
@@ -388,13 +388,14 @@ def test_config_rejects_same_coder_and_reviewer(tmp_path):
         "--codex-dir",
         str(tmp_path / "codex"),
     ])
-    runner = FakeRunner()
 
-    with pytest.raises(AgentLoopError, match="must be different"):
-        config_from_args(args, runner)
+    config = config_from_args(args, FakeRunner())
+
+    assert config.coder == "codex"
+    assert config.reviewer == ("codex",)
 
 
-def test_config_rejects_coder_in_multiple_reviewers(tmp_path):
+def test_config_allows_coder_in_multiple_reviewers(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
         "pr",
@@ -413,8 +414,10 @@ def test_config_rejects_coder_in_multiple_reviewers(tmp_path):
         str(tmp_path / "codex"),
     ])
 
-    with pytest.raises(AgentLoopError, match="must be different"):
-        config_from_args(args, FakeRunner())
+    config = config_from_args(args, FakeRunner())
+
+    assert config.coder == "codex"
+    assert config.reviewer == ("claude", "codex")
 
 
 def test_config_rejects_duplicate_reviewers(tmp_path):

@@ -58,7 +58,8 @@ agent-loop task "Refactor the cache layer" \
   --codex-dir /path/to/codex/worktree
 ```
 
-Require both reviewers to approve:
+Require both reviewers to approve. The coder may also be listed as a reviewer
+when you want the same agent to work in separate coding and review passes:
 
 ```bash
 agent-loop pr 123 \
