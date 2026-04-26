@@ -310,6 +310,7 @@ def test_missing_agent_workdirs_are_created(tmp_path):
         codex_dir=codex_dir,
         coder="codex",
         reviewer="claude",
+        create_dirs=False,
     )
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
