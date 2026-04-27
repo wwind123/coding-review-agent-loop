@@ -82,6 +82,24 @@ For trusted local automation that must run without approval prompts:
 agent-loop issue 123 --repo OWNER/REPO --dangerous-agent-permissions
 ```
 
+## Real Example
+
+This project uses `agent-loop` to improve itself. This command asked Codex to
+implement multiple-reviewer support and Claude to review the result. The work
+became PR #2:
+https://github.com/wwind123/coding-review-agent-loop/pull/2
+
+```bash
+~/tools/coding-review-agent-loop/.venv/bin/agent-loop task \
+  "Currently the tool allows only 1 reviewer. Can we add the feature to allow multiple reviewers? By default, all reviewers have to approve for the whole thing to be considered approved." \
+  --repo wwind123/coding-review-agent-loop \
+  --claude-dir ~/tools/coding-review-agent-loop/claude/repo \
+  --codex-dir ~/tools/coding-review-agent-loop/codex/repo \
+  --coder codex \
+  --reviewer claude \
+  --dangerous-agent-permissions
+```
+
 See [docs/local_agent_loop.md](docs/local_agent_loop.md) for full usage and safety notes.
 
 ## Test
