@@ -31,6 +31,20 @@ That makes it easier to experiment with agent-to-agent review loops before
 committing to hosted automation. It also keeps local workspace setup,
 credentials, and agent approval prompts under your direct control.
 
+## Compared To Similar Tools
+
+Several related projects exist. `coding-review-agent-loop` is deliberately
+positioned as a standalone local CLI for GitHub PR lifecycle orchestration:
+one agent creates or fixes a PR, one or more reviewers review it, and the loop
+continues until approval.
+
+| Tool | Focus | How this project differs |
+|------|-------|--------------------------|
+| [claude-review-loop](https://github.com/hamelsmu/claude-review-loop) | Claude Code plugin that has Claude implement, then Codex review. | This project is not a Claude plugin; it is a standalone CLI that can start from an issue, task, or existing PR and can reverse the coder/reviewer direction. |
+| [codex-review](https://github.com/boyand/codex-review) | Claude Code plugin for Codex review of plans and implementations. | This project focuses on GitHub PR creation, review, fix, and approval loops rather than plan/artifact review inside Claude Code. |
+| [reviewd](https://pypi.org/project/reviewd/) | Local PR review assistant for GitHub/BitBucket using Claude, Gemini, or Codex CLI. | This project focuses on agent-to-agent implementation loops where the coder can create/fix the PR and reviewers gate approval. |
+| [codex-plugin-cc](https://github.com/openai/codex-plugin-cc) | Use Codex from inside Claude Code for review or delegated tasks. | This project stays outside either agent host and orchestrates local CLIs plus GitHub directly. |
+
 ## Agent Backends
 
 Currently supported local agent CLIs:
