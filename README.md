@@ -9,6 +9,17 @@ subscriptions or authenticated developer accounts, the review loop can use
 those existing entitlements rather than requiring separate Claude/OpenAI API
 keys and per-token API billing.
 
+## Agent Backends
+
+Currently supported local agent CLIs:
+
+- Claude Code via `claude`
+- OpenAI Codex CLI via `codex`
+
+Gemini CLI support is planned. The architecture is intended to support
+additional local agent CLIs over time while keeping the same local,
+subscription-friendly workflow.
+
 ## Install / Use
 
 Clone the repo first:

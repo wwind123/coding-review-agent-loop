@@ -11,6 +11,17 @@ The default flow is:
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`. Repeat `--reviewer` to require multiple reviewer approvals.
 
+## Agent Backends
+
+Currently supported local agent CLIs:
+
+- Claude Code via `claude`
+- OpenAI Codex CLI via `codex`
+
+Gemini CLI support is planned. The architecture is intended to support
+additional local agent CLIs over time while keeping the same local,
+subscription-friendly workflow.
+
 ## Prerequisites
 
 - `gh` is installed and authenticated for the target GitHub repository.
