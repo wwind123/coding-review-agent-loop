@@ -2,12 +2,34 @@
 
 Local command-line orchestration for a coding PR review loop.
 
+Run a local Claude/Codex PR review loop using your existing CLI subscriptions,
+without paying separate model API costs.
+
 The main advantage is cost and account reuse: the tool shells out to your
 already-authenticated local CLIs (`claude`, `codex`, and `gh`) instead of
 calling model APIs directly. If your local agent CLIs are backed by existing AI
 subscriptions or authenticated developer accounts, the review loop can use
 those existing entitlements rather than requiring separate Claude/OpenAI API
 keys and per-token API billing.
+
+## Who This Is For
+
+This is for developers who already use Claude Code, OpenAI Codex CLI, and
+GitHub, and want one local agent to implement or fix a PR while another local
+agent reviews it before merge.
+
+It is especially useful when you are already doing this manually by switching
+between agent CLIs and copying review feedback back and forth.
+
+## Why Not GitHub Actions?
+
+GitHub Actions-based agent loops usually need model API keys, hosted workflow
+permissions, and separate API billing. This tool keeps the loop on your local
+machine and uses the CLI accounts you have already authenticated.
+
+That makes it easier to experiment with agent-to-agent review loops before
+committing to hosted automation. It also keeps local workspace setup,
+credentials, and agent approval prompts under your direct control.
 
 ## Agent Backends
 
