@@ -1,6 +1,6 @@
 # coding-review-agent-loop
 
-Local command-line orchestration for a two-agent coding PR review loop.
+Local command-line orchestration for a coding PR review loop.
 
 The tool shells out to your already-authenticated local CLIs (`claude`, `codex`, and `gh`) so it can run from your workstation without GitHub Actions model API keys.
 
@@ -65,6 +65,15 @@ By default Claude is the coder and Codex is the reviewer. Reverse that with:
 
 ```bash
 agent-loop task "Fix the flaky test" --repo OWNER/REPO --coder codex --reviewer claude
+```
+
+Repeat `--reviewer` to require approvals from multiple reviewers. The PR is
+approved only after every configured reviewer approves in the same round. The
+coder may also be listed as a reviewer when you want the same agent to work in
+separate coding and review passes:
+
+```bash
+agent-loop pr 456 --repo OWNER/REPO --reviewer codex --reviewer claude
 ```
 
 For trusted local automation that must run without approval prompts:

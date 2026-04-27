@@ -278,6 +278,52 @@ def test_pr_loop_runs_tests_and_merge_only_after_codex_approval(tmp_path):
     assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
 
 
+def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["Codex approves.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        claude_outputs=["Claude approves.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        auto_merge=True,
+        test_command=("pytest", "tests/test_agent_loop.py"),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    agent_commands = [cmd[:2] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
+    assert agent_commands == [["codex", "exec"], ["claude", "--print"]]
+    assert len(runner.comments) == 2
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert ["pytest", "tests/test_agent_loop.py"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
+
+
+def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[
+            "Needs a regression test.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Addressed review.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Claude approves.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            "Codex approves first pass.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Codex approves second pass.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer=("claude", "codex"))
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(runner.comments) == 5
+    followup_prompt = next(
+        cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"] and "Address the review below" in cmd[-1]
+    )
+    assert "Needs a regression test." in followup_prompt
+    assert "Codex approves first pass." not in followup_prompt
+
+
 def test_pr_loop_does_not_run_claude_after_final_blocking_round(tmp_path):
     runner = FakeRunner(codex_outputs=["Still blocked.\n<!-- AGENT_STATE: blocking -->"])
     config = make_config(tmp_path, max_rounds=1)
@@ -328,7 +374,7 @@ def test_agent_workdir_existing_file_fails_clearly(tmp_path):
         run_pr_loop(runner, pr_number=77, config=config)
 
 
-def test_config_rejects_same_coder_and_reviewer(tmp_path):
+def test_config_allows_same_coder_and_reviewer(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
         "pr",
@@ -342,10 +388,55 @@ def test_config_rejects_same_coder_and_reviewer(tmp_path):
         "--codex-dir",
         str(tmp_path / "codex"),
     ])
-    runner = FakeRunner()
 
-    with pytest.raises(AgentLoopError, match="must be different"):
-        config_from_args(args, runner)
+    config = config_from_args(args, FakeRunner())
+
+    assert config.coder == "codex"
+    assert config.reviewer == ("codex",)
+
+
+def test_config_allows_coder_in_multiple_reviewers(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "codex",
+        "--reviewer",
+        "claude",
+        "--reviewer",
+        "codex",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.coder == "codex"
+    assert config.reviewer == ("claude", "codex")
+
+
+def test_config_rejects_duplicate_reviewers(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--reviewer",
+        "codex",
+        "--reviewer",
+        "codex",
+        "--codex-dir",
+        str(tmp_path / "codex"),
+    ])
+
+    with pytest.raises(AgentLoopError, match="same agent more than once"):
+        config_from_args(args, FakeRunner())
 
 
 def test_config_defaults_do_not_bypass_agent_permissions(tmp_path):
