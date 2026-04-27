@@ -2,7 +2,12 @@
 
 Local command-line orchestration for a coding PR review loop.
 
-The tool shells out to your already-authenticated local CLIs (`claude`, `codex`, and `gh`) so it can run from your workstation without GitHub Actions model API keys.
+The main advantage is cost and account reuse: the tool shells out to your
+already-authenticated local CLIs (`claude`, `codex`, and `gh`) instead of
+calling model APIs directly. If your local agent CLIs are backed by existing AI
+subscriptions or authenticated developer accounts, the review loop can use
+those existing entitlements rather than requiring separate Claude/OpenAI API
+keys and per-token API billing.
 
 ## Install / Use
 

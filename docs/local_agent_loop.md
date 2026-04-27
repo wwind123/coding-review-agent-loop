@@ -1,6 +1,6 @@
 # Local Coding Review Agent Loop
 
-`coding-review-agent-loop` is a local CLI that orchestrates coding agents through a GitHub pull request review loop. It shells out to locally authenticated `claude`, `codex`, and `gh` CLIs instead of calling model APIs directly.
+`coding-review-agent-loop` is a local CLI that orchestrates coding agents through a GitHub pull request review loop. Its main advantage is cost and account reuse: it shells out to locally authenticated `claude`, `codex`, and `gh` CLIs instead of calling model APIs directly. If your local agent CLIs are backed by existing AI subscriptions or authenticated developer accounts, the review loop can use those existing entitlements rather than requiring separate Claude/OpenAI API keys and per-token API billing.
 
 The default flow is:
 
