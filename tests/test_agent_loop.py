@@ -34,6 +34,7 @@ class FakeRunner(Runner):
         pr_payload=None,
         git_status="",
         git_remote="git@github.com:OWNER/REPO.git",
+        git_inside=True,
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -54,6 +55,7 @@ class FakeRunner(Runner):
         self.comments = []
         self.git_status = git_status
         self.git_remote = git_remote
+        self.git_inside = git_inside
 
     def _record_command(self, args, cwd):
         cmd = [str(arg) for arg in args]
@@ -133,7 +135,9 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, "", "", 0)
 
         if cmd[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
-            return CommandResult(cmd, cwd_path, "true\n", "", 0)
+            if self.git_inside:
+                return CommandResult(cmd, cwd_path, "true\n", "", 0)
+            return CommandResult(cmd, cwd_path, "false\n", "", 1)
 
         if cmd[:4] == ["git", "remote", "get-url", "origin"]:
             return CommandResult(cmd, cwd_path, f"{self.git_remote}\n", "", 0)
@@ -627,6 +631,12 @@ def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts():
     assert set(config.auto_agent_dirs) == {"claude", "codex", "gemini"}
 
 
+@pytest.mark.parametrize("repo", ["OWNER", "OWNER/", "/REPO", "OWNER/REPO/EXTRA"])
+def test_default_agent_workdir_rejects_invalid_repo_formats(repo):
+    with pytest.raises(AgentLoopError, match="OWNER/REPO"):
+        default_agent_workdir(repo, "codex")
+
+
 def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):
     parser = build_parser()
     codex_dir = tmp_path / "codex"
@@ -733,6 +743,46 @@ def test_dirty_existing_auto_agent_dir_fails_clearly(tmp_path):
     config.gemini_dir.mkdir(parents=True)
 
     with pytest.raises(AgentLoopError, match="dirty"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+
+
+def test_existing_auto_agent_dir_must_be_git_checkout(tmp_path):
+    runner = FakeRunner(git_inside=False)
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path,
+        codex_dir=codex_dir,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+        create_dirs=False,
+    )
+    config.claude_dir.mkdir(parents=True)
+    config.gemini_dir.mkdir(parents=True)
+
+    with pytest.raises(AgentLoopError, match="not a git checkout"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+
+
+def test_existing_auto_agent_dir_must_match_requested_repo(tmp_path):
+    runner = FakeRunner(git_remote="git@github.com:OTHER/REPO.git")
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path,
+        codex_dir=codex_dir,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+        create_dirs=False,
+    )
+    config.claude_dir.mkdir(parents=True)
+    config.gemini_dir.mkdir(parents=True)
+
+    with pytest.raises(AgentLoopError, match="not 'OWNER/REPO'"):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)

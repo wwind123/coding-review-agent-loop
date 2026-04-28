@@ -23,7 +23,7 @@ class AgentLoopConfig:
     codex_dir: Path
     gemini_dir: Path
     coder: AgentName
-    reviewer: AgentName | tuple[AgentName, ...]
+    reviewer: tuple[AgentName, ...]
     base: str
     max_rounds: int
     auto_merge: bool
@@ -51,8 +51,6 @@ class AgentLoopConfig:
 
 
 def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
-    if isinstance(config.reviewer, str):
-        return (config.reviewer,)
     return config.reviewer
 
 
@@ -114,6 +112,8 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
         runner.run((config.gh_cmd, "repo", "clone", config.repo, str(path)), cwd=path.parent)
         if runner.dry_run:
             return
+        # Fresh clones still flow through validation and sync below so the
+        # same remote, cleanliness, and base-branch checks apply to every run.
 
     if not path.is_dir():
         raise AgentLoopError(f"Default {agent} workdir exists but is not a directory: {path}")
@@ -145,7 +145,7 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
     _run_git(runner, path, ("pull", "--ff-only", "origin", config.base))
 
 
-def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner | None = None) -> None:
+def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner) -> None:
     required: set[AgentName] = {config.coder, *reviewers(config)}
     paths = {
         "claude": (config.claude_dir, "--claude-dir"),
@@ -156,8 +156,6 @@ def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner | None = None)
     for agent in required:
         path, option = paths[agent]
         if agent in auto_dirs:
-            if runner is None:
-                raise AgentLoopError("Internal error: runner is required for default agent checkouts.")
             log(config, f"Using default {agent} workdir: {path}")
             ensure_temp_checkout(path, agent=agent, config=config, runner=runner)
         else:

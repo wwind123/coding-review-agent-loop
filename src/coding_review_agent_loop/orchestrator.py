@@ -177,6 +177,8 @@ def run_pr_loop(
     reviewer_session_ids: dict[AgentName, str | None] = {}
     configured_reviewers = reviewers(config)
     if reviewer_session_id is not None and configured_reviewers:
+        # Backward-compatible single-reviewer resume support: older callers
+        # pass one reviewer session, so attach it to the first configured reviewer.
         reviewer_session_ids[configured_reviewers[0]] = reviewer_session_id
 
     for round_number in range(1, config.max_rounds + 1):
