@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from .base import AgentBackend, AgentName
 from .claude import BACKEND as CLAUDE_BACKEND
 from .codex import BACKEND as CODEX_BACKEND
+from .gemini import BACKEND as GEMINI_BACKEND
 from ..errors import AgentLoopError
 from ..runner import Runner
 
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
 BACKENDS: dict[AgentName, AgentBackend] = {
     "claude": CLAUDE_BACKEND,
     "codex": CODEX_BACKEND,
+    "gemini": GEMINI_BACKEND,
 }
 
 
@@ -63,3 +65,7 @@ def run_claude(
 
 def run_codex(runner: Runner, *, config: AgentLoopConfig, prompt: str) -> str:
     return CODEX_BACKEND.run(runner, config, prompt).text
+
+
+def run_gemini(runner: Runner, *, config: AgentLoopConfig, prompt: str) -> str:
+    return GEMINI_BACKEND.run(runner, config, prompt).text

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from coding_review_agent_loop.agents.claude import _parse_claude_output
+from coding_review_agent_loop.agents.gemini import _parse_gemini_output
 from coding_review_agent_loop.cli import (
     AgentLoopConfig,
     AgentLoopError,
@@ -22,10 +23,19 @@ from coding_review_agent_loop.cli import (
 
 
 class FakeRunner(Runner):
-    def __init__(self, *, claude_outputs=None, codex_outputs=None, issue_payload=None, pr_payload=None):
+    def __init__(
+        self,
+        *,
+        claude_outputs=None,
+        codex_outputs=None,
+        gemini_outputs=None,
+        issue_payload=None,
+        pr_payload=None,
+    ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
         self.codex_outputs = list(codex_outputs or [])
+        self.gemini_outputs = list(gemini_outputs or [])
         self.issue_payload = issue_payload or {
             "number": 56,
             "state": "open",
@@ -68,6 +78,11 @@ class FakeRunner(Runner):
             log_path.write_text(f"$ {' '.join(cmd)}\n\ncodex completed", encoding="utf-8")
             return CommandResult(cmd, Path(cwd), "codex completed", "", 0)
 
+        if cmd[:1] == ["gemini"]:
+            output = self.gemini_outputs.pop(0)
+            log_path.write_text(f"$ {' '.join(cmd)}\n\n{output}", encoding="utf-8")
+            return CommandResult(cmd, Path(cwd), output, "", 0)
+
         return self.run(args, cwd=cwd, check=check)
 
     def run(self, args, *, cwd, input_text=None, check=True):
@@ -83,6 +98,9 @@ class FakeRunner(Runner):
                 out_path = Path(cmd[cmd.index("--output-last-message") + 1])
                 out_path.write_text(output, encoding="utf-8")
             return CommandResult(cmd, Path(cwd), "", "", 0)
+
+        if cmd[:1] == ["gemini"]:
+            return CommandResult(cmd, Path(cwd), self.gemini_outputs.pop(0), "", 0)
 
         if cmd[:3] == ["gh", "pr", "comment"]:
             if "--body-file" in cmd:
@@ -120,6 +138,7 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         "repo": "OWNER/REPO",
         "claude_dir": tmp_path / "claude",
         "codex_dir": tmp_path / "codex",
+        "gemini_dir": tmp_path / "gemini",
         "coder": "claude",
         "reviewer": "codex",
         "base": "main",
@@ -129,9 +148,11 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         "allow_shared_dir": False,
         "claude_cmd": "claude",
         "codex_cmd": "codex",
+        "gemini_cmd": "gemini",
         "gh_cmd": "gh",
         "claude_args": (),
         "codex_args": (),
+        "gemini_args": (),
         "test_command": None,
         "ci_check_name": "test",
         "ci_timeout_seconds": 1200,
@@ -144,6 +165,7 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
     if create_dirs:
         config["claude_dir"].mkdir(parents=True, exist_ok=True)
         config["codex_dir"].mkdir(parents=True, exist_ok=True)
+        config["gemini_dir"].mkdir(parents=True, exist_ok=True)
     return AgentLoopConfig(**config)
 
 
@@ -166,6 +188,15 @@ def test_parse_claude_output_falls_back_on_non_string_result():
     text, sid = _parse_claude_output(raw)
     assert text == raw  # non-string result → fall back to raw
     assert sid == "abc"
+
+
+def test_parse_gemini_output_extracts_json_response():
+    raw = json.dumps({"response": "Reviewed.\n<!-- AGENT_STATE: approved -->"})
+    assert _parse_gemini_output(raw) == "Reviewed.\n<!-- AGENT_STATE: approved -->"
+
+
+def test_parse_gemini_output_falls_back_on_plain_text():
+    assert _parse_gemini_output("plain response") == "plain response"
 
 
 def test_parse_agent_state_accepts_html_marker():
@@ -344,6 +375,21 @@ def test_shared_workdir_requires_explicit_override(tmp_path):
         run_pr_loop(runner, pr_number=77, config=config)
 
 
+def test_gemini_shared_workdir_requires_explicit_override(tmp_path):
+    runner = FakeRunner()
+    shared = tmp_path / "repo"
+    shared.mkdir()
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        codex_dir=shared,
+        gemini_dir=shared,
+    )
+
+    with pytest.raises(AgentLoopError, match="same directory"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+
 def test_missing_agent_workdirs_are_created(tmp_path):
     runner = FakeRunner(
         claude_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"],
@@ -364,11 +410,42 @@ def test_missing_agent_workdirs_are_created(tmp_path):
     assert codex_dir.is_dir()
 
 
+def test_missing_gemini_workdir_is_created_when_configured(tmp_path):
+    runner = FakeRunner(
+        gemini_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"],
+    )
+    gemini_dir = tmp_path / "missing" / "gemini"
+    config = make_config(
+        tmp_path,
+        reviewer="gemini",
+        gemini_dir=gemini_dir,
+        create_dirs=False,
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert gemini_dir.is_dir()
+
+
 def test_agent_workdir_existing_file_fails_clearly(tmp_path):
     runner = FakeRunner()
     claude_path = tmp_path / "claude-file"
     claude_path.write_text("not a dir", encoding="utf-8")
     config = make_config(tmp_path, claude_dir=claude_path, create_dirs=False)
+
+    with pytest.raises(AgentLoopError, match="not a directory"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+
+def test_gemini_workdir_existing_file_fails_clearly(tmp_path):
+    runner = FakeRunner()
+    gemini_path = tmp_path / "gemini-file"
+    gemini_path.write_text("not a dir", encoding="utf-8")
+    config = make_config(
+        tmp_path,
+        reviewer="gemini",
+        gemini_dir=gemini_path,
+        create_dirs=False,
+    )
 
     with pytest.raises(AgentLoopError, match="not a directory"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -420,6 +497,32 @@ def test_config_allows_coder_in_multiple_reviewers(tmp_path):
     assert config.reviewer == ("claude", "codex")
 
 
+def test_config_accepts_gemini_as_coder_and_reviewer(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "gemini",
+        "--reviewer",
+        "claude",
+        "--reviewer",
+        "gemini",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--gemini-dir",
+        str(tmp_path / "gemini"),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.coder == "gemini"
+    assert config.reviewer == ("claude", "gemini")
+    assert config.gemini_dir == tmp_path / "gemini"
+
+
 def test_config_rejects_duplicate_reviewers(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
@@ -455,6 +558,7 @@ def test_config_defaults_do_not_bypass_agent_permissions(tmp_path):
 
     assert config.claude_args == ()
     assert config.codex_args == ()
+    assert config.gemini_args == ()
 
 
 def test_config_can_opt_into_dangerous_agent_permissions(tmp_path):
@@ -474,6 +578,7 @@ def test_config_can_opt_into_dangerous_agent_permissions(tmp_path):
 
     assert config.claude_args == ("--dangerously-skip-permissions",)
     assert config.codex_args == ("--dangerously-bypass-approvals-and-sandbox",)
+    assert config.gemini_args == ("--yolo",)
 
 
 def test_explicit_agent_args_replace_dangerous_profile(tmp_path):
@@ -492,11 +597,14 @@ def test_explicit_agent_args_replace_dangerous_profile(tmp_path):
         "--claude-arg=acceptEdits",
         "--codex-arg=--sandbox",
         "--codex-arg=workspace-write",
+        "--gemini-arg=--approval-mode",
+        "--gemini-arg=auto_edit",
     ])
     config = config_from_args(args, FakeRunner())
 
     assert config.claude_args == ("--permission-mode", "acceptEdits")
     assert config.codex_args == ("--sandbox", "workspace-write")
+    assert config.gemini_args == ("--approval-mode", "auto_edit")
 
 
 def test_issue_loop_requires_claude_to_report_pr_number(tmp_path):
@@ -775,6 +883,47 @@ def test_codex_task_loop_picks_up_pr_url_when_marker_missing(tmp_path):
     config = make_config(tmp_path, coder="codex", reviewer="claude")
 
     assert run_task_loop(runner, task_text="Tighten rate limiter.", config=config) == 0
+
+
+def test_gemini_issue_loop_creates_pr_then_codex_approves(tmp_path):
+    runner = FakeRunner(
+        gemini_outputs=[
+            "Fixed issue.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
+        ],
+        codex_outputs=[
+            "Looks good.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+    )
+    config = make_config(tmp_path, coder="gemini", reviewer="codex")
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    agent_commands = [cmd[:2] for cmd, _cwd in runner.commands if cmd[:1] in (["gemini"], ["codex"])]
+    assert agent_commands == [["gemini", "--prompt"], ["codex", "exec"]]
+    assert len(runner.comments) == 2
+    assert runner.comments[0].startswith("Fixed issue.")
+    assert runner.comments[1].startswith("Looks good.")
+
+
+def test_gemini_review_loop_uses_prompt_and_extra_args(tmp_path):
+    runner = FakeRunner(
+        gemini_outputs=[
+            json.dumps({"response": "LGTM.\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"}),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer="gemini",
+        gemini_args=("--output-format", "json", "--model", "gemini-2.5-flash"),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    gemini_call = next(cmd for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"])
+    assert gemini_call[:2] == ["gemini", "--prompt"]
+    assert "--output-format" in gemini_call
+    assert "--model" in gemini_call
+    assert runner.comments == ["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"]
 
 
 def test_codex_task_loop_rejects_empty_task_text(tmp_path):

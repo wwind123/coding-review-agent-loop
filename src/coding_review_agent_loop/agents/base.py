@@ -11,7 +11,7 @@ from ..runner import Runner
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
 
-AgentName = Literal["claude", "codex"]
+AgentName = Literal["claude", "codex", "gemini"]
 
 
 @dataclass(frozen=True)
