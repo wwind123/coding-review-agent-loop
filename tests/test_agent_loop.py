@@ -210,6 +210,35 @@ def test_parse_gemini_output_falls_back_on_non_string_response():
     assert sid == "gemini-session-1"
 
 
+def test_parse_gemini_output_strips_cli_preamble_before_final_response():
+    raw = """Warning: True color (24-bit) support not detected.
+YOLO mode is enabled. All tool calls will be automatically approved.
+Attempt 1 failed with status 429. Retrying with backoff... _GaxiosError: [{
+  "error": {
+    "code": 429,
+    "message": "No capacity available for model gemini-3-flash-preview on the server"
+  }
+}]
+I am now ready to provide my final response.
+
+---
+
+## Code Review
+
+Looks good.
+
+<!-- AGENT_STATE: approved -->
+
+-- Google Gemini
+"""
+    text, sid = _parse_gemini_output(raw)
+    assert text.startswith("## Code Review")
+    assert "_GaxiosError" not in text
+    assert "YOLO mode" not in text
+    assert "<!-- AGENT_STATE: approved -->" in text
+    assert sid is None
+
+
 def test_parse_agent_state_accepts_html_marker():
     assert parse_agent_state("looks fine\n<!-- AGENT_STATE: approved -->") == "approved"
     assert parse_agent_state("needs work\n<!-- agent_state: BLOCKING -->") == "blocking"
@@ -923,6 +952,8 @@ def test_gemini_issue_loop_resumes_session_for_followup(tmp_path):
                 "response": "Fixed issue.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
                 "session_id": "gemini-session-1",
             }),
+            # Plain-text output intentionally clears the tracked session; a third
+            # Gemini turn would start without --resume.
             "Addressed review.\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
         ],
         codex_outputs=[

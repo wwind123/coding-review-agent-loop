@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,24 @@ from ..runner import Runner
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
+
+
+_AGENT_STATE_RE = re.compile(r"<!--\s*AGENT_STATE:\s*(?:approved|blocking)\s*-->", re.I)
+
+
+def _strip_gemini_preamble(raw: str) -> str:
+    """Drop Gemini CLI diagnostics that can appear before the final response."""
+    state_matches = list(_AGENT_STATE_RE.finditer(raw))
+    if not state_matches:
+        return raw
+
+    public_end = state_matches[-1].start()
+    separator = "\n---\n"
+    separator_at = raw.rfind(separator, 0, public_end)
+    if separator_at == -1:
+        return raw
+
+    return raw[separator_at + len(separator) :].lstrip()
 
 
 def _parse_gemini_output(raw: str) -> tuple[str, str | None]:
@@ -26,7 +45,8 @@ def _parse_gemini_output(raw: str) -> tuple[str, str | None]:
             return text, session_id if isinstance(session_id, str) else None
     except (json.JSONDecodeError, ValueError):
         pass
-    return raw, None
+    return _strip_gemini_preamble(raw), None
+
 
 
 class GeminiBackend:
