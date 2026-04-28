@@ -55,6 +55,14 @@ class FakeRunner(Runner):
         self.git_status = git_status
         self.git_remote = git_remote
 
+    def _record_command(self, args, cwd):
+        cmd = [str(arg) for arg in args]
+        cwd_path = Path(cwd)
+        if not cwd_path.is_dir():
+            raise FileNotFoundError(cwd_path)
+        self.commands.append((cmd, cwd_path))
+        return cmd, cwd_path
+
     def run_with_log(
         self,
         args,
@@ -65,15 +73,14 @@ class FakeRunner(Runner):
         progress_interval_seconds,
         check=True,
     ):
-        cmd = [str(arg) for arg in args]
-        self.commands.append((cmd, Path(cwd)))
+        cmd, cwd_path = self._record_command(args, cwd)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         ensure_log_dir_ignored(log_path.parent)
 
         if cmd[:1] == ["claude"]:
             output = self.claude_outputs.pop(0)
             log_path.write_text(f"$ {' '.join(cmd)}\n\n{output}", encoding="utf-8")
-            return CommandResult(cmd, Path(cwd), output, "", 0)
+            return CommandResult(cmd, cwd_path, output, "", 0)
 
         if cmd[:2] == ["codex", "exec"]:
             output = self.codex_outputs.pop(0)
@@ -81,28 +88,27 @@ class FakeRunner(Runner):
                 out_path = Path(cmd[cmd.index("--output-last-message") + 1])
                 out_path.write_text(output, encoding="utf-8")
             log_path.write_text(f"$ {' '.join(cmd)}\n\ncodex completed", encoding="utf-8")
-            return CommandResult(cmd, Path(cwd), "codex completed", "", 0)
+            return CommandResult(cmd, cwd_path, "codex completed", "", 0)
 
         if cmd[:1] == ["gemini"]:
             output = self.gemini_outputs.pop(0)
             log_path.write_text(f"$ {' '.join(cmd)}\n\n{output}", encoding="utf-8")
-            return CommandResult(cmd, Path(cwd), output, "", 0)
+            return CommandResult(cmd, cwd_path, output, "", 0)
 
         return self.run(args, cwd=cwd, check=check)
 
     def run(self, args, *, cwd, input_text=None, check=True):
-        cmd = [str(arg) for arg in args]
-        self.commands.append((cmd, Path(cwd)))
+        cmd, cwd_path = self._record_command(args, cwd)
 
         if cmd[:1] == ["claude"]:
-            return CommandResult(cmd, Path(cwd), self.claude_outputs.pop(0), "", 0)
+            return CommandResult(cmd, cwd_path, self.claude_outputs.pop(0), "", 0)
 
         if cmd[:2] == ["codex", "exec"]:
             output = self.codex_outputs.pop(0)
             if "--output-last-message" in cmd:
                 out_path = Path(cmd[cmd.index("--output-last-message") + 1])
                 out_path.write_text(output, encoding="utf-8")
-            return CommandResult(cmd, Path(cwd), "", "", 0)
+            return CommandResult(cmd, cwd_path, "", "", 0)
 
         if cmd[:3] == ["gh", "pr", "comment"]:
             if "--body-file" in cmd:
@@ -110,36 +116,36 @@ class FakeRunner(Runner):
                 self.comments.append(body_path.read_text(encoding="utf-8"))
             elif "--body" in cmd:
                 self.comments.append(cmd[cmd.index("--body") + 1])
-            return CommandResult(cmd, Path(cwd), "", "", 0)
+            return CommandResult(cmd, cwd_path, "", "", 0)
 
         if cmd[:3] == ["gh", "pr", "view"]:
             if "--jq" in cmd and ".headRefOid" in cmd:
-                return CommandResult(cmd, Path(cwd), "abc123\n", "", 0)
-            return CommandResult(cmd, Path(cwd), json_dumps(self.pr_payload), "", 0)
+                return CommandResult(cmd, cwd_path, "abc123\n", "", 0)
+            return CommandResult(cmd, cwd_path, json_dumps(self.pr_payload), "", 0)
 
         if cmd[:2] == ["gh", "api"] and "/issues/" in cmd[2]:
-            return CommandResult(cmd, Path(cwd), json_dumps(self.issue_payload), "", 0)
+            return CommandResult(cmd, cwd_path, json_dumps(self.issue_payload), "", 0)
 
         if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/check-runs"):
-            return CommandResult(cmd, Path(cwd), "success\n", "", 0)
+            return CommandResult(cmd, cwd_path, "success\n", "", 0)
 
         if cmd[:1] == ["sleep"]:
-            return CommandResult(cmd, Path(cwd), "", "", 0)
+            return CommandResult(cmd, cwd_path, "", "", 0)
 
         if cmd[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
-            return CommandResult(cmd, Path(cwd), "true\n", "", 0)
+            return CommandResult(cmd, cwd_path, "true\n", "", 0)
 
         if cmd[:4] == ["git", "remote", "get-url", "origin"]:
-            return CommandResult(cmd, Path(cwd), f"{self.git_remote}\n", "", 0)
+            return CommandResult(cmd, cwd_path, f"{self.git_remote}\n", "", 0)
 
         if cmd[:3] == ["git", "status", "--porcelain"]:
-            return CommandResult(cmd, Path(cwd), self.git_status, "", 0)
+            return CommandResult(cmd, cwd_path, self.git_status, "", 0)
 
         if cmd[:3] == ["gh", "repo", "clone"]:
             Path(cmd[4]).mkdir(parents=True, exist_ok=True)
-            return CommandResult(cmd, Path(cwd), "", "", 0)
+            return CommandResult(cmd, cwd_path, "", "", 0)
 
-        return CommandResult(cmd, Path(cwd), "", "", 0)
+        return CommandResult(cmd, cwd_path, "", "", 0)
 
 
 def json_dumps(value):
@@ -526,6 +532,34 @@ def test_missing_gemini_workdir_is_created_when_configured(tmp_path):
     assert gemini_dir.is_dir()
 
 
+def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path):
+    runner = FakeRunner(
+        gemini_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"],
+    )
+    codex_dir = tmp_path / "inactive" / "codex"
+    config = make_config(
+        tmp_path,
+        claude_dir=tmp_path / "missing" / "claude",
+        codex_dir=codex_dir,
+        gemini_dir=tmp_path / "missing" / "gemini",
+        coder="claude",
+        reviewer="gemini",
+        test_command=("pytest", "tests/test_agent_loop.py"),
+        create_dirs=False,
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not codex_dir.exists()
+    github_or_test_cwds = [
+        cwd
+        for cmd, cwd in runner.commands
+        if cmd[:1] == ["gh"] or cmd == ["pytest", "tests/test_agent_loop.py"]
+    ]
+    assert github_or_test_cwds
+    assert set(github_or_test_cwds) == {config.claude_dir}
+
+
 def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts():
     parser = build_parser()
     args = parser.parse_args([
@@ -568,6 +602,27 @@ def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):
     assert config.codex_dir == codex_dir
     assert config.claude_dir == default_agent_workdir("OWNER/REPO", "claude").resolve()
     assert set(config.auto_agent_dirs) == {"claude", "gemini"}
+
+
+def test_relative_log_dir_defaults_under_active_coder_workdir(tmp_path):
+    parser = build_parser()
+    claude_dir = tmp_path / "claude"
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "claude",
+        "--reviewer",
+        "gemini",
+        "--claude-dir",
+        str(claude_dir),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.log_dir == claude_dir / ".agent-loop-logs"
 
 
 def test_auto_created_agent_dir_is_cloned_before_use(tmp_path):

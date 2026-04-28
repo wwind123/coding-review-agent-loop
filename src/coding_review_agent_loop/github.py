@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from .errors import AgentLoopError
 from .logging import log
 from .runner import Runner
+from .workdirs import active_workdir
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
@@ -41,7 +42,7 @@ def validate_open_pr(runner: Runner, *, config: AgentLoopConfig, pr_number: int)
             "--json",
             "number,state,url",
         ],
-        cwd=config.codex_dir,
+        cwd=active_workdir(config),
     )
     data = json.loads(result.stdout or "{}")
     if data.get("state") != "OPEN":
@@ -61,7 +62,7 @@ def validate_open_issue(runner: Runner, *, config: AgentLoopConfig, issue_number
             "--jq",
             "{number:.number,state:.state,is_pr:has(\"pull_request\"),url:.html_url}",
         ],
-        cwd=config.codex_dir,
+        cwd=active_workdir(config),
     )
     data = json.loads(result.stdout or "{}")
     if data.get("is_pr"):
@@ -85,7 +86,7 @@ def post_pr_comment(
     if config.dry_run:
         runner.run(
             [config.gh_cmd, "pr", "comment", str(pr_number), "--repo", config.repo, "--body", body],
-            cwd=config.codex_dir,
+            cwd=active_workdir(config),
         )
         return
 
@@ -104,7 +105,7 @@ def post_pr_comment(
                 "--body-file",
                 path,
             ],
-            cwd=config.codex_dir,
+            cwd=active_workdir(config),
         )
     finally:
         try:
@@ -127,7 +128,7 @@ def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> 
             "--jq",
             ".headRefOid",
         ],
-        cwd=config.codex_dir,
+        cwd=active_workdir(config),
     )
     sha = result.stdout.strip()
     if not sha:
@@ -147,7 +148,7 @@ def get_check_status(runner: Runner, config: AgentLoopConfig, head_sha: str) -> 
                 'if length == 0 then "pending" else .[0].conclusion // .[0].status end'
             ),
         ],
-        cwd=config.codex_dir,
+        cwd=active_workdir(config),
     )
     return result.stdout.strip() or "pending"
 
@@ -172,7 +173,7 @@ def wait_for_ci(runner: Runner, config: AgentLoopConfig, pr_number: int) -> None
         if status in terminal_failures:
             raise AgentLoopError(f"CI check '{config.ci_check_name}' failed with status: {status}")
         if attempt < attempts - 1:
-            runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=config.codex_dir)
+            runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
     raise AgentLoopError(
         f"CI check '{config.ci_check_name}' did not pass within {config.ci_timeout_seconds}s"
     )
@@ -182,5 +183,5 @@ def merge_pr(runner: Runner, config: AgentLoopConfig, pr_number: int) -> None:
     log(config, f"Merging PR #{pr_number}")
     runner.run(
         [config.gh_cmd, "pr", "merge", str(pr_number), "--repo", config.repo, "--merge"],
-        cwd=config.codex_dir,
+        cwd=active_workdir(config),
     )

@@ -26,13 +26,14 @@ from .prompts import (
 )
 from .protocol import is_clarification_request, parse_agent_state, parse_pr_number
 from .runner import Runner
+from .workdirs import active_workdir
 
 
 def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
     if not config.test_command:
         return
     log(config, f"Running local test command: {' '.join(config.test_command)}")
-    runner.run(config.test_command, cwd=config.codex_dir)
+    runner.run(config.test_command, cwd=active_workdir(config))
     log(config, "Local test command passed")
 
 

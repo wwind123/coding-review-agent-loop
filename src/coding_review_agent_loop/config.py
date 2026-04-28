@@ -202,6 +202,11 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         if args.gemini_dir is not None
         else default_agent_workdir(repo, "gemini").resolve()
     )
+    primary_dir = {
+        "claude": claude_dir,
+        "codex": codex_dir,
+        "gemini": gemini_dir,
+    }[args.coder]
     test_command = _split_command(args.test_command)
     if args.ci_timeout_seconds <= 0:
         raise AgentLoopError("--ci-timeout-seconds must be greater than zero.")
@@ -245,7 +250,7 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         ci_timeout_seconds=args.ci_timeout_seconds,
         ci_poll_interval_seconds=args.ci_poll_interval_seconds,
         quiet=args.quiet,
-        log_dir=(codex_dir / args.log_dir if not args.log_dir.is_absolute() else args.log_dir),
+        log_dir=(primary_dir / args.log_dir if not args.log_dir.is_absolute() else args.log_dir),
         progress_interval_seconds=args.progress_interval_seconds,
         auto_agent_dirs=auto_agent_dirs,
     )
