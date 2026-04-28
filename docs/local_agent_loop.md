@@ -11,6 +11,83 @@ The default flow is:
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
+## Architecture
+
+The tool is a local orchestrator. It does not call model APIs directly; it shells
+out to locally authenticated agent and GitHub CLIs from separate checkouts.
+
+```mermaid
+flowchart LR
+    User[Developer terminal] --> CLI[agent-loop CLI<br/>cli.py]
+    CLI --> Config[Config and workdir setup<br/>config.py / workdirs.py]
+    CLI --> Orchestrator[Issue, task, and PR loops<br/>orchestrator.py]
+
+    Config --> Workdirs[(Agent checkouts<br/>Claude / Codex / Gemini)]
+    Config --> Logs[(.agent-loop-logs)]
+
+    Orchestrator --> Prompts[Prompt builders<br/>prompts.py]
+    Orchestrator --> Protocol[Marker parsing<br/>protocol.py]
+    Orchestrator --> Registry[Agent registry<br/>agents/registry.py]
+    Orchestrator --> GitHubOps[GitHub operations<br/>github.py]
+    Orchestrator --> OptionalTests[Optional local test command]
+
+    Registry --> Claude[Claude backend<br/>claude]
+    Registry --> Codex[Codex backend<br/>codex exec]
+    Registry --> Gemini[Gemini backend<br/>gemini --prompt]
+
+    Claude --> Runner[Subprocess runner<br/>runner.py]
+    Codex --> Runner
+    Gemini --> Runner
+    GitHubOps --> Runner
+    OptionalTests --> Runner
+
+    Runner --> AgentCLIs[Local agent CLIs]
+    Runner --> GhCLI[gh CLI]
+    Runner --> TestCmd[Local test process]
+
+    AgentCLIs --> Workdirs
+    AgentCLIs --> Logs
+    GhCLI --> GitHub[(GitHub repo<br/>issues / PRs / comments / checks)]
+```
+
+At runtime, the orchestrator drives one of three entrypoints:
+
+```mermaid
+sequenceDiagram
+    participant User as Developer
+    participant CLI as agent-loop CLI
+    participant Orch as Orchestrator
+    participant Coder as Coder agent CLI
+    participant Reviewer as Reviewer agent CLI(s)
+    participant GH as GitHub via gh
+
+    User->>CLI: agent-loop issue | task | pr
+    CLI->>Orch: validated config and workdirs
+    alt issue or task
+        Orch->>Coder: create or update PR
+        Coder-->>Orch: output with AGENT_PR marker
+        Orch->>GH: validate PR and post coder output
+    else existing PR
+        Orch->>GH: validate open PR
+    end
+
+    loop until all reviewers approve or max rounds reached
+        Orch->>Reviewer: review PR
+        Reviewer-->>Orch: AGENT_STATE approved or blocking
+        Orch->>GH: post review comment
+        alt any blocking review
+            Orch->>Coder: address combined feedback
+            Coder-->>Orch: AGENT_STATE blocking
+            Orch->>GH: post coder update
+        else all approved
+            Orch->>Orch: run optional local tests
+            opt auto-merge enabled
+                Orch->>GH: wait for configured check and merge
+            end
+        end
+    end
+```
+
 ## Agent Backends
 
 Currently supported local agent CLIs:
