@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .agents.claude import _parse_claude_output
 from .agents.registry import (
     agent_display_name,
     agent_signature,

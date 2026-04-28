@@ -6,14 +6,12 @@ import argparse
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
+from .agents.base import AgentName
 from .agents.registry import default_agent_args
 from .errors import AgentLoopError
 from .github import detect_repo
 from .runner import Runner
-
-AgentName = Literal["claude", "codex"]
 
 
 @dataclass(frozen=True)

@@ -3,12 +3,12 @@ from pathlib import Path
 
 import pytest
 
+from coding_review_agent_loop.agents.claude import _parse_claude_output
 from coding_review_agent_loop.cli import (
     AgentLoopConfig,
     AgentLoopError,
     CommandResult,
     Runner,
-    _parse_claude_output,
     build_parser,
     config_from_args,
     ensure_log_dir_ignored,

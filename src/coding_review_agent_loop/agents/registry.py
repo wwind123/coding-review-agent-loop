@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from .base import AgentBackend, AgentName
 from .claude import BACKEND as CLAUDE_BACKEND
 from .codex import BACKEND as CODEX_BACKEND
 from ..errors import AgentLoopError
 from ..runner import Runner
+
+if TYPE_CHECKING:
+    from ..config import AgentLoopConfig
 
 BACKENDS: dict[AgentName, AgentBackend] = {
     "claude": CLAUDE_BACKEND,
@@ -37,7 +42,7 @@ def run_agent(
     runner: Runner,
     *,
     agent: AgentName,
-    config,
+    config: AgentLoopConfig,
     prompt: str,
     session_id: str | None = None,
 ) -> tuple[str, str | None]:
@@ -48,7 +53,7 @@ def run_agent(
 def run_claude(
     runner: Runner,
     *,
-    config,
+    config: AgentLoopConfig,
     prompt: str,
     session_id: str | None = None,
 ) -> tuple[str, str | None]:
@@ -56,5 +61,5 @@ def run_claude(
     return result.text, result.session_id
 
 
-def run_codex(runner: Runner, *, config, prompt: str) -> str:
+def run_codex(runner: Runner, *, config: AgentLoopConfig, prompt: str) -> str:
     return CODEX_BACKEND.run(runner, config, prompt).text

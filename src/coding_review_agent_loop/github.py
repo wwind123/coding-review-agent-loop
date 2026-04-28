@@ -6,10 +6,14 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .errors import AgentLoopError
 from .logging import log
 from .runner import Runner
+
+if TYPE_CHECKING:
+    from .config import AgentLoopConfig
 
 
 def detect_repo(runner: Runner, cwd: Path, gh_cmd: str) -> str:
@@ -23,7 +27,7 @@ def detect_repo(runner: Runner, cwd: Path, gh_cmd: str) -> str:
     return repo
 
 
-def validate_open_pr(runner: Runner, *, config, pr_number: int) -> None:
+def validate_open_pr(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> None:
     if config.dry_run:
         return
     result = runner.run(
@@ -46,7 +50,7 @@ def validate_open_pr(runner: Runner, *, config, pr_number: int) -> None:
         )
 
 
-def validate_open_issue(runner: Runner, *, config, issue_number: int) -> None:
+def validate_open_issue(runner: Runner, *, config: AgentLoopConfig, issue_number: int) -> None:
     if config.dry_run:
         return
     result = runner.run(
@@ -73,7 +77,7 @@ def validate_open_issue(runner: Runner, *, config, issue_number: int) -> None:
 def post_pr_comment(
     runner: Runner,
     *,
-    config,
+    config: AgentLoopConfig,
     pr_number: int,
     body: str,
 ) -> None:
@@ -109,7 +113,7 @@ def post_pr_comment(
             pass
 
 
-def get_pr_head_sha(runner: Runner, config, pr_number: int) -> str:
+def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> str:
     result = runner.run(
         [
             config.gh_cmd,
@@ -131,7 +135,7 @@ def get_pr_head_sha(runner: Runner, config, pr_number: int) -> str:
     return sha
 
 
-def get_check_status(runner: Runner, config, head_sha: str) -> str:
+def get_check_status(runner: Runner, config: AgentLoopConfig, head_sha: str) -> str:
     result = runner.run(
         [
             config.gh_cmd,
@@ -148,7 +152,7 @@ def get_check_status(runner: Runner, config, head_sha: str) -> str:
     return result.stdout.strip() or "pending"
 
 
-def wait_for_ci(runner: Runner, config, pr_number: int) -> None:
+def wait_for_ci(runner: Runner, config: AgentLoopConfig, pr_number: int) -> None:
     log(config, f"Waiting for GitHub check '{config.ci_check_name}' before merge")
     head_sha = get_pr_head_sha(runner, config, pr_number)
     attempts = max(1, config.ci_timeout_seconds // config.ci_poll_interval_seconds)
@@ -174,7 +178,7 @@ def wait_for_ci(runner: Runner, config, pr_number: int) -> None:
     )
 
 
-def merge_pr(runner: Runner, config, pr_number: int) -> None:
+def merge_pr(runner: Runner, config: AgentLoopConfig, pr_number: int) -> None:
     log(config, f"Merging PR #{pr_number}")
     runner.run(
         [config.gh_cmd, "pr", "merge", str(pr_number), "--repo", config.repo, "--merge"],
