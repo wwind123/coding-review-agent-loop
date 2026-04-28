@@ -288,7 +288,11 @@ Agent responses are parsed using HTML comment markers:
 
 ## Logs
 
-Agent stdout/stderr is written to `.agent-loop-logs/` under the Codex checkout by default. The CLI prints heartbeat messages with the log path while agents run:
+Agent stdout/stderr is written to `.agent-loop-logs/` under the active coder
+checkout by default. If that coder directory was omitted, the relative default
+log path is also under the repo-scoped temporary checkout and may disappear
+with `/tmp` cleanup. The CLI prints heartbeat messages with the log path while
+agents run:
 
 ```text
 [agent-loop 12:00:31] Claude still running (30s); log: /path/to/.agent-loop-logs/20260425-120001-claude.log
