@@ -904,6 +904,25 @@ def test_config_rejects_duplicate_reviewers(tmp_path):
         config_from_args(args, FakeRunner())
 
 
+def test_config_rejects_non_positive_max_rounds(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--max-rounds",
+        "0",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+    ])
+
+    with pytest.raises(AgentLoopError, match="--max-rounds must be greater than zero"):
+        config_from_args(args, FakeRunner())
+
+
 def test_config_defaults_do_not_bypass_agent_permissions(tmp_path):
     parser = build_parser()
     args = parser.parse_args([

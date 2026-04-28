@@ -67,7 +67,7 @@ def validate_open_issue(runner: Runner, *, config: AgentLoopConfig, issue_number
     data = json.loads(result.stdout or "{}")
     if data.get("is_pr"):
         raise AgentLoopError(
-            f"#{issue_number} is a pull request, not an issue. Use `agent_loop.py pr {issue_number}`."
+            f"#{issue_number} is a pull request, not an issue. Use `agent-loop pr {issue_number}`."
         )
     if data.get("state") != "open":
         raise AgentLoopError(

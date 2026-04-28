@@ -206,6 +206,8 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         "gemini": gemini_dir,
     }[args.coder]
     test_command = _split_command(args.test_command)
+    if args.max_rounds <= 0:
+        raise AgentLoopError("--max-rounds must be greater than zero.")
     if args.ci_timeout_seconds <= 0:
         raise AgentLoopError("--ci-timeout-seconds must be greater than zero.")
     if args.ci_poll_interval_seconds <= 0:
