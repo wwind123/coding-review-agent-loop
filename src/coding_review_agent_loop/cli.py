@@ -63,9 +63,24 @@ def build_parser() -> argparse.ArgumentParser:
     def add_common(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--repo", help="GitHub repo as owner/name. Defaults to gh repo view.")
         subparser.add_argument("--base", default="main", help="PR base branch for new issue work.")
-        subparser.add_argument("--claude-dir", type=Path, default=Path.cwd())
-        subparser.add_argument("--codex-dir", type=Path, default=Path.cwd())
-        subparser.add_argument("--gemini-dir", type=Path, default=Path.cwd())
+        subparser.add_argument(
+            "--claude-dir",
+            type=Path,
+            default=None,
+            help="Claude checkout. Defaults to a repo-scoped temporary checkout when Claude is active.",
+        )
+        subparser.add_argument(
+            "--codex-dir",
+            type=Path,
+            default=None,
+            help="Codex checkout. Defaults to a repo-scoped temporary checkout when Codex is active.",
+        )
+        subparser.add_argument(
+            "--gemini-dir",
+            type=Path,
+            default=None,
+            help="Gemini checkout. Defaults to a repo-scoped temporary checkout when Gemini is active.",
+        )
         subparser.add_argument(
             "--coder",
             choices=("claude", "codex", "gemini"),

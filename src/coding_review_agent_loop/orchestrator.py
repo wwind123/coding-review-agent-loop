@@ -37,7 +37,7 @@ def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
 
 
 def run_issue_loop(runner: Runner, *, issue_number: int, config: AgentLoopConfig) -> int:
-    ensure_agent_workdirs(config)
+    ensure_agent_workdirs(config, runner)
     log(config, f"Validating issue #{issue_number}")
     validate_open_issue(runner, config=config, issue_number=issue_number)
 
@@ -61,6 +61,7 @@ def run_issue_loop(runner: Runner, *, issue_number: int, config: AgentLoopConfig
         pr_number=pr_number,
         config=config,
         coder_session_id=coder_session_id,
+        workdirs_ready=True,
     )
 
 
@@ -91,7 +92,7 @@ def run_task_loop(
     max_clarification_rounds: int = 3,
     clarification_input=None,
 ) -> int:
-    ensure_agent_workdirs(config)
+    ensure_agent_workdirs(config, runner)
     if not task_text.strip():
         raise AgentLoopError("Task text is empty; provide a non-empty description.")
     if max_clarification_rounds < 0:
@@ -125,6 +126,7 @@ def run_task_loop(
                 pr_number=pr_number,
                 config=config,
                 coder_session_id=session_id,
+                workdirs_ready=True,
             )
 
         if not is_clarification_request(coder_output):
@@ -165,8 +167,10 @@ def run_pr_loop(
     config: AgentLoopConfig,
     coder_session_id: str | None = None,
     reviewer_session_id: str | None = None,
+    workdirs_ready: bool = False,
 ) -> int:
-    ensure_agent_workdirs(config)
+    if not workdirs_ready:
+        ensure_agent_workdirs(config, runner)
     log(config, f"Validating PR #{pr_number}")
     validate_open_pr(runner, config=config, pr_number=pr_number)
     reviewer_session_ids: dict[AgentName, str | None] = {}

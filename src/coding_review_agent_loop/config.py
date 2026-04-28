@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from .agents.base import AgentName
 from .agents.registry import default_agent_args
 from .errors import AgentLoopError
 from .github import detect_repo
+from .logging import log
 from .runner import Runner
 
 
@@ -41,6 +43,7 @@ class AgentLoopConfig:
     quiet: bool
     log_dir: Path
     progress_interval_seconds: int
+    auto_agent_dirs: tuple[AgentName, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
@@ -72,6 +75,15 @@ def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
                 )
 
 
+def default_agent_workdir(repo: str, agent: AgentName) -> Path:
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise AgentLoopError("--repo must use the OWNER/REPO format.")
+    owner, name = parts
+    repo_slug = f"{owner}-{name}"
+    return Path(tempfile.gettempdir()) / "coding-review-agent-loop" / repo_slug / agent / "repo"
+
+
 def ensure_workdir(path: Path, option_name: str) -> None:
     if path.exists():
         if not path.is_dir():
@@ -83,14 +95,73 @@ def ensure_workdir(path: Path, option_name: str) -> None:
         raise AgentLoopError(f"Could not create {option_name} at {path}: {exc}") from exc
 
 
-def ensure_agent_workdirs(config: AgentLoopConfig) -> None:
+def _looks_like_repo_remote(remote_url: str, repo: str) -> bool:
+    normalized = remote_url.strip().removesuffix(".git").lower()
+    repo = repo.lower()
+    return normalized.endswith(f"/{repo}") or normalized.endswith(f":{repo}")
+
+
+def _run_git(runner: Runner, path: Path, args: tuple[str, ...], *, check: bool = True):
+    return runner.run(("git", *args), cwd=path, check=check)
+
+
+def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfig, runner: Runner) -> None:
+    if not path.exists():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise AgentLoopError(f"Could not create parent directory for {agent} checkout at {path}: {exc}") from exc
+        runner.run((config.gh_cmd, "repo", "clone", config.repo, str(path)), cwd=path.parent)
+        if runner.dry_run:
+            return
+
+    if not path.is_dir():
+        raise AgentLoopError(f"Default {agent} workdir exists but is not a directory: {path}")
+
+    git_check = _run_git(runner, path, ("rev-parse", "--is-inside-work-tree"), check=False)
+    if git_check.returncode != 0 or git_check.stdout.strip() != "true":
+        raise AgentLoopError(
+            f"Default {agent} workdir exists but is not a git checkout: {path}. "
+            "Remove it or pass an explicit agent directory."
+        )
+
+    remote = _run_git(runner, path, ("remote", "get-url", "origin")).stdout.strip()
+    if not _looks_like_repo_remote(remote, config.repo):
+        raise AgentLoopError(
+            f"Default {agent} workdir at {path} uses origin {remote!r}, not {config.repo!r}."
+        )
+
+    status = _run_git(runner, path, ("status", "--porcelain")).stdout.strip()
+    if status:
+        raise AgentLoopError(
+            f"Default {agent} workdir is dirty: {path}. "
+            "Commit, stash, or clean it before rerunning, or pass an explicit agent directory."
+        )
+
+    _run_git(runner, path, ("fetch", "origin"))
+    checkout = _run_git(runner, path, ("checkout", config.base), check=False)
+    if checkout.returncode != 0:
+        _run_git(runner, path, ("checkout", "-B", config.base, f"origin/{config.base}"))
+    _run_git(runner, path, ("pull", "--ff-only", "origin", config.base))
+
+
+def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner | None = None) -> None:
     required: set[AgentName] = {config.coder, *reviewers(config)}
-    if "claude" in required:
-        ensure_workdir(config.claude_dir, "--claude-dir")
-    if "codex" in required:
-        ensure_workdir(config.codex_dir, "--codex-dir")
-    if "gemini" in required:
-        ensure_workdir(config.gemini_dir, "--gemini-dir")
+    paths = {
+        "claude": (config.claude_dir, "--claude-dir"),
+        "codex": (config.codex_dir, "--codex-dir"),
+        "gemini": (config.gemini_dir, "--gemini-dir"),
+    }
+    auto_dirs = set(config.auto_agent_dirs)
+    for agent in required:
+        path, option = paths[agent]
+        if agent in auto_dirs:
+            if runner is None:
+                raise AgentLoopError("Internal error: runner is required for default agent checkouts.")
+            log(config, f"Using default {agent} workdir: {path}")
+            ensure_temp_checkout(path, agent=agent, config=config, runner=runner)
+        else:
+            ensure_workdir(path, option)
     ensure_distinct_workdirs(config)
 
 
@@ -101,8 +172,36 @@ def _split_command(value: str | None) -> tuple[str, ...] | None:
 
 
 def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfig:
-    codex_dir = args.codex_dir.resolve()
-    repo = args.repo or detect_repo(runner, codex_dir, args.gh_cmd)
+    configured_reviewers = tuple(args.reviewer or ["codex"])
+    if len(set(configured_reviewers)) != len(configured_reviewers):
+        raise AgentLoopError("--reviewer cannot include the same agent more than once.")
+
+    detect_dir = args.codex_dir.resolve() if args.codex_dir is not None else Path.cwd().resolve()
+    repo = args.repo or detect_repo(runner, detect_dir, args.gh_cmd)
+    auto_agent_dirs = tuple(
+        agent
+        for agent, value in (
+            ("claude", args.claude_dir),
+            ("codex", args.codex_dir),
+            ("gemini", args.gemini_dir),
+        )
+        if value is None
+    )
+    claude_dir = (
+        args.claude_dir.resolve()
+        if args.claude_dir is not None
+        else default_agent_workdir(repo, "claude").resolve()
+    )
+    codex_dir = (
+        args.codex_dir.resolve()
+        if args.codex_dir is not None
+        else default_agent_workdir(repo, "codex").resolve()
+    )
+    gemini_dir = (
+        args.gemini_dir.resolve()
+        if args.gemini_dir is not None
+        else default_agent_workdir(repo, "gemini").resolve()
+    )
     test_command = _split_command(args.test_command)
     if args.ci_timeout_seconds <= 0:
         raise AgentLoopError("--ci-timeout-seconds must be greater than zero.")
@@ -110,14 +209,11 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         raise AgentLoopError("--ci-poll-interval-seconds must be greater than zero.")
     if args.progress_interval_seconds <= 0:
         raise AgentLoopError("--progress-interval-seconds must be greater than zero.")
-    configured_reviewers = tuple(args.reviewer or ["codex"])
-    if len(set(configured_reviewers)) != len(configured_reviewers):
-        raise AgentLoopError("--reviewer cannot include the same agent more than once.")
     return AgentLoopConfig(
         repo=repo,
-        claude_dir=args.claude_dir.resolve(),
+        claude_dir=claude_dir,
         codex_dir=codex_dir,
-        gemini_dir=args.gemini_dir.resolve(),
+        gemini_dir=gemini_dir,
         coder=args.coder,
         reviewer=configured_reviewers,
         base=args.base,
@@ -151,4 +247,5 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         quiet=args.quiet,
         log_dir=(codex_dir / args.log_dir if not args.log_dir.is_absolute() else args.log_dir),
         progress_interval_seconds=args.progress_interval_seconds,
+        auto_agent_dirs=auto_agent_dirs,
     )

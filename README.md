@@ -94,21 +94,29 @@ Start from a GitHub issue when you want the agent loop to use the issue title
 and body as the implementation task:
 
 ```bash
-agent-loop issue 123 --repo OWNER/REPO --claude-dir /path/to/claude/repo --codex-dir /path/to/codex/repo
+agent-loop issue 123 --repo OWNER/REPO
 ```
 
 Provide a one-off task directly when there is no issue yet:
 
 ```bash
-agent-loop task "Add a health check endpoint" --repo OWNER/REPO --claude-dir /path/to/claude/repo --codex-dir /path/to/codex/repo
+agent-loop task "Add a health check endpoint" --repo OWNER/REPO
 ```
 
 Run the loop against an existing pull request when you want another review and
 iteration pass:
 
 ```bash
-agent-loop pr 456 --repo OWNER/REPO --claude-dir /path/to/claude/repo --codex-dir /path/to/codex/repo
+agent-loop pr 456 --repo OWNER/REPO
 ```
+
+When `--claude-dir`, `--codex-dir`, or `--gemini-dir` is omitted for an active
+agent, the tool creates or reuses a repo-scoped temporary checkout such as
+`/tmp/coding-review-agent-loop/OWNER-REPO/codex/repo`. Existing clean temp
+checkouts are fetched and fast-forwarded on the base branch before the agent
+runs; dirty temp checkouts fail clearly instead of being overwritten. Use
+explicit persistent directories for large repositories, long-lived agent
+worktrees, or setups that should survive `/tmp` cleanup or reboot.
 
 By default Claude is the coder and Codex is the reviewer. Reverse that with:
 
@@ -122,14 +130,11 @@ Use Gemini as either side of the loop:
 agent-loop task "Improve error handling" \
   --repo OWNER/REPO \
   --coder gemini \
-  --reviewer codex \
-  --gemini-dir /path/to/gemini/repo \
-  --codex-dir /path/to/codex/repo
+  --reviewer codex
 
 agent-loop pr 456 \
   --repo OWNER/REPO \
-  --reviewer gemini \
-  --gemini-dir /path/to/gemini/repo
+  --reviewer gemini
 ```
 
 Repeat `--reviewer` to require approvals from multiple reviewers. The PR is

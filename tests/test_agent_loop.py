@@ -20,6 +20,7 @@ from coding_review_agent_loop.cli import (
     run_pr_loop,
     run_task_loop,
 )
+from coding_review_agent_loop.config import default_agent_workdir
 
 
 class FakeRunner(Runner):
@@ -31,6 +32,8 @@ class FakeRunner(Runner):
         gemini_outputs=None,
         issue_payload=None,
         pr_payload=None,
+        git_status="",
+        git_remote="git@github.com:OWNER/REPO.git",
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -49,6 +52,8 @@ class FakeRunner(Runner):
         }
         self.commands = []
         self.comments = []
+        self.git_status = git_status
+        self.git_remote = git_remote
 
     def run_with_log(
         self,
@@ -119,6 +124,19 @@ class FakeRunner(Runner):
             return CommandResult(cmd, Path(cwd), "success\n", "", 0)
 
         if cmd[:1] == ["sleep"]:
+            return CommandResult(cmd, Path(cwd), "", "", 0)
+
+        if cmd[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return CommandResult(cmd, Path(cwd), "true\n", "", 0)
+
+        if cmd[:4] == ["git", "remote", "get-url", "origin"]:
+            return CommandResult(cmd, Path(cwd), f"{self.git_remote}\n", "", 0)
+
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return CommandResult(cmd, Path(cwd), self.git_status, "", 0)
+
+        if cmd[:3] == ["gh", "repo", "clone"]:
+            Path(cmd[4]).mkdir(parents=True, exist_ok=True)
             return CommandResult(cmd, Path(cwd), "", "", 0)
 
         return CommandResult(cmd, Path(cwd), "", "", 0)
@@ -506,6 +524,117 @@ def test_missing_gemini_workdir_is_created_when_configured(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert gemini_dir.is_dir()
+
+
+def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts():
+    parser = build_parser()
+    args = parser.parse_args([
+        "task",
+        "Fix the bug",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "codex",
+        "--reviewer",
+        "claude",
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.codex_dir == default_agent_workdir("OWNER/REPO", "codex").resolve()
+    assert config.claude_dir == default_agent_workdir("OWNER/REPO", "claude").resolve()
+    assert config.gemini_dir == default_agent_workdir("OWNER/REPO", "gemini").resolve()
+    assert set(config.auto_agent_dirs) == {"claude", "codex", "gemini"}
+
+
+def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):
+    parser = build_parser()
+    codex_dir = tmp_path / "codex"
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "codex",
+        "--reviewer",
+        "claude",
+        "--codex-dir",
+        str(codex_dir),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.codex_dir == codex_dir
+    assert config.claude_dir == default_agent_workdir("OWNER/REPO", "claude").resolve()
+    assert set(config.auto_agent_dirs) == {"claude", "gemini"}
+
+
+def test_auto_created_agent_dir_is_cloned_before_use(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    codex_dir = tmp_path / "tmp-root" / "owner-repo" / "codex" / "repo"
+    config = make_config(
+        tmp_path,
+        claude_dir=tmp_path / "explicit-claude",
+        codex_dir=codex_dir,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+        create_dirs=False,
+    )
+    config.claude_dir.mkdir(parents=True)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert ["gh", "repo", "clone", "OWNER/REPO", str(codex_dir)] in [
+        cmd for cmd, _cwd in runner.commands
+    ]
+    assert codex_dir.is_dir()
+
+
+def test_clean_existing_auto_agent_dir_is_synced(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path,
+        codex_dir=codex_dir,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+        create_dirs=False,
+    )
+    config.claude_dir.mkdir(parents=True)
+    config.gemini_dir.mkdir(parents=True)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert ["git", "fetch", "origin"] in commands
+    assert ["git", "checkout", "main"] in commands
+    assert ["git", "pull", "--ff-only", "origin", "main"] in commands
+
+
+def test_dirty_existing_auto_agent_dir_fails_clearly(tmp_path):
+    runner = FakeRunner(git_status=" M file.py\n")
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path,
+        codex_dir=codex_dir,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+        create_dirs=False,
+    )
+    config.claude_dir.mkdir(parents=True)
+    config.gemini_dir.mkdir(parents=True)
+
+    with pytest.raises(AgentLoopError, match="dirty"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
 
 
 def test_agent_workdir_existing_file_fails_clearly(tmp_path):
