@@ -3,34 +3,31 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .base import AgentName, AgentResult
 from ..logging import agent_log_path, log
+from ..protocol import CLARIFY_RE, STATE_RE
 from ..runner import Runner
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
 
 
-_AGENT_STATE_RE = re.compile(r"<!--\s*AGENT_STATE:\s*(?:approved|blocking)\s*-->", re.I)
-
-
 def _strip_gemini_preamble(raw: str) -> str:
     """Drop Gemini CLI diagnostics that can appear before the final response."""
-    state_matches = list(_AGENT_STATE_RE.finditer(raw))
-    if not state_matches:
+    marker_matches = [*STATE_RE.finditer(raw), *CLARIFY_RE.finditer(raw)]
+    if not marker_matches:
         return raw
 
-    public_end = state_matches[-1].start()
+    public_end = max(match.start() for match in marker_matches)
     separator = "\n---\n"
-    separator_at = raw.rfind(separator, 0, public_end)
+    separator_at = raw.find(separator, 0, public_end)
     if separator_at == -1:
         return raw
 
-    return raw[separator_at + len(separator) :].lstrip()
+    return raw[separator_at + len(separator) :].lstrip("\n")
 
 
 def _parse_gemini_output(raw: str) -> tuple[str, str | None]:
