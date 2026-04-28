@@ -99,9 +99,6 @@ class FakeRunner(Runner):
                 out_path.write_text(output, encoding="utf-8")
             return CommandResult(cmd, Path(cwd), "", "", 0)
 
-        if cmd[:1] == ["gemini"]:
-            return CommandResult(cmd, Path(cwd), self.gemini_outputs.pop(0), "", 0)
-
         if cmd[:3] == ["gh", "pr", "comment"]:
             if "--body-file" in cmd:
                 body_path = Path(cmd[cmd.index("--body-file") + 1])
@@ -191,12 +188,26 @@ def test_parse_claude_output_falls_back_on_non_string_result():
 
 
 def test_parse_gemini_output_extracts_json_response():
-    raw = json.dumps({"response": "Reviewed.\n<!-- AGENT_STATE: approved -->"})
-    assert _parse_gemini_output(raw) == "Reviewed.\n<!-- AGENT_STATE: approved -->"
+    raw = json.dumps({
+        "response": "Reviewed.\n<!-- AGENT_STATE: approved -->",
+        "session_id": "gemini-session-1",
+    })
+    text, sid = _parse_gemini_output(raw)
+    assert text == "Reviewed.\n<!-- AGENT_STATE: approved -->"
+    assert sid == "gemini-session-1"
 
 
 def test_parse_gemini_output_falls_back_on_plain_text():
-    assert _parse_gemini_output("plain response") == "plain response"
+    text, sid = _parse_gemini_output("plain response")
+    assert text == "plain response"
+    assert sid is None
+
+
+def test_parse_gemini_output_falls_back_on_non_string_response():
+    raw = json.dumps({"response": 42, "session_id": "gemini-session-1"})
+    text, sid = _parse_gemini_output(raw)
+    assert text == raw
+    assert sid == "gemini-session-1"
 
 
 def test_parse_agent_state_accepts_html_marker():
@@ -903,6 +914,35 @@ def test_gemini_issue_loop_creates_pr_then_codex_approves(tmp_path):
     assert len(runner.comments) == 2
     assert runner.comments[0].startswith("Fixed issue.")
     assert runner.comments[1].startswith("Looks good.")
+
+
+def test_gemini_issue_loop_resumes_session_for_followup(tmp_path):
+    runner = FakeRunner(
+        gemini_outputs=[
+            json.dumps({
+                "response": "Fixed issue.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
+                "session_id": "gemini-session-1",
+            }),
+            "Addressed review.\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
+        ],
+        codex_outputs=[
+            "Needs a regression test.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Looks good.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        coder="gemini",
+        reviewer="codex",
+        gemini_args=("--output-format", "json"),
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    gemini_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"]]
+    assert len(gemini_calls) == 2
+    assert "--resume" not in gemini_calls[0]
+    assert gemini_calls[1][-2:] == ["--resume", "gemini-session-1"]
 
 
 def test_gemini_review_loop_uses_prompt_and_extra_args(tmp_path):

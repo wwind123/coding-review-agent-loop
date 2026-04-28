@@ -14,17 +14,19 @@ if TYPE_CHECKING:
     from ..config import AgentLoopConfig
 
 
-def _parse_gemini_output(raw: str) -> str:
-    """Extract text from Gemini's optional --output-format json response."""
+def _parse_gemini_output(raw: str) -> tuple[str, str | None]:
+    """Extract (text, session_id) from Gemini's optional --output-format json response."""
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
             text = data.get("response", raw)
-            if isinstance(text, str):
-                return text
+            if not isinstance(text, str):
+                text = raw
+            session_id = data.get("session_id")
+            return text, session_id if isinstance(session_id, str) else None
     except (json.JSONDecodeError, ValueError):
         pass
-    return raw
+    return raw, None
 
 
 class GeminiBackend:
@@ -47,15 +49,19 @@ class GeminiBackend:
     ) -> AgentResult:
         log_path = agent_log_path(config, "gemini")
         log(config, f"Starting Gemini in {config.gemini_dir}; log: {log_path}")
+        args = [config.gemini_cmd, "--prompt", prompt, *config.gemini_args]
+        if session_id:
+            args += ["--resume", session_id]
         result = runner.run_with_log(
-            [config.gemini_cmd, "--prompt", prompt, *config.gemini_args],
+            args,
             cwd=config.gemini_dir,
             log_path=log_path,
             label="Gemini",
             progress_interval_seconds=config.progress_interval_seconds,
         )
         log(config, f"Gemini finished; log: {log_path}")
-        return AgentResult(text=_parse_gemini_output(result.stdout), session_id=session_id)
+        text, new_session_id = _parse_gemini_output(result.stdout)
+        return AgentResult(text=text, session_id=new_session_id)
 
 
 BACKEND = GeminiBackend()
