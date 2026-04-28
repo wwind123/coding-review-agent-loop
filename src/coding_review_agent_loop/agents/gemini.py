@@ -86,7 +86,7 @@ class GeminiBackend:
         return config.gemini_dir
 
     def default_args(self, *, dangerous: bool) -> tuple[str, ...]:
-        return ("--yolo",) if dangerous else ()
+        return ("--yolo", "--skip-trust") if dangerous else ()
 
     def run(
         self,

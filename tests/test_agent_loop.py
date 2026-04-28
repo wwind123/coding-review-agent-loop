@@ -890,7 +890,7 @@ def test_config_can_opt_into_dangerous_agent_permissions(tmp_path):
 
     assert config.claude_args == ("--dangerously-skip-permissions",)
     assert config.codex_args == ("--dangerously-bypass-approvals-and-sandbox",)
-    assert config.gemini_args == ("--yolo",)
+    assert config.gemini_args == ("--yolo", "--skip-trust")
 
 
 def test_explicit_agent_args_replace_dangerous_profile(tmp_path):
