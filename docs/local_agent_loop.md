@@ -25,35 +25,27 @@ Currently supported local agent CLIs:
 - `claude` is installed and authenticated if either side uses Claude.
 - `codex` is installed and authenticated if either side uses Codex.
 - `gemini` is installed and authenticated if either side uses Gemini.
-- Use separate clones or worktrees for each active agent to avoid local file conflicts. Missing `--claude-dir` / `--codex-dir` / `--gemini-dir` directories are created automatically; paths that already exist as files fail clearly.
+- Use separate clones or worktrees for each active agent to avoid local file conflicts. If you omit `--claude-dir`, `--codex-dir`, or `--gemini-dir` for an active agent, the tool uses a repo-scoped temporary checkout under `/tmp/coding-review-agent-loop/OWNER-REPO/{agent}/repo`.
 
 ## Usage
 
 Fix a GitHub issue:
 
 ```bash
-agent-loop issue 56 \
-  --repo OWNER/REPO \
-  --claude-dir /path/to/claude/worktree \
-  --codex-dir /path/to/codex/worktree
+agent-loop issue 56 --repo OWNER/REPO
 ```
 
 Implement a free-form task:
 
 ```bash
 agent-loop task "Add a /healthz endpoint that returns 200 OK." \
-  --repo OWNER/REPO \
-  --claude-dir /path/to/claude/worktree \
-  --codex-dir /path/to/codex/worktree
+  --repo OWNER/REPO
 ```
 
 Review an existing PR:
 
 ```bash
-agent-loop pr 123 \
-  --repo OWNER/REPO \
-  --claude-dir /path/to/claude/worktree \
-  --codex-dir /path/to/codex/worktree
+agent-loop pr 123 --repo OWNER/REPO
 ```
 
 Reverse the direction so Codex creates/fixes and Claude reviews:
@@ -62,9 +54,7 @@ Reverse the direction so Codex creates/fixes and Claude reviews:
 agent-loop task "Refactor the cache layer" \
   --repo OWNER/REPO \
   --coder codex \
-  --reviewer claude \
-  --claude-dir /path/to/claude/worktree \
-  --codex-dir /path/to/codex/worktree
+  --reviewer claude
 ```
 
 Use Gemini as the coder. Gemini is invoked in headless mode with `gemini --prompt`:
@@ -73,9 +63,7 @@ Use Gemini as the coder. Gemini is invoked in headless mode with `gemini --promp
 agent-loop task "Improve validation errors" \
   --repo OWNER/REPO \
   --coder gemini \
-  --reviewer codex \
-  --gemini-dir /path/to/gemini/worktree \
-  --codex-dir /path/to/codex/worktree
+  --reviewer codex
 ```
 
 Use Gemini as one reviewer:
@@ -84,9 +72,7 @@ Use Gemini as one reviewer:
 agent-loop pr 123 \
   --repo OWNER/REPO \
   --reviewer codex \
-  --reviewer gemini \
-  --codex-dir /path/to/codex/worktree \
-  --gemini-dir /path/to/gemini/worktree
+  --reviewer gemini
 ```
 
 Require both reviewers to approve. The coder may also be listed as a reviewer
@@ -96,10 +82,34 @@ when you want the same agent to work in separate coding and review passes:
 agent-loop pr 123 \
   --repo OWNER/REPO \
   --reviewer codex \
-  --reviewer claude \
-  --claude-dir /path/to/claude/worktree \
-  --codex-dir /path/to/codex/worktree
+  --reviewer claude
 ```
+
+## Workdirs
+
+Explicit `--claude-dir`, `--codex-dir`, and `--gemini-dir` values are used
+exactly as provided. Missing explicit directories are still created for
+backwards compatibility.
+
+When an active agent directory is omitted, the default checkout path is scoped
+by repo and agent:
+
+```text
+/tmp/coding-review-agent-loop/OWNER-REPO/claude/repo
+/tmp/coding-review-agent-loop/OWNER-REPO/codex/repo
+/tmp/coding-review-agent-loop/OWNER-REPO/gemini/repo
+```
+
+The tool prints the selected default workdirs. If a default checkout does not
+exist, it runs `gh repo clone OWNER/REPO <path>`. If it already exists and is a
+clean checkout for the requested repo, it fetches origin and fast-forwards the
+configured base branch. If the checkout is dirty, points at another repo, or is
+not a git checkout, the command fails clearly instead of overwriting local
+work.
+
+These temporary checkouts may disappear after reboot or `/tmp` cleanup. Large
+projects and long-lived agent setups should use explicit persistent workdirs to
+avoid repeated clone, dependency setup, and indexing costs.
 
 ## Real Example
 

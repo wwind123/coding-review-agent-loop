@@ -15,8 +15,39 @@ if TYPE_CHECKING:
     from ..config import AgentLoopConfig
 
 
+PUBLIC_RESPONSE_MARKER = "=== AGENT_LOOP_PUBLIC_RESPONSE_BELOW ==="
+
+
+def _with_public_response_marker_instruction(prompt: str) -> str:
+    return f"""{prompt}
+
+IMPORTANT FOR GEMINI CLI OUTPUT FILTERING:
+
+Gemini CLI may print tool-use narration, diagnostics, or internal status text
+before your final answer.
+
+When you are ready to provide the response that should be posted publicly to
+GitHub, print this exact line immediately before it:
+
+{PUBLIC_RESPONSE_MARKER}
+
+Only content after that line will be posted to GitHub. Do not print the marker
+until you are done with all internal reasoning, tool use, and review work.
+"""
+
+
+def _strip_public_response_marker(raw: str) -> str:
+    if PUBLIC_RESPONSE_MARKER not in raw:
+        return raw
+    return raw.rsplit(PUBLIC_RESPONSE_MARKER, 1)[1].lstrip("\n")
+
+
 def _strip_gemini_preamble(raw: str) -> str:
     """Drop Gemini CLI diagnostics that can appear before the final response."""
+    marker_stripped = _strip_public_response_marker(raw)
+    if marker_stripped != raw:
+        return marker_stripped
+
     marker_matches = [*STATE_RE.finditer(raw), *CLARIFY_RE.finditer(raw)]
     if not marker_matches:
         return raw
@@ -39,7 +70,7 @@ def _parse_gemini_output(raw: str) -> tuple[str, str | None]:
             if not isinstance(text, str):
                 text = raw
             session_id = data.get("session_id")
-            return text, session_id if isinstance(session_id, str) else None
+            return _strip_gemini_preamble(text), session_id if isinstance(session_id, str) else None
     except (json.JSONDecodeError, ValueError):
         pass
     return _strip_gemini_preamble(raw), None
@@ -66,7 +97,12 @@ class GeminiBackend:
     ) -> AgentResult:
         log_path = agent_log_path(config, "gemini")
         log(config, f"Starting Gemini in {config.gemini_dir}; log: {log_path}")
-        args = [config.gemini_cmd, "--prompt", prompt, *config.gemini_args]
+        args = [
+            config.gemini_cmd,
+            "--prompt",
+            _with_public_response_marker_instruction(prompt),
+            *config.gemini_args,
+        ]
         if session_id:
             args += ["--resume", session_id]
         result = runner.run_with_log(

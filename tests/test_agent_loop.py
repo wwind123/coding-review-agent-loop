@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from coding_review_agent_loop.agents.claude import _parse_claude_output
-from coding_review_agent_loop.agents.gemini import _parse_gemini_output
+from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER, _parse_gemini_output
 from coding_review_agent_loop.cli import (
     AgentLoopConfig,
     AgentLoopError,
@@ -20,6 +20,7 @@ from coding_review_agent_loop.cli import (
     run_pr_loop,
     run_task_loop,
 )
+from coding_review_agent_loop.config import default_agent_workdir
 
 
 class FakeRunner(Runner):
@@ -31,6 +32,8 @@ class FakeRunner(Runner):
         gemini_outputs=None,
         issue_payload=None,
         pr_payload=None,
+        git_status="",
+        git_remote="git@github.com:OWNER/REPO.git",
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -49,6 +52,16 @@ class FakeRunner(Runner):
         }
         self.commands = []
         self.comments = []
+        self.git_status = git_status
+        self.git_remote = git_remote
+
+    def _record_command(self, args, cwd):
+        cmd = [str(arg) for arg in args]
+        cwd_path = Path(cwd)
+        if not cwd_path.is_dir():
+            raise FileNotFoundError(cwd_path)
+        self.commands.append((cmd, cwd_path))
+        return cmd, cwd_path
 
     def run_with_log(
         self,
@@ -60,15 +73,14 @@ class FakeRunner(Runner):
         progress_interval_seconds,
         check=True,
     ):
-        cmd = [str(arg) for arg in args]
-        self.commands.append((cmd, Path(cwd)))
+        cmd, cwd_path = self._record_command(args, cwd)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         ensure_log_dir_ignored(log_path.parent)
 
         if cmd[:1] == ["claude"]:
             output = self.claude_outputs.pop(0)
             log_path.write_text(f"$ {' '.join(cmd)}\n\n{output}", encoding="utf-8")
-            return CommandResult(cmd, Path(cwd), output, "", 0)
+            return CommandResult(cmd, cwd_path, output, "", 0)
 
         if cmd[:2] == ["codex", "exec"]:
             output = self.codex_outputs.pop(0)
@@ -76,28 +88,27 @@ class FakeRunner(Runner):
                 out_path = Path(cmd[cmd.index("--output-last-message") + 1])
                 out_path.write_text(output, encoding="utf-8")
             log_path.write_text(f"$ {' '.join(cmd)}\n\ncodex completed", encoding="utf-8")
-            return CommandResult(cmd, Path(cwd), "codex completed", "", 0)
+            return CommandResult(cmd, cwd_path, "codex completed", "", 0)
 
         if cmd[:1] == ["gemini"]:
             output = self.gemini_outputs.pop(0)
             log_path.write_text(f"$ {' '.join(cmd)}\n\n{output}", encoding="utf-8")
-            return CommandResult(cmd, Path(cwd), output, "", 0)
+            return CommandResult(cmd, cwd_path, output, "", 0)
 
         return self.run(args, cwd=cwd, check=check)
 
     def run(self, args, *, cwd, input_text=None, check=True):
-        cmd = [str(arg) for arg in args]
-        self.commands.append((cmd, Path(cwd)))
+        cmd, cwd_path = self._record_command(args, cwd)
 
         if cmd[:1] == ["claude"]:
-            return CommandResult(cmd, Path(cwd), self.claude_outputs.pop(0), "", 0)
+            return CommandResult(cmd, cwd_path, self.claude_outputs.pop(0), "", 0)
 
         if cmd[:2] == ["codex", "exec"]:
             output = self.codex_outputs.pop(0)
             if "--output-last-message" in cmd:
                 out_path = Path(cmd[cmd.index("--output-last-message") + 1])
                 out_path.write_text(output, encoding="utf-8")
-            return CommandResult(cmd, Path(cwd), "", "", 0)
+            return CommandResult(cmd, cwd_path, "", "", 0)
 
         if cmd[:3] == ["gh", "pr", "comment"]:
             if "--body-file" in cmd:
@@ -105,23 +116,36 @@ class FakeRunner(Runner):
                 self.comments.append(body_path.read_text(encoding="utf-8"))
             elif "--body" in cmd:
                 self.comments.append(cmd[cmd.index("--body") + 1])
-            return CommandResult(cmd, Path(cwd), "", "", 0)
+            return CommandResult(cmd, cwd_path, "", "", 0)
 
         if cmd[:3] == ["gh", "pr", "view"]:
             if "--jq" in cmd and ".headRefOid" in cmd:
-                return CommandResult(cmd, Path(cwd), "abc123\n", "", 0)
-            return CommandResult(cmd, Path(cwd), json_dumps(self.pr_payload), "", 0)
+                return CommandResult(cmd, cwd_path, "abc123\n", "", 0)
+            return CommandResult(cmd, cwd_path, json_dumps(self.pr_payload), "", 0)
 
         if cmd[:2] == ["gh", "api"] and "/issues/" in cmd[2]:
-            return CommandResult(cmd, Path(cwd), json_dumps(self.issue_payload), "", 0)
+            return CommandResult(cmd, cwd_path, json_dumps(self.issue_payload), "", 0)
 
         if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/check-runs"):
-            return CommandResult(cmd, Path(cwd), "success\n", "", 0)
+            return CommandResult(cmd, cwd_path, "success\n", "", 0)
 
         if cmd[:1] == ["sleep"]:
-            return CommandResult(cmd, Path(cwd), "", "", 0)
+            return CommandResult(cmd, cwd_path, "", "", 0)
 
-        return CommandResult(cmd, Path(cwd), "", "", 0)
+        if cmd[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return CommandResult(cmd, cwd_path, "true\n", "", 0)
+
+        if cmd[:4] == ["git", "remote", "get-url", "origin"]:
+            return CommandResult(cmd, cwd_path, f"{self.git_remote}\n", "", 0)
+
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return CommandResult(cmd, cwd_path, self.git_status, "", 0)
+
+        if cmd[:3] == ["gh", "repo", "clone"]:
+            Path(cmd[4]).mkdir(parents=True, exist_ok=True)
+            return CommandResult(cmd, cwd_path, "", "", 0)
+
+        return CommandResult(cmd, cwd_path, "", "", 0)
 
 
 def json_dumps(value):
@@ -207,6 +231,52 @@ def test_parse_gemini_output_falls_back_on_non_string_response():
     raw = json.dumps({"response": 42, "session_id": "gemini-session-1"})
     text, sid = _parse_gemini_output(raw)
     assert text == raw
+    assert sid == "gemini-session-1"
+
+
+def test_parse_gemini_output_prefers_public_response_marker():
+    raw = f"""Warning: True color (24-bit) support not detected.
+YOLO mode is enabled. All tool calls will be automatically approved.
+I will inspect the PR before giving the final answer.
+Error executing tool read_file: Path not in workspace.
+{PUBLIC_RESPONSE_MARKER}
+## Review
+
+No blocking findings.
+
+<!-- AGENT_STATE: approved -->
+
+-- Google Gemini
+"""
+    text, sid = _parse_gemini_output(raw)
+    assert text.startswith("## Review")
+    assert "True color" not in text
+    assert "YOLO mode" not in text
+    assert "I will inspect" not in text
+    assert "Error executing tool" not in text
+    assert "<!-- AGENT_STATE: approved -->" in text
+    assert sid is None
+
+
+def test_parse_gemini_output_uses_last_public_response_marker():
+    raw = f"""Gemini may mention {PUBLIC_RESPONSE_MARKER} while planning.
+{PUBLIC_RESPONSE_MARKER}
+intermediate draft
+{PUBLIC_RESPONSE_MARKER}
+Final answer.
+<!-- AGENT_STATE: approved -->
+"""
+    text, _sid = _parse_gemini_output(raw)
+    assert text == "Final answer.\n<!-- AGENT_STATE: approved -->\n"
+
+
+def test_parse_gemini_json_response_strips_public_response_marker():
+    raw = json.dumps({
+        "response": f"diagnostic\n{PUBLIC_RESPONSE_MARKER}\nReviewed.\n<!-- AGENT_STATE: approved -->",
+        "session_id": "gemini-session-1",
+    })
+    text, sid = _parse_gemini_output(raw)
+    assert text == "Reviewed.\n<!-- AGENT_STATE: approved -->"
     assert sid == "gemini-session-1"
 
 
@@ -506,6 +576,166 @@ def test_missing_gemini_workdir_is_created_when_configured(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert gemini_dir.is_dir()
+
+
+def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path):
+    runner = FakeRunner(
+        gemini_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"],
+    )
+    codex_dir = tmp_path / "inactive" / "codex"
+    config = make_config(
+        tmp_path,
+        claude_dir=tmp_path / "missing" / "claude",
+        codex_dir=codex_dir,
+        gemini_dir=tmp_path / "missing" / "gemini",
+        coder="claude",
+        reviewer="gemini",
+        test_command=("pytest", "tests/test_agent_loop.py"),
+        create_dirs=False,
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not codex_dir.exists()
+    github_or_test_cwds = [
+        cwd
+        for cmd, cwd in runner.commands
+        if cmd[:1] == ["gh"] or cmd == ["pytest", "tests/test_agent_loop.py"]
+    ]
+    assert github_or_test_cwds
+    assert set(github_or_test_cwds) == {config.claude_dir}
+
+
+def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts():
+    parser = build_parser()
+    args = parser.parse_args([
+        "task",
+        "Fix the bug",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "codex",
+        "--reviewer",
+        "claude",
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.codex_dir == default_agent_workdir("OWNER/REPO", "codex").resolve()
+    assert config.claude_dir == default_agent_workdir("OWNER/REPO", "claude").resolve()
+    assert config.gemini_dir == default_agent_workdir("OWNER/REPO", "gemini").resolve()
+    assert set(config.auto_agent_dirs) == {"claude", "codex", "gemini"}
+
+
+def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):
+    parser = build_parser()
+    codex_dir = tmp_path / "codex"
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "codex",
+        "--reviewer",
+        "claude",
+        "--codex-dir",
+        str(codex_dir),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.codex_dir == codex_dir
+    assert config.claude_dir == default_agent_workdir("OWNER/REPO", "claude").resolve()
+    assert set(config.auto_agent_dirs) == {"claude", "gemini"}
+
+
+def test_relative_log_dir_defaults_under_active_coder_workdir(tmp_path):
+    parser = build_parser()
+    claude_dir = tmp_path / "claude"
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "claude",
+        "--reviewer",
+        "gemini",
+        "--claude-dir",
+        str(claude_dir),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.log_dir == claude_dir / ".agent-loop-logs"
+
+
+def test_auto_created_agent_dir_is_cloned_before_use(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    codex_dir = tmp_path / "tmp-root" / "owner-repo" / "codex" / "repo"
+    config = make_config(
+        tmp_path,
+        claude_dir=tmp_path / "explicit-claude",
+        codex_dir=codex_dir,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+        create_dirs=False,
+    )
+    config.claude_dir.mkdir(parents=True)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert ["gh", "repo", "clone", "OWNER/REPO", str(codex_dir)] in [
+        cmd for cmd, _cwd in runner.commands
+    ]
+    assert codex_dir.is_dir()
+
+
+def test_clean_existing_auto_agent_dir_is_synced(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path,
+        codex_dir=codex_dir,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+        create_dirs=False,
+    )
+    config.claude_dir.mkdir(parents=True)
+    config.gemini_dir.mkdir(parents=True)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert ["git", "fetch", "origin"] in commands
+    assert ["git", "checkout", "main"] in commands
+    assert ["git", "pull", "--ff-only", "origin", "main"] in commands
+
+
+def test_dirty_existing_auto_agent_dir_fails_clearly(tmp_path):
+    runner = FakeRunner(git_status=" M file.py\n")
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path,
+        codex_dir=codex_dir,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+        create_dirs=False,
+    )
+    config.claude_dir.mkdir(parents=True)
+    config.gemini_dir.mkdir(parents=True)
+
+    with pytest.raises(AgentLoopError, match="dirty"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
 
 
 def test_agent_workdir_existing_file_fails_clearly(tmp_path):
@@ -1034,6 +1264,8 @@ def test_gemini_review_loop_uses_prompt_and_extra_args(tmp_path):
 
     gemini_call = next(cmd for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"])
     assert gemini_call[:2] == ["gemini", "--prompt"]
+    assert PUBLIC_RESPONSE_MARKER in gemini_call[2]
+    assert "Only content after that line will be posted to GitHub" in gemini_call[2]
     assert "--output-format" in gemini_call
     assert "--model" in gemini_call
     assert runner.comments == ["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"]
