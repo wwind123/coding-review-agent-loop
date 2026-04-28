@@ -76,7 +76,6 @@ def _parse_gemini_output(raw: str) -> tuple[str, str | None]:
     return _strip_gemini_preamble(raw), None
 
 
-
 class GeminiBackend:
     name: AgentName = "gemini"
     display_name = "Gemini"

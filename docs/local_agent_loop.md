@@ -284,7 +284,7 @@ Agent responses are parsed using HTML comment markers:
 <!-- AGENT_CLARIFY -->
 ```
 
-`AGENT_PR` is required after a coder creates a PR. Review/fix responses must include exactly one `AGENT_STATE` marker. If a response quotes older markers, the final marker is treated as authoritative.
+`AGENT_PR` is required after a coder creates a PR. Review/fix responses must include a final `AGENT_STATE` marker. If a response quotes older markers, the final marker is treated as authoritative.
 
 ## Logs
 
