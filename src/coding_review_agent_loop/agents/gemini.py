@@ -8,10 +8,26 @@ from typing import TYPE_CHECKING
 
 from .base import AgentName, AgentResult
 from ..logging import agent_log_path, log
+from ..protocol import CLARIFY_RE, STATE_RE
 from ..runner import Runner
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
+
+
+def _strip_gemini_preamble(raw: str) -> str:
+    """Drop Gemini CLI diagnostics that can appear before the final response."""
+    marker_matches = [*STATE_RE.finditer(raw), *CLARIFY_RE.finditer(raw)]
+    if not marker_matches:
+        return raw
+
+    public_end = max(match.start() for match in marker_matches)
+    separator = "\n---\n"
+    separator_at = raw.find(separator, 0, public_end)
+    if separator_at == -1:
+        return raw
+
+    return raw[separator_at + len(separator) :].lstrip("\n")
 
 
 def _parse_gemini_output(raw: str) -> tuple[str, str | None]:
@@ -26,7 +42,8 @@ def _parse_gemini_output(raw: str) -> tuple[str, str | None]:
             return text, session_id if isinstance(session_id, str) else None
     except (json.JSONDecodeError, ValueError):
         pass
-    return raw, None
+    return _strip_gemini_preamble(raw), None
+
 
 
 class GeminiBackend:
