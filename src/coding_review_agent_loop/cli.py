@@ -14,6 +14,7 @@ from .agents.registry import (
     run_agent,
     run_claude,
     run_codex,
+    run_gemini,
 )
 from .config import (
     AgentLoopConfig,
@@ -64,15 +65,16 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--base", default="main", help="PR base branch for new issue work.")
         subparser.add_argument("--claude-dir", type=Path, default=Path.cwd())
         subparser.add_argument("--codex-dir", type=Path, default=Path.cwd())
+        subparser.add_argument("--gemini-dir", type=Path, default=Path.cwd())
         subparser.add_argument(
             "--coder",
-            choices=("claude", "codex"),
+            choices=("claude", "codex", "gemini"),
             default="claude",
             help="Agent that creates and fixes the PR (default: claude).",
         )
         subparser.add_argument(
             "--reviewer",
-            choices=("claude", "codex"),
+            choices=("claude", "codex", "gemini"),
             action="append",
             default=None,
             help=(
@@ -86,14 +88,16 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--dry-run", action="store_true")
         subparser.add_argument("--claude-cmd", default="claude")
         subparser.add_argument("--codex-cmd", default="codex")
+        subparser.add_argument("--gemini-cmd", default="gemini")
         subparser.add_argument("--gh-cmd", default="gh")
         subparser.add_argument(
             "--dangerous-agent-permissions",
             action="store_true",
             help=(
-                "Use permission-bypass defaults for both agents. Only use in trusted "
+                "Use permission-bypass defaults for configured agents. Only use in trusted "
                 "local repositories: Claude gets --dangerously-skip-permissions and "
-                "Codex gets --dangerously-bypass-approvals-and-sandbox."
+                "Codex gets --dangerously-bypass-approvals-and-sandbox, and Gemini "
+                "gets --yolo."
             ),
         )
         subparser.add_argument(
@@ -112,6 +116,15 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "Extra argument passed to codex exec (repeat for multiple). "
                 "Providing any --codex-arg replaces the default entirely."
+            ),
+        )
+        subparser.add_argument(
+            "--gemini-arg",
+            action="append",
+            default=None,
+            help=(
+                "Extra argument passed to gemini (repeat for multiple). "
+                "Providing any --gemini-arg replaces the default entirely."
             ),
         )
         subparser.add_argument(
@@ -144,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--log-dir",
             type=Path,
             default=Path(".agent-loop-logs"),
-            help="Directory for Claude/Codex subprocess logs (default: .agent-loop-logs).",
+            help="Directory for agent subprocess logs (default: .agent-loop-logs).",
         )
         subparser.add_argument(
             "--progress-interval-seconds",

@@ -2,21 +2,21 @@
 
 Local command-line orchestration for a coding PR review loop.
 
-Run a local Claude/Codex PR review loop using your existing CLI subscriptions,
+Run a local Claude/Codex/Gemini PR review loop using your existing CLI subscriptions,
 without paying separate model API costs.
 
 The main advantage is cost and account reuse: the tool shells out to your
-already-authenticated local CLIs (`claude`, `codex`, and `gh`) instead of
-calling model APIs directly. If your local agent CLIs are backed by existing AI
-subscriptions or authenticated developer accounts, the review loop can use
-those existing entitlements rather than requiring separate Claude/OpenAI API
+already-authenticated local CLIs (`claude`, `codex`, `gemini`, and `gh`) instead
+of calling model APIs directly. If your local agent CLIs are backed by existing
+AI subscriptions or authenticated developer accounts, the review loop can use
+those existing entitlements rather than requiring separate model API
 keys and per-token API billing.
 
 ## Who This Is For
 
-This is for developers who already use Claude Code, OpenAI Codex CLI, and
-GitHub, and want one local agent to implement or fix a PR while another local
-agent reviews it before merge.
+This is for developers who already use Claude Code, OpenAI Codex CLI, Gemini
+CLI, and GitHub, and want one local agent to implement or fix a PR while
+another local agent reviews it before merge.
 
 It is especially useful when you are already doing this manually by switching
 between agent CLIs and copying review feedback back and forth.
@@ -51,10 +51,7 @@ Currently supported local agent CLIs:
 
 - Claude Code via `claude`
 - OpenAI Codex CLI via `codex`
-
-Gemini CLI support is planned. The architecture is intended to support
-additional local agent CLIs over time while keeping the same local,
-subscription-friendly workflow.
+- Gemini CLI via `gemini`
 
 ## Install / Use
 
@@ -75,8 +72,8 @@ agent-loop --help
 ```
 
 This installs the `agent-loop` command from your checkout. The tool still
-requires local `gh`, `claude`, and/or `codex` authentication depending on which
-agents you use.
+requires local `gh`, `claude`, `codex`, and/or `gemini` authentication depending
+on which agents you use.
 
 ## Develop This Tool
 
@@ -117,6 +114,22 @@ By default Claude is the coder and Codex is the reviewer. Reverse that with:
 
 ```bash
 agent-loop task "Fix the flaky test" --repo OWNER/REPO --coder codex --reviewer claude
+```
+
+Use Gemini as either side of the loop:
+
+```bash
+agent-loop task "Improve error handling" \
+  --repo OWNER/REPO \
+  --coder gemini \
+  --reviewer codex \
+  --gemini-dir /path/to/gemini/repo \
+  --codex-dir /path/to/codex/repo
+
+agent-loop pr 456 \
+  --repo OWNER/REPO \
+  --reviewer gemini \
+  --gemini-dir /path/to/gemini/repo
 ```
 
 Repeat `--reviewer` to require approvals from multiple reviewers. The PR is
@@ -160,4 +173,4 @@ See [docs/local_agent_loop.md](docs/local_agent_loop.md) for full usage and safe
 python -m pytest
 ```
 
-Tests use fake subprocess runners. They do not call real `claude`, `codex`, or `gh`.
+Tests use fake subprocess runners. They do not call real `claude`, `codex`, `gemini`, or `gh`.

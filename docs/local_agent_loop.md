@@ -1,6 +1,6 @@
 # Local Coding Review Agent Loop
 
-`coding-review-agent-loop` is a local CLI that orchestrates coding agents through a GitHub pull request review loop. Its main advantage is cost and account reuse: it shells out to locally authenticated `claude`, `codex`, and `gh` CLIs instead of calling model APIs directly. If your local agent CLIs are backed by existing AI subscriptions or authenticated developer accounts, the review loop can use those existing entitlements rather than requiring separate Claude/OpenAI API keys and per-token API billing.
+`coding-review-agent-loop` is a local CLI that orchestrates coding agents through a GitHub pull request review loop. Its main advantage is cost and account reuse: it shells out to locally authenticated `claude`, `codex`, `gemini`, and `gh` CLIs instead of calling model APIs directly. If your local agent CLIs are backed by existing AI subscriptions or authenticated developer accounts, the review loop can use those existing entitlements rather than requiring separate model API keys and per-token API billing.
 
 The default flow is:
 
@@ -9,7 +9,7 @@ The default flow is:
 3. If any reviewer finds blockers, the coder fixes the PR.
 4. The loop repeats until every reviewer approves in the same round or `--max-rounds` is reached.
 
-The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`. Repeat `--reviewer` to require multiple reviewer approvals.
+The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
 ## Agent Backends
 
@@ -17,17 +17,15 @@ Currently supported local agent CLIs:
 
 - Claude Code via `claude`
 - OpenAI Codex CLI via `codex`
-
-Gemini CLI support is planned. The architecture is intended to support
-additional local agent CLIs over time while keeping the same local,
-subscription-friendly workflow.
+- Gemini CLI via `gemini`
 
 ## Prerequisites
 
 - `gh` is installed and authenticated for the target GitHub repository.
 - `claude` is installed and authenticated if either side uses Claude.
 - `codex` is installed and authenticated if either side uses Codex.
-- Use separate clones or worktrees for Claude and Codex to avoid local file conflicts. Missing `--claude-dir` / `--codex-dir` directories are created automatically; paths that already exist as files fail clearly.
+- `gemini` is installed and authenticated if either side uses Gemini.
+- Use separate clones or worktrees for each active agent to avoid local file conflicts. Missing `--claude-dir` / `--codex-dir` / `--gemini-dir` directories are created automatically; paths that already exist as files fail clearly.
 
 ## Usage
 
@@ -67,6 +65,28 @@ agent-loop task "Refactor the cache layer" \
   --reviewer claude \
   --claude-dir /path/to/claude/worktree \
   --codex-dir /path/to/codex/worktree
+```
+
+Use Gemini as the coder. Gemini is invoked in headless mode with `gemini --prompt`:
+
+```bash
+agent-loop task "Improve validation errors" \
+  --repo OWNER/REPO \
+  --coder gemini \
+  --reviewer codex \
+  --gemini-dir /path/to/gemini/worktree \
+  --codex-dir /path/to/codex/worktree
+```
+
+Use Gemini as one reviewer:
+
+```bash
+agent-loop pr 123 \
+  --repo OWNER/REPO \
+  --reviewer codex \
+  --reviewer gemini \
+  --codex-dir /path/to/codex/worktree \
+  --gemini-dir /path/to/gemini/worktree
 ```
 
 Require both reviewers to approve. The coder may also be listed as a reviewer
@@ -152,6 +172,7 @@ This applies:
 |-------|------|
 | `claude` | `--dangerously-skip-permissions` |
 | `codex exec` | `--dangerously-bypass-approvals-and-sandbox` |
+| `gemini` | `--yolo` |
 
 You can also provide exact per-agent replacements. Repeat once per token:
 
@@ -159,10 +180,11 @@ You can also provide exact per-agent replacements. Repeat once per token:
 agent-loop issue 56 \
   --repo OWNER/REPO \
   --claude-arg=--permission-mode --claude-arg=acceptEdits \
-  --codex-arg=--sandbox --codex-arg=workspace-write --codex-arg=--ask-for-approval --codex-arg=never
+  --codex-arg=--sandbox --codex-arg=workspace-write --codex-arg=--ask-for-approval --codex-arg=never \
+  --gemini-arg=--approval-mode --gemini-arg=auto_edit
 ```
 
-Providing any `--claude-arg` or `--codex-arg` replaces that agent's default entirely.
+Providing any `--claude-arg`, `--codex-arg`, or `--gemini-arg` replaces that agent's default entirely. Gemini's text output is used directly. If you pass `--gemini-arg=--output-format --gemini-arg=json`, the loop extracts the JSON `response` field before parsing markers.
 
 ## Protocol
 

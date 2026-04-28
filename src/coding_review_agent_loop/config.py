@@ -19,6 +19,7 @@ class AgentLoopConfig:
     repo: str
     claude_dir: Path
     codex_dir: Path
+    gemini_dir: Path
     coder: AgentName
     reviewer: AgentName | tuple[AgentName, ...]
     base: str
@@ -28,9 +29,11 @@ class AgentLoopConfig:
     allow_shared_dir: bool
     claude_cmd: str
     codex_cmd: str
+    gemini_cmd: str
     gh_cmd: str
     claude_args: tuple[str, ...]
     codex_args: tuple[str, ...]
+    gemini_args: tuple[str, ...]
     test_command: tuple[str, ...] | None
     ci_check_name: str
     ci_timeout_seconds: int
@@ -53,11 +56,20 @@ def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
 def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
     if config.allow_shared_dir:
         return
-    if config.claude_dir.resolve() == config.codex_dir.resolve():
-        raise AgentLoopError(
-            "--claude-dir and --codex-dir point to the same directory. "
-            "Use separate clones/worktrees, or pass --allow-shared-dir explicitly."
-        )
+    required: set[AgentName] = {config.coder, *reviewers(config)}
+    paths = {
+        "claude": (config.claude_dir, "--claude-dir"),
+        "codex": (config.codex_dir, "--codex-dir"),
+        "gemini": (config.gemini_dir, "--gemini-dir"),
+    }
+    active = [(agent, *paths[agent]) for agent in required]
+    for index, (_left_agent, left_path, left_option) in enumerate(active):
+        for _right_agent, right_path, right_option in active[index + 1 :]:
+            if left_path.resolve() == right_path.resolve():
+                raise AgentLoopError(
+                    f"{left_option} and {right_option} point to the same directory. "
+                    "Use separate clones/worktrees, or pass --allow-shared-dir explicitly."
+                )
 
 
 def ensure_workdir(path: Path, option_name: str) -> None:
@@ -77,6 +89,8 @@ def ensure_agent_workdirs(config: AgentLoopConfig) -> None:
         ensure_workdir(config.claude_dir, "--claude-dir")
     if "codex" in required:
         ensure_workdir(config.codex_dir, "--codex-dir")
+    if "gemini" in required:
+        ensure_workdir(config.gemini_dir, "--gemini-dir")
     ensure_distinct_workdirs(config)
 
 
@@ -103,6 +117,7 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         repo=repo,
         claude_dir=args.claude_dir.resolve(),
         codex_dir=codex_dir,
+        gemini_dir=args.gemini_dir.resolve(),
         coder=args.coder,
         reviewer=configured_reviewers,
         base=args.base,
@@ -112,6 +127,7 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         allow_shared_dir=args.allow_shared_dir,
         claude_cmd=args.claude_cmd,
         codex_cmd=args.codex_cmd,
+        gemini_cmd=args.gemini_cmd,
         gh_cmd=args.gh_cmd,
         claude_args=tuple(
             args.claude_arg
@@ -122,6 +138,11 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
             args.codex_arg
             if args.codex_arg is not None
             else default_agent_args("codex", dangerous=args.dangerous_agent_permissions)
+        ),
+        gemini_args=tuple(
+            args.gemini_arg
+            if args.gemini_arg is not None
+            else default_agent_args("gemini", dangerous=args.dangerous_agent_permissions)
         ),
         test_command=test_command,
         ci_check_name=args.ci_check_name,

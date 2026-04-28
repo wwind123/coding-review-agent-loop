@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "coding-review-agent-loop"
 version = "0.1.0"
-description = "Local Claude/Codex coding PR review loop orchestrator"
+description = "Local Claude/Codex/Gemini coding PR review loop orchestrator"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Wild Wind" }]
-keywords = ["agents", "codex", "claude", "github", "code-review"]
+keywords = ["agents", "codex", "claude", "gemini", "github", "code-review"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
