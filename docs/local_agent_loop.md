@@ -259,7 +259,7 @@ This applies:
 |-------|------|
 | `claude` | `--dangerously-skip-permissions` |
 | `codex exec` | `--dangerously-bypass-approvals-and-sandbox` |
-| `gemini` | `--yolo` |
+| `gemini` | `--yolo --skip-trust` |
 
 You can also provide exact per-agent replacements. Repeat once per token:
 

@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "Use permission-bypass defaults for configured agents. Only use in trusted "
                 "local repositories: Claude gets --dangerously-skip-permissions and "
                 "Codex gets --dangerously-bypass-approvals-and-sandbox, and Gemini "
-                "gets --yolo."
+                "gets --yolo and --skip-trust."
             ),
         )
         subparser.add_argument(
