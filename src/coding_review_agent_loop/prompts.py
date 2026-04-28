@@ -1,0 +1,166 @@
+"""Prompt builders for coder and reviewer agent turns."""
+
+from __future__ import annotations
+
+from typing import Sequence
+
+from .agents.base import AgentName
+from .agents.registry import agent_display_name, agent_signature
+from .config import AgentLoopConfig, reviewers
+
+
+def format_agent_list(agents: Sequence[AgentName]) -> str:
+    names = [agent_display_name(agent) for agent in agents]
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{', '.join(names[:-1])}, and {names[-1]}"
+
+
+def build_issue_prompt(issue_number: int, config: AgentLoopConfig) -> str:
+    reviewer_name = format_agent_list(reviewers(config))
+    coder_signature = agent_signature(config.coder)
+    return f"""Fix GitHub issue #{issue_number} in {config.repo}.
+
+Use this local checkout as your workspace. Create a branch, implement the fix,
+run relevant tests, commit, push, and open a pull request against {config.base}.
+
+Do not wait for {reviewer_name} yourself; this local orchestrator will run {reviewer_name} after
+you create the PR. In your final response, include the PR number using exactly
+this marker:
+
+<!-- AGENT_PR: <number> -->
+
+Also include exactly one state marker:
+
+<!-- AGENT_STATE: blocking -->
+
+Use blocking here to hand the PR to {reviewer_name} for review. Sign the response as:
+-- {coder_signature}
+"""
+
+
+def build_task_prompt(task_text: str, config: AgentLoopConfig) -> str:
+    reviewer_name = format_agent_list(reviewers(config))
+    coder_signature = agent_signature(config.coder)
+    return f"""You have been given a free-form task to implement in {config.repo}.
+
+Task:
+{task_text}
+
+Use this local checkout as your workspace. Decide between two paths:
+
+(a) If the task is clear enough to implement, create a branch, implement the
+    change, run relevant tests, commit, push, and open a pull request against
+    {config.base}. Do not wait for {reviewer_name}; this local orchestrator
+    will run {reviewer_name} after you create the PR. End your final response
+    with both markers:
+
+    <!-- AGENT_PR: <number> -->
+    <!-- AGENT_STATE: blocking -->
+
+(b) If the task is genuinely ambiguous or missing information that would change
+    the implementation, do NOT write code. Instead, ask focused clarifying
+    questions and end your final response with exactly this marker:
+
+    <!-- AGENT_CLARIFY -->
+
+Prefer (a) when reasonable assumptions can be documented in the PR description;
+choose (b) only for material ambiguity. Sign your response as:
+-- {coder_signature}
+"""
+
+
+def build_task_clarification_prompt(
+    task_text: str,
+    history: Sequence[tuple[str, str]],
+    config: AgentLoopConfig,
+) -> str:
+    coder_signature = agent_signature(config.coder)
+    qa_blocks = "\n\n".join(
+        f"Round {idx + 1} questions from you:\n{questions}\n\n"
+        f"Round {idx + 1} answers from the user:\n{answers}"
+        for idx, (questions, answers) in enumerate(history)
+    )
+    return f"""Continuing the previous free-form task in {config.repo}.
+
+Original task:
+{task_text}
+
+Clarification so far:
+
+{qa_blocks}
+
+Now proceed. Strongly prefer to implement the task and open a PR. Only ask
+again if a critical detail is still missing. Use the same response markers as
+before:
+
+- For implementation: include both <!-- AGENT_PR: <number> --> and
+  <!-- AGENT_STATE: blocking --> at the end of your final response.
+- For another clarification round: end your final response with exactly
+  <!-- AGENT_CLARIFY -->.
+
+Sign your response as:
+-- {coder_signature}
+"""
+
+
+def build_review_prompt(
+    pr_number: int,
+    round_number: int,
+    config: AgentLoopConfig,
+    *,
+    reviewer: AgentName,
+) -> str:
+    coder_name = agent_display_name(config.coder)
+    reviewer_signature = agent_signature(reviewer)
+    reviewer_group = format_agent_list(reviewers(config))
+    return f"""Review pull request #{pr_number} in {config.repo} (round {round_number}).
+
+Focus on correctness, security, test coverage, and maintainability. Review the
+full diff and any existing PR discussion. Do not make code changes in this
+review step; report blocking findings if {coder_name} needs to fix anything.
+All configured reviewers ({reviewer_group}) must approve in the same round for
+the pull request to be considered approved.
+
+End your final response with exactly one marker:
+
+<!-- AGENT_STATE: approved -->
+
+or:
+
+<!-- AGENT_STATE: blocking -->
+
+Use approved only if there are no blocking issues. Always sign your response:
+-- {reviewer_signature}
+"""
+
+
+def build_followup_prompt(
+    pr_number: int,
+    round_number: int,
+    review: str,
+    config: AgentLoopConfig,
+) -> str:
+    reviewer_name = format_agent_list(reviewers(config))
+    coder_signature = agent_signature(config.coder)
+    return f"""{reviewer_name} reviewed pull request #{pr_number} in {config.repo} and found blocking issues.
+
+Address the review below in this local checkout. Pull/sync the PR branch if
+needed, implement fixes, run relevant tests, commit, and push to the same PR.
+Do not create a new PR.
+
+{reviewer_name} review:
+
+{review}
+
+This is round {round_number}. End your final response with exactly one marker:
+
+<!-- AGENT_STATE: blocking -->
+
+Use blocking to hand the updated PR back to {reviewer_name}. If you cannot safely address
+the review, explain why and still use the blocking marker so a human can
+intervene. Sign the response as:
+-- {coder_signature}
+"""
