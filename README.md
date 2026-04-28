@@ -170,7 +170,7 @@ https://github.com/wwind123/coding-review-agent-loop/pull/2
   --dangerous-agent-permissions
 ```
 
-See [docs/local_agent_loop.md](docs/local_agent_loop.md) for full usage and safety notes.
+See [docs/local_agent_loop.md](docs/local_agent_loop.md) for the architecture diagram, full usage, and safety notes.
 
 ## Test
 
