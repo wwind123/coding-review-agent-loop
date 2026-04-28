@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from coding_review_agent_loop.agents.claude import _parse_claude_output
-from coding_review_agent_loop.agents.gemini import _parse_gemini_output
+from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER, _parse_gemini_output
 from coding_review_agent_loop.cli import (
     AgentLoopConfig,
     AgentLoopError,
@@ -231,6 +231,52 @@ def test_parse_gemini_output_falls_back_on_non_string_response():
     raw = json.dumps({"response": 42, "session_id": "gemini-session-1"})
     text, sid = _parse_gemini_output(raw)
     assert text == raw
+    assert sid == "gemini-session-1"
+
+
+def test_parse_gemini_output_prefers_public_response_marker():
+    raw = f"""Warning: True color (24-bit) support not detected.
+YOLO mode is enabled. All tool calls will be automatically approved.
+I will inspect the PR before giving the final answer.
+Error executing tool read_file: Path not in workspace.
+{PUBLIC_RESPONSE_MARKER}
+## Review
+
+No blocking findings.
+
+<!-- AGENT_STATE: approved -->
+
+-- Google Gemini
+"""
+    text, sid = _parse_gemini_output(raw)
+    assert text.startswith("## Review")
+    assert "True color" not in text
+    assert "YOLO mode" not in text
+    assert "I will inspect" not in text
+    assert "Error executing tool" not in text
+    assert "<!-- AGENT_STATE: approved -->" in text
+    assert sid is None
+
+
+def test_parse_gemini_output_uses_last_public_response_marker():
+    raw = f"""Gemini may mention {PUBLIC_RESPONSE_MARKER} while planning.
+{PUBLIC_RESPONSE_MARKER}
+intermediate draft
+{PUBLIC_RESPONSE_MARKER}
+Final answer.
+<!-- AGENT_STATE: approved -->
+"""
+    text, _sid = _parse_gemini_output(raw)
+    assert text == "Final answer.\n<!-- AGENT_STATE: approved -->\n"
+
+
+def test_parse_gemini_json_response_strips_public_response_marker():
+    raw = json.dumps({
+        "response": f"diagnostic\n{PUBLIC_RESPONSE_MARKER}\nReviewed.\n<!-- AGENT_STATE: approved -->",
+        "session_id": "gemini-session-1",
+    })
+    text, sid = _parse_gemini_output(raw)
+    assert text == "Reviewed.\n<!-- AGENT_STATE: approved -->"
     assert sid == "gemini-session-1"
 
 
@@ -1218,6 +1264,8 @@ def test_gemini_review_loop_uses_prompt_and_extra_args(tmp_path):
 
     gemini_call = next(cmd for cmd, _cwd in runner.commands if cmd[:1] == ["gemini"])
     assert gemini_call[:2] == ["gemini", "--prompt"]
+    assert PUBLIC_RESPONSE_MARKER in gemini_call[2]
+    assert "Only content after that line will be posted to GitHub" in gemini_call[2]
     assert "--output-format" in gemini_call
     assert "--model" in gemini_call
     assert runner.comments == ["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"]
