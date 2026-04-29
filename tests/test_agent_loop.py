@@ -513,6 +513,14 @@ def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
     assert agent_commands == [["codex", "exec"], ["claude", "--print"]]
     assert len(runner.comments) == 2
     commands = [cmd for cmd, _cwd in runner.commands]
+    metadata_fetches = [
+        cmd
+        for cmd in commands
+        if cmd[:3] == ["gh", "pr", "view"]
+        and "--json" in cmd
+        and cmd[cmd.index("--json") + 1] == "number,title,headRefName,baseRefName,headRefOid,url"
+    ]
+    assert len(metadata_fetches) == 1
     assert ["pytest", "tests/test_agent_loop.py"] in commands
     assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
 

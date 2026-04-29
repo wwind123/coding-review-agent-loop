@@ -185,10 +185,10 @@ def run_pr_loop(
     for round_number in range(1, config.max_rounds + 1):
         coder_name = agent_display_name(config.coder)
         blocking_reviews: list[tuple[str, str]] = []
+        pr_metadata = get_pr_metadata(runner, config=config, pr_number=pr_number)
         for reviewer in configured_reviewers:
             reviewer_name = agent_display_name(reviewer)
             log(config, f"Round {round_number}: {reviewer_name} reviewing PR #{pr_number}")
-            pr_metadata = get_pr_metadata(runner, config=config, pr_number=pr_number)
             review_output, new_session_id = run_agent(
                 runner,
                 agent=reviewer,
