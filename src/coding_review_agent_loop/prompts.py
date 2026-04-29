@@ -7,6 +7,7 @@ from typing import Sequence
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .config import AgentLoopConfig, reviewers
+from .github import PullRequestMetadata
 
 
 def format_agent_list(agents: Sequence[AgentName]) -> str:
@@ -112,11 +113,45 @@ def build_review_prompt(
     config: AgentLoopConfig,
     *,
     reviewer: AgentName,
+    pr_metadata: PullRequestMetadata | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer)
     reviewer_group = format_agent_list(reviewers(config))
+    metadata = pr_metadata or PullRequestMetadata(
+        number=pr_number,
+        repo=config.repo,
+        title=None,
+        head_branch=None,
+        base_branch=None,
+        head_sha=None,
+        url=None,
+    )
+    title = metadata.title or "(unknown)"
+    head_branch = metadata.head_branch or "(unknown)"
+    base_branch = metadata.base_branch or "(unknown)"
+    head_sha = metadata.head_sha or "(unknown)"
+    url_line = f"- URL: {metadata.url}\n" if metadata.url else ""
     return f"""Review pull request #{pr_number} in {config.repo} (round {round_number}).
+
+PR metadata:
+- Repo: {metadata.repo}
+- PR: #{metadata.number}
+- Title: {title}
+- Head branch: {head_branch}
+- Base branch: {base_branch}
+- Head SHA: {head_sha}
+{url_line}
+Use this PR metadata as authoritative. Do not spend time discovering the PR
+branch.
+
+Suggested commands:
+- {config.gh_cmd} pr view {metadata.number} --repo {metadata.repo} --json title,body,headRefName,baseRefName,headRefOid,comments,reviews
+- {config.gh_cmd} pr diff {metadata.number} --repo {metadata.repo}
+
+If a shell/tool command requires confirmation in non-interactive mode, do not
+retry repeatedly. Use the PR metadata above and the suggested GitHub CLI
+commands, or produce a blocking review explaining the limitation.
 
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this

@@ -9,6 +9,7 @@ from .agents.registry import agent_display_name, run_agent
 from .config import AgentLoopConfig, ensure_agent_workdirs, reviewers
 from .errors import AgentLoopError
 from .github import (
+    get_pr_metadata,
     merge_pr,
     post_pr_comment,
     validate_open_issue,
@@ -187,6 +188,7 @@ def run_pr_loop(
         for reviewer in configured_reviewers:
             reviewer_name = agent_display_name(reviewer)
             log(config, f"Round {round_number}: {reviewer_name} reviewing PR #{pr_number}")
+            pr_metadata = get_pr_metadata(runner, config=config, pr_number=pr_number)
             review_output, new_session_id = run_agent(
                 runner,
                 agent=reviewer,
@@ -196,6 +198,7 @@ def run_pr_loop(
                     round_number,
                     config,
                     reviewer=reviewer,
+                    pr_metadata=pr_metadata,
                 ),
                 session_id=reviewer_session_ids.get(reviewer),
             )
