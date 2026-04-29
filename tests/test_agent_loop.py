@@ -50,6 +50,10 @@ class FakeRunner(Runner):
             "number": 77,
             "state": "OPEN",
             "url": "https://github.com/OWNER/REPO/pull/77",
+            "title": "Improve review prompt context",
+            "headRefName": "feature/review-context",
+            "baseRefName": "main",
+            "headRefOid": "abc123",
         }
         self.commands = []
         self.comments = []
@@ -463,6 +467,32 @@ def test_pr_loop_runs_tests_and_merge_only_after_codex_approval(tmp_path):
         '[.check_runs[] | select(.name == "test")] | if length == 0 then "pending" else .[0].conclusion // .[0].status end',
     ] in commands
     assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
+
+
+def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
+    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    config = make_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    assert "PR metadata:" in prompt
+    assert "- Repo: OWNER/REPO" in prompt
+    assert "- PR: #77" in prompt
+    assert "- Title: Improve review prompt context" in prompt
+    assert "- Head branch: feature/review-context" in prompt
+    assert "- Base branch: main" in prompt
+    assert "- Head SHA: abc123" in prompt
+    assert "Use this PR metadata as authoritative." in prompt
+    assert "Do not spend time discovering the PR\nbranch." in prompt
+    assert (
+        "gh pr view 77 --repo OWNER/REPO --json "
+        "title,body,headRefName,baseRefName,headRefOid,comments,reviews"
+    ) in prompt
+    assert "gh pr diff 77 --repo OWNER/REPO" in prompt
+    assert "requires confirmation in non-interactive mode" in prompt
 
 
 def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):

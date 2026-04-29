@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,17 @@ from .workdirs import active_workdir
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
+
+
+@dataclass(frozen=True)
+class PullRequestMetadata:
+    number: int
+    repo: str
+    title: str | None
+    head_branch: str | None
+    base_branch: str | None
+    head_sha: str | None
+    url: str | None
 
 
 def detect_repo(runner: Runner, cwd: Path, gh_cmd: str) -> str:
@@ -49,6 +61,43 @@ def validate_open_pr(runner: Runner, *, config: AgentLoopConfig, pr_number: int)
         raise AgentLoopError(
             f"PR #{pr_number} is {data.get('state', 'not open')}; provide an open PR number."
         )
+
+
+def get_pr_metadata(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> PullRequestMetadata:
+    if config.dry_run:
+        return PullRequestMetadata(
+            number=pr_number,
+            repo=config.repo,
+            title=None,
+            head_branch=None,
+            base_branch=None,
+            head_sha=None,
+            url=None,
+        )
+
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            config.repo,
+            "--json",
+            "number,title,headRefName,baseRefName,headRefOid,url",
+        ],
+        cwd=active_workdir(config),
+    )
+    data = json.loads(result.stdout or "{}")
+    return PullRequestMetadata(
+        number=int(data.get("number") or pr_number),
+        repo=config.repo,
+        title=data.get("title"),
+        head_branch=data.get("headRefName"),
+        base_branch=data.get("baseRefName"),
+        head_sha=data.get("headRefOid"),
+        url=data.get("url"),
+    )
 
 
 def validate_open_issue(runner: Runner, *, config: AgentLoopConfig, issue_number: int) -> None:
