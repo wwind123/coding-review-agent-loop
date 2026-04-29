@@ -195,19 +195,18 @@ avoid repeated clone, dependency setup, and indexing costs.
 
 ## Real Example
 
-This project uses `agent-loop` to improve itself. The following command asked
-Codex to implement multiple-reviewer support and Claude to review the result.
-That work became PR #2:
-https://github.com/wwind123/coding-review-agent-loop/pull/2
+This project uses `agent-loop` to improve itself. This command asked Codex to
+review existing issue and PR feedback, with both Claude and Gemini reviewing
+the result. The work became PR #13:
+https://github.com/wwind123/coding-review-agent-loop/pull/13
 
 ```bash
 ~/tools/coding-review-agent-loop/.venv/bin/agent-loop task \
-  "Currently the tool allows only 1 reviewer. Can we add the feature to allow multiple reviewers? By default, all reviewers have to approve for the whole thing to be considered approved." \
+  "Please go over all the issue and pr reviews again and see if there's any non-blocking issues still worth addressing but have not been addressed." \
   --repo wwind123/coding-review-agent-loop \
-  --claude-dir ~/tools/coding-review-agent-loop/claude/repo \
-  --codex-dir ~/tools/coding-review-agent-loop/codex/repo \
   --coder codex \
   --reviewer claude \
+  --reviewer gemini \
   --dangerous-agent-permissions
 ```
 
