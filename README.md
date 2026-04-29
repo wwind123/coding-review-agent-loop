@@ -110,6 +110,11 @@ iteration pass:
 agent-loop pr 456 --repo OWNER/REPO
 ```
 
+If `--repo` is omitted, the tool runs `gh repo view` from the current working
+directory, or from `--codex-dir` when that flag is provided, and uses the
+detected `OWNER/REPO`. Pass `--repo` explicitly when running outside the target
+repository.
+
 When `--claude-dir`, `--codex-dir`, or `--gemini-dir` is omitted for an active
 agent, the tool creates or reuses a repo-scoped temporary checkout such as
 `/tmp/coding-review-agent-loop/OWNER-REPO/codex/repo`. Existing clean temp

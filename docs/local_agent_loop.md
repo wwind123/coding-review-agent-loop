@@ -125,6 +125,11 @@ Review an existing PR:
 agent-loop pr 123 --repo OWNER/REPO
 ```
 
+If `--repo` is omitted, the tool runs `gh repo view` from the current working
+directory, or from `--codex-dir` when that flag is provided, and uses the
+detected `OWNER/REPO`. Pass `--repo` explicitly when running outside the target
+repository.
+
 Reverse the direction so Codex creates/fixes and Claude reviews:
 
 ```bash
