@@ -167,6 +167,7 @@ https://github.com/wwind123/coding-review-agent-loop/pull/13
 ```bash
 ~/tools/coding-review-agent-loop/.venv/bin/agent-loop task \
   "Please go over all the issue and pr reviews again and see if there's any non-blocking issues still worth addressing but have not been addressed." \
+  --repo wwind123/coding-review-agent-loop \
   --coder codex \
   --reviewer claude \
   --reviewer gemini \
