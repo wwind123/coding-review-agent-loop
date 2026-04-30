@@ -944,6 +944,14 @@ def test_default_agent_memory_dir_uses_xdg_cache_and_repo_scope(monkeypatch, tmp
     )
 
 
+def test_default_cache_root_uses_posix_home_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr("coding_review_agent_loop.config.sys.platform", "linux")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+    assert default_cache_root() == tmp_path / ".cache" / "coding-review-agent-loop"
+
+
 @pytest.mark.parametrize(
     ("platform", "home_parts"),
     [
