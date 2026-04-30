@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,12 +81,34 @@ def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
 
 
 def default_agent_workdir(repo: str, agent: AgentName) -> Path:
+    repo_slug = repo_cache_slug(repo)
+    return Path(tempfile.gettempdir()) / "coding-review-agent-loop" / repo_slug / agent / "repo"
+
+
+def repo_cache_slug(repo: str) -> str:
     parts = repo.split("/")
     if len(parts) != 2 or not all(parts):
         raise AgentLoopError("--repo must use the OWNER/REPO format.")
     owner, name = parts
-    repo_slug = f"{owner}-{name}"
-    return Path(tempfile.gettempdir()) / "coding-review-agent-loop" / repo_slug / agent / "repo"
+    return f"{owner}-{name}"
+
+
+def default_cache_root() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "coding-review-agent-loop"
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "coding-review-agent-loop" / "Cache"
+        return Path.home() / "AppData" / "Local" / "coding-review-agent-loop" / "Cache"
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return Path(xdg_cache_home) / "coding-review-agent-loop"
+    return Path.home() / ".cache" / "coding-review-agent-loop"
+
+
+def default_agent_memory_dir(repo: str) -> Path:
+    return default_cache_root() / "repos" / repo_cache_slug(repo) / "memory"
 
 
 def ensure_workdir(path: Path, option_name: str) -> None:
@@ -260,9 +284,13 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         agent_memory=args.agent_memory,
         refresh_agent_memory=args.refresh_agent_memory,
         agent_memory_dir=(
-            primary_dir / args.agent_memory_dir
-            if not args.agent_memory_dir.is_absolute()
-            else args.agent_memory_dir
+            default_agent_memory_dir(repo).resolve()
+            if args.agent_memory_dir is None
+            else (
+                primary_dir / args.agent_memory_dir
+                if not args.agent_memory_dir.is_absolute()
+                else args.agent_memory_dir
+            )
         ),
         refresh_test_profile=args.refresh_test_profile,
         approved_followups=args.approved_followups,
