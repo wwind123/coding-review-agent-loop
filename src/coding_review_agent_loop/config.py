@@ -47,6 +47,7 @@ class AgentLoopConfig:
     refresh_agent_memory: bool
     agent_memory_dir: Path
     refresh_test_profile: bool
+    approved_followups: str = "ignore"
     auto_agent_dirs: tuple[AgentName, ...] = ()
 
     def __post_init__(self) -> None:
@@ -218,6 +219,8 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         raise AgentLoopError("--ci-poll-interval-seconds must be greater than zero.")
     if args.progress_interval_seconds <= 0:
         raise AgentLoopError("--progress-interval-seconds must be greater than zero.")
+    if args.approved_followups not in {"ignore", "summarize"}:
+        raise AgentLoopError("--approved-followups must be one of: ignore, summarize.")
     return AgentLoopConfig(
         repo=repo,
         claude_dir=claude_dir,
@@ -264,5 +267,6 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
             else args.agent_memory_dir
         ),
         refresh_test_profile=args.refresh_test_profile,
+        approved_followups=args.approved_followups,
         auto_agent_dirs=auto_agent_dirs,
     )

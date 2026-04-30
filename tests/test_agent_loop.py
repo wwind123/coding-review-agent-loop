@@ -21,6 +21,7 @@ from coding_review_agent_loop.cli import (
     run_task_loop,
 )
 from coding_review_agent_loop.config import default_agent_workdir
+from coding_review_agent_loop.protocol import parse_non_blocking_followups
 
 
 class FakeRunner(Runner):
@@ -403,6 +404,39 @@ def test_parse_agent_state_requires_marker():
         parse_agent_state("LGTM")
 
 
+def test_parse_non_blocking_followups_extracts_bullets_only_from_section():
+    review = """
+    Looks good.
+
+    ### Non-blocking follow-ups
+    - Add `.agent-loop/` to `.gitignore`.
+    1. Add regression coverage for stale memory refresh.
+       Include multiple reviewers.
+
+    ### Notes
+    - This is not a follow-up.
+
+    <!-- AGENT_STATE: approved -->
+    -- OpenAI Codex
+    """
+
+    followups = parse_non_blocking_followups(review, reviewer="OpenAI Codex")
+
+    assert [(item.reviewer, item.text) for item in followups] == [
+        ("OpenAI Codex", "Add `.agent-loop/` to `.gitignore`."),
+        (
+            "OpenAI Codex",
+            "Add regression coverage for stale memory refresh. Include multiple reviewers.",
+        ),
+    ]
+
+
+def test_parse_non_blocking_followups_returns_empty_without_section():
+    review = "LGTM.\n- A normal bullet outside the section.\n<!-- AGENT_STATE: approved -->"
+
+    assert parse_non_blocking_followups(review, reviewer="OpenAI Codex") == []
+
+
 def test_parse_pr_number_accepts_marker_and_url():
     assert parse_pr_number("opened\n<!-- AGENT_PR: 61 -->") == 61
     assert parse_pr_number("https://github.com/OWNER/REPO/pull/62") == 62
@@ -517,6 +551,8 @@ def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
     ) in prompt
     assert "gh pr diff 77 --repo OWNER/REPO" in prompt
     assert "requires confirmation in non-interactive mode" in prompt
+    assert "### Non-blocking follow-ups" in prompt
+    assert "Use blocking only for issues that should prevent merge." in prompt
 
 
 def test_agent_memory_is_created_and_added_to_review_prompt(tmp_path):
@@ -619,6 +655,50 @@ def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
     assert len(metadata_fetches) == 1
     assert ["pytest", "tests/test_agent_loop.py"] in commands
     assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
+
+
+def test_pr_loop_ignores_approved_followups_by_default(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "LGTM.\n\n### Non-blocking follow-ups\n- Add cleanup docs.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+    )
+    config = make_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert runner.comments == [
+        "LGTM.\n\n### Non-blocking follow-ups\n- Add cleanup docs.\n"
+        "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+    ]
+
+
+def test_pr_loop_summarizes_approved_followups_from_multiple_reviewers(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves.\n\n### Non-blocking follow-ups\n- Add cleanup docs.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+        claude_outputs=[
+            "Claude approves.\n\n### Non-blocking follow-ups\n- Add regression coverage.\n"
+            "<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        approved_followups="summarize",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(runner.comments) == 3
+    summary = runner.comments[-1]
+    assert summary.startswith("Approved-review non-blocking follow-ups for PR #77:")
+    assert "- Add cleanup docs. (Codex)" in summary
+    assert "- Add regression coverage. (Claude)" in summary
+    assert "did not block merge readiness" in summary
 
 
 def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):
@@ -769,6 +849,28 @@ def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts():
 def test_default_agent_workdir_rejects_invalid_repo_formats(repo):
     with pytest.raises(AgentLoopError, match="OWNER/REPO"):
         default_agent_workdir(repo, "codex")
+
+
+def test_approved_followups_cli_mode_is_configurable(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--approved-followups",
+        "summarize",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+        "--gemini-dir",
+        str(tmp_path / "gemini"),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.approved_followups == "summarize"
 
 
 def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):
