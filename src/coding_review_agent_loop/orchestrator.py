@@ -17,6 +17,7 @@ from .github import (
     wait_for_ci,
 )
 from .logging import log
+from .memory import prepare_agent_memory
 from .prompts import (
     build_followup_prompt,
     build_issue_prompt,
@@ -42,12 +43,13 @@ def run_issue_loop(runner: Runner, *, issue_number: int, config: AgentLoopConfig
     ensure_agent_workdirs(config, runner)
     log(config, f"Validating issue #{issue_number}")
     validate_open_issue(runner, config=config, issue_number=issue_number)
+    memory = prepare_agent_memory(runner, config)
 
     coder_output, coder_session_id = run_agent(
         runner,
         agent=config.coder,
         config=config,
-        prompt=build_issue_prompt(issue_number, config),
+        prompt=build_issue_prompt(issue_number, config, memory),
     )
     pr_number = parse_pr_number(coder_output)
     if pr_number is None:
@@ -94,14 +96,15 @@ def run_task_loop(
     max_clarification_rounds: int = 3,
     clarification_input=None,
 ) -> int:
-    ensure_agent_workdirs(config, runner)
     if not task_text.strip():
         raise AgentLoopError("Task text is empty; provide a non-empty description.")
     if max_clarification_rounds < 0:
         raise AgentLoopError("--max-clarification-rounds must be zero or positive.")
+    ensure_agent_workdirs(config, runner)
+    memory = prepare_agent_memory(runner, config)
 
     history: list[tuple[str, str]] = []
-    prompt = build_task_prompt(task_text, config)
+    prompt = build_task_prompt(task_text, config, memory)
     read_clarification = clarification_input or _read_clarification_from_stdin
     coder_name = agent_display_name(config.coder)
     session_id: str | None = None
@@ -157,7 +160,7 @@ def run_task_loop(
         if not answers.strip():
             raise AgentLoopError("Empty clarification reply; aborting task.")
         history.append((coder_output, answers))
-        prompt = build_task_clarification_prompt(task_text, history, config)
+        prompt = build_task_clarification_prompt(task_text, history, config, memory)
 
     raise AgentLoopError("run_task_loop exited unexpectedly without producing a PR.")
 
@@ -175,6 +178,7 @@ def run_pr_loop(
         ensure_agent_workdirs(config, runner)
     log(config, f"Validating PR #{pr_number}")
     validate_open_pr(runner, config=config, pr_number=pr_number)
+    memory = prepare_agent_memory(runner, config)
     reviewer_session_ids: dict[AgentName, str | None] = {}
     configured_reviewers = reviewers(config)
     if reviewer_session_id is not None and configured_reviewers:
@@ -199,6 +203,7 @@ def run_pr_loop(
                     config,
                     reviewer=reviewer,
                     pr_metadata=pr_metadata,
+                    memory=memory,
                 ),
                 session_id=reviewer_session_ids.get(reviewer),
             )
@@ -233,7 +238,7 @@ def run_pr_loop(
             runner,
             agent=config.coder,
             config=config,
-            prompt=build_followup_prompt(pr_number, round_number, combined_review, config),
+            prompt=build_followup_prompt(pr_number, round_number, combined_review, config, memory),
             session_id=coder_session_id,
         )
         if not coder_output.strip():

@@ -35,6 +35,9 @@ class FakeRunner(Runner):
         git_status="",
         git_remote="git@github.com:OWNER/REPO.git",
         git_inside=True,
+        git_head="abc123",
+        tracked_files=None,
+        changed_files=None,
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -60,6 +63,14 @@ class FakeRunner(Runner):
         self.git_status = git_status
         self.git_remote = git_remote
         self.git_inside = git_inside
+        self.git_head = git_head
+        self.tracked_files = tracked_files or [
+            "pyproject.toml",
+            "README.md",
+            "src/coding_review_agent_loop/cli.py",
+            "tests/test_agent_loop.py",
+        ]
+        self.changed_files = changed_files or ["src/coding_review_agent_loop/cli.py"]
 
     def _record_command(self, args, cwd):
         cmd = [str(arg) for arg in args]
@@ -143,6 +154,15 @@ class FakeRunner(Runner):
                 return CommandResult(cmd, cwd_path, "true\n", "", 0)
             return CommandResult(cmd, cwd_path, "false\n", "", 1)
 
+        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+            return CommandResult(cmd, cwd_path, f"{self.git_head}\n", "", 0)
+
+        if cmd[:2] == ["git", "ls-files"]:
+            return CommandResult(cmd, cwd_path, "\n".join(self.tracked_files) + "\n", "", 0)
+
+        if cmd[:3] == ["git", "diff", "--name-only"]:
+            return CommandResult(cmd, cwd_path, "\n".join(self.changed_files) + "\n", "", 0)
+
         if cmd[:4] == ["git", "remote", "get-url", "origin"]:
             return CommandResult(cmd, cwd_path, f"{self.git_remote}\n", "", 0)
 
@@ -189,6 +209,10 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         "quiet": True,
         "log_dir": tmp_path / "logs",
         "progress_interval_seconds": 30,
+        "agent_memory": True,
+        "refresh_agent_memory": False,
+        "agent_memory_dir": tmp_path / "claude" / ".agent-loop" / "memory",
+        "refresh_test_profile": False,
     }
     config.update(overrides)
     if create_dirs:
@@ -495,6 +519,78 @@ def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
     assert "requires confirmation in non-interactive mode" in prompt
 
 
+def test_agent_memory_is_created_and_added_to_review_prompt(tmp_path):
+    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    memory_dir = tmp_path / "memory"
+    config = make_config(tmp_path, agent_memory_dir=memory_dir)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert (memory_dir / "repo-summary.md").exists()
+    assert (memory_dir / "architecture-map.md").exists()
+    assert (memory_dir / "module-index.json").exists()
+    assert (memory_dir / "test-profile.md").exists()
+    assert (memory_dir / "toolchain.json").exists()
+    assert (memory_dir / "last-analyzed-commit").read_text(encoding="utf-8") == "abc123\n"
+
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "Agent memory context:" in prompt
+    assert "Use cached repo memory and execution memory only for orientation." in prompt
+    assert "inspect the actual source files and PR diff directly" in prompt
+    assert "Do not search the whole filesystem for test tools." in prompt
+    assert "src/coding_review_agent_loop/cli.py" in prompt
+
+
+def test_agent_memory_detects_changed_files_since_previous_commit(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        git_head="def456",
+        changed_files=["src/coding_review_agent_loop/prompts.py", "tests/test_agent_loop.py"],
+    )
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "last-analyzed-commit").write_text("abc123\n", encoding="utf-8")
+    config = make_config(tmp_path, agent_memory_dir=memory_dir)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    diff_commands = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["git", "diff", "--name-only"]]
+    assert diff_commands == [["git", "diff", "--name-only", "abc123..def456"]]
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "src/coding_review_agent_loop/prompts.py" in prompt
+    assert "tests/test_agent_loop.py" in prompt
+    assert (memory_dir / "last-analyzed-commit").read_text(encoding="utf-8") == "def456\n"
+
+
+def test_test_profile_records_provided_test_command(tmp_path):
+    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    memory_dir = tmp_path / "memory"
+    config = make_config(
+        tmp_path,
+        agent_memory_dir=memory_dir,
+        test_command=("python", "-m", "pytest", "-q"),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    profile = (memory_dir / "test-profile.md").read_text(encoding="utf-8")
+    assert "`python -m pytest -q`" in profile
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "prefer verified test commands from the execution profile" in prompt
+
+
+def test_agent_memory_can_be_disabled(tmp_path):
+    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    memory_dir = tmp_path / "memory"
+    config = make_config(tmp_path, agent_memory=False, agent_memory_dir=memory_dir)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not memory_dir.exists()
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "Agent memory context:" not in prompt
+
+
 def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
     runner = FakeRunner(
         codex_outputs=["Codex approves.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
@@ -717,6 +813,35 @@ def test_relative_log_dir_defaults_under_active_coder_workdir(tmp_path):
     config = config_from_args(args, FakeRunner())
 
     assert config.log_dir == claude_dir / ".agent-loop-logs"
+
+
+def test_agent_memory_flags_configure_memory_dir_and_refresh(tmp_path):
+    parser = build_parser()
+    codex_dir = tmp_path / "codex"
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "codex",
+        "--reviewer",
+        "claude",
+        "--codex-dir",
+        str(codex_dir),
+        "--no-agent-memory",
+        "--refresh-agent-memory",
+        "--refresh-test-profile",
+        "--agent-memory-dir",
+        "custom-memory",
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.agent_memory is False
+    assert config.refresh_agent_memory is True
+    assert config.refresh_test_profile is True
+    assert config.agent_memory_dir == codex_dir / "custom-memory"
 
 
 def test_auto_created_agent_dir_is_cloned_before_use(tmp_path):
