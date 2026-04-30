@@ -72,6 +72,7 @@ def parse_non_blocking_followups(text: str, *, reviewer: str) -> list[ApprovedFo
             continue
         if HTML_COMMENT_RE.match(line) or SIGNATURE_RE.match(line):
             flush_current()
+            in_section = False
             continue
         bullet = BULLET_RE.match(line)
         if bullet:

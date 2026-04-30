@@ -436,6 +436,24 @@ def test_parse_non_blocking_followups_extracts_bullets_only_from_section():
     ]
 
 
+@pytest.mark.parametrize("terminator", ["<!-- AGENT_STATE: approved -->", "-- OpenAI Codex"])
+def test_parse_non_blocking_followups_stops_at_final_markers(terminator):
+    review = f"""
+    Looks good.
+
+    ### Non-blocking follow-ups
+    - Add cleanup docs.
+    {terminator}
+    - This is outside the follow-up section.
+    """
+
+    followups = parse_non_blocking_followups(review, reviewer="OpenAI Codex")
+
+    assert [(item.reviewer, item.text) for item in followups] == [
+        ("OpenAI Codex", "Add cleanup docs."),
+    ]
+
+
 def test_parse_non_blocking_followups_returns_empty_without_section():
     review = "LGTM.\n- A normal bullet outside the section.\n<!-- AGENT_STATE: approved -->"
 
@@ -769,6 +787,15 @@ def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):
     )
     assert "Needs a regression test." in followup_prompt
     assert "Codex approves first pass." not in followup_prompt
+    commands = [cmd for cmd, _cwd in runner.commands]
+    metadata_fetches = [
+        cmd
+        for cmd in commands
+        if cmd[:3] == ["gh", "pr", "view"]
+        and "--json" in cmd
+        and cmd[cmd.index("--json") + 1] == "number,title,headRefName,baseRefName,headRefOid,url"
+    ]
+    assert len(metadata_fetches) == 2
 
 
 def test_pr_loop_does_not_run_claude_after_final_blocking_round(tmp_path):
@@ -1215,7 +1242,8 @@ def test_config_rejects_duplicate_reviewers(tmp_path):
         config_from_args(args, FakeRunner())
 
 
-def test_config_rejects_non_positive_max_rounds(tmp_path):
+@pytest.mark.parametrize("max_rounds", ["0", "-1"])
+def test_config_rejects_non_positive_max_rounds(tmp_path, max_rounds):
     parser = build_parser()
     args = parser.parse_args([
         "pr",
@@ -1223,7 +1251,7 @@ def test_config_rejects_non_positive_max_rounds(tmp_path):
         "--repo",
         "OWNER/REPO",
         "--max-rounds",
-        "0",
+        max_rounds,
         "--claude-dir",
         str(tmp_path / "claude"),
         "--codex-dir",
