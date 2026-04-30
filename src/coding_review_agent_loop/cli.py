@@ -186,7 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
             dest="agent_memory",
             action="store_true",
             default=True,
-            help="Enable repo-local advisory agent memory (default).",
+            help="Enable repo-scoped advisory agent memory (default).",
         )
         memory_group.add_argument(
             "--no-agent-memory",
@@ -202,8 +202,11 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--agent-memory-dir",
             type=Path,
-            default=Path(".agent-loop") / "memory",
-            help="Directory for repo memory, relative to the coder checkout by default.",
+            default=None,
+            help=(
+                "Directory for repo memory. Defaults to a repo-scoped user cache; "
+                "relative explicit paths are resolved inside the coder checkout."
+            ),
         )
         subparser.add_argument(
             "--refresh-test-profile",

@@ -196,18 +196,25 @@ avoid repeated clone, dependency setup, and indexing costs.
 ## Agent Memory
 
 Agent memory is enabled by default. Before an agent prompt is built, the loop
-creates or refreshes advisory repo memory in the active coder checkout under:
+creates or refreshes advisory repo memory in a durable, repo-scoped user cache
+directory. On Linux the default is:
 
 ```text
-.agent-loop/memory
+~/.cache/coding-review-agent-loop/repos/OWNER-REPO/memory
 ```
+
+If `$XDG_CACHE_HOME` is set on Linux, the root is
+`$XDG_CACHE_HOME/coding-review-agent-loop`. On macOS the default root is
+`~/Library/Caches/coding-review-agent-loop`; on Windows it is
+`%LOCALAPPDATA%/coding-review-agent-loop/Cache`.
 
 The memory cache includes a repo summary, architecture map, module index,
 execution/test profile, toolchain facts, and changed files since the previous
 memory commit. This context is included in coder and reviewer prompts as
 orientation only. The prompt explicitly tells agents that cached memory may be
 stale and that correctness, security, and behavior claims must come from the
-actual source files and PR diff.
+actual source files and PR diff. The cache is local-only, but it can contain
+repo structure, local paths, test command notes, and advisory summaries.
 
 Use these flags to control it:
 
@@ -219,10 +226,13 @@ agent-loop pr 123 --repo OWNER/REPO --agent-memory-dir .cache/agent-loop-memory
 ```
 
 Relative `--agent-memory-dir` values are resolved inside the active coder
-checkout. The default `.agent-loop` parent is ignored automatically so generated
-memory files are not accidentally committed. If the previous memory commit
-cannot be diffed against the current commit, the loop logs the git failure and
-treats all tracked files as changed for that refresh.
+checkout. Use `--no-agent-memory` or a custom short-lived
+`--agent-memory-dir` for sensitive repositories where local cache retention is
+undesirable. If a custom memory directory uses the repo-local `.agent-loop`
+parent, that parent is ignored automatically so generated memory files are not
+accidentally committed. If the previous memory commit cannot be diffed against
+the current commit, the loop logs the git failure and treats all tracked files
+as changed for that refresh.
 
 ## Real Example
 

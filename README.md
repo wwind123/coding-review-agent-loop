@@ -124,17 +124,22 @@ explicit persistent directories for large repositories, long-lived agent
 worktrees, or setups that should survive `/tmp` cleanup or reboot.
 
 Agent memory is enabled by default. Before invoking agents, the loop creates or
-refreshes advisory repo memory under `.agent-loop/memory` in the coder checkout:
+refreshes advisory repo memory in a durable, repo-scoped user cache directory
+such as `~/.cache/coding-review-agent-loop/repos/OWNER-REPO/memory` on Linux:
 repo summary, architecture map, module index, execution/test profile, toolchain
-facts, and changed files since the previous memory commit. Agent prompts state
-that this cache is stale-prone orientation only, and that agents must inspect
-source files and PR diffs directly for correctness claims. Disable it with
-`--no-agent-memory`, force a refresh with `--refresh-agent-memory`, customize
-the location with `--agent-memory-dir PATH`, or refresh only test command facts
-with `--refresh-test-profile`. The default `.agent-loop` parent is ignored
-automatically so generated memory files are not accidentally committed. If the
-previous memory commit is unavailable or no longer diffable, the loop logs the
-git failure and treats all tracked files as changed for that refresh.
+facts, and changed files since the previous memory commit. On macOS the default
+root is `~/Library/Caches/coding-review-agent-loop`; on Windows it is
+`%LOCALAPPDATA%/coding-review-agent-loop/Cache`. Agent prompts state that this
+cache is stale-prone orientation only, and that agents must inspect source files
+and PR diffs directly for correctness claims. The cache is local-only. Disable
+it with `--no-agent-memory`, force a refresh with `--refresh-agent-memory`,
+customize the location with `--agent-memory-dir PATH`, or refresh only test
+command facts with `--refresh-test-profile`. Relative `--agent-memory-dir`
+values are resolved inside the coder checkout. If you keep sensitive repo
+details out of local cache retention, use `--no-agent-memory` or a custom
+short-lived location. If the previous memory commit is unavailable or no longer
+diffable, the loop logs the git failure and treats all tracked files as changed
+for that refresh.
 
 By default Claude is the coder and Codex is the reviewer. Reverse that with:
 

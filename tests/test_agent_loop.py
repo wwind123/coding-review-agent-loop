@@ -20,7 +20,7 @@ from coding_review_agent_loop.cli import (
     run_pr_loop,
     run_task_loop,
 )
-from coding_review_agent_loop.config import default_agent_workdir
+from coding_review_agent_loop.config import default_agent_memory_dir, default_agent_workdir
 from coding_review_agent_loop.protocol import parse_non_blocking_followups
 
 
@@ -916,12 +916,29 @@ def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts():
     assert config.claude_dir == default_agent_workdir("OWNER/REPO", "claude").resolve()
     assert config.gemini_dir == default_agent_workdir("OWNER/REPO", "gemini").resolve()
     assert set(config.auto_agent_dirs) == {"claude", "codex", "gemini"}
+    assert config.agent_memory_dir == default_agent_memory_dir("OWNER/REPO").resolve()
 
 
 @pytest.mark.parametrize("repo", ["OWNER", "OWNER/", "/REPO", "OWNER/REPO/EXTRA"])
 def test_default_agent_workdir_rejects_invalid_repo_formats(repo):
     with pytest.raises(AgentLoopError, match="OWNER/REPO"):
         default_agent_workdir(repo, "codex")
+
+
+def test_default_agent_memory_dir_uses_xdg_cache_and_repo_scope(monkeypatch, tmp_path):
+    cache_home = tmp_path / "xdg-cache"
+    monkeypatch.setattr("coding_review_agent_loop.config.sys.platform", "linux")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+
+    assert default_agent_memory_dir("OWNER/REPO") == (
+        cache_home / "coding-review-agent-loop" / "repos" / "OWNER-REPO" / "memory"
+    )
+
+
+@pytest.mark.parametrize("repo", ["OWNER", "OWNER/", "/REPO", "OWNER/REPO/EXTRA"])
+def test_default_agent_memory_dir_rejects_invalid_repo_formats(repo):
+    with pytest.raises(AgentLoopError, match="OWNER/REPO"):
+        default_agent_memory_dir(repo)
 
 
 def test_approved_followups_cli_mode_is_configurable(tmp_path):
@@ -1017,6 +1034,33 @@ def test_agent_memory_flags_configure_memory_dir_and_refresh(tmp_path):
     assert config.refresh_agent_memory is True
     assert config.refresh_test_profile is True
     assert config.agent_memory_dir == codex_dir / "custom-memory"
+
+
+def test_agent_memory_default_ignores_active_coder_workdir(tmp_path, monkeypatch):
+    parser = build_parser()
+    cache_home = tmp_path / "cache"
+    codex_dir = tmp_path / "codex"
+    monkeypatch.setattr("coding_review_agent_loop.config.sys.platform", "linux")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        "codex",
+        "--reviewer",
+        "claude",
+        "--codex-dir",
+        str(codex_dir),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.agent_memory_dir == (
+        cache_home / "coding-review-agent-loop" / "repos" / "OWNER-REPO" / "memory"
+    ).resolve()
+    assert codex_dir not in config.agent_memory_dir.parents
 
 
 def test_auto_created_agent_dir_is_cloned_before_use(tmp_path):
