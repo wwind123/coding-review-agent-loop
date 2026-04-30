@@ -24,7 +24,7 @@ def _memory_block(memory: AgentMemoryContext | None) -> str:
     text = format_agent_memory_context(memory)
     if not text:
         return ""
-    return f"\n\nAgent memory context:\n{text}\n"
+    return f"Agent memory context:\n{text}\n"
 
 
 def build_issue_prompt(

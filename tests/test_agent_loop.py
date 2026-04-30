@@ -39,6 +39,8 @@ class FakeRunner(Runner):
         git_head="abc123",
         tracked_files=None,
         changed_files=None,
+        diff_returncode=0,
+        diff_stderr="",
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -72,6 +74,8 @@ class FakeRunner(Runner):
             "tests/test_agent_loop.py",
         ]
         self.changed_files = changed_files or ["src/coding_review_agent_loop/cli.py"]
+        self.diff_returncode = diff_returncode
+        self.diff_stderr = diff_stderr
 
     def _record_command(self, args, cwd):
         cmd = [str(arg) for arg in args]
@@ -162,7 +166,8 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, "\n".join(self.tracked_files) + "\n", "", 0)
 
         if cmd[:3] == ["git", "diff", "--name-only"]:
-            return CommandResult(cmd, cwd_path, "\n".join(self.changed_files) + "\n", "", 0)
+            stdout = "\n".join(self.changed_files) + "\n" if self.diff_returncode == 0 else ""
+            return CommandResult(cmd, cwd_path, stdout, self.diff_stderr, self.diff_returncode)
 
         if cmd[:4] == ["git", "remote", "get-url", "origin"]:
             return CommandResult(cmd, cwd_path, f"{self.git_remote}\n", "", 0)
@@ -577,6 +582,26 @@ def test_agent_memory_is_created_and_added_to_review_prompt(tmp_path):
     assert "src/coding_review_agent_loop/cli.py" in prompt
 
 
+def test_agent_memory_default_parent_ignores_generated_contents(tmp_path):
+    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    config = make_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    gitignore = tmp_path / "claude" / ".agent-loop" / ".gitignore"
+    assert gitignore.read_text(encoding="utf-8") == "*\n!.gitignore\n"
+
+
+def test_agent_memory_does_not_ignore_custom_parent_directory(tmp_path):
+    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    memory_dir = tmp_path / "custom-memory"
+    config = make_config(tmp_path, agent_memory_dir=memory_dir)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not (tmp_path / ".gitignore").exists()
+
+
 def test_agent_memory_detects_changed_files_since_previous_commit(tmp_path):
     runner = FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
@@ -596,6 +621,27 @@ def test_agent_memory_detects_changed_files_since_previous_commit(tmp_path):
     assert "src/coding_review_agent_loop/prompts.py" in prompt
     assert "tests/test_agent_loop.py" in prompt
     assert (memory_dir / "last-analyzed-commit").read_text(encoding="utf-8") == "def456\n"
+
+
+def test_agent_memory_logs_when_changed_file_diff_falls_back(tmp_path, capsys):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        git_head="def456",
+        diff_returncode=128,
+        diff_stderr="fatal: bad revision 'abc123..def456'",
+    )
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "last-analyzed-commit").write_text("abc123\n", encoding="utf-8")
+    config = make_config(tmp_path, agent_memory_dir=memory_dir, quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    captured = capsys.readouterr()
+    assert "Could not diff agent memory baseline abc123..def456" in captured.err
+    assert "treating all tracked files as changed" in captured.err
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "README.md" in prompt
 
 
 def test_test_profile_records_provided_test_command(tmp_path):
