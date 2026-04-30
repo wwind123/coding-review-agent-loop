@@ -198,6 +198,14 @@ def _split_command(value: str | None) -> tuple[str, ...] | None:
     return tuple(shlex.split(value))
 
 
+def _resolve_agent_memory_dir(value: Path | None, *, repo: str, primary_dir: Path) -> Path:
+    if value is None:
+        return default_agent_memory_dir(repo).resolve()
+    if value.is_absolute():
+        return value.resolve()
+    return (primary_dir / value).resolve()
+
+
 def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfig:
     configured_reviewers = tuple(args.reviewer or ["codex"])
     if len(set(configured_reviewers)) != len(configured_reviewers):
@@ -283,14 +291,10 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         progress_interval_seconds=args.progress_interval_seconds,
         agent_memory=args.agent_memory,
         refresh_agent_memory=args.refresh_agent_memory,
-        agent_memory_dir=(
-            default_agent_memory_dir(repo).resolve()
-            if args.agent_memory_dir is None
-            else (
-                primary_dir / args.agent_memory_dir
-                if not args.agent_memory_dir.is_absolute()
-                else args.agent_memory_dir
-            )
+        agent_memory_dir=_resolve_agent_memory_dir(
+            args.agent_memory_dir,
+            repo=repo,
+            primary_dir=primary_dir,
         ),
         refresh_test_profile=args.refresh_test_profile,
         approved_followups=args.approved_followups,
