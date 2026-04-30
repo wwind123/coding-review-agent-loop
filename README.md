@@ -131,7 +131,10 @@ that this cache is stale-prone orientation only, and that agents must inspect
 source files and PR diffs directly for correctness claims. Disable it with
 `--no-agent-memory`, force a refresh with `--refresh-agent-memory`, customize
 the location with `--agent-memory-dir PATH`, or refresh only test command facts
-with `--refresh-test-profile`.
+with `--refresh-test-profile`. The default `.agent-loop` parent is ignored
+automatically so generated memory files are not accidentally committed. If the
+previous memory commit is unavailable or no longer diffable, the loop logs the
+git failure and treats all tracked files as changed for that refresh.
 
 By default Claude is the coder and Codex is the reviewer. Reverse that with:
 
@@ -175,6 +178,10 @@ the coder, use:
 ```bash
 agent-loop pr 456 --repo OWNER/REPO --approved-followups summarize
 ```
+
+Only bullets inside the `Non-blocking follow-ups` section are summarized. The
+section ends at the next heading, HTML marker, or agent signature, so final
+protocol markers are not mistaken for follow-up text.
 
 For trusted local automation that must run without approval prompts:
 
