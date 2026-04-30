@@ -123,6 +123,16 @@ runs; dirty temp checkouts fail clearly instead of being overwritten. Use
 explicit persistent directories for large repositories, long-lived agent
 worktrees, or setups that should survive `/tmp` cleanup or reboot.
 
+Agent memory is enabled by default. Before invoking agents, the loop creates or
+refreshes advisory repo memory under `.agent-loop/memory` in the coder checkout:
+repo summary, architecture map, module index, execution/test profile, toolchain
+facts, and changed files since the previous memory commit. Agent prompts state
+that this cache is stale-prone orientation only, and that agents must inspect
+source files and PR diffs directly for correctness claims. Disable it with
+`--no-agent-memory`, force a refresh with `--refresh-agent-memory`, customize
+the location with `--agent-memory-dir PATH`, or refresh only test command facts
+with `--refresh-test-profile`.
+
 By default Claude is the coder and Codex is the reviewer. Reverse that with:
 
 ```bash

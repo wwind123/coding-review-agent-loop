@@ -8,6 +8,7 @@ from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .config import AgentLoopConfig, reviewers
 from .github import PullRequestMetadata
+from .memory import AgentMemoryContext, format_agent_memory_context
 
 
 def format_agent_list(agents: Sequence[AgentName]) -> str:
@@ -19,13 +20,25 @@ def format_agent_list(agents: Sequence[AgentName]) -> str:
     return f"{', '.join(names[:-1])}, and {names[-1]}"
 
 
-def build_issue_prompt(issue_number: int, config: AgentLoopConfig) -> str:
+def _memory_block(memory: AgentMemoryContext | None) -> str:
+    text = format_agent_memory_context(memory)
+    if not text:
+        return ""
+    return f"\n\nAgent memory context:\n{text}\n"
+
+
+def build_issue_prompt(
+    issue_number: int,
+    config: AgentLoopConfig,
+    memory: AgentMemoryContext | None = None,
+) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder)
     return f"""Fix GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout as your workspace. Create a branch, implement the fix,
 run relevant tests, commit, push, and open a pull request against {config.base}.
+{_memory_block(memory)}
 
 Do not wait for {reviewer_name} yourself; this local orchestrator will run {reviewer_name} after
 you create the PR. In your final response, include the PR number using exactly
@@ -42,13 +55,18 @@ Use blocking here to hand the PR to {reviewer_name} for review. Sign the respons
 """
 
 
-def build_task_prompt(task_text: str, config: AgentLoopConfig) -> str:
+def build_task_prompt(
+    task_text: str,
+    config: AgentLoopConfig,
+    memory: AgentMemoryContext | None = None,
+) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder)
     return f"""You have been given a free-form task to implement in {config.repo}.
 
 Task:
 {task_text}
+{_memory_block(memory)}
 
 Use this local checkout as your workspace. Decide between two paths:
 
@@ -77,6 +95,7 @@ def build_task_clarification_prompt(
     task_text: str,
     history: Sequence[tuple[str, str]],
     config: AgentLoopConfig,
+    memory: AgentMemoryContext | None = None,
 ) -> str:
     coder_signature = agent_signature(config.coder)
     qa_blocks = "\n\n".join(
@@ -88,6 +107,7 @@ def build_task_clarification_prompt(
 
 Original task:
 {task_text}
+{_memory_block(memory)}
 
 Clarification so far:
 
@@ -114,6 +134,7 @@ def build_review_prompt(
     *,
     reviewer: AgentName,
     pr_metadata: PullRequestMetadata | None = None,
+    memory: AgentMemoryContext | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer)
@@ -144,6 +165,7 @@ PR metadata:
 {url_line}
 Use this PR metadata as authoritative. Do not spend time discovering the PR
 branch.
+{_memory_block(memory)}
 
 Suggested commands:
 - {config.gh_cmd} pr view {metadata.number} --repo {metadata.repo} --json title,body,headRefName,baseRefName,headRefOid,comments,reviews
@@ -177,6 +199,7 @@ def build_followup_prompt(
     round_number: int,
     review: str,
     config: AgentLoopConfig,
+    memory: AgentMemoryContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder)
@@ -185,6 +208,7 @@ def build_followup_prompt(
 Address the review below in this local checkout. Pull/sync the PR branch if
 needed, implement fixes, run relevant tests, commit, and push to the same PR.
 Do not create a new PR.
+{_memory_block(memory)}
 
 {reviewer_name} review:
 

@@ -43,6 +43,10 @@ class AgentLoopConfig:
     quiet: bool
     log_dir: Path
     progress_interval_seconds: int
+    agent_memory: bool
+    refresh_agent_memory: bool
+    agent_memory_dir: Path
+    refresh_test_profile: bool
     auto_agent_dirs: tuple[AgentName, ...] = ()
 
     def __post_init__(self) -> None:
@@ -252,5 +256,13 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         quiet=args.quiet,
         log_dir=(primary_dir / args.log_dir if not args.log_dir.is_absolute() else args.log_dir),
         progress_interval_seconds=args.progress_interval_seconds,
+        agent_memory=args.agent_memory,
+        refresh_agent_memory=args.refresh_agent_memory,
+        agent_memory_dir=(
+            primary_dir / args.agent_memory_dir
+            if not args.agent_memory_dir.is_absolute()
+            else args.agent_memory_dir
+        ),
+        refresh_test_profile=args.refresh_test_profile,
         auto_agent_dirs=auto_agent_dirs,
     )

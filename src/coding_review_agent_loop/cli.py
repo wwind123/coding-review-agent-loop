@@ -180,6 +180,36 @@ def build_parser() -> argparse.ArgumentParser:
             default=30,
             help="How often to print long-running agent heartbeats (default: 30).",
         )
+        memory_group = subparser.add_mutually_exclusive_group()
+        memory_group.add_argument(
+            "--agent-memory",
+            dest="agent_memory",
+            action="store_true",
+            default=True,
+            help="Enable repo-local advisory agent memory (default).",
+        )
+        memory_group.add_argument(
+            "--no-agent-memory",
+            dest="agent_memory",
+            action="store_false",
+            help="Disable repo-local advisory agent memory.",
+        )
+        subparser.add_argument(
+            "--refresh-agent-memory",
+            action="store_true",
+            help="Force regeneration of repo-level memory files before invoking agents.",
+        )
+        subparser.add_argument(
+            "--agent-memory-dir",
+            type=Path,
+            default=Path(".agent-loop") / "memory",
+            help="Directory for repo memory, relative to the coder checkout by default.",
+        )
+        subparser.add_argument(
+            "--refresh-test-profile",
+            action="store_true",
+            help="Regenerate the cached execution/test profile before invoking agents.",
+        )
 
     issue = subparsers.add_parser("issue", help="Ask the coder to fix an issue, then review it.")
     issue.add_argument("issue_number", type=int)
