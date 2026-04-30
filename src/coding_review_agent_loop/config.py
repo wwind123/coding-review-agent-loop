@@ -219,8 +219,6 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         raise AgentLoopError("--ci-poll-interval-seconds must be greater than zero.")
     if args.progress_interval_seconds <= 0:
         raise AgentLoopError("--progress-interval-seconds must be greater than zero.")
-    if args.approved_followups not in {"ignore", "summarize"}:
-        raise AgentLoopError("--approved-followups must be one of: ignore, summarize.")
     return AgentLoopConfig(
         repo=repo,
         claude_dir=claude_dir,
