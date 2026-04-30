@@ -20,7 +20,11 @@ from coding_review_agent_loop.cli import (
     run_pr_loop,
     run_task_loop,
 )
-from coding_review_agent_loop.config import default_agent_memory_dir, default_agent_workdir
+from coding_review_agent_loop.config import (
+    default_agent_memory_dir,
+    default_agent_workdir,
+    default_cache_root,
+)
 from coding_review_agent_loop.protocol import parse_non_blocking_followups
 
 
@@ -897,8 +901,11 @@ def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path):
     assert set(github_or_test_cwds) == {config.claude_dir}
 
 
-def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts():
+def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts(monkeypatch, tmp_path):
     parser = build_parser()
+    cache_home = tmp_path / "cache"
+    monkeypatch.setattr("coding_review_agent_loop.config.sys.platform", "linux")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
     args = parser.parse_args([
         "task",
         "Fix the bug",
@@ -916,7 +923,9 @@ def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts():
     assert config.claude_dir == default_agent_workdir("OWNER/REPO", "claude").resolve()
     assert config.gemini_dir == default_agent_workdir("OWNER/REPO", "gemini").resolve()
     assert set(config.auto_agent_dirs) == {"claude", "codex", "gemini"}
-    assert config.agent_memory_dir == default_agent_memory_dir("OWNER/REPO").resolve()
+    assert config.agent_memory_dir == (
+        cache_home / "coding-review-agent-loop" / "repos" / "OWNER-REPO" / "memory"
+    ).resolve()
 
 
 @pytest.mark.parametrize("repo", ["OWNER", "OWNER/", "/REPO", "OWNER/REPO/EXTRA"])
@@ -933,6 +942,34 @@ def test_default_agent_memory_dir_uses_xdg_cache_and_repo_scope(monkeypatch, tmp
     assert default_agent_memory_dir("OWNER/REPO") == (
         cache_home / "coding-review-agent-loop" / "repos" / "OWNER-REPO" / "memory"
     )
+
+
+@pytest.mark.parametrize(
+    ("platform", "home_parts"),
+    [
+        ("darwin", ("Library", "Caches", "coding-review-agent-loop")),
+        ("win32", ("AppData", "Local", "coding-review-agent-loop", "Cache")),
+    ],
+)
+def test_default_cache_root_uses_platform_home_fallbacks(
+    monkeypatch,
+    tmp_path,
+    platform,
+    home_parts,
+):
+    monkeypatch.setattr("coding_review_agent_loop.config.sys.platform", platform)
+    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+
+    assert default_cache_root() == tmp_path.joinpath(*home_parts)
+
+
+def test_default_cache_root_uses_windows_local_app_data(monkeypatch, tmp_path):
+    local_app_data = tmp_path / "local-app-data"
+    monkeypatch.setattr("coding_review_agent_loop.config.sys.platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+
+    assert default_cache_root() == local_app_data / "coding-review-agent-loop" / "Cache"
 
 
 @pytest.mark.parametrize("repo", ["OWNER", "OWNER/", "/REPO", "OWNER/REPO/EXTRA"])
@@ -1034,6 +1071,23 @@ def test_agent_memory_flags_configure_memory_dir_and_refresh(tmp_path):
     assert config.refresh_agent_memory is True
     assert config.refresh_test_profile is True
     assert config.agent_memory_dir == codex_dir / "custom-memory"
+
+
+def test_agent_memory_explicit_absolute_dir_is_resolved(tmp_path):
+    parser = build_parser()
+    memory_dir = tmp_path / "memory-parent" / ".." / "agent-memory"
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--agent-memory-dir",
+        str(memory_dir),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.agent_memory_dir == memory_dir.resolve()
 
 
 def test_agent_memory_default_ignores_active_coder_workdir(tmp_path, monkeypatch):
