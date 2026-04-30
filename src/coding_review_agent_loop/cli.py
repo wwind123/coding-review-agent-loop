@@ -210,6 +210,15 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="Regenerate the cached execution/test profile before invoking agents.",
         )
+        subparser.add_argument(
+            "--approved-followups",
+            choices=("ignore", "summarize"),
+            default="ignore",
+            help=(
+                "How to handle structured non-blocking follow-ups in approved reviews "
+                "(default: ignore)."
+            ),
+        )
 
     issue = subparsers.add_parser("issue", help="Ask the coder to fix an issue, then review it.")
     issue.add_argument("issue_number", type=int)

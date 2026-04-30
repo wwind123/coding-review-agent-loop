@@ -27,6 +27,7 @@ from .prompts import (
     format_agent_list,
 )
 from .protocol import is_clarification_request, parse_agent_state, parse_pr_number
+from .protocol import ApprovedFollowup, parse_non_blocking_followups
 from .runner import Runner
 from .workdirs import active_workdir
 
@@ -37,6 +38,22 @@ def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
     log(config, f"Running local test command: {' '.join(config.test_command)}")
     runner.run(config.test_command, cwd=active_workdir(config))
     log(config, "Local test command passed")
+
+
+def _format_approved_followup_summary(pr_number: int, followups: list[ApprovedFollowup]) -> str:
+    lines = [
+        f"Approved-review non-blocking follow-ups for PR #{pr_number}:",
+        "",
+    ]
+    for followup in followups:
+        lines.append(f"- {followup.text} ({followup.reviewer})")
+    lines.extend(
+        [
+            "",
+            "These were mentioned in approved reviews and did not block merge readiness.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def run_issue_loop(runner: Runner, *, issue_number: int, config: AgentLoopConfig) -> int:
@@ -189,6 +206,7 @@ def run_pr_loop(
     for round_number in range(1, config.max_rounds + 1):
         coder_name = agent_display_name(config.coder)
         blocking_reviews: list[tuple[str, str]] = []
+        approved_followups: list[ApprovedFollowup] = []
         pr_metadata = get_pr_metadata(runner, config=config, pr_number=pr_number)
         for reviewer in configured_reviewers:
             reviewer_name = agent_display_name(reviewer)
@@ -216,8 +234,15 @@ def run_pr_loop(
             log(config, f"Round {round_number}: {reviewer_name} state is {review_state}")
             if review_state == "blocking":
                 blocking_reviews.append((reviewer_name, review_output))
+            elif config.approved_followups != "ignore":
+                approved_followups.extend(
+                    parse_non_blocking_followups(review_output, reviewer=reviewer_name)
+                )
 
         if not blocking_reviews:
+            if config.approved_followups == "summarize" and approved_followups:
+                body = _format_approved_followup_summary(pr_number, approved_followups)
+                post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
             run_optional_tests(runner, config)
             if config.auto_merge:
                 wait_for_ci(runner, config, pr_number)

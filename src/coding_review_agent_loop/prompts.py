@@ -178,6 +178,12 @@ commands, or produce a blocking review explaining the limitation.
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
+If you approve but notice worthwhile non-blocking cleanup, list it under this
+exact heading:
+
+### Non-blocking follow-ups
+
+Use blocking only for issues that should prevent merge.
 All configured reviewers ({reviewer_group}) must approve in the same round for
 the pull request to be considered approved.
 

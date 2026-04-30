@@ -161,6 +161,21 @@ separate coding and review passes:
 agent-loop pr 456 --repo OWNER/REPO --reviewer codex --reviewer claude
 ```
 
+Approved reviews may include non-blocking cleanup under:
+
+```md
+### Non-blocking follow-ups
+- Add a follow-up test.
+```
+
+By default those follow-ups do not change approval semantics and are ignored by
+the loop. To keep a grouped record on the PR without sending the work back to
+the coder, use:
+
+```bash
+agent-loop pr 456 --repo OWNER/REPO --approved-followups summarize
+```
+
 For trusted local automation that must run without approval prompts:
 
 ```bash
