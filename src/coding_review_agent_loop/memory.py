@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .logging import log
-from .runner import Runner
+from .runner import Runner, ensure_log_dir_ignored
 from .workdirs import active_workdir
 
 if TYPE_CHECKING:
@@ -50,11 +50,14 @@ def prepare_agent_memory(runner: Runner, config: AgentLoopConfig) -> AgentMemory
     last_analyzed_commit = _read_optional(memory_dir / "last-analyzed-commit")
     changed_files = _changed_files(
         runner,
+        config,
         workdir,
         last_analyzed_commit=last_analyzed_commit,
         current_commit=current_commit,
     )
     tracked_files = _git_lines(runner, workdir, ("ls-files",))
+    tracked_file_set = set(tracked_files)
+    _ensure_memory_parent_ignored(memory_dir)
 
     if config.refresh_agent_memory or not (memory_dir / "repo-summary.md").exists():
         _write_repo_summary(memory_dir / "repo-summary.md", config, current_commit, tracked_files)
@@ -73,7 +76,7 @@ def prepare_agent_memory(runner: Runner, config: AgentLoopConfig) -> AgentMemory
         _write_toolchain(memory_dir / "toolchain.json", tracked_files)
 
     for rel_path in changed_files[:25]:
-        if rel_path in tracked_files:
+        if rel_path in tracked_file_set:
             _write_file_summary(memory_dir / "file-summaries", workdir, rel_path)
 
     context = load_agent_memory(config)
@@ -172,6 +175,7 @@ def _read_optional(path: Path) -> str | None:
 
 def _changed_files(
     runner: Runner,
+    config: AgentLoopConfig,
     cwd: Path,
     *,
     last_analyzed_commit: str | None,
@@ -187,8 +191,20 @@ def _changed_files(
         check=False,
     )
     if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no command output"
+        log(
+            config,
+            "Could not diff agent memory baseline "
+            f"{last_analyzed_commit}..{current_commit}; treating all tracked files as changed. "
+            f"git output: {_trim_text(detail, max_chars=500)}",
+        )
         return tuple(_git_lines(runner, cwd, ("ls-files",)))
     return tuple(line for line in result.stdout.splitlines() if line.strip())
+
+
+def _ensure_memory_parent_ignored(memory_dir: Path) -> None:
+    if memory_dir.parent.name == ".agent-loop":
+        ensure_log_dir_ignored(memory_dir.parent)
 
 
 def _write_repo_summary(
