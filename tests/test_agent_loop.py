@@ -958,7 +958,7 @@ def test_default_cache_root_uses_platform_home_fallbacks(
     home_parts,
 ):
     monkeypatch.setattr("coding_review_agent_loop.config.sys.platform", platform)
-    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
 
     assert default_cache_root() == tmp_path.joinpath(*home_parts)
