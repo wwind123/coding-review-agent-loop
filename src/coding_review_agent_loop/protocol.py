@@ -11,7 +11,9 @@ STATE_RE = re.compile(r"<!--\s*AGENT_STATE:\s*(approved|blocking)\s*-->", re.I)
 PR_RE = re.compile(r"<!--\s*AGENT_PR:\s*(\d+)\s*-->", re.I)
 GH_PR_URL_RE = re.compile(r"/pull/(\d+)(?:\b|$)")
 CLARIFY_RE = re.compile(r"<!--\s*AGENT_CLARIFY\s*-->", re.I)
-FOLLOWUP_HEADING_RE = re.compile(r"^\s*#{2,6}\s+non[- ]blocking follow[- ]ups\s*$", re.I)
+SAME_PR_FOLLOWUP_HEADING_RE = re.compile(r"^\s*#{2,6}\s+same[- ]pr follow[- ]ups\s*$", re.I)
+FUTURE_FOLLOWUP_HEADING_RE = re.compile(r"^\s*#{2,6}\s+future follow[- ]ups\s*$", re.I)
+LEGACY_FOLLOWUP_HEADING_RE = re.compile(r"^\s*#{2,6}\s+non[- ]blocking follow[- ]ups\s*$", re.I)
 ANY_HEADING_RE = re.compile(r"^\s*#{1,6}\s+\S")
 HTML_COMMENT_RE = re.compile(r"^\s*<!--.*-->\s*$")
 SIGNATURE_RE = re.compile(r"^\s*--\s+\S")
@@ -22,6 +24,12 @@ BULLET_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(?P<text>.+?)\s*$")
 class ApprovedFollowup:
     reviewer: str
     text: str
+
+
+@dataclass(frozen=True)
+class ApprovedFollowups:
+    same_pr: list[ApprovedFollowup]
+    future: list[ApprovedFollowup]
 
 
 def parse_agent_state(text: str) -> str:
@@ -46,33 +54,38 @@ def is_clarification_request(text: str) -> bool:
     return bool(CLARIFY_RE.search(text))
 
 
-def parse_non_blocking_followups(text: str, *, reviewer: str) -> list[ApprovedFollowup]:
-    """Extract bullets from reviewer-approved non-blocking follow-up sections."""
-    followups: list[ApprovedFollowup] = []
-    in_section = False
+def parse_approved_followups(text: str, *, reviewer: str) -> ApprovedFollowups:
+    """Extract same-PR and future follow-up bullets from an approved review."""
+    same_pr: list[ApprovedFollowup] = []
+    future: list[ApprovedFollowup] = []
+    active: list[ApprovedFollowup] | None = None
     current: list[str] = []
 
     def flush_current() -> None:
-        if current:
+        if active is not None and current:
             item = " ".join(part.strip() for part in current if part.strip()).strip()
             if item:
-                followups.append(ApprovedFollowup(reviewer=reviewer, text=item))
+                active.append(ApprovedFollowup(reviewer=reviewer, text=item))
             current.clear()
 
     for line in text.splitlines():
-        if FOLLOWUP_HEADING_RE.match(line):
+        if SAME_PR_FOLLOWUP_HEADING_RE.match(line):
             flush_current()
-            in_section = True
+            active = same_pr
             continue
-        if not in_section:
+        if FUTURE_FOLLOWUP_HEADING_RE.match(line) or LEGACY_FOLLOWUP_HEADING_RE.match(line):
+            flush_current()
+            active = future
+            continue
+        if active is None:
             continue
         if ANY_HEADING_RE.match(line):
             flush_current()
-            in_section = False
+            active = None
             continue
         if HTML_COMMENT_RE.match(line) or SIGNATURE_RE.match(line):
             flush_current()
-            in_section = False
+            active = None
             continue
         bullet = BULLET_RE.match(line)
         if bullet:
@@ -83,4 +96,9 @@ def parse_non_blocking_followups(text: str, *, reviewer: str) -> list[ApprovedFo
             current.append(line)
 
     flush_current()
-    return followups
+    return ApprovedFollowups(same_pr=same_pr, future=future)
+
+
+def parse_non_blocking_followups(text: str, *, reviewer: str) -> list[ApprovedFollowup]:
+    """Extract legacy non-blocking follow-ups as future follow-ups."""
+    return parse_approved_followups(text, reviewer=reviewer).future

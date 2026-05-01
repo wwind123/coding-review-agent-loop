@@ -215,11 +215,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.add_argument(
             "--approved-followups",
-            choices=("ignore", "summarize", "issue"),
+            choices=("ignore", "summarize", "issue", "fix-and-summarize", "fix-and-issue"),
             default="ignore",
             help=(
-                "How to handle structured non-blocking follow-ups in approved reviews "
-                "('ignore', 'summarize', or 'issue'; default: ignore)."
+                "How to handle structured follow-ups in approved reviews "
+                "('ignore', 'summarize', 'issue', 'fix-and-summarize', or "
+                "'fix-and-issue'; default: ignore)."
             ),
         )
 

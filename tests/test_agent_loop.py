@@ -25,7 +25,7 @@ from coding_review_agent_loop.config import (
     default_agent_workdir,
     default_cache_root,
 )
-from coding_review_agent_loop.protocol import parse_non_blocking_followups
+from coding_review_agent_loop.protocol import parse_approved_followups, parse_non_blocking_followups
 
 
 class FakeRunner(Runner):
@@ -451,6 +451,35 @@ def test_parse_non_blocking_followups_extracts_bullets_only_from_section():
     ]
 
 
+def test_parse_approved_followups_extracts_same_pr_and_future_independently():
+    review = """
+    LGTM with cleanup.
+
+    ### Same-PR follow-ups
+    - Rename the helper for clarity.
+      Keep the public behavior unchanged.
+
+    ### Future follow-ups
+    1. Add an integration fixture later.
+
+    ### Non-blocking follow-ups
+    - Legacy future item.
+
+    <!-- AGENT_STATE: approved -->
+    -- OpenAI Codex
+    """
+
+    followups = parse_approved_followups(review, reviewer="OpenAI Codex")
+
+    assert [(item.reviewer, item.text) for item in followups.same_pr] == [
+        ("OpenAI Codex", "Rename the helper for clarity. Keep the public behavior unchanged.")
+    ]
+    assert [(item.reviewer, item.text) for item in followups.future] == [
+        ("OpenAI Codex", "Add an integration fixture later."),
+        ("OpenAI Codex", "Legacy future item."),
+    ]
+
+
 @pytest.mark.parametrize("terminator", ["<!-- AGENT_STATE: approved -->", "-- OpenAI Codex"])
 def test_parse_non_blocking_followups_stops_at_final_markers(terminator):
     review = f"""
@@ -589,8 +618,21 @@ def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
     ) in prompt
     assert "gh pr diff 77 --repo OWNER/REPO" in prompt
     assert "requires confirmation in non-interactive mode" in prompt
-    assert "### Non-blocking follow-ups" in prompt
+    assert "### Future follow-ups" in prompt
+    assert "legacy heading `### Non-blocking follow-ups`" in prompt
     assert "Use blocking only for issues that should prevent merge." in prompt
+
+
+def test_review_prompt_allows_same_pr_followups_for_fix_modes(tmp_path):
+    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    config = make_config(tmp_path, approved_followups="fix-and-summarize")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "### Same-PR follow-ups" in prompt
+    assert "### Future follow-ups" in prompt
+    assert "will be sent back to Claude and require another review" in prompt
 
 
 def test_agent_memory_is_created_and_added_to_review_prompt(tmp_path):
@@ -774,10 +816,10 @@ def test_pr_loop_summarizes_approved_followups_from_multiple_reviewers(tmp_path)
 
     assert len(runner.comments) == 3
     summary = runner.comments[-1]
-    assert summary.startswith("Approved-review non-blocking follow-ups for PR #77:")
+    assert summary.startswith("Approved-review future follow-ups for PR #77:")
     assert "- Add cleanup docs. (Codex)" in summary
     assert "- Add regression coverage. (Claude)" in summary
-    assert "did not block merge readiness" in summary
+    assert "future work and did not block merge readiness" in summary
     assert summary.endswith("-- coding-review-agent-loop")
 
 
@@ -803,28 +845,48 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
     assert len(runner.comments) == 2
     assert runner.issues == [
         {
-            "title": "Follow up approved review note: Add cleanup docs.",
+            "title": "Follow up future review note: Add cleanup docs.",
             "body": (
-                "Non-blocking follow-up from approved review on PR #77.\n\n"
+                "Future follow-up from approved review on PR #77.\n\n"
                 "Reviewer: Codex\n\n"
                 "Follow-up:\n"
                 "- Add cleanup docs.\n\n"
-                "This was mentioned in an approved review and did not block merge readiness.\n\n"
+                "This was mentioned in an approved review as future work and did not block merge readiness.\n\n"
                 "-- OpenAI Codex"
             ),
         },
         {
-            "title": "Follow up approved review note: Add regression coverage.",
+            "title": "Follow up future review note: Add regression coverage.",
             "body": (
-                "Non-blocking follow-up from approved review on PR #77.\n\n"
+                "Future follow-up from approved review on PR #77.\n\n"
                 "Reviewer: Claude\n\n"
                 "Follow-up:\n"
                 "- Add regression coverage.\n\n"
-                "This was mentioned in an approved review and did not block merge readiness.\n\n"
+                "This was mentioned in an approved review as future work and did not block merge readiness.\n\n"
                 "-- OpenAI Codex"
             ),
         },
     ]
+
+
+@pytest.mark.parametrize("mode", ["summarize", "issue"])
+def test_pr_loop_treats_same_pr_followups_as_blocking_without_fix_mode(tmp_path, mode):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves with cleanup.\n\n"
+            "### Same-PR follow-ups\n"
+            "- Rename the helper before merge.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+    )
+    config = make_config(tmp_path, approved_followups=mode, max_rounds=1)
+
+    with pytest.raises(AgentLoopError, match="still reported blocking"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert len(runner.comments) == 1
+    assert not runner.issues
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 
 def test_pr_loop_caps_approved_followup_issues(tmp_path):
@@ -843,13 +905,107 @@ def test_pr_loop_caps_approved_followup_issues(tmp_path):
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert [issue["title"] for issue in runner.issues] == [
-        "Follow up approved review note: Follow up one.",
-        "Follow up approved review note: Follow up two.",
-        "Follow up approved review note: Follow up three.",
+        "Follow up future review note: Follow up one.",
+        "Follow up future review note: Follow up two.",
+        "Follow up future review note: Follow up three.",
     ]
     assert len(runner.comments) == 2
     assert "Skipped 1 additional item(s) to avoid issue noise" in runner.comments[-1]
     assert runner.comments[-1].endswith("-- coding-review-agent-loop")
+
+
+def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rereviews(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves with cleanup.\n\n"
+            "### Same-PR follow-ups\n"
+            "- Rename the helper before merge.\n\n"
+            "### Future follow-ups\n"
+            "- Add broader integration coverage later.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Codex approves final pass.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=["Renamed helper.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+    )
+    config = make_config(tmp_path, approved_followups="fix-and-summarize")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    agent_commands = [cmd[:2] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
+    assert agent_commands == [["codex", "exec"], ["claude", "--print"], ["codex", "exec"]]
+    assert len(runner.comments) == 4
+    followup_prompt = next(
+        cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"] and "Same-PR follow-ups" in cmd[-1]
+    )
+    assert "Rename the helper before merge." in followup_prompt
+    summary = runner.comments[-1]
+    assert summary.startswith("Approved-review future follow-ups for PR #77:")
+    assert "- Add broader integration coverage later. (Codex)" in summary
+
+
+def test_pr_loop_fix_and_issue_retains_future_followups_across_same_pr_round(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves with cleanup.\n\n"
+            "### Same-PR follow-ups\n"
+            "- Tighten the validation message.\n\n"
+            "### Future follow-ups\n"
+            "- Add a separate migration dry-run command.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Codex approves final pass.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=["Tightened message.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+    )
+    config = make_config(tmp_path, approved_followups="fix-and-issue")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(runner.issues) == 1
+    assert runner.issues[0]["title"] == "Follow up future review note: Add a separate migration dry-run command."
+    commands = [cmd[:3] for cmd, _cwd in runner.commands]
+    assert commands.count(["gh", "issue", "create"]) == 1
+
+
+def test_pr_loop_fix_and_summarize_retains_future_followups_from_multiple_reviewers(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves with cleanup.\n\n"
+            "### Same-PR follow-ups\n"
+            "- Add a small assertion before merge.\n\n"
+            "### Future follow-ups\n"
+            "- Add Codex's larger follow-up later.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Codex approves final pass.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=[
+            "Claude approves.\n\n"
+            "### Future follow-ups\n"
+            "- Add Claude's larger follow-up later.\n"
+            "<!-- AGENT_STATE: approved -->\n-- Anthropic Claude",
+            "Claude approves final pass.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude",
+        ],
+        gemini_outputs=["Added assertion.\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini"],
+    )
+    config = make_config(
+        tmp_path,
+        coder="gemini",
+        reviewer=("codex", "claude"),
+        approved_followups="fix-and-summarize",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    agent_commands = [cmd[:2] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"], ["gemini"])]
+    assert agent_commands == [
+        ["codex", "exec"],
+        ["claude", "--print"],
+        ["gemini", "--prompt"],
+        ["codex", "exec"],
+        ["claude", "--print"],
+    ]
+    summary = runner.comments[-1]
+    assert "- Add Codex's larger follow-up later. (Codex)" in summary
+    assert "- Add Claude's larger follow-up later. (Claude)" in summary
 
 
 def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):
@@ -1070,7 +1226,7 @@ def test_default_agent_memory_dir_rejects_invalid_repo_formats(repo):
         default_agent_memory_dir(repo)
 
 
-@pytest.mark.parametrize("mode", ["ignore", "summarize", "issue"])
+@pytest.mark.parametrize("mode", ["ignore", "summarize", "issue", "fix-and-summarize", "fix-and-issue"])
 def test_approved_followups_cli_mode_is_configurable(tmp_path, mode):
     parser = build_parser()
     args = parser.parse_args([
