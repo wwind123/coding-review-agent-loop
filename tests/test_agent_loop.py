@@ -25,6 +25,15 @@ from coding_review_agent_loop.config import (
     default_agent_workdir,
     default_cache_root,
 )
+from coding_review_agent_loop.prompts import (
+    SCRATCH_FILE_GUIDANCE,
+    build_followup_prompt,
+    build_issue_prompt,
+    build_review_prompt,
+    build_same_pr_followup_prompt,
+    build_task_clarification_prompt,
+    build_task_prompt,
+)
 from coding_review_agent_loop.protocol import parse_approved_followups, parse_non_blocking_followups
 
 
@@ -623,6 +632,28 @@ def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
     assert "### Future follow-ups" in prompt
     assert "legacy heading `### Non-blocking follow-ups`" in prompt
     assert "Use blocking only for issues that should prevent merge." in prompt
+
+
+def test_agent_prompts_keep_scratch_files_outside_repo_worktree(tmp_path):
+    config = make_config(tmp_path)
+
+    prompts = [
+        build_issue_prompt(56, config),
+        build_task_prompt("Fix the bug", config),
+        build_task_clarification_prompt(
+            "Fix the bug",
+            [("Which bug?", "The failing parser bug.")],
+            config,
+        ),
+        build_review_prompt(77, 1, config, reviewer="codex"),
+        build_followup_prompt(77, 2, "Please add a regression test.", config),
+        build_same_pr_followup_prompt(77, 2, "Please rename the helper.", config),
+    ]
+
+    for prompt in prompts:
+        assert SCRATCH_FILE_GUIDANCE in prompt
+        assert "/tmp/coding-review-agent-loop/scratch/" in prompt
+        assert "Do not create temporary files in the repo worktree" in prompt
 
 
 def test_review_prompt_allows_same_pr_followups_for_fix_modes(tmp_path):
@@ -1448,8 +1479,11 @@ def test_clean_existing_auto_agent_dir_is_synced(tmp_path):
     assert ["git", "pull", "--ff-only", "origin", "main"] in commands
 
 
-def test_dirty_existing_auto_agent_dir_fails_clearly(tmp_path):
-    runner = FakeRunner(git_status=" M file.py\n")
+def test_dirty_existing_auto_agent_dir_is_cleaned_before_reuse(tmp_path, capsys):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        git_status=" M file.py\n?? scratch.txt\n",
+    )
     codex_dir = tmp_path / "codex"
     codex_dir.mkdir()
     config = make_config(
@@ -1457,14 +1491,39 @@ def test_dirty_existing_auto_agent_dir_fails_clearly(tmp_path):
         codex_dir=codex_dir,
         reviewer="codex",
         auto_agent_dirs=("codex",),
+        quiet=False,
         create_dirs=False,
     )
     config.claude_dir.mkdir(parents=True)
     config.gemini_dir.mkdir(parents=True)
 
-    with pytest.raises(AgentLoopError, match="dirty"):
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert ["git", "reset", "--hard"] in commands
+    assert ["git", "clean", "-fd"] in commands
+    assert ["git", "fetch", "origin"] in commands
+    assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    captured = capsys.readouterr()
+    assert f"Cleaning dirty default codex workdir before reuse: {codex_dir}" in captured.err
+
+
+def test_dirty_explicit_agent_dir_still_fails_clearly(tmp_path):
+    runner = FakeRunner(git_status=" M file.py\n")
+    codex_dir = tmp_path / "codex"
+    config = make_config(
+        tmp_path,
+        codex_dir=codex_dir,
+        reviewer="codex",
+    )
+    (codex_dir / ".git").mkdir()
+
+    with pytest.raises(AgentLoopError, match="Explicit codex workdir is dirty"):
         run_pr_loop(runner, pr_number=77, config=config)
 
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert ["git", "reset", "--hard"] not in commands
+    assert ["git", "clean", "-fd"] not in commands
     assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
 
 

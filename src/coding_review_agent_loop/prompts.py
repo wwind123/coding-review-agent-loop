@@ -27,6 +27,14 @@ def _memory_block(memory: AgentMemoryContext | None) -> str:
     return f"Agent memory context:\n{text}\n"
 
 
+SCRATCH_FILE_GUIDANCE = (
+    "If you need temporary scratch files while inspecting diffs or command output, "
+    "write them outside the repository checkout, for example under "
+    "/tmp/coding-review-agent-loop/scratch/. Do not create temporary files in the "
+    "repo worktree unless they are intended project changes."
+)
+
+
 def build_issue_prompt(
     issue_number: int,
     config: AgentLoopConfig,
@@ -38,6 +46,7 @@ def build_issue_prompt(
 
 Use this local checkout as your workspace. Create a branch, implement the fix,
 run relevant tests, commit, push, and open a pull request against {config.base}.
+{SCRATCH_FILE_GUIDANCE}
 {_memory_block(memory)}
 
 Do not wait for {reviewer_name} yourself; this local orchestrator will run {reviewer_name} after
@@ -69,6 +78,7 @@ Task:
 {_memory_block(memory)}
 
 Use this local checkout as your workspace. Decide between two paths:
+{SCRATCH_FILE_GUIDANCE}
 
 (a) If the task is clear enough to implement, create a branch, implement the
     change, run relevant tests, commit, push, and open a pull request against
@@ -116,6 +126,7 @@ Clarification so far:
 Now proceed. Strongly prefer to implement the task and open a PR. Only ask
 again if a critical detail is still missing. Use the same response markers as
 before:
+{SCRATCH_FILE_GUIDANCE}
 
 - For implementation: include both <!-- AGENT_PR: <number> --> and
   <!-- AGENT_STATE: blocking --> at the end of your final response.
@@ -206,6 +217,7 @@ commands, or produce a blocking review explaining the limitation.
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
+{SCRATCH_FILE_GUIDANCE}
 {followup_guidance}
 Use blocking only for issues that should prevent merge.
 All configured reviewers ({reviewer_group}) must approve in the same round for
@@ -238,6 +250,7 @@ def build_followup_prompt(
 Address the review below in this local checkout. Pull/sync the PR branch if
 needed, implement fixes, run relevant tests, commit, and push to the same PR.
 Do not create a new PR.
+{SCRATCH_FILE_GUIDANCE}
 {_memory_block(memory)}
 
 {reviewer_name} review:
@@ -269,6 +282,7 @@ def build_same_pr_followup_prompt(
 Address the follow-up items below in this local checkout. Pull/sync the PR
 branch if needed, implement fixes, run relevant tests, commit, and push to the
 same PR. Do not create a new PR.
+{SCRATCH_FILE_GUIDANCE}
 {_memory_block(memory)}
 
 Same-PR follow-ups:

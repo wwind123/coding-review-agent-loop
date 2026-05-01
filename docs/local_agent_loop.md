@@ -185,9 +185,15 @@ by repo and agent:
 The tool prints the selected default workdirs. If a default checkout does not
 exist, it runs `gh repo clone OWNER/REPO <path>`. If it already exists and is a
 clean checkout for the requested repo, it fetches origin and fast-forwards the
-configured base branch. If the checkout is dirty, points at another repo, or is
-not a git checkout, the command fails clearly instead of overwriting local
-work.
+configured base branch. Default checkouts are disposable tool-owned temp
+workdirs: if one is dirty, the tool logs the cleanup, runs `git reset --hard`
+and `git clean -fd` inside that generated repo checkout, then syncs it to the
+configured base branch. A default path that points at another repo or is not a
+git checkout still fails clearly.
+
+Explicit `--claude-dir`, `--codex-dir`, and `--gemini-dir` workdirs are treated
+conservatively. If an explicit git checkout is dirty, the command fails and asks
+you to commit, stash, or clean it yourself.
 
 These temporary checkouts may disappear after reboot or `/tmp` cleanup. Large
 projects and long-lived agent setups should use explicit persistent workdirs to

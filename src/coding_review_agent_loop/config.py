@@ -132,6 +132,29 @@ def _run_git(runner: Runner, path: Path, args: tuple[str, ...], *, check: bool =
     return runner.run(("git", *args), cwd=path, check=check)
 
 
+def ensure_explicit_workdir(
+    path: Path,
+    *,
+    option_name: str,
+    agent: AgentName,
+    runner: Runner,
+) -> None:
+    ensure_workdir(path, option_name)
+    if not (path / ".git").exists():
+        return
+
+    git_check = _run_git(runner, path, ("rev-parse", "--is-inside-work-tree"), check=False)
+    if git_check.returncode != 0 or git_check.stdout.strip() != "true":
+        return
+
+    status = _run_git(runner, path, ("status", "--porcelain")).stdout.strip()
+    if status:
+        raise AgentLoopError(
+            f"Explicit {agent} workdir is dirty: {path}. "
+            "Commit, stash, or clean it before rerunning."
+        )
+
+
 def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfig, runner: Runner) -> None:
     if not path.exists():
         try:
@@ -162,10 +185,9 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
 
     status = _run_git(runner, path, ("status", "--porcelain")).stdout.strip()
     if status:
-        raise AgentLoopError(
-            f"Default {agent} workdir is dirty: {path}. "
-            "Commit, stash, or clean it before rerunning, or pass an explicit agent directory."
-        )
+        log(config, f"Cleaning dirty default {agent} workdir before reuse: {path}")
+        _run_git(runner, path, ("reset", "--hard"))
+        _run_git(runner, path, ("clean", "-fd"))
 
     _run_git(runner, path, ("fetch", "origin"))
     checkout = _run_git(runner, path, ("checkout", config.base), check=False)
@@ -188,7 +210,7 @@ def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner) -> None:
             log(config, f"Using default {agent} workdir: {path}")
             ensure_temp_checkout(path, agent=agent, config=config, runner=runner)
         else:
-            ensure_workdir(path, option)
+            ensure_explicit_workdir(path, option_name=option, agent=agent, runner=runner)
     ensure_distinct_workdirs(config)
 
 
