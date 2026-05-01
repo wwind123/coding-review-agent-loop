@@ -844,7 +844,7 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert len(runner.comments) == 2
+    assert len(runner.comments) == 3
     assert runner.issues == [
         {
             "title": "Follow up future review note: Add cleanup docs.",
@@ -867,6 +867,11 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
             ),
         },
     ]
+    issue_summary = runner.comments[-1]
+    assert issue_summary.startswith("Created approved-review future follow-up issues for PR #77:")
+    assert "- https://github.com/OWNER/REPO/issues/99" in issue_summary
+    assert "future work and did not block merge readiness" in issue_summary
+    assert issue_summary.endswith("-- coding-review-agent-loop")
 
 
 def test_pr_loop_creates_no_issues_without_approved_followups(tmp_path):
@@ -937,8 +942,10 @@ def test_pr_loop_caps_approved_followup_issues(tmp_path):
         "Follow up future review note: Follow up three.",
     ]
     assert len(runner.comments) == 2
-    assert "Skipped 1 additional item(s) to avoid issue noise" in runner.comments[-1]
-    assert runner.comments[-1].endswith("-- coding-review-agent-loop")
+    issue_summary = runner.comments[-1]
+    assert "- https://github.com/OWNER/REPO/issues/99" in issue_summary
+    assert "Skipped 1 additional item(s) to avoid issue noise" in issue_summary
+    assert issue_summary.endswith("-- coding-review-agent-loop")
 
 
 def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rereviews(tmp_path):
@@ -989,6 +996,7 @@ def test_pr_loop_fix_and_issue_retains_future_followups_across_same_pr_round(tmp
 
     assert len(runner.issues) == 1
     assert runner.issues[0]["title"] == "Follow up future review note: Add a separate migration dry-run command."
+    assert "- https://github.com/OWNER/REPO/issues/99" in runner.comments[-1]
     commands = [cmd[:3] for cmd, _cwd in runner.commands]
     assert commands.count(["gh", "issue", "create"]) == 1
 

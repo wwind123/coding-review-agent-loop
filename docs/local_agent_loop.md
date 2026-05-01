@@ -363,9 +363,9 @@ By default, these do not affect approval.
 
 - `ignore`: ignore approved follow-up sections. This is the default.
 - `summarize`: post future follow-ups as a grouped PR comment.
-- `issue`: create GitHub issues for up to three future follow-ups.
+- `issue`: create GitHub issues for up to three future follow-ups, then comment with the created issue links.
 - `fix-and-summarize`: send same-PR follow-ups to the coder for another review round, then summarize future follow-ups after final approval.
-- `fix-and-issue`: send same-PR follow-ups to the coder for another review round, then create issues for future follow-ups after final approval.
+- `fix-and-issue`: send same-PR follow-ups to the coder for another review round, then create issues for future follow-ups after final approval and comment with the created issue links.
 
 Only bullets inside the `Same-PR follow-ups`, `Future follow-ups`, and legacy
 `Non-blocking follow-ups` sections are parsed; each section ends at the next
