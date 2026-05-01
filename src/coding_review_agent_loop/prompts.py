@@ -153,7 +153,13 @@ def build_review_prompt(
     base_branch = metadata.base_branch or "(unknown)"
     head_sha = metadata.head_sha or "(unknown)"
     url_line = f"- URL: {metadata.url}\n" if metadata.url else ""
-    if config.approved_followups.startswith("fix-and-"):
+    if config.approved_followups == "ignore":
+        followup_guidance = """Do not include Same-PR follow-ups, Future follow-ups, or legacy
+Non-blocking follow-ups sections in approved reviews; this run is configured to
+ignore approved-review follow-up sections. Mark the review blocking instead
+when cleanup should be fixed before merge.
+"""
+    elif config.approved_followups.startswith("fix-and-"):
         followup_guidance = f"""If you approve but notice small, low-risk cleanup worth fixing before merge,
 list those items under this exact heading:
 
