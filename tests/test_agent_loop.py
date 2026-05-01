@@ -471,6 +471,8 @@ def test_parse_approved_followups_extracts_same_pr_and_future_independently():
 
     followups = parse_approved_followups(review, reviewer="OpenAI Codex")
 
+    assert isinstance(followups.same_pr, tuple)
+    assert isinstance(followups.future, tuple)
     assert [(item.reviewer, item.text) for item in followups.same_pr] == [
         ("OpenAI Codex", "Rename the helper for clarity. Keep the public behavior unchanged.")
     ]
