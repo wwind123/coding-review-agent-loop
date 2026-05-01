@@ -90,29 +90,51 @@ def _create_approved_followup_issues(
     config: AgentLoopConfig,
     pr_number: int,
     followups: list[ApprovedFollowup],
-) -> None:
+) -> tuple[list[str], int]:
+    issue_urls: list[str] = []
     selected_followups = followups[:MAX_APPROVED_FOLLOWUP_ISSUES]
     for followup in selected_followups:
-        create_issue(
+        issue_url = create_issue(
             runner,
             config=config,
             title=_followup_issue_title(followup),
             body=_followup_issue_body(pr_number, followup),
         )
+        if issue_url is not None:
+            issue_urls.append(issue_url)
     skipped_count = len(followups) - len(selected_followups)
-    if skipped_count <= 0:
-        return
-    post_pr_comment(
-        runner,
-        config=config,
-        pr_number=pr_number,
-        body=(
-            f"Created follow-up issues for the first {len(selected_followups)} "
-            f"approved-review future items. Skipped {skipped_count} additional "
-            "item(s) to avoid issue noise; reviewers should reserve this section for "
-            "substantial independent follow-up work.\n\n-- coding-review-agent-loop"
-        ),
+    return issue_urls, skipped_count
+
+
+def _format_created_followup_issue_summary(
+    pr_number: int,
+    issue_urls: list[str],
+    skipped_count: int,
+) -> str:
+    lines = [
+        f"Created approved-review future follow-up issues for PR #{pr_number}:",
+        "",
+    ]
+    if issue_urls:
+        lines.extend(f"- {issue_url}" for issue_url in issue_urls)
+    else:
+        lines.append("- Created issue URL unavailable from GitHub CLI output.")
+    lines.extend(
+        [
+            "",
+            "These were mentioned in approved reviews as future work and did not block merge readiness.",
+        ]
     )
+    if skipped_count > 0:
+        lines.extend(
+            [
+                "",
+                f"Skipped {skipped_count} additional item(s) to avoid issue noise; reviewers should reserve "
+                "this section for substantial independent follow-up work.",
+            ]
+        )
+    lines.extend(["", "-- coding-review-agent-loop"])
+    return "\n".join(lines)
 
 
 def _format_same_pr_followups(followups: Sequence[ApprovedFollowup]) -> str:
@@ -332,12 +354,14 @@ def run_pr_loop(
                 body = _format_approved_followup_summary(pr_number, approved_followups)
                 post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
             elif config.approved_followups in ("issue", "fix-and-issue") and approved_followups:
-                _create_approved_followup_issues(
+                issue_urls, skipped_count = _create_approved_followup_issues(
                     runner,
                     config=config,
                     pr_number=pr_number,
                     followups=approved_followups,
                 )
+                body = _format_created_followup_issue_summary(pr_number, issue_urls, skipped_count)
+                post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
             run_optional_tests(runner, config)
             if config.auto_merge:
                 wait_for_ci(runner, config, pr_number)

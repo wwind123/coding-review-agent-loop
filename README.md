@@ -200,9 +200,9 @@ the loop.
 
 - `ignore`: ignore approved follow-up sections. This is the default.
 - `summarize`: post future follow-ups as a grouped PR comment.
-- `issue`: create GitHub issues for future follow-ups.
+- `issue`: create GitHub issues for future follow-ups, then comment with the created issue links.
 - `fix-and-summarize`: send same-PR follow-ups to the coder for another review round, then summarize future follow-ups after final approval.
-- `fix-and-issue`: send same-PR follow-ups to the coder for another review round, then create issues for future follow-ups after final approval.
+- `fix-and-issue`: send same-PR follow-ups to the coder for another review round, then create issues for future follow-ups after final approval and comment with the created issue links.
 
 To keep a grouped record on the PR or create follow-up issues, use:
 
