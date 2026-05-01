@@ -853,8 +853,7 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
                 "Reviewer: Codex\n\n"
                 "Follow-up:\n"
                 "- Add cleanup docs.\n\n"
-                "This was mentioned in an approved review as future work and did not block merge readiness.\n\n"
-                "-- OpenAI Codex"
+                "This was mentioned in an approved review as future work and did not block merge readiness."
             ),
         },
         {
@@ -864,11 +863,37 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
                 "Reviewer: Claude\n\n"
                 "Follow-up:\n"
                 "- Add regression coverage.\n\n"
-                "This was mentioned in an approved review as future work and did not block merge readiness.\n\n"
-                "-- OpenAI Codex"
+                "This was mentioned in an approved review as future work and did not block merge readiness."
             ),
         },
     ]
+
+
+def test_pr_loop_creates_no_issues_without_approved_followups(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["Codex approves.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path, approved_followups="issue")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(runner.comments) == 1
+    assert runner.issues == []
+
+
+def test_pr_loop_logs_created_followup_issue_url(tmp_path, capsys):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves.\n\n### Future follow-ups\n- Add cleanup docs.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+    )
+    config = make_config(tmp_path, approved_followups="issue", quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    captured = capsys.readouterr()
+    assert "Created GitHub issue: https://github.com/OWNER/REPO/issues/99" in captured.err
 
 
 @pytest.mark.parametrize("mode", ["summarize", "issue"])
