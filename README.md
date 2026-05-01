@@ -177,11 +177,19 @@ Approved reviews may include non-blocking cleanup under:
 ```
 
 By default those follow-ups do not change approval semantics and are ignored by
-the loop. To keep a grouped record on the PR without sending the work back to
-the coder, use:
+the loop.
+
+`--approved-followups` accepts:
+
+- `ignore`: ignore non-blocking follow-up bullets from approved reviews. This is the default.
+- `summarize`: post a grouped record on the PR without sending those items back to the coder.
+- `issue`: create GitHub issues for the follow-ups without delaying the PR.
+
+To keep a grouped record on the PR or create follow-up issues, use:
 
 ```bash
 agent-loop pr 456 --repo OWNER/REPO --approved-followups summarize
+agent-loop pr 456 --repo OWNER/REPO --approved-followups issue
 ```
 
 Only bullets inside the `Non-blocking follow-ups` section are summarized. The

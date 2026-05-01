@@ -163,6 +163,56 @@ def post_pr_comment(
             pass
 
 
+def create_issue(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    title: str,
+    body: str,
+) -> None:
+    log(config, f"Creating GitHub issue: {title}")
+    if config.dry_run:
+        runner.run(
+            [
+                config.gh_cmd,
+                "issue",
+                "create",
+                "--repo",
+                config.repo,
+                "--title",
+                title,
+                "--body",
+                body,
+            ],
+            cwd=active_workdir(config),
+        )
+        return
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+        handle.write(body)
+        path = handle.name
+    try:
+        runner.run(
+            [
+                config.gh_cmd,
+                "issue",
+                "create",
+                "--repo",
+                config.repo,
+                "--title",
+                title,
+                "--body-file",
+                path,
+            ],
+            cwd=active_workdir(config),
+        )
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> str:
     result = runner.run(
         [

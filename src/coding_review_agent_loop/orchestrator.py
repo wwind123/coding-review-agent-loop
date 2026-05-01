@@ -9,6 +9,7 @@ from .agents.registry import agent_display_name, run_agent
 from .config import AgentLoopConfig, ensure_agent_workdirs, reviewers
 from .errors import AgentLoopError
 from .github import (
+    create_issue,
     get_pr_metadata,
     merge_pr,
     post_pr_comment,
@@ -54,6 +55,45 @@ def _format_approved_followup_summary(pr_number: int, followups: list[ApprovedFo
         ]
     )
     return "\n".join(lines)
+
+
+def _followup_issue_title(followup: ApprovedFollowup) -> str:
+    text = " ".join(followup.text.split())
+    title = f"Follow up approved review note: {text}"
+    return title[:120]
+
+
+def _followup_issue_body(pr_number: int, followup: ApprovedFollowup) -> str:
+    return "\n".join(
+        [
+            f"Non-blocking follow-up from approved review on PR #{pr_number}.",
+            "",
+            f"Reviewer: {followup.reviewer}",
+            "",
+            "Follow-up:",
+            f"- {followup.text}",
+            "",
+            "This was mentioned in an approved review and did not block merge readiness.",
+            "",
+            "-- OpenAI Codex",
+        ]
+    )
+
+
+def _create_approved_followup_issues(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    followups: list[ApprovedFollowup],
+) -> None:
+    for followup in followups:
+        create_issue(
+            runner,
+            config=config,
+            title=_followup_issue_title(followup),
+            body=_followup_issue_body(pr_number, followup),
+        )
 
 
 def run_issue_loop(runner: Runner, *, issue_number: int, config: AgentLoopConfig) -> int:
@@ -243,6 +283,13 @@ def run_pr_loop(
             if config.approved_followups == "summarize" and approved_followups:
                 body = _format_approved_followup_summary(pr_number, approved_followups)
                 post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
+            elif config.approved_followups == "issue" and approved_followups:
+                _create_approved_followup_issues(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    followups=approved_followups,
+                )
             run_optional_tests(runner, config)
             if config.auto_merge:
                 wait_for_ci(runner, config, pr_number)
