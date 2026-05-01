@@ -74,8 +74,6 @@ def _followup_issue_body(pr_number: int, followup: ApprovedFollowup) -> str:
             f"- {followup.text}",
             "",
             "This was mentioned in an approved review and did not block merge readiness.",
-            "",
-            "-- OpenAI Codex",
         ]
     )
 
