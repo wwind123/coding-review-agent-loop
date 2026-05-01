@@ -345,7 +345,7 @@ By default, these do not affect approval.
 
 - `ignore`: ignore non-blocking follow-up bullets from approved reviews. This is the default.
 - `summarize`: post a grouped record on the PR instead of sending those items back to the coder as blocking work.
-- `issue`: create GitHub issues for the follow-ups instead of delaying the PR.
+- `issue`: create GitHub issues for the follow-ups instead of delaying the PR, then comment with the created issue links.
 
 Only bullets inside the `Non-blocking follow-ups` section are summarized; the
 section ends at the next heading, HTML marker, or agent signature. The same

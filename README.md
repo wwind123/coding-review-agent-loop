@@ -183,7 +183,7 @@ the loop.
 
 - `ignore`: ignore non-blocking follow-up bullets from approved reviews. This is the default.
 - `summarize`: post a grouped record on the PR without sending those items back to the coder.
-- `issue`: create GitHub issues for the follow-ups without delaying the PR.
+- `issue`: create GitHub issues for the follow-ups without delaying the PR, then comment with the created issue links.
 
 To keep a grouped record on the PR or create follow-up issues, use:
 

@@ -86,14 +86,33 @@ def _create_approved_followup_issues(
     config: AgentLoopConfig,
     pr_number: int,
     followups: list[ApprovedFollowup],
-) -> None:
+) -> list[str]:
+    issue_urls: list[str] = []
     for followup in followups:
-        create_issue(
+        issue_url = create_issue(
             runner,
             config=config,
             title=_followup_issue_title(followup),
             body=_followup_issue_body(pr_number, followup),
         )
+        if issue_url is not None:
+            issue_urls.append(issue_url)
+    return issue_urls
+
+
+def _format_created_followup_issue_summary(pr_number: int, issue_urls: list[str]) -> str:
+    lines = [
+        f"Created approved-review follow-up issues for PR #{pr_number}:",
+        "",
+    ]
+    lines.extend(f"- {issue_url}" for issue_url in issue_urls)
+    lines.extend(
+        [
+            "",
+            "These follow-ups were mentioned in approved reviews and did not block merge readiness.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def run_issue_loop(runner: Runner, *, issue_number: int, config: AgentLoopConfig) -> int:
@@ -284,12 +303,15 @@ def run_pr_loop(
                 body = _format_approved_followup_summary(pr_number, approved_followups)
                 post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
             elif config.approved_followups == "issue" and approved_followups:
-                _create_approved_followup_issues(
+                issue_urls = _create_approved_followup_issues(
                     runner,
                     config=config,
                     pr_number=pr_number,
                     followups=approved_followups,
                 )
+                if issue_urls:
+                    body = _format_created_followup_issue_summary(pr_number, issue_urls)
+                    post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
             run_optional_tests(runner, config)
             if config.auto_merge:
                 wait_for_ci(runner, config, pr_number)

@@ -169,10 +169,10 @@ def create_issue(
     config: AgentLoopConfig,
     title: str,
     body: str,
-) -> None:
+) -> str | None:
     log(config, f"Creating GitHub issue: {title}")
     if config.dry_run:
-        runner.run(
+        result = runner.run(
             [
                 config.gh_cmd,
                 "issue",
@@ -186,13 +186,14 @@ def create_issue(
             ],
             cwd=active_workdir(config),
         )
-        return
+        issue_url = result.stdout.strip()
+        return issue_url or None
 
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
         handle.write(body)
         path = handle.name
     try:
-        runner.run(
+        result = runner.run(
             [
                 config.gh_cmd,
                 "issue",
@@ -206,6 +207,8 @@ def create_issue(
             ],
             cwd=active_workdir(config),
         )
+        issue_url = result.stdout.strip()
+        return issue_url or None
     finally:
         try:
             os.unlink(path)

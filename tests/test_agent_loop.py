@@ -799,7 +799,7 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert len(runner.comments) == 2
+    assert len(runner.comments) == 3
     assert runner.issues == [
         {
             "title": "Follow up approved review note: Add cleanup docs.",
@@ -824,6 +824,10 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
             ),
         },
     ]
+    issue_summary = runner.comments[-1]
+    assert issue_summary.startswith("Created approved-review follow-up issues for PR #77:")
+    assert "- https://github.com/OWNER/REPO/issues/99" in issue_summary
+    assert "did not block merge readiness" in issue_summary
 
 
 def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):
