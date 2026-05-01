@@ -169,16 +169,28 @@ separate coding and review passes:
 agent-loop pr 456 --repo OWNER/REPO --reviewer codex --reviewer claude
 ```
 
-Approved reviews may include non-blocking cleanup under:
+Approved reviews may include future work under:
 
 ```md
-### Non-blocking follow-ups
+### Future follow-ups
 - Add a follow-up test.
 ```
 
 Reviewers should use that section only for substantial work that is better
-handled in a separate issue or PR. Same-PR cleanup should be marked blocking
-instead, and the issue mode creates at most three follow-up issues per approved
+handled in a separate issue or PR. The legacy heading
+`### Non-blocking follow-ups` is still parsed as future work for compatibility.
+
+When `--approved-followups` uses a `fix-and-*` mode, approved reviews may also
+include small, low-risk current-PR cleanup under:
+
+```md
+### Same-PR follow-ups
+- Rename a helper before merge.
+```
+
+Same-PR follow-ups are sent back to the coder in the existing PR and require a
+new review round. Future follow-ups are retained and processed only after final
+approval. The issue modes create at most three follow-up issues per approved
 round to avoid issue noise.
 
 By default those follow-ups do not change approval semantics and are ignored by
@@ -186,20 +198,24 @@ the loop.
 
 `--approved-followups` accepts:
 
-- `ignore`: ignore non-blocking follow-up bullets from approved reviews. This is the default.
-- `summarize`: post a grouped record on the PR without sending those items back to the coder.
-- `issue`: create GitHub issues for the follow-ups without delaying the PR.
+- `ignore`: ignore approved follow-up sections. This is the default.
+- `summarize`: post future follow-ups as a grouped PR comment.
+- `issue`: create GitHub issues for future follow-ups.
+- `fix-and-summarize`: send same-PR follow-ups to the coder for another review round, then summarize future follow-ups after final approval.
+- `fix-and-issue`: send same-PR follow-ups to the coder for another review round, then create issues for future follow-ups after final approval.
 
 To keep a grouped record on the PR or create follow-up issues, use:
 
 ```bash
 agent-loop pr 456 --repo OWNER/REPO --approved-followups summarize
 agent-loop pr 456 --repo OWNER/REPO --approved-followups issue
+agent-loop pr 456 --repo OWNER/REPO --approved-followups fix-and-summarize
 ```
 
-Only bullets inside the `Non-blocking follow-ups` section are summarized. The
-section ends at the next heading, HTML marker, or agent signature, so final
-protocol markers are not mistaken for follow-up text.
+Only bullets inside the `Same-PR follow-ups`, `Future follow-ups`, and legacy
+`Non-blocking follow-ups` sections are parsed. Each section ends at the next
+heading, HTML marker, or agent signature, so final protocol markers are not
+mistaken for follow-up text.
 
 For trusted local automation that must run without approval prompts:
 

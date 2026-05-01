@@ -23,12 +23,13 @@ from .prompts import (
     build_followup_prompt,
     build_issue_prompt,
     build_review_prompt,
+    build_same_pr_followup_prompt,
     build_task_clarification_prompt,
     build_task_prompt,
     format_agent_list,
 )
 from .protocol import is_clarification_request, parse_agent_state, parse_pr_number
-from .protocol import ApprovedFollowup, parse_non_blocking_followups
+from .protocol import ApprovedFollowup, parse_approved_followups
 from .runner import Runner
 from .workdirs import active_workdir
 
@@ -45,7 +46,7 @@ def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
 
 def _format_approved_followup_summary(pr_number: int, followups: list[ApprovedFollowup]) -> str:
     lines = [
-        f"Approved-review non-blocking follow-ups for PR #{pr_number}:",
+        f"Approved-review future follow-ups for PR #{pr_number}:",
         "",
     ]
     for followup in followups:
@@ -53,7 +54,7 @@ def _format_approved_followup_summary(pr_number: int, followups: list[ApprovedFo
     lines.extend(
         [
             "",
-            "These were mentioned in approved reviews and did not block merge readiness.",
+            "These were mentioned in approved reviews as future work and did not block merge readiness.",
             "",
             "-- coding-review-agent-loop",
         ]
@@ -63,21 +64,21 @@ def _format_approved_followup_summary(pr_number: int, followups: list[ApprovedFo
 
 def _followup_issue_title(followup: ApprovedFollowup) -> str:
     text = " ".join(followup.text.split())
-    title = f"Follow up approved review note: {text}"
+    title = f"Follow up future review note: {text}"
     return title[:120]
 
 
 def _followup_issue_body(pr_number: int, followup: ApprovedFollowup) -> str:
     return "\n".join(
         [
-            f"Non-blocking follow-up from approved review on PR #{pr_number}.",
+            f"Future follow-up from approved review on PR #{pr_number}.",
             "",
             f"Reviewer: {followup.reviewer}",
             "",
             "Follow-up:",
             f"- {followup.text}",
             "",
-            "This was mentioned in an approved review and did not block merge readiness.",
+            "This was mentioned in an approved review as future work and did not block merge readiness.",
             "",
             "-- OpenAI Codex",
         ]
@@ -108,11 +109,20 @@ def _create_approved_followup_issues(
         pr_number=pr_number,
         body=(
             f"Created follow-up issues for the first {len(selected_followups)} "
-            f"approved-review non-blocking items. Skipped {skipped_count} additional "
+            f"approved-review future items. Skipped {skipped_count} additional "
             "item(s) to avoid issue noise; reviewers should reserve this section for "
             "substantial independent follow-up work.\n\n-- coding-review-agent-loop"
         ),
     )
+
+
+def _format_same_pr_followups(followups: list[ApprovedFollowup]) -> str:
+    lines: list[str] = []
+    for followup in followups:
+        lines.append(f"{followup.reviewer} same-PR follow-up:")
+        lines.append(f"- {followup.text}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def run_issue_loop(runner: Runner, *, issue_number: int, config: AgentLoopConfig) -> int:
@@ -261,11 +271,13 @@ def run_pr_loop(
         # Backward-compatible single-reviewer resume support: older callers
         # pass one reviewer session, so attach it to the first configured reviewer.
         reviewer_session_ids[configured_reviewers[0]] = reviewer_session_id
+    pending_future_followups: list[ApprovedFollowup] = []
 
     for round_number in range(1, config.max_rounds + 1):
         coder_name = agent_display_name(config.coder)
         blocking_reviews: list[tuple[str, str]] = []
-        approved_followups: list[ApprovedFollowup] = []
+        same_pr_followups: list[ApprovedFollowup] = []
+        round_future_followups: list[ApprovedFollowup] = []
         pr_metadata = get_pr_metadata(runner, config=config, pr_number=pr_number)
         for reviewer in configured_reviewers:
             reviewer_name = agent_display_name(reviewer)
@@ -294,15 +306,33 @@ def run_pr_loop(
             if review_state == "blocking":
                 blocking_reviews.append((reviewer_name, review_output))
             elif config.approved_followups != "ignore":
-                approved_followups.extend(
-                    parse_non_blocking_followups(review_output, reviewer=reviewer_name)
-                )
+                followups = parse_approved_followups(review_output, reviewer=reviewer_name)
+                round_future_followups.extend(followups.future)
+                if followups.same_pr:
+                    if config.approved_followups.startswith("fix-and-"):
+                        same_pr_followups.extend(followups.same_pr)
+                    else:
+                        blocking_reviews.append(
+                            (
+                                reviewer_name,
+                                "\n".join(
+                                    [
+                                        "Approved review included Same-PR follow-ups, "
+                                        f"but --approved-followups={config.approved_followups} "
+                                        "does not enable a same-PR fix path.",
+                                        "",
+                                        _format_same_pr_followups(followups.same_pr),
+                                    ]
+                                ),
+                            )
+                        )
 
-        if not blocking_reviews:
-            if config.approved_followups == "summarize" and approved_followups:
+        if not blocking_reviews and not same_pr_followups:
+            approved_followups = [*pending_future_followups, *round_future_followups]
+            if config.approved_followups in ("summarize", "fix-and-summarize") and approved_followups:
                 body = _format_approved_followup_summary(pr_number, approved_followups)
                 post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
-            elif config.approved_followups == "issue" and approved_followups:
+            elif config.approved_followups in ("issue", "fix-and-issue") and approved_followups:
                 _create_approved_followup_issues(
                     runner,
                     config=config,
@@ -321,15 +351,40 @@ def run_pr_loop(
                 "human review required."
             )
 
-        combined_review = "\n\n".join(
-            f"{name} review:\n\n{review}" for name, review in blocking_reviews
-        )
+        if same_pr_followups and not blocking_reviews:
+            pending_future_followups.extend(round_future_followups)
+            combined_review = _format_same_pr_followups(same_pr_followups)
+            followup_prompt = build_same_pr_followup_prompt(
+                pr_number,
+                round_number,
+                combined_review,
+                config,
+                memory,
+            )
+        else:
+            if same_pr_followups:
+                blocking_reviews.append(
+                    (
+                        "Approved same-PR follow-ups",
+                        _format_same_pr_followups(same_pr_followups),
+                    )
+                )
+            combined_review = "\n\n".join(
+                f"{name} review:\n\n{review}" for name, review in blocking_reviews
+            )
+            followup_prompt = build_followup_prompt(
+                pr_number,
+                round_number,
+                combined_review,
+                config,
+                memory,
+            )
         log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
         coder_output, coder_session_id = run_agent(
             runner,
             agent=config.coder,
             config=config,
-            prompt=build_followup_prompt(pr_number, round_number, combined_review, config, memory),
+            prompt=followup_prompt,
             session_id=coder_session_id,
         )
         if not coder_output.strip():

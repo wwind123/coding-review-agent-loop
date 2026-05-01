@@ -331,30 +331,47 @@ Agent responses are parsed using HTML comment markers:
 
 `AGENT_PR` is required after a coder creates a PR. Review/fix responses must include a final `AGENT_STATE` marker. If a response quotes older markers, the final marker is treated as authoritative.
 
-Approved reviewer responses may also include optional cleanup items under a
+Approved reviewer responses may also include optional future-work items under a
 dedicated heading:
 
 ```md
-### Non-blocking follow-ups
+### Future follow-ups
 - Add a follow-up test.
 ```
 
 Reviewers should use this section only for substantial work that is better
-handled in a separate issue or PR. If a small or local cleanup should be fixed
-in the current PR, the reviewer should mark the review blocking instead.
+handled in a separate issue or PR. The legacy heading
+`### Non-blocking follow-ups` is still accepted as future work for
+compatibility.
+
+When `--approved-followups` is set to a `fix-and-*` mode, approved reviewers
+can put small, low-risk cleanup that should land in the current PR under:
+
+```md
+### Same-PR follow-ups
+- Rename a helper before merge.
+```
+
+Same-PR follow-ups are sent back to the coder in the existing PR and require a
+new review round. Future follow-ups are retained and processed only after the
+final approval round. Without a `fix-and-*` mode, reviewers should mark
+same-PR cleanup blocking instead.
 
 By default, these do not affect approval.
 
 `--approved-followups` accepts:
 
-- `ignore`: ignore non-blocking follow-up bullets from approved reviews. This is the default.
-- `summarize`: post a grouped record on the PR instead of sending those items back to the coder as blocking work.
-- `issue`: create GitHub issues for up to three follow-ups instead of delaying the PR.
+- `ignore`: ignore approved follow-up sections. This is the default.
+- `summarize`: post future follow-ups as a grouped PR comment.
+- `issue`: create GitHub issues for up to three future follow-ups.
+- `fix-and-summarize`: send same-PR follow-ups to the coder for another review round, then summarize future follow-ups after final approval.
+- `fix-and-issue`: send same-PR follow-ups to the coder for another review round, then create issues for future follow-ups after final approval.
 
-Only bullets inside the `Non-blocking follow-ups` section are summarized; the
-section ends at the next heading, HTML marker, or agent signature. The same
-parsing is used when creating follow-up issues. The issue cap keeps one
-approved review from creating a large batch of low-value issues.
+Only bullets inside the `Same-PR follow-ups`, `Future follow-ups`, and legacy
+`Non-blocking follow-ups` sections are parsed; each section ends at the next
+heading, HTML marker, or agent signature. The same parsing is used when
+creating follow-up issues. The issue cap keeps one approved review from
+creating a large batch of low-value issues.
 
 ## Logs
 

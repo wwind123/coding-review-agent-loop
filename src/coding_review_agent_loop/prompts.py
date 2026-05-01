@@ -153,6 +153,34 @@ def build_review_prompt(
     base_branch = metadata.base_branch or "(unknown)"
     head_sha = metadata.head_sha or "(unknown)"
     url_line = f"- URL: {metadata.url}\n" if metadata.url else ""
+    if config.approved_followups.startswith("fix-and-"):
+        followup_guidance = f"""If you approve but notice small, low-risk cleanup worth fixing before merge,
+list those items under this exact heading:
+
+### Same-PR follow-ups
+
+If you approve but notice substantial work that is better handled separately in
+a future issue or PR, list at most three highest-value items under this exact
+heading:
+
+### Future follow-ups
+
+Same-PR follow-ups will be sent back to {coder_name} and require another review
+round before final approval. Do not put trivial style nits in either follow-up
+section.
+"""
+    else:
+        followup_guidance = """If you approve but notice substantial work that is better handled separately in
+a future issue or PR, list at most three highest-value items under this exact
+heading:
+
+### Future follow-ups
+
+Do not use the Same-PR follow-ups section in this mode; mark the review blocking
+instead when small or local cleanup should be fixed before merge.
+The legacy heading `### Non-blocking follow-ups` is still accepted as future
+follow-ups for compatibility, but prefer `### Future follow-ups`.
+"""
     return f"""Review pull request #{pr_number} in {config.repo} (round {round_number}).
 
 PR metadata:
@@ -178,16 +206,7 @@ commands, or produce a blocking review explaining the limitation.
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
-If a concern is small, local to this PR, and should be fixed before merge, mark
-the review blocking instead of treating it as a follow-up.
-If you approve but notice substantial work that is better handled separately in
-a future issue or PR, list at most three highest-value items under this exact
-heading:
-
-### Non-blocking follow-ups
-
-Do not put trivial style nits, small test gaps, or same-PR cleanup in the
-non-blocking follow-up section.
+{followup_guidance}
 Use blocking only for issues that should prevent merge.
 All configured reviewers ({reviewer_group}) must approve in the same round for
 the pull request to be considered approved.
@@ -231,6 +250,37 @@ This is round {round_number}. End your final response with exactly one marker:
 
 Use blocking to hand the updated PR back to {reviewer_name}. If you cannot safely address
 the review, explain why and still use the blocking marker so a human can
+intervene. Sign the response as:
+-- {coder_signature}
+"""
+
+
+def build_same_pr_followup_prompt(
+    pr_number: int,
+    round_number: int,
+    review: str,
+    config: AgentLoopConfig,
+    memory: AgentMemoryContext | None = None,
+) -> str:
+    reviewer_name = format_agent_list(reviewers(config))
+    coder_signature = agent_signature(config.coder)
+    return f"""{reviewer_name} approved pull request #{pr_number} in {config.repo} with same-PR follow-ups.
+
+Address the follow-up items below in this local checkout. Pull/sync the PR
+branch if needed, implement fixes, run relevant tests, commit, and push to the
+same PR. Do not create a new PR.
+{_memory_block(memory)}
+
+Same-PR follow-ups:
+
+{review}
+
+This is round {round_number}. End your final response with exactly one marker:
+
+<!-- AGENT_STATE: blocking -->
+
+Use blocking to hand the updated PR back to {reviewer_name}. If you cannot safely address
+the follow-ups, explain why and still use the blocking marker so a human can
 intervene. Sign the response as:
 -- {coder_signature}
 """
