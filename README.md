@@ -176,6 +176,11 @@ Approved reviews may include non-blocking cleanup under:
 - Add a follow-up test.
 ```
 
+Reviewers should use that section only for substantial work that is better
+handled in a separate issue or PR. Same-PR cleanup should be marked blocking
+instead, and the issue mode creates at most three follow-up issues per approved
+round to avoid issue noise.
+
 By default those follow-ups do not change approval semantics and are ignored by
 the loop.
 

@@ -778,6 +778,7 @@ def test_pr_loop_summarizes_approved_followups_from_multiple_reviewers(tmp_path)
     assert "- Add cleanup docs. (Codex)" in summary
     assert "- Add regression coverage. (Claude)" in summary
     assert "did not block merge readiness" in summary
+    assert summary.endswith("-- coding-review-agent-loop")
 
 
 def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
@@ -824,6 +825,31 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
             ),
         },
     ]
+
+
+def test_pr_loop_caps_approved_followup_issues(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves.\n\n### Non-blocking follow-ups\n"
+            "- Follow up one.\n"
+            "- Follow up two.\n"
+            "- Follow up three.\n"
+            "- Follow up four.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+    )
+    config = make_config(tmp_path, approved_followups="issue")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert [issue["title"] for issue in runner.issues] == [
+        "Follow up approved review note: Follow up one.",
+        "Follow up approved review note: Follow up two.",
+        "Follow up approved review note: Follow up three.",
+    ]
+    assert len(runner.comments) == 2
+    assert "Skipped 1 additional item(s) to avoid issue noise" in runner.comments[-1]
+    assert runner.comments[-1].endswith("-- coding-review-agent-loop")
 
 
 def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):

@@ -32,6 +32,8 @@ from .protocol import ApprovedFollowup, parse_non_blocking_followups
 from .runner import Runner
 from .workdirs import active_workdir
 
+MAX_APPROVED_FOLLOWUP_ISSUES = 3
+
 
 def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
     if not config.test_command:
@@ -52,6 +54,8 @@ def _format_approved_followup_summary(pr_number: int, followups: list[ApprovedFo
         [
             "",
             "These were mentioned in approved reviews and did not block merge readiness.",
+            "",
+            "-- coding-review-agent-loop",
         ]
     )
     return "\n".join(lines)
@@ -87,13 +91,28 @@ def _create_approved_followup_issues(
     pr_number: int,
     followups: list[ApprovedFollowup],
 ) -> None:
-    for followup in followups:
+    selected_followups = followups[:MAX_APPROVED_FOLLOWUP_ISSUES]
+    for followup in selected_followups:
         create_issue(
             runner,
             config=config,
             title=_followup_issue_title(followup),
             body=_followup_issue_body(pr_number, followup),
         )
+    skipped_count = len(followups) - len(selected_followups)
+    if skipped_count <= 0:
+        return
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=(
+            f"Created follow-up issues for the first {len(selected_followups)} "
+            f"approved-review non-blocking items. Skipped {skipped_count} additional "
+            "item(s) to avoid issue noise; reviewers should reserve this section for "
+            "substantial independent follow-up work.\n\n-- coding-review-agent-loop"
+        ),
+    )
 
 
 def run_issue_loop(runner: Runner, *, issue_number: int, config: AgentLoopConfig) -> int:
