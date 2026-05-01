@@ -620,6 +620,19 @@ def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
     ) in prompt
     assert "gh pr diff 77 --repo OWNER/REPO" in prompt
     assert "requires confirmation in non-interactive mode" in prompt
+    assert "ignore approved-review follow-up sections" in prompt
+    assert "### Future follow-ups" not in prompt
+    assert "legacy heading `### Non-blocking follow-ups`" not in prompt
+    assert "Use blocking only for issues that should prevent merge." in prompt
+
+
+def test_review_prompt_requests_future_followups_when_processed(tmp_path):
+    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    config = make_config(tmp_path, approved_followups="summarize")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert "### Future follow-ups" in prompt
     assert "legacy heading `### Non-blocking follow-ups`" in prompt
     assert "Use blocking only for issues that should prevent merge." in prompt

@@ -331,8 +331,9 @@ Agent responses are parsed using HTML comment markers:
 
 `AGENT_PR` is required after a coder creates a PR. Review/fix responses must include a final `AGENT_STATE` marker. If a response quotes older markers, the final marker is treated as authoritative.
 
-Approved reviewer responses may also include optional future-work items under a
-dedicated heading:
+When `--approved-followups` is set to `summarize`, `issue`, or a `fix-and-*`
+mode, approved reviewer responses may also include optional future-work items
+under a dedicated heading:
 
 ```md
 ### Future follow-ups
@@ -357,7 +358,9 @@ new review round. Future follow-ups are retained and processed only after the
 final approval round. Without a `fix-and-*` mode, reviewers should mark
 same-PR cleanup blocking instead.
 
-By default, these do not affect approval.
+By default, `--approved-followups=ignore` asks reviewers not to include these
+sections. Reviewers should mark the review blocking instead when cleanup should
+be fixed before merge.
 
 `--approved-followups` accepts:
 

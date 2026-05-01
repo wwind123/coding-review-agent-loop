@@ -169,7 +169,8 @@ separate coding and review passes:
 agent-loop pr 456 --repo OWNER/REPO --reviewer codex --reviewer claude
 ```
 
-Approved reviews may include future work under:
+When `--approved-followups` is set to `summarize`, `issue`, or a `fix-and-*`
+mode, approved reviews may include future work under:
 
 ```md
 ### Future follow-ups
@@ -193,8 +194,9 @@ new review round. Future follow-ups are retained and processed only after final
 approval. The issue modes create at most three follow-up issues per approved
 round to avoid issue noise.
 
-By default those follow-ups do not change approval semantics and are ignored by
-the loop.
+By default, `--approved-followups=ignore` asks reviewers not to include
+approved-review follow-up sections. Reviewers should mark the review blocking
+instead when cleanup should be fixed before merge.
 
 `--approved-followups` accepts:
 
