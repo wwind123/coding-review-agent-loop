@@ -339,11 +339,22 @@ dedicated heading:
 - Add a follow-up test.
 ```
 
-By default, these do not affect approval. With `--approved-followups summarize`,
-the loop posts a grouped record on the PR instead of sending those items back to
-the coder as blocking work. Only bullets inside the `Non-blocking follow-ups`
-section are summarized; the section ends at the next heading, HTML marker, or
-agent signature.
+Reviewers should use this section only for substantial work that is better
+handled in a separate issue or PR. If a small or local cleanup should be fixed
+in the current PR, the reviewer should mark the review blocking instead.
+
+By default, these do not affect approval.
+
+`--approved-followups` accepts:
+
+- `ignore`: ignore non-blocking follow-up bullets from approved reviews. This is the default.
+- `summarize`: post a grouped record on the PR instead of sending those items back to the coder as blocking work.
+- `issue`: create GitHub issues for up to three follow-ups instead of delaying the PR.
+
+Only bullets inside the `Non-blocking follow-ups` section are summarized; the
+section ends at the next heading, HTML marker, or agent signature. The same
+parsing is used when creating follow-up issues. The issue cap keeps one
+approved review from creating a large batch of low-value issues.
 
 ## Logs
 

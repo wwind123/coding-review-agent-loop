@@ -67,6 +67,7 @@ class FakeRunner(Runner):
         }
         self.commands = []
         self.comments = []
+        self.issues = []
         self.git_status = git_status
         self.git_remote = git_remote
         self.git_inside = git_inside
@@ -143,6 +144,16 @@ class FakeRunner(Runner):
             elif "--body" in cmd:
                 self.comments.append(cmd[cmd.index("--body") + 1])
             return CommandResult(cmd, cwd_path, "", "", 0)
+
+        if cmd[:3] == ["gh", "issue", "create"]:
+            title = cmd[cmd.index("--title") + 1]
+            if "--body-file" in cmd:
+                body_path = Path(cmd[cmd.index("--body-file") + 1])
+                body = body_path.read_text(encoding="utf-8")
+            else:
+                body = cmd[cmd.index("--body") + 1]
+            self.issues.append({"title": title, "body": body})
+            return CommandResult(cmd, cwd_path, "https://github.com/OWNER/REPO/issues/99\n", "", 0)
 
         if cmd[:3] == ["gh", "pr", "view"]:
             if "--jq" in cmd and ".headRefOid" in cmd:
@@ -769,6 +780,77 @@ def test_pr_loop_summarizes_approved_followups_from_multiple_reviewers(tmp_path)
     assert "did not block merge readiness" in summary
 
 
+def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves.\n\n### Non-blocking follow-ups\n- Add cleanup docs.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+        claude_outputs=[
+            "Claude approves.\n\n### Non-blocking follow-ups\n- Add regression coverage.\n"
+            "<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        approved_followups="issue",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(runner.comments) == 2
+    assert runner.issues == [
+        {
+            "title": "Follow up approved review note: Add cleanup docs.",
+            "body": (
+                "Non-blocking follow-up from approved review on PR #77.\n\n"
+                "Reviewer: Codex\n\n"
+                "Follow-up:\n"
+                "- Add cleanup docs.\n\n"
+                "This was mentioned in an approved review and did not block merge readiness.\n\n"
+                "-- OpenAI Codex"
+            ),
+        },
+        {
+            "title": "Follow up approved review note: Add regression coverage.",
+            "body": (
+                "Non-blocking follow-up from approved review on PR #77.\n\n"
+                "Reviewer: Claude\n\n"
+                "Follow-up:\n"
+                "- Add regression coverage.\n\n"
+                "This was mentioned in an approved review and did not block merge readiness.\n\n"
+                "-- OpenAI Codex"
+            ),
+        },
+    ]
+
+
+def test_pr_loop_caps_approved_followup_issues(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves.\n\n### Non-blocking follow-ups\n"
+            "- Follow up one.\n"
+            "- Follow up two.\n"
+            "- Follow up three.\n"
+            "- Follow up four.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+    )
+    config = make_config(tmp_path, approved_followups="issue")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert [issue["title"] for issue in runner.issues] == [
+        "Follow up approved review note: Follow up one.",
+        "Follow up approved review note: Follow up two.",
+        "Follow up approved review note: Follow up three.",
+    ]
+    assert len(runner.comments) == 2
+    assert "Skipped 1 additional item(s) to avoid issue noise" in runner.comments[-1]
+    assert runner.comments[-1].endswith("-- OpenAI Codex")
+
+
 def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
@@ -987,7 +1069,8 @@ def test_default_agent_memory_dir_rejects_invalid_repo_formats(repo):
         default_agent_memory_dir(repo)
 
 
-def test_approved_followups_cli_mode_is_configurable(tmp_path):
+@pytest.mark.parametrize("mode", ["ignore", "summarize", "issue"])
+def test_approved_followups_cli_mode_is_configurable(tmp_path, mode):
     parser = build_parser()
     args = parser.parse_args([
         "pr",
@@ -995,7 +1078,7 @@ def test_approved_followups_cli_mode_is_configurable(tmp_path):
         "--repo",
         "OWNER/REPO",
         "--approved-followups",
-        "summarize",
+        mode,
         "--claude-dir",
         str(tmp_path / "claude"),
         "--codex-dir",
@@ -1006,7 +1089,7 @@ def test_approved_followups_cli_mode_is_configurable(tmp_path):
 
     config = config_from_args(args, FakeRunner())
 
-    assert config.approved_followups == "summarize"
+    assert config.approved_followups == mode
 
 
 def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):
