@@ -28,8 +28,8 @@ class ApprovedFollowup:
 
 @dataclass(frozen=True)
 class ApprovedFollowups:
-    same_pr: list[ApprovedFollowup]
-    future: list[ApprovedFollowup]
+    same_pr: tuple[ApprovedFollowup, ...]
+    future: tuple[ApprovedFollowup, ...]
 
 
 def parse_agent_state(text: str) -> str:
@@ -96,9 +96,9 @@ def parse_approved_followups(text: str, *, reviewer: str) -> ApprovedFollowups:
             current.append(line)
 
     flush_current()
-    return ApprovedFollowups(same_pr=same_pr, future=future)
+    return ApprovedFollowups(same_pr=tuple(same_pr), future=tuple(future))
 
 
 def parse_non_blocking_followups(text: str, *, reviewer: str) -> list[ApprovedFollowup]:
     """Extract legacy non-blocking follow-ups as future follow-ups."""
-    return parse_approved_followups(text, reviewer=reviewer).future
+    return list(parse_approved_followups(text, reviewer=reviewer).future)

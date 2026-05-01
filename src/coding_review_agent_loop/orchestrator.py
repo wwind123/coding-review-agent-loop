@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, run_agent
@@ -116,7 +117,7 @@ def _create_approved_followup_issues(
     )
 
 
-def _format_same_pr_followups(followups: list[ApprovedFollowup]) -> str:
+def _format_same_pr_followups(followups: Sequence[ApprovedFollowup]) -> str:
     lines: list[str] = []
     for followup in followups:
         lines.append(f"{followup.reviewer} same-PR follow-up:")
@@ -362,6 +363,10 @@ def run_pr_loop(
                 memory,
             )
         else:
+            # Future follow-ups are only retained for fully approved same-PR fix
+            # rounds. If any reviewer blocks, future-work suggestions from that
+            # round are discarded so reviewers can restate still-relevant items
+            # after the blocking issues have been resolved.
             if same_pr_followups:
                 blocking_reviews.append(
                     (
