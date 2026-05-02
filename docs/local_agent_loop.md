@@ -22,11 +22,10 @@ and optional advisory memory in a repo-scoped cache directory.
 flowchart LR
     User[Developer terminal] --> CLI[agent-loop CLI<br/>cli.py]
     CLI --> Config[Config validation<br/>config.py]
-    CLI --> Orchestrator[Issue, task, and PR loops<br/>orchestrator.py]
+    Config --> Orchestrator[Issue, task, and PR loops<br/>orchestrator.py]
 
-    Config --> Workdirs[Workdir setup and validation<br/>workdirs.py / git / gh repo clone]
-    Config --> Memory[Agent memory preparation<br/>memory.py]
-    Config --> Logs[(Agent logs<br/>.agent-loop-logs)]
+    Orchestrator --> Workdirs[Workdir setup and validation<br/>workdirs.py / git / gh repo clone]
+    Orchestrator --> Memory[Agent memory preparation<br/>memory.py]
 
     Workdirs --> AgentDirs[(Separate agent checkouts<br/>Claude / Codex / Gemini)]
     Memory --> MemoryCache[(Repo-scoped memory cache<br/>summary / architecture / tests)]
