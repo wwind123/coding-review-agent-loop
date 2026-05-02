@@ -119,9 +119,12 @@ When `--claude-dir`, `--codex-dir`, or `--gemini-dir` is omitted for an active
 agent, the tool creates or reuses a repo-scoped temporary checkout such as
 `/tmp/coding-review-agent-loop/OWNER-REPO/codex/repo`. Existing clean temp
 checkouts are fetched and fast-forwarded on the base branch before the agent
-runs; dirty temp checkouts fail clearly instead of being overwritten. Use
-explicit persistent directories for large repositories, long-lived agent
-worktrees, or setups that should survive `/tmp` cleanup or reboot.
+runs. Default temp checkouts are tool-owned and disposable; if one is dirty,
+the tool resets and cleans it before reuse. Explicit persistent directories are
+kept conservative: dirty explicit workdirs fail clearly, and existing git
+checkouts must point at the requested repository. Use explicit persistent
+directories for large repositories, long-lived agent worktrees, or setups that
+should survive `/tmp` cleanup or reboot.
 
 Agent memory is enabled by default. Before invoking agents, the loop creates or
 refreshes advisory repo memory in a durable, repo-scoped user cache directory

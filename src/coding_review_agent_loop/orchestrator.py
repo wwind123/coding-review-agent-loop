@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, run_agent
@@ -35,6 +37,20 @@ from .runner import Runner
 from .workdirs import active_workdir
 
 MAX_APPROVED_FOLLOWUP_ISSUES = 3
+
+
+@dataclass(frozen=True)
+class GroupedApprovedFollowup:
+    text: str
+    items: tuple[ApprovedFollowup, ...]
+
+    @property
+    def reviewers(self) -> tuple[str, ...]:
+        reviewers: list[str] = []
+        for item in self.items:
+            if item.reviewer not in reviewers:
+                reviewers.append(item.reviewer)
+        return tuple(reviewers)
 
 
 def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
@@ -69,19 +85,74 @@ def _followup_issue_title(followup: ApprovedFollowup) -> str:
     return title[:120]
 
 
-def _followup_issue_body(pr_number: int, followup: ApprovedFollowup) -> str:
-    return "\n".join(
+def _normalize_followup_key(text: str) -> str:
+    key = re.sub(r"`([^`]+)`", r"\1", text)
+    key = re.sub(r"\*\*([^*]+)\*\*", r"\1", key)
+    key = re.sub(r"[_*#>]+", " ", key)
+    key = re.sub(r"[^\w\s]+", " ", key.lower())
+    return " ".join(key.split())
+
+
+def _followup_heading_key(text: str) -> str | None:
+    heading_match = re.match(r"^\s*\*\*(?P<title>[^*]+)\*\*\s*:?", text)
+    if heading_match:
+        return _normalize_followup_key(heading_match.group("title"))
+    first_clause = re.split(r"\s+-\s+|:\s+", text, maxsplit=1)[0]
+    if first_clause != text and 3 <= len(first_clause.split()) <= 12:
+        return _normalize_followup_key(first_clause)
+    return None
+
+
+def _dedupe_approved_followups(followups: Sequence[ApprovedFollowup]) -> list[GroupedApprovedFollowup]:
+    grouped: list[GroupedApprovedFollowup] = []
+    indexes: dict[str, int] = {}
+    for followup in followups:
+        keys = [_normalize_followup_key(followup.text)]
+        heading_key = _followup_heading_key(followup.text)
+        if heading_key:
+            keys.append(heading_key)
+        existing_index = next((indexes[key] for key in keys if key in indexes), None)
+        if existing_index is None:
+            indexes.update((key, len(grouped)) for key in keys if key)
+            grouped.append(GroupedApprovedFollowup(text=followup.text, items=(followup,)))
+            continue
+        existing = grouped[existing_index]
+        grouped[existing_index] = GroupedApprovedFollowup(
+            text=existing.text,
+            items=(*existing.items, followup),
+        )
+        indexes.update((key, existing_index) for key in keys if key)
+    return grouped
+
+
+def _followup_issue_body(pr_number: int, followup: GroupedApprovedFollowup) -> str:
+    lines = [
+        f"Future follow-up from approved review on PR #{pr_number}.",
+        "",
+    ]
+    reviewers = followup.reviewers
+    if len(reviewers) == 1:
+        lines.append(f"Reviewer: {reviewers[0]}")
+    else:
+        lines.append("Reviewers:")
+        lines.extend(f"- {reviewer}" for reviewer in reviewers)
+    lines.extend(
         [
-            f"Future follow-up from approved review on PR #{pr_number}.",
-            "",
-            f"Reviewer: {followup.reviewer}",
             "",
             "Follow-up:",
             f"- {followup.text}",
+        ]
+    )
+    if len(followup.items) > 1:
+        lines.extend(["", "Original reviewer notes:"])
+        lines.extend(f"- {item.reviewer}: {item.text}" for item in followup.items)
+    lines.extend(
+        [
             "",
             "This was mentioned in an approved review as future work and did not block merge readiness.",
         ]
     )
+    return "\n".join(lines)
 
 
 def _create_approved_followup_issues(
@@ -92,17 +163,20 @@ def _create_approved_followup_issues(
     followups: list[ApprovedFollowup],
 ) -> tuple[list[str], int]:
     issue_urls: list[str] = []
-    selected_followups = followups[:MAX_APPROVED_FOLLOWUP_ISSUES]
+    deduped_followups = _dedupe_approved_followups(followups)
+    selected_followups = deduped_followups[:MAX_APPROVED_FOLLOWUP_ISSUES]
     for followup in selected_followups:
         issue_url = create_issue(
             runner,
             config=config,
-            title=_followup_issue_title(followup),
+            title=_followup_issue_title(
+                ApprovedFollowup(reviewer=followup.reviewers[0], text=followup.text)
+            ),
             body=_followup_issue_body(pr_number, followup),
         )
         if issue_url is not None:
             issue_urls.append(issue_url)
-    skipped_count = len(followups) - len(selected_followups)
+    skipped_count = len(deduped_followups) - len(selected_followups)
     return issue_urls, skipped_count
 
 
@@ -111,12 +185,13 @@ def _format_created_followup_issue_summary(
     issue_urls: list[str],
     skipped_count: int,
 ) -> str:
+    unique_issue_urls = list(dict.fromkeys(issue_urls))
     lines = [
         f"Created approved-review future follow-up issues for PR #{pr_number}:",
         "",
     ]
-    if issue_urls:
-        lines.extend(f"- {issue_url}" for issue_url in issue_urls)
+    if unique_issue_urls:
+        lines.extend(f"- {issue_url}" for issue_url in unique_issue_urls)
     else:
         lines.append("- Created issue URL unavailable from GitHub CLI output.")
     lines.extend(
@@ -360,8 +435,9 @@ def run_pr_loop(
                     pr_number=pr_number,
                     followups=approved_followups,
                 )
-                body = _format_created_followup_issue_summary(pr_number, issue_urls, skipped_count)
-                post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
+                if issue_urls:
+                    body = _format_created_followup_issue_summary(pr_number, issue_urls, skipped_count)
+                    post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
             run_optional_tests(runner, config)
             if config.auto_merge:
                 wait_for_ci(runner, config, pr_number)

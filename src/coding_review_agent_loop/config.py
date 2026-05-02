@@ -162,16 +162,33 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
 
     status = _run_git(runner, path, ("status", "--porcelain")).stdout.strip()
     if status:
-        raise AgentLoopError(
-            f"Default {agent} workdir is dirty: {path}. "
-            "Commit, stash, or clean it before rerunning, or pass an explicit agent directory."
-        )
+        log(config, f"Cleaning dirty default {agent} workdir: {path}")
+        _run_git(runner, path, ("reset", "--hard"))
+        _run_git(runner, path, ("clean", "-fd"))
 
     _run_git(runner, path, ("fetch", "origin"))
     checkout = _run_git(runner, path, ("checkout", config.base), check=False)
     if checkout.returncode != 0:
         _run_git(runner, path, ("checkout", "-B", config.base, f"origin/{config.base}"))
     _run_git(runner, path, ("pull", "--ff-only", "origin", config.base))
+
+
+def validate_explicit_workdir(path: Path, option_name: str, config: AgentLoopConfig, runner: Runner) -> None:
+    git_check = _run_git(runner, path, ("rev-parse", "--is-inside-work-tree"), check=False)
+    if git_check.returncode != 0 or git_check.stdout.strip() != "true":
+        return
+
+    status = _run_git(runner, path, ("status", "--porcelain")).stdout.strip()
+    if status:
+        raise AgentLoopError(
+            f"{option_name} is dirty: {path}. Commit, stash, or clean it before rerunning."
+        )
+
+    remote = _run_git(runner, path, ("remote", "get-url", "origin")).stdout.strip()
+    if not _looks_like_repo_remote(remote, config.repo):
+        raise AgentLoopError(
+            f"{option_name} at {path} uses origin {remote!r}, not {config.repo!r}."
+        )
 
 
 def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner) -> None:
@@ -189,6 +206,7 @@ def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner) -> None:
             ensure_temp_checkout(path, agent=agent, config=config, runner=runner)
         else:
             ensure_workdir(path, option)
+            validate_explicit_workdir(path, option, config, runner)
     ensure_distinct_workdirs(config)
 
 

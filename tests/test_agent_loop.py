@@ -45,6 +45,7 @@ class FakeRunner(Runner):
         changed_files=None,
         diff_returncode=0,
         diff_stderr="",
+        issue_urls=None,
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -81,6 +82,7 @@ class FakeRunner(Runner):
         self.changed_files = changed_files or ["src/coding_review_agent_loop/cli.py"]
         self.diff_returncode = diff_returncode
         self.diff_stderr = diff_stderr
+        self.issue_urls = list(issue_urls) if issue_urls is not None else None
 
     def _record_command(self, args, cwd):
         cmd = [str(arg) for arg in args]
@@ -153,7 +155,11 @@ class FakeRunner(Runner):
             else:
                 body = cmd[cmd.index("--body") + 1]
             self.issues.append({"title": title, "body": body})
-            return CommandResult(cmd, cwd_path, "https://github.com/OWNER/REPO/issues/99\n", "", 0)
+            if self.issue_urls is None:
+                issue_url = "https://github.com/OWNER/REPO/issues/99"
+            else:
+                issue_url = self.issue_urls.pop(0)
+            return CommandResult(cmd, cwd_path, f"{issue_url or ''}\n", "", 0)
 
         if cmd[:3] == ["gh", "pr", "view"]:
             if "--jq" in cmd and ".headRefOid" in cmd:
@@ -620,6 +626,8 @@ def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
     ) in prompt
     assert "gh pr diff 77 --repo OWNER/REPO" in prompt
     assert "requires confirmation in non-interactive mode" in prompt
+    assert "write them outside the repository checkout" in prompt
+    assert "/tmp/coding-review-agent-loop/scratch/" in prompt
     assert "ignore approved-review follow-up sections" in prompt
     assert "### Future follow-ups" not in prompt
     assert "legacy heading `### Non-blocking follow-ups`" not in prompt
@@ -885,8 +893,69 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
     issue_summary = runner.comments[-1]
     assert issue_summary.startswith("Created approved-review future follow-up issues for PR #77:")
     assert "- https://github.com/OWNER/REPO/issues/99" in issue_summary
+    assert issue_summary.count("https://github.com/OWNER/REPO/issues/99") == 1
     assert "future work and did not block merge readiness" in issue_summary
     assert issue_summary.endswith("-- coding-review-agent-loop")
+
+
+def test_pr_loop_deduplicates_approved_followup_issues_across_reviewers(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves.\n\n### Future follow-ups\n"
+            "- **Remote validation**: Validate explicit workdir git remotes against the target repo.\n"
+            "- Add a distinct dry-run smoke test.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+        claude_outputs=[
+            "Claude approves.\n\n### Future follow-ups\n"
+            "- **Remote validation**: Validate explicit workdir git remotes against the target repo.\n"
+            "- Document cache cleanup behavior.\n"
+            "<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"
+        ],
+        issue_urls=[
+            "https://github.com/OWNER/REPO/issues/99",
+            "https://github.com/OWNER/REPO/issues/100",
+            "https://github.com/OWNER/REPO/issues/101",
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        approved_followups="issue",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert [issue["title"] for issue in runner.issues] == [
+        "Follow up future review note: **Remote validation**: Validate explicit workdir git remotes against the target repo.",
+        "Follow up future review note: Add a distinct dry-run smoke test.",
+        "Follow up future review note: Document cache cleanup behavior.",
+    ]
+    remote_body = runner.issues[0]["body"]
+    assert "Reviewers:\n- Codex\n- Claude" in remote_body
+    assert "Original reviewer notes:" in remote_body
+    assert "- Codex: **Remote validation**" in remote_body
+    assert "- Claude: **Remote validation**" in remote_body
+    issue_summary = runner.comments[-1]
+    assert "- https://github.com/OWNER/REPO/issues/99" in issue_summary
+    assert "- https://github.com/OWNER/REPO/issues/100" in issue_summary
+    assert "- https://github.com/OWNER/REPO/issues/101" in issue_summary
+
+
+def test_pr_loop_suppresses_followup_issue_summary_when_no_urls_returned(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Codex approves.\n\n### Future follow-ups\n- Add cleanup docs.\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+        issue_urls=[None],
+    )
+    config = make_config(tmp_path, approved_followups="issue")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(runner.comments) == 1
+    assert len(runner.issues) == 1
 
 
 def test_pr_loop_creates_no_issues_without_approved_followups(tmp_path):
@@ -1466,21 +1535,67 @@ def test_clean_existing_auto_agent_dir_is_synced(tmp_path):
     assert ["git", "pull", "--ff-only", "origin", "main"] in commands
 
 
-def test_dirty_existing_auto_agent_dir_fails_clearly(tmp_path):
+def test_dirty_existing_auto_agent_dir_is_cleaned_before_sync(tmp_path, capsys):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        git_status=" M file.py\n",
+    )
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path,
+        codex_dir=codex_dir,
+        coder="codex",
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+        create_dirs=False,
+        quiet=False,
+    )
+    config.gemini_dir.mkdir(parents=True)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert ["git", "reset", "--hard"] in commands
+    assert ["git", "clean", "-fd"] in commands
+    assert ["git", "pull", "--ff-only", "origin", "main"] in commands
+    captured = capsys.readouterr()
+    assert f"Cleaning dirty default codex workdir: {codex_dir}" in captured.err
+
+
+def test_dirty_explicit_agent_dir_fails_clearly(tmp_path):
     runner = FakeRunner(git_status=" M file.py\n")
     codex_dir = tmp_path / "codex"
     codex_dir.mkdir()
     config = make_config(
         tmp_path,
         codex_dir=codex_dir,
+        coder="codex",
         reviewer="codex",
-        auto_agent_dirs=("codex",),
         create_dirs=False,
     )
-    config.claude_dir.mkdir(parents=True)
     config.gemini_dir.mkdir(parents=True)
 
-    with pytest.raises(AgentLoopError, match="dirty"):
+    with pytest.raises(AgentLoopError, match="--codex-dir is dirty"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+
+
+def test_explicit_agent_dir_must_match_requested_repo(tmp_path):
+    runner = FakeRunner(git_remote="git@github.com:OTHER/REPO.git")
+    codex_dir = tmp_path / "codex"
+    codex_dir.mkdir()
+    config = make_config(
+        tmp_path,
+        codex_dir=codex_dir,
+        coder="codex",
+        reviewer="codex",
+        create_dirs=False,
+    )
+    config.gemini_dir.mkdir(parents=True)
+
+    with pytest.raises(AgentLoopError, match="not 'OWNER/REPO'"):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
