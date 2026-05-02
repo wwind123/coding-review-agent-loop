@@ -27,6 +27,15 @@ def _memory_block(memory: AgentMemoryContext | None) -> str:
     return f"Agent memory context:\n{text}\n"
 
 
+def _scratch_file_guidance() -> str:
+    return (
+        "If you need temporary scratch files while inspecting diffs or command output, "
+        "write them outside the repository checkout, for example under "
+        "/tmp/coding-review-agent-loop/scratch/. Do not create temporary files in the "
+        "repo worktree unless they are intended project changes.\n"
+    )
+
+
 def build_issue_prompt(
     issue_number: int,
     config: AgentLoopConfig,
@@ -38,6 +47,7 @@ def build_issue_prompt(
 
 Use this local checkout as your workspace. Create a branch, implement the fix,
 run relevant tests, commit, push, and open a pull request against {config.base}.
+{_scratch_file_guidance()}
 {_memory_block(memory)}
 
 Do not wait for {reviewer_name} yourself; this local orchestrator will run {reviewer_name} after
@@ -75,6 +85,7 @@ Use this local checkout as your workspace. Decide between two paths:
     {config.base}. Do not wait for {reviewer_name}; this local orchestrator
     will run {reviewer_name} after you create the PR. End your final response
     with both markers:
+{_scratch_file_guidance()}
 
     <!-- AGENT_PR: <number> -->
     <!-- AGENT_STATE: blocking -->
@@ -116,6 +127,7 @@ Clarification so far:
 Now proceed. Strongly prefer to implement the task and open a PR. Only ask
 again if a critical detail is still missing. Use the same response markers as
 before:
+{_scratch_file_guidance()}
 
 - For implementation: include both <!-- AGENT_PR: <number> --> and
   <!-- AGENT_STATE: blocking --> at the end of your final response.
@@ -203,6 +215,7 @@ PR metadata:
 {url_line}
 Use this PR metadata as authoritative. Do not spend time discovering the PR
 branch.
+{_scratch_file_guidance()}
 {_memory_block(memory)}
 
 Suggested commands:
@@ -248,6 +261,7 @@ def build_followup_prompt(
 Address the review below in this local checkout. Pull/sync the PR branch if
 needed, implement fixes, run relevant tests, commit, and push to the same PR.
 Do not create a new PR.
+{_scratch_file_guidance()}
 {_memory_block(memory)}
 
 {reviewer_name} review:
@@ -282,6 +296,7 @@ same PR. Do not create a new PR.
 These same-PR follow-ups are intended to be small, localized cleanup for the
 current PR. Keep the change narrowly scoped to the listed items. Do not take on
 larger redesigns or unrelated future work; call that out instead.
+{_scratch_file_guidance()}
 {_memory_block(memory)}
 
 Same-PR follow-ups:
