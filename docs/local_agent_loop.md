@@ -346,7 +346,8 @@ handled in a separate issue or PR. The legacy heading
 compatibility.
 
 When `--approved-followups` is set to a `fix-and-*` mode, approved reviewers
-can put small, low-risk cleanup that should land in the current PR under:
+can put small, localized, low-risk cleanup that should land in the current PR
+under:
 
 ```md
 ### Same-PR follow-ups
@@ -354,9 +355,11 @@ can put small, low-risk cleanup that should land in the current PR under:
 ```
 
 Same-PR follow-ups are sent back to the coder in the existing PR and require a
-new review round. Future follow-ups are retained and processed only after the
-final approval round. Without a `fix-and-*` mode, reviewers should mark
-same-PR cleanup blocking instead.
+new review round. They should stay narrowly scoped to files already touched by
+the PR or directly adjacent code; larger redesigns and independent work belong
+under Future follow-ups. Future follow-ups are retained and processed only
+after the final approval round. Without a `fix-and-*` mode, reviewers should
+mark same-PR cleanup blocking instead.
 
 By default, `--approved-followups=ignore` asks reviewers not to include these
 sections. Reviewers should mark the review blocking instead when cleanup should

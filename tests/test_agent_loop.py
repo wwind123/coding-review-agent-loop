@@ -647,6 +647,8 @@ def test_review_prompt_allows_same_pr_followups_for_fix_modes(tmp_path):
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert "### Same-PR follow-ups" in prompt
     assert "### Future follow-ups" in prompt
+    assert "small, localized, low-risk cleanup" in prompt
+    assert "narrow current-PR cleanup in files already\ntouched by this PR or directly adjacent code" in prompt
     assert "will be sent back to Claude and require another review" in prompt
 
 
@@ -985,6 +987,9 @@ def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rerevie
         cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"] and "Same-PR follow-ups" in cmd[-1]
     )
     assert "Rename the helper before merge." in followup_prompt
+    assert "small, localized cleanup for the\ncurrent PR" in followup_prompt
+    assert "Keep the change narrowly scoped to the listed items" in followup_prompt
+    assert "Do not take on\nlarger redesigns or unrelated future work" in followup_prompt
     summary = runner.comments[-1]
     assert summary.startswith("Approved-review future follow-ups for PR #77:")
     assert "- Add broader integration coverage later. (Codex)" in summary
