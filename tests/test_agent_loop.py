@@ -482,6 +482,37 @@ def test_parse_approved_followups_extracts_same_pr_and_future_independently():
     ]
 
 
+@pytest.mark.parametrize(
+    "placeholder",
+    [
+        "None",
+        "none.",
+        "N/A",
+        "No follow-ups",
+        "No same-PR follow-ups.",
+        "No future follow-ups",
+    ],
+)
+def test_parse_approved_followups_ignores_empty_placeholders(placeholder):
+    review = f"""
+    LGTM.
+
+    ### Same-PR follow-ups
+    - {placeholder}
+
+    ### Future follow-ups
+    - {placeholder}
+
+    <!-- AGENT_STATE: approved -->
+    -- Google Gemini
+    """
+
+    followups = parse_approved_followups(review, reviewer="Gemini")
+
+    assert followups.same_pr == ()
+    assert followups.future == ()
+
+
 @pytest.mark.parametrize("terminator", ["<!-- AGENT_STATE: approved -->", "-- OpenAI Codex"])
 def test_parse_non_blocking_followups_stops_at_final_markers(terminator):
     review = f"""
