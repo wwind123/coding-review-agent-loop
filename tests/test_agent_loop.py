@@ -704,6 +704,11 @@ def test_agent_memory_is_created_and_added_to_review_prompt(tmp_path):
     assert (memory_dir / "test-profile.md").exists()
     assert (memory_dir / "toolchain.json").exists()
     assert (memory_dir / "last-analyzed-commit").read_text(encoding="utf-8") == "abc123\n"
+    architecture_map = (memory_dir / "architecture-map.md").read_text(encoding="utf-8")
+    assert "## Top-level Layout" in architecture_map
+    assert "## Python Modules" in architecture_map
+    assert "## Supporting Surfaces" in architecture_map
+    assert "`src/coding_review_agent_loop`" in architecture_map
 
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert "Agent memory context:" in prompt
