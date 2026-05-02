@@ -182,7 +182,7 @@ handled in a separate issue or PR. The legacy heading
 `### Non-blocking follow-ups` is still parsed as future work for compatibility.
 
 When `--approved-followups` uses a `fix-and-*` mode, approved reviews may also
-include small, low-risk current-PR cleanup under:
+include small, localized, low-risk current-PR cleanup under:
 
 ```md
 ### Same-PR follow-ups
@@ -190,9 +190,11 @@ include small, low-risk current-PR cleanup under:
 ```
 
 Same-PR follow-ups are sent back to the coder in the existing PR and require a
-new review round. Future follow-ups are retained and processed only after final
-approval. The issue modes create at most three follow-up issues per approved
-round to avoid issue noise.
+new review round. They should stay narrowly scoped to files already touched by
+the PR or directly adjacent code; larger redesigns and independent work belong
+under Future follow-ups. Future follow-ups are retained and processed only after
+final approval. The issue modes create at most three follow-up issues per
+approved round to avoid issue noise.
 
 By default, `--approved-followups=ignore` asks reviewers not to include
 approved-review follow-up sections. Reviewers should mark the review blocking

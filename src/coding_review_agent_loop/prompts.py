@@ -160,10 +160,14 @@ ignore approved-review follow-up sections. Mark the review blocking instead
 when cleanup should be fixed before merge.
 """
     elif config.approved_followups.startswith("fix-and-"):
-        followup_guidance = f"""If you approve but notice small, low-risk cleanup worth fixing before merge,
-list those items under this exact heading:
+        followup_guidance = f"""If you approve but notice small, localized, low-risk cleanup worth fixing
+before merge, list those items under this exact heading:
 
 ### Same-PR follow-ups
+
+Use Same-PR follow-ups only for narrow current-PR cleanup in files already
+touched by this PR or directly adjacent code. Do not use this section for
+larger redesigns, broad refactors, or independent future work.
 
 If you approve but notice substantial work that is better handled separately in
 a future issue or PR, list at most three highest-value items under this exact
@@ -275,6 +279,9 @@ def build_same_pr_followup_prompt(
 Address the follow-up items below in this local checkout. Pull/sync the PR
 branch if needed, implement fixes, run relevant tests, commit, and push to the
 same PR. Do not create a new PR.
+These same-PR follow-ups are intended to be small, localized cleanup for the
+current PR. Keep the change narrowly scoped to the listed items. Do not take on
+larger redesigns or unrelated future work; call that out instead.
 {_memory_block(memory)}
 
 Same-PR follow-ups:
