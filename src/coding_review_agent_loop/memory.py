@@ -1,4 +1,4 @@
-"""Repo-local advisory memory for repeated agent loop runs."""
+"""Repo-scoped advisory memory for repeated agent loop runs."""
 
 from __future__ import annotations
 
@@ -232,10 +232,44 @@ def _write_architecture_map(path: Path, tracked_files: list[str]) -> None:
     for file in tracked_files:
         head = file.split("/", 1)[0]
         buckets.setdefault(head, []).append(file)
-    lines = ["# Architecture Map", ""]
+    lines = [
+        "# Architecture Map",
+        "",
+        "## Top-level Layout",
+        "",
+    ]
     for head in sorted(buckets):
         examples = ", ".join(buckets[head][:8])
         lines.append(f"- `{head}`: {len(buckets[head])} tracked file(s); examples: {examples}")
+
+    python_files = [
+        file for file in tracked_files if file.startswith("src/") and file.endswith(".py")
+    ]
+    if python_files:
+        lines.extend(["", "## Python Modules", ""])
+        module_buckets: dict[str, list[str]] = {}
+        for file in python_files:
+            parts = file.split("/")
+            if len(parts) >= 4:
+                module = "/".join(parts[:3])
+            else:
+                module = "/".join(parts[:-1]) or "src"
+            module_buckets.setdefault(module, []).append(file)
+        for module in sorted(module_buckets):
+            examples = ", ".join(module_buckets[module][:8])
+            lines.append(f"- `{module}`: {len(module_buckets[module])} file(s); examples: {examples}")
+
+    docs = [file for file in tracked_files if file == "README.md" or file.startswith("docs/")]
+    tests = [file for file in tracked_files if file.startswith("tests/")]
+    workflows = [file for file in tracked_files if file.startswith(".github/workflows/")]
+    if docs or tests or workflows:
+        lines.extend(["", "## Supporting Surfaces", ""])
+        if docs:
+            lines.append(f"- Docs: {', '.join(docs[:8])}")
+        if tests:
+            lines.append(f"- Tests: {', '.join(tests[:8])}")
+        if workflows:
+            lines.append(f"- GitHub Actions: {', '.join(workflows[:8])}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

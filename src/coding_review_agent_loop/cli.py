@@ -192,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--no-agent-memory",
             dest="agent_memory",
             action="store_false",
-            help="Disable repo-local advisory agent memory.",
+            help="Disable repo-scoped advisory agent memory.",
         )
         subparser.add_argument(
             "--refresh-agent-memory",

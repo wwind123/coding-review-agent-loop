@@ -14,22 +14,29 @@ The default coder is Claude and the default reviewer is Codex. Reverse the direc
 ## Architecture
 
 The tool is a local orchestrator. It does not call model APIs directly; it shells
-out to locally authenticated agent and GitHub CLIs from separate checkouts.
+out to locally authenticated agent and GitHub CLIs from separate checkouts. The
+only durable state it creates is local: agent logs in the active coder checkout
+and optional advisory memory in a repo-scoped cache directory.
 
 ```mermaid
 flowchart LR
     User[Developer terminal] --> CLI[agent-loop CLI<br/>cli.py]
-    CLI --> Config[Config and workdir setup<br/>config.py / workdirs.py]
+    CLI --> Config[Config validation<br/>config.py]
     CLI --> Orchestrator[Issue, task, and PR loops<br/>orchestrator.py]
 
-    Config --> Workdirs[(Agent checkouts<br/>Claude / Codex / Gemini)]
-    Config --> Logs[(.agent-loop-logs)]
+    Config --> Workdirs[Workdir setup and validation<br/>workdirs.py / git / gh repo clone]
+    Config --> Memory[Agent memory preparation<br/>memory.py]
+    Config --> Logs[(Agent logs<br/>.agent-loop-logs)]
+
+    Workdirs --> AgentDirs[(Separate agent checkouts<br/>Claude / Codex / Gemini)]
+    Memory --> MemoryCache[(Repo-scoped memory cache<br/>summary / architecture / tests)]
 
     Orchestrator --> Prompts[Prompt builders<br/>prompts.py]
-    Orchestrator --> Protocol[Marker parsing<br/>protocol.py]
+    Orchestrator --> Protocol[Marker and follow-up parsing<br/>protocol.py]
     Orchestrator --> Registry[Agent registry<br/>agents/registry.py]
     Orchestrator --> GitHubOps[GitHub operations<br/>github.py]
-    Orchestrator --> OptionalTests[Optional local test command]
+    Orchestrator --> OptionalTests[Optional local test command<br/>--test-command]
+    Orchestrator --> Followups[Approved follow-up handling<br/>summaries / issues / same-PR fixes]
 
     Registry --> Claude[Claude backend<br/>claude]
     Registry --> Codex[Codex backend<br/>codex exec]
@@ -44,10 +51,11 @@ flowchart LR
     Runner --> AgentCLIs[Local agent CLIs]
     Runner --> GhCLI[gh CLI]
     Runner --> TestCmd[Local test process]
+    Runner --> Logs
 
-    AgentCLIs --> Workdirs
-    AgentCLIs --> Logs
+    AgentCLIs --> AgentDirs
     GhCLI --> GitHub[(GitHub repo<br/>issues / PRs / comments / checks)]
+    Followups --> GitHubOps
 ```
 
 At runtime, the orchestrator drives one of three entrypoints:
@@ -57,12 +65,15 @@ sequenceDiagram
     participant User as Developer
     participant CLI as agent-loop CLI
     participant Orch as Orchestrator
+    participant Memory as Agent memory
     participant Coder as Coder agent CLI
     participant Reviewer as Reviewer agent CLI(s)
     participant GH as GitHub via gh
 
     User->>CLI: agent-loop issue | task | pr
-    CLI->>Orch: validated config and workdirs
+    CLI->>Orch: validated config
+    Orch->>Orch: ensure active agent workdirs
+    Orch->>Memory: prepare advisory repo memory
     alt issue or task
         Orch->>Coder: create or update PR
         Coder-->>Orch: output with AGENT_PR marker
@@ -79,7 +90,14 @@ sequenceDiagram
             Orch->>Coder: address combined feedback
             Coder-->>Orch: AGENT_STATE blocking
             Orch->>GH: post coder update
+        else approved review has same-PR follow-ups in a fix-and mode
+            Orch->>Coder: address same-PR follow-ups
+            Coder-->>Orch: AGENT_STATE blocking
+            Orch->>GH: post coder update
         else all approved
+            opt future follow-ups requested
+                Orch->>GH: summarize follow-ups or create issues
+            end
             Orch->>Orch: run optional local tests
             opt auto-merge enabled
                 Orch->>GH: wait for configured check and merge
