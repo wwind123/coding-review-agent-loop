@@ -18,6 +18,10 @@ ANY_HEADING_RE = re.compile(r"^\s*#{1,6}\s+\S")
 HTML_COMMENT_RE = re.compile(r"^\s*<!--.*-->\s*$")
 SIGNATURE_RE = re.compile(r"^\s*--\s+\S")
 BULLET_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(?P<text>.+?)\s*$")
+EMPTY_FOLLOWUP_RE = re.compile(
+    r"^(?:none|n/a|no follow[- ]?ups?|no same[- ]pr follow[- ]?ups?|no future follow[- ]?ups?)\.?$",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -64,7 +68,7 @@ def parse_approved_followups(text: str, *, reviewer: str) -> ApprovedFollowups:
     def flush_current() -> None:
         if active is not None and current:
             item = " ".join(part.strip() for part in current if part.strip()).strip()
-            if item:
+            if item and not EMPTY_FOLLOWUP_RE.match(item):
                 active.append(ApprovedFollowup(reviewer=reviewer, text=item))
             current.clear()
 
