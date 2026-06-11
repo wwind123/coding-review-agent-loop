@@ -136,21 +136,35 @@ def _normalize_raw_response(text: str) -> str:
     """Strip prose the protocol validator would reject.
 
     1. Leading prose before the JSON object (Gemini sometimes writes a summary line first).
-    2. Any content after the first agent signature line (e.g. a duplicate state marker).
+    2. Non-AGENT markers between the closing } and <!-- AGENT_STATE --> (e.g. Codex's
+       <!-- HUMAN_REQUIREMENTS_RESOLVED -->).
+    3. Any content after the first agent signature line (e.g. a duplicate state marker).
     """
     # Strip leading prose before the JSON block
     brace_idx = text.find("{")
     if brace_idx > 0:
         text = text[brace_idx:]
 
-    # Strip trailing content after the first signature line
-    m = _STATE_MARKER_RE.search(text)
+    # Use raw_decode to find exact end of the JSON object
+    try:
+        _, json_end_idx = json.JSONDecoder().raw_decode(text)
+        json_text = text[:json_end_idx]
+        remainder = text[json_end_idx:]
+    except json.JSONDecodeError:
+        json_text = text
+        remainder = ""
+
+    # Find state marker and signature in the remainder
+    m = _STATE_MARKER_RE.search(remainder)
     if m is None:
         return text
-    sig_m = _SIGNATURE_RE.search(text, m.end())
+    sig_m = _SIGNATURE_RE.search(remainder, m.end())
     if sig_m is None:
         return text
-    return text[: sig_m.end()].rstrip() + "\n"
+
+    # Reconstruct: JSON + state-marker-through-signature, dropping anything in between
+    state_and_sig = remainder[m.start() : sig_m.end()]
+    return json_text.rstrip() + "\n" + state_and_sig.rstrip() + "\n"
 
 
 def _max_item_number(item_lists: list[list[dict]]) -> int:
