@@ -70,6 +70,7 @@ from coding_review_agent_loop.round_state import (
     _plan_subject,
     _resume_plan_round,
     _resume_pr_round,
+    _serialize_disposition,
     _serialize_unresolved_item,
 )
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
@@ -169,6 +170,9 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
         "prior_items": [],
         "compact_prior_summaries": [],
         "completed_reviewer_names": [],
+        "completed_reviewer_data": [],
+        "completed_round_number": 0,
+        "current_plan_subject": None,
         "pending_comment_body": session.get("pending_comment_body"),
     }
 
@@ -182,10 +186,28 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                     _serialize_unresolved_item(item) for item in resumed.prior_items
                 ]
                 descriptor["compact_prior_summaries"] = list(resumed.compact_prior_summaries)
-                descriptor["completed_reviewer_names"] = [
-                    record.metadata.agent for record in resumed.completed_reviews
-                ]
+                completed_names = [record.metadata.agent for record in resumed.completed_reviews]
+                descriptor["completed_reviewer_names"] = completed_names
                 descriptor["current_plan"] = plan_text
+                descriptor["current_plan_subject"] = _plan_subject(plan_text)
+                descriptor["completed_reviewer_data"] = [
+                    {
+                        "reviewer_name": record.metadata.agent,
+                        "state": record.metadata.state or "approved",
+                        "dispositions": [
+                            _serialize_disposition(d) for d in record.metadata.dispositions
+                        ],
+                        "new_items": [
+                            _serialize_unresolved_item(item)
+                            for item in record.metadata.new_items
+                        ],
+                    }
+                    for record in resumed.completed_reviews
+                ]
+                if len(completed_names) == len(reviewers):
+                    descriptor["completed_round_number"] = resumed.round_number
+                elif resumed.round_number > 1:
+                    descriptor["completed_round_number"] = resumed.round_number - 1
         else:
             # PR flow
             head_sha: str | None = getattr(args, "head_sha", None)
@@ -203,9 +225,27 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                     _serialize_unresolved_item(item) for item in result.prior_items
                 ]
                 descriptor["compact_prior_summaries"] = list(result.compact_prior_summaries)
-                descriptor["completed_reviewer_names"] = [
-                    record.metadata.agent for record in result.completed_reviews
+                completed_names = [record.metadata.agent for record in result.completed_reviews]
+                descriptor["completed_reviewer_names"] = completed_names
+                descriptor["current_plan_subject"] = head_sha
+                descriptor["completed_reviewer_data"] = [
+                    {
+                        "reviewer_name": record.metadata.agent,
+                        "state": record.metadata.state or "approved",
+                        "dispositions": [
+                            _serialize_disposition(d) for d in record.metadata.dispositions
+                        ],
+                        "new_items": [
+                            _serialize_unresolved_item(item)
+                            for item in record.metadata.new_items
+                        ],
+                    }
+                    for record in result.completed_reviews
                 ]
+                if len(completed_names) == len(reviewers):
+                    descriptor["completed_round_number"] = result.round_number
+                elif result.round_number > 1:
+                    descriptor["completed_round_number"] = result.round_number - 1
     except AgentLoopError as exc:
         print(f"state_manager: resume error: {exc}", file=sys.stderr)
         sys.exit(1)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -17,13 +18,14 @@ SRC = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(SRC))
 
 
-def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _run(*args: str, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         [sys.executable, "-m", *args],
         capture_output=True,
         text=True,
         cwd=Path(__file__).parent.parent,
         check=False,
+        env=env,
     )
     if check and result.returncode != 0:
         raise AssertionError(
@@ -32,6 +34,42 @@ def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
             f"stderr: {result.stderr}"
         )
     return result
+
+
+def _make_fake_gh_env(fake_gh_dir: Path) -> dict:
+    """Return an environment dict with a fake gh prepended to PATH."""
+    env = os.environ.copy()
+    env["PATH"] = str(fake_gh_dir) + ":" + env.get("PATH", "")
+    return env
+
+
+def _write_fake_gh(directory: Path) -> Path:
+    """Write a fake gh script that returns canned responses for test isolation."""
+    script = directory / "gh"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, json\n"
+        "args = sys.argv[1:]\n"
+        "combined = ' '.join(args)\n"
+        "# Empty comments (no AGENT_LOOP_META → fresh round 1)\n"
+        "if 'api' in args and 'comments' in combined:\n"
+        "    pass\n"
+        "elif args[:2] == ['issue', 'view']:\n"
+        "    print(json.dumps({'number': 9998, 'title': 'Test Issue', 'body': 'Test body', 'url': 'https://github.com/test/repo/issues/9998'}))\n"
+        "elif args[:2] == ['pr', 'view']:\n"
+        "    print(json.dumps({'number': 9998, 'title': 'Test PR', 'body': 'Test body', 'url': 'https://github.com/test/repo/pull/9998', 'headRefOid': 'abc123def'}))\n"
+        "elif args[:2] == ['pr', 'diff']:\n"
+        "    print('diff --git a/foo.py b/foo.py')\n"
+        "elif 'comment' in args:\n"
+        "    # Should not be called in dry-run; fail loudly\n"
+        "    print('fake-gh: unexpected comment post in dry-run', file=sys.stderr)\n"
+        "    sys.exit(1)\n"
+        "else:\n"
+        "    print('{}')\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
 
 
 # ---------------------------------------------------------------------------
@@ -446,3 +484,127 @@ class TestRunExternal:
             "plan_state",
         )
         assert "validation passed: plan_state" in validate_result.stdout
+
+    def test_dry_run_flow_pr_writes_pr_review_stub(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as pf:
+            pf.write("Review this PR.")
+            prompt_path = pf.name
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as of:
+            output_path = of.name
+
+        result = _run(
+            "helpers.run_external",
+            "--agent", "codex",
+            "--prompt-file", prompt_path,
+            "--output", output_path,
+            "--workdir", "/tmp",
+            "--flow", "pr",
+            "--dry-run",
+        )
+        assert result.returncode == 0
+        content = Path(output_path).read_text(encoding="utf-8")
+        # PR stub must use AGENT_STATE (not AGENT_PLAN_STATE) and kind pr_review
+        assert "AGENT_STATE: approved" in content
+        assert "AGENT_PLAN_STATE" not in content
+        assert '"kind": "pr_review"' in content
+
+        # Confirm stub passes pr_review validation
+        stub_path = _write_tmp(content)
+        ctx_path = _write_tmp(
+            json.dumps({"reviewer": "Codex", "prior_items": [], "current_round_items": []}),
+            suffix=".json",
+        )
+        val = _run(
+            "helpers.validate_response",
+            "--file", stub_path,
+            "--kind", "pr_review",
+            "--context-file", ctx_path,
+        )
+        assert "validation passed: pr_review" in val.stdout
+
+
+# ---------------------------------------------------------------------------
+# helpers/skill_runner.py
+# ---------------------------------------------------------------------------
+
+_VALID_PLAN_FOR_RUNNER = """\
+## Plan
+
+1. Implement the feature.
+
+<!-- AGENT_PLAN_STATE: approved -->
+-- Anthropic Claude
+"""
+
+
+class TestSkillRunner:
+    def test_run_plan_round_dry_run_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            plan_path = tmppath / "plan.md"
+            plan_path.write_text(_VALID_PLAN_FOR_RUNNER, encoding="utf-8")
+
+            result = _run(
+                "helpers.skill_runner", "run-plan-round",
+                "--issue", "9998",
+                "--repo", "test/skill-repo",
+                "--plan-file", str(plan_path),
+                "--reviewers", "codex",
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0
+            # The runner prints progress lines then a final multi-line JSON object.
+            # Find the last '\n{' to locate the start of that object.
+            stdout = result.stdout
+            json_start = stdout.rfind("\n{")
+            if json_start < 0:
+                json_start = stdout.find("{")
+            assert json_start >= 0, f"No JSON found in stdout:\n{stdout}"
+            output = json.loads(stdout[json_start:].strip())
+            assert "state" in output
+            assert "round_number" in output
+            assert "blocking_items" in output
+            assert "approved_reviewers" in output
+
+    def test_run_plan_round_dry_run_no_github_posts(self) -> None:
+        """Dry-run must not invoke gh for posting (only for build-resume reads)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            plan_path = tmppath / "plan.md"
+            plan_path.write_text(_VALID_PLAN_FOR_RUNNER, encoding="utf-8")
+
+            result = _run(
+                "helpers.skill_runner", "run-plan-round",
+                "--issue", "9998",
+                "--repo", "test/skill-repo",
+                "--plan-file", str(plan_path),
+                "--reviewers", "codex",
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0
+
+    def test_run_plan_round_invalid_plan_exits_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            bad_plan = tmppath / "bad_plan.md"
+            bad_plan.write_text("No marker here at all.", encoding="utf-8")
+
+            result = _run(
+                "helpers.skill_runner", "run-plan-round",
+                "--issue", "9998",
+                "--repo", "test/skill-repo",
+                "--plan-file", str(bad_plan),
+                "--reviewers", "codex",
+                "--dry-run",
+                env=env,
+                check=False,
+            )
+            assert result.returncode != 0

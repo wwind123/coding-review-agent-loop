@@ -464,6 +464,22 @@ def _format_same_pr_unresolved_items(items: Sequence[UnresolvedReviewItem]) -> s
     return "\n".join(lines).strip()
 
 
+def apply_item_dispositions(
+    prior_items: Sequence[UnresolvedReviewItem],
+    dispositions_by_item: dict[str, list],
+    *,
+    same_status: str,
+    retain_future: bool,
+) -> tuple[list[UnresolvedReviewItem], list[UnresolvedReviewItem]]:
+    """Public wrapper around _apply_unresolved_item_dispositions for skill_runner use."""
+    return _apply_unresolved_item_dispositions(
+        prior_items,
+        dispositions_by_item,
+        same_status=same_status,
+        retain_future=retain_future,
+    )
+
+
 def _format_unresolved_items_for_coder(items: Sequence[UnresolvedReviewItem]) -> str:
     lines: list[str] = []
     for item in items:

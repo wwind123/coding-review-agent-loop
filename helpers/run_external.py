@@ -46,6 +46,21 @@ _CANNED_PLAN_REVIEW_FOOTER = (
     "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Codex (dry-run stub)\n"
 )
 
+_CANNED_PR_REVIEW = json.dumps(
+    {
+        "schema_version": 1,
+        "kind": "pr_review",
+        "state": "approved",
+        "summary": "Dry-run stub: PR looks good.",
+        "prior_item_dispositions": [],
+    },
+    indent=2,
+)
+
+_CANNED_PR_REVIEW_FOOTER = (
+    "\n<!-- AGENT_STATE: approved -->\n-- Codex (dry-run stub)\n"
+)
+
 _CANNED_PLAN_STATE = """\
 ## Plan (dry-run stub)
 
@@ -56,9 +71,11 @@ _CANNED_PLAN_STATE = """\
 """
 
 
-def _build_dry_run_response(role: str) -> str:
+def _build_dry_run_response(role: str, flow: str = "plan") -> str:
     if role == "coder":
         return _CANNED_PLAN_STATE
+    if flow == "pr":
+        return _CANNED_PR_REVIEW + _CANNED_PR_REVIEW_FOOTER
     return _CANNED_PLAN_REVIEW + _CANNED_PLAN_REVIEW_FOOTER
 
 
@@ -76,6 +93,12 @@ def main() -> None:
     )
     parser.add_argument("--cmd", default=None, help="Agent CLI command (overrides default).")
     parser.add_argument("--diff-file", default=None, help="Path to a pre-fetched PR diff to embed in the prompt.")
+    parser.add_argument(
+        "--flow",
+        default="plan",
+        choices=["plan", "pr"],
+        help="Review flow: 'plan' (default) or 'pr'. Affects dry-run stub kind.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Write a canned stub and exit.")
     args = parser.parse_args()
 
@@ -83,8 +106,14 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.dry_run:
-        stub_kind = "plan_state" if args.role == "coder" else "plan_review"
-        output_path.write_text(_build_dry_run_response(args.role), encoding="utf-8")
+        flow = args.flow
+        if args.role == "coder":
+            stub_kind = "plan_state"
+        elif flow == "pr":
+            stub_kind = "pr_review"
+        else:
+            stub_kind = "plan_review"
+        output_path.write_text(_build_dry_run_response(args.role, flow), encoding="utf-8")
         print(f"dry-run: wrote canned {stub_kind} stub to {output_path}")
         return
 

@@ -55,24 +55,12 @@ Then follow the steps below.
 
 ## Orchestration steps
 
-### Step 1 — Check for an existing session
-
-```bash
-python -m helpers.state_manager build-resume \
-  --issue ISSUE --repo OWNER/REPO \
-  --reviewers codex gemini \
-  --flow plan
-```
-
-If `round_number` > 1 or `completed_reviewer_names` is non-empty, a prior round
-was found and you can skip already-completed reviewer turns.
-
-### Step 2 — Write the plan (Claude host turn)
+### Step 1 — Write the plan (Claude host turn)
 
 Write the implementation plan to a temp file, e.g.:
 
 ```
-/tmp/agent-loop-skill/{session-id}/plan-{uuid}.md
+/tmp/agent-loop-skill/{session-id}/plan-r{N}.md
 ```
 
 The file must end with:
@@ -82,200 +70,75 @@ The file must end with:
 -- Anthropic Claude
 ```
 
-### Step 3 — Validate the plan
+### Step 2 — Run one review round
+
+`skill_runner` handles everything else: session resume, plan validation, attaching
+`AGENT_LOOP_META`, posting to GitHub, running each reviewer, validating/rendering
+their responses, and writing session state.
 
 ```bash
-python -m helpers.validate_response \
-  --file /tmp/agent-loop-skill/{session-id}/plan-{uuid}.md \
-  --kind plan_state
+python -m helpers.skill_runner run-plan-round \
+  --issue ISSUE \
+  --repo OWNER/REPO \
+  --plan-file /tmp/agent-loop-skill/{session-id}/plan-r{N}.md \
+  --reviewers codex gemini \
+  [--workdir-codex /path/to/codex/checkout] \
+  [--workdir-gemini /path/to/gemini/checkout]
 ```
 
-### Step 4 — Attach AGENT_LOOP_META to the plan comment
-
-The comment posted to GitHub must carry an `AGENT_LOOP_META` marker so that
-`build-resume` can reconstruct the round state in future sessions.  Use
-`attach-metadata` to produce a metadata-tagged version of the plan file:
-
-```bash
-python -m helpers.state_manager attach-metadata \
-  --body-file /tmp/agent-loop-skill/{session-id}/plan-{uuid}.md \
-  --output /tmp/agent-loop-skill/{session-id}/plan-tagged.md \
-  --flow plan --role coder --agent Claude \
-  --round-number {round_number} --state approved \
-  --subject-plan-file /tmp/agent-loop-skill/{session-id}/plan-{uuid}.md \
-  --canonical-plan-file /tmp/agent-loop-skill/{session-id}/plan-{uuid}.md \
-  [--prior-items-file /tmp/agent-loop-skill/{session-id}/prior_items.json]
-```
-
-`prior_items.json` is the `prior_items` array from the `build-resume` JSON
-output.  Omit the flag when `prior_items` is empty (round 1).
-
-### Step 5 — Save as pending comment and post
-
-```bash
-python -m helpers.state_manager write-pending-comment \
-  --issue ISSUE --repo OWNER/REPO \
-  --body /tmp/agent-loop-skill/{session-id}/plan-tagged.md
-```
-
-```bash
-python -m helpers.gh_ops post-issue-comment \
-  --issue ISSUE --file /tmp/agent-loop-skill/{session-id}/plan-tagged.md \
-  --repo OWNER/REPO
-```
-
-```bash
-python -m helpers.state_manager clear-pending-comment \
-  --issue ISSUE --repo OWNER/REPO
-```
-
-### Step 6 — Run each reviewer
-
-For each reviewer (e.g. Codex):
-
-```bash
-python -m helpers.run_external \
-  --agent codex \
-  --prompt-file /tmp/agent-loop-skill/{session-id}/reviewer-prompt.md \
-  --output /tmp/agent-loop-skill/{session-id}/codex-review.md \
-  --workdir /path/to/codex/checkout
-```
-
-Validate the reviewer response:
-
-```bash
-python -m helpers.validate_response \
-  --file /tmp/agent-loop-skill/{session-id}/codex-review.md \
-  --kind plan_review \
-  --context-file /tmp/agent-loop-skill/{session-id}/context.json
-```
-
-The `context.json` must contain:
+It prints a JSON result to stdout:
 
 ```json
 {
-  "reviewer": "Codex",
-  "prior_items": [...],
-  "current_round_items": [...]
+  "state": "approved" | "blocking",
+  "round_number": N,
+  "blocking_items": [...],
+  "approved_reviewers": [...]
 }
 ```
 
-Render the structured JSON to human-readable markdown before posting:
+### Step 3 — Decision
 
-```bash
-python -m helpers.render_response \
-  --file /tmp/agent-loop-skill/{session-id}/codex-review.md \
-  --kind plan_review \
-  --reviewer Codex \
-  --context-file /tmp/agent-loop-skill/{session-id}/context.json \
-  --output /tmp/agent-loop-skill/{session-id}/codex-review-rendered.md
-```
-
-Attach AGENT_LOOP_META to the rendered reviewer comment:
-
-```bash
-python -m helpers.state_manager attach-metadata \
-  --body-file /tmp/agent-loop-skill/{session-id}/codex-review-rendered.md \
-  --output /tmp/agent-loop-skill/{session-id}/codex-review-tagged.md \
-  --flow plan --role reviewer --agent Codex \
-  --round-number {round_number} --state approved \
-  --subject-plan-file /tmp/agent-loop-skill/{session-id}/plan-{uuid}.md \
-  [--prior-items-file /tmp/agent-loop-skill/{session-id}/prior_items.json] \
-  [--dispositions-file /tmp/agent-loop-skill/{session-id}/codex_dispositions.json]
-```
-
-Post the rendered reviewer comment (with metadata):
-
-```bash
-python -m helpers.gh_ops post-issue-comment \
-  --issue ISSUE --file /tmp/agent-loop-skill/{session-id}/codex-review-tagged.md \
-  --repo OWNER/REPO
-```
-
-### Step 7 — Update session state
-
-```bash
-python -m helpers.state_manager write-session \
-  --issue ISSUE --repo OWNER/REPO \
-  --fields '{"last_completed_step": "post_review", "round_number": 1}'
-```
-
-### Step 8 — Decision
-
-- If all reviewers approved: implementation is complete.
-- If any reviewer blocked: perform a new plan revision and loop back to Step 2.
+- `"state": "approved"` and `blocking_items` is empty → implementation is complete.
+- `"state": "blocking"` → address the `blocking_items`, write a revised plan, and
+  loop back to Step 1 with the new plan file (the round number increments automatically).
 - If clarification is needed: post an `<!-- AGENT_CLARIFY -->` comment and stop.
 
 ---
 
 ## PR review mode
 
-Use `--flow pr` with `build-resume` and pass `--pr PR_NUMBER` (or `--head-sha SHA`)
-to operate in PR-review mode. All other steps are the same, using `--kind pr_review`
-for validation.
+Use `run-pr-round` instead of `run-plan-round`.  Pass `--pr PR_NUMBER` and
+optionally `--head-sha SHA` (auto-fetched if omitted):
+
+```bash
+python -m helpers.skill_runner run-pr-round \
+  --pr PR_NUMBER \
+  --repo OWNER/REPO \
+  --reviewers codex gemini \
+  [--head-sha SHA] \
+  [--workdir-codex /path/to/checkout] \
+  [--workdir-gemini /path/to/checkout]
+```
+
+The JSON result shape is the same as for plan rounds.  There is no "write plan"
+step — the PR diff is fetched automatically.
 
 ---
 
 ## Reversed roles (Codex as coder, Claude as reviewer)
 
-When `--coder codex` is requested, the following steps differ from the normal flow.
+Reversed-roles mode (Codex writes the plan, Claude reviews) is tracked in
+issue #285 and not yet implemented in `skill_runner`.  Until then, use the
+low-level helpers directly:
 
-**Critical**: `build-resume` tracks completion by matching the posted review's
-`--agent` value against the `--reviewers` list.  In reversed-roles mode Claude
-is the reviewer, so **pass `--reviewers claude`** in Step 1 (not `codex` or
-`gemini`).  Using the wrong reviewers list causes `build-resume` to ignore
-Claude's completed review on any subsequent resume.
-
-### Step 1 — build-resume (reversed-roles variant)
-
-```bash
-python -m helpers.state_manager build-resume \
-  --issue ISSUE --repo OWNER/REPO \
-  --reviewers claude \
-  --flow plan
-```
-
-### Step 2 (coder turn) — Codex writes the plan
-
-Instead of Claude writing the plan directly, invoke Codex:
-
-```bash
-python -m helpers.run_external \
-  --agent codex \
-  --role coder \
-  --prompt-file /tmp/agent-loop-skill/{session-id}/coder-prompt.md \
-  --output /tmp/agent-loop-skill/{session-id}/plan.md \
-  --workdir /path/to/codex/checkout
-```
-
-The prompt file must contain the issue context and plan-format instructions
-(including the `<!-- AGENT_PLAN_STATE: approved -->` footer requirement).
-
-### Step 3 — Validate the plan (same as normal)
-
-```bash
-python -m helpers.validate_response \
-  --file /tmp/agent-loop-skill/{session-id}/plan.md \
-  --kind plan_state
-```
-
-### Steps 4–5 — Attach metadata and post (same as normal)
-
-Use `--agent Codex` in the `attach-metadata` call instead of `--agent Claude`.
-
-### Step 6 (review turn) — Claude writes the structured review
-
-Claude (the session host) writes the structured JSON review directly to a temp file:
-
-```
-/tmp/agent-loop-skill/{session-id}/claude-review.md
-```
-
-The file must be a valid `plan_review` JSON followed by the `<!-- AGENT_PLAN_STATE: ... -->` footer.
-
-Validate, render, and post as in the normal reviewer flow (Step 6), using
-`--reviewer Claude` and `--agent Claude` in the respective commands.
-This ensures `build-resume --reviewers claude` recognizes the review on resume.
+1. Invoke Codex to write the plan via `helpers.run_external --role coder`.
+2. Validate the plan with `helpers.validate_response --kind plan_state`.
+3. Attach metadata with `helpers.state_manager attach-metadata --agent Codex`.
+4. Post the plan via `helpers.gh_ops post-issue-comment`.
+5. Claude writes a `plan_review` JSON review, validates it, renders it, and posts it
+   using `--agent Claude`.  Pass `--reviewers claude` to `build-resume` so that
+   Claude's review is recognized on resume.
 
 ---
 
@@ -303,8 +166,9 @@ This location is outside git checkouts, so it never dirties any working tree.
 
 ## Limitations
 
-- If Claude Code's session ends mid-loop, resume from the last posted GitHub comment
-  by re-running Step 1 with `build-resume`.
+- If Claude Code's session ends mid-loop, resume by running `skill_runner` again
+  with the same plan file — it reads GitHub comment history automatically via
+  `build-resume` and skips already-completed reviewer turns.
 - Long-running Codex/Gemini subprocess progress is not streamed; check the log
   file in `/tmp/coding-review-agent-loop/skill-logs/` if a reviewer hangs.
 - The structured protocol (AGENT_LOOP_META markers, structured JSON responses)
