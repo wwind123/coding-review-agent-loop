@@ -113,13 +113,10 @@ def _normalize_disposition_values(text: str) -> str:
     Agents occasionally write natural-language variants like 'still blocking'
     instead of the canonical 'blocking'. This normalizes them before validation.
     """
-    json_end = text.find("<!-- AGENT")
-    if json_end < 0:
-        json_end = len(text)
-    json_part = text[:json_end].strip()
-    footer = text[json_end:]
     try:
-        data = json.loads(json_part)
+        decoder = json.JSONDecoder()
+        data, end_idx = decoder.raw_decode(text.lstrip())
+        footer = text.lstrip()[end_idx:]
     except json.JSONDecodeError:
         return text
     changed = False
@@ -429,8 +426,8 @@ def _run_reviewer(
     # --- Parse review JSON for metadata ---
     raw_text = raw_output.read_text(encoding="utf-8")
     try:
-        json_part = raw_text.split("<!-- AGENT")[0].strip()
-        review_json = json.loads(json_part)
+        decoder = json.JSONDecoder()
+        review_json, _ = decoder.raw_decode(raw_text.lstrip())
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"skill_runner: cannot parse {agent} review JSON: {exc}", file=sys.stderr)
         sys.exit(1)
