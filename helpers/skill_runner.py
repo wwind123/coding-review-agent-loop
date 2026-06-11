@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -92,6 +93,43 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+_ITEM_ID_RE = re.compile(r"-(\d+)$")
+_STATE_MARKER_RE = re.compile(r"<!-- AGENT(?:_PLAN)?_STATE: \w+ -->")
+_SIGNATURE_RE = re.compile(r"^--\s+\S[^\n]*", re.MULTILINE)
+
+
+def _normalize_raw_response(text: str) -> str:
+    """Strip prose the protocol validator would reject.
+
+    1. Leading prose before the JSON object (Gemini sometimes writes a summary line first).
+    2. Any content after the first agent signature line (e.g. a duplicate state marker).
+    """
+    # Strip leading prose before the JSON block
+    brace_idx = text.find("{")
+    if brace_idx > 0:
+        text = text[brace_idx:]
+
+    # Strip trailing content after the first signature line
+    m = _STATE_MARKER_RE.search(text)
+    if m is None:
+        return text
+    sig_m = _SIGNATURE_RE.search(text, m.end())
+    if sig_m is None:
+        return text
+    return text[: sig_m.end()].rstrip() + "\n"
+
+
+def _max_item_number(item_lists: list[list[dict]]) -> int:
+    """Return the highest numeric suffix found across all item dicts, or 0 if none."""
+    max_n = 0
+    for items in item_lists:
+        for item in items:
+            m = _ITEM_ID_RE.search(str(item.get("item_id", "")))
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    return max_n
+
+
 def _workdir_for_agent(agent: str, args: argparse.Namespace) -> str:
     specific = getattr(args, f"workdir_{agent}", None)
     if specific:
@@ -140,14 +178,19 @@ def _fetch_pr_diff(repo: str, pr: int, gh_cmd: str = "gh") -> str:
 
 
 def _fetch_issue_comments_raw(repo: str, issue: int, gh_cmd: str = "gh") -> list[str]:
+    # Use `gh issue view --json comments` to get correctly structured comment bodies
+    # without the multiline-splitting bug that `--jq .[].body` produces.
     result = subprocess.run(
-        [gh_cmd, "api", f"repos/{repo}/issues/{issue}/comments",
-         "--paginate", "--jq", ".[].body"],
+        [gh_cmd, "issue", "view", str(issue), "--repo", repo, "--json", "comments"],
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
         return []
-    return [b for b in result.stdout.strip().split("\n") if b]
+    try:
+        data = json.loads(result.stdout)
+        return [c["body"] for c in data.get("comments", []) if isinstance(c, dict) and "body" in c]
+    except (json.JSONDecodeError, KeyError):
+        return []
 
 
 def _build_resume(
@@ -201,20 +244,11 @@ def _reconcile_pending_comment(
         )
         return
     body_text = body_path.read_text(encoding="utf-8")
-    # Check if it's already been posted by looking for its AGENT_LOOP_META in GitHub comments
-    from coding_review_agent_loop.round_state import _extract_round_metadata_records
-
-    class _FC:
-        def __init__(self, b: str) -> None:
-            self.body = b
-
+    # Check if already posted by comparing against raw GitHub comment bodies.
+    # Both body_text and the posted comment contain the full AGENT_LOOP_META block,
+    # so a direct (stripped) comparison is sufficient and avoids any parsing dependency.
     existing_bodies = _fetch_issue_comments_raw(repo, issue)
-    records = _extract_round_metadata_records([_FC(b) for b in existing_bodies], flow="plan")
-    # Try both flows
-    records_pr = _extract_round_metadata_records([_FC(b) for b in existing_bodies], flow="pr")
-    all_bodies = {r.body for r in records} | {r.body for r in records_pr}
-
-    already_posted = body_text in all_bodies
+    already_posted = body_text.strip() in {b.strip() for b in existing_bodies}
     if already_posted:
         _run_helper(
             "helpers.state_manager", "clear-pending-comment",
@@ -298,6 +332,7 @@ def _run_reviewer(
     workdir: str,
     dry_run: bool,
     tmpdir: Path,
+    item_id_offset: int = 0,
 ) -> dict:
     """Run one reviewer turn; return {reviewer_name, state, blocking_items, new_items}."""
     agent_cap = agent.capitalize() if agent in ("codex", "gemini") else agent
@@ -323,6 +358,12 @@ def _run_reviewer(
         "--workdir", workdir,
         "--flow", flow,
         *(["--dry-run"] if dry_run else []),
+    )
+
+    # Normalize: strip duplicate state markers that some agents append after the signature
+    raw_output.write_text(
+        _normalize_raw_response(raw_output.read_text(encoding="utf-8")),
+        encoding="utf-8",
     )
 
     # --- Validate ---
@@ -365,19 +406,23 @@ def _run_reviewer(
             d["reviewer"] = agent_cap
 
     blocking_key = "blocking_plan_issues" if flow == "plan" else "blocking_items"
-    blocking_texts = review_json.get(blocking_key, [])
-    new_unresolved_texts = review_json.get(
-        "same_plan_followups" if flow == "plan" else "same_pr_followups", []
-    )
+    blocking_texts = list(review_json.get(blocking_key, []))
+    same_key = "same_plan_followups" if flow == "plan" else "same_pr_followups"
+    new_unresolved_texts = list(review_json.get(same_key, []))
+
+    # When a reviewer blocks via same-round followups only (no explicit blocking issues),
+    # surface those followups as blocking_items for the caller so the overall state is correct.
+    reported_blocking = blocking_texts
+    if parsed_state == "blocking" and not blocking_texts:
+        reported_blocking = new_unresolved_texts
 
     # Serialize dispositions (with reviewer) for attach-metadata
     _write_json(dispositions_file, raw_dispositions)
 
-    # Build new_items as UnresolvedReviewItem dicts
-    # We don't have next_unresolved_item_number here so we mint simple IDs
-    # The metadata embed is for resume; IDs only need to be unique within the comment
+    # Mint IDs that are globally unique across rounds by starting from item_id_offset.
+    # item_id_offset = max numeric suffix seen across prior_items + already-minted round items.
     new_items_serialized: list[dict] = []
-    item_counter = len(next_prior_items_raw) + 1
+    item_counter = item_id_offset + 1
     for text in blocking_texts:
         new_items_serialized.append({
             "item_id": f"item-{item_counter}",
@@ -447,7 +492,7 @@ def _run_reviewer(
     return {
         "reviewer_name": agent_cap,
         "state": parsed_state,
-        "blocking_items": [{"text": t} for t in blocking_texts],
+        "blocking_items": [{"text": t} for t in reported_blocking],
         "new_items": new_items_serialized,
     }
 
@@ -476,9 +521,9 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
     # Step 3 — new-round vs resume detection
     plan_subject = _plan_subject_of_file(plan_file)
     current_plan_subject = resume.get("current_plan_subject")
+    is_new_round = current_plan_subject != plan_subject
 
-    if current_plan_subject != plan_subject:
-        # New round
+    if is_new_round:
         completed_round_number = int(resume.get("completed_round_number", 0))
         new_round_number = completed_round_number + 1
         next_prior_items_raw = _compute_next_prior_items(
@@ -489,14 +534,13 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         )
         local_completed: set[str] = set()
     else:
-        # Resume
+        # Resume: plan already posted; only run remaining reviewers
         new_round_number = int(resume.get("round_number", 1))
         next_prior_items_raw = list(resume.get("prior_items", []))
         local_completed = {str(n) for n in resume.get("completed_reviewer_names", [])}
 
-    # Step 4 — validate and post new plan (new round only)
-    if not local_completed:
-        # Validate
+    # Step 4 — validate and post plan (new rounds only; resume skips this)
+    if is_new_round:
         result = _run_helper_capture(
             "helpers.validate_response",
             "--file", str(plan_file),
@@ -542,16 +586,19 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         else:
             print(f"[dry-run] would post plan for {repo}#{issue} (round {new_round_number})")
 
-    # Step 5 — reconstruct round state from completed reviewers (resume path)
+    # Step 5 — reconstruct round state from already-completed reviewers (resume path)
     current_round_items: list[dict] = []
     round_blocking_items: list[dict] = []
     round_approved_reviewers: list[str] = []
+    any_reviewer_blocked = False
     for record in resume.get("completed_reviewer_data", []):
         current_round_items.extend(record.get("new_items", []))
         if record.get("state") == "blocking":
+            any_reviewer_blocked = True
             round_blocking_items.extend(
-                item for item in record.get("new_items", [])
-                if item.get("status") == "blocking"
+                {"text": item.get("text", "")}
+                for item in record.get("new_items", [])
+                if item.get("status") in ("blocking", "same-plan")
             )
         else:
             round_approved_reviewers.append(str(record.get("reviewer_name", "")))
@@ -581,7 +628,6 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                     all_reviewers=[r for r in reviewers],  # type: ignore[misc]
                 )
             except Exception as exc:  # noqa: BLE001
-                # Fallback: plain prompt
                 prompt_text = (
                     f"Review the following implementation plan for issue #{issue} in {repo}.\n\n"
                     f"Round: {new_round_number}\n\n"
@@ -594,6 +640,8 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                 "current_round_items": current_round_items,
             }
 
+            # item_id_offset: highest numeric suffix across prior + current-round items
+            item_id_offset = _max_item_number([next_prior_items_raw, current_round_items])
             workdir = _workdir_for_agent(reviewer, args)
             record = _run_reviewer(
                 agent=reviewer,
@@ -610,9 +658,11 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                 workdir=workdir,
                 dry_run=dry_run,
                 tmpdir=tmpdir,
+                item_id_offset=item_id_offset,
             )
             current_round_items.extend(record["new_items"])
             if record["state"] == "blocking":
+                any_reviewer_blocked = True
                 round_blocking_items.extend(record["blocking_items"])
             else:
                 round_approved_reviewers.append(record["reviewer_name"])
@@ -629,7 +679,8 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         )
 
     # Step 8 — print result
-    overall_state = "approved" if not round_blocking_items else "blocking"
+    # Use any_reviewer_blocked to catch reviewers that blocked via same-plan followups only.
+    overall_state = "blocking" if any_reviewer_blocked else "approved"
     result_json = {
         "state": overall_state,
         "round_number": new_round_number,
@@ -678,15 +729,18 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         next_prior_items_raw = list(resume.get("prior_items", []))
         local_completed = {str(n) for n in resume.get("completed_reviewer_names", [])}
 
-    # Step 5 — reconstruct round state from completed reviewers
+    # Step 5 — reconstruct round state from already-completed reviewers
     current_round_items: list[dict] = []
     round_blocking_items: list[dict] = []
     round_approved_reviewers: list[str] = []
+    any_reviewer_blocked = False
     for record in resume.get("completed_reviewer_data", []):
         current_round_items.extend(record.get("new_items", []))
         if record.get("state") == "blocking":
+            any_reviewer_blocked = True
             round_blocking_items.extend(
-                item for item in record.get("new_items", [])
+                {"text": item.get("text", "")}
+                for item in record.get("new_items", [])
                 if item.get("status") in ("blocking", "same-pr")
             )
         else:
@@ -729,6 +783,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 "current_round_items": current_round_items,
             }
 
+            item_id_offset = _max_item_number([next_prior_items_raw, current_round_items])
             workdir = _workdir_for_agent(reviewer, args)
             record = _run_reviewer(
                 agent=reviewer,
@@ -745,9 +800,11 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 workdir=workdir,
                 dry_run=dry_run,
                 tmpdir=tmpdir,
+                item_id_offset=item_id_offset,
             )
             current_round_items.extend(record["new_items"])
             if record["state"] == "blocking":
+                any_reviewer_blocked = True
                 round_blocking_items.extend(record["blocking_items"])
             else:
                 round_approved_reviewers.append(record["reviewer_name"])
@@ -764,7 +821,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         )
 
     # Step 8 — print result
-    overall_state = "approved" if not round_blocking_items else "blocking"
+    overall_state = "blocking" if any_reviewer_blocked else "approved"
     result_json = {
         "state": overall_state,
         "round_number": new_round_number,
