@@ -100,8 +100,20 @@ It prints a JSON result to stdout:
 ### Step 3 — Decision
 
 - `"state": "approved"` and `blocking_items` is empty → implementation is complete.
-- `"state": "blocking"` → address the `blocking_items`, write a revised plan, and
-  loop back to Step 1 with the new plan file (the round number increments automatically).
+- `"state": "blocking"` → address the `blocking_items`, then:
+  1. Post a change-summary comment on the issue so reviewers know what changed before re-reading the plan:
+     ```bash
+     gh issue comment ISSUE --repo OWNER/REPO --body "$(cat <<'EOF'
+     Addressed round-N feedback:
+
+     - **item-X**: <what was changed>
+     - **item-Y**: <what was changed>
+
+     -- Anthropic Claude
+     EOF
+     )"
+     ```
+  2. Write a revised plan and loop back to Step 1 (round number increments automatically).
 - If clarification is needed: post an `<!-- AGENT_CLARIFY -->` comment and stop.
 
 ---
@@ -123,6 +135,21 @@ python -m helpers.skill_runner run-pr-round \
 
 The JSON result shape is the same as for plan rounds.  There is no "write plan"
 step — the PR diff is fetched automatically.
+
+When the result is `"state": "blocking"`, address the items, push the fixes, and
+post a change-summary comment on the PR before running the next round:
+
+```bash
+gh pr comment PR --repo OWNER/REPO --body "$(cat <<'EOF'
+Addressed round-N feedback:
+
+- **item-X**: <what was changed>
+- **item-Y**: <what was changed>
+
+-- Anthropic Claude
+EOF
+)"
+```
 
 ---
 
