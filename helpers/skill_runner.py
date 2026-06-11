@@ -94,8 +94,45 @@ def _write_text(path: Path, text: str) -> None:
 
 
 _ITEM_ID_RE = re.compile(r"-(\d+)$")
+_DISPOSITION_ALIASES: dict[str, str] = {
+    "still blocking": "blocking",
+    "remains blocking": "blocking",
+    "keep blocking": "blocking",
+    "stay blocking": "blocking",
+    "still same-pr": "same-pr",
+    "still same-plan": "same-plan",
+    "still future": "future",
+}
 _STATE_MARKER_RE = re.compile(r"<!-- AGENT(?:_PLAN)?_STATE: \w+ -->")
 _SIGNATURE_RE = re.compile(r"^--\s+\S[^\n]*", re.MULTILINE)
+
+
+def _normalize_disposition_values(text: str) -> str:
+    """Fix known bad disposition values in the review JSON blob.
+
+    Agents occasionally write natural-language variants like 'still blocking'
+    instead of the canonical 'blocking'. This normalizes them before validation.
+    """
+    json_end = text.find("<!-- AGENT")
+    if json_end < 0:
+        json_end = len(text)
+    json_part = text[:json_end].strip()
+    footer = text[json_end:]
+    try:
+        data = json.loads(json_part)
+    except json.JSONDecodeError:
+        return text
+    changed = False
+    for key in ("prior_plan_item_dispositions", "prior_item_dispositions"):
+        for disp in data.get(key, []):
+            raw = str(disp.get("disposition", ""))
+            canonical = _DISPOSITION_ALIASES.get(raw.lower())
+            if canonical:
+                disp["disposition"] = canonical
+                changed = True
+    if not changed:
+        return text
+    return json.dumps(data, indent=2) + "\n" + footer.lstrip()
 
 
 def _normalize_raw_response(text: str) -> str:
@@ -173,7 +210,8 @@ def _fetch_pr_diff(repo: str, pr: int, gh_cmd: str = "gh") -> str:
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
-        return ""
+        print(f"skill_runner: gh pr diff failed: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
     return result.stdout
 
 
@@ -321,7 +359,7 @@ def _run_reviewer(
     agent: str,
     prompt_text: str,
     context: dict,
-    plan_subject: str,
+    round_subject: str,
     next_prior_items_raw: list[dict],
     new_round_number: int,
     issue: int,
@@ -360,11 +398,11 @@ def _run_reviewer(
         *(["--dry-run"] if dry_run else []),
     )
 
-    # Normalize: strip duplicate state markers that some agents append after the signature
-    raw_output.write_text(
-        _normalize_raw_response(raw_output.read_text(encoding="utf-8")),
-        encoding="utf-8",
-    )
+    # Normalize: fix prose prefix / duplicate state markers / bad disposition values
+    raw_text = raw_output.read_text(encoding="utf-8")
+    raw_text = _normalize_raw_response(raw_text)
+    raw_text = _normalize_disposition_values(raw_text)
+    raw_output.write_text(raw_text, encoding="utf-8")
 
     # --- Validate ---
     validate_kind = "pr_review" if flow == "pr" else "plan_review"
@@ -462,12 +500,7 @@ def _run_reviewer(
         "--dispositions-file", str(dispositions_file),
         "--new-items-file", str(new_items_file),
     ]
-    if flow == "plan":
-        # For plan flow, subject is the sha256 of the plan text
-        attach_args += ["--subject", plan_subject]
-    else:
-        # For PR flow, subject is the head SHA (plan_subject holds it)
-        attach_args += ["--subject", plan_subject]
+    attach_args += ["--subject", round_subject]
     _run_helper(*attach_args)
 
     # --- Post (skip when dry_run) ---
@@ -586,22 +619,25 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         else:
             print(f"[dry-run] would post plan for {repo}#{issue} (round {new_round_number})")
 
-    # Step 5 — reconstruct round state from already-completed reviewers (resume path)
+    # Step 5 — reconstruct round state from already-completed reviewers (RESUME path only).
+    # In a new round, completed_reviewer_data belongs to the previous round and must not
+    # contaminate the current round's result.
     current_round_items: list[dict] = []
     round_blocking_items: list[dict] = []
     round_approved_reviewers: list[str] = []
     any_reviewer_blocked = False
-    for record in resume.get("completed_reviewer_data", []):
-        current_round_items.extend(record.get("new_items", []))
-        if record.get("state") == "blocking":
-            any_reviewer_blocked = True
-            round_blocking_items.extend(
-                {"text": item.get("text", "")}
-                for item in record.get("new_items", [])
-                if item.get("status") in ("blocking", "same-plan")
-            )
-        else:
-            round_approved_reviewers.append(str(record.get("reviewer_name", "")))
+    if not is_new_round:
+        for record in resume.get("completed_reviewer_data", []):
+            current_round_items.extend(record.get("new_items", []))
+            if record.get("state") == "blocking":
+                any_reviewer_blocked = True
+                round_blocking_items.extend(
+                    {"text": item.get("text", "")}
+                    for item in record.get("new_items", [])
+                    if item.get("status") in ("blocking", "same-plan")
+                )
+            else:
+                round_approved_reviewers.append(str(record.get("reviewer_name", "")))
 
     plan_text = plan_file.read_text(encoding="utf-8")
 
@@ -647,7 +683,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                 agent=reviewer,
                 prompt_text=prompt_text,
                 context=context,
-                plan_subject=plan_subject,
+                round_subject=plan_subject,
                 next_prior_items_raw=next_prior_items_raw,
                 new_round_number=new_round_number,
                 issue=issue,
@@ -713,8 +749,9 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
 
     # Step 3 — detect new vs resume (for PR, head SHA mismatch = new round)
     current_subject = resume.get("current_plan_subject")
+    is_new_round = current_subject != head_sha
 
-    if current_subject != head_sha:
+    if is_new_round:
         completed_round_number = int(resume.get("completed_round_number", 0))
         new_round_number = completed_round_number + 1
         next_prior_items_raw = _compute_next_prior_items(
@@ -729,22 +766,25 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         next_prior_items_raw = list(resume.get("prior_items", []))
         local_completed = {str(n) for n in resume.get("completed_reviewer_names", [])}
 
-    # Step 5 — reconstruct round state from already-completed reviewers
+    # Step 5 — reconstruct round state from already-completed reviewers (RESUME path only).
+    # In a new round, completed_reviewer_data belongs to the previous round and must not
+    # contaminate the current round's result.
     current_round_items: list[dict] = []
     round_blocking_items: list[dict] = []
     round_approved_reviewers: list[str] = []
     any_reviewer_blocked = False
-    for record in resume.get("completed_reviewer_data", []):
-        current_round_items.extend(record.get("new_items", []))
-        if record.get("state") == "blocking":
-            any_reviewer_blocked = True
-            round_blocking_items.extend(
-                {"text": item.get("text", "")}
-                for item in record.get("new_items", [])
-                if item.get("status") in ("blocking", "same-pr")
-            )
-        else:
-            round_approved_reviewers.append(str(record.get("reviewer_name", "")))
+    if not is_new_round:
+        for record in resume.get("completed_reviewer_data", []):
+            current_round_items.extend(record.get("new_items", []))
+            if record.get("state") == "blocking":
+                any_reviewer_blocked = True
+                round_blocking_items.extend(
+                    {"text": item.get("text", "")}
+                    for item in record.get("new_items", [])
+                    if item.get("status") in ("blocking", "same-pr")
+                )
+            else:
+                round_approved_reviewers.append(str(record.get("reviewer_name", "")))
 
     pr_diff = _fetch_pr_diff(repo, pr)
     issue_dict = _fetch_pr_json(repo, pr)
@@ -789,7 +829,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 agent=reviewer,
                 prompt_text=prompt_text,
                 context=context,
-                plan_subject=head_sha,
+                round_subject=head_sha,
                 next_prior_items_raw=next_prior_items_raw,
                 new_round_number=new_round_number,
                 issue=pr,

@@ -609,3 +609,29 @@ class TestSkillRunner:
                 check=False,
             )
             assert result.returncode != 0
+
+    def test_run_pr_round_dry_run_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+
+            result = _run(
+                "helpers.skill_runner", "run-pr-round",
+                "--pr", "9998",
+                "--repo", "test/skill-repo",
+                "--reviewers", "codex",
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0
+            stdout = result.stdout
+            json_start = stdout.rfind("\n{")
+            if json_start < 0:
+                json_start = stdout.find("{")
+            assert json_start >= 0, f"No JSON found in stdout:\n{stdout}"
+            output = json.loads(stdout[json_start:].strip())
+            assert output["state"] in ("approved", "blocking")
+            assert "round_number" in output
+            assert "blocking_items" in output
+            assert "approved_reviewers" in output
