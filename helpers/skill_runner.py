@@ -132,14 +132,22 @@ def _normalize_disposition_values(text: str) -> str:
     return json.dumps(data, indent=2) + "\n" + footer.lstrip()
 
 
+_HR_RESOLVED_LINE_RE = re.compile(r"^\s*<!--\s*HUMAN_REQUIREMENTS_RESOLVED\s*-->\s*$")
+
+
 def _normalize_raw_response(text: str) -> str:
-    """Strip prose the protocol validator would reject.
+    """Strip content the protocol validator would reject.
 
     1. Leading prose before the JSON object (Gemini sometimes writes a summary line first).
-    2. Stray HTML-comment-only lines between the closing } and <!-- AGENT_STATE --> (e.g.
-       Codex's <!-- HUMAN_REQUIREMENTS_RESOLVED -->). Lines with actual prose are kept so
-       that plan-revision <!-- HUMAN_REQUIREMENTS_ADDRESSED --> sections are not destroyed.
+    2. Between the closing } and <!-- AGENT_STATE -->: keep only the one recognized optional
+       marker (<!-- HUMAN_REQUIREMENTS_RESOLVED -->); strip everything else (e.g. Codex's
+       stray <!-- HUMAN_REQUIREMENTS_RESOLVED --> mixed with other unrecognized lines, or
+       prose that predates the structured format).
     3. Any content after the first agent signature line (e.g. a duplicate state marker).
+
+    This function is only called for reviewer responses (pr_review / plan_review).
+    Plan-revision responses (plan_state) are never passed here; their
+    <!-- HUMAN_REQUIREMENTS_ADDRESSED --> + ### Human requirements sections are not at risk.
     """
     # Strip leading prose before the JSON block
     brace_idx = text.find("{")
@@ -163,19 +171,16 @@ def _normalize_raw_response(text: str) -> str:
     if sig_m is None:
         return text
 
-    # Only strip the between-section when it contains nothing but HTML comments.
-    # Prose lines (e.g. ### Human requirements) mean we must preserve the section.
+    # Reconstruct: JSON + (preserved HR_RESOLVED if present) + state-marker + signature.
+    # All other between-section content (unrecognized HTML comments, prose) is dropped.
     between = remainder[: m.start()]
-    between_is_comments_only = all(
-        not line.strip() or line.strip().startswith("<!--")
-        for line in between.splitlines()
+    state_and_sig = remainder[m.start() : sig_m.end()]
+    hr_resolved = next(
+        (line.strip() for line in between.splitlines() if _HR_RESOLVED_LINE_RE.match(line)),
+        None,
     )
-    if between_is_comments_only:
-        state_and_sig = remainder[m.start() : sig_m.end()]
-        return json_text.rstrip() + "\n" + state_and_sig.rstrip() + "\n"
-
-    # Prose present between JSON and state marker — preserve it, just drop after signature
-    return (json_text + remainder[: sig_m.end()]).rstrip() + "\n"
+    prefix = (hr_resolved + "\n") if hr_resolved else ""
+    return json_text.rstrip() + "\n" + prefix + state_and_sig.rstrip() + "\n"
 
 
 def _max_item_number(item_lists: list[list[dict]]) -> int:
