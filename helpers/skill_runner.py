@@ -163,18 +163,31 @@ def _normalize_raw_response(text: str) -> str:
         json_text = text
         remainder = ""
 
-    # Find state marker and signature in the remainder
+    # Find state marker and signature. Either order may appear (Gemini sometimes
+    # places the signature before the state marker).
     m = _STATE_MARKER_RE.search(remainder)
     if m is None:
         return text
-    sig_m = _SIGNATURE_RE.search(remainder, m.end())
-    if sig_m is None:
-        return text
 
-    # Reconstruct: JSON + (preserved HR_RESOLVED if present) + state-marker + signature.
-    # All other between-section content (unrecognized HTML comments, prose) is dropped.
-    between = remainder[: m.start()]
-    state_and_sig = remainder[m.start() : sig_m.end()]
+    sig_m = _SIGNATURE_RE.search(remainder, m.end())
+    if sig_m is not None:
+        # Standard order: STATE_MARKER … SIGNATURE
+        # Keep HR_RESOLVED from between-section; drop everything else.
+        between = remainder[: m.start()]
+        state_and_sig = remainder[m.start() : sig_m.end()]
+    else:
+        # Non-standard order: SIGNATURE … STATE_MARKER (Gemini legacy)
+        sig_m = _SIGNATURE_RE.search(remainder)
+        if sig_m is None or sig_m.start() >= m.start():
+            return text  # Cannot normalize — return as-is
+        # Reorder to standard form.
+        between = remainder[: sig_m.start()]
+        state_text = remainder[m.start() : m.end()].strip()
+        sig_text = remainder[sig_m.start() : sig_m.end()].strip()
+        state_and_sig = state_text + "\n" + sig_text
+
+    # Reconstruct: JSON + (HR_RESOLVED if present) + state-marker + signature.
+    # All other between-section content (prose, unrecognized HTML comments) is dropped.
     hr_resolved = next(
         (line.strip() for line in between.splitlines() if _HR_RESOLVED_LINE_RE.match(line)),
         None,
