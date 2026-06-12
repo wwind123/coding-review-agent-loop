@@ -114,9 +114,10 @@ def _normalize_disposition_values(text: str) -> str:
     instead of the canonical 'blocking'. This normalizes them before validation.
     """
     try:
+        stripped = text.lstrip()
         decoder = json.JSONDecoder()
-        data, end_idx = decoder.raw_decode(text.lstrip())
-        footer = text.lstrip()[end_idx:]
+        data, end_idx = decoder.raw_decode(stripped)
+        footer = stripped[end_idx:]
     except json.JSONDecodeError:
         return text
     changed = False
