@@ -100,21 +100,24 @@ It prints a JSON result to stdout:
 ### Step 3 — Decision
 
 - `"state": "approved"` and `blocking_items` is empty → implementation is complete.
-- `"state": "blocking"` → address the `blocking_items`, then:
-  1. Post a change-summary comment on the issue so reviewers know what changed before re-reading the plan:
-     ```bash
-     gh issue comment ISSUE --repo OWNER/REPO --body "$(cat <<'EOF'
-     Addressed round-N feedback:
-
-     - **item-X**: <what was changed>
-     - **item-Y**: <what was changed>
-
-     -- Anthropic Claude
-     EOF
-     )"
-     ```
-  2. Write a revised plan and loop back to Step 1 (round number increments automatically).
+- `"state": "blocking"` → address the `blocking_items`, post a change-summary
+  comment on the issue (see template below), write a revised plan, and loop back
+  to Step 1 (the round number increments automatically).
 - If clarification is needed: post an `<!-- AGENT_CLARIFY -->` comment and stop.
+
+Change-summary template for plan rounds (`EOF` must be flush-left when run in a shell):
+
+```bash
+gh issue comment ISSUE --repo OWNER/REPO --body "$(cat <<'EOF'
+Addressed round-N feedback:
+
+- **item-X**: <what was changed>
+- **item-Y**: <what was changed>
+
+-- <Your Name>
+EOF
+)"
+```
 
 ---
 
@@ -146,7 +149,7 @@ Addressed round-N feedback:
 - **item-X**: <what was changed>
 - **item-Y**: <what was changed>
 
--- Anthropic Claude
+-- <Your Name>
 EOF
 )"
 ```
