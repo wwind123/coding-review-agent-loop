@@ -136,8 +136,9 @@ def _normalize_raw_response(text: str) -> str:
     """Strip prose the protocol validator would reject.
 
     1. Leading prose before the JSON object (Gemini sometimes writes a summary line first).
-    2. Non-AGENT markers between the closing } and <!-- AGENT_STATE --> (e.g. Codex's
-       <!-- HUMAN_REQUIREMENTS_RESOLVED -->).
+    2. Stray HTML-comment-only lines between the closing } and <!-- AGENT_STATE --> (e.g.
+       Codex's <!-- HUMAN_REQUIREMENTS_RESOLVED -->). Lines with actual prose are kept so
+       that plan-revision <!-- HUMAN_REQUIREMENTS_ADDRESSED --> sections are not destroyed.
     3. Any content after the first agent signature line (e.g. a duplicate state marker).
     """
     # Strip leading prose before the JSON block
@@ -162,9 +163,19 @@ def _normalize_raw_response(text: str) -> str:
     if sig_m is None:
         return text
 
-    # Reconstruct: JSON + state-marker-through-signature, dropping anything in between
-    state_and_sig = remainder[m.start() : sig_m.end()]
-    return json_text.rstrip() + "\n" + state_and_sig.rstrip() + "\n"
+    # Only strip the between-section when it contains nothing but HTML comments.
+    # Prose lines (e.g. ### Human requirements) mean we must preserve the section.
+    between = remainder[: m.start()]
+    between_is_comments_only = all(
+        not line.strip() or line.strip().startswith("<!--")
+        for line in between.splitlines()
+    )
+    if between_is_comments_only:
+        state_and_sig = remainder[m.start() : sig_m.end()]
+        return json_text.rstrip() + "\n" + state_and_sig.rstrip() + "\n"
+
+    # Prose present between JSON and state marker — preserve it, just drop after signature
+    return (json_text + remainder[: sig_m.end()]).rstrip() + "\n"
 
 
 def _max_item_number(item_lists: list[list[dict]]) -> int:
