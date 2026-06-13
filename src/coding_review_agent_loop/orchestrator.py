@@ -97,6 +97,11 @@ from .protocol import (
 from .protocol import parse_review
 from .repair import attempt_envelope_normalization, attempt_repair, strip_unknown_prior_item_dispositions
 from .runner import Runner
+from .transient import (
+    NON_RETRYABLE_AGENT_OUTPUT_RE,
+    TRANSIENT_AGENT_OUTPUT_RE,
+    is_transient_agent_output,
+)
 from .usage import RunUsageContext, UsageMetadata, estimate_usage
 from .workdirs import active_workdir
 from .workdir_guard import (
@@ -197,23 +202,9 @@ from .unresolved_items import (
 )
 
 
-TRANSIENT_AGENT_OUTPUT_RE = re.compile(
-    r"Invalid stream|empty response|malformed tool call|"
-    r"network (?:reset|timeout)|connection (?:reset|timed out|timeout)|"
-    r"\btimed out\b|\btimeout\b|"
-    r"Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|"
-    r"\b429\b|rate.?limit(?:ed)?|"
-    r"session.?limit.?exceeded|session_limit_exceeded|too many sessions|"
-    r"no capacity available|capacity.*(?:unavailable|exceeded)|"
-    r"resource.?exhausted|overloaded|"
-    r"\bquota\b",
-    re.I,
-)
-NON_RETRYABLE_AGENT_OUTPUT_RE = re.compile(
-    r"auth(?:entication|orization)?|unauthorized|forbidden|invalid api key|"
-    r"credit|billing|dirty (?:checkout|workdir|working tree)",
-    re.I,
-)
+# TRANSIENT_AGENT_OUTPUT_RE / NON_RETRYABLE_AGENT_OUTPUT_RE / is_transient_agent_output
+# now live in .transient (imported above) so dependency-light callers such as
+# helpers.run_external can reuse them without importing this module.
 NEAR_MISS_AGENT_MARKER_RE = re.compile(
     r"(?m)^[ \t]*AGENT_(?:PLAN_)?STATE:[ \t]*(?:approved|blocking)[ \t.]*$",
     re.I,
@@ -428,10 +419,8 @@ def _agent_log_context(log_paths: Sequence[object]) -> str:
     return "\nAttempt logs:\n" + "\n".join(f"- {path}" for path in paths)
 
 
-def _is_transient_agent_output(text: str) -> bool:
-    return bool(TRANSIENT_AGENT_OUTPUT_RE.search(text)) and not bool(
-        NON_RETRYABLE_AGENT_OUTPUT_RE.search(text)
-    )
+# Backwards-compatible alias: the implementation moved to .transient.
+_is_transient_agent_output = is_transient_agent_output
 
 
 def _decode_public_response_json_prefix(text: str) -> object | None:

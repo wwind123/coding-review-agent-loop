@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -106,7 +107,28 @@ def main() -> None:
         help="GitHub OWNER/REPO to clone if workdir is absent or stale. "
              "When provided, workdir is validated and re-cloned automatically.",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Retries for transient agent failures (429/overloaded/timeout). "
+             "Total attempts = max-retries + 1 (default: 2, matching the CLI). "
+             "Use 0 to disable retries.",
+    )
+    parser.add_argument(
+        "--retry-backoff-seconds",
+        type=int,
+        nargs="+",
+        default=[15, 45],
+        help="Backoff delays before each retry; the final value is reused when "
+             "retries exceed the list length (default: 15 45).",
+    )
     args = parser.parse_args()
+
+    if args.max_retries < 0:
+        parser.error("--max-retries must be >= 0")
+    if any(delay <= 0 for delay in args.retry_backoff_seconds):
+        parser.error("--retry-backoff-seconds values must be > 0")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,6 +170,7 @@ def main() -> None:
     from coding_review_agent_loop.agents.codex import CodexBackend
     from coding_review_agent_loop.agents.gemini import GeminiBackend
     from coding_review_agent_loop.config import AgentLoopConfig, AgentName, ensure_temp_checkout
+    from coding_review_agent_loop.transient import is_transient_agent_output
 
     agent_name: AgentName = args.agent
     default_cmds = {"codex": "codex", "gemini": "gemini"}
@@ -195,15 +218,50 @@ def main() -> None:
     )
 
     runner = Runner(dry_run=False)
+    # Re-clone (if requested) happens once, outside the retry loop: it raises
+    # deterministically and re-cloning per attempt would be wasteful.
     if args.repo:
         ensure_temp_checkout(workdir, agent=agent_name, config=config, runner=runner)
     backend = CodexBackend() if agent_name == "codex" else GeminiBackend()
-    try:
-        result = backend.run(runner, config, prompt)
-    except Exception as exc:  # noqa: BLE001
-        print(f"run_external: agent invocation failed: {exc}", file=sys.stderr)
+
+    # Retry transient agent failures (429 / overloaded / timeout / capacity).
+    # The primary failure path is a *returned* AgentResult with a non-zero
+    # returncode whose raw_output (merged stdout+stderr) carries the signal;
+    # a raised exception is the secondary path (its message embeds the captured
+    # output tail for AgentLoopError from run_with_log).
+    max_attempts = args.max_retries + 1
+    backoff = args.retry_backoff_seconds
+    result = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            candidate = backend.run(runner, config, prompt)
+        except Exception as exc:  # noqa: BLE001
+            failure_text = str(exc)
+        else:
+            if candidate.returncode != 0 or not candidate.text.strip():
+                failure_text = candidate.raw_output or candidate.text
+            else:
+                result = candidate
+                break
+
+        transient = is_transient_agent_output(failure_text or "")
+        if attempt < max_attempts and transient:
+            delay = backoff[min(attempt - 1, len(backoff) - 1)] if backoff else 1
+            print(
+                f"run_external: transient failure (attempt {attempt}/{max_attempts}), "
+                f"retrying in {delay}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            continue
+        reason = "retries exhausted" if transient else "non-transient failure"
+        print(
+            f"run_external: agent invocation failed ({reason}): {failure_text}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
+    assert result is not None  # loop either set result or exited
     output_path.write_text(result.text, encoding="utf-8")
     print(f"agent result written to {output_path}")
 

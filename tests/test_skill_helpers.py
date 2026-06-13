@@ -851,3 +851,95 @@ class TestRetryValidate:
             assert output["state"] == "blocking"
             assert len(output["blocking_items"]) == 1
             assert output["blocking_items"][0]["text"] == "Address the followup from last round."
+
+
+# ---------------------------------------------------------------------------
+# helpers/run_external.py  retry loop (in-process, monkeypatched backend)
+# ---------------------------------------------------------------------------
+
+# Ensure the repo root is importable so `helpers.run_external` resolves in-process.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+class TestRunExternalRetries:
+    def _invoke(self, monkeypatch, agent, outcomes, *, max_retries=2):
+        """Drive run_external.main with a fake backend; return (calls, sleeps, output_path, exit_code)."""
+        import helpers.run_external as rex
+        from coding_review_agent_loop.agents.base import AgentResult  # noqa: F401
+
+        calls = {"n": 0}
+
+        class FakeBackend:
+            def run(self, runner, config, prompt):
+                i = calls["n"]
+                calls["n"] += 1
+                outcome = outcomes[min(i, len(outcomes) - 1)]
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        monkeypatch.setattr("coding_review_agent_loop.agents.codex.CodexBackend", FakeBackend)
+        monkeypatch.setattr("coding_review_agent_loop.agents.gemini.GeminiBackend", FakeBackend)
+        sleeps: list[int] = []
+        monkeypatch.setattr(rex.time, "sleep", lambda s: sleeps.append(s))
+
+        prompt_path = _write_tmp("Review this.")
+        output_path = _write_tmp("", suffix=".out.md")
+        argv = [
+            "run_external", "--agent", agent,
+            "--prompt-file", prompt_path, "--output", output_path,
+            "--workdir", "/tmp",
+            "--max-retries", str(max_retries),
+            "--retry-backoff-seconds", "1", "2",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        exit_code = 0
+        try:
+            rex.main()
+        except SystemExit as exc:
+            exit_code = exc.code or 0
+        return calls, sleeps, output_path, exit_code
+
+    def test_returned_transient_result_is_retried_then_succeeds(self, monkeypatch) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+        outcomes = [
+            AgentResult(text="", raw_output="Error: 429 Too Many Requests", returncode=1),
+            AgentResult(text="", raw_output="model overloaded", returncode=1),
+            AgentResult(text="final review body", returncode=0),
+        ]
+        calls, sleeps, output_path, exit_code = self._invoke(monkeypatch, "codex", outcomes)
+        assert exit_code == 0
+        assert calls["n"] == 3
+        assert sleeps == [1, 2]  # backoff[0], backoff[1]
+        assert Path(output_path).read_text(encoding="utf-8") == "final review body"
+
+    def test_raised_transient_exception_is_retried_then_succeeds(self, monkeypatch) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+        outcomes = [
+            RuntimeError("503 Service Unavailable"),
+            AgentResult(text="ok", returncode=0),
+        ]
+        calls, sleeps, output_path, exit_code = self._invoke(monkeypatch, "gemini", outcomes)
+        assert exit_code == 0
+        assert calls["n"] == 2
+        assert sleeps == [1]
+        assert Path(output_path).read_text(encoding="utf-8") == "ok"
+
+    def test_non_transient_returned_result_fails_fast(self, monkeypatch) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+        outcomes = [AgentResult(text="", raw_output="invalid api key", returncode=1)]
+        calls, sleeps, _output_path, exit_code = self._invoke(monkeypatch, "codex", outcomes)
+        assert exit_code == 1
+        assert calls["n"] == 1  # no retry on non-transient failure
+        assert sleeps == []
+
+    def test_max_retries_zero_makes_single_attempt(self, monkeypatch) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+        outcomes = [AgentResult(text="", raw_output="429 rate limit", returncode=1)]
+        calls, sleeps, _output_path, exit_code = self._invoke(
+            monkeypatch, "codex", outcomes, max_retries=0
+        )
+        assert exit_code == 1
+        assert calls["n"] == 1  # transient, but retries disabled
+        assert sleeps == []
