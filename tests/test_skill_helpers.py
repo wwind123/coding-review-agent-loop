@@ -943,3 +943,52 @@ class TestRunExternalRetries:
         assert exit_code == 1
         assert calls["n"] == 1  # transient, but retries disabled
         assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# helpers/prompt_builders.py  checkout path embedding (#297)
+# ---------------------------------------------------------------------------
+
+class TestPromptCheckoutPath:
+    _ISSUE = {
+        "number": 296, "repo": "wwind123/coding-review-agent-loop",
+        "title": "t", "body": "b", "url": "u",
+    }
+
+    def _no_bare_skill_runner(self, prompt: str) -> int:
+        import re
+        # the bare path (no -{agent} suffix) is the bug; it must not appear
+        return len(re.findall(r"/coding-review-agent-loop/skill-runner(?!-)", prompt))
+
+    def test_plan_prompt_embeds_explicit_reviewer_workdir(self) -> None:
+        from helpers.prompt_builders import build_plan_review_prompt_for_skill
+        wd = "/tmp/coding-review-agent-loop/skill-runner-codex"
+        prompt = build_plan_review_prompt_for_skill(
+            self._ISSUE, "PLAN", [], 1, "codex",
+            repo="wwind123/coding-review-agent-loop",
+            all_reviewers=["codex", "gemini"], workdir=wd,
+        )
+        assert wd in prompt
+        assert self._no_bare_skill_runner(prompt) == 0
+
+    def test_plan_prompt_default_uses_agent_suffixed_path(self) -> None:
+        from helpers.prompt_builders import build_plan_review_prompt_for_skill
+        prompt = build_plan_review_prompt_for_skill(
+            self._ISSUE, "PLAN", [], 1, "gemini",
+            repo="wwind123/coding-review-agent-loop",
+            all_reviewers=["codex", "gemini"],
+        )
+        # default mirrors _workdir_for_agent: skill-runner-{agent}, never the bare path
+        assert "skill-runner-gemini" in prompt
+        assert self._no_bare_skill_runner(prompt) == 0
+
+    def test_pr_prompt_embeds_explicit_reviewer_workdir(self) -> None:
+        from helpers.prompt_builders import build_review_prompt_for_skill
+        wd = "/tmp/coding-review-agent-loop/skill-runner-codex"
+        prompt = build_review_prompt_for_skill(
+            self._ISSUE, "diff --git a b", [], 1, "codex",
+            repo="wwind123/coding-review-agent-loop", pr_number=295,
+            all_reviewers=["codex", "gemini"], workdir=wd,
+        )
+        assert wd in prompt
+        assert self._no_bare_skill_runner(prompt) == 0

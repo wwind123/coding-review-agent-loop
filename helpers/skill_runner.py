@@ -831,6 +831,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
 
             # Build prompt
             issue_dict = _fetch_issue_json(repo, issue)
+            workdir = _workdir_for_agent(reviewer, args)
             try:
                 from helpers.prompt_builders import build_plan_review_prompt_for_skill
                 prompt_text = build_plan_review_prompt_for_skill(
@@ -841,6 +842,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                     reviewer,  # type: ignore[arg-type]
                     repo=repo,
                     all_reviewers=[r for r in reviewers],  # type: ignore[misc]
+                    workdir=workdir,
                 )
             except Exception as exc:  # noqa: BLE001
                 prompt_text = (
@@ -857,7 +859,6 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
 
             # item_id_offset: highest numeric suffix across prior + current-round items
             item_id_offset = _max_item_number([next_prior_items_raw, current_round_items])
-            workdir = _workdir_for_agent(reviewer, args)
             record = _run_reviewer(
                 agent=reviewer,
                 prompt_text=prompt_text,
@@ -977,6 +978,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 print(f"[skip] {reviewer_cap} already completed this round")
                 continue
 
+            workdir = _workdir_for_agent(reviewer, args)
             try:
                 from helpers.prompt_builders import build_review_prompt_for_skill
                 prompt_text = build_review_prompt_for_skill(
@@ -988,6 +990,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                     repo=repo,
                     pr_number=pr,
                     all_reviewers=[r for r in reviewers],  # type: ignore[misc]
+                    workdir=workdir,
                 )
             except Exception as exc:  # noqa: BLE001
                 prompt_text = (
@@ -1003,7 +1006,6 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             }
 
             item_id_offset = _max_item_number([next_prior_items_raw, current_round_items])
-            workdir = _workdir_for_agent(reviewer, args)
             record = _run_reviewer(
                 agent=reviewer,
                 prompt_text=prompt_text,

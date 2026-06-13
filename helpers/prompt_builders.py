@@ -25,13 +25,28 @@ def _make_minimal_config(
     repo: str,
     coder: AgentName,
     reviewer_names: Sequence[AgentName],
+    *,
+    reviewer: AgentName | None = None,
+    workdir: str | None = None,
 ) -> AgentLoopConfig:
-    tmp = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "skill-runner"
+    base = Path(tempfile.gettempdir()) / "coding-review-agent-loop"
+    legacy = base / "skill-runner"
+
+    def _agent_dir(agent: AgentName) -> Path:
+        # The active reviewer's dir must match where the agent actually runs, so the
+        # checkout path embedded in the prompt is real. The default mirrors
+        # skill_runner._workdir_for_agent ("skill-runner-{agent}"); previously this
+        # hardcoded the bare "skill-runner" path, which never exists and made
+        # reviewers (notably Codex) block on a missing checkout (#297).
+        if workdir and agent == reviewer:
+            return Path(workdir)
+        return base / f"skill-runner-{agent}"
+
     return AgentLoopConfig(
         repo=repo,
-        claude_dir=tmp,
-        codex_dir=tmp,
-        gemini_dir=tmp,
+        claude_dir=_agent_dir("claude"),
+        codex_dir=_agent_dir("codex"),
+        gemini_dir=_agent_dir("gemini"),
         coder=coder,
         reviewer=tuple(reviewer_names),
         base="main",
@@ -52,13 +67,13 @@ def _make_minimal_config(
         ci_timeout_seconds=300,
         ci_poll_interval_seconds=30,
         quiet=False,
-        log_dir=tmp,
+        log_dir=legacy,
         progress_interval_seconds=30,
         agent_max_retries=0,
         agent_retry_backoff_seconds=(30,),
         agent_memory=False,
         refresh_agent_memory=False,
-        agent_memory_dir=tmp,
+        agent_memory_dir=legacy,
         refresh_test_profile=False,
         auto_agent_dirs=tuple(reviewer_names),
     )
@@ -85,6 +100,7 @@ def build_plan_review_prompt_for_skill(
     repo: str,
     coder: AgentName = "claude",
     all_reviewers: Sequence[AgentName] | None = None,
+    workdir: str | None = None,
 ) -> str:
     """Build a plan reviewer prompt from plain dicts.
 
@@ -97,9 +113,11 @@ def build_plan_review_prompt_for_skill(
         repo: Repository owner/name.
         coder: Agent name of the coder (default: "claude").
         all_reviewers: All configured reviewer names (defaults to [reviewer]).
+        workdir: The reviewer's actual checkout path, embedded in the prompt so
+            the agent inspects a directory that exists (#297).
     """
     reviewers_list: Sequence[AgentName] = all_reviewers or [reviewer]
-    config = _make_minimal_config(repo, coder, reviewers_list)
+    config = _make_minimal_config(repo, coder, reviewers_list, reviewer=reviewer, workdir=workdir)
     issue_context = _make_issue_context(issue_dict)
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
     return build_plan_review_prompt(
@@ -124,6 +142,7 @@ def build_review_prompt_for_skill(
     pr_number: int,
     coder: AgentName = "claude",
     all_reviewers: Sequence[AgentName] | None = None,
+    workdir: str | None = None,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
 
@@ -137,11 +156,13 @@ def build_review_prompt_for_skill(
         pr_number: Pull request number.
         coder: Agent name of the coder (default: "claude").
         all_reviewers: All configured reviewer names (defaults to [reviewer]).
+        workdir: The reviewer's actual checkout path, embedded in the prompt so
+            the agent inspects a directory that exists (#297).
     """
     from coding_review_agent_loop.github import PullRequestMetadata
 
     reviewers_list: Sequence[AgentName] = all_reviewers or [reviewer]
-    config = _make_minimal_config(repo, coder, reviewers_list)
+    config = _make_minimal_config(repo, coder, reviewers_list, reviewer=reviewer, workdir=workdir)
     issue_context = _make_issue_context(issue_dict)
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
     pr_metadata = PullRequestMetadata(
