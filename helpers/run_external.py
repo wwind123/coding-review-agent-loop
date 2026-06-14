@@ -81,9 +81,32 @@ and opened a pull request.
 -- Codex (dry-run stub)
 """
 
+_CANNED_PLAN_DECOMPOSITION = json.dumps(
+    {
+        "schema_version": 1,
+        "kind": "plan_decomposition",
+        "phases": [
+            {
+                "title": "Dry-run implementation phase",
+                "scope": "Dry-run stub: implement the approved plan in one child issue.",
+                "non_goals": "No real GitHub issue is created during dry-run.",
+                "dependency_notes": "First phase; no dependencies.",
+                "rollout_risk": "low - dry-run preview only.",
+                "validation": "Run the relevant project tests before opening a PR.",
+                "parent_context": "Dry-run stub derived from the approved parent plan.",
+                "automation": "agent-pr",
+                "depends_on": [],
+            }
+        ],
+    },
+    indent=2,
+)
+
 
 def _build_dry_run_response(role: str, flow: str = "plan") -> str:
     if role == "coder":
+        if flow == "decompose":
+            return _CANNED_PLAN_DECOMPOSITION
         return _CANNED_IMPLEMENTATION if flow == "pr" else _CANNED_PLAN_STATE
     if flow == "pr":
         return _CANNED_PR_REVIEW + _CANNED_PR_REVIEW_FOOTER
@@ -107,8 +130,8 @@ def main() -> None:
     parser.add_argument(
         "--flow",
         default="plan",
-        choices=["plan", "pr"],
-        help="Review flow: 'plan' (default) or 'pr'. Affects dry-run stub kind.",
+        choices=["plan", "pr", "decompose"],
+        help="Review flow: 'plan' (default), 'pr', or 'decompose'. Affects dry-run stub kind.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Write a canned stub and exit.")
     parser.add_argument(
@@ -152,7 +175,10 @@ def main() -> None:
     if args.dry_run:
         flow = args.flow
         if args.role == "coder":
-            stub_kind = "implementation" if flow == "pr" else "plan_state"
+            if flow == "decompose":
+                stub_kind = "plan_decomposition"
+            else:
+                stub_kind = "implementation" if flow == "pr" else "plan_state"
         elif flow == "pr":
             stub_kind = "pr_review"
         else:

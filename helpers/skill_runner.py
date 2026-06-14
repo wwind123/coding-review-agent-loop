@@ -48,6 +48,17 @@ Subcommands:
     role: coder PR comment so run-pr-round can review it. Idempotent per plan via
     the one-shot handoff marker. Requires a push-capable workdir.
 
+  run-decompose
+    --issue N --repo OWNER/REPO
+    --coder {codex,gemini}
+    --plan-file PATH
+    [--workdir PATH] [--workdir-codex PATH] [--workdir-gemini PATH]
+    [--dry-run]
+
+    Reversed roles: an external coder decomposes an approved plan into child
+    phase issues. Live runs create real GitHub issues and post an idempotency
+    marker on the parent. Dry-run invokes a parseable stub and creates nothing.
+
 Prints a JSON result to stdout and exits 0:
   {"state": "approved"|"blocking", "round_number": N,
    "blocking_items": [...], "approved_reviewers": [...]}
@@ -2467,6 +2478,230 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# run-decompose  (external coder decomposes an approved plan into child issues) (#318)
+# ---------------------------------------------------------------------------
+
+def _issue_context_for_decompose_preview(repo: str, issue: int):
+    from coding_review_agent_loop.github import IssueContext, IssueComment
+
+    try:
+        issue_json = _fetch_issue_json(repo, issue)
+    except SystemExit:
+        return IssueContext(
+            number=issue,
+            repo=repo,
+            title=None,
+            body=None,
+            url=None,
+            comments=(),
+            human_requirements=(),
+        )
+    comments = tuple(
+        IssueComment(author=None, created_at=None, body=body)
+        for body in _fetch_issue_comments_raw(repo, issue)
+    )
+    return IssueContext(
+        number=int(issue_json.get("number") or issue),
+        repo=repo,
+        title=issue_json.get("title"),
+        body=issue_json.get("body"),
+        url=issue_json.get("url"),
+        comments=comments,
+        human_requirements=(),
+    )
+
+
+def _decomposition_phase_json(index: int, phase, *, issue_url: str | None = None,
+                              issue_number: int | None = None) -> dict:
+    return {
+        "index": index,
+        "title": phase.title,
+        "phase_title": f"Phase {index}: {phase.title}",
+        "automation": phase.automation,
+        "depends_on": list(getattr(phase, "depends_on", ()) or ()),
+        "scope": getattr(phase, "scope", None),
+        "non_goals": getattr(phase, "non_goals", None),
+        "dependency_notes": getattr(phase, "dependency_notes", None),
+        "rollout_risk": phase.rollout_risk,
+        "validation": getattr(phase, "validation", None),
+        "parent_context": phase.parent_context,
+        "issue_url": issue_url,
+        "issue_number": issue_number,
+    }
+
+
+def _existing_decomposition_json(existing) -> list[dict]:
+    phases = []
+    for index, (title, url, number) in enumerate(existing.children, start=1):
+        phases.append({
+            "index": index,
+            "title": title,
+            "phase_title": f"Phase {index}: {title}",
+            "automation": existing.automation[index - 1] if index <= len(existing.automation) else None,
+            "issue_url": url,
+            "issue_number": number,
+        })
+    return phases
+
+
+def cmd_run_decompose(args: argparse.Namespace) -> None:
+    issue: int = args.issue
+    repo: str = args.repo
+    coder: str = args.coder
+    dry_run: bool = args.dry_run
+    mode = "decompose-only"
+
+    plan_file = Path(args.plan_file)
+    if not plan_file.exists():
+        print(f"skill_runner: plan file not found: {plan_file}", file=sys.stderr)
+        sys.exit(1)
+    approved_plan = plan_file.read_text(encoding="utf-8")
+    if not approved_plan.strip():
+        print("skill_runner: plan file is empty; cannot decompose an empty plan", file=sys.stderr)
+        sys.exit(1)
+
+    workdir = _workdir_for_agent(coder, args)
+    Path(workdir).mkdir(parents=True, exist_ok=True)
+
+    from coding_review_agent_loop.decomposition import (
+        approved_plan_hash,
+        create_decomposition_child_issues,
+        find_existing_decomposition,
+        parse_plan_decomposition,
+        post_decomposition_parent_summary,
+    )
+    from coding_review_agent_loop.github import get_issue_context
+    from helpers.prompt_builders import (
+        build_plan_decomposition_prompt_for_skill,
+        make_minimal_config,
+    )
+
+    config = dataclasses.replace(
+        make_minimal_config(repo, coder, (coder,), reviewer=coder, workdir=str(workdir)),  # type: ignore[arg-type]
+        dry_run=dry_run,
+    )
+    runner = Runner(dry_run=dry_run)
+    plan_hash = approved_plan_hash(approved_plan)
+
+    if dry_run:
+        issue_context = _issue_context_for_decompose_preview(repo, issue)
+    else:
+        issue_context = get_issue_context(runner, config=config, issue_number=issue)
+
+    existing = find_existing_decomposition(
+        issue_context.comments,
+        parent_issue=issue,
+        plan_hash=plan_hash,
+        mode=mode,
+    )
+    if existing is not None:
+        print(json.dumps({
+            "issue": issue,
+            "plan_hash": plan_hash,
+            "mode": mode,
+            "dry_run": dry_run,
+            "reused": True,
+            "phase_count": existing.phase_count,
+            "phases": _existing_decomposition_json(existing),
+        }, indent=2))
+        print(
+            f"hint: issue #{issue} already has a {mode} decomposition for this plan.",
+            file=sys.stderr,
+        )
+        return
+
+    prompt_text = build_plan_decomposition_prompt_for_skill(
+        issue_context, approved_plan, repo=repo, coder=coder, workdir=str(workdir),  # type: ignore[arg-type]
+    )
+
+    with tempfile.TemporaryDirectory() as tmpstr:
+        tmpdir = Path(tmpstr)
+        prompt_file = tmpdir / "decompose-prompt.md"
+        raw_output = tmpdir / "decompose-raw.md"
+        usage_file = tmpdir / "decompose-usage.json"
+        _write_text(prompt_file, prompt_text)
+
+        _run_helper(
+            "helpers.run_external",
+            "--agent", coder,
+            "--role", "coder",
+            "--prompt-file", str(prompt_file),
+            "--output", str(raw_output),
+            "--workdir", str(workdir),
+            "--repo", repo,
+            "--flow", "decompose",
+            "--usage-output", str(usage_file),
+            *(["--dry-run"] if dry_run else []),
+        )
+        coder_output = raw_output.read_text(encoding="utf-8")
+        coder_usage: dict | None = None
+        if usage_file.exists():
+            try:
+                coder_usage = json.loads(usage_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                coder_usage = None
+
+        try:
+            decomposition = parse_plan_decomposition(coder_output)
+        except AgentLoopError as exc:
+            debug_dir = _REPAIR_BASE / f"{issue}-decompose-debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(raw_output, debug_dir / "raw.md")
+            shutil.copy2(prompt_file, debug_dir / "prompt.md")
+            print(f"skill_runner: decomposition response rejected: {exc}", file=sys.stderr)
+            print(
+                f"skill_runner: raw response saved to {debug_dir}/raw.md — fix the "
+                f"underlying issue and re-run run-decompose (non-retryable).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        result_json: dict = {
+            "issue": issue,
+            "plan_hash": plan_hash,
+            "mode": mode,
+            "dry_run": dry_run,
+            "reused": False,
+        }
+        if dry_run:
+            result_json["would_post_parent_summary"] = True
+            result_json["phases"] = [
+                _decomposition_phase_json(index, phase)
+                for index, phase in enumerate(decomposition.phases, start=1)
+            ]
+            print("[dry-run] would create child phase issues and post parent decomposition marker")
+        else:
+            created = create_decomposition_child_issues(
+                runner,
+                config=config,
+                parent_issue=issue,
+                approved_plan=approved_plan,
+                decomposition=decomposition,
+            )
+            post_decomposition_parent_summary(
+                runner,
+                config=config,
+                parent_issue=issue,
+                mode=mode,
+                plan_hash=plan_hash,
+                created=created,
+            )
+            result_json["phases"] = [
+                _decomposition_phase_json(
+                    index, created_issue.phase,
+                    issue_url=created_issue.issue_url,
+                    issue_number=created_issue.issue_number,
+                )
+                for index, created_issue in enumerate(created, start=1)
+            ]
+        result_json["phase_count"] = len(result_json["phases"])
+        usage = _aggregate_reviewer_usage([{"usage": coder_usage}] if coder_usage else [])
+        if usage is not None:
+            result_json["usage"] = usage
+        print(json.dumps(result_json, indent=2))
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2591,6 +2826,24 @@ def main() -> None:
     p_impl.add_argument("--workdir-gemini", default=None)
     p_impl.add_argument("--dry-run", action="store_true")
 
+    # run-decompose
+    p_decompose = subparsers.add_parser(
+        "run-decompose",
+        help="Reversed roles: an external coder decomposes an approved plan into "
+             "child phase issues (#318).",
+    )
+    p_decompose.add_argument("--issue", type=int, required=True)
+    p_decompose.add_argument("--repo", required=True)
+    p_decompose.add_argument(
+        "--coder", choices=["codex", "gemini"], required=True,
+        help="External coder that decomposes the approved plan.",
+    )
+    p_decompose.add_argument("--plan-file", required=True, help="Approved plan to decompose.")
+    p_decompose.add_argument("--workdir", default=None)
+    p_decompose.add_argument("--workdir-codex", default=None)
+    p_decompose.add_argument("--workdir-gemini", default=None)
+    p_decompose.add_argument("--dry-run", action="store_true")
+
     # run-task-round
     p_task = subparsers.add_parser(
         "run-task-round",
@@ -2628,6 +2881,7 @@ def main() -> None:
         "retry-validate": cmd_retry_validate,
         "complete-host-review": cmd_complete_host_review,
         "run-implement": cmd_run_implement,
+        "run-decompose": cmd_run_decompose,
         "run-task-round": cmd_run_task_round,
     }
     dispatch[args.subcommand](args)

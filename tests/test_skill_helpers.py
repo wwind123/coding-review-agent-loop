@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import pytest
@@ -1973,6 +1974,24 @@ class TestRunExternalImplStub:
             assert "<!-- AGENT_PR:" in out.read_text(encoding="utf-8")
 
 
+class TestRunExternalDecomposeStub:
+    def test_coder_decompose_dry_run_writes_valid_decomposition_stub(self) -> None:
+        from coding_review_agent_loop.decomposition import parse_plan_decomposition
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.md"
+            result = _run(
+                "helpers.run_external",
+                "--agent", "codex", "--role", "coder", "--flow", "decompose",
+                "--prompt-file", _write_tmp("decompose it"),
+                "--output", str(out), "--workdir", tmpdir,
+                "--dry-run",
+            )
+            assert result.returncode == 0
+            parsed = parse_plan_decomposition(out.read_text(encoding="utf-8"))
+            assert parsed.phases[0].title == "Dry-run implementation phase"
+
+
 class TestImplementationPrompt:
     def test_includes_plan_workdir_and_human_requirement(self) -> None:
         from coding_review_agent_loop.github import IssueContext
@@ -1990,6 +2009,33 @@ class TestImplementationPrompt:
         assert "/tmp/skill-runner-codex" in prompt
         assert "release-x" in prompt  # PR-base instruction threads --base
         assert "backward compatible" in prompt  # signed human requirement surfaced
+
+
+class TestDecompositionPrompt:
+    def test_includes_plan_issue_context_and_workdir(self) -> None:
+        from coding_review_agent_loop.github import IssueContext, IssueComment
+        from helpers.prompt_builders import build_plan_decomposition_prompt_for_skill
+        ctx = IssueContext(
+            number=42,
+            repo="o/r",
+            title="Decompose this",
+            body="Issue body ABC",
+            url="https://example/42",
+            comments=(IssueComment(author="wwind123", created_at="2026-06-14T00:00:00Z", body="Comment XYZ"),),
+            human_requirements=(_human_req(),),
+        )
+        prompt = build_plan_decomposition_prompt_for_skill(
+            ctx,
+            "APPROVED PLAN BODY XYZ",
+            repo="o/r",
+            coder="codex",
+            workdir="/tmp/skill-runner-codex",
+        )
+        assert "APPROVED PLAN BODY XYZ" in prompt
+        assert "Issue body ABC" in prompt
+        assert "Comment XYZ" in prompt
+        assert "/tmp/skill-runner-codex" in prompt
+        assert "backward compatible" in prompt
 
 
 class TestValidateCoderImplementationResponse:
@@ -2080,3 +2126,183 @@ class TestRunImplement:
             )
             assert result.returncode != 0
             assert "push-capable" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# helpers/skill_runner.py — approved-plan decomposition: run-decompose (#318)
+# ---------------------------------------------------------------------------
+
+_DECOMP_JSON = json.dumps(
+    {
+        "schema_version": 1,
+        "kind": "plan_decomposition",
+        "phases": [
+            {
+                "title": "Schema helpers",
+                "scope": "Add parser dataclasses and tests.",
+                "non_goals": "No live orchestrator switch.",
+                "dependency_notes": "First phase; no dependencies.",
+                "rollout_risk": "low - internal only.",
+                "validation": "Run python -m pytest tests/test_agent_loop.py.",
+                "parent_context": "Approved plan slice: add schema helpers.",
+                "automation": "agent-pr",
+                "depends_on": [],
+            }
+        ],
+    }
+)
+
+
+class TestRunDecompose:
+    def _last_json(self, stdout: str) -> dict:
+        start = stdout.rfind("\n{")
+        if start < 0:
+            start = stdout.find("{")
+        return json.loads(stdout[start:].strip())
+
+    def test_dry_run_runs_coder_parses_and_prints_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            plan = tmppath / "plan.md"
+            plan.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            result = _run(
+                "helpers.skill_runner", "run-decompose",
+                "--issue", "9992", "--repo", "test/skill-repo",
+                "--coder", "codex", "--plan-file", str(plan),
+                "--workdir", str(tmppath),
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0, result.stderr
+            output = self._last_json(result.stdout)
+            assert output["issue"] == 9992
+            assert output["mode"] == "decompose-only"
+            assert output["dry_run"] is True
+            assert output["reused"] is False
+            assert output["phase_count"] == 1
+            assert output["phases"][0]["automation"] == "agent-pr"
+            assert output["would_post_parent_summary"] is True
+
+    def test_live_path_creates_children_and_posts_parent_summary(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        from coding_review_agent_loop.github import IssueContext
+
+        raw_outputs: list[str] = []
+        created_calls: list[dict] = []
+        posted_calls: list[dict] = []
+
+        def fake_run_helper(*args, **_kwargs):
+            raw_outputs.append(" ".join(args))
+            output = Path(args[args.index("--output") + 1])
+            output.write_text(_DECOMP_JSON, encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def fake_get_issue_context(_runner, *, config, issue_number):
+            return IssueContext(
+                number=issue_number, repo=config.repo, title="T", body="B", url="u",
+                comments=(), human_requirements=(),
+            )
+
+        def fake_create(runner, *, config, parent_issue, approved_plan, decomposition):
+            created_calls.append({
+                "parent_issue": parent_issue,
+                "approved_plan": approved_plan,
+                "phase_count": len(decomposition.phases),
+            })
+            phase = decomposition.phases[0]
+            return (
+                decomp.CreatedPhaseIssue(
+                    phase=phase,
+                    issue_url="https://github.com/test/skill-repo/issues/123",
+                    issue_number=123,
+                ),
+            )
+
+        def fake_post(runner, *, config, parent_issue, mode, plan_hash, created):
+            posted_calls.append({
+                "parent_issue": parent_issue,
+                "mode": mode,
+                "plan_hash": plan_hash,
+                "created": created,
+            })
+
+        monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(gh, "get_issue_context", fake_get_issue_context)
+        monkeypatch.setattr(decomp, "create_decomposition_child_issues", fake_create)
+        monkeypatch.setattr(decomp, "post_decomposition_parent_summary", fake_post)
+        plan = tmp_path / "plan.md"
+        plan.write_text("Approved plan body", encoding="utf-8")
+        sr.cmd_run_decompose(types.SimpleNamespace(
+            issue=77,
+            repo="test/skill-repo",
+            coder="codex",
+            plan_file=str(plan),
+            workdir=str(tmp_path),
+            workdir_codex=None,
+            workdir_gemini=None,
+            dry_run=False,
+        ))
+
+        assert raw_outputs and "--flow decompose" in raw_outputs[0]
+        assert created_calls == [{
+            "parent_issue": 77,
+            "approved_plan": "Approved plan body",
+            "phase_count": 1,
+        }]
+        assert posted_calls[0]["parent_issue"] == 77
+        assert posted_calls[0]["mode"] == "decompose-only"
+        assert posted_calls[0]["created"][0].issue_number == 123
+
+    def test_existing_marker_reuses_without_running_coder(self, monkeypatch, tmp_path, capsys) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        from coding_review_agent_loop.github import IssueContext, IssueComment
+
+        plan_text = "Approved plan body"
+        marker = decomp.format_decomposition_parent_summary(
+            parent_issue=77,
+            mode="decompose-only",
+            plan_hash=decomp.approved_plan_hash(plan_text),
+            created=(
+                decomp.CreatedPhaseIssue(
+                    phase=decomp.RecordedPhase(title="Schema helpers", automation="agent-pr"),
+                    issue_url="https://github.com/test/skill-repo/issues/123",
+                    issue_number=123,
+                ),
+            ),
+        )
+
+        def fake_get_issue_context(_runner, *, config, issue_number):
+            return IssueContext(
+                number=issue_number, repo=config.repo, title="T", body="B", url="u",
+                comments=(IssueComment(author="bot", created_at=None, body=marker),),
+                human_requirements=(),
+            )
+
+        def fail_run_helper(*_args, **_kwargs):
+            raise AssertionError("coder should not run when decomposition marker exists")
+
+        monkeypatch.setattr(gh, "get_issue_context", fake_get_issue_context)
+        monkeypatch.setattr(sr, "_run_helper", fail_run_helper)
+        plan = tmp_path / "plan.md"
+        plan.write_text(plan_text, encoding="utf-8")
+        sr.cmd_run_decompose(types.SimpleNamespace(
+            issue=77,
+            repo="test/skill-repo",
+            coder="codex",
+            plan_file=str(plan),
+            workdir=str(tmp_path),
+            workdir_codex=None,
+            workdir_gemini=None,
+            dry_run=False,
+        ))
+
+        output = self._last_json(capsys.readouterr().out)
+        assert output["reused"] is True
+        assert output["phase_count"] == 1
+        assert output["phases"][0]["issue_number"] == 123

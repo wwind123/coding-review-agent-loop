@@ -1094,12 +1094,18 @@ def build_plan_decomposition_prompt(
     issue_context: IssueContext | None = None,
 ) -> str:
     coder_signature = agent_signature(config.coder)
+    human_requirements_block = _issue_human_requirements_block(
+        issue_context,
+        requirement_scope="decomposition requirements",
+        full_omission_fallback="Fetch the issue discussion directly before decomposing the plan.",
+    )
     return f"""Decompose the approved implementation plan for GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this decomposition stage.
+{_coder_workdir_guidance(config, implementation=False)}
 {_scratch_file_guidance()}
-{_issue_context_block(issue_context)}
+{human_requirements_block}{_issue_context_block(issue_context)}
 {_memory_block(memory)}
 
 Approved implementation plan:

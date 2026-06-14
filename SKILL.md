@@ -330,6 +330,26 @@ It is **idempotent per plan** (the one-shot handoff marker): re-running returns 
 existing PR instead of opening a duplicate. A response that fails validation is
 non-retryable — fix the cause and re-run. `--dry-run` does no pushes/PRs.
 
+### Decompose an approved plan into phase issues
+
+`run-decompose` has an **external coder** turn an approved plan into structured
+phase child issues:
+
+```bash
+python -m helpers.skill_runner run-decompose \
+  --issue N --repo OWNER/REPO \
+  --coder codex \
+  --plan-file <approved-plan.md> \
+  [--workdir <checkout>]
+```
+
+Live runs are **side-effecting**: they create real GitHub child issues and post a
+parent summary marker. The command is idempotent by parent issue + approved-plan
+hash + `decompose-only` mode; re-running the same plan returns the recorded child
+issues instead of creating duplicates. `--dry-run` still exercises the
+decomposition parser and prints the child-issue preview JSON, but it does not
+create issues or post comments.
+
 `run-task-round` stays host-coder only.
 
 ---

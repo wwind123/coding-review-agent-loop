@@ -21,6 +21,7 @@ from coding_review_agent_loop.memory import AgentMemoryContext
 from coding_review_agent_loop.prompts import (
     build_issue_implementation_prompt,
     build_issue_plan_prompt,
+    build_plan_decomposition_prompt,
     build_plan_review_prompt,
     build_plan_revision_prompt,
     build_review_prompt,
@@ -292,5 +293,28 @@ def build_implementation_prompt_for_skill(
         repo, coder, (coder,), reviewer=coder, workdir=workdir, base=base,
     )
     return build_issue_implementation_prompt(
+        issue_context.number, approved_plan, config, memory, issue_context=issue_context,
+    )
+
+
+def build_plan_decomposition_prompt_for_skill(
+    issue_context: IssueContext,
+    approved_plan: str,
+    *,
+    repo: str,
+    coder: AgentName,
+    workdir: str,
+    memory: AgentMemoryContext | None = None,
+) -> str:
+    """Build the external-coder plan decomposition prompt (#318).
+
+    Takes a full ``IssueContext`` so issue comments + signed human requirements
+    reach the decomposer. Sets the coder's checkout dir to ``workdir`` so the
+    prompt's checkout guidance points at the actual skill-runner workspace.
+    """
+    config = make_minimal_config(
+        repo, coder, (coder,), reviewer=coder, workdir=workdir,
+    )
+    return build_plan_decomposition_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,
     )
