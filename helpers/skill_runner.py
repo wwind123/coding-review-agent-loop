@@ -2300,9 +2300,13 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
     mode = "implement-one-shot"
     coder_cap = agent_display_name(coder)  # type: ignore[arg-type]
 
+    # auto_agent_dirs=() so the explicit, user-provided push-capable workdir is
+    # treated as user-owned: sync_coder_base_before_implementation then *rejects* a
+    # dirty checkout instead of `git reset --hard`/`clean -fd`-ing the user's clone (#316).
     config = dataclasses.replace(
         make_minimal_config(repo, coder, (coder,), reviewer=coder, workdir=str(workdir), base=base),  # type: ignore[arg-type]
         dry_run=dry_run,
+        auto_agent_dirs=(),
     )
     runner = Runner(dry_run=dry_run)
 
@@ -2312,12 +2316,17 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         comments, parent_issue=issue, plan_hash=plan_hash, mode=mode,
     )
     if existing is not None:
-        pr_open = True
+        # Only reuse a recorded PR that is still open AND still references this issue
+        # — a stale/injected same-plan-hash marker must not return an unrelated PR.
+        reusable = True
         try:
             validate_open_pr(runner, config=config, pr_number=existing.pr_number)
+            validate_pr_references_issue(
+                runner, config=config, pr_number=existing.pr_number, issue_number=issue,
+            )
         except AgentLoopError:
-            pr_open = False
-        if pr_open:
+            reusable = False
+        if reusable:
             print(json.dumps({
                 "pr": existing.pr_number,
                 "head_sha": existing.pr_head_sha,
