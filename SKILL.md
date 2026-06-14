@@ -246,19 +246,42 @@ Every phase is re-runnable; if a session ends mid-arc, just re-invoke:
 
 ---
 
-## Reversed roles (Codex as coder, Claude as reviewer)
+## Reversed roles (external coder, #307)
 
-Reversed-roles mode (Codex writes the plan, Claude reviews) is tracked in
-issue #285 and not yet implemented in `skill_runner`.  Until then, use the
-low-level helpers directly:
+`run-plan-round` can run with an **external coder** (Codex or Gemini writes the
+plan) instead of the host. Pass `--coder codex|gemini` and **omit** `--plan-file`
+— the skill generates the plan via `run_external --role coder`, validates it,
+attaches `--role coder --agent Codex|Gemini`, and posts it, then runs the
+configured reviewers:
 
-1. Invoke Codex to write the plan via `helpers.run_external --role coder`.
-2. Validate the plan with `helpers.validate_response --kind plan_state`.
-3. Attach metadata with `helpers.state_manager attach-metadata --agent Codex`.
-4. Post the plan via `helpers.gh_ops post-issue-comment`.
-5. Claude writes a `plan_review` JSON review, validates it, renders it, and posts it
-   using `--agent Claude`.  Pass `--reviewers claude` to `build-resume` so that
-   Claude's review is recognized on resume.
+```bash
+python -m helpers.skill_runner run-plan-round \
+  --issue N --repo OWNER/REPO \
+  --coder codex \
+  --reviewers gemini
+```
+
+The skill drives the rounds from the posted ledger (no `--plan-file` to
+discriminate them): you just re-run the command until it returns
+`{"state": "approved"}`. Each invocation:
+
+- **no coder record yet** → runs the coder for round 1 (`plan_state`);
+- **plan posted, reviewers pending** → runs the remaining reviewers;
+- **round complete, blocking/same-plan** → runs the coder for round N+1, which
+  emits a structured `plan_revision` (rendered to a public comment; the canonical
+  plan is carried forward for reviewers);
+- **round complete, all approved** → returns `approved`.
+
+If a coder turn produces a malformed plan, the raw response is saved to a repair
+dir (manifest `role: coder`); fix `raw.md` and recover with
+`retry-validate --repair-dir <dir>` (no re-run of the agent), then re-run
+`run-plan-round`.
+
+**This increment is plan-flow only and host-coder reviewers only.** Host-as-reviewer
+(a `claude` reviewer authoring the review after reading the posted plan), PR-flow
+reverse, and reverse implementation are deferred to later increments; passing a
+`claude` reviewer with an external coder is rejected for now. `run-task-round`
+stays host-coder only.
 
 ---
 

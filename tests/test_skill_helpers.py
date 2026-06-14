@@ -1530,3 +1530,186 @@ class TestReverseRolesHelpers:
         meta = _decode_round_metadata(m.group(1))
         assert meta.agent == "Codex"
         assert meta.raw_structured_coder_response.strip() == '{"kind": "plan_revision", "x": 1}'
+
+
+# ---------------------------------------------------------------------------
+# helpers/skill_runner.py — reversed roles: external coder (#307)
+# ---------------------------------------------------------------------------
+
+
+class TestExternalCoderPhase:
+    """Unit tests for the external-coder round state machine."""
+
+    def _phase(self, resume: dict, reviewers=("codex",)) -> str:
+        from helpers.skill_runner import _external_coder_phase
+        return _external_coder_phase(resume, list(reviewers))["phase"]
+
+    def test_no_coder_record_runs_round_1(self) -> None:
+        assert self._phase({}) == "coder-round-1"
+
+    def test_plan_posted_reviewers_incomplete_resumes_reviewers(self) -> None:
+        resume = {
+            "current_plan_subject": "abc",
+            "completed_reviewer_names": [],
+            "completed_reviewer_data": [],
+            "prior_items": [],
+            "round_number": 1,
+        }
+        assert self._phase(resume) == "resume-reviewers"
+
+    def test_round_complete_all_approved_returns_approved(self) -> None:
+        resume = {
+            "current_plan_subject": "abc",
+            "completed_reviewer_names": ["Codex"],
+            "completed_reviewer_data": [
+                {"reviewer_name": "Codex", "state": "approved", "new_items": [], "dispositions": []}
+            ],
+            "prior_items": [],
+            "round_number": 1,
+        }
+        assert self._phase(resume) == "approved"
+
+    def test_round_complete_blocking_runs_next_round(self) -> None:
+        resume = {
+            "current_plan_subject": "abc",
+            "completed_reviewer_names": ["Codex"],
+            "completed_reviewer_data": [
+                {"reviewer_name": "Codex", "state": "blocking", "new_items": [], "dispositions": []}
+            ],
+            "prior_items": [],
+            "round_number": 1,
+        }
+        assert self._phase(resume) == "coder-round-next"
+
+
+class TestExternalCoderRun:
+    """Subprocess dry-run tests for run-plan-round --coder codex (#307)."""
+
+    def test_external_coder_dry_run_exits_zero_and_runs_coder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+
+            # No --plan-file: the external coder generates the plan.
+            result = _run(
+                "helpers.skill_runner", "run-plan-round",
+                "--issue", "9997",
+                "--repo", "test/skill-repo",
+                "--coder", "codex",
+                "--reviewers", "codex",
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0, result.stderr
+            stdout = result.stdout
+            json_start = stdout.rfind("\n{")
+            if json_start < 0:
+                json_start = stdout.find("{")
+            output = json.loads(stdout[json_start:].strip())
+            assert "state" in output and "round_number" in output
+
+            # The external coder turn saved a role:coder repair dir before validating.
+            repair_dir = _REPAIR_BASE / "9997-r1-codex-coder"
+            assert (repair_dir / "manifest.json").exists(), f"coder repair dir missing: {repair_dir}"
+            manifest = json.loads((repair_dir / "manifest.json").read_text(encoding="utf-8"))
+            assert manifest["role"] == "coder"
+            assert manifest["kind"] == "plan_state"
+
+    def test_claude_reviewer_with_external_coder_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            result = _run(
+                "helpers.skill_runner", "run-plan-round",
+                "--issue", "9997",
+                "--repo", "test/skill-repo",
+                "--coder", "codex",
+                "--reviewers", "claude",
+                "--dry-run",
+                env=env,
+                check=False,
+            )
+            assert result.returncode != 0
+            assert "host-as-reviewer" in result.stderr
+
+    def test_claude_coder_without_plan_file_rejected(self) -> None:
+        result = _run(
+            "helpers.skill_runner", "run-plan-round",
+            "--issue", "9997",
+            "--repo", "test/skill-repo",
+            "--reviewers", "codex",
+            "--dry-run",
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "requires --plan-file" in result.stderr
+
+    def test_run_task_round_rejects_external_coder(self) -> None:
+        result = _run(
+            "helpers.skill_runner", "run-task-round",
+            "--task", "do a thing",
+            "--repo", "test/skill-repo",
+            "--coder", "codex",
+            "--plan-file", "/tmp/does-not-matter.md",
+            "--reviewers", "codex",
+            "--dry-run",
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "only --coder claude" in result.stderr
+
+
+class TestRetryValidateCoder:
+    """retry-validate routes role:coder manifests to the coder-completion path (#307)."""
+
+    def _make_coder_repair_dir(self, tmpdir: Path, *, kind: str = "plan_state") -> Path:
+        repair_dir = tmpdir / "9997-r1-codex-coder"
+        repair_dir.mkdir(parents=True, exist_ok=True)
+        (repair_dir / "raw.md").write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        (repair_dir / "prior_items.json").write_text("[]", encoding="utf-8")
+        manifest = {
+            "role": "coder",
+            "agent": "codex",
+            "agent_cap": "Codex",
+            "flow": "plan",
+            "issue": 9997,
+            "repo": "OWNER/REPO",
+            "new_round_number": 1,
+            "kind": kind,
+            "dry_run": True,
+        }
+        (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return repair_dir
+
+    def test_retry_validate_coder_plan_state_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            repair_dir = self._make_coder_repair_dir(tmppath)
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run",
+                env=env,
+                check=False,
+            )
+            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+            output = json.loads(result.stdout[result.stdout.find("{"):].strip())
+            assert output["role"] == "coder"
+            assert output["agent"] == "Codex"
+
+    def test_retry_validate_coder_invalid_plan_state_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            repair_dir = self._make_coder_repair_dir(tmppath)
+            (repair_dir / "raw.md").write_text("no marker here", encoding="utf-8")
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run",
+                check=False,
+            )
+            assert result.returncode != 0

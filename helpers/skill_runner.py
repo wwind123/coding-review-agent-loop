@@ -50,6 +50,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.agents.base import AgentName
+from coding_review_agent_loop.agents.registry import agent_display_name
 from coding_review_agent_loop.config import ensure_temp_checkout
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.followups import (
@@ -1054,6 +1055,13 @@ def _create_task_issue(repo: str, task_text: str, task_key: str, gh_cmd: str = "
 def cmd_run_task_round(args: argparse.Namespace) -> None:
     repo: str = args.repo
     dry_run: bool = args.dry_run
+    if getattr(args, "coder", "claude") != "claude":
+        print(
+            "skill_runner: run-task-round supports only --coder claude (host coder) for now; "
+            "external coders are available via run-plan-round (#307).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     task_text = _resolve_task_text(args)
     key = _task_key(task_text)
     issue = _lookup_task_issue(repo, key)
@@ -1082,27 +1090,381 @@ def cmd_run_task_round(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# External-coder plan turn (reversed roles: Codex/Gemini writes the plan) (#307)
+# ---------------------------------------------------------------------------
+
+def _external_coder_phase(resume: dict, reviewers: list[str]) -> dict:
+    """Decide what an external-coder plan round should do from the resume state.
+
+    With no host ``--plan-file`` to discriminate rounds, the phase is read entirely
+    from the posted ledger. Returns ``{"phase": ..., ...}``:
+
+      ``coder-round-1``    — no coder record yet; run the coder for round 1.
+      ``resume-reviewers`` — plan posted, some reviewers incomplete; run them.
+      ``coder-round-next`` — round complete with blocking/same-plan findings; run
+                             the coder for round N+1 (carries ``next_prior_items_raw``).
+      ``approved``         — round complete and all reviewers approved.
+    """
+    if not resume.get("current_plan_subject"):
+        return {"phase": "coder-round-1"}
+
+    completed = {str(n) for n in resume.get("completed_reviewer_names", [])}
+    configured = {agent_display_name(r) for r in reviewers}  # type: ignore[arg-type]
+    if not configured.issubset(completed):
+        return {"phase": "resume-reviewers"}
+
+    # All configured reviewers completed this round; decide approve vs. revise.
+    completed_data = list(resume.get("completed_reviewer_data", []))
+    any_blocking = any(rec.get("state") == "blocking" for rec in completed_data)
+    next_prior = _compute_next_prior_items(
+        list(resume.get("prior_items", [])),
+        completed_data,
+        same_status="same-plan",
+        retain_future=False,
+    )
+    if any_blocking or next_prior:
+        return {"phase": "coder-round-next", "next_prior_items_raw": next_prior}
+    return {"phase": "approved"}
+
+
+def _aggregate_blocking_feedback(resume: dict) -> str:
+    """Assemble prose reviewer feedback for the coder's revision prompt.
+
+    The skill ledger keeps each completed reviewer's must-fix items (not the full
+    review prose), so synthesize the feedback from the blocking / same-plan items.
+    """
+    parts: list[str] = []
+    for rec in resume.get("completed_reviewer_data", []):
+        name = str(rec.get("reviewer_name", "Reviewer"))
+        texts = [
+            str(item.get("text", ""))
+            for item in rec.get("new_items", [])
+            if item.get("status") in ("blocking", "same-plan")
+        ]
+        if texts:
+            body = "\n".join(f"- {t}" for t in texts)
+            parts.append(f"{name} plan review:\n{body}")
+    return "\n\n".join(parts)
+
+
+def _save_coder_raw_to_repair_dir(
+    *,
+    coder: str,
+    coder_cap: str,
+    issue: int,
+    repo: str,
+    new_round_number: int,
+    kind: str,
+    next_prior_items_raw: list[dict],
+    dry_run: bool,
+    raw_output: Path,
+    usage_file: Path,
+) -> Path:
+    """Copy the coder's raw response + context to a stable repair dir.
+
+    The manifest is tagged ``role: coder`` so ``retry-validate`` routes to the
+    coder-completion path rather than the reviewer one.
+    """
+    repair_dir = _REPAIR_BASE / f"{issue}-r{new_round_number}-{coder}-coder"
+    repair_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(raw_output, repair_dir / "raw.md")
+    _write_json(repair_dir / "prior_items.json", next_prior_items_raw)
+    if usage_file.exists():
+        shutil.copy2(usage_file, repair_dir / "coder-usage.json")
+    manifest = {
+        "role": "coder",
+        "agent": coder, "agent_cap": coder_cap, "flow": "plan",
+        "issue": issue, "repo": repo,
+        "new_round_number": new_round_number, "kind": kind,
+        "dry_run": dry_run,
+    }
+    (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return repair_dir
+
+
+def _complete_coder_turn(
+    *,
+    coder: str,
+    coder_cap: str,
+    issue: int,
+    repo: str,
+    new_round_number: int,
+    next_prior_items_raw: list[dict],
+    kind: str,
+    dry_run: bool,
+    raw_output: Path,
+    work_dir: Path,
+    usage_file: Path,
+) -> dict:
+    """Validate, render, canonicalize, attach (role coder), and post a coder plan.
+
+    ``kind`` is ``plan_state`` (round 1) or ``plan_revision`` (round N+1). For a
+    revision, the structured response is rendered to a public comment, the
+    canonical plan is extracted for reviewers, and the raw JSON is persisted in
+    AGENT_LOOP_META. Raises ``_ValidationError`` on validation failure. Returns
+    ``{plan_text, subject, usage}`` (``plan_text`` is the canonical plan reviewers
+    will review).
+    """
+    result = _run_helper_capture(
+        "helpers.validate_response", "--file", str(raw_output), "--kind", kind,
+    )
+    if result.returncode != 0:
+        raise _ValidationError(
+            f"skill_runner: {coder_cap} {kind} validation failed: {result.stderr.strip()}\n"
+            f"skill_runner: raw response at: {raw_output}"
+        )
+
+    raw_text = raw_output.read_text(encoding="utf-8")
+    canonical_file = work_dir / "coder-canonical.md"
+    raw_structured_args: list[str] = []
+
+    if kind == "plan_state":
+        canonical_text = raw_text
+        public_file = raw_output
+    else:
+        from coding_review_agent_loop.agents.registry import agent_signature
+        from coding_review_agent_loop.comment_rendering import (
+            _render_public_plan_revision_comment,
+            render_canonical_plan_revision,
+        )
+        from coding_review_agent_loop.protocol import validate_structured_plan_revision
+
+        parsed = validate_structured_plan_revision(raw_text)
+        if parsed is None:
+            raise _ValidationError(
+                f"skill_runner: {coder_cap} plan_revision did not parse\n"
+                f"skill_runner: raw response at: {raw_output}"
+            )
+        prior_items = [_deserialize_unresolved_item(i) for i in next_prior_items_raw]
+        canonical_text = render_canonical_plan_revision(parsed, prior_items)
+        public_body = _render_public_plan_revision_comment(
+            parsed,
+            prior_items=prior_items,
+            raw_text=raw_text,
+            signature=agent_signature(coder),  # type: ignore[arg-type]
+        )
+        public_file = work_dir / "coder-public.md"
+        _write_text(public_file, public_body)
+        raw_structured_file = work_dir / "coder-raw-structured.json"
+        _write_text(raw_structured_file, raw_text)
+        raw_structured_args = ["--raw-structured-coder-response-file", str(raw_structured_file)]
+
+    _write_text(canonical_file, canonical_text)
+    subject = _plan_subject(canonical_text)
+
+    prior_file = work_dir / "coder-prior-items.json"
+    _write_json(prior_file, next_prior_items_raw)
+
+    coder_usage: dict | None = None
+    usage_args: list[str] = []
+    if usage_file.exists():
+        usage_args = ["--usage-file", str(usage_file)]
+        try:
+            coder_usage = json.loads(usage_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            coder_usage = None
+
+    tagged = work_dir / "coder-tagged.md"
+    _run_helper(
+        "helpers.state_manager", "attach-metadata",
+        "--body-file", str(public_file),
+        "--output", str(tagged),
+        "--flow", "plan",
+        "--role", "coder",
+        "--agent", coder_cap,
+        "--round-number", str(new_round_number),
+        "--state", "approved",
+        "--subject", subject,
+        "--canonical-plan-file", str(canonical_file),
+        "--prior-items-file", str(prior_file),
+        *raw_structured_args,
+        *usage_args,
+    )
+
+    if not dry_run:
+        _run_helper(
+            "helpers.state_manager", "write-pending-comment",
+            "--issue", str(issue), "--repo", repo, "--body", str(tagged),
+        )
+        _run_helper(
+            "helpers.gh_ops", "post-issue-comment",
+            "--issue", str(issue), "--file", str(tagged), "--repo", repo,
+        )
+        _run_helper(
+            "helpers.state_manager", "clear-pending-comment",
+            "--issue", str(issue), "--repo", repo,
+        )
+    else:
+        print(f"[dry-run] would post {coder_cap} plan for {repo}#{issue} (round {new_round_number})")
+
+    return {"plan_text": canonical_text, "subject": subject, "usage": coder_usage}
+
+
+def _run_external_coder_phase(
+    args: argparse.Namespace,
+    coder: str,
+    resume: dict,
+    reviewers: list[str],
+    memory: AgentMemoryContext | None,
+    dry_run: bool,
+) -> dict:
+    """Drive the external-coder side of a plan round and return shared round vars.
+
+    Returns ``{"done": True, "result": {...}}`` when the round is already approved
+    (nothing left to do), otherwise ``{"done": False, ...}`` with the variables the
+    shared reviewer loop needs (plan text/subject, round number, prior items,
+    new-round flag, locally-completed reviewers, and the coder usage sidecar).
+    """
+    issue: int = args.issue
+    repo: str = args.repo
+    phase_info = _external_coder_phase(resume, reviewers)
+    phase = phase_info["phase"]
+
+    if phase == "approved":
+        completed_data = list(resume.get("completed_reviewer_data", []))
+        result = {
+            "state": "approved",
+            "round_number": int(resume.get("round_number", 1)),
+            "blocking_items": [],
+            "approved_reviewers": [str(r.get("reviewer_name", "")) for r in completed_data],
+        }
+        usage = _aggregate_reviewer_usage(completed_data)
+        if usage is not None:
+            result["usage"] = usage
+        return {"done": True, "result": result}
+
+    if phase == "resume-reviewers":
+        return {
+            "done": False,
+            "plan_text": str(resume.get("current_plan", "")),
+            "plan_subject": str(resume.get("current_plan_subject")),
+            "new_round_number": int(resume.get("round_number", 1)),
+            "next_prior_items_raw": list(resume.get("prior_items", [])),
+            "is_new_round": False,
+            "local_completed": {str(n) for n in resume.get("completed_reviewer_names", [])},
+            "coder_usage": None,
+        }
+
+    # coder-round-1 or coder-round-next: run the external coder turn.
+    from helpers.prompt_builders import (
+        build_plan_prompt_for_skill,
+        build_plan_revision_prompt_for_skill,
+    )
+    from coding_review_agent_loop.protocol import is_clarification_request
+
+    new_round_number = int(resume.get("completed_round_number", 0)) + 1
+    workdir = _workdir_for_agent(coder, args)
+    issue_dict = _fetch_issue_json(repo, issue)
+    coder_cap = agent_display_name(coder)  # type: ignore[arg-type]
+
+    if phase == "coder-round-1":
+        next_prior_items_raw: list[dict] = []
+        prompt_text = build_plan_prompt_for_skill(
+            issue_dict, repo=repo, coder=coder,  # type: ignore[arg-type]
+            reviewers=reviewers, workdir=workdir, memory=memory,  # type: ignore[arg-type]
+        )
+        kind = "plan_state"
+    else:  # coder-round-next
+        next_prior_items_raw = list(phase_info["next_prior_items_raw"])
+        prompt_text = build_plan_revision_prompt_for_skill(
+            issue_dict, repo=repo, coder=coder,  # type: ignore[arg-type]
+            reviewers=reviewers, workdir=workdir,  # type: ignore[arg-type]
+            round_number=new_round_number,
+            previous_plan=str(resume.get("current_plan", "")),
+            reviewer_feedback=_aggregate_blocking_feedback(resume),
+            prior_items_raw=next_prior_items_raw,
+            memory=memory,
+        )
+        kind = "plan_revision"
+
+    with tempfile.TemporaryDirectory() as tmpstr:
+        tmpdir = Path(tmpstr)
+        prompt_file = tmpdir / "coder-prompt.md"
+        raw_output = tmpdir / "coder-plan-raw.md"
+        usage_file = tmpdir / "coder-usage.json"
+        _write_text(prompt_file, prompt_text)
+
+        _run_helper(
+            "helpers.run_external",
+            "--agent", coder,
+            "--role", "coder",
+            "--prompt-file", str(prompt_file),
+            "--output", str(raw_output),
+            "--workdir", workdir,
+            "--repo", repo,
+            "--flow", "plan",
+            "--usage-output", str(usage_file),
+            *(["--dry-run"] if dry_run else []),
+        )
+
+        raw_text = raw_output.read_text(encoding="utf-8")
+        if is_clarification_request(raw_text):
+            print(
+                f"skill_runner: {coder_cap} requested clarification during planning; "
+                f"human intervention required.\n\n{raw_text}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        # Save raw to a stable repair dir before validation so a malformed plan is
+        # recoverable via `retry-validate` (manifest role: coder).
+        repair_dir = _save_coder_raw_to_repair_dir(
+            coder=coder, coder_cap=coder_cap, issue=issue, repo=repo,
+            new_round_number=new_round_number, kind=kind,
+            next_prior_items_raw=next_prior_items_raw, dry_run=dry_run,
+            raw_output=raw_output, usage_file=usage_file,
+        )
+
+        try:
+            completed = _complete_coder_turn(
+                coder=coder, coder_cap=coder_cap, issue=issue, repo=repo,
+                new_round_number=new_round_number,
+                next_prior_items_raw=next_prior_items_raw, kind=kind,
+                dry_run=dry_run, raw_output=raw_output, work_dir=tmpdir,
+                usage_file=usage_file,
+            )
+        except _ValidationError as exc:
+            print(str(exc), file=sys.stderr)
+            dry_run_flag = " --dry-run" if dry_run else ""
+            print(
+                f"skill_runner: fix raw.md, then run: "
+                f"python -m helpers.skill_runner retry-validate --repair-dir {repair_dir}{dry_run_flag}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    return {
+        "done": False,
+        "plan_text": completed["plan_text"],
+        "plan_subject": completed["subject"],
+        "new_round_number": new_round_number,
+        "next_prior_items_raw": next_prior_items_raw,
+        "is_new_round": True,
+        "local_completed": set(),
+        "coder_usage": completed.get("usage"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # run-plan-round
 # ---------------------------------------------------------------------------
 
-def cmd_run_plan_round(args: argparse.Namespace) -> None:
+def _run_host_coder_phase(
+    args: argparse.Namespace,
+    plan_file: Path,
+    resume: dict,
+    dry_run: bool,
+) -> dict:
+    """Host-coder (Claude) plan turn: detect new-round vs resume and post the plan.
+
+    This is the default behavior — the host supplies ``--plan-file`` — extracted
+    verbatim so ``cmd_run_plan_round`` can dispatch symmetrically with the external
+    coder. Returns the shared round vars the reviewer loop consumes.
+    """
     issue: int = args.issue
     repo: str = args.repo
-    reviewers: list[str] = args.reviewers
-    plan_file = Path(args.plan_file)
-    dry_run: bool = args.dry_run
 
-    if not plan_file.exists():
-        print(f"skill_runner: plan file not found: {plan_file}", file=sys.stderr)
-        sys.exit(1)
-
-    # Step 1 — build_resume
-    resume = _build_resume(issue, repo, reviewers, flow="plan")
-
-    # Step 2 — pending-comment reconciliation
-    _reconcile_pending_comment(resume, issue, repo, dry_run)
-
-    # Step 3 — new-round vs resume detection
+    # New-round vs resume detection
     plan_subject = _plan_subject_of_file(plan_file)
     current_plan_subject = resume.get("current_plan_subject")
     is_new_round = current_plan_subject != plan_subject
@@ -1123,7 +1485,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         next_prior_items_raw = list(resume.get("prior_items", []))
         local_completed = {str(n) for n in resume.get("completed_reviewer_names", [])}
 
-    # Step 4 — validate and post plan (new rounds only; resume skips this)
+    # Validate and post plan (new rounds only; resume skips this)
     if is_new_round:
         result = _run_helper_capture(
             "helpers.validate_response",
@@ -1170,6 +1532,76 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         else:
             print(f"[dry-run] would post plan for {repo}#{issue} (round {new_round_number})")
 
+    return {
+        "plan_text": plan_file.read_text(encoding="utf-8"),
+        "plan_subject": plan_subject,
+        "new_round_number": new_round_number,
+        "next_prior_items_raw": next_prior_items_raw,
+        "is_new_round": is_new_round,
+        "local_completed": local_completed,
+        "coder_usage": None,
+    }
+
+
+def cmd_run_plan_round(args: argparse.Namespace) -> None:
+    issue: int = args.issue
+    repo: str = args.repo
+    reviewers: list[str] = args.reviewers
+    dry_run: bool = args.dry_run
+    coder: str = getattr(args, "coder", "claude")
+
+    plan_file: Path | None = None
+    if coder == "claude":
+        if not args.plan_file:
+            print("skill_runner: run-plan-round --coder claude requires --plan-file", file=sys.stderr)
+            sys.exit(1)
+        plan_file = Path(args.plan_file)
+        if not plan_file.exists():
+            print(f"skill_runner: plan file not found: {plan_file}", file=sys.stderr)
+            sys.exit(1)
+    elif "claude" in reviewers:
+        # Host-as-reviewer (a 'claude' reviewer authored after the coder posts) is
+        # the reversed-roles part-3 increment; not yet wired into the reviewer loop.
+        print(
+            "skill_runner: --coder <external> with a 'claude' reviewer (host-as-reviewer) "
+            "is not yet supported; use external reviewers for now.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Step 1 — build_resume
+    resume = _build_resume(issue, repo, reviewers, flow="plan")
+
+    # Step 2 — pending-comment reconciliation
+    _reconcile_pending_comment(resume, issue, repo, dry_run)
+
+    # Repo-scoped agent memory for coder/reviewer orientation (#306), prepared once
+    # and shared by the coder turn (external mode) and the reviewer turns.
+    memory = None
+    if getattr(args, "agent_memory", True):
+        memory = _prepare_skill_memory(
+            repo, reviewers, _workdir_for_agent(reviewers[0], args),
+            refresh=getattr(args, "refresh_agent_memory", False), dry_run=dry_run,
+        )
+
+    # Step 3+4 — produce and post the round's plan (host coder or external coder)
+    if coder == "claude":
+        assert plan_file is not None
+        phase = _run_host_coder_phase(args, plan_file, resume, dry_run)
+    else:
+        phase = _run_external_coder_phase(args, coder, resume, reviewers, memory, dry_run)
+        if phase["done"]:
+            print(json.dumps(phase["result"], indent=2))
+            return
+
+    plan_text: str = phase["plan_text"]
+    plan_subject: str = phase["plan_subject"]
+    new_round_number: int = phase["new_round_number"]
+    next_prior_items_raw: list[dict] = phase["next_prior_items_raw"]
+    is_new_round: bool = phase["is_new_round"]
+    local_completed: set[str] = phase["local_completed"]
+    coder_usage: dict | None = phase["coder_usage"]
+
     # Step 5 — reconstruct round state from already-completed reviewers (RESUME path only).
     # In a new round, completed_reviewer_data belongs to the previous round and must not
     # contaminate the current round's result.
@@ -1191,16 +1623,6 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                 )
             else:
                 round_approved_reviewers.append(str(record.get("reviewer_name", "")))
-
-    plan_text = plan_file.read_text(encoding="utf-8")
-
-    # Repo-scoped agent memory for reviewer orientation (#306), prepared once.
-    memory = None
-    if getattr(args, "agent_memory", True):
-        memory = _prepare_skill_memory(
-            repo, reviewers, _workdir_for_agent(reviewers[0], args),
-            refresh=getattr(args, "refresh_agent_memory", False), dry_run=dry_run,
-        )
 
     # Step 6 — run pending reviewers
     with tempfile.TemporaryDirectory() as tmpstr:
@@ -1224,6 +1646,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                     reviewer,  # type: ignore[arg-type]
                     repo=repo,
                     all_reviewers=[r for r in reviewers],  # type: ignore[misc]
+                    coder=coder,  # type: ignore[arg-type]
                     workdir=workdir,
                     memory=memory,
                 )
@@ -1287,7 +1710,11 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         "blocking_items": round_blocking_items,
         "approved_reviewers": round_approved_reviewers,
     }
-    usage = _aggregate_reviewer_usage(round_reviewer_records)
+    # Include the external coder's usage (if any) alongside the reviewers'.
+    usage_records = list(round_reviewer_records)
+    if coder_usage is not None:
+        usage_records.append({"usage": coder_usage})
+    usage = _aggregate_reviewer_usage(usage_records)
     if usage is not None:
         result_json["usage"] = usage
     print(json.dumps(result_json, indent=2))
@@ -1493,6 +1920,42 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     manifest = json.loads((repair_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    # Reversed-roles coder repair: a malformed external coder plan_state/plan_revision
+    # is recoverable here, distinct from the reviewer completion path below (#307).
+    if manifest.get("role") == "coder":
+        coder            = manifest["agent"]
+        coder_cap        = manifest["agent_cap"]
+        issue            = manifest["issue"]
+        repo             = manifest["repo"]
+        new_round_number = manifest["new_round_number"]
+        kind             = manifest["kind"]
+        next_prior_items_raw = json.loads(
+            (repair_dir / "prior_items.json").read_text(encoding="utf-8")
+        )
+        try:
+            result = _complete_coder_turn(
+                coder=coder, coder_cap=coder_cap, issue=issue, repo=repo,
+                new_round_number=new_round_number,
+                next_prior_items_raw=next_prior_items_raw, kind=kind,
+                dry_run=args.dry_run, raw_output=repair_dir / "raw.md",
+                work_dir=repair_dir, usage_file=repair_dir / "coder-usage.json",
+            )
+        except _ValidationError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps({
+            "role": "coder",
+            "agent": coder_cap,
+            "round_number": new_round_number,
+            "subject": result["subject"],
+        }, indent=2))
+        print(
+            "hint: coder plan posted — re-run run-plan-round to drive the reviewers.",
+            file=sys.stderr,
+        )
+        return
+
     agent            = manifest["agent"]
     agent_cap        = manifest["agent_cap"]
     flow             = manifest["flow"]
@@ -1542,7 +2005,15 @@ def main() -> None:
     p_plan = subparsers.add_parser("run-plan-round", help="Run one plan review round.")
     p_plan.add_argument("--issue", type=int, required=True)
     p_plan.add_argument("--repo", required=True)
-    p_plan.add_argument("--plan-file", required=True)
+    p_plan.add_argument(
+        "--coder", choices=["claude", "codex", "gemini"], default="claude",
+        help="Who writes the plan: 'claude' (default, host supplies --plan-file) or "
+             "an external coder ('codex'/'gemini') run by the skill (reversed roles, #307).",
+    )
+    p_plan.add_argument(
+        "--plan-file", default=None,
+        help="Plan markdown file. Required for --coder claude; ignored for an external coder.",
+    )
     p_plan.add_argument("--reviewers", nargs="+", required=True)
     p_plan.add_argument("--workdir-codex", default=None)
     p_plan.add_argument("--workdir-gemini", default=None)
@@ -1618,6 +2089,10 @@ def main() -> None:
         help="Read task description from this file ('-' for stdin).",
     )
     p_task.add_argument("--repo", required=True)
+    p_task.add_argument(
+        "--coder", choices=["claude", "codex", "gemini"], default="claude",
+        help="Host coder only for now; external coders are rejected in task mode (#307).",
+    )
     p_task.add_argument("--plan-file", required=True)
     p_task.add_argument("--reviewers", nargs="+", required=True)
     p_task.add_argument("--workdir-codex", default=None)
