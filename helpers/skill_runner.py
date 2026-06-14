@@ -50,11 +50,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.agents.base import AgentName
+from coding_review_agent_loop.config import ensure_temp_checkout
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.followups import (
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
 )
+from coding_review_agent_loop.memory import AgentMemoryContext, prepare_agent_memory
 from coding_review_agent_loop.runner import Runner, tail_text
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
 from coding_review_agent_loop.round_state import (
@@ -305,6 +307,50 @@ def _workdir_for_agent(agent: str, args: argparse.Namespace) -> str:
     tmp = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / f"skill-runner-{agent}"
     tmp.mkdir(parents=True, exist_ok=True)
     return str(tmp)
+
+
+def _agent_memory_dir(repo: str) -> Path:
+    slug = repo.replace("/", "-").replace(":", "-")
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return state_home / "coding-review-agent-loop" / "skill-sessions" / slug / "agent-memory"
+
+
+def _prepare_skill_memory(
+    repo: str,
+    reviewers: list[str],
+    memory_workdir: str,
+    *,
+    refresh: bool,
+    dry_run: bool,
+) -> AgentMemoryContext | None:
+    """Build repo-scoped agent memory once for a round (advisory; never crashes).
+
+    Memory generation is deterministic (git + static analysis) but needs a
+    checked-out target repo, so this ensures `memory_workdir` exists first. The
+    config's coder is set to ``reviewers[0]`` with its dir = `memory_workdir` so
+    `active_workdir(config)` resolves there. Failures degrade to None.
+    """
+    if dry_run or not reviewers:
+        return None
+    from helpers.prompt_builders import make_minimal_config
+    first = reviewers[0]
+    try:
+        config = dataclasses.replace(
+            make_minimal_config(
+                repo, first, tuple(reviewers),
+                reviewer=first, workdir=memory_workdir,
+            ),
+            agent_memory=True,
+            agent_memory_dir=_agent_memory_dir(repo),
+            refresh_agent_memory=refresh,
+        )
+        runner = Runner(dry_run=False)
+        ensure_temp_checkout(Path(memory_workdir), agent=first, config=config, runner=runner)
+        return prepare_agent_memory(runner, config)
+    except Exception as exc:  # noqa: BLE001 — advisory only
+        print(f"skill_runner: agent memory unavailable ({exc}); continuing without it",
+              file=sys.stderr)
+        return None
 
 
 def _run_test_gate(command: str, workdir: str, *, dry_run: bool) -> dict:
@@ -1093,6 +1139,14 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
 
     plan_text = plan_file.read_text(encoding="utf-8")
 
+    # Repo-scoped agent memory for reviewer orientation (#306), prepared once.
+    memory = None
+    if getattr(args, "agent_memory", True):
+        memory = _prepare_skill_memory(
+            repo, reviewers, _workdir_for_agent(reviewers[0], args),
+            refresh=getattr(args, "refresh_agent_memory", False), dry_run=dry_run,
+        )
+
     # Step 6 — run pending reviewers
     with tempfile.TemporaryDirectory() as tmpstr:
         tmpdir = Path(tmpstr)
@@ -1116,6 +1170,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                     repo=repo,
                     all_reviewers=[r for r in reviewers],  # type: ignore[misc]
                     workdir=workdir,
+                    memory=memory,
                 )
             except Exception as exc:  # noqa: BLE001
                 prompt_text = (
@@ -1242,6 +1297,14 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
     pr_diff = _fetch_pr_diff(repo, pr)
     issue_dict = _fetch_pr_json(repo, pr)
 
+    # Repo-scoped agent memory for reviewer orientation (#306), prepared once.
+    memory = None
+    if getattr(args, "agent_memory", True):
+        memory = _prepare_skill_memory(
+            repo, reviewers, _workdir_for_agent(reviewers[0], args),
+            refresh=getattr(args, "refresh_agent_memory", False), dry_run=dry_run,
+        )
+
     # Step 6 — run pending reviewers
     with tempfile.TemporaryDirectory() as tmpstr:
         tmpdir = Path(tmpstr)
@@ -1265,6 +1328,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                     all_reviewers=[r for r in reviewers],  # type: ignore[misc]
                     workdir=workdir,
                     approved_followups=getattr(args, "approved_followups", "ignore"),
+                    memory=memory,
                 )
             except Exception as exc:  # noqa: BLE001
                 prompt_text = (
@@ -1418,6 +1482,13 @@ def main() -> None:
     p_plan.add_argument("--workdir-codex", default=None)
     p_plan.add_argument("--workdir-gemini", default=None)
     p_plan.add_argument("--workdir", default=None)
+    p_plan_mem = p_plan.add_mutually_exclusive_group()
+    p_plan_mem.add_argument("--agent-memory", dest="agent_memory", action="store_true", default=True,
+                            help="Include repo-scoped agent memory in reviewer prompts (default).")
+    p_plan_mem.add_argument("--no-agent-memory", dest="agent_memory", action="store_false",
+                            help="Disable repo-scoped agent memory.")
+    p_plan.add_argument("--refresh-agent-memory", action="store_true",
+                        help="Regenerate the agent-memory cache before this round.")
     p_plan.add_argument("--dry-run", action="store_true")
 
     # run-pr-round
@@ -1450,6 +1521,13 @@ def main() -> None:
              "'summarize' posts one PR comment; 'issue' files follow-up issues; "
              "'ignore' (default) discards them. Never blocks or merges.",
     )
+    p_pr_mem = p_pr.add_mutually_exclusive_group()
+    p_pr_mem.add_argument("--agent-memory", dest="agent_memory", action="store_true", default=True,
+                          help="Include repo-scoped agent memory in reviewer prompts (default).")
+    p_pr_mem.add_argument("--no-agent-memory", dest="agent_memory", action="store_false",
+                          help="Disable repo-scoped agent memory.")
+    p_pr.add_argument("--refresh-agent-memory", action="store_true",
+                      help="Regenerate the agent-memory cache before this round.")
     p_pr.add_argument("--dry-run", action="store_true")
 
     # retry-validate
@@ -1480,6 +1558,13 @@ def main() -> None:
     p_task.add_argument("--workdir-codex", default=None)
     p_task.add_argument("--workdir-gemini", default=None)
     p_task.add_argument("--workdir", default=None)
+    p_task_mem = p_task.add_mutually_exclusive_group()
+    p_task_mem.add_argument("--agent-memory", dest="agent_memory", action="store_true", default=True,
+                            help="Include repo-scoped agent memory in reviewer prompts (default).")
+    p_task_mem.add_argument("--no-agent-memory", dest="agent_memory", action="store_false",
+                            help="Disable repo-scoped agent memory.")
+    p_task.add_argument("--refresh-agent-memory", action="store_true",
+                        help="Regenerate the agent-memory cache before this round.")
     p_task.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()

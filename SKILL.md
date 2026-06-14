@@ -208,6 +208,14 @@ Plan-loop onward (including the optional Implement step + PR-loop).
   ```json
   "approved_followups": { "mode": "summarize", "published": true, "count": 2 }
   ```
+- **Agent memory** (plan-loop and PR-loop): repo-scoped orientation context
+  (repo summary, architecture map, module index, test profile, toolchain,
+  changed-file summaries) is generated deterministically (git + static analysis,
+  no LLM) and included in the reviewer prompts so Codex/Gemini get the same
+  context the CLI gives them. On by default; `--no-agent-memory` disables it,
+  `--refresh-agent-memory` forces regeneration. The cache lives under the skill
+  session dir and is incremental. Generation is advisory — if it fails, the round
+  continues without memory.
 - **Merge is always a human decision.** The skill never runs CI-wait or
   auto-merge; every mode stops at "ready to merge."
 

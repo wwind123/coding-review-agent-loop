@@ -1303,3 +1303,73 @@ class TestRunTaskRound:
         assert created["n"] == 0 and delegated["n"] == 0
         out = capsys.readouterr().out
         assert "would_reuse_issue" in out and "88" in out
+
+
+# ---------------------------------------------------------------------------
+# agent-memory wiring (#306)
+# ---------------------------------------------------------------------------
+
+class TestAgentMemory:
+    def _ctx(self):
+        from coding_review_agent_loop.memory import AgentMemoryContext
+        return AgentMemoryContext(
+            memory_dir=Path("/tmp/mem"), current_commit="abc123",
+            last_analyzed_commit=None, changed_files=(),
+            repo_summary="REPO SUMMARY TEXT", architecture_map=None,
+            test_profile=None, toolchain=None,
+        )
+
+    _ISSUE = {"number": 9, "repo": "o/r", "title": "t", "body": "b", "url": "u"}
+
+    def test_plan_prompt_includes_memory(self) -> None:
+        from helpers.prompt_builders import build_plan_review_prompt_for_skill
+        common = dict(repo="o/r", all_reviewers=["codex", "gemini"])
+        without = build_plan_review_prompt_for_skill(self._ISSUE, "PLAN", [], 1, "codex", **common)
+        with_mem = build_plan_review_prompt_for_skill(self._ISSUE, "PLAN", [], 1, "codex", memory=self._ctx(), **common)
+        assert with_mem != without
+        assert "Cached repo memory is available" in with_mem
+        assert "REPO SUMMARY TEXT" in with_mem
+
+    def test_pr_prompt_includes_memory(self) -> None:
+        from helpers.prompt_builders import build_review_prompt_for_skill
+        common = dict(repo="o/r", pr_number=9, all_reviewers=["codex", "gemini"])
+        without = build_review_prompt_for_skill(self._ISSUE, "diff", [], 1, "codex", **common)
+        with_mem = build_review_prompt_for_skill(self._ISSUE, "diff", [], 1, "codex", memory=self._ctx(), **common)
+        assert with_mem != without
+        assert "Cached repo memory is available" in with_mem
+
+    def test_prepare_memory_dry_run_is_noop(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        called = {"checkout": 0, "prepare": 0}
+        monkeypatch.setattr(sr, "ensure_temp_checkout", lambda *a, **k: called.__setitem__("checkout", 1))
+        monkeypatch.setattr(sr, "prepare_agent_memory", lambda *a, **k: called.__setitem__("prepare", 1))
+        assert sr._prepare_skill_memory("o/r", ["codex"], "/tmp/wd", refresh=False, dry_run=True) is None
+        assert called == {"checkout": 0, "prepare": 0}
+
+    def test_prepare_memory_no_reviewers(self) -> None:
+        import helpers.skill_runner as sr
+        assert sr._prepare_skill_memory("o/r", [], "/tmp/wd", refresh=False, dry_run=False) is None
+
+    def test_prepare_memory_resilient_to_errors(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        monkeypatch.setattr(sr, "ensure_temp_checkout", lambda *a, **k: None)
+        def boom(*a, **k):
+            raise RuntimeError("git exploded")
+        monkeypatch.setattr(sr, "prepare_agent_memory", boom)
+        assert sr._prepare_skill_memory("o/r", ["codex"], "/tmp/wd", refresh=False, dry_run=False) is None
+
+    def test_prepare_memory_success_builds_enabled_config(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.workdirs import active_workdir
+        captured = {}
+        sentinel = object()
+        monkeypatch.setattr(sr, "ensure_temp_checkout", lambda *a, **k: None)
+        def fake_prepare(runner, config):
+            captured["config"] = config
+            return sentinel
+        monkeypatch.setattr(sr, "prepare_agent_memory", fake_prepare)
+        out = sr._prepare_skill_memory("o/r", ["codex", "gemini"], "/tmp/skill-runner-codex", refresh=True, dry_run=False)
+        assert out is sentinel
+        cfg = captured["config"]
+        assert cfg.agent_memory is True and cfg.refresh_agent_memory is True
+        assert str(active_workdir(cfg)) == "/tmp/skill-runner-codex"

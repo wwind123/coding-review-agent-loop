@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from coding_review_agent_loop.agents.base import AgentName
 from coding_review_agent_loop.config import AgentLoopConfig
 from coding_review_agent_loop.github import IssueContext, IssueComment
+from coding_review_agent_loop.memory import AgentMemoryContext
 from coding_review_agent_loop.prompts import build_plan_review_prompt, build_review_prompt
 from coding_review_agent_loop.round_state import _deserialize_unresolved_item
 
@@ -29,6 +30,9 @@ def make_minimal_config(
     reviewer: AgentName | None = None,
     workdir: str | None = None,
     approved_followups: str = "ignore",
+    agent_memory: bool = False,
+    agent_memory_dir: Path | None = None,
+    refresh_agent_memory: bool = False,
 ) -> AgentLoopConfig:
     base = Path(tempfile.gettempdir()) / "coding-review-agent-loop"
     legacy = base / "skill-runner"
@@ -72,9 +76,9 @@ def make_minimal_config(
         progress_interval_seconds=30,
         agent_max_retries=0,
         agent_retry_backoff_seconds=(30,),
-        agent_memory=False,
-        refresh_agent_memory=False,
-        agent_memory_dir=legacy,
+        agent_memory=agent_memory,
+        refresh_agent_memory=refresh_agent_memory,
+        agent_memory_dir=agent_memory_dir if agent_memory_dir is not None else legacy,
         refresh_test_profile=False,
         auto_agent_dirs=tuple(reviewer_names),
         approved_followups=approved_followups,
@@ -103,6 +107,7 @@ def build_plan_review_prompt_for_skill(
     coder: AgentName = "claude",
     all_reviewers: Sequence[AgentName] | None = None,
     workdir: str | None = None,
+    memory: AgentMemoryContext | None = None,
 ) -> str:
     """Build a plan reviewer prompt from plain dicts.
 
@@ -117,6 +122,7 @@ def build_plan_review_prompt_for_skill(
         all_reviewers: All configured reviewer names (defaults to [reviewer]).
         workdir: The reviewer's actual checkout path, embedded in the prompt so
             the agent inspects a directory that exists (#297).
+        memory: Repo-scoped agent memory to include for reviewer orientation (#306).
     """
     reviewers_list: Sequence[AgentName] = all_reviewers or [reviewer]
     config = make_minimal_config(repo, coder, reviewers_list, reviewer=reviewer, workdir=workdir)
@@ -128,6 +134,7 @@ def build_plan_review_prompt_for_skill(
         plan_text,
         config,
         reviewer=reviewer,
+        memory=memory,
         issue_context=issue_context,
         unresolved_items=unresolved,
     )
@@ -146,6 +153,7 @@ def build_review_prompt_for_skill(
     all_reviewers: Sequence[AgentName] | None = None,
     workdir: str | None = None,
     approved_followups: str = "ignore",
+    memory: AgentMemoryContext | None = None,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
 
@@ -164,6 +172,7 @@ def build_review_prompt_for_skill(
         approved_followups: Approved-followups mode; when not "ignore" the prompt
             instructs the reviewer to surface future follow-ups so they can be
             published on approval (#300).
+        memory: Repo-scoped agent memory to include for reviewer orientation (#306).
     """
     from coding_review_agent_loop.github import PullRequestMetadata
 
@@ -188,6 +197,7 @@ def build_review_prompt_for_skill(
         round_number,
         config,
         reviewer=reviewer,
+        memory=memory,
         pr_metadata=pr_metadata,
         issue_context=issue_context,
         unresolved_items=unresolved,
