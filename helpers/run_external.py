@@ -123,6 +123,12 @@ def main() -> None:
         help="Backoff delays before each retry; the final value is reused when "
              "retries exceed the list length (default: 15 45).",
     )
+    parser.add_argument(
+        "--usage-output",
+        default=None,
+        help="Write the agent's token usage (JSON) to this path for external-agent "
+             "cost tracking (#308). Skipped in --dry-run.",
+    )
     args = parser.parse_args()
 
     if args.max_retries < 0:
@@ -171,6 +177,7 @@ def main() -> None:
     from coding_review_agent_loop.agents.gemini import GeminiBackend
     from coding_review_agent_loop.config import AgentLoopConfig, AgentName, ensure_temp_checkout
     from coding_review_agent_loop.transient import is_transient_agent_output
+    from coding_review_agent_loop.usage import estimate_usage
 
     agent_name: AgentName = args.agent
     default_cmds = {"codex": "codex", "gemini": "gemini"}
@@ -264,6 +271,22 @@ def main() -> None:
     assert result is not None  # loop either set result or exited
     output_path.write_text(result.text, encoding="utf-8")
     print(f"agent result written to {output_path}")
+
+    # External-agent usage for cost tracking (#308). Advisory — never fail the run.
+    if args.usage_output:
+        try:
+            usage = result.usage or estimate_usage(prompt, result.text)
+            Path(args.usage_output).write_text(
+                json.dumps({
+                    "agent": agent_name,
+                    "session_id": result.session_id,
+                    "returncode": result.returncode,
+                    "usage": usage.to_dict(),
+                }, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"run_external: could not write usage output: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

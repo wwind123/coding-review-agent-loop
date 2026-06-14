@@ -1373,3 +1373,112 @@ class TestAgentMemory:
         cfg = captured["config"]
         assert cfg.agent_memory is True and cfg.refresh_agent_memory is True
         assert str(active_workdir(cfg)) == "/tmp/skill-runner-codex"
+
+
+# ---------------------------------------------------------------------------
+# external-agent usage/cost tracking (#308)
+# ---------------------------------------------------------------------------
+
+class TestUsageTracking:
+    def _rec(self, agent, mode, inp, out, returncode=0):
+        return {
+            "reviewer_name": agent.capitalize(),
+            "usage": {
+                "agent": agent, "session_id": f"s-{agent}", "returncode": returncode,
+                "usage": {"mode": mode, "input_tokens": inp, "output_tokens": out,
+                          "total_tokens": inp + out},
+            },
+        }
+
+    def test_aggregate_sums_and_preserves_modes(self) -> None:
+        from helpers.skill_runner import _aggregate_reviewer_usage
+        out = _aggregate_reviewer_usage([
+            self._rec("codex", "exact", 100, 50),
+            self._rec("gemini", "estimated", 80, 20),
+            {"reviewer_name": "NoUsage"},  # carries no usage → ignored
+        ])
+        assert out["scope"] == "external-agents-only"
+        assert "note" in out
+        totals = out["totals"]
+        assert totals["call_count"] == 2
+        assert totals["input_tokens"] == 180 and totals["output_tokens"] == 70
+        assert totals["total_tokens"] == 250
+        # modes preserved across reviewers
+        assert totals["exact_calls"] == 1 and totals["estimated_calls"] == 1
+        # success_count omitted (would be a misleading 0)
+        assert "success_count" not in totals
+        assert set(out["per_agent"]) == {"codex", "gemini"}
+        assert "success_count" not in out["per_agent"]["codex"]
+
+    def test_aggregate_none_when_no_usage(self) -> None:
+        from helpers.skill_runner import _aggregate_reviewer_usage
+        assert _aggregate_reviewer_usage([{"reviewer_name": "x"}, {"reviewer_name": "y"}]) is None
+        assert _aggregate_reviewer_usage([]) is None
+
+    def test_metadata_round_trips_usage(self) -> None:
+        # PostedRoundMetadata.usage survives encode -> decode (so build-resume
+        # can recover it for resumed-round aggregation).
+        from coding_review_agent_loop.round_state import (
+            PostedRoundMetadata, _encode_round_metadata, _decode_round_metadata,
+        )
+        usage = {"agent": "codex", "returncode": 0, "usage": {"mode": "exact", "total_tokens": 5}}
+        meta = PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex",
+                                   round_number=1, subject="abc", usage=usage)
+        decoded = _decode_round_metadata(_encode_round_metadata(meta))
+        assert decoded.usage == usage
+
+    def test_metadata_usage_defaults_none(self) -> None:
+        from coding_review_agent_loop.round_state import (
+            PostedRoundMetadata, _encode_round_metadata, _decode_round_metadata,
+        )
+        meta = PostedRoundMetadata(flow="plan", role="coder", agent="Claude",
+                                   round_number=1, subject="x")
+        assert _decode_round_metadata(_encode_round_metadata(meta)).usage is None
+
+    def _run_external_usage(self, monkeypatch, tmp_path, agent, result):
+        import helpers.run_external as rex
+        class FakeBackend:
+            def run(self, runner, config, prompt):
+                return result
+        monkeypatch.setattr("coding_review_agent_loop.agents.codex.CodexBackend", FakeBackend)
+        monkeypatch.setattr("coding_review_agent_loop.agents.gemini.GeminiBackend", FakeBackend)
+        usage_path = tmp_path / "u.json"
+        monkeypatch.setattr(sys, "argv", [
+            "run_external", "--agent", agent,
+            "--prompt-file", _write_tmp("Prompt text here."),
+            "--output", _write_tmp("", suffix=".out.md"),
+            "--workdir", "/tmp", "--usage-output", str(usage_path),
+        ])
+        rex.main()
+        return usage_path
+
+    def test_run_external_writes_exact_usage(self, monkeypatch, tmp_path) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+        from coding_review_agent_loop.usage import UsageMetadata
+        result = AgentResult(
+            text="review body", returncode=0, session_id="sess1",
+            usage=UsageMetadata(mode="exact", input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+        usage_path = self._run_external_usage(monkeypatch, tmp_path, "codex", result)
+        data = json.loads(usage_path.read_text(encoding="utf-8"))
+        assert data["agent"] == "codex" and data["session_id"] == "sess1"
+        assert data["usage"]["mode"] == "exact" and data["usage"]["total_tokens"] == 15
+
+    def test_run_external_estimates_usage_when_backend_omits(self, monkeypatch, tmp_path) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+        result = AgentResult(text="some response text", returncode=0, usage=None)
+        usage_path = self._run_external_usage(monkeypatch, tmp_path, "gemini", result)
+        data = json.loads(usage_path.read_text(encoding="utf-8"))
+        assert data["usage"]["mode"] == "estimated"
+
+    def test_run_external_dry_run_writes_no_usage(self, monkeypatch, tmp_path) -> None:
+        import helpers.run_external as rex
+        usage_path = tmp_path / "u.json"
+        monkeypatch.setattr(sys, "argv", [
+            "run_external", "--agent", "codex",
+            "--prompt-file", _write_tmp("Review this."),
+            "--output", _write_tmp("", suffix=".out.md"),
+            "--workdir", "/tmp", "--usage-output", str(usage_path), "--dry-run",
+        ])
+        rex.main()
+        assert not usage_path.exists()

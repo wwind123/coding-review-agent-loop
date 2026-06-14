@@ -201,6 +201,7 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                             _serialize_unresolved_item(item)
                             for item in record.metadata.new_items
                         ],
+                        "usage": record.metadata.usage,
                     }
                     for record in resumed.completed_reviews
                 ]
@@ -239,6 +240,7 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                             _serialize_unresolved_item(item)
                             for item in record.metadata.new_items
                         ],
+                        "usage": record.metadata.usage,
                     }
                     for record in result.completed_reviews
                 ]
@@ -301,6 +303,14 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             print(f"state_manager: cannot read canonical plan file: {exc}", file=sys.stderr)
             sys.exit(1)
 
+    usage: dict | None = None
+    if getattr(args, "usage_file", None):
+        try:
+            loaded = json.loads(Path(args.usage_file).read_text(encoding="utf-8"))
+            usage = loaded if isinstance(loaded, dict) else None
+        except (OSError, json.JSONDecodeError):
+            usage = None  # advisory; never block posting on usage
+
     metadata = PostedRoundMetadata(
         flow=args.flow,
         role=args.role,
@@ -312,6 +322,7 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         new_items=new_items,
         state=args.state,
         canonical_plan=canonical_plan,
+        usage=usage,
     )
     augmented = _attach_round_metadata(body, metadata)
 
@@ -382,6 +393,8 @@ def main() -> None:
                         help="JSON array of serialized ReviewItemDisposition.")
     p_meta.add_argument("--new-items-file", default=None,
                         help="JSON array of serialized UnresolvedReviewItem (new items from this turn).")
+    p_meta.add_argument("--usage-file", default=None,
+                        help="JSON file with external-agent usage to persist in AGENT_LOOP_META (#308).")
     p_meta.add_argument("--canonical-plan-file", default=None,
                         help="Plan text file (written as canonical_plan for coder turns).")
 

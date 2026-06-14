@@ -58,6 +58,7 @@ from coding_review_agent_loop.followups import (
 )
 from coding_review_agent_loop.memory import AgentMemoryContext, prepare_agent_memory
 from coding_review_agent_loop.runner import Runner, tail_text
+from coding_review_agent_loop.usage import RunUsageContext, UsageMetadata
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
@@ -446,6 +447,43 @@ def _mint_new_items(
     return items
 
 
+def _aggregate_reviewer_usage(records: list[dict]) -> dict | None:
+    """Aggregate external-agent usage across reviewer records (#308).
+
+    Each record's ``usage`` is the sidecar dict written by run_external
+    (``{agent, session_id, returncode, usage: <UsageMetadata dict>}``). Returns a
+    labeled, external-agents-only summary, or None if no record carried usage.
+    ``success_count`` is intentionally dropped: it is a validation metric not
+    tracked per usage record here, and would otherwise read 0.
+    """
+    ctx = RunUsageContext(run_id="skill", summary_path=Path(tempfile.gettempdir()) / "skill-usage.json")
+    found = False
+    for rec in records:
+        sidecar = rec.get("usage") if isinstance(rec, dict) else None
+        if not isinstance(sidecar, dict) or not isinstance(sidecar.get("usage"), dict):
+            continue
+        found = True
+        ctx.add_record(
+            agent=sidecar.get("agent", "codex"),
+            session_id=sidecar.get("session_id"),
+            returncode=int(sidecar.get("returncode", 0) or 0),
+            usage=UsageMetadata(**sidecar["usage"]),
+        )
+    if not found:
+        return None
+
+    def _strip(d: dict) -> dict:
+        d.pop("success_count", None)
+        return d
+
+    return {
+        "scope": "external-agents-only",
+        "note": "Host (Claude) coder/plan turns run in the interactive session and are not counted.",
+        "totals": _strip(ctx.totals().to_dict()),
+        "per_agent": {agent: _strip(t.to_dict()) for agent, t in ctx.per_agent_totals().items()},
+    }
+
+
 def _publish_pr_followups(
     repo: str,
     pr: int,
@@ -781,6 +819,17 @@ def _complete_reviewer_turn(
     )
     _write_json(new_items_file, new_items_serialized)
 
+    # External-agent usage sidecar written by run_external (#308); persist it in
+    # AGENT_LOOP_META so resumed rounds can aggregate the complete cost.
+    usage_file = work_dir / f"{agent}-usage.json"
+    reviewer_usage: dict | None = None
+    if usage_file.exists():
+        try:
+            reviewer_usage = json.loads(usage_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            reviewer_usage = None
+    usage_args = ["--usage-file", str(usage_file)] if usage_file.exists() else []
+
     # --- Attach metadata ---
     _run_helper(
         "helpers.state_manager", "attach-metadata",
@@ -795,6 +844,7 @@ def _complete_reviewer_turn(
         "--dispositions-file", str(dispositions_file),
         "--new-items-file", str(new_items_file),
         "--subject", round_subject,
+        *usage_args,
     )
 
     # --- Post ---
@@ -820,6 +870,7 @@ def _complete_reviewer_turn(
         "state": parsed_state,
         "blocking_items": [{"text": t} for t in reported_blocking],
         "new_items": new_items_serialized,
+        "usage": reviewer_usage,
     }
 
 
@@ -859,6 +910,7 @@ def _run_reviewer(
     _write_json(prior_items_file, next_prior_items_raw)
 
     # --- Run agent ---
+    usage_file = tmpdir / f"{agent}-usage.json"
     _run_helper(
         "helpers.run_external",
         "--agent", agent,
@@ -867,6 +919,7 @@ def _run_reviewer(
         "--workdir", workdir,
         "--repo", repo,
         "--flow", flow,
+        "--usage-output", str(usage_file),
         *(["--dry-run"] if dry_run else []),
     )
 
@@ -1121,12 +1174,14 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
     # In a new round, completed_reviewer_data belongs to the previous round and must not
     # contaminate the current round's result.
     current_round_items: list[dict] = []
+    round_reviewer_records: list[dict] = []
     round_blocking_items: list[dict] = []
     round_approved_reviewers: list[str] = []
     any_reviewer_blocked = False
     if not is_new_round:
         for record in resume.get("completed_reviewer_data", []):
             current_round_items.extend(record.get("new_items", []))
+            round_reviewer_records.append(record)
             if record.get("state") == "blocking":
                 any_reviewer_blocked = True
                 round_blocking_items.extend(
@@ -1205,6 +1260,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                 item_id_offset=item_id_offset,
             )
             current_round_items.extend(record["new_items"])
+            round_reviewer_records.append(record)
             if record["state"] == "blocking":
                 any_reviewer_blocked = True
                 round_blocking_items.extend(record["blocking_items"])
@@ -1231,6 +1287,9 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         "blocking_items": round_blocking_items,
         "approved_reviewers": round_approved_reviewers,
     }
+    usage = _aggregate_reviewer_usage(round_reviewer_records)
+    if usage is not None:
+        result_json["usage"] = usage
     print(json.dumps(result_json, indent=2))
 
 
@@ -1278,12 +1337,14 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
     # In a new round, completed_reviewer_data belongs to the previous round and must not
     # contaminate the current round's result.
     current_round_items: list[dict] = []
+    round_reviewer_records: list[dict] = []
     round_blocking_items: list[dict] = []
     round_approved_reviewers: list[str] = []
     any_reviewer_blocked = False
     if not is_new_round:
         for record in resume.get("completed_reviewer_data", []):
             current_round_items.extend(record.get("new_items", []))
+            round_reviewer_records.append(record)
             if record.get("state") == "blocking":
                 any_reviewer_blocked = True
                 round_blocking_items.extend(
@@ -1362,6 +1423,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 item_id_offset=item_id_offset,
             )
             current_round_items.extend(record["new_items"])
+            round_reviewer_records.append(record)
             if record["state"] == "blocking":
                 any_reviewer_blocked = True
                 round_blocking_items.extend(record["blocking_items"])
@@ -1413,6 +1475,9 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             repo, pr, head_sha, followups_mode, round_future_items, pr_comments,
             dry_run=dry_run,
         )
+    usage = _aggregate_reviewer_usage(round_reviewer_records)
+    if usage is not None:
+        result_json["usage"] = usage
     print(json.dumps(result_json, indent=2))
 
 

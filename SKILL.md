@@ -216,6 +216,18 @@ Plan-loop onward (including the optional Implement step + PR-loop).
   `--refresh-agent-memory` forces regeneration. The cache lives under the skill
   session dir and is incremental. Generation is advisory — if it fails, the round
   continues without memory.
+- **Usage/cost** (plan-loop and PR-loop): the round result includes a `usage`
+  field with token totals for the external reviewers (Codex/Gemini), aggregated
+  per agent. It is **external-agents-only** — the host's Claude coder/plan turns
+  run in the interactive session and have no programmatic token count, so the
+  numbers are *not* a session total (the field's `scope`/`note` say so). Usage is
+  persisted in `AGENT_LOOP_META`, so resumed rounds aggregate the full
+  external-agent cost.
+  ```json
+  "usage": { "scope": "external-agents-only", "note": "...host turns not counted...",
+             "totals": { "call_count": 2, "total_tokens": 250, ... },
+             "per_agent": { "codex": {...}, "gemini": {...} } }
+  ```
 - **Merge is always a human decision.** The skill never runs CI-wait or
   auto-merge; every mode stops at "ready to merge."
 

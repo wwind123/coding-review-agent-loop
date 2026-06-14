@@ -37,6 +37,7 @@ class PostedRoundMetadata:
     canonical_plan: str | None = None
     raw_structured_coder_response: str | None = None
     compact_prior_summaries: tuple[str, ...] = ()
+    usage: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "canonical_plan": metadata.canonical_plan,
         "raw_structured_coder_response": metadata.raw_structured_coder_response,
         "compact_prior_summaries": list(metadata.compact_prior_summaries),
+        "usage": metadata.usage,
     }
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -162,6 +164,7 @@ def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:
             compact_prior_summaries=tuple(
                 str(summary) for summary in payload.get("compact_prior_summaries", [])
             ),
+            usage=payload.get("usage") if isinstance(payload.get("usage"), dict) else None,
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise AgentLoopError("Invalid AGENT_LOOP_META payload.") from exc
