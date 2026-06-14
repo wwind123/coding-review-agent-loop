@@ -1930,3 +1930,13 @@ class TestHostReviewerPR:
             )
             assert result.returncode != 0
             assert "pr_review" in result.stderr
+
+    def test_complete_host_review_help_is_flow_neutral(self) -> None:
+        """The --dir CLI help must not be plan-only (it serves both flows)."""
+        result = _run(
+            "helpers.skill_runner", "complete-host-review", "--help",
+            check=False,
+        )
+        assert result.returncode == 0
+        assert "run-pr-round" in result.stdout
+        assert "pr_review" in result.stdout

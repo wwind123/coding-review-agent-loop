@@ -2287,12 +2287,14 @@ def main() -> None:
     # complete-host-review
     p_host = subparsers.add_parser(
         "complete-host-review",
-        help="Complete a host (Claude) reviewer turn from a review-request dir (#307).",
+        help="Complete a host (Claude) reviewer turn from a review-request dir "
+             "(plan flow #307; PR flow #314).",
     )
     p_host.add_argument(
         "--dir", required=True,
-        help="Path to the host-review request dir printed by run-plan-round. "
-             "Write your plan_review JSON to {dir}/host-review.md first.",
+        help="Path to the host-review request dir printed by the round command "
+             "(run-plan-round or run-pr-round). Write your review JSON "
+             "(plan_review or pr_review) to {dir}/host-review.md first.",
     )
     p_host.add_argument("--dry-run", action="store_true")
 
