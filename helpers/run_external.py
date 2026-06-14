@@ -71,10 +71,20 @@ _CANNED_PLAN_STATE = """\
 -- Codex (dry-run stub)
 """
 
+# Coder implementation turn (reversed roles, #316). Reports a PR number and makes
+# no out-of-workdir test claims, so the workdir test guard passes trivially.
+_CANNED_IMPLEMENTATION = """\
+Implemented the approved plan (dry-run stub): created a branch, made the changes,
+and opened a pull request.
+
+<!-- AGENT_PR: 0 -->
+-- Codex (dry-run stub)
+"""
+
 
 def _build_dry_run_response(role: str, flow: str = "plan") -> str:
     if role == "coder":
-        return _CANNED_PLAN_STATE
+        return _CANNED_IMPLEMENTATION if flow == "pr" else _CANNED_PLAN_STATE
     if flow == "pr":
         return _CANNED_PR_REVIEW + _CANNED_PR_REVIEW_FOOTER
     return _CANNED_PLAN_REVIEW + _CANNED_PLAN_REVIEW_FOOTER
@@ -142,7 +152,7 @@ def main() -> None:
     if args.dry_run:
         flow = args.flow
         if args.role == "coder":
-            stub_kind = "plan_state"
+            stub_kind = "implementation" if flow == "pr" else "plan_state"
         elif flow == "pr":
             stub_kind = "pr_review"
         else:

@@ -36,6 +36,18 @@ Subcommands:
     round pending; write your plan_review JSON to {dir}/host-review.md, then run
     this subcommand to validate, render, attach (--agent Claude), and post it.
 
+  run-implement
+    --issue N --repo OWNER/REPO
+    --coder {codex,gemini}
+    --plan-file PATH
+    [--base BRANCH] [--workdir PATH] [--dry-run]
+
+    Reversed roles: an external coder implements an approved plan and opens a PR
+    (validated for the PR marker, human-requirements ack, in-workdir tests, an
+    advanced HEAD, and that the PR is open and references the issue), then posts a
+    role: coder PR comment so run-pr-round can review it. Idempotent per plan via
+    the one-shot handoff marker. Requires a push-capable workdir.
+
 Prints a JSON result to stdout and exits 0:
   {"state": "approved"|"blocking", "round_number": N,
    "blocking_items": [...], "approved_reviewers": [...]}
@@ -2199,6 +2211,253 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# run-implement  (reversed roles: external coder implements an approved plan) (#316)
+# ---------------------------------------------------------------------------
+
+def _git_head(workdir: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", workdir, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _validate_coder_implementation_response(
+    coder_output: str,
+    *,
+    workdir: str,
+    human_requirements,
+) -> int:
+    """Validate an external coder's implementation response; return the PR number.
+
+    Mirrors the guards in ``orchestrator._implement_approved_issue``: a valid
+    ``<!-- AGENT_PR: N -->`` marker, the signed-human-requirements acknowledgement
+    (when any were surfaced), and that the coder's reported test commands ran inside
+    the assigned workdir. Raises ``AgentLoopError`` on any failure (the caller treats
+    that as non-retryable). Factored out so the guards are directly unit-testable.
+    """
+    from coding_review_agent_loop.orchestrator import (
+        _require_pr_number,
+        _validate_response_with_human_requirements,
+    )
+    from coding_review_agent_loop.workdir_guard import validate_response_tests_within_workdir
+
+    pr_number = _validate_response_with_human_requirements(
+        coder_output,
+        marker_validator=_require_pr_number,
+        human_requirements=human_requirements,
+        requirement_scope="implementation requirements",
+        full_omission_fallback="Fetch the issue discussion directly before implementing.",
+    )
+    validate_response_tests_within_workdir(coder_output, assigned_workdir=Path(workdir))
+    return int(pr_number)
+
+
+def cmd_run_implement(args: argparse.Namespace) -> None:
+    issue: int = args.issue
+    repo: str = args.repo
+    coder: str = args.coder
+    base: str = args.base
+    dry_run: bool = args.dry_run
+
+    plan_file = Path(args.plan_file)
+    if not plan_file.exists():
+        print(f"skill_runner: plan file not found: {plan_file}", file=sys.stderr)
+        sys.exit(1)
+    approved_plan = plan_file.read_text(encoding="utf-8")
+
+    explicit_workdir = getattr(args, f"workdir_{coder}", None) or getattr(args, "workdir", None)
+    if not dry_run and not explicit_workdir:
+        print(
+            "skill_runner: run-implement requires an explicit push-capable "
+            "--workdir (or --workdir-codex/--workdir-gemini); the external coder "
+            "commits, pushes a branch, and opens a PR there.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    workdir = _workdir_for_agent(coder, args)
+
+    from coding_review_agent_loop.config import sync_coder_base_before_implementation
+    from coding_review_agent_loop.decomposition import (
+        approved_plan_hash,
+        find_existing_one_shot_impl_handoff,
+        format_one_shot_impl_handoff_comment,
+    )
+    from coding_review_agent_loop.github import (
+        get_issue_context,
+        get_pr_review_context,
+        validate_open_pr,
+        validate_pr_references_issue,
+    )
+    from coding_review_agent_loop.workdir_guard import validate_assigned_head_advanced
+    from helpers.prompt_builders import (
+        build_implementation_prompt_for_skill,
+        make_minimal_config,
+    )
+
+    plan_hash = approved_plan_hash(approved_plan)
+    plan_subject = _plan_subject(approved_plan)
+    mode = "implement-one-shot"
+    coder_cap = agent_display_name(coder)  # type: ignore[arg-type]
+
+    config = dataclasses.replace(
+        make_minimal_config(repo, coder, (coder,), reviewer=coder, workdir=str(workdir), base=base),  # type: ignore[arg-type]
+        dry_run=dry_run,
+    )
+    runner = Runner(dry_run=dry_run)
+
+    # Idempotency — reuse the durable one-shot handoff marker (no duplicate PRs).
+    comments = [types.SimpleNamespace(body=b) for b in _fetch_issue_comments_raw(repo, issue)]
+    existing = find_existing_one_shot_impl_handoff(
+        comments, parent_issue=issue, plan_hash=plan_hash, mode=mode,
+    )
+    if existing is not None:
+        pr_open = True
+        try:
+            validate_open_pr(runner, config=config, pr_number=existing.pr_number)
+        except AgentLoopError:
+            pr_open = False
+        if pr_open:
+            print(json.dumps({
+                "pr": existing.pr_number,
+                "head_sha": existing.pr_head_sha,
+                "issue": issue,
+                "reused": True,
+            }, indent=2))
+            print(
+                f"hint: PR #{existing.pr_number} already implements this plan — "
+                f"review it with run-pr-round.",
+                file=sys.stderr,
+            )
+            return
+
+    issue_context = get_issue_context(runner, config=config, issue_number=issue)
+    prompt_text = build_implementation_prompt_for_skill(
+        issue_context, approved_plan,
+        repo=repo, coder=coder, workdir=str(workdir), base=base,  # type: ignore[arg-type]
+    )
+
+    # Sync the workdir to the requested base and capture HEAD *after* the sync, so
+    # the head-advanced check reflects the coder's commits (not the sync).
+    if dry_run:
+        print(f"[dry-run] would sync {workdir} to base '{base}' and run {coder_cap} implementation")
+        head_before = None
+    else:
+        sync_coder_base_before_implementation(config, runner)
+        head_before = _git_head(str(workdir))
+
+    with tempfile.TemporaryDirectory() as tmpstr:
+        tmpdir = Path(tmpstr)
+        prompt_file = tmpdir / "impl-prompt.md"
+        raw_output = tmpdir / "impl-raw.md"
+        usage_file = tmpdir / "impl-usage.json"
+        _write_text(prompt_file, prompt_text)
+
+        # No --repo: run_external would otherwise ensure_temp_checkout the workdir
+        # against its own base="main" config, resetting it away from --base right
+        # before the coder runs (#316).
+        _run_helper(
+            "helpers.run_external",
+            "--agent", coder,
+            "--role", "coder",
+            "--prompt-file", str(prompt_file),
+            "--output", str(raw_output),
+            "--workdir", str(workdir),
+            "--flow", "pr",
+            "--usage-output", str(usage_file),
+            *(["--dry-run"] if dry_run else []),
+        )
+        coder_output = raw_output.read_text(encoding="utf-8")
+        coder_usage: dict | None = None
+        if usage_file.exists():
+            try:
+                coder_usage = json.loads(usage_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                coder_usage = None
+
+        # Validate the coder response (PR marker + human-requirements ack +
+        # tests-within-workdir). Non-retryable: an implementation turn can't be
+        # file-repaired, so save a debug copy and exit before posting anything.
+        try:
+            pr_number = _validate_coder_implementation_response(
+                coder_output, workdir=str(workdir),
+                human_requirements=issue_context.human_requirements,
+            )
+        except AgentLoopError as exc:
+            debug_dir = _REPAIR_BASE / f"{issue}-implement-debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(raw_output, debug_dir / "raw.md")
+            print(f"skill_runner: implementation response rejected: {exc}", file=sys.stderr)
+            print(
+                f"skill_runner: raw response saved to {debug_dir}/raw.md — fix the "
+                f"underlying issue and re-run run-implement (non-retryable).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Validate the workdir + PR state.
+        if dry_run:
+            head_sha = "dry-run-sha"
+        else:
+            head_after = _git_head(str(workdir))
+            validate_assigned_head_advanced(
+                before_head=head_before, after_head=head_after,
+                assigned_workdir=Path(str(workdir)),
+            )
+            validate_open_pr(runner, config=config, pr_number=pr_number)
+            validate_pr_references_issue(
+                runner, config=config, pr_number=pr_number, issue_number=issue,
+            )
+            head_sha = get_pr_review_context(
+                runner, config=config, pr_number=pr_number,
+            ).metadata.head_sha or "unknown"
+
+        # Post the role: coder PR comment so run-pr-round's build-resume recognizes
+        # the round anchor. --state is required by attach-metadata; approved matches
+        # the other coder posts and is not load-bearing for PR-review resume.
+        tagged = tmpdir / "impl-tagged.md"
+        _run_helper(
+            "helpers.state_manager", "attach-metadata",
+            "--body-file", str(raw_output),
+            "--output", str(tagged),
+            "--flow", "pr",
+            "--role", "coder",
+            "--agent", coder_cap,
+            "--round-number", "1",
+            "--subject", str(head_sha),
+            "--state", "approved",
+        )
+        if not dry_run:
+            _run_helper(
+                "helpers.gh_ops", "post-issue-comment",
+                "--issue", str(pr_number), "--file", str(tagged), "--repo", repo,
+            )
+            # Record idempotency: the durable one-shot handoff marker on the issue.
+            handoff = tmpdir / "impl-handoff.md"
+            _write_text(handoff, format_one_shot_impl_handoff_comment(
+                parent_issue=issue, mode=mode, plan_hash=plan_hash,
+                plan_subject=plan_subject, pr_number=pr_number, pr_head_sha=head_sha,
+            ))
+            _run_helper(
+                "helpers.gh_ops", "post-issue-comment",
+                "--issue", str(issue), "--file", str(handoff), "--repo", repo,
+            )
+        else:
+            print(f"[dry-run] would post coder PR comment + handoff for PR #{pr_number}")
+
+    result_json: dict = {"pr": pr_number, "head_sha": head_sha, "issue": issue}
+    usage = _aggregate_reviewer_usage([{"usage": coder_usage}] if coder_usage else [])
+    if usage is not None:
+        result_json["usage"] = usage
+    print(json.dumps(result_json, indent=2))
+    print(
+        f"hint: PR #{pr_number} opened — review it with: python -m helpers.skill_runner "
+        f"run-pr-round --pr {pr_number} --repo {repo} --reviewers claude gemini",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2298,6 +2557,31 @@ def main() -> None:
     )
     p_host.add_argument("--dry-run", action="store_true")
 
+    # run-implement
+    p_impl = subparsers.add_parser(
+        "run-implement",
+        help="Reversed roles: an external coder implements an approved plan and "
+             "opens a PR, which you then review with run-pr-round (#316).",
+    )
+    p_impl.add_argument("--issue", type=int, required=True)
+    p_impl.add_argument("--repo", required=True)
+    p_impl.add_argument(
+        "--coder", choices=["codex", "gemini"], required=True,
+        help="External coder that implements the plan (the host implements in-session).",
+    )
+    p_impl.add_argument("--plan-file", required=True, help="Approved plan to implement.")
+    p_impl.add_argument(
+        "--base", default="main", help="Branch to base the PR on (default: main).",
+    )
+    p_impl.add_argument(
+        "--workdir", default=None,
+        help="Push-capable clone where the coder commits/pushes/opens the PR "
+             "(required for a real run).",
+    )
+    p_impl.add_argument("--workdir-codex", default=None)
+    p_impl.add_argument("--workdir-gemini", default=None)
+    p_impl.add_argument("--dry-run", action="store_true")
+
     # run-task-round
     p_task = subparsers.add_parser(
         "run-task-round",
@@ -2334,6 +2618,7 @@ def main() -> None:
         "run-pr-round": cmd_run_pr_round,
         "retry-validate": cmd_retry_validate,
         "complete-host-review": cmd_complete_host_review,
+        "run-implement": cmd_run_implement,
         "run-task-round": cmd_run_task_round,
     }
     dispatch[args.subcommand](args)

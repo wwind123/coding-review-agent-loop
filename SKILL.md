@@ -306,9 +306,31 @@ review. Re-run the same round command to recompute the round (it advances to
 `approved`, or — for a plan — revises via the coder when there are blocking /
 same-plan findings).
 
-**Reviewer side only.** An external coder *implementing* a PR (PR-flow reverse
-coder / reverse implementation) is still deferred; `run-task-round` stays
-host-coder only.
+### Reverse implementation (external coder opens the PR)
+
+`run-implement` has an **external coder** implement an approved plan and open a PR,
+which you then review with `run-pr-round` (`claude` reviewer optional):
+
+```bash
+python -m helpers.skill_runner run-implement \
+  --issue N --repo OWNER/REPO \
+  --coder codex \
+  --plan-file <approved-plan.md> \
+  --workdir <push-capable-clone> [--base main]
+# → prints {"pr": N, ...}; then:
+python -m helpers.skill_runner run-pr-round --pr N --repo OWNER/REPO --reviewers claude gemini
+```
+
+This is **side-effecting**: the coder commits, pushes a branch, and opens a real
+PR, so it needs a **push-capable** `--workdir`. The response is validated like the
+CLI's implement path — a real PR marker, the signed-human-requirements
+acknowledgement, in-workdir test reports, an advanced checkout HEAD, and that the
+PR is open and references the issue — before a `role: coder` PR comment is posted.
+It is **idempotent per plan** (the one-shot handoff marker): re-running returns the
+existing PR instead of opening a duplicate. A response that fails validation is
+non-retryable — fix the cause and re-run. `--dry-run` does no pushes/PRs.
+
+`run-task-round` stays host-coder only.
 
 ---
 

@@ -1940,3 +1940,143 @@ class TestHostReviewerPR:
         assert result.returncode == 0
         assert "run-pr-round" in result.stdout
         assert "pr_review" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# helpers/skill_runner.py — reverse implementation: run-implement (#316)
+# ---------------------------------------------------------------------------
+
+_IMPL_WITH_PR = "Implemented the plan.\n\n<!-- AGENT_PR: 5 -->\n-- Codex\n"
+
+
+def _human_req():
+    from coding_review_agent_loop.github import HumanReviewRequirement
+    return HumanReviewRequirement(
+        source_type="Issue comment", author="wwind123",
+        created_at="2026-06-14T00:00:00Z", url="https://example/1",
+        body="Must keep the public API backward compatible.",
+    )
+
+
+class TestRunExternalImplStub:
+    def test_coder_pr_dry_run_writes_pr_marker_stub(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.md"
+            result = _run(
+                "helpers.run_external",
+                "--agent", "codex", "--role", "coder", "--flow", "pr",
+                "--prompt-file", _write_tmp("implement it"),
+                "--output", str(out), "--workdir", tmpdir,
+                "--dry-run",
+            )
+            assert result.returncode == 0
+            assert "<!-- AGENT_PR:" in out.read_text(encoding="utf-8")
+
+
+class TestImplementationPrompt:
+    def test_includes_plan_workdir_and_human_requirement(self) -> None:
+        from coding_review_agent_loop.github import IssueContext
+        from helpers.prompt_builders import build_implementation_prompt_for_skill
+        ctx = IssueContext(
+            number=42, repo="o/r", title="T", body="B", url="u",
+            comments=(), human_requirements=(_human_req(),),
+        )
+        prompt = build_implementation_prompt_for_skill(
+            ctx, "APPROVED PLAN BODY XYZ",
+            repo="o/r", coder="codex", workdir="/tmp/skill-runner-codex",
+            base="release-x",
+        )
+        assert "APPROVED PLAN BODY XYZ" in prompt
+        assert "/tmp/skill-runner-codex" in prompt
+        assert "release-x" in prompt  # PR-base instruction threads --base
+        assert "backward compatible" in prompt  # signed human requirement surfaced
+
+
+class TestValidateCoderImplementationResponse:
+    def test_well_formed_returns_pr_number(self) -> None:
+        from helpers.skill_runner import _validate_coder_implementation_response
+        pr = _validate_coder_implementation_response(
+            _IMPL_WITH_PR, workdir="/tmp/wd", human_requirements=(),
+        )
+        assert pr == 5
+
+    def test_missing_human_ack_rejected(self) -> None:
+        from coding_review_agent_loop.errors import AgentLoopError
+        from helpers.skill_runner import _validate_coder_implementation_response
+        with pytest.raises(AgentLoopError):
+            _validate_coder_implementation_response(
+                _IMPL_WITH_PR, workdir="/tmp/wd", human_requirements=(_human_req(),),
+            )
+
+    def test_out_of_workdir_test_rejected(self) -> None:
+        from coding_review_agent_loop.errors import AgentLoopError
+        from helpers.skill_runner import _validate_coder_implementation_response
+        bad = (
+            "Implemented the plan.\n"
+            "Tests: cd /nonexistent/other-dir && pytest passed.\n\n"
+            "<!-- AGENT_PR: 5 -->\n-- Codex\n"
+        )
+        with pytest.raises(AgentLoopError):
+            _validate_coder_implementation_response(
+                bad, workdir="/tmp/wd", human_requirements=(),
+            )
+
+    def test_missing_pr_marker_rejected(self) -> None:
+        from coding_review_agent_loop.errors import AgentLoopError
+        from helpers.skill_runner import _validate_coder_implementation_response
+        with pytest.raises(AgentLoopError):
+            _validate_coder_implementation_response(
+                "I implemented it but forgot the marker.", workdir="/tmp/wd",
+                human_requirements=(),
+            )
+
+
+class TestRunImplement:
+    def _last_json(self, stdout: str) -> dict:
+        start = stdout.rfind("\n{")
+        if start < 0:
+            start = stdout.find("{")
+        return json.loads(stdout[start:].strip())
+
+    def test_dry_run_runs_coder_and_prints_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            plan = tmppath / "plan.md"
+            plan.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            result = _run(
+                "helpers.skill_runner", "run-implement",
+                "--issue", "9992", "--repo", "test/skill-repo",
+                "--coder", "codex", "--plan-file", str(plan),
+                "--workdir", str(tmppath), "--base", "release-x",
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0, result.stderr
+            output = self._last_json(result.stdout)
+            assert output["pr"] == 0 and output["issue"] == 9992
+            # Launcher base behavior is observable (not only the prompt text).
+            assert "release-x" in result.stdout
+
+    def test_invalid_coder_rejected(self) -> None:
+        result = _run(
+            "helpers.skill_runner", "run-implement",
+            "--issue", "1", "--repo", "o/r", "--coder", "claude",
+            "--plan-file", "/tmp/x.md", "--dry-run",
+            check=False,
+        )
+        assert result.returncode != 0  # argparse choices reject 'claude'
+
+    def test_missing_workdir_rejected_for_real_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan = Path(tmpdir) / "plan.md"
+            plan.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            result = _run(
+                "helpers.skill_runner", "run-implement",
+                "--issue", "1", "--repo", "o/r", "--coder", "codex",
+                "--plan-file", str(plan),
+                check=False,
+            )
+            assert result.returncode != 0
+            assert "push-capable" in result.stderr

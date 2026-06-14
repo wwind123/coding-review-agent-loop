@@ -19,6 +19,7 @@ from coding_review_agent_loop.config import AgentLoopConfig
 from coding_review_agent_loop.github import IssueContext, IssueComment
 from coding_review_agent_loop.memory import AgentMemoryContext
 from coding_review_agent_loop.prompts import (
+    build_issue_implementation_prompt,
     build_issue_plan_prompt,
     build_plan_review_prompt,
     build_plan_revision_prompt,
@@ -34,13 +35,14 @@ def make_minimal_config(
     *,
     reviewer: AgentName | None = None,
     workdir: str | None = None,
+    base: str = "main",
     approved_followups: str = "ignore",
     agent_memory: bool = False,
     agent_memory_dir: Path | None = None,
     refresh_agent_memory: bool = False,
 ) -> AgentLoopConfig:
-    base = Path(tempfile.gettempdir()) / "coding-review-agent-loop"
-    legacy = base / "skill-runner"
+    tmp_base = Path(tempfile.gettempdir()) / "coding-review-agent-loop"
+    legacy = tmp_base / "skill-runner"
 
     def _agent_dir(agent: AgentName) -> Path:
         # The active reviewer's dir must match where the agent actually runs, so the
@@ -50,7 +52,7 @@ def make_minimal_config(
         # reviewers (notably Codex) block on a missing checkout (#297).
         if workdir and agent == reviewer:
             return Path(workdir)
-        return base / f"skill-runner-{agent}"
+        return tmp_base / f"skill-runner-{agent}"
 
     return AgentLoopConfig(
         repo=repo,
@@ -59,7 +61,7 @@ def make_minimal_config(
         gemini_dir=_agent_dir("gemini"),
         coder=coder,
         reviewer=tuple(reviewer_names),
-        base="main",
+        base=base,
         max_rounds=1,
         auto_merge=False,
         dry_run=False,
@@ -265,4 +267,30 @@ def build_plan_revision_prompt_for_skill(
         memory,
         issue_context,
         unresolved_items=unresolved,
+    )
+
+
+def build_implementation_prompt_for_skill(
+    issue_context: IssueContext,
+    approved_plan: str,
+    *,
+    repo: str,
+    coder: AgentName,
+    workdir: str,
+    base: str = "main",
+    memory: AgentMemoryContext | None = None,
+) -> str:
+    """Build the external-coder implementation prompt (reversed roles, #316).
+
+    Takes a full ``IssueContext`` (built by the caller via ``get_issue_context``)
+    rather than a bare dict, so issue comments + signed human requirements reach the
+    coder. Sets the coder's checkout dir to ``workdir`` and the config ``base`` so
+    the embedded checkout guidance and "open a PR against {base}" instruction match
+    the real run dir + requested base.
+    """
+    config = make_minimal_config(
+        repo, coder, (coder,), reviewer=coder, workdir=workdir, base=base,
+    )
+    return build_issue_implementation_prompt(
+        issue_context.number, approved_plan, config, memory, issue_context=issue_context,
     )
