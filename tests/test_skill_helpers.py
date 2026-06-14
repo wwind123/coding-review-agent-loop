@@ -1616,24 +1616,6 @@ class TestExternalCoderRun:
             assert manifest["role"] == "coder"
             assert manifest["kind"] == "plan_state"
 
-    def test_claude_reviewer_with_external_coder_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-            _write_fake_gh(tmppath)
-            env = _make_fake_gh_env(tmppath)
-            result = _run(
-                "helpers.skill_runner", "run-plan-round",
-                "--issue", "9997",
-                "--repo", "test/skill-repo",
-                "--coder", "codex",
-                "--reviewers", "claude",
-                "--dry-run",
-                env=env,
-                check=False,
-            )
-            assert result.returncode != 0
-            assert "host-as-reviewer" in result.stderr
-
     def test_claude_coder_without_plan_file_rejected(self) -> None:
         result = _run(
             "helpers.skill_runner", "run-plan-round",
@@ -1713,3 +1695,117 @@ class TestRetryValidateCoder:
                 check=False,
             )
             assert result.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# helpers/skill_runner.py — reversed roles: host-as-reviewer (#307)
+# ---------------------------------------------------------------------------
+
+
+class TestHostReviewer:
+    def _last_json(self, stdout: str) -> dict:
+        start = stdout.rfind("\n{")
+        if start < 0:
+            start = stdout.find("{")
+        return json.loads(stdout[start:].strip())
+
+    def test_external_coder_with_claude_reviewer_is_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            result = _run(
+                "helpers.skill_runner", "run-plan-round",
+                "--issue", "9996",
+                "--repo", "test/skill-repo",
+                "--coder", "codex",
+                "--reviewers", "claude",
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0, result.stderr
+            output = self._last_json(result.stdout)
+            assert output["state"] == "pending"
+            assert output["pending_reviewers"] == ["Claude"]
+
+            # A host-review request dir was written with the plan + manifest.
+            request_dir = _REPAIR_BASE / "9996-r1-claude"
+            assert (request_dir / "plan.md").exists()
+            manifest = json.loads((request_dir / "manifest.json").read_text(encoding="utf-8"))
+            assert manifest["agent"] == "claude" and manifest["role"] == "reviewer"
+            assert manifest["validate_kind"] == "plan_review"
+
+    def test_external_reviewer_runs_before_host_review(self) -> None:
+        """With both gemini and claude configured, the external reviewer still runs
+        and only the host review is left pending."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            result = _run(
+                "helpers.skill_runner", "run-plan-round",
+                "--issue", "9995",
+                "--repo", "test/skill-repo",
+                "--coder", "codex",
+                "--reviewers", "claude", "gemini",
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0, result.stderr
+            output = self._last_json(result.stdout)
+            assert output["state"] == "pending"
+            assert output["pending_reviewers"] == ["Claude"]
+            # Gemini (external) ran this round despite being listed after claude.
+            assert "Gemini" in output["approved_reviewers"]
+
+    def _make_host_review_dir(self, tmpdir: Path) -> Path:
+        request_dir = tmpdir / "9996-r1-claude"
+        request_dir.mkdir(parents=True, exist_ok=True)
+        (request_dir / "plan.md").write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        (request_dir / "prior_items.json").write_text("[]", encoding="utf-8")
+        (request_dir / "context.json").write_text(
+            json.dumps({"reviewer": "Claude", "prior_items": [], "current_round_items": []}),
+            encoding="utf-8",
+        )
+        (request_dir / "host-review.md").write_text(_VALID_PLAN_REVIEW_DRY, encoding="utf-8")
+        manifest = {
+            "role": "reviewer", "agent": "claude", "agent_cap": "Claude", "flow": "plan",
+            "issue": 9996, "repo": "OWNER/REPO", "new_round_number": 1,
+            "round_subject": "abc123", "item_id_offset": 0,
+            "validate_kind": "plan_review", "dry_run": True,
+        }
+        (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return request_dir
+
+    def test_complete_host_review_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            request_dir = self._make_host_review_dir(tmppath)
+            result = _run(
+                "helpers.skill_runner", "complete-host-review",
+                "--dir", str(request_dir),
+                "--dry-run",
+                env=env,
+                check=False,
+            )
+            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+            start = result.stdout.find("{")
+            output = json.loads(result.stdout[start:].strip())
+            assert output["reviewer_name"] == "Claude"
+            assert output["state"] in ("approved", "blocking")
+
+    def test_complete_host_review_missing_review_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            request_dir = self._make_host_review_dir(tmppath)
+            (request_dir / "host-review.md").unlink()
+            result = _run(
+                "helpers.skill_runner", "complete-host-review",
+                "--dir", str(request_dir),
+                "--dry-run",
+                check=False,
+            )
+            assert result.returncode != 0
+            assert "host-review.md" in result.stderr

@@ -277,11 +277,34 @@ dir (manifest `role: coder`); fix `raw.md` and recover with
 `retry-validate --repair-dir <dir>` (no re-run of the agent), then re-run
 `run-plan-round`.
 
-**This increment is plan-flow only and host-coder reviewers only.** Host-as-reviewer
-(a `claude` reviewer authoring the review after reading the posted plan), PR-flow
-reverse, and reverse implementation are deferred to later increments; passing a
-`claude` reviewer with an external coder is rejected for now. `run-task-round`
-stays host-coder only.
+### Host-as-reviewer (Claude reviews the plan)
+
+Put `claude` in `--reviewers` to have **you (the host) review** the posted plan —
+the natural reversed-roles pairing (external coder, Claude reviewer):
+
+```bash
+python -m helpers.skill_runner run-plan-round \
+  --issue N --repo OWNER/REPO \
+  --coder codex \
+  --reviewers claude gemini
+```
+
+External reviewers always run first. The host can only review *after* reading the
+posted plan, so a configured `claude` reviewer becomes a **pending handoff**: the
+round returns `{"state": "pending", "pending_reviewers": ["Claude"], ...}` (never
+`approved`/`blocking` while it's outstanding) and prints a review-request dir.
+Read `{dir}/plan.md`, write your `plan_review` JSON to `{dir}/host-review.md`, then:
+
+```bash
+python -m helpers.skill_runner complete-host-review --dir <dir>
+```
+
+That validates, renders, attaches `--agent Claude --role reviewer`, and posts your
+review. Re-run `run-plan-round` to recompute the round (it advances to `approved`,
+or revises via the coder when there are blocking/same-plan findings).
+
+**Plan flow only.** PR-flow reverse and reverse implementation are deferred to
+later increments; `run-task-round` stays host-coder only.
 
 ---
 
