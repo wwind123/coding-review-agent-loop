@@ -277,34 +277,38 @@ dir (manifest `role: coder`); fix `raw.md` and recover with
 `retry-validate --repair-dir <dir>` (no re-run of the agent), then re-run
 `run-plan-round`.
 
-### Host-as-reviewer (Claude reviews the plan)
+### Host-as-reviewer (Claude reviews the plan or PR)
 
-Put `claude` in `--reviewers` to have **you (the host) review** the posted plan —
-the natural reversed-roles pairing (external coder, Claude reviewer):
+Put `claude` in `--reviewers` to have **you (the host) review** — for both
+`run-plan-round` (review the posted plan) and `run-pr-round` (review the PR diff):
 
 ```bash
 python -m helpers.skill_runner run-plan-round \
-  --issue N --repo OWNER/REPO \
-  --coder codex \
-  --reviewers claude gemini
+  --issue N --repo OWNER/REPO --coder codex --reviewers claude gemini
+
+python -m helpers.skill_runner run-pr-round \
+  --pr N --repo OWNER/REPO --reviewers claude codex
 ```
 
 External reviewers always run first. The host can only review *after* reading the
-posted plan, so a configured `claude` reviewer becomes a **pending handoff**: the
-round returns `{"state": "pending", "pending_reviewers": ["Claude"], ...}` (never
-`approved`/`blocking` while it's outstanding) and prints a review-request dir.
-Read `{dir}/plan.md`, write your `plan_review` JSON to `{dir}/host-review.md`, then:
+posted plan/PR, so a configured `claude` reviewer becomes a **pending handoff**:
+the round returns `{"state": "pending", "pending_reviewers": ["Claude"], ...}`
+(never `approved`/`blocking` while it's outstanding) and prints a review-request
+dir. Read the material there (`{dir}/plan.md` for a plan, `{dir}/pr-diff.diff` for
+a PR), write your `plan_review`/`pr_review` JSON to `{dir}/host-review.md`, then:
 
 ```bash
 python -m helpers.skill_runner complete-host-review --dir <dir>
 ```
 
 That validates, renders, attaches `--agent Claude --role reviewer`, and posts your
-review. Re-run `run-plan-round` to recompute the round (it advances to `approved`,
-or revises via the coder when there are blocking/same-plan findings).
+review. Re-run the same round command to recompute the round (it advances to
+`approved`, or — for a plan — revises via the coder when there are blocking /
+same-plan findings).
 
-**Plan flow only.** PR-flow reverse and reverse implementation are deferred to
-later increments; `run-task-round` stays host-coder only.
+**Reviewer side only.** An external coder *implementing* a PR (PR-flow reverse
+coder / reverse implementation) is still deferred; `run-task-round` stays
+host-coder only.
 
 ---
 

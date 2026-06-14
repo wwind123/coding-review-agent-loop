@@ -1456,16 +1456,20 @@ def _run_external_coder_phase(
 
 
 # ---------------------------------------------------------------------------
-# Host-as-reviewer handoff (reversed roles: Claude reviews the posted plan) (#307)
+# Host-as-reviewer handoff (reversed roles: Claude reviews the posted plan/PR)
+# (plan flow #307; PR flow #314)
 # ---------------------------------------------------------------------------
 
 def _write_host_review_request(
     *,
+    flow: str,
+    validate_kind: str,
     issue: int,
     repo: str,
     new_round_number: int,
     round_subject: str,
-    plan_text: str,
+    review_material: str,
+    material_filename: str,
     next_prior_items_raw: list[dict],
     current_round_items: list[dict],
     item_id_offset: int,
@@ -1473,13 +1477,15 @@ def _write_host_review_request(
 ) -> Path:
     """Write a review-request dir for the host (Claude) reviewer turn.
 
-    Contains the plan to review (``plan.md``), the review context, prior items, and
-    a manifest mirroring the reviewer repair manifest so ``complete-host-review``
-    can drive ``_complete_reviewer_turn`` once the host writes ``host-review.md``.
+    Flow-agnostic: ``review_material`` (the plan text or the PR diff) is written to
+    ``{dir}/{material_filename}`` for the host to read, alongside the review
+    context, prior items, and a manifest mirroring the reviewer repair manifest so
+    ``complete-host-review`` can drive ``_complete_reviewer_turn`` once the host
+    writes ``host-review.md``.
     """
     request_dir = _REPAIR_BASE / f"{issue}-r{new_round_number}-claude"
     request_dir.mkdir(parents=True, exist_ok=True)
-    _write_text(request_dir / "plan.md", plan_text)
+    _write_text(request_dir / material_filename, review_material)
     _write_json(request_dir / "prior_items.json", next_prior_items_raw)
     _write_json(request_dir / "context.json", {
         "reviewer": "Claude",
@@ -1488,10 +1494,11 @@ def _write_host_review_request(
     })
     manifest = {
         "role": "reviewer",
-        "agent": "claude", "agent_cap": "Claude", "flow": "plan",
+        "agent": "claude", "agent_cap": "Claude", "flow": flow,
         "issue": issue, "repo": repo,
         "new_round_number": new_round_number, "round_subject": round_subject,
-        "item_id_offset": item_id_offset, "validate_kind": "plan_review",
+        "item_id_offset": item_id_offset, "validate_kind": validate_kind,
+        "material_filename": material_filename,
         "dry_run": dry_run,
     }
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1745,8 +1752,10 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
     if "claude" in reviewers and "Claude" not in local_completed:
         item_id_offset = _max_item_number([next_prior_items_raw, current_round_items])
         request_dir = _write_host_review_request(
+            flow="plan", validate_kind="plan_review",
             issue=issue, repo=repo, new_round_number=new_round_number,
-            round_subject=plan_subject, plan_text=plan_text,
+            round_subject=plan_subject, review_material=plan_text,
+            material_filename="plan.md",
             next_prior_items_raw=next_prior_items_raw,
             current_round_items=current_round_items,
             item_id_offset=item_id_offset, dry_run=dry_run,
@@ -1871,10 +1880,15 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             refresh=getattr(args, "refresh_agent_memory", False), dry_run=dry_run,
         )
 
-    # Step 6 — run pending reviewers
+    # Step 6 — run pending reviewers.
+    # External reviewers (Codex/Gemini) always run first, regardless of --reviewers
+    # order; a configured host reviewer ("claude") reviews the PR itself and becomes
+    # a pending handoff after the loop (#314).
+    pending_reviewers: list[str] = []
+    external_reviewers = [r for r in reviewers if r != "claude"]
     with tempfile.TemporaryDirectory() as tmpstr:
         tmpdir = Path(tmpstr)
-        for reviewer in reviewers:
+        for reviewer in external_reviewers:
             reviewer_cap = reviewer.capitalize() if reviewer in ("codex", "gemini") else reviewer
             if reviewer_cap in local_completed or reviewer in local_completed:
                 print(f"[skip] {reviewer_cap} already completed this round")
@@ -1935,6 +1949,30 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             else:
                 round_approved_reviewers.append(record["reviewer_name"])
 
+    # Step 6b — host-as-reviewer handoff. The host (Claude) reviews the PR itself,
+    # so write a review-request dir (the PR diff for the host to read) and mark it
+    # pending; the host writes its pr_review JSON there and completes it via
+    # `complete-host-review` (#314).
+    if "claude" in reviewers and "Claude" not in local_completed:
+        item_id_offset = _max_item_number([next_prior_items_raw, current_round_items])
+        request_dir = _write_host_review_request(
+            flow="pr", validate_kind="pr_review",
+            issue=pr, repo=repo, new_round_number=new_round_number,
+            round_subject=head_sha or "", review_material=pr_diff,
+            material_filename="pr-diff.diff",
+            next_prior_items_raw=next_prior_items_raw,
+            current_round_items=current_round_items,
+            item_id_offset=item_id_offset, dry_run=dry_run,
+        )
+        pending_reviewers.append("Claude")
+        dry_run_flag = " --dry-run" if dry_run else ""
+        print(
+            f"skill_runner: host review pending — read the PR diff in {request_dir}/pr-diff.diff, "
+            f"write your pr_review JSON to {request_dir}/host-review.md, then run: "
+            f"python -m helpers.skill_runner complete-host-review --dir {request_dir}{dry_run_flag}",
+            file=sys.stderr,
+        )
+
     # Step 7 — write session
     if not dry_run:
         _run_helper(
@@ -1946,17 +1984,26 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             }),
         )
 
-    # Step 8 — print result
-    overall_state = "blocking" if any_reviewer_blocked else "approved"
+    # Step 8 — print result.
+    # A configured-but-incomplete host reviewer makes the round "pending": never
+    # report approved/blocking (or publish followups / run the test gate, which
+    # belong to a settled round) while a reviewer is still outstanding (#314).
+    if pending_reviewers:
+        overall_state = "pending"
+    else:
+        overall_state = "blocking" if any_reviewer_blocked else "approved"
     result_json = {
         "state": overall_state,
         "round_number": new_round_number,
         "blocking_items": round_blocking_items,
         "approved_reviewers": round_approved_reviewers,
     }
+    if pending_reviewers:
+        result_json["pending_reviewers"] = pending_reviewers
     # Optional test gate: reports pass/fail; never blocks or merges. An explicit
     # empty --test-command "" is reported as a setup error, not silently skipped.
-    gate = _maybe_test_gate(
+    # Skipped while the round is pending a host review.
+    gate = None if pending_reviewers else _maybe_test_gate(
         getattr(args, "test_command", None),
         getattr(args, "test_workdir", "."),
         dry_run=dry_run,
@@ -2070,17 +2117,20 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# complete-host-review  (reversed roles: host (Claude) reviewer turn) (#307)
+# complete-host-review  (reversed roles: host (Claude) reviewer turn)
+# (plan flow #307; PR flow #314)
 # ---------------------------------------------------------------------------
 
 def cmd_complete_host_review(args: argparse.Namespace) -> None:
     """Complete a host (Claude) reviewer turn from a review-request dir.
 
-    The host reads ``{dir}/plan.md``, writes its ``plan_review`` JSON to
-    ``{dir}/host-review.md``, then runs this command. Reuses
-    ``_complete_reviewer_turn`` (agent=claude → display ``Claude``) to validate,
-    render, attach metadata, and post — so ``build-resume`` recognizes the review
-    and re-running ``run-plan-round`` recomputes the round's final state.
+    The host reads the posted plan/PR (``{dir}/<material>``), writes its
+    ``plan_review``/``pr_review`` JSON to ``{dir}/host-review.md``, then runs this
+    command. Reuses ``_complete_reviewer_turn`` (agent=claude → display ``Claude``)
+    to validate, render, attach metadata, and post — so ``build-resume`` recognizes
+    the review and re-running the round command recomputes the final state. Works
+    for both flows; the manifest's ``flow``/``validate_kind`` drive the behavior and
+    the user-facing wording.
     """
     request_dir = Path(args.dir)
     if not request_dir.exists():
@@ -2094,10 +2144,14 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
+    flow             = manifest["flow"]
+    validate_kind    = manifest["validate_kind"]
+    round_command    = f"run-{flow}-round"
+
     review_file = request_dir / "host-review.md"
     if not review_file.exists():
         print(
-            f"skill_runner: write your plan_review JSON to {review_file} first, then re-run.",
+            f"skill_runner: write your {validate_kind} JSON to {review_file} first, then re-run.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2111,7 +2165,7 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
     try:
         result = _complete_reviewer_turn(
             agent="claude", agent_cap=agent_display_name("claude"),
-            flow=manifest["flow"], validate_kind=manifest["validate_kind"],
+            flow=flow, validate_kind=validate_kind,
             issue=issue, repo=repo,
             new_round_number=new_round_number, round_subject=manifest["round_subject"],
             next_prior_items_raw=prior_items_raw,
@@ -2139,7 +2193,7 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
 
     print(json.dumps(result, indent=2))
     print(
-        "hint: host review posted — re-run run-plan-round to recompute the round.",
+        f"hint: host review posted — re-run {round_command} to recompute the round.",
         file=sys.stderr,
     )
 
