@@ -85,6 +85,17 @@ This installs the `agent-loop` command from your checkout. The tool still
 requires local `gh`, `claude`, `codex`, and/or `gemini` authentication depending
 on which agents you use.
 
+## Claude Code skill mode
+
+Besides the headless `agent-loop` CLI, the repo ships a **Claude Code skill** that
+runs the same review loop directly inside an interactive Claude Code session
+(host Claude turns use your session instead of `claude -p`). It supports the
+reversed roles end to end — an external agent (Codex/Gemini) can plan, implement
+(one-shot, decompose, or by-phase), and the host (Claude) can review — and
+degrades gracefully if a reviewer's CLI fails. See [`SKILL.md`](SKILL.md) for the
+step-by-step instructions and [`docs/skill_mode.md`](docs/skill_mode.md) for the
+design overview.
+
 ## Develop This Tool
 
 Use this if you are changing `coding-review-agent-loop` itself:

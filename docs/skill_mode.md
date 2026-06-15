@@ -29,7 +29,10 @@ Claude Code (interactive session)
 
 Claude performs coder/plan turns by writing files directly (using its Write
 tool or by producing structured JSON in its response).  External reviewers
-(Codex, Gemini) are still invoked as subprocesses via `run_external.py`.
+(Codex, Gemini) are still invoked as subprocesses via `run_external.py`.  In
+**reversed-roles** mode these swap — an external agent performs the coder/
+implement turns via `run_external.py` while the host (Claude) reviews — see
+[Reversed roles](#reversed-roles-external-coder--host-reviewer) below.
 
 ## Structured protocol compatibility
 
@@ -42,6 +45,30 @@ The skill helpers reuse the same library entry points used by the headless CLI:
 GitHub comment metadata markers (`AGENT_LOOP_META`) written by the skill are
 identical to those written by the headless CLI, so mixed-mode operation (start
 headless, resume in skill, or vice versa) is supported.
+
+## Reversed roles (external coder / host reviewer)
+
+Skill mode supports running the loop with the coder/reviewer roles reversed —
+mirroring the CLI's `--coder` / `--reviewer` reversal — so an external agent
+(Codex/Gemini) does the coder turns and the host (Claude) reviews:
+
+- **Plan, reversed**: `run-plan-round --coder codex --reviewers gemini claude`
+  has the external coder write the plan; the configured reviewers (external
+  and/or the host) review it. `--coder claude` (the default) keeps the host as
+  coder and requires `--plan-file`; an external `--coder` generates the plan
+  instead.
+- **Host as reviewer**: when `claude` is among `--reviewers`, the round runs the
+  external reviewers first, then writes a review-request dir and reports
+  `pending`. The host reads the posted plan/PR, writes its structured review
+  there, and finalizes it with `complete-host-review --dir <dir>` (works for both
+  plan and PR rounds); re-running the round then recomputes the final state.
+- **Implement, reversed**: after a plan is approved, an external coder implements
+  it and opens a PR — see [Approved-plan execution helpers](#approved-plan-execution-helpers)
+  — which the host then reviews with `run-pr-round`.
+
+End to end: external coder plans → reviewers review → external coder implements
+(one-shot / decompose / by-phase) → host + external reviewers review the PR.
+Merge stays a human decision.
 
 ## Approved-plan execution helpers
 
@@ -79,6 +106,27 @@ Dry-run by-phase execution validates the decomposition and implementation stubs
 without creating issues, posting comments, pushing branches, or opening real
 PRs. Because dry-run child issue numbers may be unavailable, its JSON output is
 a preview of what would be handed off and implemented.
+
+## Round states and reviewer resilience
+
+Each `run-plan-round` / `run-pr-round` prints a JSON result whose `state` is one
+of the following, in precedence order:
+
+- `pending` — a host (`claude`) review handoff is outstanding (listed under
+  `pending_reviewers`); complete it with `complete-host-review`, then re-run.
+- `blocking` — a completed reviewer reported must-fix items (`blocking_items`).
+- `incomplete` — a configured external reviewer was **unavailable** (listed under
+  `unavailable_reviewers`); re-attempted on the next run.
+- `approved` — all configured reviewers signed off.
+
+**Reviewer resilience**: if an external reviewer's CLI fails to produce a usable
+review — an agent/tooling failure such as an empty or malformed-tool-call
+response, *not* a fixable malformed review — the round does **not** abort. That
+reviewer is marked unavailable, the remaining reviewers still run, and a round is
+never falsely reported `approved`. A genuinely malformed-but-content-bearing
+review instead uses the `retry-validate` repair path. (The classifier is
+conservative: only known tooling-failure signatures or truly-empty output count
+as unavailable.)
 
 ## Session state
 
