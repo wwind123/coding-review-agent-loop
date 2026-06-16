@@ -442,6 +442,7 @@ class FakeRunner(Runner):
         progress_interval_seconds,
         check=True,
         env=None,
+        use_pty=False,
     ):
         cmd, cwd_path = self._record_command(args, cwd)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -17619,9 +17620,12 @@ def test_antigravity_backend_command_and_prefers_response_file(tmp_path):
     result = AntigravityBackend().run(runner, config, "Review this PR.", run_id="run-1")
     cmd = runner.commands[-1][0]
     assert cmd[0] == "agy"
-    assert "--print" in cmd
     assert cmd[cmd.index("--model") + 1] == "Gemini 3.1 Pro (High)"
     assert "--dangerously-skip-permissions" in cmd
+    # The prompt is the value of --print and must be the last argument (agy's
+    # --print/--prompt consumes the next token, not a trailing positional).
+    assert cmd[-2] == "--print"
+    assert "Review this PR." in cmd[-1]
     assert result.text == "response file text"
     assert result.session_id is None  # agy --print exposes no conversation id
 
@@ -17637,6 +17641,24 @@ def test_antigravity_backend_stdout_fallback(tmp_path):
     assert result.text_source == "stdout"
 
 
+def test_antigravity_backend_strips_public_response_marker(tmp_path):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+    from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER
+    agy_dir = tmp_path / "antigravity"
+    agy_dir.mkdir(parents=True, exist_ok=True)
+    stdout = (
+        "I will inspect the diff and run the tests.\n"
+        f"{PUBLIC_RESPONSE_MARKER}\n"
+        "STATE: approved\n\nLooks good to me."
+    )
+    runner = FakeRunner(antigravity_outputs=[(stdout, 0)])
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    result = AntigravityBackend().run(runner, config, "Review this PR.", run_id="run-1")
+    assert result.text == "STATE: approved\n\nLooks good to me."
+    assert result.text_source == "stdout_marker"
+    assert "I will inspect" not in result.text
+
+
 def test_antigravity_backend_resume_uses_conversation(tmp_path):
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
     agy_dir = tmp_path / "antigravity"
@@ -17646,6 +17668,34 @@ def test_antigravity_backend_resume_uses_conversation(tmp_path):
     AntigravityBackend().run(runner, config, "x", session_id="conv-7", run_id="r")
     cmd = runner.commands[-1][0]
     assert cmd[cmd.index("--conversation") + 1] == "conv-7"
+
+
+def test_runner_pty_reports_tty_and_strips_ansi(tmp_path):
+    """The real PTY path: the child sees a TTY and ANSI codes are stripped."""
+    import sys
+    from coding_review_agent_loop.runner import Runner, strip_ansi
+
+    assert strip_ansi("\x1b[31mred\x1b[0m\r\ndone") == "red\ndone"
+
+    program = (
+        "import sys\n"
+        "sys.stdout.write('istty=%s\\n' % sys.stdout.isatty())\n"
+        "sys.stdout.write('\\x1b[32mGREEN\\x1b[0m\\n')\n"
+    )
+    log_path = tmp_path / "logs" / "pty.log"
+    result = Runner().run_with_log(
+        [sys.executable, "-c", program],
+        cwd=tmp_path,
+        log_path=log_path,
+        label="PtyProbe",
+        progress_interval_seconds=999,
+        check=True,
+        use_pty=True,
+    )
+    assert "istty=True" in result.stdout
+    assert "GREEN" in result.stdout
+    assert "\x1b[" not in result.stdout  # ANSI stripped from captured output
+    assert result.returncode == 0
 
 
 def test_antigravity_registry():

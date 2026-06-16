@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -21,6 +22,17 @@ class CommandResult:
     stdout: str
     stderr: str
     returncode: int
+
+
+# Matches ANSI/VT100 control sequences (CSI, OSC, charset selection) that a
+# program emits when it believes it is talking to a terminal. We run some agents
+# under a pseudo-terminal (see run_with_log use_pty), so we strip these from the
+# captured output before parsing it.
+_ANSI_RE = re.compile(r"\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)|\x1B[()][AB0-2]")
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text).replace("\r", "")
 
 
 def tail_text(text: str, *, max_lines: int = 80) -> str:
@@ -82,6 +94,7 @@ class Runner:
         progress_interval_seconds: int,
         check: bool = True,
         env: Mapping[str, str] | None = None,
+        use_pty: bool = False,
     ) -> CommandResult:
         cmd = [str(a) for a in args]
         if self.dry_run:
@@ -90,6 +103,16 @@ class Runner:
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         ensure_log_dir_ignored(log_path.parent)
+        if use_pty:
+            return self._run_with_log_pty(
+                cmd,
+                cwd=cwd,
+                log_path=log_path,
+                label=label,
+                progress_interval_seconds=progress_interval_seconds,
+                check=check,
+                env=env,
+            )
         started = time.monotonic()
         next_progress = started + progress_interval_seconds
         header = f"$ {' '.join(cmd)}\n\n"
@@ -140,5 +163,94 @@ class Runner:
             raise AgentLoopError(
                 f"Command failed with exit {returncode}: {' '.join(cmd)}\n"
                 f"log: {log_path}\n\nlast output:\n{tail_text(full_output)}"
+            )
+        return result
+
+    def _run_with_log_pty(
+        self,
+        cmd: list[str],
+        *,
+        cwd: Path,
+        log_path: Path,
+        label: str,
+        progress_interval_seconds: int,
+        check: bool,
+        env: Mapping[str, str] | None,
+    ) -> CommandResult:
+        """Run a command attached to a pseudo-terminal, logging and capturing output.
+
+        Some agents (notably Antigravity's `agy`) detect whether stdout is a TTY
+        and silently drop their final response when it is not (a pipe / file /
+        subprocess), see upstream antigravity-cli issue #76. Allocating a PTY makes
+        the agent emit normally; we strip the resulting ANSI control sequences from
+        the captured text before returning it.
+        """
+        import pty
+        import select
+
+        started = time.monotonic()
+        next_progress = started + progress_interval_seconds
+        header = f"$ {' '.join(cmd)}\n\n"
+        master_fd, slave_fd = pty.openpty()
+        chunks: list[bytes] = []
+        with log_path.open("wb") as log_file:
+            log_file.write(header.encode("utf-8"))
+            log_file.flush()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
+                start_new_session=True,
+                env={**os.environ, **env} if env is not None else None,
+            )
+            os.close(slave_fd)
+            try:
+                while True:
+                    ready, _, _ = select.select([master_fd], [], [], 1.0)
+                    if master_fd in ready:
+                        try:
+                            data = os.read(master_fd, 65536)
+                        except OSError:
+                            data = b""  # EIO once the slave side has fully closed
+                        if data:
+                            log_file.write(data)
+                            log_file.flush()
+                            chunks.append(data)
+                        elif proc.poll() is not None:
+                            break
+                    elif proc.poll() is not None:
+                        break
+                    now = time.monotonic()
+                    if now >= next_progress:
+                        elapsed = int(now - started)
+                        print(
+                            f"[agent-loop {datetime.now().strftime('%H:%M:%S')}] "
+                            f"{label} still running ({elapsed}s); log: {log_path}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        next_progress = now + progress_interval_seconds
+            except KeyboardInterrupt:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                raise
+            finally:
+                os.close(master_fd)
+            returncode = proc.wait()
+
+        raw = b"".join(chunks).decode("utf-8", errors="replace")
+        output = strip_ansi(raw)
+        result = CommandResult(cmd, cwd, output, "", returncode)
+        if check and returncode != 0:
+            raise AgentLoopError(
+                f"Command failed with exit {returncode}: {' '.join(cmd)}\n"
+                f"log: {log_path}\n\nlast output:\n{tail_text(output)}"
             )
         return result
