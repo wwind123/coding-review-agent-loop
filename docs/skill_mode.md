@@ -22,7 +22,7 @@ Claude Code (interactive session)
 │
 ├── helpers/validate_response.py   ← validates structured protocol responses
 ├── helpers/state_manager.py       ← session state + GitHub comment resume
-├── helpers/run_external.py        ← invokes codex/gemini CLIs
+├── helpers/run_external.py        ← invokes codex / gemini / antigravity (agy) CLIs
 ├── helpers/gh_ops.py              ← GitHub issue/PR comment operations
 └── helpers/demo_loop.py           ← standalone dry-run demo
 ```
@@ -69,6 +69,12 @@ mirroring the CLI's `--coder` / `--reviewer` reversal — so an external agent
 End to end: external coder plans → reviewers review → external coder implements
 (one-shot / decompose / by-phase) → host + external reviewers review the PR.
 Merge stays a human decision.
+
+The external agent can be `codex`, `gemini`, or `antigravity` (the `agy` CLI —
+the migration path for Gemini CLI consumer access, which Google retires on
+2026-06-18; pick its model with `--antigravity-model`, default `Gemini 3.1 Pro
+(High)`). Antigravity turns are single-shot (no cross-round session resume) and
+report estimated token usage.
 
 ## Approved-plan execution helpers
 

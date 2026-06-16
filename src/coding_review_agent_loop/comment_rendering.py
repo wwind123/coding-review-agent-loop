@@ -27,7 +27,8 @@ from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID
 
 ITEM_SUMMARY_LIMIT = 100
 PUBLIC_REVIEWER_NAME_BY_DISPLAY = {
-    agent_display_name(agent): agent_signature(agent) for agent in ("claude", "codex", "gemini")
+    agent_display_name(agent): agent_signature(agent)
+    for agent in ("claude", "codex", "gemini", "antigravity")
 }
 
 

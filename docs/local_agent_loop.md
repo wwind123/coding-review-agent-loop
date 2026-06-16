@@ -13,6 +13,8 @@ The default flow is:
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
+Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick the model via `--antigravity-model`, default `Gemini 3.1 Pro (High)`). Enterprise / API-key Gemini CLI paths remain supported. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
+
 ## Architecture
 
 The tool is a local orchestrator. It does not call model APIs directly; it shells

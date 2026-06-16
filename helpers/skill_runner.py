@@ -988,7 +988,7 @@ def _run_reviewer(
     item_id_offset: int = 0,
 ) -> dict:
     """Run one reviewer turn; return {reviewer_name, state, blocking_items, new_items}."""
-    agent_cap = agent.capitalize() if agent in ("codex", "gemini") else agent
+    agent_cap = agent_display_name(agent)  # type: ignore[arg-type]
     validate_kind = "pr_review" if flow == "pr" else "plan_review"
 
     prompt_file      = tmpdir / f"{agent}-prompt.md"
@@ -1800,7 +1800,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory() as tmpstr:
         tmpdir = Path(tmpstr)
         for reviewer in external_reviewers:
-            reviewer_cap = reviewer.capitalize() if reviewer in ("codex", "gemini") else reviewer
+            reviewer_cap = agent_display_name(reviewer)  # type: ignore[arg-type]
             if reviewer_cap in local_completed or reviewer in local_completed:
                 print(f"[skip] {reviewer_cap} already completed this round")
                 continue
@@ -2019,7 +2019,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory() as tmpstr:
         tmpdir = Path(tmpstr)
         for reviewer in external_reviewers:
-            reviewer_cap = reviewer.capitalize() if reviewer in ("codex", "gemini") else reviewer
+            reviewer_cap = agent_display_name(reviewer)  # type: ignore[arg-type]
             if reviewer_cap in local_completed or reviewer in local_completed:
                 print(f"[skip] {reviewer_cap} already completed this round")
                 continue
@@ -3124,7 +3124,7 @@ def main() -> None:
     p_plan.add_argument("--issue", type=int, required=True)
     p_plan.add_argument("--repo", required=True)
     p_plan.add_argument(
-        "--coder", choices=["claude", "codex", "gemini"], default="claude",
+        "--coder", choices=["claude", "codex", "gemini", "antigravity"], default="claude",
         help="Who writes the plan: 'claude' (default, host supplies --plan-file) or "
              "an external coder ('codex'/'gemini') run by the skill (reversed roles, #307).",
     )
@@ -3218,7 +3218,7 @@ def main() -> None:
     p_impl.add_argument("--issue", type=int, required=True)
     p_impl.add_argument("--repo", required=True)
     p_impl.add_argument(
-        "--coder", choices=["codex", "gemini"], required=True,
+        "--coder", choices=["codex", "gemini", "antigravity"], required=True,
         help="External coder that implements the plan (the host implements in-session).",
     )
     p_impl.add_argument("--plan-file", required=True, help="Approved plan to implement.")
@@ -3243,7 +3243,7 @@ def main() -> None:
     p_impl_phase.add_argument("--issue", type=int, required=True)
     p_impl_phase.add_argument("--repo", required=True)
     p_impl_phase.add_argument(
-        "--coder", choices=["codex", "gemini"], required=True,
+        "--coder", choices=["codex", "gemini", "antigravity"], required=True,
         help="External coder that decomposes and implements the first agent phase.",
     )
     p_impl_phase.add_argument("--plan-file", required=True, help="Approved plan to decompose and implement.")
@@ -3268,7 +3268,7 @@ def main() -> None:
     p_decompose.add_argument("--issue", type=int, required=True)
     p_decompose.add_argument("--repo", required=True)
     p_decompose.add_argument(
-        "--coder", choices=["codex", "gemini"], required=True,
+        "--coder", choices=["codex", "gemini", "antigravity"], required=True,
         help="External coder that decomposes the approved plan.",
     )
     p_decompose.add_argument("--plan-file", required=True, help="Approved plan to decompose.")
@@ -3290,7 +3290,7 @@ def main() -> None:
     )
     p_task.add_argument("--repo", required=True)
     p_task.add_argument(
-        "--coder", choices=["claude", "codex", "gemini"], default="claude",
+        "--coder", choices=["claude", "codex", "gemini", "antigravity"], default="claude",
         help="Host coder only for now; external coders are rejected in task mode (#307).",
     )
     p_task.add_argument("--plan-file", required=True)

@@ -115,8 +115,13 @@ def _build_dry_run_response(role: str, flow: str = "plan") -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one external agent turn.")
-    parser.add_argument("--agent", required=True, choices=["codex", "gemini"])
+    parser.add_argument("--agent", required=True, choices=["codex", "gemini", "antigravity"])
     parser.add_argument("--prompt-file", required=True, help="Path to prompt text file.")
+    parser.add_argument(
+        "--model", default=None,
+        help="Model override (antigravity only; as shown by `agy models`). "
+             "Defaults to 'Gemini 3.1 Pro (High)'.",
+    )
     parser.add_argument("--output", required=True, help="Path to write the agent response.")
     parser.add_argument("--workdir", required=True, help="Working directory for the agent.")
     parser.add_argument(
@@ -209,6 +214,7 @@ def main() -> None:
     workdir = Path(args.workdir)
 
     # Import backends lazily to avoid heavy import in dry-run path
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
     from coding_review_agent_loop.agents.codex import CodexBackend
     from coding_review_agent_loop.agents.gemini import GeminiBackend
     from coding_review_agent_loop.config import AgentLoopConfig, AgentName, ensure_temp_checkout
@@ -216,8 +222,9 @@ def main() -> None:
     from coding_review_agent_loop.usage import estimate_usage
 
     agent_name: AgentName = args.agent
-    default_cmds = {"codex": "codex", "gemini": "gemini"}
+    default_cmds = {"codex": "codex", "gemini": "gemini", "antigravity": "agy"}
     cmd = args.cmd or default_cmds[agent_name]
+    antigravity_model = args.model or "Gemini 3.1 Pro (High)"
 
     # Build a minimal config sufficient for backend.run()
     import tempfile
@@ -229,6 +236,7 @@ def main() -> None:
         claude_dir=workdir,
         codex_dir=workdir,
         gemini_dir=workdir,
+        antigravity_dir=workdir,
         coder="claude",
         reviewer=(agent_name,),
         base="main",
@@ -239,6 +247,9 @@ def main() -> None:
         claude_cmd="claude",
         codex_cmd=cmd if agent_name == "codex" else "codex",
         gemini_cmd=cmd if agent_name == "gemini" else "gemini",
+        antigravity_cmd=cmd if agent_name == "antigravity" else "agy",
+        antigravity_args=("--dangerously-skip-permissions",),
+        antigravity_model=antigravity_model,
         gh_cmd="gh",
         claude_args=(),
         codex_args=("--dangerously-bypass-approvals-and-sandbox",),
@@ -265,7 +276,12 @@ def main() -> None:
     # deterministically and re-cloning per attempt would be wasteful.
     if args.repo:
         ensure_temp_checkout(workdir, agent=agent_name, config=config, runner=runner)
-    backend = CodexBackend() if agent_name == "codex" else GeminiBackend()
+    if agent_name == "codex":
+        backend = CodexBackend()
+    elif agent_name == "antigravity":
+        backend = AntigravityBackend()
+    else:
+        backend = GeminiBackend()
 
     # Retry transient agent failures (429 / overloaded / timeout / capacity).
     # The primary failure path is a *returned* AgentResult with a non-zero

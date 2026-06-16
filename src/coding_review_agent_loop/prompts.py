@@ -105,6 +105,7 @@ def _coder_workdir_guidance(
         "claude": config.claude_args,
         "codex": config.codex_args,
         "gemini": config.gemini_args,
+        "antigravity": config.antigravity_args,
     }[active_agent]
     dangerous_warning = ""
     if any(arg in dangerous_args for arg in active_args):

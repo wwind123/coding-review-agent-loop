@@ -78,14 +78,20 @@ def build_parser() -> argparse.ArgumentParser:
             help="Gemini checkout. Defaults to a repo-scoped temporary checkout when Gemini is active.",
         )
         subparser.add_argument(
+            "--antigravity-dir",
+            type=Path,
+            default=None,
+            help="Antigravity (agy) checkout. Defaults to a repo-scoped temporary checkout when Antigravity is active.",
+        )
+        subparser.add_argument(
             "--coder",
-            choices=("claude", "codex", "gemini"),
+            choices=("claude", "codex", "gemini", "antigravity"),
             default="claude",
             help="Agent that creates and fixes the PR (default: claude).",
         )
         subparser.add_argument(
             "--reviewer",
-            choices=("claude", "codex", "gemini"),
+            choices=("claude", "codex", "gemini", "antigravity"),
             action="append",
             default=None,
             help=(
@@ -100,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--claude-cmd", default="claude")
         subparser.add_argument("--codex-cmd", default="codex")
         subparser.add_argument("--gemini-cmd", default="gemini")
+        subparser.add_argument("--antigravity-cmd", default="agy")
+        subparser.add_argument(
+            "--antigravity-model",
+            default="Gemini 3.1 Pro (High)",
+            help="Antigravity (agy) model, as shown by `agy models` (default: 'Gemini 3.1 Pro (High)').",
+        )
         subparser.add_argument("--gh-cmd", default="gh")
         subparser.add_argument(
             "--dangerous-agent-permissions",
@@ -107,8 +119,9 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "Use permission-bypass defaults for configured agents. Only use in trusted "
                 "local repositories: Claude gets --dangerously-skip-permissions and "
-                "Codex gets --dangerously-bypass-approvals-and-sandbox, and Gemini "
-                "gets --yolo and --skip-trust."
+                "Codex gets --dangerously-bypass-approvals-and-sandbox, Gemini "
+                "gets --yolo and --skip-trust, and Antigravity gets "
+                "--dangerously-skip-permissions."
             ),
         )
         subparser.add_argument(
@@ -136,6 +149,15 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "Extra argument passed to gemini (repeat for multiple). "
                 "Providing any --gemini-arg replaces the default entirely."
+            ),
+        )
+        subparser.add_argument(
+            "--antigravity-arg",
+            action="append",
+            default=None,
+            help=(
+                "Extra argument passed to agy (repeat for multiple). "
+                "Providing any --antigravity-arg replaces the default entirely."
             ),
         )
         subparser.add_argument(

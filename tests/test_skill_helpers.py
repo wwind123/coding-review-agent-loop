@@ -2710,3 +2710,71 @@ class TestRunReviewerUnavailable:
         assert output["state"] == "pending"
         assert output["pending_reviewers"] == ["Claude"]
         assert output["unavailable_reviewers"] == ["Gemini"]
+
+
+# ---------------------------------------------------------------------------
+# helpers — Antigravity (agy) agent in the skill (#215)
+# ---------------------------------------------------------------------------
+
+
+class TestAntigravitySkill:
+    def _last_json(self, stdout: str) -> dict:
+        start = stdout.rfind("\n{")
+        if start < 0:
+            start = stdout.find("{")
+        return json.loads(stdout[start:].strip())
+
+    def test_run_external_antigravity_dry_run_plan_review_stub(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.md"
+            result = _run(
+                "helpers.run_external",
+                "--agent", "antigravity", "--role", "reviewer", "--flow", "plan",
+                "--prompt-file", _write_tmp("review it"),
+                "--output", str(out), "--workdir", tmpdir,
+                "--dry-run",
+            )
+            assert result.returncode == 0
+            val = _run(
+                "helpers.validate_response", "--file", str(out), "--kind", "plan_review",
+                check=False,
+            )
+            assert val.returncode == 0, f"{out.read_text()}\n{val.stderr}"
+
+    def test_run_plan_round_antigravity_external_coder_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            result = _run(
+                "helpers.skill_runner", "run-plan-round",
+                "--issue", "9991", "--repo", "test/skill-repo",
+                "--coder", "antigravity", "--reviewers", "codex",
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0, result.stderr
+            output = self._last_json(result.stdout)
+            assert "state" in output
+            repair_dir = _REPAIR_BASE / "9991-r1-antigravity-coder"
+            manifest = json.loads((repair_dir / "manifest.json").read_text(encoding="utf-8"))
+            assert manifest["role"] == "coder"
+            assert manifest["agent"] == "antigravity"
+
+    def test_antigravity_reviewer_display_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            plan = tmppath / "plan.md"
+            plan.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            result = _run(
+                "helpers.skill_runner", "run-plan-round",
+                "--issue", "9990", "--repo", "test/skill-repo",
+                "--plan-file", str(plan), "--reviewers", "antigravity",
+                "--dry-run",
+                env=env,
+            )
+            assert result.returncode == 0, result.stderr
+            output = self._last_json(result.stdout)
+            assert "Antigravity" in output["approved_reviewers"]

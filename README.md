@@ -62,6 +62,26 @@ Currently supported local agent CLIs:
 - Claude Code via `claude`
 - OpenAI Codex CLI via `codex`
 - Gemini CLI via `gemini`
+- Antigravity CLI via `agy` (Gemini CLI migration path — see below)
+
+### Gemini CLI → Antigravity migration
+
+Google is retiring **Gemini CLI consumer access** (free / Google AI Pro / Ultra)
+on **June 18, 2026**; personal-account `gemini` usage stops working after that
+(enterprise / API-key Gemini CLI paths remain supported). Use the Antigravity CLI
+(`agy`) instead — it runs the same Google account plans with its own quota model:
+
+```bash
+# install agy, authenticate, then select it as a coder or reviewer:
+agent-loop pr 123 --repo OWNER/REPO --reviewer antigravity
+agent-loop task "Fix the flaky test" --repo OWNER/REPO --coder antigravity --reviewer codex
+```
+
+Pick the model with `--antigravity-model "<name>"` (as listed by `agy models`;
+default `Gemini 3.1 Pro (High)`). When a `gemini` invocation fails with an
+auth/quota error near or after the cutoff, the tool surfaces this migration
+guidance. Notes: Antigravity turns are single-shot (no cross-round session
+resume) and report estimated token usage (`agy` emits no token counts).
 
 ## Install / Use
 

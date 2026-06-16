@@ -60,6 +60,7 @@ def make_minimal_config(
         claude_dir=_agent_dir("claude"),
         codex_dir=_agent_dir("codex"),
         gemini_dir=_agent_dir("gemini"),
+        antigravity_dir=_agent_dir("antigravity"),
         coder=coder,
         reviewer=tuple(reviewer_names),
         base=base,

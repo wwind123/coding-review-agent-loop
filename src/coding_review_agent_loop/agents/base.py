@@ -14,7 +14,7 @@ from ..usage import UsageMetadata
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
 
-AgentName = Literal["claude", "codex", "gemini"]
+AgentName = Literal["claude", "codex", "gemini", "antigravity"]
 AgentTextSource = Literal["response_file", "stdout_marker", "stdout"]
 
 

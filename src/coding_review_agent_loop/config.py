@@ -59,6 +59,12 @@ class AgentLoopConfig:
     planning_context_mode: str = "compact"
     pr_review_context_mode: str = "full"
     auto_agent_dirs: tuple[AgentName, ...] = ()
+    # Antigravity (`agy`) backend (#215). Defaulted so existing AgentLoopConfig
+    # constructions keep working; real values are set when antigravity is used.
+    antigravity_dir: Path = Path("antigravity")
+    antigravity_cmd: str = "agy"
+    antigravity_args: tuple[str, ...] = ()
+    antigravity_model: str = "Gemini 3.1 Pro (High)"
 
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
@@ -81,6 +87,7 @@ def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
         "claude": (config.claude_dir, "--claude-dir"),
         "codex": (config.codex_dir, "--codex-dir"),
         "gemini": (config.gemini_dir, "--gemini-dir"),
+        "antigravity": (config.antigravity_dir, "--antigravity-dir"),
     }
     active = [(agent, *paths[agent]) for agent in required]
     for index, (_left_agent, left_path, left_option) in enumerate(active):
@@ -173,6 +180,7 @@ def _agent_dir_option(agent: AgentName) -> str:
         "claude": "--claude-dir",
         "codex": "--codex-dir",
         "gemini": "--gemini-dir",
+        "antigravity": "--antigravity-dir",
     }[agent]
 
 
@@ -422,6 +430,7 @@ def ensure_agent_workdirs(config: AgentLoopConfig, runner: Runner) -> None:
         "claude": (config.claude_dir, "--claude-dir"),
         "codex": (config.codex_dir, "--codex-dir"),
         "gemini": (config.gemini_dir, "--gemini-dir"),
+        "antigravity": (config.antigravity_dir, "--antigravity-dir"),
     }
     auto_dirs = set(config.auto_agent_dirs)
     for agent in required:
@@ -462,6 +471,7 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
             ("claude", args.claude_dir),
             ("codex", args.codex_dir),
             ("gemini", args.gemini_dir),
+            ("antigravity", args.antigravity_dir),
         )
         if value is None
     )
@@ -480,10 +490,16 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         if args.gemini_dir is not None
         else default_agent_workdir(repo, "gemini").resolve()
     )
+    antigravity_dir = (
+        args.antigravity_dir.resolve()
+        if args.antigravity_dir is not None
+        else default_agent_workdir(repo, "antigravity").resolve()
+    )
     primary_dir = {
         "claude": claude_dir,
         "codex": codex_dir,
         "gemini": gemini_dir,
+        "antigravity": antigravity_dir,
     }[args.coder]
     test_command = _split_command(args.test_command)
     if args.max_rounds <= 0:
@@ -529,6 +545,14 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
             if args.gemini_arg is not None
             else default_agent_args("gemini", dangerous=args.dangerous_agent_permissions)
         ),
+        antigravity_dir=antigravity_dir,
+        antigravity_cmd=args.antigravity_cmd,
+        antigravity_args=tuple(
+            args.antigravity_arg
+            if args.antigravity_arg is not None
+            else default_agent_args("antigravity", dangerous=args.dangerous_agent_permissions)
+        ),
+        antigravity_model=args.antigravity_model,
         test_command=test_command,
         pre_review_tests=args.pre_review_tests,
         ci_check_name=args.ci_check_name,

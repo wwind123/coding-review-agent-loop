@@ -54,7 +54,10 @@ This is one skill with three modes; pick the procedure from what you're given:
 
 All modes share the sub-procedures below, the same primitives, the same session/
 resume model, and the same posture: **merge is always a human decision.** For any
-mode, you need `OWNER/REPO` and the reviewer set (`codex`, `gemini`, or both).
+mode, you need `OWNER/REPO` and the reviewer set (`codex`, `gemini`, and/or
+`antigravity` — the `agy` CLI, the migration path for Gemini CLI consumer access
+that Google retires on 2026-06-18). `antigravity` works wherever an external
+coder/reviewer does (`--coder antigravity` / `--reviewers antigravity ...`).
 
 ---
 

@@ -16,6 +16,7 @@ def agent_workdir(config: AgentLoopConfig, agent: AgentName) -> Path:
         "claude": config.claude_dir,
         "codex": config.codex_dir,
         "gemini": config.gemini_dir,
+        "antigravity": config.antigravity_dir,
     }[agent]
 
 

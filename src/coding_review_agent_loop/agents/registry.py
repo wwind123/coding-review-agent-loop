@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .base import AgentBackend, AgentName, AgentResult
+from .antigravity import BACKEND as ANTIGRAVITY_BACKEND
 from .claude import BACKEND as CLAUDE_BACKEND
 from .codex import BACKEND as CODEX_BACKEND
 from .gemini import BACKEND as GEMINI_BACKEND
@@ -18,6 +19,7 @@ BACKENDS: dict[AgentName, AgentBackend] = {
     "claude": CLAUDE_BACKEND,
     "codex": CODEX_BACKEND,
     "gemini": GEMINI_BACKEND,
+    "antigravity": ANTIGRAVITY_BACKEND,
 }
 
 

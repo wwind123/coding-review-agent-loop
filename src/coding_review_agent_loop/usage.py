@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-AgentName = Literal["claude", "codex", "gemini"]
+AgentName = Literal["claude", "codex", "gemini", "antigravity"]
 UsageMode = Literal["exact", "partial", "estimated"]
 
 NUMERIC_USAGE_FIELDS = (

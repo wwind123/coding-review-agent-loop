@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,41 @@ from ..usage import UsageMetadata, coerce_int, first_present
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
+
+
+# Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on this
+# date; after it, personal-account Gemini CLI usage stops working and users should
+# migrate to Antigravity (`agy`) or a supported enterprise / API-key path (#215).
+GEMINI_CONSUMER_CUTOFF = date(2026, 6, 18)
+_GEMINI_CUTOFF_WARN_AHEAD_DAYS = 14
+
+_GEMINI_MIGRATION_GUIDANCE = (
+    "Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on "
+    "2026-06-18. If you are on a personal Google account, migrate to Antigravity "
+    "(`agy`): --coder antigravity / --reviewer antigravity (skill: --agent "
+    "antigravity). Gemini CLI remains supported for enterprise / API-key paths."
+)
+
+# Substrings (lowercased) in a *failed* gemini invocation's output that suggest an
+# auth/quota/retirement problem, where the migration guidance is relevant.
+_GEMINI_RETIREMENT_SIGNATURES = (
+    "unauthenticated",
+    "permission denied",
+    "permission_denied",
+    "quota",
+    "resource exhausted",
+    "resource_exhausted",
+    "not authorized",
+    "unauthorized",
+    "no longer",
+    "retir",
+)
+
+
+def _gemini_retirement_signal(text: str) -> bool:
+    """True if failed-gemini output looks like an auth/quota/retirement problem."""
+    lowered = text.lower()
+    return any(signature in lowered for signature in _GEMINI_RETIREMENT_SIGNATURES)
 
 
 def _with_public_response_marker_instruction(prompt: str) -> str:
@@ -169,6 +205,8 @@ class GeminiBackend:
         )
         log_path = agent_log_path(config, "gemini", run_id=run_id)
         log(config, f"Starting Gemini in {config.gemini_dir}; log: {log_path}; response: {response_path}")
+        if date.today() >= GEMINI_CONSUMER_CUTOFF - timedelta(days=_GEMINI_CUTOFF_WARN_AHEAD_DAYS):
+            log(config, f"Gemini CLI advisory: {_GEMINI_MIGRATION_GUIDANCE}")
         args = [
             config.gemini_cmd,
             "--prompt",
@@ -189,6 +227,12 @@ class GeminiBackend:
             env={"AGENT_LOOP_WORKDIR": str(config.gemini_dir.resolve())},
         )
         log(config, f"Gemini finished; log: {log_path}")
+        if result.returncode != 0 and _gemini_retirement_signal(result.stdout or ""):
+            log(
+                config,
+                "Gemini CLI invocation failed with an auth/quota signal that may be the "
+                f"consumer retirement. {_GEMINI_MIGRATION_GUIDANCE}",
+            )
         message_text, new_session_id, usage, raw_usage, message_source = _parse_gemini_payload(result.stdout)
         response_file_text = read_public_response_file(response_path)
         return AgentResult(
