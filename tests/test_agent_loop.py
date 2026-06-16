@@ -17788,6 +17788,29 @@ def test_gemini_failure_appends_migration_guidance(tmp_path, capsys, monkeypatch
     monkeypatch.setattr(gm, "date", _BeforeWindow)
     config = make_config(tmp_path, quiet=False)
     runner = FakeRunner(gemini_outputs=[{"stdout": "Error: quota exceeded", "returncode": 1}])
-    gm.BACKEND.run(runner, config, "Review", run_id="r")
+    result = gm.BACKEND.run(runner, config, "Review", run_id="r")
     err = capsys.readouterr().err
     assert "Antigravity" in err and "2026-06-18" in err
+    # The guidance must travel with the *returned* result (raw_output and text),
+    # since run_external classifies/persists failures from those, not stderr (#215).
+    assert "2026-06-18" in result.raw_output
+    assert "antigravity" in result.raw_output
+    assert result.raw_output.startswith("Error: quota exceeded")  # original error preserved
+    assert "2026-06-18" in result.text
+
+
+def test_gemini_success_does_not_append_migration_guidance(tmp_path, monkeypatch):
+    import coding_review_agent_loop.agents.gemini as gm
+    from datetime import date
+
+    class _BeforeWindow(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 1, 1)
+
+    monkeypatch.setattr(gm, "date", _BeforeWindow)
+    config = make_config(tmp_path)
+    runner = FakeRunner(gemini_outputs=[("STATE: approved\n\nLGTM", 0)])
+    result = gm.BACKEND.run(runner, config, "Review", run_id="r")
+    assert "2026-06-18" not in result.raw_output  # no guidance on a clean success
+    assert "2026-06-18" not in result.text

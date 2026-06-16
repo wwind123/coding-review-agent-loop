@@ -227,7 +227,8 @@ class GeminiBackend:
             env={"AGENT_LOOP_WORKDIR": str(config.gemini_dir.resolve())},
         )
         log(config, f"Gemini finished; log: {log_path}")
-        if result.returncode != 0 and _gemini_retirement_signal(result.stdout or ""):
+        retired_failure = result.returncode != 0 and _gemini_retirement_signal(result.stdout or "")
+        if retired_failure:
             log(
                 config,
                 "Gemini CLI invocation failed with an auth/quota signal that may be the "
@@ -235,9 +236,17 @@ class GeminiBackend:
             )
         message_text, new_session_id, usage, raw_usage, message_source = _parse_gemini_payload(result.stdout)
         response_file_text = read_public_response_file(response_path)
+        raw_output = result.stdout
+        if retired_failure:
+            # Append the guidance to the *returned* output, not just stderr: callers
+            # such as helpers.run_external classify/persist failures from
+            # raw_output/text, so the migration guidance must travel with them (#215).
+            guidance_block = f"\n\n{_GEMINI_MIGRATION_GUIDANCE}"
+            raw_output = (raw_output or "") + guidance_block
+            message_text = (message_text or "") + guidance_block
         return AgentResult(
             text=response_file_text or message_text,
-            raw_output=result.stdout,
+            raw_output=raw_output,
             text_source="response_file" if response_file_text is not None else message_source,
             response_file_text=response_file_text,
             message_text=message_text,
