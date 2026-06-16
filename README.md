@@ -65,7 +65,9 @@ Currently supported local agent CLIs:
 - Claude Code via `claude`
 - OpenAI Codex CLI via `codex`
 - Gemini CLI via `gemini`
-- Antigravity CLI via `agy` (Gemini CLI migration path — see below)
+- Antigravity CLI via `agy` (first-class backend; also the Gemini CLI migration path — see below)
+
+The `agy` backend is supported in every role the other external agents support — `--coder antigravity` and `--reviewer antigravity` — and in skill mode (`--coder antigravity` / `--reviewers antigravity`).
 
 ### Gemini CLI → Antigravity migration
 
