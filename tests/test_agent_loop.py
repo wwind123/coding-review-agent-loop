@@ -55,6 +55,12 @@ from coding_review_agent_loop.config import (
     default_agent_workdir,
     default_cache_root,
 )
+from coding_review_agent_loop.comment_rendering import (
+    _render_public_coder_followup_comment,
+    _render_public_plan_review_comment,
+    _render_public_plan_revision_comment,
+    _render_public_pr_review_comment,
+)
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
     MAX_DECOMPOSITION_PHASES,
@@ -91,10 +97,6 @@ from coding_review_agent_loop.orchestrator import (
     _encode_round_metadata,
     _format_unresolved_item_label,
     _plan_subject,
-    _render_public_coder_followup_comment,
-    _render_public_plan_review_comment,
-    _render_public_plan_revision_comment,
-    _render_public_pr_review_comment,
     _render_public_review_comment,
     _reconcile_human_requirements_ack_item,
     _review_freeform_summary_text,

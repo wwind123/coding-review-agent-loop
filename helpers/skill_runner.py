@@ -2868,7 +2868,6 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         validate_test_commands_within_workdir,
     )
     from helpers.prompt_builders import build_pr_fix_prompt_for_skill, make_minimal_config
-    from coding_review_agent_loop.comment_rendering import _render_public_coder_followup_comment
 
     config = dataclasses.replace(
         make_minimal_config(repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir),  # type: ignore[arg-type]
