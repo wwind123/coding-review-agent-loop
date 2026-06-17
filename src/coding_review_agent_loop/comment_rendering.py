@@ -68,12 +68,22 @@ def _public_reviewer_name(
     model_used: str | None = None,
 ) -> str:
     agent = _AGENT_BY_DISPLAY_NAME.get(name)
+    if agent is None and name in {"claude", "codex", "gemini", "antigravity"}:
+        agent = name  # type: ignore[assignment]
     if agent is None:
         return name
     # `model_used` is the producing agent's actual model (footers). Prior-item
     # attributions pass model_used=None and use the configured model (or the
     # generic signature when nothing is declared) — no cross-agent leakage.
     return agent_signature(agent, config, model_used)
+
+
+def _comment_signature(
+    agent: str,
+    config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
+) -> str:
+    return _public_reviewer_name(agent, config, model_used)
 
 
 def _format_unresolved_item_label(
@@ -375,9 +385,10 @@ def _render_public_plan_review_comment(
 def _render_public_coder_followup_comment(
     parsed_followup: StructuredCoderFollowup,
     *,
-    signature: str,
+    agent: str,
     prior_items: Sequence[UnresolvedReviewItem] = (),
     config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
 
@@ -430,7 +441,7 @@ def _render_public_coder_followup_comment(
             "\n".join(["### Tests run", *[f"- {test}" for test in parsed_followup.tests_run]])
         )
     sections.append(f"<!-- AGENT_STATE: {parsed_followup.state} -->")
-    sections.append(f"-- {signature}")
+    sections.append(f"-- {_comment_signature(agent, config, model_used)}")
     return "\n\n".join(section for section in sections if section)
 
 
@@ -454,13 +465,80 @@ def _render_public_plan_revision_comment(
     *,
     prior_items: Sequence[UnresolvedReviewItem],
     raw_text: str,
-    signature: str,
+    agent: str,
     config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
 ) -> str:
     sections = ["## Revised plan", render_canonical_plan_revision(parsed_revision, prior_items, config)]
     human_requirements_block = _extract_plan_revision_human_requirements_block(raw_text)
     if human_requirements_block:
         sections.append(human_requirements_block)
     sections.append(f"<!-- AGENT_PLAN_STATE: {parsed_revision.state} -->")
-    sections.append(f"-- {signature}")
+    sections.append(f"-- {_comment_signature(agent, config, model_used)}")
     return "\n\n".join(section for section in sections if section)
+
+
+def render_public_agent_comment(
+    *,
+    kind: str,
+    parsed: ParsedReview | ParsedPlanReview | StructuredCoderFollowup | StructuredPlanRevision,
+    agent: str,
+    config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
+    prior_items: Sequence[UnresolvedReviewItem] = (),
+    dispositions: Sequence[ReviewItemDisposition] = (),
+    raw_text: str = "",
+    human_requirements_resolved_flag: bool = False,
+) -> str:
+    """Render a parsed agent response and stamp the agent/model signature.
+
+    This is the single render-and-sign seam used by CLI and skill mode. Callers
+    resolve where the actual model came from, then pass it here; footer signing
+    stays owned by the renderer.
+    """
+    if kind == "pr_review":
+        if not isinstance(parsed, ParsedReview):
+            raise AgentLoopError("render_public_agent_comment expected ParsedReview.")
+        return _render_public_pr_review_comment(
+            parsed,
+            reviewer=agent,
+            human_requirements_resolved_flag=human_requirements_resolved_flag,
+            prior_items=prior_items,
+            dispositions=dispositions,
+            config=config,
+            model_used=model_used,
+        )
+    if kind == "plan_review":
+        if not isinstance(parsed, ParsedPlanReview):
+            raise AgentLoopError("render_public_agent_comment expected ParsedPlanReview.")
+        return _render_public_plan_review_comment(
+            parsed,
+            reviewer=agent,
+            prior_items=prior_items,
+            dispositions=dispositions,
+            human_requirements_resolved_flag=human_requirements_resolved_flag,
+            config=config,
+            model_used=model_used,
+        )
+    if kind == "coder_followup":
+        if not isinstance(parsed, StructuredCoderFollowup):
+            raise AgentLoopError("render_public_agent_comment expected StructuredCoderFollowup.")
+        return _render_public_coder_followup_comment(
+            parsed,
+            agent=agent,
+            prior_items=prior_items,
+            config=config,
+            model_used=model_used,
+        )
+    if kind == "plan_revision":
+        if not isinstance(parsed, StructuredPlanRevision):
+            raise AgentLoopError("render_public_agent_comment expected StructuredPlanRevision.")
+        return _render_public_plan_revision_comment(
+            parsed,
+            prior_items=prior_items,
+            raw_text=raw_text,
+            agent=agent,
+            config=config,
+            model_used=model_used,
+        )
+    raise AgentLoopError(f"Unknown render kind: {kind}")

@@ -22,11 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.comment_rendering import (
-    _public_reviewer_name,
-    _render_public_pr_review_comment,
-    _render_public_plan_review_comment,
-    _render_public_coder_followup_comment,
-    _render_public_plan_revision_comment,
+    render_public_agent_comment,
 )
 from coding_review_agent_loop.protocol import (
     parse_pr_review,
@@ -78,20 +74,20 @@ def main() -> None:
     try:
         if args.kind == "pr_review":
             parsed = parse_pr_review(text, reviewer=args.reviewer)
-            rendered = _render_public_pr_review_comment(
-                parsed,
-                reviewer=args.reviewer,
-                human_requirements_resolved_flag=False,
+            rendered = render_public_agent_comment(
+                kind="pr_review",
+                parsed=parsed,
+                agent=args.reviewer,
                 prior_items=prior_items,
                 dispositions=parsed.dispositions,
                 model_used=model_used,
             )
         elif args.kind == "plan_review":
             parsed = parse_plan_review(text, reviewer=args.reviewer)
-            rendered = _render_public_plan_review_comment(
-                parsed,
-                reviewer=args.reviewer,
-                human_requirements_resolved_flag=False,
+            rendered = render_public_agent_comment(
+                kind="plan_review",
+                parsed=parsed,
+                agent=args.reviewer,
                 prior_items=prior_items,
                 dispositions=parsed.dispositions,
                 model_used=model_used,
@@ -101,18 +97,25 @@ def main() -> None:
             if parsed is None:
                 print("render_response: coder_followup did not parse", file=sys.stderr)
                 sys.exit(1)
-            signature = _public_reviewer_name(args.reviewer, None, model_used)
-            rendered = _render_public_coder_followup_comment(
-                parsed, signature=signature, prior_items=prior_items
+            rendered = render_public_agent_comment(
+                kind="coder_followup",
+                parsed=parsed,
+                agent=args.reviewer,
+                prior_items=prior_items,
+                model_used=model_used,
             )
         elif args.kind == "plan_revision":
             parsed = validate_structured_plan_revision(text)
             if parsed is None:
                 print("render_response: plan_revision did not parse", file=sys.stderr)
                 sys.exit(1)
-            signature = _public_reviewer_name(args.reviewer, None, model_used)
-            rendered = _render_public_plan_revision_comment(
-                parsed, prior_items=prior_items, raw_text=text, signature=signature
+            rendered = render_public_agent_comment(
+                kind="plan_revision",
+                parsed=parsed,
+                agent=args.reviewer,
+                prior_items=prior_items,
+                raw_text=text,
+                model_used=model_used,
             )
         else:
             print(f"render_response: unknown kind {args.kind}", file=sys.stderr)

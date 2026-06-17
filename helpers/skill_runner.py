@@ -1392,11 +1392,7 @@ def _complete_coder_turn(
         canonical_text = raw_text
         public_file = raw_output
     else:
-        from coding_review_agent_loop.agents.registry import agent_signature
-        from coding_review_agent_loop.comment_rendering import (
-            _render_public_plan_revision_comment,
-            render_canonical_plan_revision,
-        )
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_revision
         from coding_review_agent_loop.protocol import validate_structured_plan_revision
 
         parsed = validate_structured_plan_revision(raw_text)
@@ -1411,14 +1407,18 @@ def _complete_coder_turn(
         # 3.1 Pro (High)" rather than the bare provider name.
         coder_model = _model_used_from_usage(usage_file)
         canonical_text = render_canonical_plan_revision(parsed, prior_items)
-        public_body = _render_public_plan_revision_comment(
-            parsed,
-            prior_items=prior_items,
-            raw_text=raw_text,
-            signature=agent_signature(coder, None, coder_model or None),  # type: ignore[arg-type]
-        )
         public_file = work_dir / "coder-public.md"
-        _write_text(public_file, public_body)
+        render_context_file = work_dir / "coder-render-context.json"
+        _write_json(render_context_file, {"prior_items": next_prior_items_raw})
+        _run_helper(
+            "helpers.render_response",
+            "--file", str(raw_output),
+            "--kind", "plan_revision",
+            "--reviewer", coder_cap,
+            "--context-file", str(render_context_file),
+            "--output", str(public_file),
+            *(["--model", coder_model] if coder_model else []),
+        )
         raw_structured_file = work_dir / "coder-raw-structured.json"
         _write_text(raw_structured_file, raw_text)
         raw_structured_args = ["--raw-structured-coder-response-file", str(raw_structured_file)]
@@ -2853,7 +2853,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         ), indent=2))
         return
 
-    from coding_review_agent_loop.agents.registry import agent_signature
+    from coding_review_agent_loop.comment_rendering import render_public_agent_comment
     from coding_review_agent_loop.github import get_issue_context, get_pr_review_context
     from coding_review_agent_loop.orchestrator import (
         _merge_human_requirements,
@@ -2956,11 +2956,13 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
                     parsed.tests_run,
                     assigned_workdir=Path(workdir),
                 )
-                public_comment = _render_public_coder_followup_comment(
-                    parsed,
-                    signature=agent_signature(coder, config, _model_used_from_usage(usage_file)),  # type: ignore[arg-type]
+                public_comment = render_public_agent_comment(
+                    kind="coder_followup",
+                    parsed=parsed,
+                    agent=coder,
                     prior_items=tuple(_deserialize_unresolved_item(item) for item in active_items_raw),
                     config=config,
+                    model_used=_model_used_from_usage(usage_file),
                 )
                 _write_text(rendered_output, public_comment)
                 raw_structured_arg = ["--raw-structured-coder-response-file", str(raw_output)]

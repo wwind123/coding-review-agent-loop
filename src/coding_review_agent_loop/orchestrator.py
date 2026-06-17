@@ -11,7 +11,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from .agents.base import AgentName, AgentResult
-from .agents.registry import agent_display_name, agent_signature, run_agent_result
+from .agents.registry import agent_display_name, run_agent_result
 from .config import (
     AgentLoopConfig,
     ensure_agent_workdirs,
@@ -133,6 +133,7 @@ from .comment_rendering import (
     _render_public_review_comment,
     _replace_structured_section,
     _review_freeform_summary_text,
+    render_public_agent_comment,
     render_canonical_plan_revision,
     render_canonical_plan_steps,
 )
@@ -1774,9 +1775,10 @@ def _run_plan_first_loop(
                     config=config,
                     issue_number=issue_number,
                     body=_attach_round_metadata(
-                        _render_public_plan_review_comment(
-                            parsed_review,
-                            reviewer=reviewer_name,
+                        render_public_agent_comment(
+                            kind="plan_review",
+                            parsed=parsed_review,
+                            agent=reviewer_name,
                             prior_items=prior_unresolved_items,
                             dispositions=parsed_review.dispositions,
                             human_requirements_resolved_flag=human_requirements_resolved(
@@ -2180,12 +2182,14 @@ def _run_plan_first_loop(
                 plan_response.marker_value, must_fix_items, config
             )
             current_plan = canonical_plan
-            public_comment = _render_public_plan_revision_comment(
-                plan_response.marker_value,
+            public_comment = render_public_agent_comment(
+                kind="plan_revision",
+                parsed=plan_response.marker_value,
+                agent=config.coder,
                 prior_items=must_fix_items,
                 raw_text=plan_response.text,
-                signature=agent_signature(config.coder, config, plan_response.model_used),
                 config=config,
+                model_used=plan_response.model_used,
             )
         else:
             current_plan = plan_response.text
@@ -2721,9 +2725,10 @@ def run_pr_loop(
                             config=config,
                             pr_number=pr_number,
                             body=_attach_round_metadata(
-                                _render_public_pr_review_comment(
-                                    parsed_review,
-                                    reviewer=reviewer_name,
+                                render_public_agent_comment(
+                                    kind="pr_review",
+                                    parsed=parsed_review,
+                                    agent=reviewer_name,
                                     human_requirements_resolved_flag=human_requirements_resolved(
                                         review_output
                                     ),
@@ -2768,9 +2773,10 @@ def run_pr_loop(
                         config=config,
                         pr_number=pr_number,
                         body=_attach_round_metadata(
-                            _render_public_pr_review_comment(
-                                parsed_review,
-                                reviewer=reviewer_name,
+                            render_public_agent_comment(
+                                kind="pr_review",
+                                parsed=parsed_review,
+                                agent=reviewer_name,
                                 human_requirements_resolved_flag=human_requirements_resolved(
                                     review_output
                                 ),
@@ -3082,11 +3088,13 @@ def run_pr_loop(
                     assigned_workdir=active_workdir(config),
                 )
                 raw_structured_coder_response = coder_output
-                public_comment = _render_public_coder_followup_comment(
-                    coder_response.marker_value,
-                    signature=agent_signature(config.coder, config, coder_response.model_used),
+                public_comment = render_public_agent_comment(
+                    kind="coder_followup",
+                    parsed=coder_response.marker_value,
+                    agent=config.coder,
                     prior_items=tuple(unresolved_items),
                     config=config,
+                    model_used=coder_response.model_used,
                 )
             else:
                 validate_response_tests_within_workdir(

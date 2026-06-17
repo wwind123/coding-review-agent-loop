@@ -105,6 +105,7 @@ from coding_review_agent_loop.orchestrator import (
     _validate_plan_revision_response,
     _validate_review_response,
     _validate_plan_review_response,
+    render_public_agent_comment,
     render_canonical_plan_revision,
     render_canonical_plan_steps,
 )
@@ -4800,7 +4801,7 @@ def test_render_canonical_plan_revision_and_public_comment():
         parsed,
         prior_items=prior_items,
         raw_text='{"schema_version":1}\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex',
-        signature="OpenAI Codex",
+        agent="Codex",
     )
 
     assert canonical == (
@@ -4865,7 +4866,7 @@ def test_render_public_coder_followup_comment():
 
     rendered = _render_public_coder_followup_comment(
         parsed,
-        signature="Anthropic Claude",
+        agent="Claude",
         prior_items=prior_items,
     )
 
@@ -4908,7 +4909,7 @@ def test_render_public_coder_followup_comment():
     assert without_tests is not None
     rendered_without_tests = _render_public_coder_followup_comment(
         without_tests,
-        signature="Anthropic Claude",
+        agent="Claude",
     )
     assert "### Tests run" not in rendered_without_tests
     assert "### Addressed items\n- None." in rendered_without_tests
@@ -4958,7 +4959,7 @@ def test_render_public_coder_followup_comment_expands_carried_items_with_notes_a
 
     rendered = _render_public_coder_followup_comment(
         parsed,
-        signature="Anthropic Claude",
+        agent="Claude",
         prior_items=prior_items,
     )
 
@@ -5022,7 +5023,7 @@ def test_render_public_coder_followup_comment_expands_pr_220_remaining_items():
 
     rendered = _render_public_coder_followup_comment(
         parsed,
-        signature="Anthropic Claude",
+        agent="Claude",
         prior_items=prior_items,
     )
 
@@ -10493,7 +10494,7 @@ def test_resume_pr_round_prefers_structured_coder_followup_metadata():
     )
     parsed = validate_structured_coder_followup(raw_structured_followup)
     assert parsed is not None
-    public_comment = _render_public_coder_followup_comment(parsed, signature="Anthropic Claude")
+    public_comment = _render_public_coder_followup_comment(parsed, agent="Claude")
     coder_comment = _attach_round_metadata(
         public_comment,
         PostedRoundMetadata(
@@ -18038,3 +18039,56 @@ def test_public_reviewer_name_config_aware_no_leakage(tmp_path):
     assert _public_reviewer_name("Claude", config) == "Anthropic Claude"
     assert _public_reviewer_name("Codex") == "OpenAI Codex"
     assert _public_reviewer_name("Somebody") == "Somebody"
+
+
+def test_render_public_agent_comment_stamps_model_for_every_kind():
+    model = "Gemini 3.1 Pro (High)"
+
+    pr_review = parse_pr_review(
+        structured_pr_review(state="approved", reviewer="Google Antigravity"),
+        reviewer="Google Antigravity",
+    )
+    plan_review = parse_plan_review(
+        structured_plan_review(state="approved", reviewer="Google Antigravity"),
+        reviewer="Google Antigravity",
+    )
+    coder_followup = validate_structured_coder_followup(
+        structured_coder_followup(state="approved", reviewer="Google Antigravity")
+    )
+    plan_revision = validate_structured_plan_revision(
+        structured_plan_revision(reviewer="Google Antigravity")
+    )
+    assert coder_followup is not None
+    assert plan_revision is not None
+
+    rendered = [
+        render_public_agent_comment(
+            kind="pr_review",
+            parsed=pr_review,
+            agent="Antigravity",
+            dispositions=pr_review.dispositions,
+            model_used=model,
+        ),
+        render_public_agent_comment(
+            kind="plan_review",
+            parsed=plan_review,
+            agent="Antigravity",
+            dispositions=plan_review.dispositions,
+            model_used=model,
+        ),
+        render_public_agent_comment(
+            kind="coder_followup",
+            parsed=coder_followup,
+            agent="antigravity",
+            model_used=model,
+        ),
+        render_public_agent_comment(
+            kind="plan_revision",
+            parsed=plan_revision,
+            agent="antigravity",
+            raw_text=structured_plan_revision(reviewer="Google Antigravity"),
+            model_used=model,
+        ),
+    ]
+
+    assert all(comment.endswith(f"-- Google Antigravity: {model}") for comment in rendered)
