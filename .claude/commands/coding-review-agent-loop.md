@@ -7,18 +7,18 @@ Parse the arguments to extract:
 - **flow** — `issue <N>` (maps to `--flow plan`) or `pr <N>` (maps to `--flow pr`)
 - **reviewers** — `--reviewers codex`, `gemini`, or both (default: gemini)
 - **plan-first** — present if the user passes `--plan-first` (only relevant for issue flow)
-- **coder** — `--coder claude` (default) or `--coder codex`
+- **coder** — `--coder claude` (default), `--coder codex`, `--coder gemini`, or
+  `--coder antigravity`
 
 If any required argument is missing, ask the user before proceeding.
 
 Then follow the orchestration steps in `SKILL.md` from Step 1.
 
-When `--coder codex` is parsed, follow the **Reversed roles** section of `SKILL.md`
-instead of the default Claude-as-coder flow: Codex handles Step 2 (plan writing)
-via `run_external --role coder`, and Claude performs Step 6 (review turn) directly
-in the session.  **Important**: pass `--reviewers claude` (not `codex`/`gemini`)
-in the `build-resume` Step 1 call so Claude's completed review is tracked correctly
-for resume.
+When an external `--coder` is parsed, follow the **Reversed roles** section of
+`SKILL.md` instead of the default Claude-as-coder flow. If an external-coder PR
+is blocked by `run-pr-round`, use `run-pr-fix --pr N --coder X --reviewers ...`
+with the same reviewer set and a push-capable PR-branch workdir, then re-run
+`run-pr-round` on the new head.
 
 Note: `task "<text>"` is not supported in skill mode. Direct the user to the
 headless CLI (`agent-loop task "..." --repo OWNER/REPO`) for task-based flows.

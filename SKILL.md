@@ -134,7 +134,8 @@ python -m helpers.skill_runner run-implement-by-phase \
 ```
 
 Live runs require a push-capable `--workdir` (or `--workdir-codex` /
-`--workdir-gemini`). The command decomposes the approved parent plan using an
+`--workdir-gemini` / `--workdir-antigravity`). The command decomposes the
+approved parent plan using an
 `implement-by-phase` decomposition marker, creates or reuses child phase issues,
 and then inspects phase 1:
 
@@ -166,8 +167,22 @@ phase that would be implemented.
    The result shape matches plan rounds, plus the optional `tests` and
    `approved_followups` fields (see **Gates & guardrails**).
 2. Decide:
-   - `"blocking"` → fix the code, push, post a change-summary comment (template
-     below), and re-run. A new head SHA starts a new round automatically.
+   - `"blocking"` with a host-owned PR → fix the code, push, post a
+     change-summary comment (template below), and re-run. A new head SHA starts
+     a new round automatically.
+   - `"blocking"` with an external-coder PR → have that coder address the
+     settled blocking review and push to the same PR branch:
+     ```bash
+     python -m helpers.skill_runner run-pr-fix \
+       --pr PR_NUMBER --repo OWNER/REPO \
+       --coder codex \
+       --reviewers claude gemini \
+       --workdir /path/to/push-capable/pr-clone
+     ```
+     The PR must be open, `--reviewers` must exactly match the reviewer set used
+     by the previous `run-pr-round`, and `--workdir` must be a clean,
+     push-capable clone where the PR head branch can be checked out by name.
+     Re-run `run-pr-round` after the coder follow-up posts.
    - `"approved"` → check the test gate, then **stop at "ready to merge — human
      decision."** The skill never merges.
 
@@ -370,6 +385,12 @@ python -m helpers.skill_runner run-implement \
   --workdir <push-capable-clone> [--base main]
 # → prints {"pr": N, ...}; then:
 python -m helpers.skill_runner run-pr-round --pr N --repo OWNER/REPO --reviewers claude gemini
+# If that review blocks, let the same external coder push fixes:
+python -m helpers.skill_runner run-pr-fix \
+  --pr N --repo OWNER/REPO --coder codex --reviewers claude gemini \
+  --workdir <push-capable-clone>
+# Then re-review the new head:
+python -m helpers.skill_runner run-pr-round --pr N --repo OWNER/REPO --reviewers claude gemini
 ```
 
 This is **side-effecting**: the coder commits, pushes a branch, and opens a real
@@ -378,8 +399,12 @@ CLI's implement path — a real PR marker, the signed-human-requirements
 acknowledgement, in-workdir test reports, an advanced checkout HEAD, and that the
 PR is open and references the issue — before a `role: coder` PR comment is posted.
 It is **idempotent per plan** (the one-shot handoff marker): re-running returns the
-existing PR instead of opening a duplicate. A response that fails validation is
-non-retryable — fix the cause and re-run. `--dry-run` does no pushes/PRs.
+existing PR instead of opening another one. For PR-review fixes, use
+`run-pr-fix`; it is gated on a complete, current-head blocking `run-pr-round`
+and posts a `role: coder` follow-up for the new PR head after validating that
+the PR head and assigned checkout HEAD advanced.
+A response that fails validation is non-retryable — fix the cause and re-run.
+`--dry-run` does no pushes/PRs.
 
 ### Decompose an approved plan into phase issues
 

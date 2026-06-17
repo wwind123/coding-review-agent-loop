@@ -121,11 +121,11 @@ on which agents you use.
 Besides the headless `agent-loop` CLI, the repo ships a **Claude Code skill** that
 runs the same review loop directly inside an interactive Claude Code session
 (host Claude turns use your session instead of `claude -p`). It supports the
-reversed roles end to end — an external agent (Codex/Gemini) can plan, implement
-(one-shot, decompose, or by-phase), and the host (Claude) can review — and
-degrades gracefully if a reviewer's CLI fails. See [`SKILL.md`](SKILL.md) for the
-step-by-step instructions and [`docs/skill_mode.md`](docs/skill_mode.md) for the
-design overview.
+reversed roles end to end: an external agent (Codex/Gemini/Antigravity) can
+plan, implement (one-shot, decompose, or by-phase), address blocking PR review
+with `run-pr-fix`, and hand the PR back for re-review; the host (Claude) can
+review. See [`SKILL.md`](SKILL.md) for the step-by-step instructions and
+[`docs/skill_mode.md`](docs/skill_mode.md) for the design overview.
 
 ## Develop This Tool
 

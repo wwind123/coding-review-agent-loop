@@ -13,6 +13,7 @@ which prompts you to read `SKILL.md` and start orchestration.
 - "Run the agent-loop skill for issue #123 in OWNER/REPO with gemini as reviewer"
 - "Start agent-loop plan-first for issue #42, reviewers: codex and gemini"
 - "Run agent-loop pr 99 in OWNER/REPO"
+- "Have codex fix the blocking review on PR #99 in OWNER/REPO"
 - "Resume the agent-loop skill for issue #123"
 
 In every case: read `SKILL.md`, gather the required inputs (repo, issue/PR

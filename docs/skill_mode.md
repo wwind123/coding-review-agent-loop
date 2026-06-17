@@ -64,10 +64,14 @@ mirroring the CLI's `--coder` / `--reviewer` reversal — so an external agent
   plan and PR rounds); re-running the round then recomputes the final state.
 - **Implement, reversed**: after a plan is approved, an external coder implements
   it and opens a PR — see [Approved-plan execution helpers](#approved-plan-execution-helpers)
-  — which the host then reviews with `run-pr-round`.
+  — which the host then reviews with `run-pr-round`. If that review blocks,
+  `run-pr-fix --coder X --reviewers ... --workdir <push-capable clone>` sends the
+  same external coder back to the open PR branch, posts a coder follow-up for the
+  new head, and hands the PR back to `run-pr-round`.
 
-End to end: external coder plans → reviewers review → external coder implements
-(one-shot / decompose / by-phase) → host + external reviewers review the PR.
+End to end: external coder plans -> reviewers review -> external coder implements
+(one-shot / decompose / by-phase) -> host + external reviewers review the PR ->
+external coder fixes blocking PR review with `run-pr-fix` -> reviewers re-review.
 Merge stays a human decision.
 
 The external agent can be `codex`, `gemini`, or `antigravity` (the `agy` CLI —
@@ -88,6 +92,10 @@ has already been approved:
   `decompose-only`.
 - `run-implement-by-phase` decomposes with mode `implement-by-phase`, then
   implements phase 1 only when that phase is `agent-pr`.
+- `run-pr-fix` addresses a settled blocking PR review for an externally opened
+  PR. The target PR must be `OPEN`; `--reviewers` must exactly match the reviewer
+  set used by the prior `run-pr-round`; and `--workdir` must be a clean,
+  push-capable clone where the PR head branch can be checked out and pushed.
 
 Example:
 

@@ -321,6 +321,17 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             print(f"state_manager: cannot read raw coder response file: {exc}", file=sys.stderr)
             sys.exit(1)
 
+    compact_prior_summaries: tuple[str, ...] = ()
+    if getattr(args, "compact_prior_summaries_file", None):
+        try:
+            raw_compact = json.loads(Path(args.compact_prior_summaries_file).read_text(encoding="utf-8"))
+            if not isinstance(raw_compact, list):
+                raise ValueError("expected a JSON array")
+            compact_prior_summaries = tuple(str(summary) for summary in raw_compact)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"state_manager: cannot read compact prior summaries file: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     metadata = PostedRoundMetadata(
         flow=args.flow,
         role=args.role,
@@ -334,6 +345,7 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         canonical_plan=canonical_plan,
         usage=usage,
         raw_structured_coder_response=raw_structured_coder_response,
+        compact_prior_summaries=compact_prior_summaries,
     )
     augmented = _attach_round_metadata(body, metadata)
 
@@ -409,6 +421,8 @@ def main() -> None:
     p_meta.add_argument("--raw-structured-coder-response-file", default=None,
                         help="Raw structured coder response (plan_revision JSON) to persist in "
                              "AGENT_LOOP_META for reversed-roles revision rounds (#307).")
+    p_meta.add_argument("--compact-prior-summaries-file", default=None,
+                        help="JSON array of compact prior summaries to persist in AGENT_LOOP_META.")
     p_meta.add_argument("--canonical-plan-file", default=None,
                         help="Plan text file (written as canonical_plan for coder turns).")
 

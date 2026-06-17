@@ -19,14 +19,21 @@ from coding_review_agent_loop.config import AgentLoopConfig
 from coding_review_agent_loop.github import IssueContext, IssueComment
 from coding_review_agent_loop.memory import AgentMemoryContext
 from coding_review_agent_loop.prompts import (
+    build_followup_prompt,
     build_issue_implementation_prompt,
     build_issue_plan_prompt,
     build_plan_decomposition_prompt,
     build_plan_review_prompt,
     build_plan_revision_prompt,
     build_review_prompt,
+    build_same_pr_followup_prompt,
+    render_coder_human_requirements_prompt_context,
 )
 from coding_review_agent_loop.round_state import _deserialize_unresolved_item
+from coding_review_agent_loop.unresolved_items import (
+    _format_same_pr_unresolved_items,
+    _format_unresolved_items_for_coder,
+)
 
 
 def make_minimal_config(
@@ -214,6 +221,53 @@ def build_review_prompt_for_skill(
     if pr_diff:
         prompt += f"\n\n## PR diff\n\n```diff\n{pr_diff}\n```\n"
     return prompt
+
+
+def build_pr_fix_prompt_for_skill(
+    pr_number: int,
+    active_items_raw: list[dict],
+    review_round_number: int,
+    *,
+    repo: str,
+    coder: AgentName,
+    reviewers: Sequence[AgentName],
+    workdir: str,
+    issue_context: IssueContext | None = None,
+    human_requirements: Sequence | None = None,
+    same_pr_only: bool = False,
+    memory: AgentMemoryContext | None = None,
+) -> str:
+    """Build the external-coder PR-fix prompt from skill-mode ledger items."""
+    config = make_minimal_config(
+        repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
+    )
+    unresolved = [_deserialize_unresolved_item(item) for item in active_items_raw]
+    human_requirements_context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+    )
+    if same_pr_only:
+        review_text = _format_same_pr_unresolved_items(unresolved)
+        return build_same_pr_followup_prompt(
+            pr_number,
+            review_round_number,
+            review_text,
+            config,
+            memory,
+            issue_context=issue_context,
+            human_requirements=human_requirements,
+            human_requirements_context=human_requirements_context,
+        )
+    review_text = _format_unresolved_items_for_coder(unresolved)
+    return build_followup_prompt(
+        pr_number,
+        review_round_number,
+        review_text,
+        config,
+        memory,
+        issue_context=issue_context,
+        human_requirements=human_requirements,
+        human_requirements_context=human_requirements_context,
+    )
 
 
 def build_plan_prompt_for_skill(

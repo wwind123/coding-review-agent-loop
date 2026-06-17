@@ -363,6 +363,38 @@ class TestStateManager:
             _plan_text, resumed = result
             assert resumed.round_number == 1
 
+    def test_attach_metadata_persists_compact_prior_summaries(self) -> None:
+        body = _VALID_PLAN_STATE
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            body_file = Path(tmpdir) / "body.md"
+            body_file.write_text(body, encoding="utf-8")
+            compact_file = Path(tmpdir) / "compact.json"
+            compact_file.write_text(json.dumps(["summary one", "summary two"]), encoding="utf-8")
+            output_file = Path(tmpdir) / "tagged.md"
+
+            _run(
+                "helpers.state_manager",
+                "attach-metadata",
+                "--body-file", str(body_file),
+                "--output", str(output_file),
+                "--flow", "pr", "--role", "coder", "--agent", "Codex",
+                "--round-number", "2", "--state", "blocking",
+                "--subject", "abc123",
+                "--compact-prior-summaries-file", str(compact_file),
+            )
+
+            from coding_review_agent_loop.round_state import (
+                ROUND_RESUME_MARKER_RE,
+                _decode_round_metadata,
+            )
+
+            tagged = output_file.read_text(encoding="utf-8")
+            match = ROUND_RESUME_MARKER_RE.search(tagged)
+            assert match is not None
+            metadata = _decode_round_metadata(match.group("payload"))
+            assert metadata.compact_prior_summaries == ("summary one", "summary two")
+
     def test_attach_metadata_reviewer_found_by_resume(self) -> None:
         """Coder + reviewer comments both with AGENT_LOOP_META → resume finds completed reviewer."""
         plan_body = _VALID_PLAN_STATE
@@ -2081,6 +2113,202 @@ class TestValidateCoderImplementationResponse:
             _validate_coder_implementation_response(
                 bad, workdir="/tmp/wd", human_requirements=(),
             )
+
+
+# ---------------------------------------------------------------------------
+# helpers/skill_runner.py — reverse implementation: run-pr-fix (#338)
+# ---------------------------------------------------------------------------
+
+def _pr_fix_item(status: str = "blocking") -> dict:
+    return {
+        "item_id": "item-1",
+        "reviewer": "Codex",
+        "source_round": 1,
+        "text": "Fix the broken behavior.",
+        "status": status,
+        "source_status": status,
+        "notes": [],
+    }
+
+
+def _pr_fix_resume(*, state: str = "blocking", reviewer_names: list[str] | None = None) -> dict:
+    names = ["Codex"] if reviewer_names is None else reviewer_names
+    return {
+        "round_number": 1,
+        "completed_round_number": 1,
+        "current_plan_subject": "head-old",
+        "prior_items": [],
+        "compact_prior_summaries": ["old summary"],
+        "completed_reviewer_names": names,
+        "completed_reviewer_data": [
+            {
+                "reviewer_name": names[0],
+                "state": state,
+                "dispositions": [],
+                "new_items": [_pr_fix_item()],
+            }
+        ] if names else [],
+    }
+
+
+def _structured_pr_fix_output() -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "coder_followup",
+            "state": "blocking",
+            "summary": "Fixed the blocking item.",
+            "addressed_items": ["item-1"],
+            "remaining_items": [],
+            "addressed_item_notes": {"item-1": "Implemented the requested fix."},
+            "remaining_item_notes": {},
+            "tests_run": ["python3 -m pytest tests/test_skill_helpers.py -k run_pr_fix"],
+            "human_requirements": {
+                "addressed_ids": ["Requirement 1"],
+                "checked_discussion_directly": True,
+            },
+        }
+    ) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
+
+
+class TestRunPrFix:
+    def test_settled_gate_requires_current_subject_complete_blocking_review(self) -> None:
+        from helpers.skill_runner import _pr_fix_gate
+
+        assert _pr_fix_gate(_pr_fix_resume(), ["codex"], "head-old") == (True, "")
+        allowed, reason = _pr_fix_gate(_pr_fix_resume(state="approved"), ["codex"], "head-old")
+        assert not allowed and "no blocking" in reason
+        allowed, reason = _pr_fix_gate(_pr_fix_resume(reviewer_names=[]), ["codex"], "head-old")
+        assert not allowed and "reviewer set" in reason
+        allowed, reason = _pr_fix_gate(_pr_fix_resume(), ["codex"], "head-new")
+        assert not allowed and "run-pr-round" in reason
+
+    def test_empty_reviewer_data_noops_even_with_carried_prior_items(self) -> None:
+        from helpers.skill_runner import _pr_fix_gate
+
+        resume = _pr_fix_resume(reviewer_names=["Codex"])
+        resume["completed_reviewer_data"] = []
+        resume["prior_items"] = [_pr_fix_item()]
+        allowed, reason = _pr_fix_gate(resume, ["codex"], "head-old")
+        assert not allowed
+        assert "reviewer data is unavailable" in reason
+
+    def test_closed_pr_noops_before_resume_or_workdir(self, monkeypatch, capsys) -> None:
+        import helpers.skill_runner as sr
+
+        monkeypatch.setattr(sr, "_fetch_pr_json", lambda repo, pr: {
+            "number": pr, "state": "CLOSED", "headRefOid": "head-old",
+        })
+        monkeypatch.setattr(sr, "_build_resume", lambda *a, **k: pytest.fail("resume should not run"))
+        monkeypatch.setattr(sr, "_position_pr_fix_workdir", lambda *a, **k: pytest.fail("workdir should not mutate"))
+
+        args = types.SimpleNamespace(
+            pr=7, repo="o/r", coder="codex", reviewers=["codex"],
+            workdir="/tmp/wd", workdir_codex=None, dry_run=False,
+        )
+        sr.cmd_run_pr_fix(args)
+        output = json.loads(capsys.readouterr().out)
+        assert output["state"] == "noop"
+        assert output["current_pr_state"] == "CLOSED"
+
+    def test_success_posts_metadata_after_head_and_assigned_head_advance(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.github import (
+            IssueContext,
+            PullRequestMetadata,
+            PullRequestReviewContext,
+        )
+
+        pr_infos = iter([
+            {
+                "number": 7,
+                "state": "OPEN",
+                "headRefOid": "head-old",
+                "headRefName": "feature/pr",
+                "body": "Fixes #338",
+            },
+            {
+                "number": 7,
+                "state": "OPEN",
+                "headRefOid": "head-new",
+                "headRefName": "feature/pr",
+                "body": "Fixes #338",
+            },
+        ])
+        helper_calls: list[tuple[str, ...]] = []
+
+        def fake_run_helper(*args: str, check: bool = True):
+            helper_calls.append(args)
+            if args[:1] == ("helpers.run_external",):
+                out = Path(args[args.index("--output") + 1])
+                out.write_text(_structured_pr_fix_output(), encoding="utf-8")
+                usage = Path(args[args.index("--usage-output") + 1])
+                usage.write_text(json.dumps({"agent": "codex", "returncode": 0}), encoding="utf-8")
+            elif args[:2] == ("helpers.state_manager", "attach-metadata"):
+                body = Path(args[args.index("--body-file") + 1]).read_text(encoding="utf-8")
+                out = Path(args[args.index("--output") + 1])
+                out.write_text(body + "\n<!-- AGENT_LOOP_META: test -->\n", encoding="utf-8")
+                assert "--raw-structured-coder-response-file" in args
+                assert "--compact-prior-summaries-file" in args
+            elif args[:2] == ("helpers.gh_ops", "post-issue-comment"):
+                posted = Path(args[args.index("--file") + 1]).read_text(encoding="utf-8")
+                assert "AGENT_LOOP_META" in posted
+            return subprocess.CompletedProcess(args, 0)
+
+        monkeypatch.setattr(sr, "_fetch_pr_json", lambda repo, pr: next(pr_infos))
+        monkeypatch.setattr(sr, "_build_resume", lambda *a, **k: _pr_fix_resume())
+        monkeypatch.setattr(sr, "_reconcile_pending_comment", lambda *a, **k: None)
+        monkeypatch.setattr(sr, "_position_pr_fix_workdir", lambda **kwargs: None)
+        monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
+
+        seen = {"count": 0}
+        def fake_git_head(workdir: str) -> str:
+            seen["count"] += 1
+            return "head-old" if seen["count"] == 1 else "head-new"
+        monkeypatch.setattr(sr, "_git_head", fake_git_head)
+
+        import coding_review_agent_loop.github as gh
+        monkeypatch.setattr(gh, "get_issue_context", lambda runner, config, issue_number: IssueContext(
+            number=issue_number,
+            repo="o/r",
+            title="Issue",
+            body="Body",
+            url=None,
+            comments=(),
+            human_requirements=(_human_req(),),
+        ))
+        monkeypatch.setattr(gh, "get_pr_review_context", lambda runner, config, pr_number: PullRequestReviewContext(
+            metadata=PullRequestMetadata(
+                number=pr_number,
+                repo="o/r",
+                title="PR",
+                head_branch="feature/pr",
+                base_branch="main",
+                head_sha="head-old",
+                url=None,
+            ),
+            comments=(),
+            human_requirements=(),
+        ))
+
+        args = types.SimpleNamespace(
+            pr=7,
+            repo="o/r",
+            coder="codex",
+            reviewers=["codex"],
+            workdir=str(tmp_path),
+            workdir_codex=None,
+            dry_run=False,
+        )
+        sr.cmd_run_pr_fix(args)
+        output = json.loads(capsys.readouterr().out)
+        assert output["state"] == "blocking"
+        assert output["previous_head_sha"] == "head-old"
+        assert output["head_sha"] == "head-new"
+        assert output["addressed_item_count"] == 1
+        assert any(call[:2] == ("helpers.gh_ops", "post-issue-comment") for call in helper_calls)
 
     def test_missing_pr_marker_rejected(self) -> None:
         from coding_review_agent_loop.errors import AgentLoopError

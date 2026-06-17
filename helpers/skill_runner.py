@@ -17,6 +17,18 @@ Subcommands:
     [--workdir PATH] [--workdir-codex PATH] [--workdir-gemini PATH]
     [--dry-run]
 
+  run-pr-fix
+    --pr N --repo OWNER/REPO
+    --coder {codex,gemini,antigravity}
+    --reviewers REVIEWER [REVIEWER ...]
+    --workdir PATH
+    [--dry-run]
+
+    Reversed roles: after an external coder's PR receives a settled blocking
+    skill-mode review, have the same external coder address the blocking items,
+    commit, and push to the existing PR branch. Requires an open PR and a
+    push-capable explicit workdir.
+
   retry-validate
     --repair-dir PATH
     [--dry-run]
@@ -603,13 +615,28 @@ def _fetch_issue_json(repo: str, issue: int, gh_cmd: str = "gh") -> dict:
 def _fetch_pr_json(repo: str, pr: int, gh_cmd: str = "gh") -> dict:
     result = subprocess.run(
         [gh_cmd, "pr", "view", str(pr), "--repo", repo,
-         "--json", "number,title,body,url,headRefOid"],
+         "--json", "number,title,body,url,headRefOid,headRefName,baseRefName,state"],
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
         print(f"skill_runner: gh pr view failed: {result.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
     return json.loads(result.stdout)
+
+
+_ISSUE_REFERENCE_RE = re.compile(r"(?:^|\s)(?:#|https://github\.com/[^/\s]+/[^/\s]+/issues/)(\d+)\b")
+
+
+def _linked_issue_number_from_pr(pr_info: dict) -> int | None:
+    body = str(pr_info.get("body") or "")
+    match = _ISSUE_REFERENCE_RE.search(body)
+    return int(match.group(1)) if match else None
+
+
+def _noop_pr_fix_result(pr: int, reason: str, **fields: object) -> dict:
+    result = {"state": "noop", "pr": pr, "reason": reason}
+    result.update(fields)
+    return result
 
 
 def _fetch_pr_diff(repo: str, pr: int, gh_cmd: str = "gh") -> str:
@@ -2439,6 +2466,93 @@ def _implementation_config(
     )
 
 
+def _pr_fix_gate(resume: dict, reviewers: list[str], current_head: str) -> tuple[bool, str]:
+    expected = {agent_display_name(r) for r in reviewers}  # type: ignore[arg-type]
+    completed_names = [str(name) for name in resume.get("completed_reviewer_names", [])]
+    completed = set(completed_names)
+    completed_data = list(resume.get("completed_reviewer_data", []))
+    subject = str(resume.get("current_plan_subject") or "")
+    if subject != current_head:
+        return False, "current PR head has not been reviewed; run run-pr-round first"
+    if len(completed_names) != len(reviewers) or completed != expected:
+        return False, "review round is incomplete or reviewer set does not match --reviewers"
+    if not completed_data:
+        return False, "reviewer data is unavailable for the current head; wait for run-pr-round/re-review"
+    if not any(record.get("state") == "blocking" for record in completed_data):
+        return False, "current head has no blocking review; no coder fix is needed"
+    return True, ""
+
+
+def _active_pr_fix_items(resume: dict) -> list[dict]:
+    items = _compute_next_prior_items(
+        list(resume.get("prior_items", [])),
+        list(resume.get("completed_reviewer_data", [])),
+        same_status="same-pr",
+        retain_future=True,
+    )
+    return [item for item in items if item.get("status") in {"blocking", "same-pr"}]
+
+
+def _run_git_capture(workdir: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", workdir, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _position_pr_fix_workdir(
+    *,
+    repo: str,
+    coder: str,
+    workdir: str,
+    branch: str,
+    head_sha: str,
+    dry_run: bool,
+) -> None:
+    from coding_review_agent_loop.config import validate_explicit_workdir
+    from helpers.prompt_builders import make_minimal_config
+
+    config = dataclasses.replace(
+        make_minimal_config(repo, coder, (coder,), reviewer=coder, workdir=workdir),  # type: ignore[arg-type]
+        dry_run=dry_run,
+        auto_agent_dirs=(),
+    )
+    runner = Runner(dry_run=dry_run)
+    path = Path(workdir)
+    if dry_run:
+        print(f"[dry-run] would validate {path} and check out PR branch {branch}")
+        return
+    if not branch:
+        raise AgentLoopError("PR head branch is unavailable; cannot position coder workdir.")
+    if not path.is_dir():
+        raise AgentLoopError(f"--workdir does not exist or is not a directory: {path}")
+    validate_explicit_workdir(path, "--workdir", config, runner)
+
+    def run(*git_args: str) -> subprocess.CompletedProcess[str]:
+        result = _run_git_capture(workdir, *git_args)
+        if result.returncode != 0:
+            raise AgentLoopError(
+                f"git {' '.join(git_args)} failed in {workdir}: {result.stderr.strip()}"
+            )
+        return result
+
+    run("fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    local_exists = _run_git_capture(workdir, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
+    if local_exists:
+        run("checkout", branch)
+        run("merge", "--ff-only", f"origin/{branch}")
+    else:
+        run("checkout", "-b", branch, "--track", f"origin/{branch}")
+    local_head = run("rev-parse", "HEAD").stdout.strip()
+    if head_sha and local_head != head_sha:
+        raise AgentLoopError(
+            f"--workdir HEAD is {local_head}, but PR head is {head_sha}; "
+            "refusing to run coder on a mispointed checkout."
+        )
+
+
 def _run_child_or_one_shot_implementation(
     *,
     issue: int,
@@ -2679,6 +2793,259 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         f"run-pr-round --pr {result_json['pr']} --repo {repo} --reviewers claude gemini",
         file=sys.stderr,
     )
+
+
+# ---------------------------------------------------------------------------
+# run-pr-fix  (external coder addresses a settled blocking PR review) (#338)
+# ---------------------------------------------------------------------------
+
+def cmd_run_pr_fix(args: argparse.Namespace) -> None:
+    pr: int = args.pr
+    repo: str = args.repo
+    coder: str = args.coder
+    reviewers: list[str] = args.reviewers
+    dry_run: bool = args.dry_run
+
+    explicit_workdir = getattr(args, f"workdir_{coder}", None) or getattr(args, "workdir", None)
+    if not dry_run and not explicit_workdir:
+        print(
+            "skill_runner: run-pr-fix requires an explicit push-capable --workdir "
+            "(or --workdir-codex/--workdir-gemini/--workdir-antigravity) checked "
+            "out from the PR's repo.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    workdir = _workdir_for_agent(coder, args)
+
+    pr_info = _fetch_pr_json(repo, pr)
+    pr_state = str(pr_info.get("state") or "")
+    if pr_state != "OPEN":
+        print(json.dumps(_noop_pr_fix_result(
+            pr,
+            "PR is not open",
+            current_pr_state=pr_state or "unknown",
+        ), indent=2))
+        return
+
+    current_head = str(pr_info.get("headRefOid") or "")
+    pr_branch = str(pr_info.get("headRefName") or "")
+    resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=current_head, pr=pr)
+    _reconcile_pending_comment(resume, pr, repo, dry_run)
+    resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=current_head, pr=pr)
+
+    allowed, reason = _pr_fix_gate(resume, reviewers, current_head)
+    if not allowed:
+        print(json.dumps(_noop_pr_fix_result(
+            pr,
+            reason,
+            head_sha=current_head,
+            current_pr_state=pr_state,
+        ), indent=2))
+        return
+
+    active_items_raw = _active_pr_fix_items(resume)
+    if not active_items_raw:
+        print(json.dumps(_noop_pr_fix_result(
+            pr,
+            "settled blocking review has no active blocking or same-PR items",
+            head_sha=current_head,
+            current_pr_state=pr_state,
+        ), indent=2))
+        return
+
+    from coding_review_agent_loop.agents.registry import agent_signature
+    from coding_review_agent_loop.github import get_issue_context, get_pr_review_context
+    from coding_review_agent_loop.orchestrator import (
+        _merge_human_requirements,
+        _reconcile_human_requirements_ack_item,
+        _validate_coder_followup_response,
+    )
+    from coding_review_agent_loop.protocol import StructuredCoderFollowup
+    from coding_review_agent_loop.round_state import _serialize_unresolved_item
+    from coding_review_agent_loop.workdir_guard import (
+        validate_assigned_head_advanced,
+        validate_response_tests_within_workdir,
+        validate_test_commands_within_workdir,
+    )
+    from helpers.prompt_builders import build_pr_fix_prompt_for_skill, make_minimal_config
+    from coding_review_agent_loop.comment_rendering import _render_public_coder_followup_comment
+
+    config = dataclasses.replace(
+        make_minimal_config(repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir),  # type: ignore[arg-type]
+        dry_run=dry_run,
+        auto_agent_dirs=(),
+    )
+    runner = Runner(dry_run=dry_run)
+    linked_issue = _linked_issue_number_from_pr(pr_info)
+    issue_context = (
+        get_issue_context(runner, config=config, issue_number=linked_issue)
+        if linked_issue is not None and not dry_run
+        else None
+    )
+    pr_context = get_pr_review_context(runner, config=config, pr_number=pr)
+    human_requirements = _merge_human_requirements(issue_context, pr_context)
+
+    same_pr_only = all(item.get("status") == "same-pr" for item in active_items_raw)
+    review_round_number = int(resume.get("round_number") or resume.get("completed_round_number") or 1)
+    prompt_text = build_pr_fix_prompt_for_skill(
+        pr,
+        active_items_raw,
+        review_round_number,
+        repo=repo,
+        coder=coder,  # type: ignore[arg-type]
+        reviewers=reviewers,  # type: ignore[arg-type]
+        workdir=workdir,
+        issue_context=issue_context,
+        human_requirements=human_requirements,
+        same_pr_only=same_pr_only,
+    )
+
+    if not dry_run:
+        _position_pr_fix_workdir(
+            repo=repo,
+            coder=coder,
+            workdir=workdir,
+            branch=pr_branch,
+            head_sha=current_head,
+            dry_run=False,
+        )
+    else:
+        _position_pr_fix_workdir(
+            repo=repo,
+            coder=coder,
+            workdir=workdir,
+            branch=pr_branch or "dry-run-branch",
+            head_sha=current_head,
+            dry_run=True,
+        )
+    assigned_head_before = _git_head(workdir)
+
+    with tempfile.TemporaryDirectory() as tmpstr:
+        tmpdir = Path(tmpstr)
+        prompt_file = tmpdir / "pr-fix-prompt.md"
+        raw_output = tmpdir / "pr-fix-raw.md"
+        rendered_output = tmpdir / "pr-fix-rendered.md"
+        tagged_output = tmpdir / "pr-fix-tagged.md"
+        prior_items_file = tmpdir / "pr-fix-prior-items.json"
+        compact_prior_file = tmpdir / "pr-fix-compact-prior.json"
+        usage_file = tmpdir / "pr-fix-usage.json"
+        _write_text(prompt_file, prompt_text)
+
+        _run_helper(
+            "helpers.run_external",
+            "--agent", coder,
+            "--role", "coder",
+            "--prompt-file", str(prompt_file),
+            "--output", str(raw_output),
+            "--workdir", workdir,
+            "--flow", "pr",
+            "--usage-output", str(usage_file),
+            *(["--dry-run"] if dry_run else []),
+        )
+        coder_output = raw_output.read_text(encoding="utf-8")
+        if re.search(r"<!--\s*AGENT_PR\s*:", coder_output):
+            raise AgentLoopError("run-pr-fix response attempted to open/report a new PR.")
+        try:
+            parsed = _validate_coder_followup_response(
+                coder_output,
+                unresolved_items=tuple(_deserialize_unresolved_item(item) for item in active_items_raw),
+                human_requirements=human_requirements,
+            )
+            if isinstance(parsed, StructuredCoderFollowup):
+                validate_test_commands_within_workdir(
+                    parsed.tests_run,
+                    assigned_workdir=Path(workdir),
+                )
+                public_comment = _render_public_coder_followup_comment(
+                    parsed,
+                    signature=agent_signature(coder, config, _model_used_from_usage(usage_file)),  # type: ignore[arg-type]
+                    prior_items=tuple(_deserialize_unresolved_item(item) for item in active_items_raw),
+                    config=config,
+                )
+                _write_text(rendered_output, public_comment)
+                raw_structured_arg = ["--raw-structured-coder-response-file", str(raw_output)]
+            else:
+                validate_response_tests_within_workdir(coder_output, assigned_workdir=Path(workdir))
+                _write_text(rendered_output, coder_output)
+                raw_structured_arg = []
+        except AgentLoopError as exc:
+            debug_dir = _REPAIR_BASE / f"{pr}-pr-fix-debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(raw_output, debug_dir / "raw.md")
+            shutil.copy2(prompt_file, debug_dir / "prompt.md")
+            print(f"skill_runner: PR-fix response rejected: {exc}", file=sys.stderr)
+            print(f"skill_runner: raw response saved to {debug_dir}/raw.md", file=sys.stderr)
+            sys.exit(1)
+
+        after_info = _fetch_pr_json(repo, pr)
+        new_head = str(after_info.get("headRefOid") or "")
+        assigned_head_after = _git_head(workdir)
+        if not dry_run:
+            if str(after_info.get("state") or "") != "OPEN":
+                raise AgentLoopError(f"PR #{pr} is no longer open after coder run.")
+            if str(after_info.get("headRefName") or "") != pr_branch:
+                raise AgentLoopError("PR head branch changed during run-pr-fix; refusing to post.")
+            if not new_head or new_head == current_head:
+                raise AgentLoopError("Coder did not push a new PR head SHA; refusing to post follow-up.")
+            validate_assigned_head_advanced(
+                before_head=assigned_head_before,
+                after_head=assigned_head_after,
+                assigned_workdir=Path(workdir),
+            )
+        else:
+            new_head = new_head or "dry-run-new-head"
+
+        reconciled_items = _reconcile_human_requirements_ack_item(
+            tuple(_deserialize_unresolved_item(item) for item in active_items_raw),
+            coder_output=coder_output,
+            human_requirements=human_requirements,
+            source_round=review_round_number,
+        )
+        _write_json(prior_items_file, [_serialize_unresolved_item(item) for item in reconciled_items])
+        _write_json(compact_prior_file, list(resume.get("compact_prior_summaries", [])))
+
+        _run_helper(
+            "helpers.state_manager", "attach-metadata",
+            "--body-file", str(rendered_output),
+            "--output", str(tagged_output),
+            "--flow", "pr",
+            "--role", "coder",
+            "--agent", agent_display_name(coder),  # type: ignore[arg-type]
+            "--round-number", str(review_round_number + 1),
+            "--subject", str(new_head),
+            "--state", "blocking",
+            "--prior-items-file", str(prior_items_file),
+            "--usage-file", str(usage_file),
+            "--compact-prior-summaries-file", str(compact_prior_file),
+            *raw_structured_arg,
+        )
+        if not dry_run:
+            _run_helper(
+                "helpers.gh_ops", "post-issue-comment",
+                "--issue", str(pr), "--file", str(tagged_output), "--repo", repo,
+            )
+        else:
+            print(f"[dry-run] would post coder follow-up for PR #{pr}")
+
+        coder_usage: dict | None = None
+        if usage_file.exists():
+            try:
+                coder_usage = json.loads(usage_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                coder_usage = None
+
+    result_json: dict = {
+        "state": "blocking",
+        "pr": pr,
+        "previous_head_sha": current_head,
+        "head_sha": new_head,
+        "addressed_item_count": len(getattr(parsed, "addressed_items", ()) or ()),
+        "remaining_item_count": len(getattr(parsed, "remaining_items", ()) or ()),
+    }
+    usage = _aggregate_reviewer_usage([{"usage": coder_usage}] if coder_usage else [])
+    if usage is not None:
+        result_json["usage"] = usage
+    print(json.dumps(result_json, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -3256,6 +3623,31 @@ def main() -> None:
     p_impl.add_argument("--workdir-gemini", default=None)
     p_impl.add_argument("--dry-run", action="store_true")
 
+    # run-pr-fix
+    p_pr_fix = subparsers.add_parser(
+        "run-pr-fix",
+        help="Reversed roles: an external coder addresses a settled blocking PR "
+             "review and pushes fixes to the existing PR branch (#338).",
+    )
+    p_pr_fix.add_argument("--pr", type=int, required=True)
+    p_pr_fix.add_argument("--repo", required=True)
+    p_pr_fix.add_argument(
+        "--coder", choices=["codex", "gemini", "antigravity"], required=True,
+        help="External coder that fixes the existing PR.",
+    )
+    p_pr_fix.add_argument(
+        "--reviewers", nargs="+", required=True,
+        help="Reviewer set used by the preceding run-pr-round; must match exactly.",
+    )
+    p_pr_fix.add_argument(
+        "--workdir", default=None,
+        help="Explicit push-capable clone for the PR branch (required for a real run).",
+    )
+    p_pr_fix.add_argument("--workdir-codex", default=None)
+    p_pr_fix.add_argument("--workdir-gemini", default=None)
+    p_pr_fix.add_argument("--workdir-antigravity", default=None)
+    p_pr_fix.add_argument("--dry-run", action="store_true")
+
     # run-implement-by-phase
     p_impl_phase = subparsers.add_parser(
         "run-implement-by-phase",
@@ -3336,6 +3728,7 @@ def main() -> None:
         "retry-validate": cmd_retry_validate,
         "complete-host-review": cmd_complete_host_review,
         "run-implement": cmd_run_implement,
+        "run-pr-fix": cmd_run_pr_fix,
         "run-implement-by-phase": cmd_run_implement_by_phase,
         "run-decompose": cmd_run_decompose,
         "run-task-round": cmd_run_task_round,
