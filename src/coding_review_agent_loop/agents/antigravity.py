@@ -128,6 +128,10 @@ class AntigravityBackend:
             returncode=result.returncode,
             usage=None,
             raw_usage=None,
+            # The model we requested is the model that ran (single-shot, no
+            # server-side substitution); the signature stamps it (#332). #333's
+            # fallback chain will override this with the model that answered.
+            model_used=config.antigravity_model or None,
         )
 
 

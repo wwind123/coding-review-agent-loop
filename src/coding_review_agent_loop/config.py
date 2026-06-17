@@ -65,10 +65,18 @@ class AgentLoopConfig:
     antigravity_cmd: str = "agy"
     antigravity_args: tuple[str, ...] = ()
     antigravity_model: str = "Gemini 3.1 Pro (High)"
+    # Declared model / reasoning effort for the dynamic signature (#332). Empty
+    # means "not declared" (the agent runs its own default and the signature
+    # falls back to the generic provider name). antigravity always has a model.
+    codex_model: str = ""
+    codex_reasoning_effort: str = ""
+    gemini_model: str = ""
+    claude_model: str = ""
 
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
             object.__setattr__(self, "reviewer", (self.reviewer,))
+        ensure_no_model_arg_conflicts(self)
         if self.planning_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--planning-context-mode must be either 'full' or 'compact'.")
         if self.pr_review_context_mode not in {"full", "compact"}:
@@ -97,6 +105,48 @@ def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
                     f"{left_option} and {right_option} point to the same directory. "
                     "Use separate clones/worktrees, or pass --allow-shared-dir explicitly."
                 )
+
+
+def _args_have_model_flag(args: tuple[str, ...]) -> bool:
+    return any(a == "--model" or a.startswith("--model=") for a in args)
+
+
+def _args_have_reasoning_effort(args: tuple[str, ...]) -> bool:
+    return any("model_reasoning_effort" in a for a in args)
+
+
+def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
+    """Reject declaring a model/effort both via the dedicated flag and a freeform arg.
+
+    The dynamic signature (#332) must match the model that actually ran. Passing a
+    model/effort both as a declared value and as a freeform `--*-arg` would emit
+    duplicate CLI flags (tool/version-dependent precedence) and risk a signature
+    that disagrees with the run, so we fail fast with a clear message. Note
+    ``antigravity_model`` is always declared, so any ``--antigravity-arg --model``
+    is always a conflict.
+    """
+    if _args_have_model_flag(config.antigravity_args):
+        raise AgentLoopError(
+            "--antigravity-arg --model conflicts with the always-declared antigravity "
+            "model; set the model via --antigravity-model only."
+        )
+    if config.codex_model and _args_have_model_flag(config.codex_args):
+        raise AgentLoopError(
+            "--codex-arg --model conflicts with --codex-model; use --codex-model only."
+        )
+    if config.codex_reasoning_effort and _args_have_reasoning_effort(config.codex_args):
+        raise AgentLoopError(
+            "--codex-arg model_reasoning_effort conflicts with --codex-reasoning-effort; "
+            "use --codex-reasoning-effort only."
+        )
+    if config.gemini_model and _args_have_model_flag(config.gemini_args):
+        raise AgentLoopError(
+            "--gemini-arg --model conflicts with --gemini-model; use --gemini-model only."
+        )
+    if config.claude_model and _args_have_model_flag(config.claude_args):
+        raise AgentLoopError(
+            "--claude-arg --model conflicts with --claude-model; use --claude-model only."
+        )
 
 
 def default_agent_workdir(repo: str, agent: AgentName) -> Path:
@@ -553,6 +603,10 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
             else default_agent_args("antigravity", dangerous=args.dangerous_agent_permissions)
         ),
         antigravity_model=args.antigravity_model,
+        codex_model=getattr(args, "codex_model", ""),
+        codex_reasoning_effort=getattr(args, "codex_reasoning_effort", ""),
+        gemini_model=getattr(args, "gemini_model", ""),
+        claude_model=getattr(args, "claude_model", ""),
         test_command=test_command,
         pre_review_tests=args.pre_review_tests,
         ci_check_name=args.ci_check_name,

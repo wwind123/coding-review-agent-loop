@@ -776,7 +776,7 @@ def build_issue_prompt(
     issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     human_requirements_context = _issue_human_requirements_prompt_context(
         issue_context,
         requirement_scope="implementation requirements",
@@ -819,7 +819,7 @@ def build_issue_plan_prompt(
     issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     human_requirements_context = _issue_human_requirements_prompt_context(
         issue_context,
         requirement_scope="planning requirements",
@@ -888,7 +888,7 @@ def build_plan_review_prompt(
             compact_tail=compact_tail,
         )
     coder_name = agent_display_name(config.coder)
-    reviewer_signature = agent_signature(reviewer)
+    reviewer_signature = agent_signature(reviewer, config)
     reviewer_group = format_agent_list(reviewers(config))
     unresolved_items_block = _format_unresolved_plan_items(unresolved_items)
     human_requirements_block = _issue_human_requirements_block(
@@ -1007,7 +1007,7 @@ def _build_compact_plan_review_prompt(
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_name = agent_display_name(reviewer)
-    reviewer_signature = agent_signature(reviewer)
+    reviewer_signature = agent_signature(reviewer, config)
     reviewer_group = format_agent_list(reviewers(config))
     human_requirements_block = _issue_human_requirements_block(
         issue_context,
@@ -1094,7 +1094,7 @@ def build_plan_decomposition_prompt(
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
 ) -> str:
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     human_requirements_block = _issue_human_requirements_block(
         issue_context,
         requirement_scope="decomposition requirements",
@@ -1184,7 +1184,7 @@ def build_plan_revision_prompt(
             compact_tail=compact_tail,
         )
     reviewer_name = format_agent_list(reviewers(config))
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     unresolved_items_block = _format_unresolved_plan_items(unresolved_items)
     human_requirements_context = _issue_human_requirements_prompt_context(
         issue_context,
@@ -1282,7 +1282,7 @@ def _build_compact_plan_revision_prompt(
     compact_tail: CompactPlanTailContext | None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     human_requirements_context = _issue_human_requirements_prompt_context(
         issue_context,
         requirement_scope="planning requirements",
@@ -1347,7 +1347,7 @@ def build_issue_implementation_prompt(
     issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     human_requirements_context = _issue_human_requirements_prompt_context(
         issue_context,
         requirement_scope="implementation requirements",
@@ -1394,7 +1394,7 @@ def build_task_prompt(
     memory: AgentMemoryContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     return f"""You have been given a free-form task to implement in {config.repo}.
 
 Task:
@@ -1433,7 +1433,7 @@ def build_task_clarification_prompt(
     config: AgentLoopConfig,
     memory: AgentMemoryContext | None = None,
 ) -> str:
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     qa_blocks = "\n\n".join(
         f"Round {idx + 1} questions from you:\n{questions}\n\n"
         f"Round {idx + 1} answers from the user:\n{answers}"
@@ -1649,7 +1649,7 @@ def _build_compact_pr_review_prompt(
     compact_tail: CompactPrReviewTailContext | None,
 ) -> str:
     reviewer_name = agent_display_name(reviewer)
-    reviewer_signature = agent_signature(reviewer)
+    reviewer_signature = agent_signature(reviewer, config)
     checks_block = f"{format_pr_checks(pr_checks)}\n" if pr_checks is not None else ""
     human_requirements_guidance = _human_requirements_review_guidance(human_requirements)
     non_future_items = [item for item in unresolved_items if item.status != "future"]
@@ -1819,7 +1819,7 @@ def build_review_prompt(
     compact_coder_tests_run: Sequence[str] | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
-    reviewer_signature = agent_signature(reviewer)
+    reviewer_signature = agent_signature(reviewer, config)
     reviewer_group = format_agent_list(reviewers(config))
     metadata = pr_metadata or PullRequestMetadata(
         number=pr_number,
@@ -2066,7 +2066,7 @@ def build_followup_prompt(
     human_requirements_context: CoderHumanRequirementsPromptContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     if human_requirements_context is None:
         human_requirements_context = render_coder_human_requirements_prompt_context(human_requirements)
     return f"""{reviewer_name} reviewed pull request #{pr_number} in {config.repo} and found blocking issues.
@@ -2111,7 +2111,7 @@ def build_same_pr_followup_prompt(
     human_requirements_context: CoderHumanRequirementsPromptContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
-    coder_signature = agent_signature(config.coder)
+    coder_signature = agent_signature(config.coder, config)
     if human_requirements_context is None:
         human_requirements_context = render_coder_human_requirements_prompt_context(human_requirements)
     return f"""{reviewer_name} requested same-PR follow-ups on pull request #{pr_number} in {config.repo}.

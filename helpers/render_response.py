@@ -57,7 +57,13 @@ def main() -> None:
     parser.add_argument("--output", required=True, help="Path to write rendered markdown.")
     parser.add_argument("--reviewer", default="Codex", help="Reviewer display name.")
     parser.add_argument("--context-file", default=None, help="Optional JSON context file.")
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Model the agent actually ran, stamped into the signature (#332).",
+    )
     args = parser.parse_args()
+    model_used = args.model or None
 
     try:
         text = Path(args.file).read_text(encoding="utf-8")
@@ -77,6 +83,7 @@ def main() -> None:
                 human_requirements_resolved_flag=False,
                 prior_items=prior_items,
                 dispositions=parsed.dispositions,
+                model_used=model_used,
             )
         elif args.kind == "plan_review":
             parsed = parse_plan_review(text, reviewer=args.reviewer)
@@ -86,6 +93,7 @@ def main() -> None:
                 human_requirements_resolved_flag=False,
                 prior_items=prior_items,
                 dispositions=parsed.dispositions,
+                model_used=model_used,
             )
         elif args.kind == "coder_followup":
             parsed = validate_structured_coder_followup(text)

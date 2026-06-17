@@ -34,8 +34,45 @@ def agent_display_name(agent: AgentName) -> str:
     return get_backend(agent).display_name
 
 
-def agent_signature(agent: AgentName) -> str:
-    return get_backend(agent).signature
+def _configured_model_label(agent: AgentName, config: AgentLoopConfig | None) -> str | None:
+    """The model label declared in config for `agent`, or None if not declared.
+
+    Codex appends its reasoning effort; antigravity's model string already embeds
+    effort (e.g. "Gemini 3.1 Pro (High)"), so it is used verbatim.
+    """
+    if config is None:
+        return None
+    if agent == "antigravity":
+        return config.antigravity_model or None
+    if agent == "codex":
+        model = config.codex_model
+        if not model:
+            return None
+        effort = config.codex_reasoning_effort
+        return f"{model} ({effort})" if effort else model
+    if agent == "gemini":
+        return config.gemini_model or None
+    if agent == "claude":
+        return config.claude_model or None
+    return None
+
+
+def agent_signature(
+    agent: AgentName,
+    config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
+) -> str:
+    """Build the `-- {signature}` label for `agent`.
+
+    Precedence: the model that actually ran (`model_used`, ground truth) > the
+    model declared in config > the generic provider signature. When no model is
+    known, returns the generic signature unchanged so existing output is stable.
+    """
+    base = get_backend(agent).signature
+    label = model_used or _configured_model_label(agent, config)
+    if not label:
+        return base
+    return f"{base}: {label}"
 
 
 def default_agent_args(agent: AgentName, *, dangerous: bool) -> tuple[str, ...]:

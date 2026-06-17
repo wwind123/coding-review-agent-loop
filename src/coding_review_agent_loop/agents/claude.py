@@ -44,8 +44,21 @@ def _normalize_claude_usage(payload: object) -> UsageMetadata | None:
     )
 
 
-def _parse_claude_output(raw: str) -> tuple[str, str | None, UsageMetadata | None, object | None]:
-    """Extract (text, session_id) from Claude's --output-format json response."""
+def _extract_claude_model(data: dict) -> str | None:
+    """Model id Claude reported running (`model`, else a `modelUsage` key)."""
+    model = data.get("model")
+    if isinstance(model, str) and model:
+        return model
+    model_usage = data.get("modelUsage")
+    if isinstance(model_usage, dict) and model_usage:
+        return next(iter(model_usage))
+    return None
+
+
+def _parse_claude_output(
+    raw: str,
+) -> tuple[str, str | None, UsageMetadata | None, object | None, str | None]:
+    """Extract (text, session_id, usage, raw_usage, model) from Claude json output."""
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
@@ -55,10 +68,16 @@ def _parse_claude_output(raw: str) -> tuple[str, str | None, UsageMetadata | Non
             raw_usage = data.get("usage")
             if raw_usage is None and isinstance(data.get("result_message"), dict):
                 raw_usage = data["result_message"].get("usage")
-            return text, data.get("session_id"), _normalize_claude_usage(raw_usage), raw_usage
+            return (
+                text,
+                data.get("session_id"),
+                _normalize_claude_usage(raw_usage),
+                raw_usage,
+                _extract_claude_model(data),
+            )
     except (json.JSONDecodeError, ValueError):
         pass
-    return raw, None, None, None
+    return raw, None, None, None, None
 
 
 class ClaudeBackend:
@@ -82,6 +101,10 @@ class ClaudeBackend:
     ) -> AgentResult:
         response_path = public_response_path(config, "claude")
         args = [config.claude_cmd, "--print", "--output-format", "json", *config.claude_args]
+        # Pin the model when declared (#332); conflict validation guarantees this is
+        # not also passed via --claude-arg --model.
+        if config.claude_model:
+            args += ["--model", config.claude_model]
         if session_id:
             args += ["--resume", session_id]
         args.append(with_public_response_file_instruction(prompt, response_path))
@@ -97,7 +120,7 @@ class ClaudeBackend:
             env={"AGENT_LOOP_WORKDIR": str(config.claude_dir.resolve())},
         )
         log(config, f"Claude finished; log: {log_path}")
-        message_text, new_session_id, usage, raw_usage = _parse_claude_output(result.stdout)
+        message_text, new_session_id, usage, raw_usage, model_detected = _parse_claude_output(result.stdout)
         response_file_text = read_public_response_file(response_path)
         return AgentResult(
             text=response_file_text or message_text,
@@ -110,6 +133,9 @@ class ClaudeBackend:
             returncode=result.returncode,
             usage=usage,
             raw_usage=raw_usage,
+            # Ground truth from Claude's own output; falls back to config.claude_model
+            # at signature time when detection is unavailable (e.g. non-JSON output).
+            model_used=model_detected,
         )
 
 

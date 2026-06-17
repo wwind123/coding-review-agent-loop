@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from .errors import AgentLoopError
 from .agents.registry import agent_display_name, agent_signature
@@ -25,9 +26,15 @@ from .protocol import (
 )
 from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID
 
+if TYPE_CHECKING:
+    from .config import AgentLoopConfig
+
 ITEM_SUMMARY_LIMIT = 100
-PUBLIC_REVIEWER_NAME_BY_DISPLAY = {
-    agent_display_name(agent): agent_signature(agent)
+# Reverse map display-name -> agent. agent_display_name is config-independent, so
+# this is safe to build at import; the signature itself is resolved per-call via
+# agent_signature(agent, config) so it can reflect the configured model (#332).
+_AGENT_BY_DISPLAY_NAME = {
+    agent_display_name(agent): agent
     for agent in ("claude", "codex", "gemini", "antigravity")
 }
 
@@ -55,11 +62,23 @@ def _item_label_status(item: UnresolvedReviewItem) -> str:
     return item.source_status or item.status
 
 
-def _public_reviewer_name(name: str) -> str:
-    return PUBLIC_REVIEWER_NAME_BY_DISPLAY.get(name, name)
+def _public_reviewer_name(
+    name: str,
+    config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
+) -> str:
+    agent = _AGENT_BY_DISPLAY_NAME.get(name)
+    if agent is None:
+        return name
+    # `model_used` is the producing agent's actual model (footers). Prior-item
+    # attributions pass model_used=None and use the configured model (or the
+    # generic signature when nothing is declared) — no cross-agent leakage.
+    return agent_signature(agent, config, model_used)
 
 
-def _format_unresolved_item_label(item: UnresolvedReviewItem) -> str:
+def _format_unresolved_item_label(
+    item: UnresolvedReviewItem, config: AgentLoopConfig | None = None
+) -> str:
     summary = _normalize_item_summary(item.text)
     status = _item_label_status(item)
     if item.item_id == HUMAN_REQUIREMENTS_ACK_ITEM_ID:
@@ -71,7 +90,7 @@ def _format_unresolved_item_label(item: UnresolvedReviewItem) -> str:
         "future": "Future follow-up",
     }
     phrase = phrases.get(status, "Unresolved item")
-    reviewer_name = _public_reviewer_name(item.reviewer)
+    reviewer_name = _public_reviewer_name(item.reviewer, config)
     return f"{phrase} from {reviewer_name}, round {item.source_round}: {summary}"
 
 
@@ -94,6 +113,7 @@ def _render_prior_dispositions_section(
     heading: str,
     prior_items: Sequence[UnresolvedReviewItem],
     dispositions: Sequence[ReviewItemDisposition],
+    config: AgentLoopConfig | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
     lines = [heading]
@@ -105,7 +125,7 @@ def _render_prior_dispositions_section(
                 f"allowed IDs: {sorted(item_by_id)}"
             )
         lines.append(
-            f"- [{disposition.item_id}] {_format_unresolved_item_label(item)}"
+            f"- [{disposition.item_id}] {_format_unresolved_item_label(item, config)}"
             f" -> {_render_disposition_status(disposition)}"
         )
     return "\n".join(lines)
@@ -176,6 +196,7 @@ def render_canonical_plan_steps(plan_steps: Sequence[str]) -> str:
 def render_canonical_plan_revision(
     parsed_revision: StructuredPlanRevision,
     prior_items: Sequence[UnresolvedReviewItem],
+    config: AgentLoopConfig | None = None,
 ) -> str:
     sections = [parsed_revision.summary.strip()]
     if prior_items or parsed_revision.prior_plan_item_dispositions:
@@ -184,6 +205,7 @@ def render_canonical_plan_revision(
                 heading="### Prior plan item dispositions",
                 prior_items=prior_items,
                 dispositions=parsed_revision.prior_plan_item_dispositions,
+                config=config,
             )
         )
     else:
@@ -206,6 +228,7 @@ def _render_public_review_comment(
     prior_items: Sequence[UnresolvedReviewItem],
     dispositions: Sequence[ReviewItemDisposition],
     new_items: Sequence[UnresolvedReviewItem],
+    config: AgentLoopConfig | None = None,
 ) -> str:
     rendered = body
     if prior_items:
@@ -221,6 +244,7 @@ def _render_public_review_comment(
                 heading=heading,
                 prior_items=prior_items,
                 dispositions=dispositions,
+                config=config,
             ),
         )
     return rendered
@@ -233,6 +257,8 @@ def _render_public_pr_review_comment(
     human_requirements_resolved_flag: bool,
     prior_items: Sequence[UnresolvedReviewItem],
     dispositions: Sequence[ReviewItemDisposition],
+    config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
 ) -> str:
     sections: list[str] = [f"**Review verdict:** {parsed_review.state.title()}"]
     if parsed_review.summary and parsed_review.summary.strip() != "Review complete.":
@@ -270,13 +296,14 @@ def _render_public_pr_review_comment(
                 heading="### Prior unresolved item dispositions",
                 prior_items=prior_items,
                 dispositions=dispositions,
+                config=config,
             )
         )
     footer: list[str] = []
     if human_requirements_resolved_flag:
         footer.append("<!-- HUMAN_REQUIREMENTS_RESOLVED -->")
     footer.append(f"<!-- AGENT_STATE: {parsed_review.state} -->")
-    footer.append(f"-- {_public_reviewer_name(reviewer)}")
+    footer.append(f"-- {_public_reviewer_name(reviewer, config, model_used)}")
     return "\n\n".join(section for section in sections if section) + (
         ("\n\n" if sections else "") + "\n".join(footer)
     )
@@ -289,6 +316,8 @@ def _render_public_plan_review_comment(
     prior_items: Sequence[UnresolvedReviewItem],
     dispositions: Sequence[ReviewItemDisposition],
     human_requirements_resolved_flag: bool = False,
+    config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
 ) -> str:
     sections: list[str] = [f"**Review verdict:** {parsed_review.state.title()}"]
     if parsed_review.summary and parsed_review.summary.strip() != "Plan review complete.":
@@ -326,6 +355,7 @@ def _render_public_plan_review_comment(
                 heading="### Prior unresolved plan item dispositions",
                 prior_items=prior_items,
                 dispositions=dispositions,
+                config=config,
             )
         )
     footer: list[str] = []
@@ -334,7 +364,7 @@ def _render_public_plan_review_comment(
     footer.extend(
         [
             f"<!-- AGENT_PLAN_STATE: {parsed_review.state} -->",
-            f"-- {_public_reviewer_name(reviewer)}",
+            f"-- {_public_reviewer_name(reviewer, config, model_used)}",
         ]
     )
     return "\n\n".join(section for section in sections if section) + (
@@ -347,6 +377,7 @@ def _render_public_coder_followup_comment(
     *,
     signature: str,
     prior_items: Sequence[UnresolvedReviewItem] = (),
+    config: AgentLoopConfig | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
 
@@ -355,7 +386,7 @@ def _render_public_coder_followup_comment(
         if item is None:
             lines = [f"- {item_id}: Item context unavailable in current round metadata."]
         else:
-            lines = [f"- {item_id}: {_format_unresolved_item_label(item)}"]
+            lines = [f"- {item_id}: {_format_unresolved_item_label(item, config)}"]
         if note:
             lines.append(f"  - {note_label}: {note}")
         elif placeholder:
@@ -424,8 +455,9 @@ def _render_public_plan_revision_comment(
     prior_items: Sequence[UnresolvedReviewItem],
     raw_text: str,
     signature: str,
+    config: AgentLoopConfig | None = None,
 ) -> str:
-    sections = ["## Revised plan", render_canonical_plan_revision(parsed_revision, prior_items)]
+    sections = ["## Revised plan", render_canonical_plan_revision(parsed_revision, prior_items, config)]
     human_requirements_block = _extract_plan_revision_human_requirements_block(raw_text)
     if human_requirements_block:
         sections.append(human_requirements_block)

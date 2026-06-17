@@ -814,6 +814,15 @@ def _complete_reviewer_turn(
         )
 
     # --- Render ---
+    # The model the reviewer actually ran is in run_external's usage sidecar (#332);
+    # pass it so the rendered signature reads e.g. "Google Antigravity: Gemini 3.1 Pro (High)".
+    reviewer_model = ""
+    _usage_path = work_dir / f"{agent}-usage.json"
+    if _usage_path.exists():
+        try:
+            reviewer_model = json.loads(_usage_path.read_text(encoding="utf-8")).get("model_used") or ""
+        except (OSError, json.JSONDecodeError):
+            reviewer_model = ""
     _run_helper(
         "helpers.render_response",
         "--file", str(raw_output),
@@ -821,6 +830,7 @@ def _complete_reviewer_turn(
         "--reviewer", agent_cap,
         "--context-file", str(context_file),
         "--output", str(rendered_output),
+        *(["--model", reviewer_model] if reviewer_model else []),
     )
 
     # --- Parse review JSON for metadata ---

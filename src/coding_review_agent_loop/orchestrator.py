@@ -118,7 +118,6 @@ from .checks import (
 )
 from .comment_rendering import (
     ITEM_SUMMARY_LIMIT,
-    PUBLIC_REVIEWER_NAME_BY_DISPLAY,
     _append_before_trailing_metadata,
     _format_unresolved_item_label,
     _extract_plan_revision_human_requirements_block,
@@ -293,6 +292,9 @@ class ValidatedAgentResponse:
     session_id: str | None
     marker_value: object
     usage: UsageMetadata | None = None
+    # Model the agent actually ran, for the dynamic signature (#332). Carried from
+    # AgentResult.model_used so the orchestrator render sites can stamp it.
+    model_used: str | None = None
 
 
 def _parse_absolute_reset_seconds(
@@ -962,6 +964,7 @@ def _run_validated_agent(
                             session_id=result.session_id,
                             marker_value=marker_value,
                             usage=usage,
+                            model_used=result.model_used,
                         )
                 if (
                     repair_expected_kind == "plan_revision"
@@ -998,6 +1001,7 @@ def _run_validated_agent(
                             session_id=result.session_id,
                             marker_value=marker_value,
                             usage=usage,
+                            model_used=result.model_used,
                         )
                 if (
                     use_repair
@@ -1054,6 +1058,7 @@ def _run_validated_agent(
                                             session_id=result.session_id,
                                             marker_value=marker_value,
                                             usage=usage,
+                                            model_used=result.model_used,
                                         )
                         except AgentLoopError:
                             pass
@@ -1069,6 +1074,7 @@ def _run_validated_agent(
                                 session_id=result.session_id,
                                 marker_value=marker_value,
                                 usage=usage,
+                                model_used=result.model_used,
                             )
                 if (
                     use_repair
@@ -1102,6 +1108,7 @@ def _run_validated_agent(
                                 session_id=result.session_id,
                                 marker_value=marker_value,
                                 usage=usage,
+                                model_used=result.model_used,
                             )
                 if (
                     use_repair
@@ -1158,6 +1165,7 @@ def _run_validated_agent(
                                 session_id=result.session_id,
                                 marker_value=marker_value,
                                 usage=usage,
+                                model_used=result.model_used,
                             )
             else:
                 if usage_record is not None:
@@ -1167,6 +1175,7 @@ def _run_validated_agent(
                     session_id=result.session_id,
                     marker_value=marker_value,
                     usage=usage,
+                    model_used=result.model_used,
                 )
 
         if should_retry:
@@ -1634,6 +1643,9 @@ def _run_plan_first_loop(
             resumed_record = resumed_by_name.get(reviewer_name)
             if resumed_record is not None:
                 review_output = resumed_record.body
+                # Resumed from a posted comment: the model is not recorded, so the
+                # signature falls back to the configured model (#332).
+                review_model_used = None
                 structured_review = parse_structured_plan_review(
                     review_output,
                     reviewer=reviewer_name,
@@ -1695,6 +1707,7 @@ def _run_plan_first_loop(
                     ledger_incomplete=round_ledger_incomplete,
                 )
                 review_output = review_response.text
+                review_model_used = review_response.model_used
                 reviewer_session_ids[reviewer] = review_response.session_id
                 parsed_review = review_response.marker_value
                 assert isinstance(parsed_review, ParsedPlanReview)
@@ -1769,6 +1782,8 @@ def _run_plan_first_loop(
                             human_requirements_resolved_flag=human_requirements_resolved(
                                 review_output
                             ),
+                            config=config,
+                            model_used=review_model_used,
                         ),
                         PostedRoundMetadata(
                             flow="plan",
@@ -2161,13 +2176,16 @@ def _run_plan_first_loop(
         raw_structured_coder_response: str | None = None
         if isinstance(plan_response.marker_value, StructuredPlanRevision):
             raw_structured_coder_response = plan_response.text
-            canonical_plan = render_canonical_plan_revision(plan_response.marker_value, must_fix_items)
+            canonical_plan = render_canonical_plan_revision(
+                plan_response.marker_value, must_fix_items, config
+            )
             current_plan = canonical_plan
             public_comment = _render_public_plan_revision_comment(
                 plan_response.marker_value,
                 prior_items=must_fix_items,
                 raw_text=plan_response.text,
-                signature=agent_signature(config.coder),
+                signature=agent_signature(config.coder, config, plan_response.model_used),
+                config=config,
             )
         else:
             current_plan = plan_response.text
@@ -2558,6 +2576,7 @@ def run_pr_loop(
                 resumed_record = resumed_by_name.get(reviewer_name)
                 if resumed_record is not None:
                     review_output = resumed_record.body
+                    review_model_used = None
                     reparsed_review = parse_review(review_output, reviewer=reviewer_name)
                     parsed_review = ParsedReview(
                         state=resumed_record.metadata.state or parse_agent_state(review_output),
@@ -2625,6 +2644,7 @@ def run_pr_loop(
                         ledger_incomplete=round_ledger_incomplete,
                     )
                     review_output = review_response.text
+                    review_model_used = review_response.model_used
                     reviewer_session_ids[reviewer] = review_response.session_id
                     parsed_review = review_response.marker_value
                     assert isinstance(parsed_review, ParsedReview)
@@ -2709,6 +2729,8 @@ def run_pr_loop(
                                     ),
                                     prior_items=prior_unresolved_items,
                                     dispositions=parsed_review.dispositions,
+                                    config=config,
+                                    model_used=review_model_used,
                                 ),
                                 PostedRoundMetadata(
                                     flow="pr",
@@ -2754,6 +2776,8 @@ def run_pr_loop(
                                 ),
                                 prior_items=prior_unresolved_items,
                                 dispositions=parsed_review.dispositions,
+                                config=config,
+                                model_used=review_model_used,
                             ),
                             PostedRoundMetadata(
                                 flow="pr",
@@ -3060,8 +3084,9 @@ def run_pr_loop(
                 raw_structured_coder_response = coder_output
                 public_comment = _render_public_coder_followup_comment(
                     coder_response.marker_value,
-                    signature=agent_signature(config.coder),
+                    signature=agent_signature(config.coder, config, coder_response.model_used),
                     prior_items=tuple(unresolved_items),
+                    config=config,
                 )
             else:
                 validate_response_tests_within_workdir(

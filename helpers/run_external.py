@@ -341,6 +341,8 @@ def main() -> None:
                     "session_id": result.session_id,
                     "returncode": result.returncode,
                     "usage": usage.to_dict(),
+                    # Model that actually ran, for the dynamic signature (#332).
+                    "model_used": result.model_used,
                 }, indent=2),
                 encoding="utf-8",
             )

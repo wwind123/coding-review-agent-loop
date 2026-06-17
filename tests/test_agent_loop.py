@@ -1228,29 +1228,39 @@ def test_validate_pr_migration_topology_blocks_non_literal_changed_metadata(tmp_
 
 def test_parse_claude_output_extracts_text_and_session_id():
     raw = json.dumps({"result": "Hello.", "session_id": "abc123"})
-    text, sid, usage, raw_usage = _parse_claude_output(raw)
+    text, sid, usage, raw_usage, model = _parse_claude_output(raw)
     assert text == "Hello."
     assert sid == "abc123"
     assert usage is None
     assert raw_usage is None
+    assert model is None
 
 
 def test_parse_claude_output_falls_back_on_plain_text():
     raw = "plain response"
-    text, sid, usage, raw_usage = _parse_claude_output(raw)
+    text, sid, usage, raw_usage, model = _parse_claude_output(raw)
     assert text == "plain response"
     assert sid is None
     assert usage is None
     assert raw_usage is None
+    assert model is None
 
 
 def test_parse_claude_output_falls_back_on_non_string_result():
     raw = json.dumps({"result": 42, "session_id": "abc"})
-    text, sid, usage, raw_usage = _parse_claude_output(raw)
+    text, sid, usage, raw_usage, model = _parse_claude_output(raw)
     assert text == raw  # non-string result → fall back to raw
     assert sid == "abc"
     assert usage is None
     assert raw_usage is None
+    assert model is None
+
+
+def test_parse_claude_output_extracts_model_from_model_usage():
+    raw = json.dumps({"result": "Hi.", "modelUsage": {"claude-sonnet-4-6": {"outputTokens": 5}}})
+    text, sid, usage, raw_usage, model = _parse_claude_output(raw)
+    assert text == "Hi."
+    assert model == "claude-sonnet-4-6"
 
 
 def test_parse_gemini_output_extracts_json_response():
@@ -17814,3 +17824,94 @@ def test_gemini_success_does_not_append_migration_guidance(tmp_path, monkeypatch
     result = gm.BACKEND.run(runner, config, "Review", run_id="r")
     assert "2026-06-18" not in result.raw_output  # no guidance on a clean success
     assert "2026-06-18" not in result.text
+
+
+# ---------------------------------------------------------------------------
+# Dynamic model-specific signatures (#332)
+# ---------------------------------------------------------------------------
+
+
+def test_agent_signature_generic_without_config():
+    from coding_review_agent_loop.agents.registry import agent_signature
+    assert agent_signature("codex") == "OpenAI Codex"
+    assert agent_signature("antigravity") == "Google Antigravity"
+
+
+def test_agent_signature_uses_configured_model(tmp_path):
+    from coding_review_agent_loop.agents.registry import agent_signature
+    config = make_config(tmp_path, codex_model="gpt-5.2-codex", codex_reasoning_effort="high")
+    assert agent_signature("codex", config) == "OpenAI Codex: gpt-5.2-codex (high)"
+    # antigravity model is always declared (effort already embedded).
+    assert agent_signature("antigravity", config) == "Google Antigravity: Gemini 3.1 Pro (High)"
+    # gemini with no declared model falls back to the generic signature.
+    assert agent_signature("gemini", make_config(tmp_path)) == "Google Gemini"
+
+
+def test_agent_signature_model_used_overrides_config(tmp_path):
+    from coding_review_agent_loop.agents.registry import agent_signature
+    config = make_config(tmp_path, antigravity_model="Gemini 3.1 Pro (High)")
+    # #333 fallback: the model that actually ran wins over the configured one.
+    assert (
+        agent_signature("antigravity", config, "Gemini 3.5 Flash (High)")
+        == "Google Antigravity: Gemini 3.5 Flash (High)"
+    )
+
+
+def test_config_rejects_model_arg_conflicts(tmp_path):
+    for kwargs in (
+        {"codex_model": "gpt-5", "codex_args": ("--model", "other")},
+        {"codex_reasoning_effort": "high", "codex_args": ("-c", 'model_reasoning_effort="low"')},
+        {"gemini_model": "g", "gemini_args": ("--model", "other")},
+        {"claude_model": "c", "claude_args": ("--model", "other")},
+        {"antigravity_args": ("--model", "x")},
+    ):
+        with pytest.raises(AgentLoopError, match="conflicts with"):
+            make_config(tmp_path, **kwargs)
+
+
+def test_config_allows_declared_model_without_conflict(tmp_path):
+    config = make_config(tmp_path, codex_model="gpt-5", gemini_model="g", claude_model="c")
+    assert config.codex_model == "gpt-5"
+    assert config.gemini_model == "g"
+    assert config.claude_model == "c"
+
+
+def test_codex_backend_passes_model_and_effort(tmp_path):
+    from coding_review_agent_loop.agents.codex import CodexBackend
+    runner = FakeRunner(codex_outputs=[("STATE: approved\n\nok", 0)])
+    config = make_config(tmp_path, codex_model="gpt-5.2-codex", codex_reasoning_effort="high")
+    result = CodexBackend().run(runner, config, "Review", run_id="r")
+    cmd = runner.commands[-1][0]
+    assert cmd[cmd.index("--model") + 1] == "gpt-5.2-codex"
+    assert 'model_reasoning_effort="high"' in cmd
+    assert result.model_used == "gpt-5.2-codex (high)"
+
+
+def test_gemini_backend_passes_model_and_sets_model_used(tmp_path):
+    import coding_review_agent_loop.agents.gemini as gm
+    runner = FakeRunner(gemini_outputs=[("STATE: approved\n\nok", 0)])
+    config = make_config(tmp_path, gemini_model="gemini-3.5-flash")
+    result = gm.BACKEND.run(runner, config, "Review", run_id="r")
+    cmd = runner.commands[-1][0]
+    assert cmd[cmd.index("--model") + 1] == "gemini-3.5-flash"
+    assert result.model_used == "gemini-3.5-flash"
+
+
+def test_claude_backend_passes_model_when_declared(tmp_path):
+    from coding_review_agent_loop.agents.claude import ClaudeBackend
+    runner = FakeRunner(claude_outputs=[("STATE: approved\n\nok", 0)])
+    config = make_config(tmp_path, claude_model="opus")
+    ClaudeBackend().run(runner, config, "Review", run_id="r")
+    cmd = runner.commands[-1][0]
+    assert cmd[cmd.index("--model") + 1] == "opus"
+
+
+def test_public_reviewer_name_config_aware_no_leakage(tmp_path):
+    from coding_review_agent_loop.comment_rendering import _public_reviewer_name
+    config = make_config(tmp_path, codex_model="gpt-5", antigravity_model="Gemini 3.1 Pro (High)")
+    assert _public_reviewer_name("Codex", config) == "OpenAI Codex: gpt-5"
+    assert _public_reviewer_name("Antigravity", config) == "Google Antigravity: Gemini 3.1 Pro (High)"
+    # No declared model → generic; unknown display name → passthrough.
+    assert _public_reviewer_name("Claude", config) == "Anthropic Claude"
+    assert _public_reviewer_name("Codex") == "OpenAI Codex"
+    assert _public_reviewer_name("Somebody") == "Somebody"

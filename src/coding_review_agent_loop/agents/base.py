@@ -30,6 +30,11 @@ class AgentResult:
     returncode: int = 0
     usage: UsageMetadata | None = None
     raw_usage: object | None = None
+    # Human-readable label of the model that actually produced this result (e.g.
+    # "Gemini 3.1 Pro (High)", "claude-sonnet-4-6"). Ground truth for the dynamic
+    # signature (#332); None when the backend could not determine it. The
+    # antigravity fallback chain (#333) sets this to the model that answered.
+    model_used: str | None = None
 
 
 class AgentBackend(Protocol):

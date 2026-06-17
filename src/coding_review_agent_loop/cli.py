@@ -112,6 +112,35 @@ def build_parser() -> argparse.ArgumentParser:
             default="Gemini 3.1 Pro (High)",
             help="Antigravity (agy) model, as shown by `agy models` (default: 'Gemini 3.1 Pro (High)').",
         )
+        subparser.add_argument(
+            "--codex-model",
+            default="",
+            help=(
+                "Codex model to run and stamp in the signature (#332). Mutually "
+                "exclusive with passing --model via --codex-arg."
+            ),
+        )
+        subparser.add_argument(
+            "--codex-reasoning-effort",
+            default="",
+            help=(
+                "Codex reasoning effort (e.g. low/medium/high) to run and stamp in the "
+                "signature. Mutually exclusive with model_reasoning_effort via --codex-arg."
+            ),
+        )
+        subparser.add_argument(
+            "--gemini-model",
+            default="",
+            help="Gemini model to run and stamp in the signature. Mutually exclusive with --gemini-arg --model.",
+        )
+        subparser.add_argument(
+            "--claude-model",
+            default="",
+            help=(
+                "Claude model to run (CLI mode) / declare for the signature (host mode). "
+                "Mutually exclusive with --claude-arg --model."
+            ),
+        )
         subparser.add_argument("--gh-cmd", default="gh")
         subparser.add_argument(
             "--dangerous-agent-permissions",

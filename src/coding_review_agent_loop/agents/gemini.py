@@ -215,6 +215,10 @@ class GeminiBackend:
             ),
             *config.gemini_args,
         ]
+        # Pin the model when declared (#332); conflict validation guarantees this is
+        # not also passed via --gemini-arg --model.
+        if config.gemini_model:
+            args += ["--model", config.gemini_model]
         if session_id:
             args += ["--resume", session_id]
         result = runner.run_with_log(
@@ -255,6 +259,7 @@ class GeminiBackend:
             returncode=result.returncode,
             usage=usage,
             raw_usage=raw_usage,
+            model_used=config.gemini_model or None,
         )
 
 

@@ -82,6 +82,28 @@ def _extract_codex_usage(raw: str) -> tuple[UsageMetadata | None, object | None]
     return None, last_usage
 
 
+def _codex_model_args(config: AgentLoopConfig) -> list[str]:
+    """CLI args to pin codex's model/effort when declared (#332).
+
+    Conflict validation guarantees these are not also passed via --codex-arg, so
+    no duplicate flags. The reasoning-effort value is TOML, hence the quotes.
+    """
+    args: list[str] = []
+    if config.codex_model:
+        args += ["--model", config.codex_model]
+    if config.codex_reasoning_effort:
+        args += ["-c", f'model_reasoning_effort="{config.codex_reasoning_effort}"']
+    return args
+
+
+def _codex_model_label(config: AgentLoopConfig) -> str | None:
+    if not config.codex_model:
+        return None
+    if config.codex_reasoning_effort:
+        return f"{config.codex_model} ({config.codex_reasoning_effort})"
+    return config.codex_model
+
+
 def _read_codex_message_file(output_path: Path) -> str | None:
     try:
         text = output_path.read_text(encoding="utf-8")
@@ -124,6 +146,7 @@ class CodexBackend:
                     "exec",
                     "--cd",
                     str(config.codex_dir),
+                    *_codex_model_args(config),
                     *config.codex_args,
                     prompt,
                 ],
@@ -138,6 +161,7 @@ class CodexBackend:
                 message_text=result.stdout,
                 log_path=log_path,
                 returncode=result.returncode,
+                model_used=_codex_model_label(config),
             )
 
         with tempfile.NamedTemporaryFile("r", encoding="utf-8", delete=False) as handle:
@@ -152,6 +176,7 @@ class CodexBackend:
                     "--json",
                     "--output-last-message",
                     output_path,
+                    *_codex_model_args(config),
                     *config.codex_args,
                     prompt_with_response_file,
                 ],
@@ -176,6 +201,7 @@ class CodexBackend:
                 returncode=result.returncode,
                 usage=usage,
                 raw_usage=raw_usage,
+                model_used=_codex_model_label(config),
             )
         finally:
             try:
