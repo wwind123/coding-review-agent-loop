@@ -355,6 +355,20 @@ def _workdir_for_agent(agent: str, args: argparse.Namespace) -> str:
     return str(tmp)
 
 
+def _model_used_from_usage(usage_file: Path) -> str:
+    """Model the agent ran, read from run_external's usage sidecar (#332).
+
+    Returns "" when the sidecar is missing/unreadable or carries no model, so the
+    signature falls back to the generic provider name.
+    """
+    if usage_file.exists():
+        try:
+            return json.loads(usage_file.read_text(encoding="utf-8")).get("model_used") or ""
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return ""
+    return ""
+
+
 def _agent_memory_dir(repo: str) -> Path:
     slug = repo.replace("/", "-").replace(":", "-")
     state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
@@ -816,13 +830,7 @@ def _complete_reviewer_turn(
     # --- Render ---
     # The model the reviewer actually ran is in run_external's usage sidecar (#332);
     # pass it so the rendered signature reads e.g. "Google Antigravity: Gemini 3.1 Pro (High)".
-    reviewer_model = ""
-    _usage_path = work_dir / f"{agent}-usage.json"
-    if _usage_path.exists():
-        try:
-            reviewer_model = json.loads(_usage_path.read_text(encoding="utf-8")).get("model_used") or ""
-        except (OSError, json.JSONDecodeError):
-            reviewer_model = ""
+    reviewer_model = _model_used_from_usage(work_dir / f"{agent}-usage.json")
     _run_helper(
         "helpers.render_response",
         "--file", str(raw_output),
@@ -1371,12 +1379,16 @@ def _complete_coder_turn(
                 f"skill_runner: raw response at: {raw_output}"
             )
         prior_items = [_deserialize_unresolved_item(i) for i in next_prior_items_raw]
+        # The coder's actual model is in run_external's usage sidecar (#332); stamp it
+        # so a skill-mode plan revision is signed e.g. "-- Google Antigravity: Gemini
+        # 3.1 Pro (High)" rather than the bare provider name.
+        coder_model = _model_used_from_usage(usage_file)
         canonical_text = render_canonical_plan_revision(parsed, prior_items)
         public_body = _render_public_plan_revision_comment(
             parsed,
             prior_items=prior_items,
             raw_text=raw_text,
-            signature=agent_signature(coder),  # type: ignore[arg-type]
+            signature=agent_signature(coder, None, coder_model or None),  # type: ignore[arg-type]
         )
         public_file = work_dir / "coder-public.md"
         _write_text(public_file, public_body)

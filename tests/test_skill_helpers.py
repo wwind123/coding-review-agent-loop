@@ -2785,6 +2785,18 @@ class TestAntigravitySkill:
 # ---------------------------------------------------------------------------
 
 
+def test_model_used_from_usage_sidecar(tmp_path):
+    import helpers.skill_runner as sr
+    sidecar = tmp_path / "agent-usage.json"
+    assert sr._model_used_from_usage(sidecar) == ""  # missing file
+    sidecar.write_text(json.dumps({"model_used": "Gemini 3.1 Pro (High)"}), encoding="utf-8")
+    assert sr._model_used_from_usage(sidecar) == "Gemini 3.1 Pro (High)"
+    sidecar.write_text(json.dumps({"usage": {}}), encoding="utf-8")  # no model_used key
+    assert sr._model_used_from_usage(sidecar) == ""
+    sidecar.write_text("not json", encoding="utf-8")  # unreadable
+    assert sr._model_used_from_usage(sidecar) == ""
+
+
 def test_render_response_plan_revision_stamps_model_signature():
     revision = json.dumps(
         {
