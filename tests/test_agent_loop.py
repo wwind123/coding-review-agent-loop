@@ -158,6 +158,7 @@ from coding_review_agent_loop.protocol import (
     validate_human_requirements_acknowledgement,
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
+    validate_structured_plan_state,
     validate_structured_plan_revision,
 )
 from coding_review_agent_loop.workdir_guard import (
@@ -804,6 +805,28 @@ def structured_plan_revision(
         )
         + human_requirements
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n"
+        + f"-- {reviewer}"
+    )
+
+
+def structured_plan_state(
+    *,
+    state: str = "approved",
+    summary: str = "Implementation plan.",
+    plan_steps: list[str] | None = None,
+    reviewer: str = "Anthropic Claude",
+) -> str:
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "plan_state",
+                "state": state,
+                "summary": summary,
+                "plan_steps": plan_steps or ["Update the code.", "Run the relevant tests."],
+            }
+        )
+        + f"\n<!-- AGENT_PLAN_STATE: {state} -->\n"
         + f"-- {reviewer}"
     )
 
@@ -4852,6 +4875,39 @@ def test_render_canonical_plan_revision_and_public_comment():
         + "\n\n<!-- AGENT_PLAN_STATE: blocking -->\n\n-- OpenAI Codex"
     )
     assert '"kind": "plan_revision"' not in public
+
+
+def test_render_structured_plan_state_to_public_markdown():
+    raw = (
+        json.dumps(
+            {
+                "kind": "plan_state",
+                "summary": "Plan the renderer fix.",
+                "plan_steps": ["Detect structured plan_state.", "Render public markdown."],
+            }
+        )
+        + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Google Antigravity"
+    )
+    parsed = validate_structured_plan_state(raw)
+
+    assert parsed is not None
+    public = render_public_agent_comment(
+        kind="plan_state",
+        parsed=parsed,
+        agent="antigravity",
+        model_used="Gemini 3.1 Pro (High)",
+    )
+
+    assert public == (
+        "## Plan\n\n"
+        "Plan the renderer fix.\n\n"
+        "### Plan steps\n"
+        "1. Detect structured plan_state.\n"
+        "2. Render public markdown.\n\n"
+        "<!-- AGENT_PLAN_STATE: approved -->\n\n"
+        "-- Google Antigravity: Gemini 3.1 Pro (High)"
+    )
+    assert '"kind": "plan_state"' not in public
 
 
 def test_render_public_coder_followup_comment():
@@ -12809,6 +12865,58 @@ def test_issue_loop_plan_first_revises_until_all_reviewers_approve(tmp_path):
     config = make_config(tmp_path)
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+
+def test_issue_loop_structured_plan_state_public_comment_renders_markdown_and_preserves_metadata(tmp_path):
+    raw_structured_plan = structured_plan_state(
+        summary="Plan the issue fix.",
+        plan_steps=["Update the renderer.", "Add regression tests."],
+        reviewer="Google Antigravity",
+    )
+    runner = FakeRunner(
+        antigravity_outputs=[raw_structured_plan],
+        codex_outputs=[structured_plan_review(summary="Plan looks sound.")],
+    )
+    config = make_config(tmp_path, coder="antigravity", reviewer="codex")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    public_comment = runner.comments[0]
+    assert public_comment.startswith("## Plan")
+    assert "### Plan steps\n1. Update the renderer.\n2. Add regression tests." in public_comment
+    assert '"kind": "plan_state"' not in _strip_round_metadata(public_comment)
+
+    raw_comment = runner.issue_comments[0]["body"]
+    match = re.search(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", raw_comment)
+    assert match is not None
+    metadata = _decode_round_metadata(match.group("payload"))
+    assert metadata.canonical_plan == raw_structured_plan
+    assert metadata.raw_structured_coder_response == raw_structured_plan
+
+
+def test_issue_loop_markdown_plan_state_public_comment_passes_through(tmp_path):
+    markdown_plan = "Initial markdown plan.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
+    runner = FakeRunner(
+        claude_outputs=[markdown_plan],
+        codex_outputs=[structured_plan_review(summary="Plan looks sound.")],
+    )
+    config = make_config(tmp_path, reviewer="codex")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    raw_comment = runner.issue_comments[0]["body"]
+    metadata_match = re.search(
+        r"\n?<!--\s*AGENT_LOOP_META:\s*[A-Za-z0-9+/=_-]+\s*-->\n?",
+        raw_comment,
+    )
+    assert metadata_match is not None
+    assert raw_comment.replace(metadata_match.group(0), "\n").strip() == markdown_plan
+    metadata = _decode_round_metadata(
+        re.search(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", raw_comment)
+        .group("payload")
+    )
+    assert metadata.canonical_plan is None
+    assert metadata.raw_structured_coder_response is None
 
 
 def test_issue_loop_plan_revision_stores_raw_structured_metadata(tmp_path):

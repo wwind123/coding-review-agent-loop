@@ -77,6 +77,7 @@ from .protocol import (
     PUBLIC_RESPONSE_MARKER,
     ReviewItemDisposition,
     StructuredCoderFollowup,
+    StructuredPlanState,
     StructuredPlanRevision,
     UnresolvedReviewItem,
     human_requirements_resolved,
@@ -92,6 +93,7 @@ from .protocol import (
     normalize_response_file_structured_text,
     validate_human_requirements_acknowledgement,
     validate_structured_coder_followup,
+    validate_structured_plan_state,
     validate_structured_plan_revision,
 )
 from .protocol import parse_review
@@ -1575,12 +1577,26 @@ def _run_plan_first_loop(
                 f"{coder_name}'s questions:\n{plan_output}"
             )
         current_plan = plan_output
+        public_plan_output = plan_output
+        raw_structured_coder_response: str | None = None
+        canonical_plan: str | None = None
+        structured_plan = validate_structured_plan_state(plan_output)
+        if isinstance(structured_plan, StructuredPlanState):
+            raw_structured_coder_response = plan_output
+            canonical_plan = plan_output
+            public_plan_output = render_public_agent_comment(
+                kind="plan_state",
+                parsed=structured_plan,
+                agent=config.coder,
+                config=config,
+                model_used=plan_response.model_used,
+            )
         post_issue_comment(
             runner,
             config=config,
             issue_number=issue_number,
             body=_attach_round_metadata(
-                plan_output,
+                public_plan_output,
                 PostedRoundMetadata(
                     flow="plan",
                     role="coder",
@@ -1588,6 +1604,8 @@ def _run_plan_first_loop(
                     round_number=1,
                     subject=_plan_subject(current_plan),
                     prior_items=(),
+                    canonical_plan=canonical_plan,
+                    raw_structured_coder_response=raw_structured_coder_response,
                     compact_prior_summaries=tuple(compact_prior_summaries),
                 ),
             ),

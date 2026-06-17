@@ -7,7 +7,7 @@ Usage:
     [--reviewer REVIEWER] \\
     [--context-file PATH]
 
-Kinds: pr_review, plan_review, coder_followup, plan_revision
+Kinds: pr_review, plan_review, coder_followup, plan_revision, plan_state
 
 Exit 0 on success; exit 1 with diagnostic on failure.
 """
@@ -28,6 +28,7 @@ from coding_review_agent_loop.protocol import (
     parse_pr_review,
     parse_plan_review,
     validate_structured_coder_followup,
+    validate_structured_plan_state,
     validate_structured_plan_revision,
 )
 from coding_review_agent_loop.round_state import _deserialize_unresolved_item
@@ -49,7 +50,7 @@ def main() -> None:
     parser.add_argument(
         "--kind",
         required=True,
-        choices=["pr_review", "plan_review", "coder_followup", "plan_revision"],
+        choices=["pr_review", "plan_review", "coder_followup", "plan_revision", "plan_state"],
     )
     parser.add_argument("--output", required=True, help="Path to write rendered markdown.")
     parser.add_argument("--reviewer", default="Codex", help="Reviewer display name.")
@@ -117,6 +118,17 @@ def main() -> None:
                 raw_text=text,
                 model_used=model_used,
             )
+        elif args.kind == "plan_state":
+            parsed = validate_structured_plan_state(text)
+            if parsed is None:
+                rendered = text
+            else:
+                rendered = render_public_agent_comment(
+                    kind="plan_state",
+                    parsed=parsed,
+                    agent=args.reviewer,
+                    model_used=model_used,
+                )
         else:
             print(f"render_response: unknown kind {args.kind}", file=sys.stderr)
             sys.exit(1)

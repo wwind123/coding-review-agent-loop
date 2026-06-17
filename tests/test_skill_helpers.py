@@ -1731,6 +1731,79 @@ class TestRetryValidateCoder:
             assert output["role"] == "coder"
             assert output["agent"] == "Codex"
 
+    def test_retry_validate_structured_coder_plan_state_renders_public_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            repair_dir = self._make_coder_repair_dir(tmppath)
+            raw_plan = (
+                json.dumps(
+                    {
+                        "kind": "plan_state",
+                        "summary": "Plan the renderer fix.",
+                        "plan_steps": ["Detect structured plan_state.", "Render markdown."],
+                    }
+                )
+                + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Codex"
+            )
+            (repair_dir / "raw.md").write_text(raw_plan, encoding="utf-8")
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run",
+                env=env,
+                check=False,
+            )
+
+            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+            tagged = (repair_dir / "coder-tagged.md").read_text(encoding="utf-8")
+            from coding_review_agent_loop.round_state import _strip_round_metadata
+
+            public = _strip_round_metadata(tagged)
+            assert public.startswith("## Plan")
+            assert "### Plan steps\n1. Detect structured plan_state.\n2. Render markdown." in public
+            assert '"kind": "plan_state"' not in public
+
+            from coding_review_agent_loop.round_state import ROUND_RESUME_MARKER_RE, _decode_round_metadata
+
+            match = ROUND_RESUME_MARKER_RE.search(tagged)
+            assert match is not None
+            metadata = _decode_round_metadata(match.group("payload"))
+            assert metadata.canonical_plan == raw_plan
+            assert metadata.raw_structured_coder_response == raw_plan
+
+    def test_retry_validate_markdown_coder_plan_state_passes_through(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            repair_dir = self._make_coder_repair_dir(tmppath)
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run",
+                env=env,
+                check=False,
+            )
+
+            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+            tagged = (repair_dir / "coder-tagged.md").read_text(encoding="utf-8")
+            from coding_review_agent_loop.round_state import ROUND_RESUME_MARKER_RE
+
+            match = ROUND_RESUME_MARKER_RE.search(tagged)
+            assert match is not None
+            original_prefix, original_suffix = _VALID_PLAN_STATE.strip().split(
+                "<!-- AGENT_PLAN_STATE: approved -->",
+                1,
+            )
+            assert tagged[: match.start()].rstrip() == original_prefix.rstrip()
+            assert tagged[match.end() :].strip() == (
+                "<!-- AGENT_PLAN_STATE: approved -->" + original_suffix
+            ).strip()
+
     def test_retry_validate_coder_invalid_plan_state_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)

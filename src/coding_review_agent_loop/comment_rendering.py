@@ -20,6 +20,7 @@ from .protocol import (
     ParsedReview,
     ReviewItemDisposition,
     StructuredCoderFollowup,
+    StructuredPlanState,
     StructuredPlanRevision,
     UnresolvedReviewItem,
     review_freeform_summary_text,
@@ -478,10 +479,33 @@ def _render_public_plan_revision_comment(
     return "\n\n".join(section for section in sections if section)
 
 
+def _render_public_plan_state_comment(
+    parsed_plan: StructuredPlanState,
+    *,
+    agent: str,
+    config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
+) -> str:
+    sections = [
+        "## Plan",
+        parsed_plan.summary.strip(),
+        "\n".join(["### Plan steps", render_canonical_plan_steps(parsed_plan.plan_steps)]),
+        f"<!-- AGENT_PLAN_STATE: {parsed_plan.state} -->",
+        f"-- {_comment_signature(agent, config, model_used)}",
+    ]
+    return "\n\n".join(section for section in sections if section)
+
+
 def render_public_agent_comment(
     *,
     kind: str,
-    parsed: ParsedReview | ParsedPlanReview | StructuredCoderFollowup | StructuredPlanRevision,
+    parsed: (
+        ParsedReview
+        | ParsedPlanReview
+        | StructuredCoderFollowup
+        | StructuredPlanRevision
+        | StructuredPlanState
+    ),
     agent: str,
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
@@ -537,6 +561,15 @@ def render_public_agent_comment(
             parsed,
             prior_items=prior_items,
             raw_text=raw_text,
+            agent=agent,
+            config=config,
+            model_used=model_used,
+        )
+    if kind == "plan_state":
+        if not isinstance(parsed, StructuredPlanState):
+            raise AgentLoopError("render_public_agent_comment expected StructuredPlanState.")
+        return _render_public_plan_state_comment(
+            parsed,
             agent=agent,
             config=config,
             model_used=model_used,

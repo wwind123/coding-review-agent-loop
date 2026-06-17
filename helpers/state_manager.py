@@ -419,8 +419,8 @@ def main() -> None:
     p_meta.add_argument("--usage-file", default=None,
                         help="JSON file with external-agent usage to persist in AGENT_LOOP_META (#308).")
     p_meta.add_argument("--raw-structured-coder-response-file", default=None,
-                        help="Raw structured coder response (plan_revision JSON) to persist in "
-                             "AGENT_LOOP_META for reversed-roles revision rounds (#307).")
+                        help="Raw structured coder response JSON to persist in "
+                             "AGENT_LOOP_META for reversed-roles coder rounds (#307).")
     p_meta.add_argument("--compact-prior-summaries-file", default=None,
                         help="JSON array of compact prior summaries to persist in AGENT_LOOP_META.")
     p_meta.add_argument("--canonical-plan-file", default=None,

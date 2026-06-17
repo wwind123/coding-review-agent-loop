@@ -1390,7 +1390,25 @@ def _complete_coder_turn(
 
     if kind == "plan_state":
         canonical_text = raw_text
-        public_file = raw_output
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        parsed_plan = validate_structured_plan_state(raw_text)
+        if parsed_plan is None:
+            public_file = raw_output
+        else:
+            coder_model = _model_used_from_usage(usage_file)
+            public_file = work_dir / "coder-public.md"
+            _run_helper(
+                "helpers.render_response",
+                "--file", str(raw_output),
+                "--kind", "plan_state",
+                "--reviewer", coder_cap,
+                "--output", str(public_file),
+                *(["--model", coder_model] if coder_model else []),
+            )
+            raw_structured_file = work_dir / "coder-raw-structured.json"
+            _write_text(raw_structured_file, raw_text)
+            raw_structured_args = ["--raw-structured-coder-response-file", str(raw_structured_file)]
     else:
         from coding_review_agent_loop.comment_rendering import render_canonical_plan_revision
         from coding_review_agent_loop.protocol import validate_structured_plan_revision

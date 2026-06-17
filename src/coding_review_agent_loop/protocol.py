@@ -206,6 +206,15 @@ class StructuredPlanRevision:
 
 
 @dataclass(frozen=True)
+class StructuredPlanState:
+    schema_version: int
+    kind: str
+    state: str
+    summary: str
+    plan_steps: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ParsedHumanRequirementsAcknowledgement:
     marker_present: bool
     section_present: bool
@@ -772,6 +781,21 @@ def _extract_structured_plan_revision_payload(text: str) -> dict[str, object] | 
     )
 
 
+def _extract_structured_plan_state_payload(text: str) -> dict[str, object] | None:
+    text, _status = normalize_response_file_structured_text(text)
+    extracted = _extract_json_object_prefix(text)
+    if extracted is None:
+        return None
+    payload, trailing = extracted
+    return _consume_structured_footer_and_signature(
+        payload=payload,
+        trailing=trailing,
+        state_re=PLAN_STATE_RE,
+        state_marker_name="AGENT_PLAN_STATE",
+        context_label="Structured plan state",
+    )
+
+
 def _extract_structured_coder_followup_payload(text: str) -> dict[str, object] | None:
     text, _status = normalize_response_file_structured_text(text)
     extracted = _extract_json_object_prefix(text)
@@ -1239,6 +1263,37 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
         summary=summary,
         prior_plan_item_dispositions=dispositions,
         plan_steps=plan_steps,
+    )
+
+
+def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
+    payload = _extract_structured_plan_state_payload(text)
+    if payload is None:
+        return None
+    if "schema_version" in payload:
+        _require_supported_schema_version(payload)
+    kind = payload.get("kind")
+    if isinstance(kind, str) and kind != "plan_state":
+        raise AgentLoopError("Structured response kind mismatch: expected `plan_state`.")
+    _expect_exact_keys(
+        payload,
+        context="plan_state",
+        required={"kind", "summary", "plan_steps"},
+        optional={"schema_version", "state"},
+    )
+    if "state" in payload:
+        _expect_state(payload["state"], context="plan_state.state")
+    return StructuredPlanState(
+        schema_version=int(payload.get("schema_version", 1)),
+        kind="plan_state",
+        state=parse_plan_state(text),
+        summary=_expect_non_empty_string(payload["summary"], context="plan_state.summary"),
+        plan_steps=_expect_string_list(
+            payload["plan_steps"],
+            context="plan_state.plan_steps",
+            item_context="plan_state.plan_steps",
+            min_length=1,
+        ),
     )
 
 
