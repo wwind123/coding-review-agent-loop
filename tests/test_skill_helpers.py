@@ -2778,3 +2778,59 @@ class TestAntigravitySkill:
             assert result.returncode == 0, result.stderr
             output = self._last_json(result.stdout)
             assert "Antigravity" in output["approved_reviewers"]
+
+
+# ---------------------------------------------------------------------------
+# render_response --model stamps the dynamic signature (#332)
+# ---------------------------------------------------------------------------
+
+
+def test_render_response_plan_revision_stamps_model_signature():
+    revision = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "plan_revision",
+            "state": "blocking",
+            "summary": "Revised plan.",
+            "prior_plan_item_dispositions": [],
+            "plan_steps": ["Step A"],
+        }
+    ) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Google Antigravity\n"
+    path = _write_tmp(revision)
+    ctx = _write_tmp(json.dumps({"prior_items": [], "current_round_items": []}), suffix=".json")
+    out = _write_tmp("", suffix=".md")
+    result = _run(
+        "helpers.render_response",
+        "--file", path, "--kind", "plan_revision",
+        "--reviewer", "Antigravity", "--context-file", ctx,
+        "--output", out, "--model", "Gemini 3.1 Pro (High)",
+    )
+    assert result.returncode == 0, result.stderr
+    rendered = Path(out).read_text(encoding="utf-8")
+    assert "Google Antigravity: Gemini 3.1 Pro (High)" in rendered
+
+
+def test_render_response_coder_followup_stamps_model_signature():
+    followup = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "coder_followup",
+            "state": "approved",
+            "summary": "Addressed feedback.",
+            "addressed_items": [],
+            "remaining_items": [],
+            "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        }
+    ) + "\n<!-- AGENT_STATE: approved -->\n-- Google Antigravity\n"
+    path = _write_tmp(followup)
+    ctx = _write_tmp(json.dumps({"prior_items": [], "current_round_items": []}), suffix=".json")
+    out = _write_tmp("", suffix=".md")
+    result = _run(
+        "helpers.render_response",
+        "--file", path, "--kind", "coder_followup",
+        "--reviewer", "Antigravity", "--context-file", ctx,
+        "--output", out, "--model", "Gemini 3.1 Pro (High)",
+    )
+    assert result.returncode == 0, result.stderr
+    rendered = Path(out).read_text(encoding="utf-8")
+    assert "Google Antigravity: Gemini 3.1 Pro (High)" in rendered

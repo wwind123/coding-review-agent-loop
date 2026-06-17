@@ -17869,6 +17869,16 @@ def test_config_rejects_model_arg_conflicts(tmp_path):
             make_config(tmp_path, **kwargs)
 
 
+def test_config_rejects_codex_effort_without_model(tmp_path):
+    # Effort alone can't be stamped (codex doesn't report its model), so it requires
+    # an explicit --codex-model.
+    with pytest.raises(AgentLoopError, match="requires --codex-model"):
+        make_config(tmp_path, codex_reasoning_effort="high")
+    # With a model it's accepted.
+    config = make_config(tmp_path, codex_model="gpt-5", codex_reasoning_effort="high")
+    assert config.codex_reasoning_effort == "high"
+
+
 def test_config_allows_declared_model_without_conflict(tmp_path):
     config = make_config(tmp_path, codex_model="gpt-5", gemini_model="g", claude_model="c")
     assert config.codex_model == "gpt-5"

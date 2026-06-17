@@ -125,7 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
             default="",
             help=(
                 "Codex reasoning effort (e.g. low/medium/high) to run and stamp in the "
-                "signature. Mutually exclusive with model_reasoning_effort via --codex-arg."
+                "signature. Requires --codex-model (codex does not report its model). "
+                "Mutually exclusive with model_reasoning_effort via --codex-arg."
             ),
         )
         subparser.add_argument(
