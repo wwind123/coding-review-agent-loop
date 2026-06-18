@@ -179,6 +179,12 @@ def main() -> None:
         help="Write the agent's token usage (JSON) to this path for external-agent "
              "cost tracking (#308). Skipped in --dry-run.",
     )
+    parser.add_argument(
+        "--response-evidence-output",
+        default=None,
+        help="Write response_file_text/message_text evidence needed for deterministic "
+             "structured-response recovery. Skipped in --dry-run.",
+    )
     args = parser.parse_args()
 
     if args.max_retries < 0:
@@ -358,6 +364,18 @@ def main() -> None:
     assert result is not None  # loop either set result or exited
     output_path.write_text(result.text, encoding="utf-8")
     print(f"agent result written to {output_path}")
+
+    if args.response_evidence_output:
+        try:
+            Path(args.response_evidence_output).write_text(
+                json.dumps({
+                    "response_file_text": result.response_file_text,
+                    "message_text": result.message_text,
+                }, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"run_external: could not write response evidence: {exc}", file=sys.stderr)
 
     # External-agent usage for cost tracking (#308). Advisory — never fail the run.
     if args.usage_output:

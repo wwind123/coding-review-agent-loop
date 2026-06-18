@@ -101,6 +101,7 @@ import subprocess
 import sys
 import tempfile
 import types
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -108,7 +109,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from coding_review_agent_loop.agents.base import AgentName
 from coding_review_agent_loop.agents.registry import agent_display_name
 from coding_review_agent_loop.config import ensure_temp_checkout
-from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
 from coding_review_agent_loop.followups import (
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
@@ -126,7 +127,16 @@ from coding_review_agent_loop.round_state import (
     _serialize_unresolved_item,
     _serialize_disposition,
 )
-from coding_review_agent_loop.unresolved_items import apply_item_dispositions
+from coding_review_agent_loop.unresolved_items import (
+    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+    apply_item_dispositions,
+)
+from coding_review_agent_loop.repair import (
+    attempt_envelope_normalization,
+    attempt_repair,
+    strip_unknown_prior_item_dispositions,
+)
+from helpers.validate_response import validate_response_text
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -310,6 +320,184 @@ def _normalize_raw_response(text: str) -> str:
     return json_text.rstrip() + "\n" + prefix + state_and_sig.rstrip() + "\n"
 
 
+def _response_evidence_texts(evidence: dict[str, object] | None) -> list[str]:
+    if not evidence:
+        return []
+    texts: list[str] = []
+    for key in ("response_file_text", "message_text"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip() and value not in texts:
+            texts.append(value)
+    return texts
+
+
+def _recover_plan_revision_human_ack(
+    candidate: str,
+    *,
+    response_evidence: dict[str, object] | None,
+    surfaced_requirement_ids: Sequence[str],
+    requires_direct_discussion_ack: bool,
+    validate: Callable[[str], object],
+) -> tuple[str, object] | None:
+    """Reattach exactly one independently-valid acknowledgement evidence block."""
+    if not surfaced_requirement_ids and not requires_direct_discussion_ack:
+        return None
+
+    from coding_review_agent_loop.protocol import (
+        HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+        PLAN_STATE_RE,
+        parse_human_requirements_acknowledgement,
+        validate_human_requirements_acknowledgement,
+    )
+
+    stripped = candidate.lstrip()
+    try:
+        payload, json_end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("kind") != "plan_revision":
+        return None
+    trailing = stripped[json_end:].lstrip()
+    footer_match = PLAN_STATE_RE.search(trailing)
+    if footer_match is None or trailing[:footer_match.start()].strip():
+        return None
+    footer_and_signature = trailing[footer_match.start():].strip()
+
+    valid_blocks: list[str] = []
+    for evidence_text in _response_evidence_texts(response_evidence):
+        lines = evidence_text.splitlines()
+        for index, line in enumerate(lines):
+            if HUMAN_REQUIREMENTS_ADDRESSED_MARKER not in line:
+                continue
+            block_lines = [line.strip()]
+            section_seen = False
+            for next_line in lines[index + 1:]:
+                stripped_line = next_line.strip()
+                if section_seen and (
+                    PLAN_STATE_RE.match(stripped_line)
+                    or re.match(r"^--\s+\S", stripped_line)
+                    or next_line.lstrip().startswith("{")
+                ):
+                    break
+                block_lines.append(next_line.rstrip())
+                if re.match(r"^\s*###\s+Human requirements\s*$", next_line, re.I):
+                    section_seen = True
+            block = "\n".join(block_lines).strip()
+            parsed = parse_human_requirements_acknowledgement(block)
+            if not parsed.marker_present or not parsed.section_present:
+                continue
+            try:
+                validate_human_requirements_acknowledgement(
+                    block,
+                    surfaced_requirement_ids=surfaced_requirement_ids,
+                    requires_direct_discussion_ack=requires_direct_discussion_ack,
+                )
+            except AgentLoopError:
+                continue
+            if block not in valid_blocks:
+                valid_blocks.append(block)
+
+    if len(valid_blocks) != 1:
+        return None
+    recovered = f"{stripped[:json_end].rstrip()}\n{valid_blocks[0]}\n{footer_and_signature}"
+    try:
+        parsed = validate(recovered)
+    except AgentLoopError:
+        return None
+    return recovered, parsed
+
+
+def _recover_structured_response(
+    original_text: str,
+    *,
+    expected_kind: str,
+    validate: Callable[[str], object],
+    allowed_prior_item_ids: Sequence[str] = (),
+    ledger_complete: bool = True,
+    unresolved_item_ids: Sequence[str] = (),
+    surfaced_requirement_ids: Sequence[str] = (),
+    requires_direct_discussion_ack: bool = False,
+    reviewer_requirement_ids: Sequence[str] = (),
+    response_evidence: dict[str, object] | None = None,
+    gemini_cmd: str = "gemini",
+    reviewer_normalization: bool = False,
+) -> tuple[str, object]:
+    """Run deterministic-to-Gemini recovery without mutating the saved raw artifact."""
+    candidate = original_text
+    if reviewer_normalization:
+        candidate = _normalize_disposition_values(_normalize_raw_response(candidate))
+
+    try:
+        return candidate, validate(candidate)
+    except AgentLoopError as first_error:
+        last_error: AgentLoopError = first_error
+
+    normalized = attempt_envelope_normalization(candidate, expected_kind=expected_kind)
+    if normalized is not None:
+        try:
+            return normalized, validate(normalized)
+        except UnknownPriorItemDispositionError as exc:
+            last_error = exc
+            if ledger_complete:
+                stripped = strip_unknown_prior_item_dispositions(
+                    normalized,
+                    allowed_ids=frozenset(allowed_prior_item_ids),
+                    expected_kind=expected_kind,
+                )
+                if stripped is not None:
+                    try:
+                        return stripped, validate(stripped)
+                    except AgentLoopError as strip_error:
+                        last_error = strip_error
+        except AgentLoopError as exc:
+            last_error = exc
+
+    if isinstance(last_error, UnknownPriorItemDispositionError) and ledger_complete:
+        stripped = strip_unknown_prior_item_dispositions(
+            candidate,
+            allowed_ids=frozenset(allowed_prior_item_ids),
+            expected_kind=expected_kind,
+        )
+        if stripped is not None:
+            try:
+                return stripped, validate(stripped)
+            except AgentLoopError as exc:
+                last_error = exc
+
+    if expected_kind == "plan_revision":
+        recovered_ack = _recover_plan_revision_human_ack(
+            candidate,
+            response_evidence=response_evidence,
+            surfaced_requirement_ids=surfaced_requirement_ids,
+            requires_direct_discussion_ack=requires_direct_discussion_ack,
+            validate=validate,
+        )
+        if recovered_ack is not None:
+            return recovered_ack
+
+    repair_kwargs: dict[str, object] = {
+        "expected_kind": expected_kind,
+        "allowed_prior_item_ids": tuple(allowed_prior_item_ids),
+    }
+    if expected_kind == "coder_followup":
+        repair_kwargs["unresolved_item_ids"] = tuple(unresolved_item_ids)
+        repair_kwargs["surfaced_requirement_ids"] = tuple(surfaced_requirement_ids)
+    if expected_kind in {"plan_review", "pr_review"}:
+        repair_kwargs["reviewer_requirement_ids"] = tuple(reviewer_requirement_ids)
+    if isinstance(last_error, UnknownPriorItemDispositionError):
+        repair_kwargs.update({
+            "unknown_prior_item_ids": last_error.unknown_ids,
+            "same_round_context": last_error.same_round_description,
+        })
+    repaired = attempt_repair(candidate, gemini_cmd, **repair_kwargs)
+    if repaired is not None:
+        try:
+            return repaired, validate(repaired)
+        except AgentLoopError as exc:
+            last_error = exc
+    raise last_error
+
+
 def _save_raw_to_repair_dir(
     *,
     agent: str,
@@ -325,6 +513,7 @@ def _save_raw_to_repair_dir(
     raw_output: Path,
     context_file: Path,
     prior_items_file: Path,
+    gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy raw response + context to a stable repair dir before normalization/validation."""
     repair_dir = _REPAIR_BASE / f"{issue}-r{new_round_number}-{agent}"
@@ -337,7 +526,7 @@ def _save_raw_to_repair_dir(
         "issue": issue, "repo": repo,
         "new_round_number": new_round_number, "round_subject": round_subject,
         "item_id_offset": item_id_offset, "validate_kind": validate_kind,
-        "dry_run": dry_run,
+        "dry_run": dry_run, "gemini_cmd": gemini_cmd,
     }
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
@@ -386,6 +575,15 @@ def _add_antigravity_options(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         default=None,
         help="Output signatures that trigger fallback to the next Antigravity model.",
+    )
+
+
+def _add_gemini_cmd_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--gemini-cmd",
+        default="gemini",
+        help="Gemini CLI executable used for Gemini turns and automatic repair "
+             "(default: gemini).",
     )
 
 
@@ -860,6 +1058,9 @@ def _complete_reviewer_turn(
     raw_output: Path,
     context_file: Path,
     work_dir: Path,
+    auto_recover: bool = False,
+    response_evidence: dict[str, object] | None = None,
+    gemini_cmd: str = "gemini",
 ) -> dict:
     """Normalize, validate, render, parse, mint IDs, attach metadata, and post.
 
@@ -874,24 +1075,44 @@ def _complete_reviewer_turn(
 
     _write_json(prior_items_file, next_prior_items_raw)
 
-    # --- Normalize ---
     raw_text = raw_output.read_text(encoding="utf-8")
-    raw_text = _normalize_raw_response(raw_text)
-    raw_text = _normalize_disposition_values(raw_text)
-    raw_output.write_text(raw_text, encoding="utf-8")
-
-    # --- Validate ---
-    result = _run_helper_capture(
-        "helpers.validate_response",
-        "--file", str(raw_output),
-        "--kind", validate_kind,
-        "--context-file", str(context_file),
+    context = json.loads(context_file.read_text(encoding="utf-8"))
+    validate = lambda text: validate_response_text(
+        text,
+        kind=validate_kind,
+        reviewer=str(context.get("reviewer", agent_cap)),
+        prior_items=list(context.get("prior_items", [])),
+        current_round_items=list(context.get("current_round_items", [])),
+        human_requirements=list(context.get("human_requirements", [])),
     )
-    if result.returncode != 0:
+    try:
+        if auto_recover:
+            raw_text, _ = _recover_structured_response(
+                raw_text,
+                expected_kind=validate_kind,
+                validate=validate,
+                allowed_prior_item_ids=[
+                    str(item.get("item_id"))
+                    for item in context.get("prior_items", [])
+                    if isinstance(item, dict) and item.get("item_id")
+                ],
+                reviewer_requirement_ids=[
+                    f"Requirement {index}"
+                    for index, _ in enumerate(context.get("human_requirements", []), start=1)
+                ],
+                response_evidence=response_evidence,
+                gemini_cmd=gemini_cmd,
+                reviewer_normalization=True,
+            )
+        else:
+            raw_text = _normalize_disposition_values(_normalize_raw_response(raw_text))
+            validate(raw_text)
+        raw_output.write_text(raw_text, encoding="utf-8")
+    except (AgentLoopError, ValueError) as exc:
         raise _ValidationError(
-            f"skill_runner: {agent} review validation failed: {result.stderr.strip()}\n"
+            f"skill_runner: {agent} review validation failed: {exc}\n"
             f"skill_runner: raw response at: {raw_output}"
-        )
+        ) from exc
 
     # --- Render ---
     # The model the reviewer actually ran is in run_external's usage sidecar (#332);
@@ -1071,6 +1292,7 @@ def _run_reviewer(
     tmpdir: Path,
     external_args: tuple[str, ...] = (),
     item_id_offset: int = 0,
+    gemini_cmd: str = "gemini",
 ) -> dict:
     """Run one reviewer turn; return {reviewer_name, state, blocking_items, new_items}."""
     agent_cap = agent_display_name(agent)  # type: ignore[arg-type]
@@ -1091,6 +1313,7 @@ def _run_reviewer(
     # the validation + agent-unavailable classification below decide whether to skip
     # this reviewer and continue.
     usage_file = tmpdir / f"{agent}-usage.json"
+    evidence_file = tmpdir / f"{agent}-response-evidence.json"
     _run_helper(
         "helpers.run_external",
         "--agent", agent,
@@ -1100,6 +1323,8 @@ def _run_reviewer(
         "--repo", repo,
         "--flow", flow,
         "--usage-output", str(usage_file),
+        "--response-evidence-output", str(evidence_file),
+        *(["--cmd", gemini_cmd] if agent == "gemini" else []),
         *external_args,
         *(["--dry-run"] if dry_run else []),
         check=False,
@@ -1116,10 +1341,17 @@ def _run_reviewer(
         round_subject=round_subject, item_id_offset=item_id_offset,
         validate_kind=validate_kind, dry_run=dry_run,
         raw_output=raw_output, context_file=context_file,
-        prior_items_file=prior_items_file,
+        prior_items_file=prior_items_file, gemini_cmd=gemini_cmd,
     )
 
+    response_evidence = None
+    if evidence_file.exists():
+        try:
+            response_evidence = json.loads(evidence_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            response_evidence = None
     try:
+        original_text = raw_output.read_text(encoding="utf-8")
         return _complete_reviewer_turn(
             agent=agent, agent_cap=agent_cap, flow=flow,
             validate_kind=validate_kind, issue=issue, repo=repo,
@@ -1128,6 +1360,9 @@ def _run_reviewer(
             item_id_offset=item_id_offset, dry_run=dry_run,
             raw_output=raw_output, context_file=context_file,
             work_dir=tmpdir,
+            auto_recover=_is_agent_unavailable_output(original_text) is None,
+            response_evidence=response_evidence,
+            gemini_cmd=gemini_cmd,
         )
     except _ValidationError as exc:
         # Distinguish an agent/CLI failure (no usable review -> skip this reviewer
@@ -1159,9 +1394,11 @@ def _run_reviewer(
         print(str(exc), file=sys.stderr)
         print(f"skill_runner: raw response saved to: {repair_dir}/raw.md", file=sys.stderr)
         dry_run_flag = " --dry-run" if dry_run else ""
+        gemini_flag = f" --gemini-cmd {shlex.quote(gemini_cmd)}" if gemini_cmd != "gemini" else ""
         print(
             f"skill_runner: fix raw.md, then run: "
-            f"python -m helpers.skill_runner retry-validate --repair-dir {repair_dir}{dry_run_flag}",
+            f"python -m helpers.skill_runner retry-validate --repair-dir {repair_dir}"
+            f"{gemini_flag}{dry_run_flag}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1373,6 +1610,8 @@ def _save_coder_raw_to_repair_dir(
     dry_run: bool,
     raw_output: Path,
     usage_file: Path,
+    response_evidence_file: Path | None = None,
+    gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy the coder's raw response + context to a stable repair dir.
 
@@ -1385,12 +1624,14 @@ def _save_coder_raw_to_repair_dir(
     _write_json(repair_dir / "prior_items.json", next_prior_items_raw)
     if usage_file.exists():
         shutil.copy2(usage_file, repair_dir / "coder-usage.json")
+    if response_evidence_file is not None and response_evidence_file.exists():
+        shutil.copy2(response_evidence_file, repair_dir / "response-evidence.json")
     manifest = {
         "role": "coder",
         "agent": coder, "agent_cap": coder_cap, "flow": "plan",
         "issue": issue, "repo": repo,
         "new_round_number": new_round_number, "kind": kind,
-        "dry_run": dry_run,
+        "dry_run": dry_run, "gemini_cmd": gemini_cmd,
     }
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
@@ -1409,6 +1650,11 @@ def _complete_coder_turn(
     raw_output: Path,
     work_dir: Path,
     usage_file: Path,
+    auto_recover: bool = False,
+    response_evidence: dict[str, object] | None = None,
+    gemini_cmd: str = "gemini",
+    surfaced_requirement_ids: Sequence[str] = (),
+    requires_direct_discussion_ack: bool = False,
 ) -> dict:
     """Validate, render, canonicalize, attach (role coder), and post a coder plan.
 
@@ -1419,16 +1665,51 @@ def _complete_coder_turn(
     ``{plan_text, subject, usage}`` (``plan_text`` is the canonical plan reviewers
     will review).
     """
-    result = _run_helper_capture(
-        "helpers.validate_response", "--file", str(raw_output), "--kind", kind,
-    )
-    if result.returncode != 0:
-        raise _ValidationError(
-            f"skill_runner: {coder_cap} {kind} validation failed: {result.stderr.strip()}\n"
-            f"skill_runner: raw response at: {raw_output}"
-        )
-
     raw_text = raw_output.read_text(encoding="utf-8")
+    def validate(text: str) -> object:
+        parsed = validate_response_text(
+            text,
+            kind=kind,
+            prior_items=next_prior_items_raw,
+        )
+        if kind == "plan_revision" and (
+            surfaced_requirement_ids or requires_direct_discussion_ack
+        ):
+            from coding_review_agent_loop.protocol import (
+                validate_human_requirements_acknowledgement,
+            )
+
+            validate_human_requirements_acknowledgement(
+                text,
+                surfaced_requirement_ids=surfaced_requirement_ids,
+                requires_direct_discussion_ack=requires_direct_discussion_ack,
+            )
+        return parsed
+    try:
+        if auto_recover and kind == "plan_revision":
+            raw_text, _ = _recover_structured_response(
+                raw_text,
+                expected_kind=kind,
+                validate=validate,
+                allowed_prior_item_ids=[
+                    str(item.get("item_id"))
+                    for item in next_prior_items_raw
+                    if item.get("item_id")
+                ],
+                surfaced_requirement_ids=surfaced_requirement_ids,
+                requires_direct_discussion_ack=requires_direct_discussion_ack,
+                response_evidence=response_evidence,
+                gemini_cmd=gemini_cmd,
+            )
+        else:
+            validate(raw_text)
+        raw_output.write_text(raw_text, encoding="utf-8")
+    except (AgentLoopError, ValueError) as exc:
+        raise _ValidationError(
+            f"skill_runner: {coder_cap} {kind} validation failed: {exc}\n"
+            f"skill_runner: raw response at: {raw_output}"
+        ) from exc
+
     canonical_file = work_dir / "coder-canonical.md"
     raw_structured_args: list[str] = []
 
@@ -1553,6 +1834,7 @@ def _run_external_coder_phase(
     """
     issue: int = args.issue
     repo: str = args.repo
+    gemini_cmd = getattr(args, "gemini_cmd", "gemini")
     phase_info = _external_coder_phase(resume, reviewers)
     phase = phase_info["phase"]
 
@@ -1592,6 +1874,19 @@ def _run_external_coder_phase(
     workdir = _workdir_for_agent(coder, args)
     issue_dict = _fetch_issue_json(repo, issue)
     coder_cap = agent_display_name(coder)  # type: ignore[arg-type]
+    human_requirements: Sequence[object] = ()
+    if not dry_run:
+        from coding_review_agent_loop.github import get_issue_context
+        from helpers.prompt_builders import make_minimal_config
+
+        issue_config = make_minimal_config(
+            repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
+        )
+        human_requirements = get_issue_context(
+            Runner(dry_run=False),
+            config=issue_config,
+            issue_number=issue,
+        ).human_requirements
 
     if phase == "coder-round-1":
         next_prior_items_raw: list[dict] = []
@@ -1609,15 +1904,20 @@ def _run_external_coder_phase(
             previous_plan=str(resume.get("current_plan", "")),
             reviewer_feedback=_aggregate_blocking_feedback(resume),
             prior_items_raw=next_prior_items_raw,
+            human_requirements=human_requirements,
             memory=memory,
         )
         kind = "plan_revision"
+
+    from coding_review_agent_loop.prompts import render_coder_human_requirements_prompt_context
+    human_context = render_coder_human_requirements_prompt_context(human_requirements)
 
     with tempfile.TemporaryDirectory() as tmpstr:
         tmpdir = Path(tmpstr)
         prompt_file = tmpdir / "coder-prompt.md"
         raw_output = tmpdir / "coder-plan-raw.md"
         usage_file = tmpdir / "coder-usage.json"
+        evidence_file = tmpdir / "coder-response-evidence.json"
         _write_text(prompt_file, prompt_text)
 
         _run_helper(
@@ -1630,6 +1930,8 @@ def _run_external_coder_phase(
             "--repo", repo,
             "--flow", "plan",
             "--usage-output", str(usage_file),
+            "--response-evidence-output", str(evidence_file),
+            *(["--cmd", gemini_cmd] if coder == "gemini" else []),
             *_run_external_antigravity_args(args),
             *(["--dry-run"] if dry_run else []),
         )
@@ -1650,8 +1952,16 @@ def _run_external_coder_phase(
             new_round_number=new_round_number, kind=kind,
             next_prior_items_raw=next_prior_items_raw, dry_run=dry_run,
             raw_output=raw_output, usage_file=usage_file,
+            response_evidence_file=evidence_file,
+            gemini_cmd=gemini_cmd,
         )
 
+        response_evidence = None
+        if evidence_file.exists():
+            try:
+                response_evidence = json.loads(evidence_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                response_evidence = None
         try:
             completed = _complete_coder_turn(
                 coder=coder, coder_cap=coder_cap, issue=issue, repo=repo,
@@ -1659,13 +1969,22 @@ def _run_external_coder_phase(
                 next_prior_items_raw=next_prior_items_raw, kind=kind,
                 dry_run=dry_run, raw_output=raw_output, work_dir=tmpdir,
                 usage_file=usage_file,
+                auto_recover=True, response_evidence=response_evidence,
+                gemini_cmd=gemini_cmd,
+                surfaced_requirement_ids=human_context.surfaced_requirement_ids,
+                requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
             )
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
             dry_run_flag = " --dry-run" if dry_run else ""
+            gemini_flag = (
+                f" --gemini-cmd {shlex.quote(gemini_cmd)}"
+                if gemini_cmd != "gemini" else ""
+            )
             print(
                 f"skill_runner: fix raw.md, then run: "
-                f"python -m helpers.skill_runner retry-validate --repair-dir {repair_dir}{dry_run_flag}",
+                f"python -m helpers.skill_runner retry-validate --repair-dir {repair_dir}"
+                f"{gemini_flag}{dry_run_flag}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -1966,6 +2285,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                 tmpdir=tmpdir,
                 external_args=_run_external_antigravity_args(args),
                 item_id_offset=item_id_offset,
+                gemini_cmd=getattr(args, "gemini_cmd", "gemini"),
             )
             if record["state"] == "unavailable":
                 # Agent/CLI failure: skip this reviewer for the round (re-attempted
@@ -2184,6 +2504,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 tmpdir=tmpdir,
                 external_args=_run_external_antigravity_args(args),
                 item_id_offset=item_id_offset,
+                gemini_cmd=getattr(args, "gemini_cmd", "gemini"),
             )
             if record["state"] == "unavailable":
                 # Agent/CLI failure: skip this reviewer for the round (re-attempted
@@ -2303,6 +2624,9 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     manifest = json.loads((repair_dir / "manifest.json").read_text(encoding="utf-8"))
+    gemini_cmd = str(
+        manifest.get("gemini_cmd") or getattr(args, "gemini_cmd", None) or "gemini"
+    )
 
     # Reversed-roles coder repair: a malformed external coder plan_state/plan_revision
     # is recoverable here, distinct from the reviewer completion path below (#307).
@@ -2323,6 +2647,7 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                 next_prior_items_raw=next_prior_items_raw, kind=kind,
                 dry_run=args.dry_run, raw_output=repair_dir / "raw.md",
                 work_dir=repair_dir, usage_file=repair_dir / "coder-usage.json",
+                gemini_cmd=gemini_cmd,
             )
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
@@ -2363,6 +2688,7 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
             item_id_offset=item_id_offset, dry_run=dry_run,
             raw_output=raw_output, context_file=context_file,
             work_dir=repair_dir,
+            gemini_cmd=gemini_cmd,
         )
     except _ValidationError as exc:
         print(str(exc), file=sys.stderr)
@@ -2873,6 +3199,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
     coder: str = args.coder
     reviewers: list[str] = args.reviewers
     dry_run: bool = args.dry_run
+    gemini_cmd = getattr(args, "gemini_cmd", "gemini")
 
     explicit_workdir = getattr(args, f"workdir_{coder}", None) or getattr(args, "workdir", None)
     if not dry_run and not explicit_workdir:
@@ -2929,6 +3256,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         _validate_coder_followup_response,
     )
     from coding_review_agent_loop.protocol import StructuredCoderFollowup
+    from coding_review_agent_loop.prompts import render_coder_human_requirements_prompt_context
     from coding_review_agent_loop.round_state import _serialize_unresolved_item
     from coding_review_agent_loop.workdir_guard import (
         validate_assigned_head_advanced,
@@ -2996,6 +3324,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         prior_items_file = tmpdir / "pr-fix-prior-items.json"
         compact_prior_file = tmpdir / "pr-fix-compact-prior.json"
         usage_file = tmpdir / "pr-fix-usage.json"
+        evidence_file = tmpdir / "pr-fix-response-evidence.json"
         _write_text(prompt_file, prompt_text)
 
         _run_helper(
@@ -3007,18 +3336,60 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             "--workdir", workdir,
             "--flow", "pr",
             "--usage-output", str(usage_file),
+            "--response-evidence-output", str(evidence_file),
+            *(["--cmd", gemini_cmd] if coder == "gemini" else []),
             *_run_external_antigravity_args(args),
             *(["--dry-run"] if dry_run else []),
         )
         coder_output = raw_output.read_text(encoding="utf-8")
+        debug_dir = _REPAIR_BASE / f"{pr}-pr-fix-debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(raw_output, debug_dir / "raw.md")
+        shutil.copy2(prompt_file, debug_dir / "prompt.md")
+        _write_json(debug_dir / "manifest.json", {
+            "role": "coder",
+            "kind": "coder_followup",
+            "agent": coder,
+            "repo": repo,
+            "pr": pr,
+            "gemini_cmd": gemini_cmd,
+            "unresolved_item_ids": [
+                str(item.get("item_id")) for item in active_items_raw if item.get("item_id")
+            ],
+        })
         if re.search(r"<!--\s*AGENT_PR\s*:", coder_output):
             raise AgentLoopError("run-pr-fix response attempted to open/report a new PR.")
+        response_evidence = None
+        if evidence_file.exists():
+            try:
+                response_evidence = json.loads(evidence_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                response_evidence = None
+        human_context = render_coder_human_requirements_prompt_context(human_requirements)
+        unresolved_items = tuple(
+            _deserialize_unresolved_item(item) for item in active_items_raw
+        )
+        validate_followup = lambda text: _validate_coder_followup_response(
+            text,
+            unresolved_items=unresolved_items,
+            human_requirements=human_requirements,
+        )
         try:
-            parsed = _validate_coder_followup_response(
+            coder_output, parsed = _recover_structured_response(
                 coder_output,
-                unresolved_items=tuple(_deserialize_unresolved_item(item) for item in active_items_raw),
-                human_requirements=human_requirements,
+                expected_kind="coder_followup",
+                validate=validate_followup,
+                unresolved_item_ids=[
+                    item.item_id
+                    for item in unresolved_items
+                    if item.item_id != HUMAN_REQUIREMENTS_ACK_ITEM_ID
+                ],
+                surfaced_requirement_ids=human_context.surfaced_requirement_ids,
+                requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
+                response_evidence=response_evidence,
+                gemini_cmd=gemini_cmd,
             )
+            raw_output.write_text(coder_output, encoding="utf-8")
             if isinstance(parsed, StructuredCoderFollowup):
                 validate_test_commands_within_workdir(
                     parsed.tests_run,
@@ -3039,10 +3410,6 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
                 _write_text(rendered_output, coder_output)
                 raw_structured_arg = []
         except AgentLoopError as exc:
-            debug_dir = _REPAIR_BASE / f"{pr}-pr-fix-debug"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(raw_output, debug_dir / "raw.md")
-            shutil.copy2(prompt_file, debug_dir / "prompt.md")
             print(f"skill_runner: PR-fix response rejected: {exc}", file=sys.stderr)
             print(f"skill_runner: raw response saved to {debug_dir}/raw.md", file=sys.stderr)
             sys.exit(1)
@@ -3606,6 +3973,7 @@ def main() -> None:
     p_plan.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
     p_plan.add_argument("--dry-run", action="store_true")
+    _add_gemini_cmd_option(p_plan)
     _add_antigravity_options(p_plan)
 
     # run-pr-round
@@ -3646,6 +4014,7 @@ def main() -> None:
     p_pr.add_argument("--refresh-agent-memory", action="store_true",
                       help="Regenerate the agent-memory cache before this round.")
     p_pr.add_argument("--dry-run", action="store_true")
+    _add_gemini_cmd_option(p_pr)
     _add_antigravity_options(p_pr)
 
     # retry-validate
@@ -3658,6 +4027,7 @@ def main() -> None:
         help="Path to repair dir written by skill_runner on validation failure.",
     )
     p_retry.add_argument("--dry-run", action="store_true")
+    _add_gemini_cmd_option(p_retry)
 
     # complete-host-review
     p_host = subparsers.add_parser(
@@ -3723,6 +4093,7 @@ def main() -> None:
     p_pr_fix.add_argument("--workdir-gemini", default=None)
     p_pr_fix.add_argument("--workdir-antigravity", default=None)
     p_pr_fix.add_argument("--dry-run", action="store_true")
+    _add_gemini_cmd_option(p_pr_fix)
     _add_antigravity_options(p_pr_fix)
 
     # run-implement-by-phase
@@ -3799,6 +4170,7 @@ def main() -> None:
     p_task.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
     p_task.add_argument("--dry-run", action="store_true")
+    _add_gemini_cmd_option(p_task)
     _add_antigravity_options(p_task)
 
     args = parser.parse_args()

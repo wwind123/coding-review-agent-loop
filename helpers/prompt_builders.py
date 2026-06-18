@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import dataclasses
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -302,6 +303,7 @@ def build_plan_revision_prompt_for_skill(
     previous_plan: str,
     reviewer_feedback: str,
     prior_items_raw: list[dict],
+    human_requirements: Sequence | None = None,
     memory: AgentMemoryContext | None = None,
 ) -> str:
     """Build the round-N+1 coder (plan revision) prompt for an external coder (#307).
@@ -313,6 +315,11 @@ def build_plan_revision_prompt_for_skill(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
     )
     issue_context = _make_issue_context(issue_dict)
+    if human_requirements:
+        issue_context = dataclasses.replace(
+            issue_context,
+            human_requirements=tuple(human_requirements),
+        )
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
     return build_plan_revision_prompt(
         issue_context.number,

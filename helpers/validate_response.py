@@ -44,6 +44,9 @@ from coding_review_agent_loop.round_state import _deserialize_unresolved_item
 from coding_review_agent_loop.github import HumanReviewRequirement
 
 
+_KINDS = ("plan_state", "plan_review", "pr_review", "coder_followup", "plan_revision")
+
+
 def _load_context(path: str | None) -> dict[str, object]:
     """Load optional context JSON file."""
     if path is None:
@@ -79,13 +82,89 @@ def _deserialize_human_requirements(raw: list[object]) -> list[HumanReviewRequir
     return result
 
 
+def validate_response_text(
+    text: str,
+    *,
+    kind: str,
+    reviewer: str = "Codex",
+    prior_items: list[object] | tuple[object, ...] = (),
+    current_round_items: list[object] | tuple[object, ...] = (),
+    human_requirements: list[object] | tuple[object, ...] = (),
+) -> object:
+    """Validate response text with the same context used by the helper CLI.
+
+    ``prior_items``/``current_round_items`` and ``human_requirements`` may contain
+    either their runtime dataclasses or their serialized dictionary forms.  The
+    original ``AgentLoopError`` subclass is intentionally allowed to propagate so
+    callers can apply type-specific deterministic recovery.
+    """
+    if kind not in _KINDS:
+        raise ValueError(f"Unsupported response kind: {kind}")
+
+    deserialized_prior = [
+        _deserialize_unresolved_item(item) if isinstance(item, dict) else item
+        for item in prior_items
+    ]
+    deserialized_current = [
+        _deserialize_unresolved_item(item) if isinstance(item, dict) else item
+        for item in current_round_items
+    ]
+    deserialized_requirements = [
+        _deserialize_human_requirements([item])[0] if isinstance(item, dict) else item
+        for item in human_requirements
+        if not isinstance(item, dict) or item
+    ]
+
+    if kind == "plan_state":
+        return parse_plan_state(text)
+    if kind == "plan_review":
+        return _validate_plan_review_response(
+            text,
+            reviewer=reviewer,
+            unresolved_items=deserialized_prior,
+            current_round_items=deserialized_current,
+        )
+    if kind == "pr_review":
+        return _validate_review_response(
+            text,
+            reviewer=reviewer,
+            unresolved_items=deserialized_prior,
+            current_round_items=deserialized_current,
+        )
+    if kind == "coder_followup":
+        return _validate_coder_followup_response(
+            text,
+            unresolved_items=deserialized_prior,
+            human_requirements=deserialized_requirements or None,
+        )
+
+    parsed = validate_structured_plan_revision(text)
+    if parsed is None:
+        raise AgentLoopError("Response did not parse as a structured plan_revision.")
+    allowed_ids = {item.item_id for item in deserialized_prior}
+    unknown = {
+        disposition.item_id
+        for disposition in parsed.prior_plan_item_dispositions
+    } - allowed_ids
+    if unknown:
+        raise UnknownPriorItemDispositionError(
+            unknown_ids=tuple(sorted(unknown)),
+            allowed_ids=tuple(sorted(allowed_ids)),
+            same_round_description=(
+                "Same-round findings are informational only and must not be "
+                "dispositioned as prior carried items."
+            ),
+        )
+    return parsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate an agent response file.")
     parser.add_argument("--file", required=True, help="Path to the response file.")
     parser.add_argument(
         "--kind",
         required=True,
-        choices=["plan_state", "plan_review", "pr_review", "coder_followup", "plan_revision"],
+        choices=_KINDS,
         help="Kind of response to validate.",
     )
     parser.add_argument(
@@ -110,49 +189,14 @@ def main() -> None:
 
     kind = args.kind
     try:
-        if kind == "plan_state":
-            parse_plan_state(text)
-        elif kind == "plan_review":
-            _validate_plan_review_response(
-                text,
-                reviewer=reviewer,
-                unresolved_items=prior_items,
-                current_round_items=current_round_items,
-            )
-        elif kind == "pr_review":
-            _validate_review_response(
-                text,
-                reviewer=reviewer,
-                unresolved_items=prior_items,
-                current_round_items=current_round_items,
-            )
-        elif kind == "coder_followup":
-            _validate_coder_followup_response(
-                text,
-                unresolved_items=prior_items,
-                human_requirements=human_requirements or None,
-            )
-        elif kind == "plan_revision":
-            parsed = validate_structured_plan_revision(text)
-            if parsed is None:
-                raise AgentLoopError("Response did not parse as a structured plan_revision.")
-            # Validate that dispositions only reference known prior item IDs,
-            # matching the check in the headless orchestrator's _validate_plan_revision_response.
-            if prior_items:
-                allowed_ids = {item.item_id for item in prior_items}
-                unknown = {
-                    disposition.item_id
-                    for disposition in parsed.prior_plan_item_dispositions
-                } - allowed_ids
-                if unknown:
-                    raise UnknownPriorItemDispositionError(
-                        unknown_ids=tuple(sorted(unknown)),
-                        allowed_ids=tuple(sorted(allowed_ids)),
-                        same_round_description=(
-                            "Same-round findings are informational only and must not be "
-                            "dispositioned as prior carried items."
-                        ),
-                    )
+        validate_response_text(
+            text,
+            kind=kind,
+            reviewer=reviewer,
+            prior_items=prior_items,
+            current_round_items=current_round_items,
+            human_requirements=human_requirements,
+        )
     except AgentLoopError as exc:
         print(f"validation failed: {kind}: {exc}", file=sys.stderr)
         sys.exit(1)

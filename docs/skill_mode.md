@@ -143,10 +143,21 @@ of the following, in precedence order:
 review — an agent/tooling failure such as an empty or malformed-tool-call
 response, *not* a fixable malformed review — the round does **not** abort. That
 reviewer is marked unavailable, the remaining reviewers still run, and a round is
-never falsely reported `approved`. A genuinely malformed-but-content-bearing
-review instead uses the `retry-validate` repair path. (The classifier is
+never falsely reported `approved`. A malformed-but-content-bearing structured
+review is recovered automatically when possible: safe skill normalization,
+envelope normalization, deterministic unknown-prior-item stripping against the
+complete carried ledger, and then Gemini format repair. The classifier is
 conservative: only known tooling-failure signatures or truly-empty output count
-as unavailable.)
+as unavailable.
+
+The same automatic recovery pipeline covers external-coder `plan_revision`
+responses and `run-pr-fix` `coder_followup` responses. Plan revisions may also
+recover one unique, independently valid signed-human-requirements
+acknowledgement from the external agent's captured response evidence. Use
+`--gemini-cmd PATH` to configure both Gemini agent invocations and the final
+repair pass. The original response is saved before recovery; `retry-validate`
+repair directories and PR-fix debug directories remain the final fallback for
+genuinely unrecoverable output.
 
 ## Session state
 

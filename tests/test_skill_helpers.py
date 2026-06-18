@@ -254,6 +254,32 @@ class TestValidateResponse:
         )
         assert "validation passed: plan_revision" in result.stdout
 
+    def test_callable_validator_preserves_unknown_prior_item_error_type(self) -> None:
+        from coding_review_agent_loop.errors import UnknownPriorItemDispositionError
+        from helpers.validate_response import validate_response_text
+
+        review = json.dumps({
+            "schema_version": 1,
+            "kind": "plan_review",
+            "state": "blocking",
+            "summary": "Blocking.",
+            "blocking_plan_issues": ["Fix it."],
+            "same_plan_followups": [],
+            "future_followups": [],
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-unknown", "disposition": "resolved"}
+            ],
+        }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Codex\n"
+
+        with pytest.raises(UnknownPriorItemDispositionError) as exc_info:
+            validate_response_text(
+                review,
+                kind="plan_review",
+                reviewer="Codex",
+                prior_items=[],
+            )
+        assert exc_info.value.unknown_ids == ("item-unknown",)
+
 
 # ---------------------------------------------------------------------------
 # helpers/state_manager.py  (session round-trip + attach-metadata)
@@ -886,6 +912,212 @@ class TestRetryValidate:
             assert output["blocking_items"][0]["text"] == "Address the followup from last round."
 
 
+class TestStructuredSkillRecovery:
+    @staticmethod
+    def _prior_item(item_id: str = "item-1") -> dict:
+        return {
+            "item_id": item_id,
+            "reviewer": "Codex",
+            "source_round": 1,
+            "text": "Fix the issue.",
+            "status": "blocking",
+            "source_status": "blocking",
+            "notes": [],
+        }
+
+    def test_reviewer_envelope_and_unknown_item_are_recovered(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from helpers.validate_response import validate_response_text
+
+        raw = json.dumps({
+            "schema_version": 1,
+            "kind": "plan_review",
+            "state": "blocking",
+            "summary": "One issue remains.",
+            "blocking_plan_issues": ["Still broken."],
+            "same_plan_followups": [],
+            "future_followups": [],
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-1", "disposition": "blocking"},
+                {"item_id": "item-invented", "disposition": "resolved"},
+            ],
+        }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Codex\ntrailing prose"
+        original = raw
+        monkeypatch.setattr(sr, "attempt_repair", lambda *a, **k: pytest.fail("repair not needed"))
+        validate = lambda text: validate_response_text(
+            text,
+            kind="plan_review",
+            reviewer="Codex",
+            prior_items=[self._prior_item()],
+        )
+
+        recovered, parsed = sr._recover_structured_response(
+            raw,
+            expected_kind="plan_review",
+            validate=validate,
+            allowed_prior_item_ids=["item-1"],
+            reviewer_normalization=True,
+        )
+
+        assert raw == original
+        assert "item-invented" not in recovered
+        assert parsed.state == "blocking"
+
+    def test_custom_gemini_command_reaches_repair(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from helpers.validate_response import validate_response_text
+
+        seen: dict[str, object] = {}
+        repaired = _VALID_PLAN_REVIEW_DRY
+
+        def fake_repair(raw, gemini_cmd, **kwargs):
+            seen.update({"raw": raw, "gemini_cmd": gemini_cmd, "kwargs": kwargs})
+            return repaired
+
+        monkeypatch.setattr(sr, "attempt_repair", fake_repair)
+        validate = lambda text: validate_response_text(
+            text, kind="plan_review", reviewer="Codex",
+        )
+        recovered, _ = sr._recover_structured_response(
+            "malformed review",
+            expected_kind="plan_review",
+            validate=validate,
+            gemini_cmd="/opt/bin/gemini-custom",
+            reviewer_normalization=True,
+        )
+
+        assert recovered == repaired
+        assert seen["gemini_cmd"] == "/opt/bin/gemini-custom"
+        assert seen["kwargs"]["expected_kind"] == "plan_review"
+
+    def test_plan_revision_ack_reconstructed_from_unique_evidence(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.protocol import validate_human_requirements_acknowledgement
+        from helpers.validate_response import validate_response_text
+
+        raw = json.dumps({
+            "schema_version": 1,
+            "kind": "plan_revision",
+            "state": "blocking",
+            "summary": "Revised.",
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-1", "disposition": "resolved"}
+            ],
+            "plan_steps": ["Implement the fix."],
+        }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Codex"
+        acknowledgement = (
+            "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+            "### Human requirements\n\n"
+            "- Requirement 1: preserved the required behavior."
+        )
+        monkeypatch.setattr(sr, "attempt_repair", lambda *a, **k: pytest.fail("repair not needed"))
+
+        def validate(text):
+            parsed = validate_response_text(
+                text,
+                kind="plan_revision",
+                prior_items=[self._prior_item()],
+            )
+            validate_human_requirements_acknowledgement(
+                text,
+                surfaced_requirement_ids=("Requirement 1",),
+                requires_direct_discussion_ack=False,
+            )
+            return parsed
+
+        recovered, _ = sr._recover_structured_response(
+            raw,
+            expected_kind="plan_revision",
+            validate=validate,
+            allowed_prior_item_ids=["item-1"],
+            surfaced_requirement_ids=["Requirement 1"],
+            response_evidence={"message_text": f"notes\n{acknowledgement}\n-- Codex"},
+        )
+        assert acknowledgement in recovered
+
+    def test_plan_revision_ambiguous_ack_evidence_falls_through(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.protocol import validate_human_requirements_acknowledgement
+        from helpers.validate_response import validate_response_text
+
+        raw = json.dumps({
+            "schema_version": 1,
+            "kind": "plan_revision",
+            "state": "blocking",
+            "summary": "Revised.",
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-1", "disposition": "resolved"}
+            ],
+            "plan_steps": ["Implement the fix."],
+        }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Codex"
+        first = (
+            "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n### Human requirements\n"
+            "- Requirement 1: first explanation."
+        )
+        second = (
+            "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n### Human requirements\n"
+            "- Requirement 1: different explanation."
+        )
+        monkeypatch.setattr(sr, "attempt_repair", lambda *a, **k: None)
+
+        def validate(text):
+            parsed = validate_response_text(
+                text, kind="plan_revision", prior_items=[self._prior_item()],
+            )
+            validate_human_requirements_acknowledgement(
+                text,
+                surfaced_requirement_ids=("Requirement 1",),
+                requires_direct_discussion_ack=False,
+            )
+            return parsed
+
+        with pytest.raises(AgentLoopError, match="signed human requirements"):
+            sr._recover_structured_response(
+                raw,
+                expected_kind="plan_revision",
+                validate=validate,
+                allowed_prior_item_ids=["item-1"],
+                surfaced_requirement_ids=["Requirement 1"],
+                response_evidence={"message_text": f"{first}\n-- Codex\n{second}\n-- Codex"},
+            )
+
+    def test_coder_followup_envelope_recovery(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from helpers.validate_response import validate_response_text
+
+        raw = json.dumps({
+            "schema_version": 1,
+            "kind": "coder_followup",
+            "state": "approved",
+            "summary": "Fixed.",
+            "addressed_items": ["item-1"],
+            "remaining_items": [],
+            "addressed_item_notes": {"item-1": "Implemented."},
+            "remaining_item_notes": {},
+            "human_requirements": {
+                "addressed_ids": [],
+                "checked_discussion_directly": False,
+            },
+            "tests_run": [],
+        }) + "\n<!-- AGENT_STATE: approved -->\n-- Codex\nextra"
+        monkeypatch.setattr(sr, "attempt_repair", lambda *a, **k: pytest.fail("repair not needed"))
+        validate = lambda text: validate_response_text(
+            text,
+            kind="coder_followup",
+            prior_items=[self._prior_item()],
+        )
+
+        recovered, parsed = sr._recover_structured_response(
+            raw,
+            expected_kind="coder_followup",
+            validate=validate,
+            unresolved_item_ids=["item-1"],
+        )
+        assert recovered.endswith("-- Codex")
+        assert parsed.state == "approved"
+
+
 # ---------------------------------------------------------------------------
 # helpers/run_external.py  retry loop (in-process, monkeypatched backend)
 # ---------------------------------------------------------------------------
@@ -991,6 +1223,39 @@ class TestRunExternalRetries:
         )
         assert exit_code == 1
         assert "Invalid stream" in Path(output_path).read_text(encoding="utf-8")
+
+    def test_writes_minimal_response_evidence_sidecar(self, monkeypatch, tmp_path) -> None:
+        import helpers.run_external as rex
+        from coding_review_agent_loop.agents.base import AgentResult
+
+        class FakeBackend:
+            def run(self, runner, config, prompt):
+                return AgentResult(
+                    text="public",
+                    response_file_text="public",
+                    message_text="captured acknowledgement",
+                )
+
+        monkeypatch.setattr("coding_review_agent_loop.agents.codex.CodexBackend", FakeBackend)
+        prompt = tmp_path / "prompt.md"
+        output = tmp_path / "output.md"
+        evidence = tmp_path / "evidence.json"
+        prompt.write_text("Review this.", encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", [
+            "run_external",
+            "--agent", "codex",
+            "--prompt-file", str(prompt),
+            "--output", str(output),
+            "--workdir", str(tmp_path),
+            "--response-evidence-output", str(evidence),
+        ])
+
+        rex.main()
+
+        assert json.loads(evidence.read_text(encoding="utf-8")) == {
+            "response_file_text": "public",
+            "message_text": "captured acknowledgement",
+        }
 
 
 # ---------------------------------------------------------------------------

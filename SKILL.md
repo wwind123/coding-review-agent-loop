@@ -294,7 +294,11 @@ Plan-loop onward (including the optional Implement step + PR-loop).
   is re-attempted on the next run (or drop it from `--reviewers` to proceed). A
   round with an unavailable reviewer is never reported `approved`: its `state` is
   `incomplete` (or `blocking`/`pending` if those apply first). A genuinely
-  malformed-but-content-bearing review still uses the `retry-validate` repair path.
+  malformed-but-content-bearing structured output is first recovered automatically
+  when possible. The skill applies its safe reviewer normalizers, envelope cleanup,
+  known-ledger unknown-disposition stripping, plan-revision human-requirements
+  acknowledgement reconstruction, and finally a Gemini format-repair pass. Only
+  genuinely unrecoverable output falls back to `retry-validate`.
 - **Round states.** `approved` (all configured reviewers signed off) · `blocking`
   (a reviewer reported must-fix items) · `pending` (a host `claude` review handoff
   is outstanding — complete it with `complete-host-review`) · `incomplete` (a
@@ -344,10 +348,16 @@ discriminate them): you just re-run the command until it returns
   plan is carried forward for reviewers);
 - **round complete, all approved** → returns `approved`.
 
-If a coder turn produces a malformed plan, the raw response is saved to a repair
-dir (manifest `role: coder`); fix `raw.md` and recover with
-`retry-validate --repair-dir <dir>` (no re-run of the agent), then re-run
-`run-plan-round`.
+Structured reviewer responses, round-N `plan_revision` responses, and
+`run-pr-fix` `coder_followup` responses use the same automatic recovery order:
+safe deterministic normalization, envelope normalization, known-ledger
+disposition cleanup, context-specific acknowledgement reconstruction, then a
+Gemini format-repair pass. Pass `--gemini-cmd PATH` to the round/fix command to
+select the Gemini executable used both for Gemini agent turns and repair. The
+agent's original output is saved before recovery. If every recovery stage fails,
+fix the preserved repair-dir `raw.md` with
+`retry-validate --repair-dir <dir>` (or inspect the PR-fix debug directory), then
+re-run the parent command.
 
 ### Host-as-reviewer (Claude reviews the plan or PR)
 
