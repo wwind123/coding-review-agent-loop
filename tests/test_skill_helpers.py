@@ -2373,6 +2373,8 @@ class TestRunPrFix:
             reviewers=["codex"],
             workdir=str(tmp_path),
             workdir_codex=None,
+            antigravity_models=["Model A", "Model B"],
+            antigravity_quota_signatures=["Quota Hit", "429"],
             dry_run=False,
         )
         sr.cmd_run_pr_fix(args)
@@ -2382,6 +2384,11 @@ class TestRunPrFix:
         assert output["head_sha"] == "head-new"
         assert output["addressed_item_count"] == 1
         assert any(call[:2] == ("helpers.gh_ops", "post-issue-comment") for call in helper_calls)
+        external_call = next(call for call in helper_calls if call[:1] == ("helpers.run_external",))
+        assert external_call[external_call.index("--antigravity-models") + 1:] == (
+            "Model A", "Model B",
+            "--antigravity-quota-signatures", "Quota Hit", "429",
+        )
 
     def test_missing_pr_marker_rejected(self) -> None:
         from coding_review_agent_loop.errors import AgentLoopError
@@ -2410,8 +2417,9 @@ class TestRunImplement:
             result = _run(
                 "helpers.skill_runner", "run-implement",
                 "--issue", "9992", "--repo", "test/skill-repo",
-                "--coder", "codex", "--plan-file", str(plan),
+                "--coder", "antigravity", "--plan-file", str(plan),
                 "--workdir", str(tmppath), "--base", "release-x",
+                "--antigravity-models", "Model A", "Model B",
                 "--dry-run",
                 env=env,
             )
@@ -3051,6 +3059,7 @@ class TestAntigravitySkill:
                 "helpers.skill_runner", "run-plan-round",
                 "--issue", "9991", "--repo", "test/skill-repo",
                 "--coder", "antigravity", "--reviewers", "codex",
+                "--antigravity-models", "Model A", "Model B",
                 "--dry-run",
                 env=env,
             )
@@ -3073,12 +3082,131 @@ class TestAntigravitySkill:
                 "helpers.skill_runner", "run-plan-round",
                 "--issue", "9990", "--repo", "test/skill-repo",
                 "--plan-file", str(plan), "--reviewers", "antigravity",
+                "--model", "Model X",
                 "--dry-run",
                 env=env,
             )
             assert result.returncode == 0, result.stderr
             output = self._last_json(result.stdout)
             assert "Antigravity" in output["approved_reviewers"]
+
+    @pytest.mark.parametrize(
+        ("extra_args", "expected_models", "expected_signatures"),
+        [
+            (
+                (),
+                ("Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (High)"),
+                ("quota", "rate limit", "resource exhausted", "RESOURCE_EXHAUSTED", "429"),
+            ),
+            (("--model", "Model X"), ("Model X",), ("quota", "rate limit", "resource exhausted", "RESOURCE_EXHAUSTED", "429")),
+            (
+                ("--antigravity-models", "Model A", "Model B"),
+                ("Model A", "Model B"),
+                ("quota", "rate limit", "resource exhausted", "RESOURCE_EXHAUSTED", "429"),
+            ),
+            (
+                ("--antigravity-quota-signatures", "Quota Hit", "429"),
+                ("Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (High)"),
+                ("Quota Hit", "429"),
+            ),
+        ],
+    )
+    def test_run_external_resolves_antigravity_config(
+        self,
+        monkeypatch,
+        tmp_path,
+        extra_args,
+        expected_models,
+        expected_signatures,
+    ) -> None:
+        import helpers.run_external as rex
+        from coding_review_agent_loop.agents.base import AgentResult
+
+        captured = {}
+
+        class FakeBackend:
+            def run(self, runner, config, prompt):
+                captured["config"] = config
+                return AgentResult(text="review complete", returncode=0)
+
+        monkeypatch.setattr(
+            "coding_review_agent_loop.agents.antigravity.AntigravityBackend",
+            FakeBackend,
+        )
+        prompt = tmp_path / "prompt.md"
+        output = tmp_path / "output.md"
+        prompt.write_text("review this", encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", [
+            "run_external",
+            "--agent", "antigravity",
+            "--prompt-file", str(prompt),
+            "--output", str(output),
+            "--workdir", str(tmp_path),
+            "--max-retries", "0",
+            *extra_args,
+        ])
+
+        rex.main()
+
+        config = captured["config"]
+        assert config.antigravity_models == expected_models
+        assert config.antigravity_quota_signatures == expected_signatures
+
+    def test_run_external_rejects_single_model_and_chain_together(self, tmp_path) -> None:
+        result = _run(
+            "helpers.run_external",
+            "--agent", "antigravity",
+            "--prompt-file", _write_tmp("review it"),
+            "--output", str(tmp_path / "out.md"),
+            "--workdir", str(tmp_path),
+            "--model", "Model X",
+            "--antigravity-models", "Model A", "Model B",
+            "--dry-run",
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "not allowed with argument" in result.stderr
+
+    @pytest.mark.parametrize(
+        ("namespace", "expected"),
+        [
+            (types.SimpleNamespace(), ()),
+            (types.SimpleNamespace(model="Model X"), ("--model", "Model X")),
+            (
+                types.SimpleNamespace(antigravity_models=["Model A", "Model B"]),
+                ("--antigravity-models", "Model A", "Model B"),
+            ),
+            (
+                types.SimpleNamespace(
+                    antigravity_models=["Model A", "Model B"],
+                    antigravity_quota_signatures=["Quota Hit", "429"],
+                ),
+                (
+                    "--antigravity-models", "Model A", "Model B",
+                    "--antigravity-quota-signatures", "Quota Hit", "429",
+                ),
+            ),
+        ],
+    )
+    def test_skill_runner_converts_antigravity_options(self, namespace, expected) -> None:
+        from helpers.skill_runner import _run_external_antigravity_args
+
+        assert _run_external_antigravity_args(namespace) == expected
+
+    def test_skill_runner_rejects_single_model_and_chain_together(self) -> None:
+        result = _run(
+            "helpers.skill_runner", "run-plan-round",
+            "--issue", "1",
+            "--repo", "o/r",
+            "--plan-file", _write_tmp(_VALID_PLAN_STATE),
+            "--reviewers", "antigravity",
+            "--model", "Model X",
+            "--antigravity-models", "Model A", "Model B",
+            "--dry-run",
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "not allowed with argument" in result.stderr
 
 
 # ---------------------------------------------------------------------------

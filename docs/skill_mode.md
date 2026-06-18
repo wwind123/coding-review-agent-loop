@@ -76,9 +76,15 @@ Merge stays a human decision.
 
 The external agent can be `codex`, `gemini`, or `antigravity` (the `agy` CLI —
 the migration path for Gemini CLI consumer access, which Google retires on
-2026-06-18; pick its model with `--antigravity-model`, default `Gemini 3.1 Pro
-(High)`). Antigravity turns are single-shot (no cross-round session resume) and
-report estimated token usage.
+2026-06-18). With no override, Antigravity uses the ordered fallback chain
+`Gemini 3.1 Pro (High)` → `Gemini 3.5 Flash (High)`. Use `--model MODEL` for the
+legacy single-model override or `--antigravity-models MODEL [MODEL ...]` for a
+custom ordered chain; these options are mutually exclusive. Use
+`--antigravity-quota-signatures SIGNATURE [SIGNATURE ...]` to customize the
+output signatures that trigger fallback. These options are available on plan,
+task, PR-review, implementation, decomposition, phased implementation, and
+PR-fix commands. Antigravity turns are single-shot (no cross-round session
+resume) and report estimated token usage.
 
 ## Approved-plan execution helpers
 

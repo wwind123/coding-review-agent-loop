@@ -367,6 +367,45 @@ def _workdir_for_agent(agent: str, args: argparse.Namespace) -> str:
     return str(tmp)
 
 
+def _add_antigravity_options(parser: argparse.ArgumentParser) -> None:
+    """Add Antigravity model-chain overrides shared by external-agent commands."""
+    models = parser.add_mutually_exclusive_group()
+    models.add_argument(
+        "--model",
+        default=None,
+        help="Legacy single-model Antigravity override.",
+    )
+    models.add_argument(
+        "--antigravity-models",
+        nargs="+",
+        default=None,
+        help="Ordered Antigravity model fallback chain.",
+    )
+    parser.add_argument(
+        "--antigravity-quota-signatures",
+        nargs="+",
+        default=None,
+        help="Output signatures that trigger fallback to the next Antigravity model.",
+    )
+
+
+def _run_external_antigravity_args(args: argparse.Namespace) -> tuple[str, ...]:
+    """Convert skill-runner Antigravity options to run_external arguments."""
+    result: list[str] = []
+    model = getattr(args, "model", None)
+    models = getattr(args, "antigravity_models", None)
+    quota_signatures = getattr(args, "antigravity_quota_signatures", None)
+    if model is not None:
+        result.extend(("--model", model))
+    elif models is not None:
+        result.append("--antigravity-models")
+        result.extend(models)
+    if quota_signatures is not None:
+        result.append("--antigravity-quota-signatures")
+        result.extend(quota_signatures)
+    return tuple(result)
+
+
 def _model_used_from_usage(usage_file: Path) -> str:
     """Model the agent ran, read from run_external's usage sidecar (#332).
 
@@ -1030,6 +1069,7 @@ def _run_reviewer(
     workdir: str,
     dry_run: bool,
     tmpdir: Path,
+    external_args: tuple[str, ...] = (),
     item_id_offset: int = 0,
 ) -> dict:
     """Run one reviewer turn; return {reviewer_name, state, blocking_items, new_items}."""
@@ -1060,6 +1100,7 @@ def _run_reviewer(
         "--repo", repo,
         "--flow", flow,
         "--usage-output", str(usage_file),
+        *external_args,
         *(["--dry-run"] if dry_run else []),
         check=False,
     )
@@ -1586,6 +1627,7 @@ def _run_external_coder_phase(
             "--repo", repo,
             "--flow", "plan",
             "--usage-output", str(usage_file),
+            *_run_external_antigravity_args(args),
             *(["--dry-run"] if dry_run else []),
         )
 
@@ -1919,6 +1961,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                 workdir=workdir,
                 dry_run=dry_run,
                 tmpdir=tmpdir,
+                external_args=_run_external_antigravity_args(args),
                 item_id_offset=item_id_offset,
             )
             if record["state"] == "unavailable":
@@ -2136,6 +2179,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 workdir=workdir,
                 dry_run=dry_run,
                 tmpdir=tmpdir,
+                external_args=_run_external_antigravity_args(args),
                 item_id_offset=item_id_offset,
             )
             if record["state"] == "unavailable":
@@ -2585,6 +2629,7 @@ def _run_child_or_one_shot_implementation(
     runner: Runner,
     post_one_shot_handoff: bool,
     one_shot_mode: str = "implement-one-shot",
+    external_args: tuple[str, ...] = (),
 ) -> dict:
     from coding_review_agent_loop.config import sync_coder_base_before_implementation
     from coding_review_agent_loop.decomposition import (
@@ -2635,6 +2680,7 @@ def _run_child_or_one_shot_implementation(
             "--workdir", str(workdir),
             "--flow", "pr",
             "--usage-output", str(usage_file),
+            *external_args,
             *(["--dry-run"] if dry_run else []),
         )
         coder_output = raw_output.read_text(encoding="utf-8")
@@ -2804,6 +2850,7 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         runner=runner,
         post_one_shot_handoff=True,
         one_shot_mode=mode,
+        external_args=_run_external_antigravity_args(args),
     )
     print(json.dumps(result_json, indent=2))
     print(
@@ -2957,6 +3004,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             "--workdir", workdir,
             "--flow", "pr",
             "--usage-output", str(usage_file),
+            *_run_external_antigravity_args(args),
             *(["--dry-run"] if dry_run else []),
         )
         coder_output = raw_output.read_text(encoding="utf-8")
@@ -3233,6 +3281,7 @@ def _run_decomposition_for_skill(
             "--repo", repo,
             "--flow", "decompose",
             "--usage-output", str(usage_file),
+            *_run_external_antigravity_args(args),
             *(["--dry-run"] if dry_run else []),
         )
         coder_output = raw_output.read_text(encoding="utf-8")
@@ -3426,6 +3475,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
             config=impl_config,
             runner=impl_runner,
             post_one_shot_handoff=False,
+            external_args=_run_external_antigravity_args(args),
         )
         result_json.update({
             "state": "would-implement",
@@ -3502,6 +3552,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         config=impl_config,
         runner=impl_runner,
         post_one_shot_handoff=False,
+        external_args=_run_external_antigravity_args(args),
     )
     result_json.update({
         "state": "implemented",
@@ -3552,6 +3603,7 @@ def main() -> None:
     p_plan.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
     p_plan.add_argument("--dry-run", action="store_true")
+    _add_antigravity_options(p_plan)
 
     # run-pr-round
     p_pr = subparsers.add_parser("run-pr-round", help="Run one PR review round.")
@@ -3591,6 +3643,7 @@ def main() -> None:
     p_pr.add_argument("--refresh-agent-memory", action="store_true",
                       help="Regenerate the agent-memory cache before this round.")
     p_pr.add_argument("--dry-run", action="store_true")
+    _add_antigravity_options(p_pr)
 
     # retry-validate
     p_retry = subparsers.add_parser(
@@ -3641,6 +3694,7 @@ def main() -> None:
     p_impl.add_argument("--workdir-codex", default=None)
     p_impl.add_argument("--workdir-gemini", default=None)
     p_impl.add_argument("--dry-run", action="store_true")
+    _add_antigravity_options(p_impl)
 
     # run-pr-fix
     p_pr_fix = subparsers.add_parser(
@@ -3666,6 +3720,7 @@ def main() -> None:
     p_pr_fix.add_argument("--workdir-gemini", default=None)
     p_pr_fix.add_argument("--workdir-antigravity", default=None)
     p_pr_fix.add_argument("--dry-run", action="store_true")
+    _add_antigravity_options(p_pr_fix)
 
     # run-implement-by-phase
     p_impl_phase = subparsers.add_parser(
@@ -3691,6 +3746,7 @@ def main() -> None:
     p_impl_phase.add_argument("--workdir-codex", default=None)
     p_impl_phase.add_argument("--workdir-gemini", default=None)
     p_impl_phase.add_argument("--dry-run", action="store_true")
+    _add_antigravity_options(p_impl_phase)
 
     # run-decompose
     p_decompose = subparsers.add_parser(
@@ -3709,6 +3765,7 @@ def main() -> None:
     p_decompose.add_argument("--workdir-codex", default=None)
     p_decompose.add_argument("--workdir-gemini", default=None)
     p_decompose.add_argument("--dry-run", action="store_true")
+    _add_antigravity_options(p_decompose)
 
     # run-task-round
     p_task = subparsers.add_parser(
@@ -3739,6 +3796,7 @@ def main() -> None:
     p_task.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
     p_task.add_argument("--dry-run", action="store_true")
+    _add_antigravity_options(p_task)
 
     args = parser.parse_args()
     dispatch = {

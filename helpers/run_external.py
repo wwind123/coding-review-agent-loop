@@ -117,10 +117,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one external agent turn.")
     parser.add_argument("--agent", required=True, choices=["codex", "gemini", "antigravity"])
     parser.add_argument("--prompt-file", required=True, help="Path to prompt text file.")
-    parser.add_argument(
+    antigravity_models = parser.add_mutually_exclusive_group()
+    antigravity_models.add_argument(
         "--model", default=None,
-        help="Model override (antigravity only; as shown by `agy models`). "
-             "Defaults to 'Gemini 3.1 Pro (High)'.",
+        help="Legacy single-model override (antigravity only; as shown by `agy models`).",
+    )
+    antigravity_models.add_argument(
+        "--antigravity-models",
+        nargs="+",
+        default=None,
+        help="Ordered Antigravity model fallback chain.",
+    )
+    parser.add_argument(
+        "--antigravity-quota-signatures",
+        nargs="+",
+        default=None,
+        help="Output signatures that trigger fallback to the next Antigravity model.",
     )
     parser.add_argument("--output", required=True, help="Path to write the agent response.")
     parser.add_argument("--workdir", required=True, help="Working directory for the agent.")
@@ -224,7 +236,16 @@ def main() -> None:
     agent_name: AgentName = args.agent
     default_cmds = {"codex": "codex", "gemini": "gemini", "antigravity": "agy"}
     cmd = args.cmd or default_cmds[agent_name]
-    antigravity_model = args.model or "Gemini 3.1 Pro (High)"
+    antigravity_models = (
+        (args.model,)
+        if args.model is not None
+        else tuple(args.antigravity_models or ())
+    )
+    antigravity_quota_signatures = (
+        tuple(args.antigravity_quota_signatures)
+        if args.antigravity_quota_signatures is not None
+        else ("quota", "rate limit", "resource exhausted", "RESOURCE_EXHAUSTED", "429")
+    )
 
     # Build a minimal config sufficient for backend.run()
     import tempfile
@@ -250,8 +271,8 @@ def main() -> None:
         antigravity_cmd=cmd if agent_name == "antigravity" else "agy",
         antigravity_args=("--dangerously-skip-permissions",),
         antigravity_model=None,
-        antigravity_models=(antigravity_model,),
-        antigravity_quota_signatures=("quota", "rate limit", "resource exhausted", "RESOURCE_EXHAUSTED", "429"),
+        antigravity_models=antigravity_models,
+        antigravity_quota_signatures=antigravity_quota_signatures,
         gh_cmd="gh",
         claude_args=(),
         codex_args=("--dangerously-bypass-approvals-and-sandbox",),
