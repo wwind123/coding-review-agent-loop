@@ -18146,6 +18146,16 @@ def test_antigravity_quota_signatures_default_single_source(tmp_path):
     assert config_from_args(args, FakeRunner()).antigravity_quota_signatures == DEFAULT
 
 
+def test_antigravity_models_default_chain_from_constant(tmp_path):
+    """The default model fallback chain resolves from the named constant when
+    neither a legacy model nor an explicit chain is given."""
+    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_MODELS
+    assert make_config(tmp_path).antigravity_models == DEFAULT_ANTIGRAVITY_MODELS
+    parser = build_parser()
+    args = parser.parse_args(["pr", "123", "--repo", "OWNER/REPO", "--codex-dir", str(tmp_path / "codex")])
+    assert config_from_args(args, FakeRunner()).antigravity_models == DEFAULT_ANTIGRAVITY_MODELS
+
+
 def test_cli_rejects_both_antigravity_model_flags():
     parser = build_parser()
     with pytest.raises(SystemExit):

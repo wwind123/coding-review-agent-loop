@@ -30,6 +30,14 @@ DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES: tuple[str, ...] = (
     "429",
 )
 
+# Default Antigravity model fallback chain, applied in __post_init__ when neither a
+# legacy antigravity_model nor an explicit antigravity_models chain is given. Named
+# for discoverability/symmetry with DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES.
+DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
+    "Gemini 3.1 Pro (High)",
+    "Gemini 3.5 Flash (High)",
+)
+
 
 @dataclass(frozen=True)
 class AgentLoopConfig:
@@ -94,7 +102,7 @@ class AgentLoopConfig:
         if self.antigravity_model is not None:
             object.__setattr__(self, "antigravity_models", (self.antigravity_model,))
         elif not self.antigravity_models:
-            object.__setattr__(self, "antigravity_models", ("Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (High)"))
+            object.__setattr__(self, "antigravity_models", DEFAULT_ANTIGRAVITY_MODELS)
         if any(not m.strip() for m in self.antigravity_models):
             raise AgentLoopError("antigravity_models chain cannot be empty or contain blank entries.")
         ensure_no_model_arg_conflicts(self)
