@@ -13,6 +13,7 @@ from .agents.registry import (
     agent_signature,
 )
 from .config import (
+    DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
     AgentLoopConfig,
     config_from_args,
     ensure_agent_workdirs,
@@ -129,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--antigravity-quota-signatures",
             nargs="+",
-            default=["quota", "rate limit", "resource exhausted", "RESOURCE_EXHAUSTED", "429"],
+            default=list(DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES),
             help="Output substrings that trigger model fallback (default: quota, rate limit, etc).",
         )
         subparser.add_argument(

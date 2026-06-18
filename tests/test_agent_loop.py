@@ -18133,6 +18133,19 @@ def test_config_from_args_antigravity_defaults(tmp_path):
     assert str(config.log_dir).startswith(str(config.antigravity_dir))
 
 
+def test_antigravity_quota_signatures_default_single_source(tmp_path):
+    """The quota-signatures default comes from one constant — no drift across the
+    dataclass field, the CLI flag, and config_from_args (#348, #350)."""
+    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES as DEFAULT
+    # dataclass field default
+    assert make_config(tmp_path).antigravity_quota_signatures == DEFAULT
+    # CLI flag default and config_from_args both derive from the constant
+    parser = build_parser()
+    args = parser.parse_args(["pr", "123", "--repo", "OWNER/REPO", "--codex-dir", str(tmp_path / "codex")])
+    assert tuple(args.antigravity_quota_signatures) == DEFAULT
+    assert config_from_args(args, FakeRunner()).antigravity_quota_signatures == DEFAULT
+
+
 def test_cli_rejects_both_antigravity_model_flags():
     parser = build_parser()
     with pytest.raises(SystemExit):

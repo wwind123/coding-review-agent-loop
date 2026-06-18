@@ -229,7 +229,12 @@ def main() -> None:
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
     from coding_review_agent_loop.agents.codex import CodexBackend
     from coding_review_agent_loop.agents.gemini import GeminiBackend
-    from coding_review_agent_loop.config import AgentLoopConfig, AgentName, ensure_temp_checkout
+    from coding_review_agent_loop.config import (
+        DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
+        AgentLoopConfig,
+        AgentName,
+        ensure_temp_checkout,
+    )
     from coding_review_agent_loop.transient import is_transient_agent_output
     from coding_review_agent_loop.usage import estimate_usage
 
@@ -244,7 +249,7 @@ def main() -> None:
     antigravity_quota_signatures = (
         tuple(args.antigravity_quota_signatures)
         if args.antigravity_quota_signatures is not None
-        else ("quota", "rate limit", "resource exhausted", "RESOURCE_EXHAUSTED", "429")
+        else DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES
     )
 
     # Build a minimal config sufficient for backend.run()

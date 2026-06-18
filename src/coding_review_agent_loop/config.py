@@ -19,6 +19,17 @@ from .logging import log
 from .runner import Runner
 from .workdirs import active_workdir, agent_workdir
 
+# Single source of truth for the Antigravity quota-exhaustion fallback signatures
+# (#348, #350). The dataclass field default, config_from_args, the CLI flag default,
+# and helpers/run_external.py all derive from this so the default can't drift.
+DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES: tuple[str, ...] = (
+    "quota",
+    "rate limit",
+    "resource exhausted",
+    "RESOURCE_EXHAUSTED",
+    "429",
+)
+
 
 @dataclass(frozen=True)
 class AgentLoopConfig:
@@ -66,7 +77,7 @@ class AgentLoopConfig:
     antigravity_args: tuple[str, ...] = ()
     antigravity_model: str | None = None
     antigravity_models: tuple[str, ...] = ()
-    antigravity_quota_signatures: tuple[str, ...] = ("quota", "rate limit", "resource exhausted", "RESOURCE_EXHAUSTED", "429")
+    antigravity_quota_signatures: tuple[str, ...] = DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES
     # Declared model / reasoning effort for the dynamic signature (#332). Empty
     # means "not declared" (the agent runs its own default and the signature
     # falls back to the generic provider name). antigravity always has a model.
@@ -670,7 +681,10 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         ),
         antigravity_model=args.antigravity_model,
         antigravity_models=tuple(args.antigravity_models) if getattr(args, "antigravity_models", None) is not None else (),
-        antigravity_quota_signatures=tuple(getattr(args, "antigravity_quota_signatures", ["quota", "rate limit", "resource exhausted", "RESOURCE_EXHAUSTED", "429"])),
+        antigravity_quota_signatures=tuple(
+            getattr(args, "antigravity_quota_signatures", None)
+            or DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES
+        ),
         codex_model=getattr(args, "codex_model", ""),
         codex_reasoning_effort=getattr(args, "codex_reasoning_effort", ""),
         gemini_model=getattr(args, "gemini_model", ""),

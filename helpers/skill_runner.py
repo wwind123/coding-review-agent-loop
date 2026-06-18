@@ -1297,6 +1297,9 @@ def cmd_run_task_round(args: argparse.Namespace) -> None:
         print(f"reusing issue #{issue} for task {key[:12]}")
 
     args.issue = issue
+    # Delegates with the full args namespace, so options added to p_task via
+    # _add_antigravity_options (--antigravity-models / --antigravity-quota-signatures,
+    # --model) are forwarded intact to the plan round and on to run_external (#347).
     cmd_run_plan_round(args)
 
 

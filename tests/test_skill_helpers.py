@@ -3214,6 +3214,32 @@ class TestAntigravitySkill:
 # ---------------------------------------------------------------------------
 
 
+def test_run_task_round_forwards_antigravity_options():
+    """run-task-round applies _add_antigravity_options and delegates the full args
+    namespace to the plan round, so the antigravity model/chain/quota options forward
+    to run_external (#347)."""
+    import argparse
+    import helpers.skill_runner as sr
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+    p_task = sub.add_parser("run-task-round")
+    sr._add_antigravity_options(p_task)
+
+    args = parser.parse_args([
+        "run-task-round",
+        "--antigravity-models", "Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (High)",
+        "--antigravity-quota-signatures", "quota", "429",
+    ])
+    assert sr._run_external_antigravity_args(args) == (
+        "--antigravity-models", "Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (High)",
+        "--antigravity-quota-signatures", "quota", "429",
+    )
+    # Legacy single-model override forwards as --model.
+    legacy = parser.parse_args(["run-task-round", "--model", "Gemini 3.1 Pro (High)"])
+    assert sr._run_external_antigravity_args(legacy) == ("--model", "Gemini 3.1 Pro (High)")
+
+
 def test_model_used_from_usage_sidecar(tmp_path):
     import helpers.skill_runner as sr
     sidecar = tmp_path / "agent-usage.json"
