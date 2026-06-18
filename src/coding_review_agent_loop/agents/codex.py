@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,6 +22,15 @@ from ..usage import UsageMetadata, coerce_int, first_present
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
+
+
+_CODEX_THREAD_ID_RE = re.compile(r"[0-9a-fA-F-]+")
+_CODEX_REASONING_EFFORT_KEYS = (
+    "effort",
+    "reasoning_effort",
+    "model_reasoning_effort",
+)
+
 
 def _normalize_codex_usage(payload: object) -> UsageMetadata | None:
     if not isinstance(payload, dict):
@@ -102,6 +112,97 @@ def _codex_model_label(config: AgentLoopConfig) -> str | None:
     if config.codex_reasoning_effort:
         return f"{config.codex_model} ({config.codex_reasoning_effort})"
     return config.codex_model
+
+
+def _extract_codex_thread_id(raw: str) -> str | None:
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "thread.started":
+            continue
+        thread_id = event.get("thread_id")
+        if isinstance(thread_id, str):
+            thread_id = thread_id.strip()
+            if _CODEX_THREAD_ID_RE.fullmatch(thread_id):
+                return thread_id
+    return None
+
+
+def _codex_session_root() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    return Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+
+
+def _find_codex_rollout(thread_id: str) -> Path | None:
+    if not _CODEX_THREAD_ID_RE.fullmatch(thread_id):
+        return None
+    sessions_root = _codex_session_root() / "sessions"
+    try:
+        matches = list(sessions_root.glob(f"**/rollout-*-{thread_id}.jsonl"))
+    except OSError:
+        return None
+
+    newest: tuple[int, str, Path] | None = None
+    for path in matches:
+        try:
+            candidate = (path.stat().st_mtime_ns, str(path), path)
+        except OSError:
+            continue
+        if newest is None or candidate > newest:
+            newest = candidate
+    return newest[2] if newest is not None else None
+
+
+def _model_record_containers(record: dict[object, object]) -> tuple[dict[object, object], ...]:
+    containers = [record]
+    for key in ("payload", "turn", "turn_context"):
+        value = record.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    return tuple(containers)
+
+
+def _read_codex_rollout_model(rollout_path: Path) -> str | None:
+    model: str | None = None
+    effort: str | None = None
+    try:
+        with rollout_path.open(encoding="utf-8") as rollout:
+            for line in rollout:
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                for container in _model_record_containers(record):
+                    candidate = container.get("model")
+                    if not isinstance(candidate, str) or not candidate.strip():
+                        continue
+                    model = candidate.strip()
+                    effort = None
+                    for key in _CODEX_REASONING_EFFORT_KEYS:
+                        candidate_effort = container.get(key)
+                        if isinstance(candidate_effort, str) and candidate_effort.strip():
+                            effort = candidate_effort.strip()
+                            break
+    except (OSError, UnicodeError):
+        return None
+
+    if model is None:
+        return None
+    return f"{model} ({effort})" if effort else model
+
+
+def _detect_codex_model(raw: str) -> str | None:
+    thread_id = _extract_codex_thread_id(raw)
+    if thread_id is None:
+        return None
+    rollout_path = _find_codex_rollout(thread_id)
+    if rollout_path is None:
+        return None
+    return _read_codex_rollout_model(rollout_path)
 
 
 def _read_codex_message_file(output_path: Path) -> str | None:
@@ -190,6 +291,7 @@ class CodexBackend:
             response_file_text = read_public_response_file(response_path)
             message_text = _read_codex_message_file(Path(output_path)) or result.stdout
             usage, raw_usage = _extract_codex_usage(result.stdout)
+            model_used = _codex_model_label(config) or _detect_codex_model(result.stdout)
             log(config, f"Codex finished; log: {log_path}")
             return AgentResult(
                 text=response_file_text or message_text,
@@ -201,7 +303,7 @@ class CodexBackend:
                 returncode=result.returncode,
                 usage=usage,
                 raw_usage=raw_usage,
-                model_used=_codex_model_label(config),
+                model_used=model_used,
             )
         finally:
             try:

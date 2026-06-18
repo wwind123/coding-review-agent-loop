@@ -214,11 +214,12 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
         )
     if config.codex_reasoning_effort and not config.codex_model:
         # The declared flags exist to stamp the signature, which needs the model
-        # name; codex does not report its model, so effort alone can't be labeled.
+        # name. Rollout-file detection is best-effort, so effort alone cannot
+        # reliably be labeled.
         raise AgentLoopError(
             "--codex-reasoning-effort requires --codex-model so the signature can "
-            "name the model (codex does not report its model). To set effort without "
-            "stamping the signature, use --codex-arg -c model_reasoning_effort=... instead."
+            "reliably name the model. To set effort without stamping the signature, "
+            "use --codex-arg -c model_reasoning_effort=... instead."
         )
     if config.gemini_model and _args_have_model_flag(config.gemini_args):
         raise AgentLoopError(

@@ -146,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
             default="",
             help=(
                 "Codex reasoning effort (e.g. low/medium/high) to run and stamp in the "
-                "signature. Requires --codex-model (codex does not report its model). "
+                "signature. Requires --codex-model because rollout detection is best-effort. "
                 "Mutually exclusive with model_reasoning_effort via --codex-arg."
             ),
         )

@@ -1743,6 +1743,159 @@ def test_codex_backend_dry_run_sets_message_text_without_response_file(tmp_path)
     assert result.text == "dry run stdout"
 
 
+def _write_codex_rollout(
+    codex_home: Path,
+    thread_id: str,
+    records: list[object],
+    *,
+    name_prefix: str = "rollout-2026-06-18T12-00-00",
+) -> Path:
+    rollout_path = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "06"
+        / "18"
+        / f"{name_prefix}-{thread_id}.jsonl"
+    )
+    rollout_path.parent.mkdir(parents=True, exist_ok=True)
+    rollout_path.write_text(
+        "\n".join(
+            record if isinstance(record, str) else json.dumps(record)
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+    return rollout_path
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        ({"payload": {"model": "gpt-5.5"}}, "gpt-5.5"),
+        (
+            {"type": "turn_context", "payload": {"model": "gpt-5.5", "effort": "high"}},
+            "gpt-5.5 (high)",
+        ),
+        (
+            {"turn": {"model": "gpt-5.5", "model_reasoning_effort": "medium"}},
+            "gpt-5.5 (medium)",
+        ),
+    ],
+)
+def test_codex_backend_detects_model_from_rollout(tmp_path, monkeypatch, record, expected):
+    thread_id = "019ed9d8-1111-7222-8333-444444444444"
+    codex_home = tmp_path / "codex-home"
+    _write_codex_rollout(codex_home, thread_id, [record])
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    runner = FakeRunner(
+        codex_outputs=[
+            {
+                "public_response": "last message text",
+                "stdout": json.dumps({"type": "thread.started", "thread_id": thread_id}),
+            }
+        ]
+    )
+    config = make_config(tmp_path)
+
+    result = CODEX_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
+
+    assert result.model_used == expected
+
+
+def test_codex_backend_declared_model_takes_precedence_over_rollout(tmp_path, monkeypatch):
+    thread_id = "019ed9d8-1111-7222-8333-444444444444"
+    codex_home = tmp_path / "codex-home"
+    _write_codex_rollout(
+        codex_home,
+        thread_id,
+        [{"payload": {"model": "gpt-5.5", "effort": "high"}}],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    runner = FakeRunner(
+        codex_outputs=[
+            {
+                "public_response": "last message text",
+                "stdout": json.dumps({"type": "thread.started", "thread_id": thread_id}),
+            }
+        ]
+    )
+    config = make_config(
+        tmp_path,
+        codex_model="gpt-5.4",
+        codex_reasoning_effort="medium",
+    )
+
+    result = CODEX_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
+
+    assert result.model_used == "gpt-5.4 (medium)"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "records"),
+    [
+        ("not json", [{"payload": {"model": "gpt-5.5"}}]),
+        (
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "019ed9d8-1111-7222-8333-444444444444",
+                }
+            ),
+            None,
+        ),
+        (
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "019ed9d8-1111-7222-8333-444444444444",
+                }
+            ),
+            ["not json", {"payload": {"model": ""}}, {"payload": {"model": 55}}],
+        ),
+    ],
+)
+def test_codex_backend_missing_or_invalid_rollout_model_falls_back_to_none(
+    tmp_path,
+    monkeypatch,
+    stdout,
+    records,
+):
+    thread_id = "019ed9d8-1111-7222-8333-444444444444"
+    codex_home = tmp_path / "codex-home"
+    if records is not None:
+        _write_codex_rollout(codex_home, thread_id, records)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    runner = FakeRunner(
+        codex_outputs=[{"public_response": "last message text", "stdout": stdout}]
+    )
+    config = make_config(tmp_path)
+
+    result = CODEX_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
+
+    assert result.model_used is None
+
+
+def test_codex_backend_invalid_rollout_falls_back_to_declared_model(tmp_path, monkeypatch):
+    thread_id = "019ed9d8-1111-7222-8333-444444444444"
+    codex_home = tmp_path / "codex-home"
+    _write_codex_rollout(codex_home, thread_id, ["not json"])
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    runner = FakeRunner(
+        codex_outputs=[
+            {
+                "public_response": "last message text",
+                "stdout": json.dumps({"type": "thread.started", "thread_id": thread_id}),
+            }
+        ]
+    )
+    config = make_config(tmp_path, codex_model="gpt-5.4")
+
+    result = CODEX_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
+
+    assert result.model_used == "gpt-5.4"
+
+
 def test_parse_agent_state_accepts_html_marker():
     assert parse_agent_state("looks fine\n<!-- AGENT_STATE: approved -->") == "approved"
     assert parse_agent_state("needs work\n<!-- agent_state: BLOCKING -->") == "blocking"
