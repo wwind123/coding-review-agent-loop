@@ -58,7 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_common(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--repo", help="GitHub repo as owner/name. Defaults to gh repo view.")
-        subparser.add_argument("--base", default="main", help="PR base branch for new issue work.")
+        subparser.add_argument(
+            "--base",
+            default=None,
+            help=(
+                "Base branch override. Defaults to the PR base for `pr`, otherwise "
+                "the repository default branch."
+            ),
+        )
         subparser.add_argument(
             "--claude-dir",
             type=Path,

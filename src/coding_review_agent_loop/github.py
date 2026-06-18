@@ -102,6 +102,31 @@ def detect_repo(runner: Runner, cwd: Path, gh_cmd: str) -> str:
     return repo
 
 
+def get_repo_default_branch(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    cwd: Path,
+) -> str | None:
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "repo",
+            "view",
+            config.repo,
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ],
+        cwd=cwd,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def get_pr_state(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> str:
     """Return the PR state string ('OPEN', 'CLOSED', or 'MERGED').
 
@@ -223,6 +248,7 @@ def get_pr_review_context(
     *,
     config: AgentLoopConfig,
     pr_number: int,
+    cwd: Path | None = None,
 ) -> PullRequestReviewContext:
     if config.dry_run:
         return PullRequestReviewContext(
@@ -250,7 +276,7 @@ def get_pr_review_context(
             "--json",
             PR_REVIEW_CONTEXT_FIELDS,
         ],
-        cwd=active_workdir(config),
+        cwd=cwd or active_workdir(config),
     )
     data = json.loads(result.stdout or "{}")
     comments = _parse_issue_comments(data.get("comments"))

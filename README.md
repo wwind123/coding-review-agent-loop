@@ -225,6 +225,11 @@ iteration pass:
 agent-loop pr 456 --repo OWNER/REPO
 ```
 
+When `--base` is omitted, `pr` mode uses the pull request's base branch.
+`issue` and `task` modes use the repository default branch. If PR metadata does
+not include a base branch, `pr` mode also falls back to the repository default.
+An explicit `--base BRANCH` always takes precedence.
+
 If `--repo` is omitted, the tool runs `gh repo view` from the current working
 directory, or from `--codex-dir` when that flag is provided, and uses the
 detected `OWNER/REPO`. Pass `--repo` explicitly when running outside the target
@@ -233,7 +238,7 @@ repository.
 When `--claude-dir`, `--codex-dir`, or `--gemini-dir` is omitted for an active
 agent, the tool creates or reuses a repo-scoped temporary checkout such as
 `/tmp/coding-review-agent-loop/OWNER-REPO/codex/repo`. Existing clean temp
-checkouts are fetched and fast-forwarded on the base branch before the agent
+checkouts are fetched and fast-forwarded on the resolved base branch before the agent
 runs. Default temp checkouts are tool-owned and disposable; if one is dirty,
 the tool resets and cleans it before reuse. Explicit persistent directories are
 kept conservative: dirty explicit workdirs fail clearly, and existing git

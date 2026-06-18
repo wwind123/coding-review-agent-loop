@@ -8,13 +8,13 @@ import shlex
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .agents.base import AgentName
 from .agents.registry import default_agent_args
 from .errors import AgentLoopError
-from .github import PullRequestMetadata, detect_repo
+from .github import PullRequestMetadata, detect_repo, get_repo_default_branch
 from .logging import log
 from .runner import Runner
 from .workdirs import active_workdir, agent_workdir
@@ -28,7 +28,7 @@ class AgentLoopConfig:
     gemini_dir: Path
     coder: AgentName
     reviewer: tuple[AgentName, ...]
-    base: str
+    base: str | None
     max_rounds: int
     auto_merge: bool
     dry_run: bool
@@ -95,6 +95,50 @@ class AgentLoopConfig:
 
 def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
     return config.reviewer
+
+
+def github_bootstrap_cwd(config: AgentLoopConfig) -> Path:
+    candidates = (
+        active_workdir(config),
+        *(agent_workdir(config, reviewer) for reviewer in reviewers(config)),
+        Path.cwd(),
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise AgentLoopError("No existing directory is available for GitHub repository metadata queries.")
+
+
+def resolve_base_branch(
+    config: AgentLoopConfig,
+    runner: Runner,
+    *,
+    pr_metadata: PullRequestMetadata | None = None,
+    cwd: Path | None = None,
+) -> AgentLoopConfig:
+    explicit_base = (config.base or "").strip()
+    if explicit_base:
+        return config if explicit_base == config.base else replace(config, base=explicit_base)
+
+    if config.dry_run:
+        return replace(config, base="main")
+
+    pr_base = (pr_metadata.base_branch or "").strip() if pr_metadata is not None else ""
+    if pr_base:
+        return replace(config, base=pr_base)
+
+    default_branch = get_repo_default_branch(
+        runner,
+        config=config,
+        cwd=cwd or github_bootstrap_cwd(config),
+    )
+    if default_branch:
+        return replace(config, base=default_branch)
+
+    raise AgentLoopError(
+        f"Unable to resolve a base branch for {config.repo}. "
+        "Pass --base <branch> explicitly."
+    )
 
 
 def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
@@ -290,6 +334,10 @@ def _sync_base_branch(
     config: AgentLoopConfig,
     runner: Runner,
 ) -> None:
+    if not config.base:
+        raise AgentLoopError(
+            f"Base branch for {config.repo} was not resolved. Pass --base <branch> explicitly."
+        )
     if not path.is_dir():
         raise AgentLoopError(f"{label} does not exist or is not a directory: {path}")
 
@@ -589,7 +637,7 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         gemini_dir=gemini_dir,
         coder=args.coder,
         reviewer=configured_reviewers,
-        base=args.base,
+        base=getattr(args, "base", None),
         max_rounds=args.max_rounds,
         auto_merge=args.auto_merge,
         dry_run=args.dry_run,

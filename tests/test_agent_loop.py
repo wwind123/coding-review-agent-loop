@@ -54,6 +54,7 @@ from coding_review_agent_loop.config import (
     default_agent_memory_dir,
     default_agent_workdir,
     default_cache_root,
+    resolve_base_branch,
 )
 from coding_review_agent_loop.comment_rendering import (
     _render_public_coder_followup_comment,
@@ -216,6 +217,8 @@ class FakeRunner(Runner):
         pr_check_runs_stderr="",
         pr_status_returncode=0,
         pr_status_stderr="",
+        repo_default_branch="main",
+        repo_default_branch_returncode=0,
         git_status="",
         git_remote="git@github.com:OWNER/REPO.git",
         git_inside=True,
@@ -269,6 +272,8 @@ class FakeRunner(Runner):
         self.pr_check_runs_stderr = pr_check_runs_stderr
         self.pr_status_returncode = pr_status_returncode
         self.pr_status_stderr = pr_status_stderr
+        self.repo_default_branch = repo_default_branch
+        self.repo_default_branch_returncode = repo_default_branch_returncode
         self.commands = []
         self.comments = []
         self.issues = []
@@ -596,6 +601,20 @@ class FakeRunner(Runner):
             if "--jq" in cmd and ".headRefOid" in cmd:
                 return CommandResult(cmd, cwd_path, "abc123\n", "", 0)
             return CommandResult(cmd, cwd_path, json_dumps(self.pr_payload), "", 0)
+
+        if cmd[:3] == ["gh", "repo", "view"] and "defaultBranchRef" in cmd:
+            stdout = (
+                f"{self.repo_default_branch}\n"
+                if self.repo_default_branch_returncode == 0 and self.repo_default_branch
+                else ""
+            )
+            return CommandResult(
+                cmd,
+                cwd_path,
+                stdout,
+                "",
+                self.repo_default_branch_returncode,
+            )
 
         if cmd[:3] == ["gh", "issue", "view"]:
             payload = {
@@ -11647,7 +11666,15 @@ def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path):
         if cmd[:1] == ["gh"] or cmd == ["pytest", "tests/test_agent_loop.py"]
     ]
     assert github_or_test_cwds
-    assert set(github_or_test_cwds) == {config.claude_dir}
+    bootstrap_pr_queries = [
+        cwd
+        for cmd, cwd in runner.commands
+        if cmd[:3] == ["gh", "pr", "view"]
+        and "number,title,headRefName,baseRefName,headRefOid,url,body,comments,reviews" in cmd
+        and cwd != config.claude_dir
+    ]
+    assert bootstrap_pr_queries == [Path.cwd()]
+    assert set(github_or_test_cwds) == {Path.cwd(), config.claude_dir}
 
 
 def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts(monkeypatch, tmp_path):
@@ -11676,6 +11703,22 @@ def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts(monkeypatch, t
     assert config.agent_memory_dir == (
         cache_home / "coding-review-agent-loop" / "repos" / "OWNER-REPO" / "memory"
     ).resolve()
+
+
+def test_omitted_cli_base_is_preserved_for_runtime_resolution(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+    ])
+
+    assert config_from_args(args, FakeRunner()).base is None
 
 
 def test_pre_review_tests_cli_defaults_on_and_can_be_disabled(tmp_path):
@@ -11979,6 +12022,127 @@ def test_clean_existing_auto_agent_dir_is_synced(tmp_path):
     assert ["git", "fetch", "origin"] in commands
     assert ["git", "switch", "main"] in commands
     assert ["git", "pull", "--ff-only", "origin", "main"] in commands
+
+
+def test_pr_loop_resolves_pr_base_before_workdir_setup(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"baseRefName": "develop"},
+    )
+    config = make_config(
+        tmp_path,
+        base=None,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    commands = [cmd for cmd, _cwd in runner.commands]
+    pr_context_index = command_index(runner.commands, ["gh", "pr", "view"])
+    switch_index = command_index(runner.commands, ["git", "switch", "develop"])
+    assert pr_context_index < switch_index
+    assert ["git", "pull", "--ff-only", "origin", "develop"] in commands
+    assert not any("origin/main" in arg for cmd in commands for arg in cmd)
+
+
+def test_pr_loop_explicit_base_overrides_pr_base_without_repo_default_query(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"baseRefName": "develop"},
+    )
+    config = make_config(
+        tmp_path,
+        base="release",
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert ["git", "switch", "release"] in commands
+    assert ["git", "switch", "develop"] not in commands
+    assert not any(
+        cmd[:3] == ["gh", "repo", "view"] and "defaultBranchRef" in cmd
+        for cmd in commands
+    )
+
+
+@pytest.mark.parametrize("pr_base", [None, "", "   "])
+def test_pr_loop_falls_back_to_repo_default_when_pr_base_is_missing(tmp_path, pr_base):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"baseRefName": pr_base},
+        repo_default_branch="develop",
+    )
+    config = make_config(
+        tmp_path,
+        base=None,
+        reviewer="codex",
+        auto_agent_dirs=("codex",),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    commands = [cmd for cmd, _cwd in runner.commands]
+    repo_query_index = command_index(runner.commands, ["gh", "repo", "view"])
+    switch_index = command_index(runner.commands, ["git", "switch", "develop"])
+    assert repo_query_index < switch_index
+
+
+@pytest.mark.parametrize("mode", ["issue", "task"])
+def test_issue_and_task_loops_use_repo_default_when_base_is_omitted(tmp_path, mode):
+    runner = FakeRunner(
+        claude_outputs=[
+            "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"baseRefName": "develop"},
+        repo_default_branch="develop",
+    )
+    config = make_config(
+        tmp_path,
+        base=None,
+        reviewer="codex",
+        auto_agent_dirs=("claude", "codex"),
+    )
+
+    if mode == "issue":
+        assert run_issue_loop(runner, issue_number=56, config=config) == 0
+    else:
+        assert run_task_loop(runner, task_text="Add /healthz endpoint.", config=config) == 0
+
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert ["git", "switch", "develop"] in commands
+    assert not any("origin/main" in arg for cmd in commands for arg in cmd)
+
+
+def test_unresolved_base_metadata_produces_targeted_override_error(tmp_path):
+    runner = FakeRunner(
+        pr_payload={"baseRefName": None},
+        repo_default_branch=None,
+        repo_default_branch_returncode=1,
+    )
+    config = make_config(tmp_path, base=None, reviewer="codex")
+
+    with pytest.raises(
+        AgentLoopError,
+        match=r"Unable to resolve a base branch for OWNER/REPO.*--base <branch>",
+    ):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(cmd[:2] == ["git", "switch"] for cmd, _cwd in runner.commands)
+
+
+def test_dry_run_base_resolution_defaults_to_main_without_github_query(tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path, base=None, dry_run=True)
+
+    resolved = resolve_base_branch(config, runner)
+
+    assert resolved.base == "main"
+    assert not any(cmd[:1] == ["gh"] for cmd, _cwd in runner.commands)
 
 
 def test_reviewer_checkout_is_refreshed_to_pr_head_before_review(tmp_path):

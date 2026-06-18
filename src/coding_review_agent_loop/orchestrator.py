@@ -15,6 +15,8 @@ from .agents.registry import agent_display_name, run_agent_result
 from .config import (
     AgentLoopConfig,
     ensure_agent_workdirs,
+    github_bootstrap_cwd,
+    resolve_base_branch,
     reviewers,
     sync_coder_base_before_implementation,
     sync_coder_pr_before_validation,
@@ -2248,6 +2250,7 @@ def run_issue_loop(
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     try:
+        config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
         log(config, f"Validating issue #{issue_number}")
         validate_open_issue(runner, config=config, issue_number=issue_number)
@@ -2365,6 +2368,7 @@ def run_task_loop(
             raise AgentLoopError("Task text is empty; provide a non-empty description.")
         if max_clarification_rounds < 0:
             raise AgentLoopError("--max-clarification-rounds must be zero or positive.")
+        config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
         memory = prepare_agent_memory(runner, config)
 
@@ -2492,6 +2496,19 @@ def run_pr_loop(
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     try:
+        bootstrap_cwd = github_bootstrap_cwd(config)
+        initial_pr_context = get_pr_review_context(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            cwd=bootstrap_cwd,
+        )
+        config = resolve_base_branch(
+            config,
+            runner,
+            pr_metadata=initial_pr_context.metadata,
+            cwd=bootstrap_cwd,
+        )
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)
         log(config, f"Validating PR #{pr_number}")
@@ -2509,7 +2526,6 @@ def run_pr_loop(
             # Backward-compatible single-reviewer resume support: older callers
             # pass one reviewer session, so attach it to the first configured reviewer.
             reviewer_session_ids[configured_reviewers[0]] = reviewer_session_id
-        initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
         prefetched_pr_context: PullRequestReviewContext | None = None
         resumed_round = _resume_pr_round(
             initial_pr_context.comments,
