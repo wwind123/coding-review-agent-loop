@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .agents.base import normalize_agent_name
 from .agents.registry import (
     agent_display_name,
     agent_signature,
@@ -93,12 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.add_argument(
             "--coder",
+            type=normalize_agent_name,
             choices=("claude", "codex", "gemini", "antigravity"),
             default="claude",
             help="Agent that creates and fixes the PR (default: claude).",
         )
         subparser.add_argument(
             "--reviewer",
+            type=normalize_agent_name,
             choices=("claude", "codex", "gemini", "antigravity"),
             action="append",
             default=None,

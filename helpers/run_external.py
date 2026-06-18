@@ -115,7 +115,14 @@ def _build_dry_run_response(role: str, flow: str = "plan") -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one external agent turn.")
-    parser.add_argument("--agent", required=True, choices=["codex", "gemini", "antigravity"])
+    from coding_review_agent_loop.agents.base import normalize_agent_name
+
+    parser.add_argument(
+        "--agent",
+        required=True,
+        type=normalize_agent_name,
+        choices=["codex", "gemini", "antigravity"],
+    )
     parser.add_argument("--prompt-file", required=True, help="Path to prompt text file.")
     antigravity_models = parser.add_mutually_exclusive_group()
     antigravity_models.add_argument(

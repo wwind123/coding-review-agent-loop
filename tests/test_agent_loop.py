@@ -12871,6 +12871,37 @@ def test_config_accepts_gemini_as_coder_and_reviewer(tmp_path):
     assert config.gemini_dir == tmp_path / "gemini"
 
 
+@pytest.mark.parametrize(
+    ("coder", "reviewer"),
+    [
+        ("agy", "codex"),
+        ("codex", "agy"),
+        ("antigravity", "codex"),
+    ],
+)
+def test_config_normalizes_antigravity_agent_names(tmp_path, coder, reviewer):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--coder",
+        coder,
+        "--reviewer",
+        reviewer,
+        "--codex-dir",
+        str(tmp_path / "codex"),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.coder == ("antigravity" if coder == "agy" else coder)
+    assert config.reviewer == (
+        "antigravity" if reviewer == "agy" else reviewer,
+    )
+
+
 def test_config_rejects_duplicate_reviewers(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
@@ -12882,6 +12913,25 @@ def test_config_rejects_duplicate_reviewers(tmp_path):
         "codex",
         "--reviewer",
         "codex",
+        "--codex-dir",
+        str(tmp_path / "codex"),
+    ])
+
+    with pytest.raises(AgentLoopError, match="same agent more than once"):
+        config_from_args(args, FakeRunner())
+
+
+def test_config_rejects_alias_and_canonical_duplicate_reviewers(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr",
+        "77",
+        "--repo",
+        "OWNER/REPO",
+        "--reviewer",
+        "agy",
+        "--reviewer",
+        "antigravity",
         "--codex-dir",
         str(tmp_path / "codex"),
     ])

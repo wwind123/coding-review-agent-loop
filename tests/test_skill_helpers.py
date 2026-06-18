@@ -3315,7 +3315,8 @@ class TestAntigravitySkill:
             )
             assert val.returncode == 0, f"{out.read_text()}\n{val.stderr}"
 
-    def test_run_plan_round_antigravity_external_coder_dry_run(self) -> None:
+    @pytest.mark.parametrize("coder", ["antigravity", "agy"])
+    def test_run_plan_round_antigravity_external_coder_dry_run(self, coder) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             _write_fake_gh(tmppath)
@@ -3323,7 +3324,7 @@ class TestAntigravitySkill:
             result = _run(
                 "helpers.skill_runner", "run-plan-round",
                 "--issue", "9991", "--repo", "test/skill-repo",
-                "--coder", "antigravity", "--reviewers", "codex",
+                "--coder", coder, "--reviewers", "codex",
                 "--antigravity-models", "Model A", "Model B",
                 "--dry-run",
                 env=env,
@@ -3346,7 +3347,7 @@ class TestAntigravitySkill:
             result = _run(
                 "helpers.skill_runner", "run-plan-round",
                 "--issue", "9990", "--repo", "test/skill-repo",
-                "--plan-file", str(plan), "--reviewers", "antigravity",
+                "--plan-file", str(plan), "--reviewers", "agy",
                 "--model", "Model X",
                 "--dry-run",
                 env=env,
@@ -3403,7 +3404,7 @@ class TestAntigravitySkill:
         prompt.write_text("review this", encoding="utf-8")
         monkeypatch.setattr(sys, "argv", [
             "run_external",
-            "--agent", "antigravity",
+            "--agent", "agy",
             "--prompt-file", str(prompt),
             "--output", str(output),
             "--workdir", str(tmp_path),
@@ -3414,6 +3415,7 @@ class TestAntigravitySkill:
         rex.main()
 
         config = captured["config"]
+        assert config.reviewer == ("antigravity",)
         assert config.antigravity_models == expected_models
         assert config.antigravity_quota_signatures == expected_signatures
 

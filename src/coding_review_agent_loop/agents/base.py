@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import tempfile
 import uuid
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from ..runner import Runner
 from ..usage import UsageMetadata
@@ -16,6 +16,11 @@ if TYPE_CHECKING:
 
 AgentName = Literal["claude", "codex", "gemini", "antigravity"]
 AgentTextSource = Literal["response_file", "stdout_marker", "stdout"]
+
+
+def normalize_agent_name(value: str) -> AgentName:
+    """Normalize input-only agent aliases to their canonical names."""
+    return cast(AgentName, "antigravity" if value == "agy" else value)
 
 
 @dataclass(frozen=True)

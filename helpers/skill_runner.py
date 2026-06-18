@@ -106,7 +106,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from coding_review_agent_loop.agents.base import AgentName
+from coding_review_agent_loop.agents.base import AgentName, normalize_agent_name
 from coding_review_agent_loop.agents.registry import agent_display_name
 from coding_review_agent_loop.config import ensure_temp_checkout
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
@@ -3953,7 +3953,8 @@ def main() -> None:
     p_plan.add_argument("--issue", type=int, required=True)
     p_plan.add_argument("--repo", required=True)
     p_plan.add_argument(
-        "--coder", choices=["claude", "codex", "gemini", "antigravity"], default="claude",
+        "--coder", type=normalize_agent_name,
+        choices=["claude", "codex", "gemini", "antigravity"], default="claude",
         help="Who writes the plan: 'claude' (default, host supplies --plan-file) or "
              "an external coder ('codex'/'gemini') run by the skill (reversed roles, #307).",
     )
@@ -3961,7 +3962,7 @@ def main() -> None:
         "--plan-file", default=None,
         help="Plan markdown file. Required for --coder claude; ignored for an external coder.",
     )
-    p_plan.add_argument("--reviewers", nargs="+", required=True)
+    p_plan.add_argument("--reviewers", type=normalize_agent_name, nargs="+", required=True)
     p_plan.add_argument("--workdir-codex", default=None)
     p_plan.add_argument("--workdir-gemini", default=None)
     p_plan.add_argument("--workdir", default=None)
@@ -3980,7 +3981,7 @@ def main() -> None:
     p_pr = subparsers.add_parser("run-pr-round", help="Run one PR review round.")
     p_pr.add_argument("--pr", type=int, required=True)
     p_pr.add_argument("--repo", required=True)
-    p_pr.add_argument("--reviewers", nargs="+", required=True)
+    p_pr.add_argument("--reviewers", type=normalize_agent_name, nargs="+", required=True)
     p_pr.add_argument("--head-sha", default=None)
     p_pr.add_argument("--workdir", default=None)
     p_pr.add_argument("--workdir-codex", default=None)
@@ -4052,7 +4053,8 @@ def main() -> None:
     p_impl.add_argument("--issue", type=int, required=True)
     p_impl.add_argument("--repo", required=True)
     p_impl.add_argument(
-        "--coder", choices=["codex", "gemini", "antigravity"], required=True,
+        "--coder", type=normalize_agent_name,
+        choices=["codex", "gemini", "antigravity"], required=True,
         help="External coder that implements the plan (the host implements in-session).",
     )
     p_impl.add_argument("--plan-file", required=True, help="Approved plan to implement.")
@@ -4078,11 +4080,12 @@ def main() -> None:
     p_pr_fix.add_argument("--pr", type=int, required=True)
     p_pr_fix.add_argument("--repo", required=True)
     p_pr_fix.add_argument(
-        "--coder", choices=["codex", "gemini", "antigravity"], required=True,
+        "--coder", type=normalize_agent_name,
+        choices=["codex", "gemini", "antigravity"], required=True,
         help="External coder that fixes the existing PR.",
     )
     p_pr_fix.add_argument(
-        "--reviewers", nargs="+", required=True,
+        "--reviewers", type=normalize_agent_name, nargs="+", required=True,
         help="Reviewer set used by the preceding run-pr-round; must match exactly.",
     )
     p_pr_fix.add_argument(
@@ -4105,7 +4108,8 @@ def main() -> None:
     p_impl_phase.add_argument("--issue", type=int, required=True)
     p_impl_phase.add_argument("--repo", required=True)
     p_impl_phase.add_argument(
-        "--coder", choices=["codex", "gemini", "antigravity"], required=True,
+        "--coder", type=normalize_agent_name,
+        choices=["codex", "gemini", "antigravity"], required=True,
         help="External coder that decomposes and implements the first agent phase.",
     )
     p_impl_phase.add_argument("--plan-file", required=True, help="Approved plan to decompose and implement.")
@@ -4131,7 +4135,8 @@ def main() -> None:
     p_decompose.add_argument("--issue", type=int, required=True)
     p_decompose.add_argument("--repo", required=True)
     p_decompose.add_argument(
-        "--coder", choices=["codex", "gemini", "antigravity"], required=True,
+        "--coder", type=normalize_agent_name,
+        choices=["codex", "gemini", "antigravity"], required=True,
         help="External coder that decomposes the approved plan.",
     )
     p_decompose.add_argument("--plan-file", required=True, help="Approved plan to decompose.")
@@ -4154,11 +4159,12 @@ def main() -> None:
     )
     p_task.add_argument("--repo", required=True)
     p_task.add_argument(
-        "--coder", choices=["claude", "codex", "gemini", "antigravity"], default="claude",
+        "--coder", type=normalize_agent_name,
+        choices=["claude", "codex", "gemini", "antigravity"], default="claude",
         help="Host coder only for now; external coders are rejected in task mode (#307).",
     )
     p_task.add_argument("--plan-file", required=True)
-    p_task.add_argument("--reviewers", nargs="+", required=True)
+    p_task.add_argument("--reviewers", type=normalize_agent_name, nargs="+", required=True)
     p_task.add_argument("--workdir-codex", default=None)
     p_task.add_argument("--workdir-gemini", default=None)
     p_task.add_argument("--workdir", default=None)
