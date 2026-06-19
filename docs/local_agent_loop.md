@@ -199,12 +199,14 @@ same planning round. Plan reviews use explicit sections:
 ### Future follow-ups
 ```
 
-If earlier blocking or same-plan items are still open, reviewers must also add
-`### Prior unresolved plan item dispositions` and disposition every carried
-item exactly once. Use `same-plan` for required current-plan refinements,
-reserve `future follow-up` for approved plan reviews only, and expect approved
-future follow-ups to be reconciled with the final approved plan instead of
-reopening planning. In `--approved-followups=issue` and `fix-and-issue` modes,
+If earlier blocking or same-plan items are still open, reviewers encode prior
+item dispositions in the JSON `prior_plan_item_dispositions` array using
+`"resolved"`, `"blocking"`, `"same-plan"`, or `"future"` (with a `"note"`).
+The orchestrator renders a `### Prior unresolved plan item dispositions` section
+in the public GitHub comment; reviewers do not add that section themselves. Use
+`"same-plan"` for required current-plan refinements; `"future"` is accepted only
+in approved plan reviews and the approved future follow-ups are reconciled with
+the final approved plan instead of reopening planning. In `--approved-followups=issue` and `fix-and-issue` modes,
 when implementation will continue after approval, plan-stage future follow-ups
 are filed as separate issues before implementation starts. If implementation
 continues but issue filing is disabled, they are summarized inline with a note

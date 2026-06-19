@@ -4443,10 +4443,13 @@ def test_review_prompt_includes_prior_unresolved_items_and_disposition_instructi
     assert "Prior unresolved review items from earlier rounds" in prompt
     assert "[item-1] blocking from Anthropic Claude in round 1" in prompt
     assert "[item-2] same-pr from OpenAI Codex in round 1" in prompt
-    assert "### Prior unresolved item dispositions" in prompt
-    assert "- [item-id] resolved" in prompt
-    assert "Only use `future follow-up` when returning `approved`." in prompt
-    assert "Contradictory forms like `same-pr: none`, `still blocking: none`, and `future follow-up: none` are invalid" in prompt
+    assert "### Prior unresolved item dispositions" not in prompt
+    assert 'Disposition every listed\nitem in the JSON `prior_item_dispositions` array' in prompt
+    assert '"resolved"' in prompt
+    assert '"blocking"' in prompt
+    assert '"same-pr"' in prompt
+    assert '"future"' in prompt
+    assert "do not add a separate prose section" in prompt
     assert "Only items listed under `Prior unresolved review items from earlier rounds`" in prompt
     assert "same-round findings from\nother reviewers appear elsewhere in the PR discussion" in prompt
     assert "Same-PR follow-ups may appear only in blocking reviews." in prompt
@@ -4455,6 +4458,38 @@ def test_review_prompt_includes_prior_unresolved_items_and_disposition_instructi
     assert "After the JSON object, include only:" in prompt
     assert "Use this mandatory structured PR review format" in prompt
     assert "Markdown fallback" not in prompt
+
+
+def test_compact_review_prompt_excludes_prose_disposition_heading(tmp_path):
+    config = make_config(tmp_path, approved_followups="fix-and-summarize")
+    prompt = build_review_prompt(
+        77,
+        2,
+        config,
+        reviewer="codex",
+        compact_context=True,
+        pr_metadata=PullRequestMetadata(
+            number=77,
+            repo="OWNER/REPO",
+            title="Improve review prompt context",
+            head_branch="feature/review-context",
+            base_branch="main",
+            head_sha="abc123",
+            url="https://github.com/OWNER/REPO/pull/77",
+        ),
+        unresolved_items=(
+            UnresolvedReviewItem(
+                item_id="item-1",
+                reviewer="Anthropic Claude",
+                source_round=1,
+                text="Needs a regression test before merge.",
+                status="blocking",
+            ),
+        ),
+    )
+    assert "### Prior unresolved item dispositions" not in prompt
+    assert 'Disposition every listed\nitem in the JSON `prior_item_dispositions` array' in prompt
+    assert "do not add a separate prose section" in prompt
 
 
 def test_review_prompt_indents_multiline_prior_unresolved_item_text(tmp_path):
@@ -4514,11 +4549,14 @@ def test_plan_review_prompt_includes_structured_sections_and_prior_items(tmp_pat
         ),
     )
 
-    assert "### Prior unresolved plan item dispositions" in prompt
+    assert "### Prior unresolved plan item dispositions" not in prompt
     assert "[item-1] blocking from Anthropic Claude in round 1" in prompt
     assert "[item-2] same-plan from Google Gemini in round 1" in prompt
-    assert "Only use `future follow-up` when returning `approved`." in prompt
-    assert "Contradictory forms like `same-plan: none`, `still blocking: none`, and `future follow-up: none` are invalid" in prompt
+    assert 'Disposition every listed item\nin the JSON `prior_plan_item_dispositions` array' in prompt
+    assert '"resolved"' in prompt
+    assert '"blocking"' in prompt
+    assert '"same-plan"' in prompt
+    assert "do not add a separate prose section" in prompt
     assert "Only items listed under `Prior unresolved plan items from earlier rounds`" in prompt
     assert "same-round findings from other\nreviewers appear elsewhere in the issue discussion" in prompt
     assert "Same-plan\nfollow-ups are small current-plan refinements" in prompt
@@ -4533,6 +4571,30 @@ def test_plan_review_prompt_includes_structured_sections_and_prior_items(tmp_pat
     assert '"prior_plan_item_dispositions"' in prompt
     assert "Use this mandatory structured JSON response format" in prompt
     assert "markdown compatibility" not in prompt.lower()
+
+
+def test_compact_plan_review_prompt_excludes_prose_disposition_heading(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    prompt = build_plan_review_prompt(
+        56,
+        2,
+        "Fix the caching layer.",
+        config,
+        reviewer="codex",
+        compact_context=True,
+        unresolved_items=(
+            UnresolvedReviewItem(
+                item_id="item-1",
+                reviewer="Anthropic Claude",
+                source_round=1,
+                text="Define exact plan-review headings.",
+                status="blocking",
+            ),
+        ),
+    )
+    assert "### Prior unresolved plan item dispositions" not in prompt
+    assert 'Disposition every listed item\nin the JSON `prior_plan_item_dispositions` array' in prompt
+    assert "do not add a separate prose section" in prompt
 
 
 def test_plan_revision_prompt_includes_unresolved_ledger_and_required_dispositions(tmp_path):

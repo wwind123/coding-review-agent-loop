@@ -194,11 +194,13 @@ edit files, push, or open a PR during planning. Reviewers approve or block with
 ### Future follow-ups
 ```
 
-When earlier plan issues remain open, reviewers must also include
-`### Prior unresolved plan item dispositions` and disposition every carried item
-exactly once with `resolved`, `still blocking`, `same-plan`, or `future
-follow-up`. `Future follow-ups` are accepted only in approved plan reviews and
-are reconciled with the final approved plan instead of reopening planning. If
+When earlier plan issues remain open, reviewers encode prior item dispositions
+in the JSON `prior_plan_item_dispositions` array using `"resolved"`,
+`"blocking"`, `"same-plan"`, or `"future"` (with a `"note"`). The orchestrator
+renders those as a `### Prior unresolved plan item dispositions` section in the
+public GitHub comment; reviewers do not add that section themselves. `"future"`
+dispositions are accepted only in approved plan reviews and are reconciled with
+the final approved plan instead of reopening planning. If
 `--approved-followups=issue` or `fix-and-issue` is enabled and implementation
 will continue after approval, those plan-stage future follow-ups are filed as
 separate issues before implementation starts. If implementation continues but

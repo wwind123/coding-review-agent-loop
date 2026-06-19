@@ -901,19 +901,17 @@ def build_plan_review_prompt(
         requirement_label="signed human issue requirements",
     )
     if unresolved_items:
-        unresolved_items_guidance = """Because prior unresolved plan items exist, include this exact section in your review:
+        unresolved_items_guidance = """Prior unresolved plan items are present. Disposition every listed item
+in the JSON `prior_plan_item_dispositions` array — do not add a separate prose section
+or bullet list for prior items outside the JSON object. Valid `disposition` values:
+- `"resolved"` — item is fixed in this revision.
+- `"blocking"` — item is still a blocking plan problem; include it in `blocking_plan_issues`.
+- `"same-plan"` — item needs to be incorporated before implementation; include it in `same_plan_followups`.
+- `"future"` — deferred; must include a `"note"` field; only valid when approving.
 
-### Prior unresolved plan item dispositions
-
-Use one bullet per listed item and cover every item exactly once. Allowed forms:
-- [item-id] resolved
-- [item-id] still blocking
-- [item-id] same-plan
-- [item-id] future follow-up: brief reason
-
-Only use `future follow-up` when returning `approved`. If a current-plan item still needs to be fixed before implementation starts, keep it as `still blocking` or `same-plan` instead of downgrading it.
-For any prior item that was already marked `future`, explicitly choose whether it remains valid future work, was resolved by later plan changes, or now belongs back in same-plan/blocking work.
-Contradictory forms like `same-plan: none`, `still blocking: none`, and `future follow-up: none` are invalid; use `resolved` if the item is no longer active.
+Only use `"future"` when returning `approved`. If a plan item still needs to be fixed
+before implementation starts, use `"blocking"` or `"same-plan"` instead. For any prior
+item already marked `"future"`, explicitly re-evaluate.
 """
     else:
         unresolved_items_guidance = ""
@@ -1019,19 +1017,17 @@ def _build_compact_plan_review_prompt(
         requirement_label="signed human issue requirements",
     )
     if unresolved_items:
-        unresolved_items_guidance = """Because prior unresolved plan items exist, include this exact section in your review:
+        unresolved_items_guidance = """Prior unresolved plan items are present. Disposition every listed item
+in the JSON `prior_plan_item_dispositions` array — do not add a separate prose section
+or bullet list for prior items outside the JSON object. Valid `disposition` values:
+- `"resolved"` — item is fixed in this revision.
+- `"blocking"` — item is still a blocking plan problem; include it in `blocking_plan_issues`.
+- `"same-plan"` — item needs to be incorporated before implementation; include it in `same_plan_followups`.
+- `"future"` — deferred; must include a `"note"` field; only valid when approving.
 
-### Prior unresolved plan item dispositions
-
-Use one bullet per listed item and cover every item exactly once. Allowed forms:
-- [item-id] resolved
-- [item-id] still blocking
-- [item-id] same-plan
-- [item-id] future follow-up: brief reason
-
-Only use `future follow-up` when returning `approved`. If a current-plan item still needs to be fixed before implementation starts, keep it as `still blocking` or `same-plan` instead of downgrading it.
-For any prior item that was already marked `future`, explicitly choose whether it remains valid future work, was resolved by later plan changes, or now belongs back in same-plan/blocking work.
-Contradictory forms like `same-plan: none`, `still blocking: none`, and `future follow-up: none` are invalid; use `resolved` if the item is no longer active.
+Only use `"future"` when returning `approved`. If a plan item still needs to be fixed
+before implementation starts, use `"blocking"` or `"same-plan"` instead. For any prior
+item already marked `"future"`, explicitly re-evaluate.
 """
     else:
         unresolved_items_guidance = ""
@@ -1654,19 +1650,18 @@ def _build_compact_pr_review_prompt(
     human_requirements_guidance = _human_requirements_review_guidance(human_requirements)
     non_future_items = [item for item in unresolved_items if item.status != "future"]
     if non_future_items:
-        unresolved_items_guidance = """Because prior unresolved items exist, include this exact section in your review:
+        unresolved_items_guidance = """Prior unresolved items are present. Disposition every listed
+item in the JSON `prior_item_dispositions` array — do not add a separate prose section
+or bullet list for prior items outside the JSON object. Valid `disposition` values:
+- `"resolved"` — item is fixed in this PR.
+- `"blocking"` — item is still a merge-blocking problem; include it in `blocking_items`.
+- `"same-pr"` — item needs to be fixed before merge; include it in `same_pr_followups`.
+- `"future"` — deferred; must include a `"note"` field; only valid when approving.
 
-### Prior unresolved item dispositions
-
-Use one bullet per listed item and cover every item exactly once. Allowed forms:
-- [item-id] resolved
-- [item-id] still blocking
-- [item-id] same-pr
-- [item-id] future follow-up: brief reason
-
-Only use `future follow-up` when returning `approved`. If an item should still be fixed before merge, keep it as `still blocking` or `same-pr` instead of downgrading it.
-For any prior item that was already marked `future`, explicitly choose whether it remains valid future work, was resolved by later commits, or now belongs back in same-PR/blocking work.
-Contradictory forms like `same-pr: none`, `still blocking: none`, and `future follow-up: none` are invalid; use `resolved` if the item is no longer active.
+Only use `"future"` when returning `approved`. If an item should still be fixed before
+merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
+`"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
+`"blocking"`/`"same-pr"`.
 """
     else:
         unresolved_items_guidance = ""
@@ -1856,19 +1851,18 @@ def build_review_prompt(
     human_requirements_guidance = _human_requirements_review_guidance(human_requirements)
     unresolved_items_block = _format_unresolved_review_items(unresolved_items)
     if unresolved_items:
-        unresolved_items_guidance = """Because prior unresolved items exist, include this exact section in your review:
+        unresolved_items_guidance = """Prior unresolved items are present. Disposition every listed
+item in the JSON `prior_item_dispositions` array — do not add a separate prose section
+or bullet list for prior items outside the JSON object. Valid `disposition` values:
+- `"resolved"` — item is fixed in this PR.
+- `"blocking"` — item is still a merge-blocking problem; include it in `blocking_items`.
+- `"same-pr"` — item needs to be fixed before merge; include it in `same_pr_followups`.
+- `"future"` — deferred; must include a `"note"` field; only valid when approving.
 
-### Prior unresolved item dispositions
-
-Use one bullet per listed item and cover every item exactly once. Allowed forms:
-- [item-id] resolved
-- [item-id] still blocking
-- [item-id] same-pr
-- [item-id] future follow-up: brief reason
-
-Only use `future follow-up` when returning `approved`. If an item should still be fixed before merge, keep it as `still blocking` or `same-pr` instead of downgrading it.
-For any prior item that was already marked `future`, explicitly choose whether it remains valid future work, was resolved by later commits, or now belongs back in same-PR/blocking work.
-Contradictory forms like `same-pr: none`, `still blocking: none`, and `future follow-up: none` are invalid; use `resolved` if the item is no longer active.
+Only use `"future"` when returning `approved`. If an item should still be fixed before
+merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
+`"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
+`"blocking"`/`"same-pr"`.
 """
     else:
         unresolved_items_guidance = ""
