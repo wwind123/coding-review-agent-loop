@@ -10,8 +10,10 @@ GitHub operations go through `gh`.
 **Skill vs the `agent-loop` CLI (when to use which):** use the skill when you want to
 participate/oversee, want Claude turns on your **session model** (e.g. Opus, no
 `--claude-model` needed), or want to avoid the `claude -p` model/binary gotchas; use the
-CLI for hands-off automation through CI-wait and `--auto-merge`. The skill never
-auto-merges (merge stays a human decision). Keeping the skill also reduces reliance on
+CLI for hands-off automation — optionally a `--test-command` gate and, with
+`--auto-merge`, CI-wait + merge (both are configuration-dependent; without them the CLI
+runs no gate and won't poll/merge). The skill never auto-merges (merge stays a human
+decision). Keeping the skill also reduces reliance on
 `claude -p` for Claude turns if it is ever billed/restricted differently (announced once,
 then reversed) — whether interactive-session usage is treated differently depends on
 Anthropic's current terms and product behavior (see the "Billing and terms note" below),

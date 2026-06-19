@@ -134,7 +134,10 @@ much they automate**. (External agents — Codex/Gemini/Antigravity — run as s
 either way; the difference is only the Claude turns.)
 
 **Use the CLI (`agent-loop`) for hands-off automation.** It's a closed-loop driver: it
-loops to approval, implements, runs the test/CI gate, waits for CI, and can `--auto-merge`.
+loops to approval and implements, and — when configured — runs a test gate
+(`--test-command`) and, with `--auto-merge`, waits for CI (`wait_for_ci`) and merges.
+Without those flags it runs no test gate and does not poll/merge (pending checks stop the
+run).
 It runs without an interactive session (cron/CI/scripts). Claude turns run as isolated
 `claude -p` subprocesses — which means a Claude turn uses the Claude CLI's *default* model
 unless you pass `--claude-model`, and it depends on the `claude` binary being on `PATH`.
