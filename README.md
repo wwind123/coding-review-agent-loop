@@ -149,9 +149,12 @@ coder/reviewer turns run in *your* interactive session instead of `claude -p`, w
 Rule of thumb: **CLI for fire-and-forget through merge; the skill when you want to
 participate, use your session model, or avoid the `claude -p` model/binary gotchas.**
 
-Keeping the skill also hedges a real risk: programmatic `claude -p` usage could be billed
-or restricted differently in the future (such a change was announced once, then reversed).
-The skill runs Claude turns as ordinary interactive-session usage, sidestepping that.
+Keeping the skill also **reduces reliance on programmatic `claude -p`** for Claude turns —
+useful if `claude -p` is ever billed or restricted differently (such a change was announced
+once, then reversed). Whether interactive-session usage is actually treated differently
+from `claude -p` depends on Anthropic's current terms and product behavior; see the billing
+note in [`SKILL.md`](SKILL.md). This is about reducing the `claude -p` dependency, not a
+guaranteed billing outcome.
 
 ## Develop This Tool
 

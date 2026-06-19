@@ -11,10 +11,12 @@ GitHub operations go through `gh`.
 participate/oversee, want Claude turns on your **session model** (e.g. Opus, no
 `--claude-model` needed), or want to avoid the `claude -p` model/binary gotchas; use the
 CLI for hands-off automation through CI-wait and `--auto-merge`. The skill never
-auto-merges (merge stays a human decision). Keeping the skill also hedges the chance that
-programmatic `claude -p` usage is billed/restricted differently in future (announced once,
-then reversed). See the "Skill vs CLI — which to use" section in [`README.md`](README.md)
-for the full comparison.
+auto-merges (merge stays a human decision). Keeping the skill also reduces reliance on
+`claude -p` for Claude turns if it is ever billed/restricted differently (announced once,
+then reversed) — whether interactive-session usage is treated differently depends on
+Anthropic's current terms and product behavior (see the "Billing and terms note" below),
+so this is about reducing the dependency, not a guaranteed billing outcome. See the
+"Skill vs CLI — which to use" section in [`README.md`](README.md) for the full comparison.
 
 ## Prerequisites
 
