@@ -1503,13 +1503,15 @@ def _create_task_issue(repo: str, task_text: str, task_key: str, gh_cmd: str = "
 def cmd_run_task_round(args: argparse.Namespace) -> None:
     repo: str = args.repo
     dry_run: bool = args.dry_run
-    if getattr(args, "coder", "claude") != "claude":
-        print(
-            "skill_runner: run-task-round supports only --coder claude (host coder) for now; "
-            "external coders are available via run-plan-round (#307).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    coder: str = getattr(args, "coder", "claude")
+    if coder == "claude":
+        if not args.plan_file:
+            print("skill_runner: run-task-round --coder claude requires --plan-file", file=sys.stderr)
+            sys.exit(1)
+        plan_file = Path(args.plan_file)
+        if not plan_file.exists():
+            print(f"skill_runner: plan file not found: {plan_file}", file=sys.stderr)
+            sys.exit(1)
     task_text = _resolve_task_text(args)
     key = _task_key(task_text)
     issue = _lookup_task_issue(repo, key)
@@ -4161,9 +4163,13 @@ def main() -> None:
     p_task.add_argument(
         "--coder", type=normalize_agent_name,
         choices=["claude", "codex", "gemini", "antigravity"], default="claude",
-        help="Host coder only for now; external coders are rejected in task mode (#307).",
+        help="Who writes the plan: 'claude' (default, host supplies --plan-file) or "
+             "an external coder ('codex'/'gemini'/'antigravity') run by the skill.",
     )
-    p_task.add_argument("--plan-file", required=True)
+    p_task.add_argument(
+        "--plan-file", default=None,
+        help="Plan markdown file. Required for --coder claude; ignored for an external coder.",
+    )
     p_task.add_argument("--reviewers", type=normalize_agent_name, nargs="+", required=True)
     p_task.add_argument("--workdir-codex", default=None)
     p_task.add_argument("--workdir-gemini", default=None)

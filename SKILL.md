@@ -255,6 +255,18 @@ stdin) for longer descriptions; `--dry-run` previews the issue it would create
 without creating it. From there, continue **exactly as issue mode** from the
 Plan-loop onward (including the optional Implement step + PR-loop).
 
+Task mode accepts the same coder roles as issue mode. The host coder remains the
+default and requires `--plan-file`. To have an external coder produce the plan,
+pass `--coder codex|gemini|antigravity` (or `agy`) and omit `--plan-file`:
+
+```bash
+python -m helpers.skill_runner run-task-round \
+  --task "Add a --verbose flag to the CLI" \
+  --repo OWNER/REPO \
+  --coder codex \
+  --reviewers gemini
+```
+
 ---
 
 ## Gates & guardrails
@@ -338,11 +350,12 @@ Every phase is re-runnable; if a session ends mid-arc, just re-invoke:
 
 ## Reversed roles (external coder, #307)
 
-`run-plan-round` can run with an **external coder** (Codex or Gemini writes the
-plan) instead of the host. Pass `--coder codex|gemini` and **omit** `--plan-file`
-— the skill generates the plan via `run_external --role coder`, validates it,
-attaches `--role coder --agent Codex|Gemini`, and posts it, then runs the
-configured reviewers:
+`run-plan-round` and `run-task-round` can run with an **external coder** (Codex,
+Gemini, or Antigravity writes the plan) instead of the host. Pass
+`--coder codex|gemini|antigravity` (or `agy`) and **omit** `--plan-file` — the
+skill generates the plan via `run_external --role coder`, validates it, attaches
+the coder role and agent metadata, and posts it, then runs the configured
+reviewers:
 
 ```bash
 python -m helpers.skill_runner run-plan-round \
@@ -455,8 +468,6 @@ hash + `decompose-only` mode; re-running the same plan returns the recorded chil
 issues instead of creating duplicates. `--dry-run` still exercises the
 decomposition parser and prints the child-issue preview JSON, but it does not
 create issues or post comments.
-
-`run-task-round` stays host-coder only.
 
 ---
 

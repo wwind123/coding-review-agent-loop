@@ -1566,9 +1566,11 @@ class TestRunTaskRound:
         assert sr._lookup_task_issue("o/r", "key123") is None
 
     def _task_args(self, **over):
-        base = dict(task="do X", task_file=None, repo="o/r", plan_file="/tmp/p.md",
-                    reviewers=["codex"], workdir=None, workdir_codex=None,
-                    workdir_gemini=None, dry_run=False)
+        base = dict(task="do X", task_file=None, repo="o/r", coder="codex",
+                    plan_file=None, reviewers=["codex"], workdir=None,
+                    workdir_codex=None, workdir_gemini=None, gemini_cmd="gemini",
+                    antigravity_models=None, antigravity_quota_signatures=None,
+                    model=None, dry_run=False)
         base.update(over)
         return _argparse.Namespace(**base)
 
@@ -1578,19 +1580,76 @@ class TestRunTaskRound:
         created = {"n": 0}
         monkeypatch.setattr(sr, "_create_task_issue", lambda *a, **k: created.__setitem__("n", created["n"] + 1) or 999)
         seen = {}
-        monkeypatch.setattr(sr, "cmd_run_plan_round", lambda args: seen.__setitem__("issue", args.issue))
-        sr.cmd_run_task_round(self._task_args())
+        monkeypatch.setattr(sr, "cmd_run_plan_round", lambda args: seen.update(vars(args)))
+        sr.cmd_run_task_round(self._task_args(
+            coder="antigravity",
+            antigravity_models=["Model A", "Model B"],
+            antigravity_quota_signatures=["quota", "429"],
+        ))
         assert created["n"] == 0          # did not create a duplicate
         assert seen["issue"] == 77        # delegated with the reused issue
+        assert seen["coder"] == "antigravity"
+        assert seen["antigravity_models"] == ["Model A", "Model B"]
+        assert seen["antigravity_quota_signatures"] == ["quota", "429"]
 
     def test_task_round_creates_when_absent(self, monkeypatch) -> None:
         import helpers.skill_runner as sr
         monkeypatch.setattr(sr, "_lookup_task_issue", lambda repo, key: None)
         monkeypatch.setattr(sr, "_create_task_issue", lambda repo, text, key: 123)
         seen = {}
-        monkeypatch.setattr(sr, "cmd_run_plan_round", lambda args: seen.__setitem__("issue", args.issue))
-        sr.cmd_run_task_round(self._task_args())
+        monkeypatch.setattr(sr, "cmd_run_plan_round", lambda args: seen.update(vars(args)))
+        sr.cmd_run_task_round(self._task_args(
+            coder="gemini", gemini_cmd="/opt/gemini", workdir_gemini="/tmp/gemini-workdir",
+        ))
         assert seen["issue"] == 123
+        assert seen["coder"] == "gemini"
+        assert seen["gemini_cmd"] == "/opt/gemini"
+        assert seen["workdir_gemini"] == "/tmp/gemini-workdir"
+
+    @pytest.mark.parametrize("coder", [None, "claude"])
+    def test_task_round_claude_requires_plan_before_issue_lookup(
+        self, monkeypatch, capsys, coder,
+    ) -> None:
+        import helpers.skill_runner as sr
+        looked_up = {"n": 0}
+        monkeypatch.setattr(
+            sr, "_lookup_task_issue",
+            lambda repo, key: looked_up.__setitem__("n", looked_up["n"] + 1),
+        )
+        args = self._task_args(coder="claude", plan_file=None)
+        if coder is None:
+            del args.coder
+        with pytest.raises(SystemExit):
+            sr.cmd_run_task_round(args)
+        assert looked_up["n"] == 0
+        assert "requires --plan-file" in capsys.readouterr().err
+
+    def test_task_round_claude_requires_existing_plan_before_issue_lookup(
+        self, monkeypatch, capsys, tmp_path,
+    ) -> None:
+        import helpers.skill_runner as sr
+        looked_up = {"n": 0}
+        monkeypatch.setattr(
+            sr, "_lookup_task_issue",
+            lambda repo, key: looked_up.__setitem__("n", looked_up["n"] + 1),
+        )
+        missing = tmp_path / "missing.md"
+        with pytest.raises(SystemExit):
+            sr.cmd_run_task_round(self._task_args(coder="claude", plan_file=str(missing)))
+        assert looked_up["n"] == 0
+        assert f"plan file not found: {missing}" in capsys.readouterr().err
+
+    def test_task_round_claude_delegation_unchanged(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+        plan = tmp_path / "plan.md"
+        plan.write_text("plan", encoding="utf-8")
+        monkeypatch.setattr(sr, "_lookup_task_issue", lambda repo, key: 77)
+        seen = {}
+        monkeypatch.setattr(sr, "cmd_run_plan_round", lambda args: seen.update(vars(args)))
+        sr.cmd_run_task_round(self._task_args(coder="claude", plan_file=str(plan)))
+        assert seen["issue"] == 77
+        assert seen["coder"] == "claude"
+        assert seen["plan_file"] == str(plan)
 
     def test_task_round_dry_run_creates_nothing(self, monkeypatch, capsys) -> None:
         import helpers.skill_runner as sr
@@ -1941,19 +2000,22 @@ class TestExternalCoderRun:
         assert result.returncode != 0
         assert "requires --plan-file" in result.stderr
 
-    def test_run_task_round_rejects_external_coder(self) -> None:
-        result = _run(
-            "helpers.skill_runner", "run-task-round",
-            "--task", "do a thing",
-            "--repo", "test/skill-repo",
-            "--coder", "codex",
-            "--plan-file", "/tmp/does-not-matter.md",
-            "--reviewers", "codex",
-            "--dry-run",
-            check=False,
-        )
-        assert result.returncode != 0
-        assert "only --coder claude" in result.stderr
+    def test_run_task_round_external_coder_dry_run_without_plan_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = os.environ.copy()
+            env["XDG_STATE_HOME"] = tmpdir
+            result = _run(
+                "helpers.skill_runner", "run-task-round",
+                "--task", "do a thing",
+                "--repo", "test/skill-repo",
+                "--coder", "codex",
+                "--reviewers", "codex",
+                "--dry-run",
+                env=env,
+            )
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["would_create_issue"] is True
 
 
 class TestRetryValidateCoder:
