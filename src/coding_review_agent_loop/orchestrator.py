@@ -840,6 +840,7 @@ def _run_validated_agent(
     repair_requires_direct_discussion_ack: bool = False,
     repair_allowed_prior_item_ids: Sequence[str] | None = None,
     ledger_incomplete: bool = False,
+    role: str | None = None,
 ) -> ValidatedAgentResponse:
     agent_name = agent_display_name(agent)
     log_paths: list[object] = []
@@ -857,6 +858,7 @@ def _run_validated_agent(
             prompt=prompt,
             session_id=session_id,
             run_id=usage_context.run_id if usage_context is not None else None,
+            role=role,
         )
         last_result = result
         if result.log_path is not None:
@@ -1722,6 +1724,7 @@ def _run_plan_first_loop(
                     repair_expected_kind="plan_review",
                     repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
                     ledger_incomplete=round_ledger_incomplete,
+                    role="reviewer",
                 )
                 review_output = review_response.text
                 review_model_used = review_response.model_used
@@ -2676,6 +2679,7 @@ def run_pr_loop(
                         repair_expected_kind="pr_review",
                         repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
                         ledger_incomplete=round_ledger_incomplete,
+                        role="reviewer",
                     )
                     review_output = review_response.text
                     review_model_used = review_response.model_used

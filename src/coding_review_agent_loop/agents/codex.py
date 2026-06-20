@@ -238,6 +238,7 @@ class CodexBackend:
         prompt: str,
         session_id: str | None = None,
         run_id: str | None = None,
+        role: str | None = None,
     ) -> AgentResult:
         log_path = agent_log_path(config, "codex", run_id=run_id)
         response_path = public_response_path(config, "codex")

@@ -192,6 +192,7 @@ class GeminiBackend:
         prompt: str,
         session_id: str | None = None,
         run_id: str | None = None,
+        role: str | None = None,
     ) -> AgentResult:
         # Gemini CLI only allows file writes inside the trusted workspace (or
         # its own private temp dir, whose path we do not know ahead of time).

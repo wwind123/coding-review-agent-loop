@@ -19307,3 +19307,597 @@ def test_base_response_file_instruction_includes_must_write_before_turn_ends(tmp
     from coding_review_agent_loop.agents.base import with_public_response_file_instruction
     composed = with_public_response_file_instruction("BASE PROMPT", tmp_path / "response.md")
     assert "before your turn ends" in composed
+
+
+# ── Tests: issue #400 – toolPermission: "strict" injection for reviewer ────────
+
+
+def test_antigravity_backend_injects_strict_mode_for_reviewer(tmp_path, monkeypatch):
+    """Reviewer run injects toolPermission:strict and expected allow-list while running."""
+    import json as _json
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import (
+        AntigravityBackend,
+        _REVIEWER_SETTINGS_INJECTION,
+    )
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    original = _json.dumps({"existingKey": "existingValue"})
+    settings_file.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    captured_settings: list[dict] = []
+
+    class CapturingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            captured_settings.append(
+                _json.loads(settings_file.read_text(encoding="utf-8"))
+            )
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    AntigravityBackend().run(
+        CapturingRunner(antigravity_outputs=[("ok", 0)]),
+        config, "Review PR.", role="reviewer",
+    )
+
+    assert len(captured_settings) == 1
+    settings = captured_settings[0]
+    assert settings["toolPermission"] == "strict"
+    assert settings["permissions"] == _REVIEWER_SETTINGS_INJECTION["permissions"]
+    assert settings["existingKey"] == "existingValue"
+
+
+def test_antigravity_backend_restores_original_settings_after_reviewer_run(tmp_path, monkeypatch):
+    """Settings file is verbatim-restored after a successful reviewer run."""
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    original_text = '{"key": "val", "nested": {"a": 1}}'
+    settings_file.write_text(original_text, encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    AntigravityBackend().run(
+        FakeRunner(antigravity_outputs=[("ok", 0)]),
+        config, "Review.", role="reviewer",
+    )
+
+    assert settings_file.read_text(encoding="utf-8") == original_text
+
+
+def test_antigravity_backend_restores_settings_on_run_exception(tmp_path, monkeypatch):
+    """Settings file is verbatim-restored even when the runner raises."""
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    original_text = '{"keep": "me"}'
+    settings_file.write_text(original_text, encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    class RaisingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            raise RuntimeError("agy crashed")
+
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    with pytest.raises(RuntimeError, match="agy crashed"):
+        AntigravityBackend().run(RaisingRunner(), config, "Review.", role="reviewer")
+
+    assert settings_file.read_text(encoding="utf-8") == original_text
+
+
+def test_antigravity_backend_restores_settings_on_injection_write_failure(tmp_path, monkeypatch):
+    """If the injection write_text partially truncates then raises, original bytes are restored."""
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    original_text = '{"preserve": "exactly"}'
+    settings_file.write_text(original_text, encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    write_calls = [0]
+    real_write_text = Path.write_text
+
+    def patched_write_text(self, *args, **kwargs):
+        if self == settings_file:
+            write_calls[0] += 1
+            if write_calls[0] == 1:
+                real_write_text(self, "PARTIAL")
+                raise OSError("simulated disk full")
+        real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", patched_write_text)
+
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    with pytest.raises(OSError, match="simulated disk full"):
+        AntigravityBackend().run(
+            FakeRunner(antigravity_outputs=[("ok", 0)]), config, "Review.", role="reviewer",
+        )
+
+    assert settings_file.read_text(encoding="utf-8") == original_text
+
+
+def test_antigravity_backend_does_not_touch_settings_for_non_reviewer(tmp_path, monkeypatch):
+    """Non-reviewer run holds the settings lock but does not read or modify settings.json."""
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    original_text = '{"untouched": true}'
+    settings_file.write_text(original_text, encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    captured_during: list[str] = []
+
+    class CapturingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            captured_during.append(settings_file.read_text(encoding="utf-8"))
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    AntigravityBackend().run(
+        CapturingRunner(antigravity_outputs=[("ok", 0)]),
+        config, "Implement.", role=None,
+    )
+
+    assert captured_during[0] == original_text
+    assert settings_file.read_text(encoding="utf-8") == original_text
+
+
+def test_antigravity_backend_fails_fast_on_malformed_settings_json(tmp_path, monkeypatch):
+    """AgentLoopError raised before any run if settings.json is not valid JSON."""
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+    from coding_review_agent_loop.errors import AgentLoopError
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text("not json at all {{{", encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    with pytest.raises(AgentLoopError, match="settings.json malformed"):
+        AntigravityBackend().run(
+            FakeRunner(antigravity_outputs=[("ok", 0)]), config, "Review.", role="reviewer",
+        )
+
+
+@pytest.mark.parametrize("invalid", ["[]", "null", "42"])
+def test_antigravity_backend_fails_fast_on_non_object_settings_json(
+    tmp_path, monkeypatch, invalid
+):
+    """AgentLoopError raised if settings.json root is not a JSON object."""
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+    from coding_review_agent_loop.errors import AgentLoopError
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(invalid, encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    with pytest.raises(AgentLoopError, match="not a JSON object"):
+        AntigravityBackend().run(
+            FakeRunner(antigravity_outputs=[("ok", 0)]), config, "Review.", role="reviewer",
+        )
+
+
+def test_antigravity_backend_strips_dangerously_skip_permissions_for_reviewer(
+    tmp_path, monkeypatch
+):
+    """--dangerously-skip-permissions is removed from args when role=reviewer."""
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    captured_args: list[list[str]] = []
+
+    class CapturingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            captured_args.append(list(args))
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    config = make_config(
+        tmp_path,
+        antigravity_dir=agy_dir,
+        antigravity_args=("--dangerously-skip-permissions",),
+    )
+    AntigravityBackend().run(
+        CapturingRunner(antigravity_outputs=[("ok", 0)]),
+        config, "Review.", role="reviewer",
+    )
+    assert "--dangerously-skip-permissions" not in captured_args[-1]
+
+    # Non-reviewer run keeps the flag
+    captured_args.clear()
+    AntigravityBackend().run(
+        CapturingRunner(antigravity_outputs=[("ok", 0)]),
+        config, "Implement.", role=None,
+    )
+    assert "--dangerously-skip-permissions" in captured_args[-1]
+
+
+def test_antigravity_backend_lock_order_settings_outer_gemini_inner(tmp_path, monkeypatch):
+    """Settings lock (outer) is acquired before GEMINI.md lock (inner);
+    settings are restored before the settings lock is released."""
+    import fcntl as fcntl_mod
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    (agy_dir / ".git").mkdir(parents=True, exist_ok=True)
+    settings_file = tmp_path / "settings.json"
+    original_text = '{"v": 1}'
+    settings_file.write_text(original_text, encoding="utf-8")
+    settings_lock_path = str(settings_file.with_suffix(".json.lock"))
+    gemini_lock_path = str(agy_dir / ".git" / "GEMINI.md.lock")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    real_flock = fcntl_mod.flock
+    operations: list[tuple[str, int]] = []
+    settings_content_at_unlock: list[str | None] = [None]
+
+    def tracking_flock(fd, operation):
+        name = str(getattr(fd, "name", ""))
+        if settings_lock_path in name:
+            label = "settings"
+        elif gemini_lock_path in name:
+            label = "gemini"
+        else:
+            label = "other"
+        if label == "settings" and operation == fcntl_mod.LOCK_UN:
+            settings_content_at_unlock[0] = settings_file.read_text(encoding="utf-8")
+        operations.append((label, operation))
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl_mod, "flock", tracking_flock)
+
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    AntigravityBackend().run(
+        FakeRunner(antigravity_outputs=[("ok", 0)]),
+        config, "Review.", role="reviewer",
+    )
+
+    relevant = [(label, op) for label, op in operations if label in ("settings", "gemini")]
+    assert relevant == [
+        ("settings", fcntl_mod.LOCK_EX),
+        ("gemini", fcntl_mod.LOCK_EX),
+        ("gemini", fcntl_mod.LOCK_UN),
+        ("settings", fcntl_mod.LOCK_UN),
+    ]
+    assert settings_content_at_unlock[0] == original_text
+
+
+def test_antigravity_settings_lock_serializes_reviewer_vs_reviewer(tmp_path, monkeypatch):
+    """Two concurrent reviewer runs are serialized: runner B starts only after A completes."""
+    import threading
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"k": "v"}', encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    order: list[str] = []
+    a_in_runner = threading.Event()
+    a_release = threading.Event()
+    b_in_runner = threading.Event()
+
+    class RunnerA(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            order.append("a_in_runner")
+            a_in_runner.set()
+            a_release.wait(timeout=10)
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    class RunnerB(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            order.append("b_in_runner")
+            b_in_runner.set()
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    def run_a():
+        AntigravityBackend().run(RunnerA(antigravity_outputs=[("ok", 0)]), config, "PromptA", role="reviewer")
+
+    def run_b():
+        AntigravityBackend().run(RunnerB(antigravity_outputs=[("ok", 0)]), config, "PromptB", role="reviewer")
+
+    ta = threading.Thread(target=run_a, daemon=True)
+    ta.start()
+    a_in_runner.wait(timeout=10)
+
+    tb = threading.Thread(target=run_b, daemon=True)
+    tb.start()
+
+    a_release.set()
+    b_in_runner.wait(timeout=10)
+
+    ta.join(timeout=10)
+    tb.join(timeout=10)
+
+    assert not ta.is_alive(), "Thread A deadlocked"
+    assert not tb.is_alive(), "Thread B deadlocked"
+    assert order == ["a_in_runner", "b_in_runner"]
+    assert settings_file.read_text(encoding="utf-8") == '{"k": "v"}'
+
+
+def test_antigravity_settings_lock_serializes_reviewer_vs_coder_both_orders(
+    tmp_path, monkeypatch
+):
+    """Reviewer-coder and coder-reviewer serialization; LOCK_NB on the contender backend's
+    settings-lock acquisition confirms the holder is actively holding the lock."""
+    import fcntl as fcntl_mod
+    import threading
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    settings_lock_path_str = str(settings_file.with_suffix(".json.lock"))
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    real_flock = fcntl_mod.flock
+    _is_contender: threading.local = threading.local()
+    _probe_done: threading.local = threading.local()
+
+    for holder_role, contender_role in [("reviewer", None), (None, "reviewer")]:
+        settings_file.write_text('{"initial": true}', encoding="utf-8")
+
+        holder_in_runner = threading.Event()
+        release_holder = threading.Event()
+        contender_attempting_lock = threading.Event()
+        contender_probe_done = threading.Event()
+        contender_in_runner = threading.Event()
+        nb_probe_results: list = []
+
+        def instrumented_flock(fd, operation,
+                               _slp=settings_lock_path_str,
+                               _cat=contender_attempting_lock,
+                               _cpd=contender_probe_done,
+                               _nbr=nb_probe_results):
+            if (
+                getattr(_is_contender, "value", False)
+                and _slp in str(getattr(fd, "name", ""))
+                and operation == fcntl_mod.LOCK_EX
+                and not getattr(_probe_done, "done", False)
+            ):
+                _probe_done.done = True
+                _cat.set()
+                try:
+                    real_flock(fd, fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
+                    _nbr.append(None)
+                except BlockingIOError as exc:
+                    _nbr.append(exc)
+                _cpd.set()
+                real_flock(fd, fcntl_mod.LOCK_EX)
+                return
+            real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl_mod, "flock", instrumented_flock)
+
+        config = make_config(tmp_path, antigravity_dir=agy_dir)
+
+        class HolderRunner(FakeRunner):
+            def run_with_log(self, args, *, cwd, **kwargs):
+                holder_in_runner.set()
+                release_holder.wait(timeout=10)
+                return super().run_with_log(args, cwd=cwd, **kwargs)
+
+        class ContenderRunner(FakeRunner):
+            def run_with_log(self, args, *, cwd, **kwargs):
+                contender_in_runner.set()
+                return super().run_with_log(args, cwd=cwd, **kwargs)
+
+        def run_holder(role=holder_role):
+            AntigravityBackend().run(
+                HolderRunner(antigravity_outputs=[("ok", 0)]),
+                config, "Holder", role=role,
+            )
+
+        def run_contender(role=contender_role):
+            _is_contender.value = True
+            _probe_done.done = False
+            AntigravityBackend().run(
+                ContenderRunner(antigravity_outputs=[("ok", 0)]),
+                config, "Contender", role=role,
+            )
+
+        th = threading.Thread(target=run_holder, daemon=True)
+        th.start()
+        holder_in_runner.wait(timeout=10)
+
+        tc = threading.Thread(target=run_contender, daemon=True)
+        tc.start()
+
+        contender_attempting_lock.wait(timeout=10)
+        contender_probe_done.wait(timeout=10)
+        release_holder.set()
+        contender_in_runner.wait(timeout=10)
+
+        th.join(timeout=10)
+        tc.join(timeout=10)
+
+        assert not th.is_alive(), f"Holder deadlocked (holder_role={holder_role!r})"
+        assert not tc.is_alive(), f"Contender deadlocked (contender_role={contender_role!r})"
+        assert contender_in_runner.is_set()
+        assert len(nb_probe_results) == 1
+        assert isinstance(nb_probe_results[0], BlockingIOError), (
+            f"LOCK_NB probe should have failed with BlockingIOError "
+            f"but got {nb_probe_results[0]!r} "
+            f"(holder_role={holder_role!r}, contender_role={contender_role!r})"
+        )
+
+
+def test_antigravity_settings_lock_restoration_precedes_unlock_on_exception(
+    tmp_path, monkeypatch
+):
+    """Settings are restored before the settings lock is released, even when runner raises.
+
+    Thread A: reviewer run; runner signals `injected_event` (settings injected, lock held),
+    waits for `contention_confirmed_event`, then raises RuntimeError.
+    Thread B: raw-lock contender; LOCK_NB proves A holds the lock, then blocks on LOCK_EX.
+    After A's exception path restores settings and releases the lock, B unblocks and
+    reads the settings file — which must already be restored to the original content.
+    """
+    import fcntl as fcntl_mod
+    import threading
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    settings_lock_path = settings_file.with_suffix(".json.lock")
+    original_text = '{"preserve": "this"}'
+    settings_file.write_text(original_text, encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+
+    injected_event = threading.Event()
+    contention_confirmed_event = threading.Event()
+    thread_a_exc: list[BaseException | None] = [None]
+    thread_b_result: list[str | None] = [None]
+    thread_b_nb_error: list = [None]
+
+    class InjectingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            injected_event.set()
+            contention_confirmed_event.wait(timeout=10)
+            raise RuntimeError("simulated reviewer failure")
+
+    def run_a():
+        try:
+            AntigravityBackend().run(
+                InjectingRunner(),
+                make_config(tmp_path, antigravity_dir=agy_dir),
+                "Review.", role="reviewer",
+            )
+        except RuntimeError as exc:
+            thread_a_exc[0] = exc
+
+    def run_b():
+        lock_f = settings_lock_path.open("a+")
+        try:
+            try:
+                fcntl_mod.flock(lock_f, fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
+                thread_b_nb_error[0] = None
+            except BlockingIOError as exc:
+                thread_b_nb_error[0] = exc
+            contention_confirmed_event.set()
+            fcntl_mod.flock(lock_f, fcntl_mod.LOCK_EX)
+            thread_b_result[0] = settings_file.read_text(encoding="utf-8")
+        finally:
+            fcntl_mod.flock(lock_f, fcntl_mod.LOCK_UN)
+            lock_f.close()
+
+    ta = threading.Thread(target=run_a, daemon=True)
+    ta.start()
+    injected_event.wait(timeout=10)
+
+    tb = threading.Thread(target=run_b, daemon=True)
+    tb.start()
+
+    ta.join(timeout=10)
+    tb.join(timeout=10)
+
+    assert not ta.is_alive(), "Thread A deadlocked"
+    assert not tb.is_alive(), "Thread B deadlocked"
+    assert isinstance(thread_a_exc[0], RuntimeError)
+    assert isinstance(thread_b_nb_error[0], BlockingIOError), (
+        f"LOCK_NB should have raised BlockingIOError; got {thread_b_nb_error[0]!r}"
+    )
+    assert thread_b_result[0] == original_text, (
+        f"Settings must be restored before the lock is released; got {thread_b_result[0]!r}"
+    )
+
+
+def test_reviewer_and_coder_call_sites_pass_correct_role(tmp_path):
+    """_run_validated_agent propagates role= to run_agent_result correctly."""
+    from unittest.mock import patch
+    from coding_review_agent_loop.agents.base import AgentResult
+
+    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
+    captured_roles: list = []
+
+    def mock_run(runner, *, agent, config, prompt, session_id=None, run_id=None, role=None):
+        captured_roles.append(role)
+        return AgentResult(text="ok")
+
+    with patch("coding_review_agent_loop.orchestrator.run_agent_result", mock_run):
+        _run_validated_agent(
+            FakeRunner(),
+            agent="gemini",
+            config=config,
+            prompt="Review the plan.",
+            marker_description="test",
+            validate=lambda text: text,
+            role="reviewer",
+        )
+
+    assert captured_roles == ["reviewer"]
+    captured_roles.clear()
+
+    with patch("coding_review_agent_loop.orchestrator.run_agent_result", mock_run):
+        _run_validated_agent(
+            FakeRunner(),
+            agent="gemini",
+            config=config,
+            prompt="Implement.",
+            marker_description="test",
+            validate=lambda text: text,
+        )
+
+    assert captured_roles == [None]
+
+
+def test_run_agent_result_passes_role_to_backend(tmp_path, monkeypatch):
+    """run_agent_result threads role= through to the backend's run() method."""
+    from coding_review_agent_loop.agents.registry import run_agent_result
+    from coding_review_agent_loop.agents.base import AgentResult
+    from coding_review_agent_loop.agents import registry as reg_mod
+
+    captured: dict = {}
+
+    class TrackingBackend:
+        name = "gemini"
+        display_name = "Gemini"
+        signature = "Google Gemini"
+
+        def workdir(self, config):
+            return tmp_path
+
+        def default_args(self, *, dangerous):
+            return ()
+
+        def run(self, runner, config, prompt, session_id=None, run_id=None, role=None):
+            captured["role"] = role
+            return AgentResult(text="ok")
+
+    monkeypatch.setitem(reg_mod.BACKENDS, "gemini", TrackingBackend())
+    config = make_config(tmp_path, reviewer="gemini")
+    run_agent_result(FakeRunner(), agent="gemini", config=config, prompt="Test", role="reviewer")
+    assert captured["role"] == "reviewer"

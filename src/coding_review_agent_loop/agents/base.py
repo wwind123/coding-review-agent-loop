@@ -58,6 +58,7 @@ class AgentBackend(Protocol):
         prompt: str,
         session_id: str | None = None,
         run_id: str | None = None,
+        role: str | None = None,
     ) -> AgentResult: ...
 
 

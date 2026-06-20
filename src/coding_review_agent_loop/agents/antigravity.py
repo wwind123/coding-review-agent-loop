@@ -34,6 +34,7 @@ from .base import (
     read_public_response_file,
     with_public_response_file_instruction,
 )
+from ..errors import AgentLoopError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
 from ..runner import Runner
@@ -88,6 +89,26 @@ review failure.
 """
 
 
+_REVIEWER_SETTINGS_INJECTION = {
+    "toolPermission": "strict",
+    "permissions": {
+        "allow": [
+            "command(ls)",
+            "command(cat)",
+            "command(which)",
+            "command(echo)",
+            "command(file)",
+            "command(head)",
+        ]
+    },
+}
+
+
+def _antigravity_settings_path() -> Path:
+    """Return ~/.gemini/antigravity-cli/settings.json (patchable in tests)."""
+    return Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
+
+
 def _strip_public_response_marker(raw: str) -> tuple[str, AgentTextSource]:
     if PUBLIC_RESPONSE_MARKER not in raw:
         return raw, "stdout"
@@ -112,13 +133,17 @@ class AntigravityBackend:
         prompt: str,
         session_id: str | None = None,
         run_id: str | None = None,
+        role: str | None = None,
     ) -> AgentResult:
+        import json, fcntl  # Unix-only (fcntl); imported here so the module loads on Windows
         for i, model in enumerate(config.antigravity_models):
             response_path = public_response_path(config, "antigravity")
             prompt_text = _with_public_response_marker_instruction(
                 with_public_response_file_instruction(prompt, response_path)
             )
             args = [config.antigravity_cmd, "--model", model, *config.antigravity_args]
+            if role == "reviewer":
+                args = [a for a in args if a != "--dangerously-skip-permissions"]
             # agy resumes by conversation id (not gemini's --resume). agy --print does
             # not surface a conversation id in plain output, so in practice session_id
             # is None and turns are single-shot; honor it if a caller ever supplies one.
@@ -138,7 +163,7 @@ class AntigravityBackend:
             # inject→run→strip sequence across concurrent processes sharing the same
             # default per-repo workdir.
             gemini_md_path = config.antigravity_dir / "GEMINI.md"
-            lock_path = _git_lock_path(config.antigravity_dir)
+            gemini_lock_path = _git_lock_path(config.antigravity_dir)
             single_shot_instruction = (
                 "# Agent Loop Single-Shot Session\n\n"
                 "You are running in a single-shot, non-interactive `agy --print` session"
@@ -154,45 +179,106 @@ class AntigravityBackend:
                 " in this same turn before writing your response.\n\n"
                 "---\n\n"
             )
-            import fcntl  # Unix-only; imported here so the module loads on Windows
-            lock_file = lock_path.open("a+")
+            settings_path = _antigravity_settings_path()
+            settings_lock_path = settings_path.with_suffix(".json.lock")
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            settings_lock = settings_lock_path.open("a+")
             try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-                try:
-                    existing = gemini_md_path.read_text(encoding="utf-8")
-                except FileNotFoundError:
-                    existing = None
-                gemini_md_path.write_text(
-                    single_shot_instruction + (existing or ""),
-                    encoding="utf-8",
-                )
-                try:
-                    result = runner.run_with_log(
-                        args,
-                        cwd=config.antigravity_dir,
-                        log_path=log_path,
-                        label=f"Antigravity ({model})",
-                        progress_interval_seconds=config.progress_interval_seconds,
-                        check=False,
-                        env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
-                        use_pty=True,
-                    )
-                finally:
-                    # Strip only our injected prefix from whatever the file contains now,
-                    # preserving any changes the agent made to the content that followed it.
-                    if gemini_md_path.exists():
-                        current = gemini_md_path.read_text(encoding="utf-8")
-                        if current.startswith(single_shot_instruction):
-                            remainder = current[len(single_shot_instruction):]
-                            if remainder:
-                                gemini_md_path.write_text(remainder, encoding="utf-8")
-                            else:
-                                gemini_md_path.unlink()
-                        # else: agent rewrote the file entirely — leave it as-is
-                    # else: agent deleted the file — leave it deleted (intentional change)
+                fcntl.flock(settings_lock, fcntl.LOCK_EX)
+                if role == "reviewer":
+                    try:
+                        original_settings_text = settings_path.read_text(encoding="utf-8")
+                        try:
+                            existing_settings = json.loads(original_settings_text)
+                        except json.JSONDecodeError as exc:
+                            raise AgentLoopError(f"settings.json malformed: {exc}") from exc
+                        if not isinstance(existing_settings, dict):
+                            raise AgentLoopError("settings.json root is not a JSON object")
+                    except FileNotFoundError:
+                        original_settings_text = None
+                        existing_settings = {}
+                    try:
+                        injected = {**existing_settings, **_REVIEWER_SETTINGS_INJECTION}
+                        settings_path.write_text(json.dumps(injected, indent=2), encoding="utf-8")
+                        # Inner: GEMINI.md lock
+                        gemini_lock_file = gemini_lock_path.open("a+")
+                        try:
+                            fcntl.flock(gemini_lock_file, fcntl.LOCK_EX)
+                            try:
+                                existing_gemini = gemini_md_path.read_text(encoding="utf-8")
+                            except FileNotFoundError:
+                                existing_gemini = None
+                            gemini_md_path.write_text(
+                                single_shot_instruction + (existing_gemini or ""),
+                                encoding="utf-8",
+                            )
+                            try:
+                                result = runner.run_with_log(
+                                    args,
+                                    cwd=config.antigravity_dir,
+                                    log_path=log_path,
+                                    label=f"Antigravity ({model})",
+                                    progress_interval_seconds=config.progress_interval_seconds,
+                                    check=False,
+                                    env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
+                                    use_pty=True,
+                                )
+                            finally:
+                                if gemini_md_path.exists():
+                                    current = gemini_md_path.read_text(encoding="utf-8")
+                                    if current.startswith(single_shot_instruction):
+                                        remainder = current[len(single_shot_instruction):]
+                                        if remainder:
+                                            gemini_md_path.write_text(remainder, encoding="utf-8")
+                                        else:
+                                            gemini_md_path.unlink()
+                        finally:
+                            fcntl.flock(gemini_lock_file, fcntl.LOCK_UN)
+                            gemini_lock_file.close()
+                    finally:
+                        if original_settings_text is None:
+                            settings_path.unlink(missing_ok=True)
+                        else:
+                            settings_path.write_text(original_settings_text, encoding="utf-8")
+                else:
+                    # Coder path: hold settings lock without modifying settings.json
+                    gemini_lock_file = gemini_lock_path.open("a+")
+                    try:
+                        fcntl.flock(gemini_lock_file, fcntl.LOCK_EX)
+                        try:
+                            existing_gemini = gemini_md_path.read_text(encoding="utf-8")
+                        except FileNotFoundError:
+                            existing_gemini = None
+                        gemini_md_path.write_text(
+                            single_shot_instruction + (existing_gemini or ""),
+                            encoding="utf-8",
+                        )
+                        try:
+                            result = runner.run_with_log(
+                                args,
+                                cwd=config.antigravity_dir,
+                                log_path=log_path,
+                                label=f"Antigravity ({model})",
+                                progress_interval_seconds=config.progress_interval_seconds,
+                                check=False,
+                                env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
+                                use_pty=True,
+                            )
+                        finally:
+                            if gemini_md_path.exists():
+                                current = gemini_md_path.read_text(encoding="utf-8")
+                                if current.startswith(single_shot_instruction):
+                                    remainder = current[len(single_shot_instruction):]
+                                    if remainder:
+                                        gemini_md_path.write_text(remainder, encoding="utf-8")
+                                    else:
+                                        gemini_md_path.unlink()
+                    finally:
+                        fcntl.flock(gemini_lock_file, fcntl.LOCK_UN)
+                        gemini_lock_file.close()
             finally:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-                lock_file.close()
+                fcntl.flock(settings_lock, fcntl.LOCK_UN)
+                settings_lock.close()
             log(config, f"Antigravity ({model}) finished; log: {log_path}")
 
             if result.returncode != 0:

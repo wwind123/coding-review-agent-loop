@@ -87,5 +87,6 @@ def run_agent_result(
     prompt: str,
     session_id: str | None = None,
     run_id: str | None = None,
+    role: str | None = None,
 ) -> AgentResult:
-    return get_backend(agent).run(runner, config, prompt, session_id=session_id, run_id=run_id)
+    return get_backend(agent).run(runner, config, prompt, session_id=session_id, run_id=run_id, role=role)

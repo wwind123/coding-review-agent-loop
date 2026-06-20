@@ -107,6 +107,7 @@ class ClaudeBackend:
         prompt: str,
         session_id: str | None = None,
         run_id: str | None = None,
+        role: str | None = None,
     ) -> AgentResult:
         response_path = public_response_path(config, "claude")
         args = [config.claude_cmd, "--print", "--output-format", "json", *config.claude_args]
