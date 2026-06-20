@@ -627,7 +627,11 @@ Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
 follow-ups are small current-plan refinements that must be incorporated before
 implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
-plan is approved; they are allowed only in approved plan reviews. A concern or
+plan is approved; they are allowed only in approved plan reviews. Before adding a
+`future_followups` entry, ask whether the finding is a one-line or trivially small
+mechanical change — initialising a variable, renaming for clarity, adding a missing
+annotation. If so, put it in `same_plan_followups` instead; a separate PR just for a
+one-liner adds overhead without value. A concern or
 paraphrase belongs in exactly one current-round list: `blocking_plan_issues`,
 `same_plan_followups`, or `future_followups`. Do not duplicate or reclassify
 the same concern across Same-plan and Future follow-up lists.
@@ -950,7 +954,11 @@ Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
 follow-ups are small current-plan refinements that must be incorporated before
 implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
-plan is approved; they are allowed only in approved plan reviews. A concern or
+plan is approved; they are allowed only in approved plan reviews. Before adding a
+`future_followups` entry, ask whether the finding is a one-line or trivially small
+mechanical change — initialising a variable, renaming for clarity, adding a missing
+annotation. If so, put it in `same_plan_followups` instead; a separate PR just for a
+one-liner adds overhead without value. A concern or
 paraphrase belongs in exactly one current-round list: `blocking_plan_issues`,
 `same_plan_followups`, or `future_followups`. Do not duplicate or reclassify
 the same concern across Same-plan and Future follow-up lists.
@@ -1714,7 +1722,10 @@ carried-forward prior unresolved items left active for this round.
 Same-PR follow-ups will be sent back to {coder_name} and require another review
 round before final approval. Before returning approved, self-check that no
 Future follow-up is trivial or local to the current PR; reclassify it as
-Same-PR or omit it. Do not put trivial style nits in either follow-up section.
+Same-PR or omit it. One-line correctness fixes (e.g. initialising a needed variable)
+belong in `blocking_items`; one-line cleanup (e.g. renaming for clarity, adding an
+annotation) belongs in `same_pr_followups`. Neither belongs in `future_followups`.
+Do not put trivial style nits in either follow-up section.
 If you return `<!-- AGENT_STATE: blocking -->`, do not use structured Future
 follow-ups; keep all required current-round work in the blocking review so it
 is not missed during revision.
@@ -1737,6 +1748,9 @@ Do not use the Same-PR follow-ups section in this mode; mark the review blocking
 instead when small or local cleanup should be fixed before merge.
 Before returning approved, self-check that no Future follow-up is trivial or
 local to the current PR; reclassify it as blocking current-PR work or omit it.
+One-line or trivially small mechanical fixes — whether a correctness issue (initialising a
+needed variable) or cleanup (renaming for clarity, adding an annotation) — belong in the
+current round as blocking work, not in a future issue.
 The legacy heading `### Non-blocking follow-ups` is still accepted as future
 follow-ups for compatibility, but prefer `### Future follow-ups`.
 """
@@ -1914,7 +1928,10 @@ carried-forward prior unresolved items left active for this round.
 Same-PR follow-ups will be sent back to {coder_name} and require another review
 round before final approval. Before returning approved, self-check that no
 Future follow-up is trivial or local to the current PR; reclassify it as
-Same-PR or omit it. Do not put trivial style nits in either follow-up section.
+Same-PR or omit it. One-line correctness fixes (e.g. initialising a needed variable)
+belong in `blocking_items`; one-line cleanup (e.g. renaming for clarity, adding an
+annotation) belongs in `same_pr_followups`. Neither belongs in `future_followups`.
+Do not put trivial style nits in either follow-up section.
 If you return `<!-- AGENT_STATE: blocking -->`, do not use structured Future
 follow-ups; keep all required current-round work in the blocking review so it
 is not missed during revision.
@@ -1937,6 +1954,9 @@ Do not use the Same-PR follow-ups section in this mode; mark the review blocking
 instead when small or local cleanup should be fixed before merge.
 Before returning approved, self-check that no Future follow-up is trivial or
 local to the current PR; reclassify it as blocking current-PR work or omit it.
+One-line or trivially small mechanical fixes — whether a correctness issue (initialising a
+needed variable) or cleanup (renaming for clarity, adding an annotation) — belong in the
+current round as blocking work, not in a future issue.
 The legacy heading `### Non-blocking follow-ups` is still accepted as future
 follow-ups for compatibility, but prefer `### Future follow-ups`.
 """

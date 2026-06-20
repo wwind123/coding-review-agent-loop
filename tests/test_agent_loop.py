@@ -9570,6 +9570,40 @@ def test_review_prompt_allows_same_pr_followups_for_fix_modes(tmp_path):
     ) in prompt
 
 
+def test_plan_review_prompt_directs_one_liner_to_same_plan(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex",))
+    for compact in (False, True):
+        prompt = build_plan_review_prompt(
+            56, 1, "Plan.", config, reviewer="codex", compact_context=compact
+        )
+        # Proves the guidance names future_followups as the excluded destination
+        assert "Before adding a\n`future_followups` entry" in prompt
+        # Proves the destination is same_plan_followups (not future)
+        assert "same_plan_followups` instead" in prompt
+        # Proves the classification-threshold text is present
+        assert "trivially small\nmechanical change" in prompt
+
+
+def test_review_prompt_one_liner_preserves_blocking_vs_same_pr_in_fix_and_mode(tmp_path):
+    config = make_config(tmp_path, approved_followups="fix-and-summarize")
+    for compact in (False, True):
+        prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
+        # Proves defect one-liners stay in blocking_items, cleanup goes to same_pr_followups
+        assert "blocking_items`; one-line cleanup" in prompt
+        # Proves explicit exclusion from future_followups
+        assert "Neither belongs in `future_followups`" in prompt
+
+
+def test_review_prompt_one_liner_excluded_from_future_in_standard_mode(tmp_path):
+    config = make_config(tmp_path, approved_followups="summarize")
+    for compact in (False, True):
+        prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
+        # Proves exclusion from future follow-up issues
+        assert "not in a future issue" in prompt
+        # Proves the classification-threshold text is present
+        assert "trivially small mechanical fixes" in prompt
+
+
 def test_same_pr_followup_prompt_no_longer_claims_pr_was_approved(tmp_path):
     config = make_config(tmp_path)
 
