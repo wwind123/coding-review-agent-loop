@@ -18607,6 +18607,28 @@ def test_antigravity_backend_gemini_md_lock_serializes_concurrent_access(tmp_pat
     assert order.index("A-releases") < order.index("B-run")
 
 
+def test_antigravity_backend_git_lock_path_follows_linked_worktree(tmp_path):
+    """_git_lock_path resolves a file-form .git marker (linked worktree) to the real
+    git dir instead of trying to mkdir the .git file."""
+    from coding_review_agent_loop.agents.antigravity import _git_lock_path
+
+    agy_dir = tmp_path / "worktree"
+    agy_dir.mkdir()
+    real_git_dir = tmp_path / "repo.git" / "worktrees" / "wt"
+    real_git_dir.mkdir(parents=True)
+
+    # Simulate the .git file that git worktree add creates
+    (agy_dir / ".git").write_text(
+        f"gitdir: {real_git_dir}\n", encoding="utf-8"
+    )
+
+    lock = _git_lock_path(agy_dir)
+    assert lock.parent == real_git_dir
+    assert lock.name == "GEMINI.md.lock"
+    # Must not attempt to mkdir over the .git file
+    assert (agy_dir / ".git").is_file()
+
+
 def test_antigravity_backend_strips_public_response_marker(tmp_path):
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
     from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER

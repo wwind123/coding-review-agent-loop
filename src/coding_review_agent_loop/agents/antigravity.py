@@ -43,6 +43,28 @@ if TYPE_CHECKING:
     from ..config import AgentLoopConfig
 
 
+def _git_lock_path(workdir: Path) -> Path:
+    """Return GEMINI.md.lock inside the git metadata dir, following linked-worktree .git files.
+
+    In a linked worktree .git is a file containing ``gitdir: <relative-path>``.
+    mkdir-ing that path would raise NotADirectoryError.  We resolve the pointer
+    and place the lock in the real git dir so git add never sees it.  If no git
+    dir can be found (test tmp dirs without a .git) we create .git/ and use it.
+    """
+    git_path = workdir / ".git"
+    if git_path.is_dir():
+        return git_path / "GEMINI.md.lock"
+    if git_path.is_file():
+        content = git_path.read_text(encoding="utf-8", errors="replace").strip()
+        if content.startswith("gitdir:"):
+            gitdir = (workdir / content[len("gitdir:"):].strip()).resolve()
+            if gitdir.is_dir():
+                return gitdir / "GEMINI.md.lock"
+    # No .git directory yet (e.g. test tmp dirs) — create it.
+    git_path.mkdir(parents=True, exist_ok=True)
+    return git_path / "GEMINI.md.lock"
+
+
 def _with_public_response_marker_instruction(prompt: str) -> str:
     return f"""{prompt}
 
@@ -112,15 +134,12 @@ class AntigravityBackend:
             # agy from spawning background execution tasks (which cause it to end the
             # --print turn without a response). Cleanup strips only the injected prefix
             # rather than restoring a snapshot, so file changes made during a coder turn
-            # are preserved. An exclusive flock on GEMINI.md.lock serializes the entire
+            # are preserved. An exclusive flock on the lock file (resolved by
+            # _git_lock_path into git metadata, not the worktree) serializes the entire
             # inject→run→strip sequence across concurrent processes sharing the same
             # default per-repo workdir.
             gemini_md_path = config.antigravity_dir / "GEMINI.md"
-            # Lock lives in .git/ (git metadata) so it is never staged or committed
-            # by a coder-role agy run, and agy itself ignores .git/. mkdir is a
-            # no-op in production (where .git/ always exists) and creates it in tests.
-            lock_path = config.antigravity_dir / ".git" / "GEMINI.md.lock"
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = _git_lock_path(config.antigravity_dir)
             single_shot_instruction = (
                 "# Agent Loop Single-Shot Session\n\n"
                 "You are running in a single-shot, non-interactive `agy --print` session"
