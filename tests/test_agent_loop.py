@@ -47,10 +47,13 @@ from coding_review_agent_loop.orchestrator import (
     _decode_public_response_json_prefix,
     _format_reset_duration,
     _failure_category,
+    _HumanRequirementsRecoveryContext,
     _is_transient_agent_output,
     _is_transient_public_response,
     _parse_rate_limit_reset_seconds,
+    _recover_plan_revision_human_requirements_acknowledgement,
     _run_validated_agent,
+    _split_reconstructable_plan_revision_response,
 )
 from coding_review_agent_loop.config import (
     default_agent_memory_dir,
@@ -7803,7 +7806,10 @@ def test_run_validated_agent_refuses_conflicting_plan_revision_human_ack_blocks(
             )
 
 
-def test_run_validated_agent_does_not_recover_unknown_prior_item_disposition(tmp_path):
+def test_run_validated_agent_strip_unknown_disposition_then_ack_recovery_succeeds(tmp_path):
+    # When the response file has both an unknown prior-item disposition AND a missing ack,
+    # block 2 strips the disposition deterministically and the new ack recovery path (#403)
+    # then reconstructs the ack from message_text — both issues fixed, no repair pass needed.
     human_requirements = (
         HumanReviewRequirement(
             source_type="Issue comment",
@@ -7842,23 +7848,24 @@ def test_run_validated_agent_does_not_recover_unknown_prior_item_disposition(tmp
     )
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None) as repair_mock:
-        with pytest.raises(AgentLoopError, match="No review result was recorded"):
-            _run_validated_agent(
-                runner,
-                agent="claude",
-                config=config,
-                prompt="Revise the plan.",
-                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
-                validate=_plan_revision_validate_with_human_requirements(human_requirements),
-                use_repair=True,
-                repair_expected_kind="plan_revision",
-                repair_surfaced_requirement_ids=context.surfaced_requirement_ids,
-                repair_requires_direct_discussion_ack=context.requires_direct_discussion_ack,
-                repair_allowed_prior_item_ids=(),
-            )
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Revise the plan.",
+            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            validate=_plan_revision_validate_with_human_requirements(human_requirements),
+            use_repair=True,
+            repair_expected_kind="plan_revision",
+            repair_surfaced_requirement_ids=context.surfaced_requirement_ids,
+            repair_requires_direct_discussion_ack=context.requires_direct_discussion_ack,
+            repair_allowed_prior_item_ids=(),
+        )
 
-    repair_mock.assert_called_once()
+    repair_mock.assert_not_called()
+    assert "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->" in response.text
+    assert "item-unknown" not in response.text
 
 
 @pytest.mark.parametrize(
@@ -17137,6 +17144,7 @@ def test_run_validated_agent_envelope_normalization_semantic_defect_uses_repair(
     repaired_review = structured_pr_review(state="approved", reviewer="Google Gemini")
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
+    normalized_review = attempt_envelope_normalization(malformed_review, expected_kind="pr_review")
 
     with patch(
         "coding_review_agent_loop.orchestrator.attempt_repair",
@@ -17158,10 +17166,300 @@ def test_run_validated_agent_envelope_normalization_semantic_defect_uses_repair(
 
     assert response.text == repaired_review
     repair_mock.assert_called_once_with(
-        malformed_review,
+        normalized_review,
         config.gemini_cmd,
         expected_kind="pr_review",
     )
+
+
+def test_run_validated_agent_attempt_repair_uses_envelope_normalized(tmp_path, monkeypatch):
+    raw_text = structured_pr_review(state="blocking", reviewer="Google Gemini") + "\ngarbage"
+    normalized_text = structured_pr_review(state="blocking", reviewer="Google Gemini")
+    repaired_text = structured_pr_review(state="approved", reviewer="Google Gemini")
+
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator.attempt_envelope_normalization",
+        lambda text, expected_kind: normalized_text,
+    )
+    repair_inputs = []
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator.attempt_repair",
+        lambda text, gemini_cmd, **kwargs: repair_inputs.append(text) or repaired_text,
+    )
+
+    runner = FakeRunner(gemini_outputs=[(raw_text, 0)])
+    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
+
+    def validate(text):
+        if text == repaired_text:
+            return parse_structured_pr_review(text, reviewer="Google Gemini").state
+        raise AgentLoopError("invalid")
+
+    response = _run_validated_agent(
+        runner,
+        agent="gemini",
+        config=config,
+        prompt="Review the PR.",
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        validate=validate,
+        use_repair=True,
+        repair_expected_kind="pr_review",
+    )
+
+    assert response.text == repaired_text
+    assert repair_inputs == [normalized_text]
+
+
+def test_run_validated_agent_attempt_repair_falls_back_to_text_when_no_normalization(tmp_path, monkeypatch):
+    raw_text = structured_pr_review(state="blocking", reviewer="Google Gemini")
+    repaired_text = structured_pr_review(state="approved", reviewer="Google Gemini")
+
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator.attempt_envelope_normalization",
+        lambda text, expected_kind: None,
+    )
+    repair_inputs = []
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator.attempt_repair",
+        lambda text, gemini_cmd, **kwargs: repair_inputs.append(text) or repaired_text,
+    )
+
+    runner = FakeRunner(gemini_outputs=[(raw_text, 0)])
+    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
+
+    def validate(text):
+        if text == repaired_text:
+            return parse_structured_pr_review(text, reviewer="Google Gemini").state
+        raise AgentLoopError("invalid")
+
+    response = _run_validated_agent(
+        runner,
+        agent="gemini",
+        config=config,
+        prompt="Review the PR.",
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        validate=validate,
+        use_repair=True,
+        repair_expected_kind="pr_review",
+    )
+
+    assert response.text == repaired_text
+    assert repair_inputs == [raw_text]
+
+
+def test_recover_plan_revision_ack_text_override_uses_stripped_as_base(tmp_path):
+    from coding_review_agent_loop.agents.base import AgentResult
+
+    human_requirements = (
+        HumanReviewRequirement(
+            source_type="Issue comment",
+            author="wwind123",
+            created_at="2026-06-05T00:00:00Z",
+            url="https://github.com/OWNER/REPO/issues/1#issuecomment-1",
+            body="Requirement 1: cover the stripped-base case.",
+        ),
+    )
+    context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue directly before revising the plan.",
+    )
+    ack = (
+        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+        "### Human requirements\n"
+        "- Requirement 1: The revised plan covers the stripped-base case.\n"
+    )
+    dirty_text = structured_plan_revision(
+        prior_plan_item_dispositions=[{"item_id": "unknown-prior-item-1", "disposition": "resolved"}],
+    )
+    stripped_text = structured_plan_revision()
+    message_text = structured_plan_revision(human_requirements=ack)
+
+    result = AgentResult(
+        text=dirty_text,
+        message_text=message_text,
+        response_file_text=dirty_text,
+    )
+    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
+    validate = _plan_revision_validate_with_human_requirements(human_requirements)
+
+    recovered = _recover_plan_revision_human_requirements_acknowledgement(
+        result,
+        text=stripped_text,
+        validate=validate,
+        context=_HumanRequirementsRecoveryContext(
+            surfaced_requirement_ids=context.surfaced_requirement_ids,
+            requires_direct_discussion_ack=context.requires_direct_discussion_ack,
+        ),
+        config=config,
+        agent_name="TestAgent",
+    )
+
+    assert recovered is not None
+    recovered_text, _ = recovered
+    # JSON prefix comes from stripped_text (no unknown disposition), not dirty_text
+    assert "unknown-prior-item-1" not in recovered_text
+    assert "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->" in recovered_text
+    assert "### Human requirements" in recovered_text
+    validate(recovered_text)
+
+
+def test_run_validated_agent_strip_path_ack_recovery(tmp_path, monkeypatch):
+    human_requirements = (
+        HumanReviewRequirement(
+            source_type="Issue comment",
+            author="wwind123",
+            created_at="2026-06-05T00:00:00Z",
+            url="https://github.com/OWNER/REPO/issues/1#issuecomment-1",
+            body="Requirement 1: cover the strip-path ack recovery.",
+        ),
+    )
+    context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue directly before revising the plan.",
+    )
+    ack = (
+        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+        "### Human requirements\n"
+        "- Requirement 1: The revised plan covers the strip-path case.\n"
+    )
+    response_file = structured_plan_revision(
+        prior_plan_item_dispositions=[{"item_id": "unknown-prior-item-1", "disposition": "resolved"}],
+    )
+    message_text_with_ack = structured_plan_revision(human_requirements=ack)
+    recovered_text = structured_plan_revision(human_requirements=ack)
+
+    recovery_calls = []
+
+    def mock_recovery(result, *, text=None, **kwargs):
+        recovery_calls.append(text)
+        return (recovered_text, "blocking")
+
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator._recover_plan_revision_human_requirements_acknowledgement",
+        mock_recovery,
+    )
+
+    runner = FakeRunner(
+        claude_outputs=[(message_text_with_ack, 0)],
+        public_response_outputs=[{"text": response_file}],
+    )
+    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Revise the plan.",
+            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            validate=_plan_revision_validate_with_human_requirements(human_requirements),
+            use_repair=True,
+            repair_expected_kind="plan_revision",
+            repair_surfaced_requirement_ids=context.surfaced_requirement_ids,
+            repair_requires_direct_discussion_ack=context.requires_direct_discussion_ack,
+        )
+
+    repair_mock.assert_not_called()
+    assert response.text == recovered_text
+    # Recovery was called once for the stripped variant (no unknown disposition)
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0] is not None
+    assert "unknown-prior-item-1" not in recovery_calls[0]
+
+
+def test_run_validated_agent_combined_strip_path_ack_recovery(tmp_path, monkeypatch):
+    raw_text = "non-structured plan revision text"
+    normalized_text = structured_plan_revision(
+        prior_plan_item_dispositions=[{"item_id": "unknown-item-1", "disposition": "resolved"}],
+    )
+    stripped_from_normalized = structured_plan_revision()
+    recovered_text = structured_plan_revision(
+        human_requirements=(
+            "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+            "### Human requirements\n- Req 1: covered.\n"
+        ),
+    )
+
+    human_requirements = (
+        HumanReviewRequirement(
+            source_type="Issue comment",
+            author="wwind123",
+            created_at="2026-06-05T00:00:00Z",
+            url="https://github.com/OWNER/REPO/issues/1#issuecomment-1",
+            body="Req 1: cover the combined-strip-path case.",
+        ),
+    )
+    context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="planning requirements",
+        full_omission_fallback="Fetch the issue directly.",
+    )
+
+    def fake_validate(text):
+        if text == raw_text:
+            raise AgentLoopError("not structured")
+        if text == normalized_text:
+            raise UnknownPriorItemDispositionError(
+                unknown_ids=("unknown-item-1",),
+                allowed_ids=(),
+                same_round_description="not a valid prior item",
+            )
+        if text == stripped_from_normalized:
+            raise AgentLoopError("missing ack")
+        return "blocking"
+
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator.attempt_envelope_normalization",
+        lambda text, expected_kind: normalized_text if text == raw_text else None,
+    )
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator.strip_unknown_prior_item_dispositions",
+        lambda text, allowed_ids, expected_kind: (
+            stripped_from_normalized if text == normalized_text else None
+        ),
+    )
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator._plan_revision_missing_human_acknowledgement",
+        lambda text, context: text == stripped_from_normalized,
+    )
+
+    recovery_calls = []
+
+    def mock_recovery(result, *, text=None, **kwargs):
+        recovery_calls.append(text)
+        return (recovered_text, "blocking")
+
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator._recover_plan_revision_human_requirements_acknowledgement",
+        mock_recovery,
+    )
+
+    runner = FakeRunner(
+        claude_outputs=[(raw_text, 0)],
+        public_response_outputs=[{"text": raw_text}],
+    )
+    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Revise the plan.",
+            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            validate=fake_validate,
+            use_repair=True,
+            repair_expected_kind="plan_revision",
+            repair_surfaced_requirement_ids=context.surfaced_requirement_ids,
+            repair_requires_direct_discussion_ack=context.requires_direct_discussion_ack,
+        )
+
+    repair_mock.assert_not_called()
+    assert response.text == recovered_text
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0] is stripped_from_normalized
 
 
 def test_run_pr_loop_repairs_format_failure_with_5xx_source_line_reference(tmp_path):

@@ -673,12 +673,13 @@ def _human_requirements_acknowledgement_blocks(text: str) -> list[str]:
 def _recover_plan_revision_human_requirements_acknowledgement(
     result: AgentResult,
     *,
+    text: str | None = None,
     validate: Callable[[str], object],
     context: _HumanRequirementsRecoveryContext,
     config: AgentLoopConfig,
     agent_name: str,
 ) -> tuple[str, object] | None:
-    split = _split_reconstructable_plan_revision_response(result.text)
+    split = _split_reconstructable_plan_revision_response(text if text is not None else result.text)
     if split is None:
         log(
             config,
@@ -1006,6 +1007,7 @@ def _run_validated_agent(
                             usage=usage,
                             model_used=result.model_used,
                         )
+                normalized: str | None = None
                 if (
                     use_repair
                     and not public_text_is_transient
@@ -1043,7 +1045,43 @@ def _run_validated_agent(
                                     try:
                                         marker_value = validate(stripped_from_normalized)
                                     except AgentLoopError:
-                                        pass
+                                        if (
+                                            repair_expected_kind == "plan_revision"
+                                            and result.response_file_text
+                                            and _plan_revision_missing_human_acknowledgement(
+                                                stripped_from_normalized,
+                                                context=_HumanRequirementsRecoveryContext(
+                                                    surfaced_requirement_ids=tuple(
+                                                        repair_surfaced_requirement_ids or ()
+                                                    ),
+                                                    requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                                                ),
+                                            )
+                                        ):
+                                            recovered = _recover_plan_revision_human_requirements_acknowledgement(
+                                                result,
+                                                text=stripped_from_normalized,
+                                                validate=validate,
+                                                context=_HumanRequirementsRecoveryContext(
+                                                    surfaced_requirement_ids=tuple(
+                                                        repair_surfaced_requirement_ids or ()
+                                                    ),
+                                                    requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                                                ),
+                                                config=config,
+                                                agent_name=agent_name,
+                                            )
+                                            if recovered is not None:
+                                                recovered_text, marker_value = recovered
+                                                if usage_record is not None:
+                                                    usage_record.validation_status = "validated"
+                                                return ValidatedAgentResponse(
+                                                    text=recovered_text,
+                                                    session_id=result.session_id,
+                                                    marker_value=marker_value,
+                                                    usage=usage,
+                                                    model_used=result.model_used,
+                                                )
                                     else:
                                         removed = ", ".join(sorted(norm_exc.unknown_ids))
                                         allowed_str = ", ".join(sorted(norm_exc.allowed_ids)) or "(none)"
@@ -1095,7 +1133,43 @@ def _run_validated_agent(
                         try:
                             marker_value = validate(stripped_text)
                         except AgentLoopError:
-                            pass
+                            if (
+                                repair_expected_kind == "plan_revision"
+                                and result.response_file_text
+                                and _plan_revision_missing_human_acknowledgement(
+                                    stripped_text,
+                                    context=_HumanRequirementsRecoveryContext(
+                                        surfaced_requirement_ids=tuple(
+                                            repair_surfaced_requirement_ids or ()
+                                        ),
+                                        requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                                    ),
+                                )
+                            ):
+                                recovered = _recover_plan_revision_human_requirements_acknowledgement(
+                                    result,
+                                    text=stripped_text,
+                                    validate=validate,
+                                    context=_HumanRequirementsRecoveryContext(
+                                        surfaced_requirement_ids=tuple(
+                                            repair_surfaced_requirement_ids or ()
+                                        ),
+                                        requires_direct_discussion_ack=repair_requires_direct_discussion_ack,
+                                    ),
+                                    config=config,
+                                    agent_name=agent_name,
+                                )
+                                if recovered is not None:
+                                    recovered_text, marker_value = recovered
+                                    if usage_record is not None:
+                                        usage_record.validation_status = "validated"
+                                    return ValidatedAgentResponse(
+                                        text=recovered_text,
+                                        session_id=result.session_id,
+                                        marker_value=marker_value,
+                                        usage=usage,
+                                        model_used=result.model_used,
+                                    )
                         else:
                             removed = ", ".join(sorted(exc.unknown_ids))
                             allowed_str = ", ".join(sorted(exc.allowed_ids)) or "(none)"
@@ -1137,7 +1211,7 @@ def _run_validated_agent(
                     elif repair_allowed_prior_item_ids is not None:
                         repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
                     repaired = attempt_repair(
-                        text,
+                        normalized if normalized is not None else text,
                         config.gemini_cmd,
                         **repair_kwargs,
                     )
