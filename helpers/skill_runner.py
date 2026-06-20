@@ -432,8 +432,10 @@ def _recover_structured_response(
     except AgentLoopError as first_error:
         last_error: AgentLoopError = first_error
 
+    acknowledgement_candidate = candidate
     normalized = attempt_envelope_normalization(candidate, expected_kind=expected_kind)
     if normalized is not None:
+        acknowledgement_candidate = normalized
         try:
             return normalized, validate(normalized)
         except UnknownPriorItemDispositionError as exc:
@@ -466,7 +468,7 @@ def _recover_structured_response(
 
     if expected_kind == "plan_revision":
         recovered_ack = _recover_plan_revision_human_ack(
-            candidate,
+            acknowledgement_candidate,
             response_evidence=response_evidence,
             surfaced_requirement_ids=surfaced_requirement_ids,
             requires_direct_discussion_ack=requires_direct_discussion_ack,

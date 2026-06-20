@@ -1035,6 +1035,55 @@ class TestStructuredSkillRecovery:
         )
         assert acknowledgement in recovered
 
+    def test_plan_revision_envelope_and_ack_are_recovered_together(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.protocol import validate_human_requirements_acknowledgement
+        from helpers.validate_response import validate_response_text
+
+        raw = json.dumps({
+            "schema_version": 1,
+            "kind": "plan_revision",
+            "state": "blocking",
+            "summary": "Revised.",
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-1", "disposition": "resolved"}
+            ],
+            "plan_steps": ["Implement the fix."],
+        }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Codex\ntrailing prose"
+        acknowledgement = (
+            "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+            "### Human requirements\n\n"
+            "- Requirement 1: preserved the required behavior."
+        )
+        monkeypatch.setattr(sr, "attempt_repair", lambda *a, **k: pytest.fail("repair not needed"))
+
+        def validate(text):
+            parsed = validate_response_text(
+                text,
+                kind="plan_revision",
+                prior_items=[self._prior_item()],
+            )
+            validate_human_requirements_acknowledgement(
+                text,
+                surfaced_requirement_ids=("Requirement 1",),
+                requires_direct_discussion_ack=False,
+            )
+            return parsed
+
+        recovered, parsed = sr._recover_structured_response(
+            raw,
+            expected_kind="plan_revision",
+            validate=validate,
+            allowed_prior_item_ids=["item-1"],
+            surfaced_requirement_ids=["Requirement 1"],
+            response_evidence={"message_text": f"notes\n{acknowledgement}\n-- Codex"},
+        )
+
+        assert "trailing prose" not in recovered
+        assert recovered.index(acknowledgement) < recovered.index("<!-- AGENT_PLAN_STATE:")
+        assert parsed.kind == "plan_revision"
+        validate(recovered)
+
     def test_plan_revision_ambiguous_ack_evidence_falls_through(self, monkeypatch) -> None:
         import helpers.skill_runner as sr
         from coding_review_agent_loop.errors import AgentLoopError
