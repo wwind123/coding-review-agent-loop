@@ -9313,6 +9313,7 @@ def test_review_prompt_includes_no_ci_wait_instruction(tmp_path, compact_context
     config = make_config(tmp_path)
     prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact_context)
     assert "Do not defer your review to wait for CI" in prompt
+    assert "DO NOT run tests, shell commands, or compile code" in prompt
 
 
 def test_review_prompt_mentions_branch_protection_forbidden_when_checks_exist(tmp_path):

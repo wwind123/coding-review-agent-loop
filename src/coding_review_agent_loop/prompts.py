@@ -1599,6 +1599,7 @@ Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
 Do not defer your review to wait for CI checks to finish. Review the PR now and report any pending or failing check status in your findings.
+DO NOT run tests, shell commands, or compile code. Review by reading files and the PR diff only. If you find yourself about to execute `pytest`, `npm test`, or any other command — stop. Write your review from code inspection alone.
 When the PR changes files under `alembic/versions/`, verify migration topology:
 new revisions should descend from the current head unless the PR intentionally
 adds a merge migration.
@@ -1976,6 +1977,7 @@ Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
 Do not defer your review to wait for CI checks to finish. Review the PR now and report any pending or failing check status in your findings.
+DO NOT run tests, shell commands, or compile code. Review by reading files and the PR diff only. If you find yourself about to execute `pytest`, `npm test`, or any other command — stop. Write your review from code inspection alone.
 When the PR changes files under `alembic/versions/`, verify migration topology:
 new revisions should descend from the current head unless the PR intentionally
 adds a merge migration.

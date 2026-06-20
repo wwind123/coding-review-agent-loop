@@ -143,9 +143,15 @@ class AntigravityBackend:
                 "# Agent Loop Single-Shot Session\n\n"
                 "You are running in a single-shot, non-interactive `agy --print` session"
                 " invoked by an automated orchestrator. There will be no follow-up turns.\n\n"
-                "**Do NOT spawn background execution tasks or subagents.** If you need to"
-                " run tests or shell commands, run them synchronously using your shell tool"
-                " and wait for the result in this same turn before writing your response.\n\n"
+                "**Do NOT spawn background execution tasks or subagents under any"
+                " circumstances.**\n\n"
+                "**For code review tasks: DO NOT run tests, shell commands, or compile"
+                " code.** Review by reading files and the PR diff only. Tests are CI's"
+                " responsibility; your job is to read code and identify issues. If you find"
+                " yourself about to run `pytest`, `npm test`, `go test`, or any other"
+                " command — stop and write your review from code inspection alone.\n\n"
+                "For non-review tasks that require shell commands, run them synchronously"
+                " in this same turn before writing your response.\n\n"
                 "---\n\n"
             )
             import fcntl  # Unix-only; imported here so the module loads on Windows
