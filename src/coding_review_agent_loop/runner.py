@@ -71,6 +71,11 @@ class Runner:
         if override_flag is None:
             command_name = Path(command).name
             override_flag = f"--{command_name}-cmd"
+        if os.path.isabs(command):
+            return AgentLoopError(
+                f"{command} not found or not executable; "
+                f"pass a valid executable path to {override_flag}."
+            )
         return AgentLoopError(
             f"{command} CLI not found on PATH; install it or pass "
             f"{override_flag} <path>."
@@ -94,6 +99,8 @@ class Runner:
             try:
                 return spawn_attempt()
             except FileNotFoundError as exc:
+                if os.path.isabs(command):
+                    raise self._missing_command_error(command) from exc
                 current = shutil.which(command)
                 if current is not None:
                     self._resolved_commands[command] = current

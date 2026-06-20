@@ -614,6 +614,11 @@ def preflight_agent_commands(
         command, override_flag = command_options[agent]
         resolved = shutil.which(command)
         if resolved is None:
+            if os.path.isabs(command):
+                raise AgentLoopError(
+                    f"{command} not found or not executable; "
+                    f"pass a valid executable path to {override_flag}."
+                )
             raise AgentLoopError(
                 f"{command} CLI not found on PATH; install it or pass "
                 f"{override_flag} <path>."

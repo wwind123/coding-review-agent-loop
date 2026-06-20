@@ -12162,6 +12162,68 @@ def test_config_preflight_skips_dry_run_command_preview(monkeypatch):
     assert config.dry_run is True
 
 
+def test_preflight_absolute_path_valid(tmp_path):
+    """Absolute path to an existing executable passes preflight and is stored."""
+    from coding_review_agent_loop.config import preflight_agent_commands
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr", "77", "--repo", "OWNER/REPO",
+        "--claude-cmd", sys.executable,
+        "--codex-cmd", "codex",
+    ])
+    args.coder = "claude"
+    runner = Runner()
+    preflight_agent_commands(args, runner, ())
+    assert runner._resolved_commands[sys.executable] == sys.executable
+
+
+def test_preflight_absolute_path_not_found_gives_path_error(tmp_path):
+    """Nonexistent absolute path gives 'not found or not executable', not 'not found on PATH'."""
+    from coding_review_agent_loop.config import preflight_agent_commands
+
+    nonexistent = str(tmp_path / "no-such-binary")
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr", "77", "--repo", "OWNER/REPO",
+        "--claude-cmd", nonexistent,
+    ])
+    args.coder = "claude"
+    with pytest.raises(AgentLoopError, match="not found or not executable"):
+        preflight_agent_commands(args, Runner(), ())
+
+
+def test_preflight_absolute_path_dangling_symlink_gives_path_error(tmp_path):
+    """Dangling absolute-path symlink gives 'not found or not executable', not 'not found on PATH'."""
+    from coding_review_agent_loop.config import preflight_agent_commands
+
+    dangling = tmp_path / "dangling-claude"
+    dangling.symlink_to(tmp_path / "missing-target")
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr", "77", "--repo", "OWNER/REPO",
+        "--claude-cmd", str(dangling),
+    ])
+    args.coder = "claude"
+    with pytest.raises(AgentLoopError, match="not found or not executable"):
+        preflight_agent_commands(args, Runner(), ())
+
+
+def test_preflight_bare_name_not_found_gives_path_message(monkeypatch):
+    """Bare name not on PATH still gives 'not found on PATH' message."""
+    from coding_review_agent_loop.config import preflight_agent_commands
+
+    monkeypatch.setattr("coding_review_agent_loop.config.shutil.which", lambda cmd: None)
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr", "77", "--repo", "OWNER/REPO",
+        "--claude-cmd", "missing-bare-name",
+    ])
+    args.coder = "claude"
+    with pytest.raises(AgentLoopError, match="not found on PATH"):
+        preflight_agent_commands(args, Runner(), ())
+
+
 def test_omitted_cli_base_is_preserved_for_runtime_resolution(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
@@ -18849,11 +18911,13 @@ def test_runner_retries_dangling_symlink_spawn_and_recovers(
 ):
     import coding_review_agent_loop.runner as runner_module
 
+    command_name = "bare-agent"
     missing_target = tmp_path / "updating-agent-target"
-    command = tmp_path / "agent"
+    command = tmp_path / command_name
     command.symlink_to(missing_target)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
     runner = Runner()
-    runner.remember_agent_command(str(command), str(command), "--codex-cmd")
+    runner.remember_agent_command(command_name, str(command), "--codex-cmd")
     original_popen = runner_module.subprocess.Popen
     popen_calls = []
     sleep_calls = []
@@ -18861,7 +18925,7 @@ def test_runner_retries_dangling_symlink_spawn_and_recovers(
     def flaky_popen(*args, **kwargs):
         popen_calls.append(args[0])
         if len(popen_calls) == 1:
-            raise FileNotFoundError(str(command))
+            raise FileNotFoundError(command_name)
         return original_popen(*args, **kwargs)
 
     def restore_command(delay):
@@ -18873,7 +18937,7 @@ def test_runner_retries_dangling_symlink_spawn_and_recovers(
     monkeypatch.setattr(runner_module.time, "sleep", restore_command)
 
     result = runner.run_with_log(
-        [str(command), "-c", "print('recovered')"],
+        [command_name, "-c", "print('recovered')"],
         cwd=tmp_path,
         log_path=tmp_path / "logs" / f"retry-{use_pty}.log",
         label="Retry probe",
@@ -18896,16 +18960,18 @@ def test_runner_dangling_symlink_spawn_retry_is_bounded(
 ):
     import coding_review_agent_loop.runner as runner_module
 
-    command = tmp_path / "agent"
+    command_name = "bare-agent"
+    command = tmp_path / command_name
     command.symlink_to(tmp_path / "missing-target")
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
     runner = Runner()
-    runner.remember_agent_command(str(command), str(command), "--codex-cmd")
+    runner.remember_agent_command(command_name, str(command), "--codex-cmd")
     popen_calls = []
     sleep_calls = []
 
     def missing_popen(*args, **kwargs):
         popen_calls.append(args[0])
-        raise FileNotFoundError(str(command))
+        raise FileNotFoundError(command_name)
 
     monkeypatch.setattr(runner_module.subprocess, "Popen", missing_popen)
     monkeypatch.setattr(
@@ -18919,7 +18985,7 @@ def test_runner_dangling_symlink_spawn_retry_is_bounded(
         match=r"CLI not found on PATH.*--codex-cmd",
     ):
         runner.run_with_log(
-            [str(command), "--version"],
+            [command_name, "--version"],
             cwd=tmp_path,
             log_path=tmp_path / "logs" / f"bounded-{use_pty}.log",
             label="Bounded retry probe",
@@ -18959,6 +19025,38 @@ def test_runner_missing_command_without_dangling_evidence_does_not_retry(
             log_path=tmp_path / "logs" / "missing.log",
             label="Missing probe",
             progress_interval_seconds=999,
+        )
+
+    assert len(popen_calls) == 1
+    assert sleep_calls == []
+
+
+@pytest.mark.parametrize("use_pty", [False, True])
+def test_runner_absolute_path_spawn_does_not_retry(monkeypatch, tmp_path, use_pty):
+    """Absolute-path FileNotFoundError raises immediately (no retry, no sleep)."""
+    import coding_review_agent_loop.runner as runner_module
+
+    abs_cmd = str(tmp_path / "no-such-binary")
+    popen_calls = []
+    sleep_calls = []
+
+    def missing_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        raise FileNotFoundError(abs_cmd)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", missing_popen)
+    monkeypatch.setattr(
+        runner_module.time, "sleep", lambda delay: sleep_calls.append(delay),
+    )
+
+    with pytest.raises(AgentLoopError, match="not found or not executable"):
+        Runner().run_with_log(
+            [abs_cmd, "--version"],
+            cwd=tmp_path,
+            log_path=tmp_path / "logs" / f"abs-no-retry-{use_pty}.log",
+            label="Absolute-path no-retry probe",
+            progress_interval_seconds=999,
+            use_pty=use_pty,
         )
 
     assert len(popen_calls) == 1
