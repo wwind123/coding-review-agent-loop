@@ -18607,6 +18607,33 @@ def test_antigravity_backend_gemini_md_lock_serializes_concurrent_access(tmp_pat
     assert order.index("A-releases") < order.index("B-run")
 
 
+def test_antigravity_module_imports_without_fcntl():
+    """Antigravity module must import cleanly even when fcntl is unavailable (Windows)."""
+    import importlib
+    import sys
+
+    # Remove any cached import of the module under test
+    mods_to_remove = [k for k in sys.modules if "antigravity" in k]
+    for m in mods_to_remove:
+        del sys.modules[m]
+
+    # Simulate a platform without fcntl by hiding it
+    original = sys.modules.pop("fcntl", None)
+    sys.modules["fcntl"] = None  # type: ignore[assignment]
+    try:
+        import coding_review_agent_loop.agents.antigravity as mod
+        assert hasattr(mod, "AntigravityBackend")
+    finally:
+        if original is not None:
+            sys.modules["fcntl"] = original
+        else:
+            sys.modules.pop("fcntl", None)
+        # Re-remove so later tests get a clean import
+        for k in list(sys.modules):
+            if "antigravity" in k:
+                del sys.modules[k]
+
+
 def test_antigravity_backend_git_lock_path_follows_linked_worktree(tmp_path):
     """_git_lock_path resolves a file-form .git marker (linked worktree) to the real
     git dir instead of trying to mkdir the .git file."""

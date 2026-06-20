@@ -23,7 +23,6 @@ emits no token usage (usage falls back to the estimated path).
 
 from __future__ import annotations
 
-import fcntl
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -149,6 +148,7 @@ class AntigravityBackend:
                 " and wait for the result in this same turn before writing your response.\n\n"
                 "---\n\n"
             )
+            import fcntl  # Unix-only; imported here so the module loads on Windows
             lock_file = lock_path.open("a+")
             try:
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
