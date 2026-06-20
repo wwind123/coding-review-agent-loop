@@ -18533,6 +18533,76 @@ def test_antigravity_backend_cleans_up_gemini_md_on_exception(tmp_path):
     assert "Do NOT spawn" not in after
 
 
+def test_antigravity_backend_gemini_md_lock_serializes_concurrent_access(tmp_path):
+    """flock on GEMINI.md.lock prevents a second run from starting until the first
+    completes its inject→run→strip sequence."""
+    import fcntl
+    import threading
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "antigravity"
+    agy_dir.mkdir(parents=True, exist_ok=True)
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+
+    order: list[str] = []
+    lock_path = agy_dir / "GEMINI.md.lock"
+
+    # Thread A: pre-acquires the exclusive lock, records "A-holds", sleeps briefly,
+    # records "A-releases", then releases the lock. This simulates another process
+    # holding the lock while running agy.
+    lock_acquired = threading.Event()
+    lock_released = threading.Event()
+
+    def hold_lock():
+        lf = lock_path.open("a+")
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        order.append("A-holds")
+        lock_acquired.set()
+        lock_released.wait()
+        order.append("A-releases")
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
+
+    t = threading.Thread(target=hold_lock, daemon=True)
+    t.start()
+    lock_acquired.wait()
+
+    # Thread B (main): tries to run AntigravityBackend — should block on LOCK_EX
+    # until Thread A releases.
+    run_started = threading.Event()
+
+    class RecordingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            order.append("B-run")
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    def run_backend():
+        AntigravityBackend().run(
+            RecordingRunner(antigravity_outputs=[("ok", 0)]),
+            config,
+            "Review.",
+            run_id="r1",
+        )
+        order.append("B-done")
+
+    backend_thread = threading.Thread(target=run_backend, daemon=True)
+    backend_thread.start()
+
+    # Give the backend thread a moment to block on the lock, then release it.
+    import time
+    time.sleep(0.05)
+    lock_released.set()
+    t.join(timeout=5)
+    backend_thread.join(timeout=10)
+
+    # A-holds must precede B-run and A-releases must precede B-run
+    assert "A-holds" in order
+    assert "A-releases" in order
+    assert "B-run" in order
+    assert order.index("A-holds") < order.index("B-run")
+    assert order.index("A-releases") < order.index("B-run")
+
+
 def test_antigravity_backend_strips_public_response_marker(tmp_path):
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
     from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER

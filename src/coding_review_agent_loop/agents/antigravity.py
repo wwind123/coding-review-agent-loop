@@ -23,6 +23,7 @@ emits no token usage (usage falls back to the estimated path).
 
 from __future__ import annotations
 
+import fcntl
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -110,10 +111,12 @@ class AntigravityBackend:
             # the model sees the prompt. Injecting a single-shot session rule prevents
             # agy from spawning background execution tasks (which cause it to end the
             # --print turn without a response). Cleanup strips only the injected prefix
-            # rather than restoring a snapshot, so any file changes the agent makes
-            # during a coder turn are preserved. Each agent gets its own dedicated
-            # workdir so concurrent GEMINI.md writes cannot occur in normal operation.
+            # rather than restoring a snapshot, so file changes made during a coder turn
+            # are preserved. An exclusive flock on GEMINI.md.lock serializes the entire
+            # inject→run→strip sequence across concurrent processes sharing the same
+            # default per-repo workdir.
             gemini_md_path = config.antigravity_dir / "GEMINI.md"
+            lock_path = config.antigravity_dir / "GEMINI.md.lock"
             single_shot_instruction = (
                 "# Agent Loop Single-Shot Session\n\n"
                 "You are running in a single-shot, non-interactive `agy --print` session"
@@ -123,38 +126,44 @@ class AntigravityBackend:
                 " and wait for the result in this same turn before writing your response.\n\n"
                 "---\n\n"
             )
+            lock_file = lock_path.open("a+")
             try:
-                existing = gemini_md_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                existing = None
-            gemini_md_path.write_text(
-                single_shot_instruction + (existing or ""),
-                encoding="utf-8",
-            )
-            try:
-                result = runner.run_with_log(
-                    args,
-                    cwd=config.antigravity_dir,
-                    log_path=log_path,
-                    label=f"Antigravity ({model})",
-                    progress_interval_seconds=config.progress_interval_seconds,
-                    check=False,
-                    env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
-                    use_pty=True,
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                try:
+                    existing = gemini_md_path.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    existing = None
+                gemini_md_path.write_text(
+                    single_shot_instruction + (existing or ""),
+                    encoding="utf-8",
                 )
+                try:
+                    result = runner.run_with_log(
+                        args,
+                        cwd=config.antigravity_dir,
+                        log_path=log_path,
+                        label=f"Antigravity ({model})",
+                        progress_interval_seconds=config.progress_interval_seconds,
+                        check=False,
+                        env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
+                        use_pty=True,
+                    )
+                finally:
+                    # Strip only our injected prefix from whatever the file contains now,
+                    # preserving any changes the agent made to the content that followed it.
+                    if gemini_md_path.exists():
+                        current = gemini_md_path.read_text(encoding="utf-8")
+                        if current.startswith(single_shot_instruction):
+                            remainder = current[len(single_shot_instruction):]
+                            if remainder:
+                                gemini_md_path.write_text(remainder, encoding="utf-8")
+                            else:
+                                gemini_md_path.unlink()
+                        # else: agent rewrote the file entirely — leave it as-is
+                    # else: agent deleted the file — leave it deleted (intentional change)
             finally:
-                # Strip only our injected prefix from whatever the file contains now,
-                # preserving any changes the agent made to the content that followed it.
-                if gemini_md_path.exists():
-                    current = gemini_md_path.read_text(encoding="utf-8")
-                    if current.startswith(single_shot_instruction):
-                        remainder = current[len(single_shot_instruction):]
-                        if remainder:
-                            gemini_md_path.write_text(remainder, encoding="utf-8")
-                        else:
-                            gemini_md_path.unlink()
-                    # else: agent rewrote the file entirely — leave it as-is
-                # else: agent deleted the file — leave it deleted (intentional change)
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
             log(config, f"Antigravity ({model}) finished; log: {log_path}")
 
             if result.returncode != 0:
