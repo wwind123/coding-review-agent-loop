@@ -107,15 +107,13 @@ class AntigravityBackend:
             log_path = agent_log_path(config, "antigravity", run_id=run_id)
             log(config, f"Starting Antigravity (model: {model}) in {config.antigravity_dir}; log: {log_path}; response: {response_path}")
             # agy reads GEMINI.md from the workdir as high-priority system context before
-            # the model sees the prompt. Injecting a single-shot session rule here
-            # prevents agy from spawning background execution tasks (which cause it to
-            # end the --print turn without writing a response). The file is restored
-            # to its original state in the finally block so the workdir is unchanged.
+            # the model sees the prompt. Injecting a single-shot session rule prevents
+            # agy from spawning background execution tasks (which cause it to end the
+            # --print turn without a response). Cleanup strips only the injected prefix
+            # rather than restoring a snapshot, so any file changes the agent makes
+            # during a coder turn are preserved. Each agent gets its own dedicated
+            # workdir so concurrent GEMINI.md writes cannot occur in normal operation.
             gemini_md_path = config.antigravity_dir / "GEMINI.md"
-            try:
-                original_gemini_md: str | None = gemini_md_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                original_gemini_md = None
             single_shot_instruction = (
                 "# Agent Loop Single-Shot Session\n\n"
                 "You are running in a single-shot, non-interactive `agy --print` session"
@@ -125,8 +123,12 @@ class AntigravityBackend:
                 " and wait for the result in this same turn before writing your response.\n\n"
                 "---\n\n"
             )
+            try:
+                existing = gemini_md_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                existing = None
             gemini_md_path.write_text(
-                single_shot_instruction + (original_gemini_md or ""),
+                single_shot_instruction + (existing or ""),
                 encoding="utf-8",
             )
             try:
@@ -141,10 +143,18 @@ class AntigravityBackend:
                     use_pty=True,
                 )
             finally:
-                if original_gemini_md is None:
-                    gemini_md_path.unlink(missing_ok=True)
-                else:
-                    gemini_md_path.write_text(original_gemini_md, encoding="utf-8")
+                # Strip only our injected prefix from whatever the file contains now,
+                # preserving any changes the agent made to the content that followed it.
+                if gemini_md_path.exists():
+                    current = gemini_md_path.read_text(encoding="utf-8")
+                    if current.startswith(single_shot_instruction):
+                        remainder = current[len(single_shot_instruction):]
+                        if remainder:
+                            gemini_md_path.write_text(remainder, encoding="utf-8")
+                        else:
+                            gemini_md_path.unlink()
+                    # else: agent rewrote the file entirely — leave it as-is
+                # else: agent deleted the file — leave it deleted (intentional change)
             log(config, f"Antigravity ({model}) finished; log: {log_path}")
 
             if result.returncode != 0:

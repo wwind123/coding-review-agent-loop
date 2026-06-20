@@ -18443,10 +18443,11 @@ def test_antigravity_backend_writes_gemini_md_single_shot_instruction(tmp_path):
 
     assert captured, "run_with_log was not called"
     assert "Do NOT spawn background execution tasks" in captured[0]
-    assert not (agy_dir / "GEMINI.md").exists()  # cleaned up
+    # prefix is stripped → file deleted (no remaining content after it)
+    assert not (agy_dir / "GEMINI.md").exists()
 
 
-def test_antigravity_backend_preserves_and_restores_existing_gemini_md(tmp_path):
+def test_antigravity_backend_preserves_existing_gemini_md_during_and_after_run(tmp_path):
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
 
     agy_dir = tmp_path / "antigravity"
@@ -18466,14 +18467,42 @@ def test_antigravity_backend_preserves_and_restores_existing_gemini_md(tmp_path)
     AntigravityBackend().run(runner, config, "Review this PR.", run_id="r1")
 
     assert captured, "run_with_log was not called"
-    # Instruction was prepended during the run
+    # Instruction was prepended before the original content during the run
     assert "Do NOT spawn background execution tasks" in captured[0]
     assert "My project rules" in captured[0]
     assert captured[0].index("Do NOT spawn") < captured[0].index("My project rules")
-    # Original content fully restored after the run
-    restored = (agy_dir / "GEMINI.md").read_text(encoding="utf-8")
-    assert restored == original_content
-    assert "Do NOT spawn" not in restored
+    # Prefix stripped after the run → original content remains
+    after = (agy_dir / "GEMINI.md").read_text(encoding="utf-8")
+    assert after == original_content
+    assert "Do NOT spawn" not in after
+
+
+def test_antigravity_backend_preserves_agent_edits_to_gemini_md(tmp_path):
+    """Agent (coder role) edits the content after our prefix — preserved after run."""
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "antigravity"
+    agy_dir.mkdir(parents=True, exist_ok=True)
+    original_content = "# Original rules\n"
+    (agy_dir / "GEMINI.md").write_text(original_content, encoding="utf-8")
+
+    class EditingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            # Simulate agent appending to the file after the injected prefix
+            gemini_md = cwd / "GEMINI.md"
+            current = gemini_md.read_text(encoding="utf-8")
+            gemini_md.write_text(current + "# New agent-added rules\n", encoding="utf-8")
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    runner = EditingRunner(antigravity_outputs=[("ok", 0)])
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    AntigravityBackend().run(runner, config, "Review this PR.", run_id="r1")
+
+    after = (agy_dir / "GEMINI.md").read_text(encoding="utf-8")
+    # Original content and agent's new content both present; our prefix stripped
+    assert "Original rules" in after
+    assert "New agent-added rules" in after
+    assert "Do NOT spawn" not in after
 
 
 def test_antigravity_backend_cleans_up_gemini_md_on_exception(tmp_path):
@@ -18486,21 +18515,22 @@ def test_antigravity_backend_cleans_up_gemini_md_on_exception(tmp_path):
         def run_with_log(self, args, *, cwd, **kwargs):
             raise RuntimeError("subprocess failed")
 
-    # Sub-test A: no pre-existing GEMINI.md — file is removed after exception
+    # Sub-test A: no pre-existing GEMINI.md — prefix stripped → file deleted
     runner = RaisingRunner()
     config = make_config(tmp_path, antigravity_dir=agy_dir)
     with pytest.raises(RuntimeError):
         AntigravityBackend().run(runner, config, "Review this PR.", run_id="r1")
     assert not (agy_dir / "GEMINI.md").exists()
 
-    # Sub-test B: pre-existing GEMINI.md — original content is restored after exception
+    # Sub-test B: pre-existing GEMINI.md — prefix stripped, original content restored
     original_content = "# Existing rules\n"
     (agy_dir / "GEMINI.md").write_text(original_content, encoding="utf-8")
     runner2 = RaisingRunner()
     with pytest.raises(RuntimeError):
         AntigravityBackend().run(runner2, config, "Review this PR.", run_id="r2")
-    restored = (agy_dir / "GEMINI.md").read_text(encoding="utf-8")
-    assert restored == original_content
+    after = (agy_dir / "GEMINI.md").read_text(encoding="utf-8")
+    assert after == original_content
+    assert "Do NOT spawn" not in after
 
 
 def test_antigravity_backend_strips_public_response_marker(tmp_path):
