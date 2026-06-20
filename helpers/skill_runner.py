@@ -3485,6 +3485,16 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
     if usage is not None:
         result_json["usage"] = usage
     print(json.dumps(result_json, indent=2))
+    try:
+        shutil.rmtree(debug_dir)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(
+            f"skill_runner: warning: could not remove successful PR-fix debug directory "
+            f"{debug_dir}: {exc}",
+            file=sys.stderr,
+        )
 
 
 # ---------------------------------------------------------------------------

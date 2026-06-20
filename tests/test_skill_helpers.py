@@ -2573,6 +2573,13 @@ def _structured_pr_fix_output() -> str:
 
 
 class TestRunPrFix:
+    @pytest.fixture(autouse=True)
+    def _isolated_repair_base(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+
+        self.repair_base = tmp_path / "repair"
+        monkeypatch.setattr(sr, "_REPAIR_BASE", self.repair_base)
+
     def test_settled_gate_requires_current_subject_complete_blocking_review(self) -> None:
         from helpers.skill_runner import _pr_fix_gate
 
@@ -2717,6 +2724,157 @@ class TestRunPrFix:
             "Model A", "Model B",
             "--antigravity-quota-signatures", "Quota Hit", "429",
         )
+        assert not (self.repair_base / "7-pr-fix-debug").exists()
+
+    def test_recovered_success_removes_debug_directory(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.github import PullRequestMetadata, PullRequestReviewContext
+
+        pr_infos = iter([
+            {
+                "number": 7,
+                "state": "OPEN",
+                "headRefOid": "head-old",
+                "headRefName": "feature/pr",
+                "body": "",
+            },
+            {
+                "number": 7,
+                "state": "OPEN",
+                "headRefOid": "head-old",
+                "headRefName": "feature/pr",
+                "body": "",
+            },
+        ])
+
+        def fake_run_helper(*args: str, check: bool = True):
+            if args[:1] == ("helpers.run_external",):
+                out = Path(args[args.index("--output") + 1])
+                recovered_output = _structured_pr_fix_output().replace(
+                    '"addressed_ids": ["Requirement 1"]',
+                    '"addressed_ids": []',
+                )
+                out.write_text(recovered_output + "trailing prose", encoding="utf-8")
+            elif args[:2] == ("helpers.state_manager", "attach-metadata"):
+                body = Path(args[args.index("--body-file") + 1]).read_text(encoding="utf-8")
+                Path(args[args.index("--output") + 1]).write_text(body, encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0)
+
+        monkeypatch.setattr(sr, "_fetch_pr_json", lambda repo, pr: next(pr_infos))
+        monkeypatch.setattr(sr, "_build_resume", lambda *a, **k: _pr_fix_resume())
+        monkeypatch.setattr(sr, "_reconcile_pending_comment", lambda *a, **k: None)
+        monkeypatch.setattr(sr, "_position_pr_fix_workdir", lambda **kwargs: None)
+        monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(sr, "_git_head", lambda workdir: "head-old")
+
+        import coding_review_agent_loop.github as gh
+        monkeypatch.setattr(
+            gh,
+            "get_pr_review_context",
+            lambda runner, config, pr_number: PullRequestReviewContext(
+                metadata=PullRequestMetadata(
+                    number=pr_number,
+                    repo="o/r",
+                    title="PR",
+                    head_branch="feature/pr",
+                    base_branch="main",
+                    head_sha="head-old",
+                    url=None,
+                ),
+                comments=(),
+                human_requirements=(),
+            ),
+        )
+
+        args = types.SimpleNamespace(
+            pr=7,
+            repo="o/r",
+            coder="codex",
+            reviewers=["codex"],
+            workdir=str(tmp_path),
+            workdir_codex=None,
+            dry_run=True,
+        )
+        sr.cmd_run_pr_fix(args)
+
+        capsys.readouterr()
+        assert not (self.repair_base / "7-pr-fix-debug").exists()
+
+    def test_unrecoverable_response_retains_debug_artifacts(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.github import PullRequestMetadata, PullRequestReviewContext
+
+        raw_response = "not a structured coder follow-up"
+
+        def fake_run_helper(*args: str, check: bool = True):
+            if args[:1] == ("helpers.run_external",):
+                Path(args[args.index("--output") + 1]).write_text(
+                    raw_response, encoding="utf-8"
+                )
+            return subprocess.CompletedProcess(args, 0)
+
+        monkeypatch.setattr(sr, "_fetch_pr_json", lambda repo, pr: {
+            "number": pr,
+            "state": "OPEN",
+            "headRefOid": "head-old",
+            "headRefName": "feature/pr",
+            "body": "",
+        })
+        monkeypatch.setattr(sr, "_build_resume", lambda *a, **k: _pr_fix_resume())
+        monkeypatch.setattr(sr, "_reconcile_pending_comment", lambda *a, **k: None)
+        monkeypatch.setattr(sr, "_position_pr_fix_workdir", lambda **kwargs: None)
+        monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(sr, "_git_head", lambda workdir: "head-old")
+        monkeypatch.setattr(sr, "attempt_repair", lambda *a, **k: None)
+
+        import coding_review_agent_loop.github as gh
+        monkeypatch.setattr(
+            gh,
+            "get_pr_review_context",
+            lambda runner, config, pr_number: PullRequestReviewContext(
+                metadata=PullRequestMetadata(
+                    number=pr_number,
+                    repo="o/r",
+                    title="PR",
+                    head_branch="feature/pr",
+                    base_branch="main",
+                    head_sha="head-old",
+                    url=None,
+                ),
+                comments=(),
+                human_requirements=(),
+            ),
+        )
+
+        args = types.SimpleNamespace(
+            pr=7,
+            repo="o/r",
+            coder="codex",
+            reviewers=["codex"],
+            workdir=str(tmp_path),
+            workdir_codex=None,
+            dry_run=True,
+        )
+        with pytest.raises(SystemExit):
+            sr.cmd_run_pr_fix(args)
+
+        debug_dir = self.repair_base / "7-pr-fix-debug"
+        assert (debug_dir / "raw.md").read_text(encoding="utf-8") == raw_response
+        assert (debug_dir / "prompt.md").read_text(encoding="utf-8")
+        manifest = json.loads((debug_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest == {
+            "role": "coder",
+            "kind": "coder_followup",
+            "agent": "codex",
+            "repo": "o/r",
+            "pr": 7,
+            "gemini_cmd": "gemini",
+            "unresolved_item_ids": ["item-1"],
+        }
 
     def test_missing_pr_marker_rejected(self) -> None:
         from coding_review_agent_loop.errors import AgentLoopError
