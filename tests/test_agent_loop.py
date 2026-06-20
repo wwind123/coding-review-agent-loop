@@ -14858,6 +14858,229 @@ def test_issue_loop_plan_first_files_approved_future_followups_before_implementa
     assert issue_create_index < second_claude_index
 
 
+def test_issue_loop_plan_first_files_surviving_future_from_mixed_outcome_round(tmp_path):
+    future_text = "Factor the shared follow-up guidance into a reusable helper."
+    runner = FakeRunner(
+        claude_outputs=[
+            "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_revision(
+                summary="Address the blocking test gap.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-2", "disposition": "resolved", "note": "Added the test."}
+                ],
+                plan_steps=["Make the change.", "Add the missing regression test."],
+            ),
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="approved",
+                future_followups=[future_text],
+            ),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[
+                    {
+                        "item_id": "item-1",
+                        "disposition": "future",
+                        "note": "Keep this as confirmed post-plan cleanup.",
+                    },
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+            structured_pr_review(state="approved", summary="LGTM."),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking",
+                blocking_plan_issues=["Add a regression test for the plan-review ledger."],
+                reviewer="Google Gemini",
+            ),
+            structured_plan_review(
+                state="approved",
+                future_followups=[future_text],
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "future"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+                reviewer="Google Gemini",
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="LGTM.",
+                reviewer="Google Gemini",
+            ),
+        ],
+        issue_urls=["https://github.com/OWNER/REPO/issues/99"],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        approved_followups="issue",
+        max_rounds=2,
+    )
+
+    assert (
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=config,
+            plan_first=True,
+            implement_after_approval=True,
+        )
+        == 0
+    )
+
+    coder_revision_prompt = next(
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] and '"kind": "plan_revision"' in cmd[-1]
+    )
+    assert "item-2" in coder_revision_prompt
+    assert "item-1" not in coder_revision_prompt
+    assert future_text not in coder_revision_prompt
+
+    round_two_reviewer_prompts = [
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if "Planning round: 2" in cmd[-1] and "Role: reviewer" in cmd[-1]
+    ]
+    assert len(round_two_reviewer_prompts) == 2
+    assert all("item-1" in prompt for prompt in round_two_reviewer_prompts)
+
+    assert len(runner.issues) == 1
+    issue_body = runner.issues[0]["body"]
+    assert "Planning round(s): 1, 2" in issue_body
+    assert "Reviewers: Codex, Gemini" in issue_body
+    assert "Original plan item ID(s): item-1, item-3" in issue_body
+    assert "Keep this as confirmed post-plan cleanup." in issue_body
+    assert any(
+        "Reconciliation: 1 filed, 1 deduplicated, 0 skipped by cap." in comment
+        for comment in runner.comments
+    )
+
+    issue_create_index = command_index(runner.commands, ["gh", "issue", "create"])
+    round_two_review_indexes = [
+        index
+        for index, (cmd, _cwd) in enumerate(runner.commands)
+        if "Planning round: 2" in cmd[-1] and "Role: reviewer" in cmd[-1]
+    ]
+    assert issue_create_index > max(round_two_review_indexes)
+
+
+@pytest.mark.parametrize("later_disposition", ["resolved", "same-plan", "blocking"])
+def test_issue_loop_plan_first_does_not_file_future_item_after_later_lifecycle_change(
+    tmp_path, later_disposition
+):
+    future_text = "Extract the shared plan-review formatting helper."
+    promoted = later_disposition in {"same-plan", "blocking"}
+    promotion_state = "blocking" if promoted else "approved"
+    final_plan_dispositions = [
+        {"item_id": "item-1", "disposition": later_disposition},
+        {"item_id": "item-2", "disposition": "resolved"},
+    ]
+    claude_outputs = [
+        "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+        structured_plan_revision(
+            summary="Address the original blocker.",
+            prior_plan_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+        ),
+    ]
+    if promoted:
+        claude_outputs.append(
+            structured_plan_revision(
+                summary="Address the promoted future item.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            )
+        )
+    claude_outputs.append(
+        "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n"
+        "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+
+    def reviewer_outputs(reviewer):
+        outputs = [
+            structured_plan_review(
+                state="approved",
+                future_followups=[future_text],
+                reviewer=reviewer,
+            ),
+            structured_plan_review(
+                state=promotion_state,
+                prior_plan_item_dispositions=final_plan_dispositions,
+                reviewer=reviewer,
+            ),
+        ]
+        if promoted:
+            outputs.append(
+                structured_plan_review(
+                    state="approved",
+                    prior_plan_item_dispositions=[
+                        {"item_id": "item-1", "disposition": "resolved"}
+                    ],
+                    reviewer=reviewer,
+                )
+            )
+        outputs.append(structured_pr_review(state="approved", reviewer=reviewer))
+        return outputs
+
+    runner = FakeRunner(
+        claude_outputs=claude_outputs,
+        codex_outputs=reviewer_outputs("OpenAI Codex"),
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking",
+                blocking_plan_issues=["Add the initial ledger regression."],
+                reviewer="Google Gemini",
+            ),
+            *reviewer_outputs("Google Gemini")[1:],
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        approved_followups="issue",
+        max_rounds=3,
+    )
+
+    assert (
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=config,
+            plan_first=True,
+            implement_after_approval=True,
+        )
+        == 0
+    )
+
+    assert runner.issues == []
+    assert not any(future_text in comment for comment in runner.comments[-2:])
+    if promoted:
+        coder_revision_prompts = [
+            cmd[-1]
+            for cmd, _cwd in runner.commands
+            if cmd[:1] == ["claude"] and '"kind": "plan_revision"' in cmd[-1]
+        ]
+        assert len(coder_revision_prompts) == 2
+        assert "item-1" in coder_revision_prompts[1]
+        assert future_text in coder_revision_prompts[1]
+        final_round_review_indexes = [
+            index
+            for index, (cmd, _cwd) in enumerate(runner.commands)
+            if "Planning round: 3" in cmd[-1] and "Role: reviewer" in cmd[-1]
+        ]
+        implementation_index = next(
+            index
+            for index, (cmd, _cwd) in enumerate(runner.commands)
+            if cmd[:1] == ["claude"] and "Implement the approved plan" in cmd[-1]
+        )
+        assert implementation_index > max(final_round_review_indexes)
+
+
 def test_issue_loop_plan_first_ignore_mode_keeps_pr_prior_ledger_clean(tmp_path):
     runner = FakeRunner(
         claude_outputs=[

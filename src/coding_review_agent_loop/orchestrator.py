@@ -141,7 +141,6 @@ from .followups import (
     APPROVED_FOLLOWUP_MARKER_RE,
     GroupedApprovedFollowup,
     MAX_APPROVED_FOLLOWUP_ISSUES,
-    PlanApprovedFollowupSource,
     _append_approved_followups_marker,
     _approved_followup_from_unresolved_item,
     _approved_followups_marker,
@@ -1627,7 +1626,6 @@ def _run_plan_first_loop(
     reviewer_session_ids: dict[AgentName, str | None] = {}
     unresolved_items: list[UnresolvedReviewItem] = []
     compact_prior_summaries: list[str] = []
-    approved_future_followup_sources: list[PlanApprovedFollowupSource] = []
     next_unresolved_item_number = 1
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
     if resume_state is None:
@@ -1724,7 +1722,6 @@ def _run_plan_first_loop(
             and round_number >= 2
             and round_ledger_incomplete
         ) else ""
-        round_approved_future_followup_sources: list[PlanApprovedFollowupSource] = []
         blocking_reviews: list[tuple[str, str]] = []
         approved_review_outputs: list[tuple[str, str]] = []
         all_approved = True
@@ -1860,9 +1857,6 @@ def _run_plan_first_loop(
                     round_new_unresolved_items.append(tracked_item)
                     reviewer_new_unresolved_items.append(tracked_item)
                     next_unresolved_item_number += 1
-                    round_approved_future_followup_sources.append(
-                        _plan_followup_source_from_unresolved_item(tracked_item)
-                    )
                 post_issue_comment(
                     runner,
                     config=config,
@@ -1896,31 +1890,23 @@ def _run_plan_first_loop(
                 )
             else:
                 round_new_unresolved_items.extend(reviewer_new_unresolved_items)
-                round_approved_future_followup_sources.extend(
-                    _plan_followup_source_from_unresolved_item(item)
-                    for item in reviewer_new_unresolved_items
-                    if item.status == "future"
-                )
 
-        unresolved_items, future_from_prior_items = _apply_unresolved_item_dispositions(
+        unresolved_items, _ = _apply_unresolved_item_dispositions(
             prior_unresolved_items,
             prior_dispositions,
             same_status="same-plan",
-            retain_future=False,
+            retain_future=True,
         )
         compact_prior_summaries.extend(
             _collect_prior_compact_summaries(
                 prior_unresolved_items,
                 unresolved_items,
-                future_from_prior_items,
+                (),
                 prior_dispositions,
             )
         )
         unresolved_items = [*unresolved_items, *round_new_unresolved_items]
         must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-plan"}]
-        approved_future_followup_sources.extend(
-            _plan_followup_source_from_unresolved_item(item) for item in future_from_prior_items
-        )
         if all_approved and not must_fix_items and issue_context.human_requirements:
             missing_acknowledgements = [
                 reviewer_name
@@ -2042,10 +2028,12 @@ def _run_plan_first_loop(
                     ]
                     all_approved = False
 
-        if all_approved:
-            approved_future_followup_sources.extend(round_approved_future_followup_sources)
-
         if all_approved and not must_fix_items:
+            approved_future_followup_sources = [
+                _plan_followup_source_from_unresolved_item(item)
+                for item in unresolved_items
+                if item.status == "future"
+            ]
             plan_hash = approved_plan_hash(current_plan)
             plan_subject = _plan_subject(current_plan)
             mode = config.plan_execution_mode
@@ -2299,14 +2287,13 @@ def _run_plan_first_loop(
                     agent=coder_name,
                     round_number=round_number + 1,
                     subject=_plan_subject(current_plan),
-                    prior_items=tuple(must_fix_items),
+                    prior_items=tuple(unresolved_items),
                     canonical_plan=canonical_plan,
                     raw_structured_coder_response=raw_structured_coder_response,
                     compact_prior_summaries=tuple(compact_prior_summaries),
                 ),
             ),
         )
-        unresolved_items = list(must_fix_items)
         resumed_round = None
 
     raise AgentLoopError(
