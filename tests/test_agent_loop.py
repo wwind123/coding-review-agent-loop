@@ -18424,6 +18424,85 @@ def test_antigravity_backend_ignores_partial_response_file_on_fallback(tmp_path)
     assert result.model_used == "ModelB"
 
 
+def test_antigravity_backend_writes_gemini_md_single_shot_instruction(tmp_path):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "antigravity"
+    agy_dir.mkdir(parents=True, exist_ok=True)
+    captured: list[str] = []
+
+    class CapturingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            gemini_md = cwd / "GEMINI.md"
+            captured.append(gemini_md.read_text(encoding="utf-8") if gemini_md.exists() else "")
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    runner = CapturingRunner(antigravity_outputs=[("ok", 0)])
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    AntigravityBackend().run(runner, config, "Review this PR.", run_id="r1")
+
+    assert captured, "run_with_log was not called"
+    assert "Do NOT spawn background execution tasks" in captured[0]
+    assert not (agy_dir / "GEMINI.md").exists()  # cleaned up
+
+
+def test_antigravity_backend_preserves_and_restores_existing_gemini_md(tmp_path):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "antigravity"
+    agy_dir.mkdir(parents=True, exist_ok=True)
+    original_content = "# My project rules\nUse tabs.\n"
+    (agy_dir / "GEMINI.md").write_text(original_content, encoding="utf-8")
+    captured: list[str] = []
+
+    class CapturingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            gemini_md = cwd / "GEMINI.md"
+            captured.append(gemini_md.read_text(encoding="utf-8") if gemini_md.exists() else "")
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    runner = CapturingRunner(antigravity_outputs=[("ok", 0)])
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    AntigravityBackend().run(runner, config, "Review this PR.", run_id="r1")
+
+    assert captured, "run_with_log was not called"
+    # Instruction was prepended during the run
+    assert "Do NOT spawn background execution tasks" in captured[0]
+    assert "My project rules" in captured[0]
+    assert captured[0].index("Do NOT spawn") < captured[0].index("My project rules")
+    # Original content fully restored after the run
+    restored = (agy_dir / "GEMINI.md").read_text(encoding="utf-8")
+    assert restored == original_content
+    assert "Do NOT spawn" not in restored
+
+
+def test_antigravity_backend_cleans_up_gemini_md_on_exception(tmp_path):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    agy_dir = tmp_path / "antigravity"
+    agy_dir.mkdir(parents=True, exist_ok=True)
+
+    class RaisingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            raise RuntimeError("subprocess failed")
+
+    # Sub-test A: no pre-existing GEMINI.md — file is removed after exception
+    runner = RaisingRunner()
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    with pytest.raises(RuntimeError):
+        AntigravityBackend().run(runner, config, "Review this PR.", run_id="r1")
+    assert not (agy_dir / "GEMINI.md").exists()
+
+    # Sub-test B: pre-existing GEMINI.md — original content is restored after exception
+    original_content = "# Existing rules\n"
+    (agy_dir / "GEMINI.md").write_text(original_content, encoding="utf-8")
+    runner2 = RaisingRunner()
+    with pytest.raises(RuntimeError):
+        AntigravityBackend().run(runner2, config, "Review this PR.", run_id="r2")
+    restored = (agy_dir / "GEMINI.md").read_text(encoding="utf-8")
+    assert restored == original_content
+
+
 def test_antigravity_backend_strips_public_response_marker(tmp_path):
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
     from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER

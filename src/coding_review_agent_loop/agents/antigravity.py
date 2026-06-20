@@ -106,16 +106,45 @@ class AntigravityBackend:
             args += ["--print", prompt_text]
             log_path = agent_log_path(config, "antigravity", run_id=run_id)
             log(config, f"Starting Antigravity (model: {model}) in {config.antigravity_dir}; log: {log_path}; response: {response_path}")
-            result = runner.run_with_log(
-                args,
-                cwd=config.antigravity_dir,
-                log_path=log_path,
-                label=f"Antigravity ({model})",
-                progress_interval_seconds=config.progress_interval_seconds,
-                check=False,
-                env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
-                use_pty=True,
+            # agy reads GEMINI.md from the workdir as high-priority system context before
+            # the model sees the prompt. Injecting a single-shot session rule here
+            # prevents agy from spawning background execution tasks (which cause it to
+            # end the --print turn without writing a response). The file is restored
+            # to its original state in the finally block so the workdir is unchanged.
+            gemini_md_path = config.antigravity_dir / "GEMINI.md"
+            try:
+                original_gemini_md: str | None = gemini_md_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                original_gemini_md = None
+            single_shot_instruction = (
+                "# Agent Loop Single-Shot Session\n\n"
+                "You are running in a single-shot, non-interactive `agy --print` session"
+                " invoked by an automated orchestrator. There will be no follow-up turns.\n\n"
+                "**Do NOT spawn background execution tasks or subagents.** If you need to"
+                " run tests or shell commands, run them synchronously using your shell tool"
+                " and wait for the result in this same turn before writing your response.\n\n"
+                "---\n\n"
             )
+            gemini_md_path.write_text(
+                single_shot_instruction + (original_gemini_md or ""),
+                encoding="utf-8",
+            )
+            try:
+                result = runner.run_with_log(
+                    args,
+                    cwd=config.antigravity_dir,
+                    log_path=log_path,
+                    label=f"Antigravity ({model})",
+                    progress_interval_seconds=config.progress_interval_seconds,
+                    check=False,
+                    env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
+                    use_pty=True,
+                )
+            finally:
+                if original_gemini_md is None:
+                    gemini_md_path.unlink(missing_ok=True)
+                else:
+                    gemini_md_path.write_text(original_gemini_md, encoding="utf-8")
             log(config, f"Antigravity ({model}) finished; log: {log_path}")
 
             if result.returncode != 0:
