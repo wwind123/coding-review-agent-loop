@@ -116,7 +116,11 @@ class AntigravityBackend:
             # inject→run→strip sequence across concurrent processes sharing the same
             # default per-repo workdir.
             gemini_md_path = config.antigravity_dir / "GEMINI.md"
-            lock_path = config.antigravity_dir / "GEMINI.md.lock"
+            # Lock lives in .git/ (git metadata) so it is never staged or committed
+            # by a coder-role agy run, and agy itself ignores .git/. mkdir is a
+            # no-op in production (where .git/ always exists) and creates it in tests.
+            lock_path = config.antigravity_dir / ".git" / "GEMINI.md.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
             single_shot_instruction = (
                 "# Agent Loop Single-Shot Session\n\n"
                 "You are running in a single-shot, non-interactive `agy --print` session"

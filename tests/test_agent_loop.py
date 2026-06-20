@@ -18445,6 +18445,8 @@ def test_antigravity_backend_writes_gemini_md_single_shot_instruction(tmp_path):
     assert "Do NOT spawn background execution tasks" in captured[0]
     # prefix is stripped → file deleted (no remaining content after it)
     assert not (agy_dir / "GEMINI.md").exists()
+    # Lock file must not appear in the worktree root (it lives in .git/ only)
+    assert not (agy_dir / "GEMINI.md.lock").exists()
 
 
 def test_antigravity_backend_preserves_existing_gemini_md_during_and_after_run(tmp_path):
@@ -18545,7 +18547,9 @@ def test_antigravity_backend_gemini_md_lock_serializes_concurrent_access(tmp_pat
     config = make_config(tmp_path, antigravity_dir=agy_dir)
 
     order: list[str] = []
-    lock_path = agy_dir / "GEMINI.md.lock"
+    # Lock lives in .git/ to avoid polluting the worktree
+    lock_path = agy_dir / ".git" / "GEMINI.md.lock"
+    (agy_dir / ".git").mkdir(parents=True, exist_ok=True)
 
     # Thread A: pre-acquires the exclusive lock, records "A-holds", sleeps briefly,
     # records "A-releases", then releases the lock. This simulates another process
