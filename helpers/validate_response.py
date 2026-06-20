@@ -97,6 +97,22 @@ def validate_response_text(
     either their runtime dataclasses or their serialized dictionary forms.  The
     original ``AgentLoopError`` subclass is intentionally allowed to propagate so
     callers can apply type-specific deterministic recovery.
+
+    For ``kind='plan_revision'``, the unknown-disposition check is unconditional
+    regardless of ledger size.  Passing ``prior_items=()`` (the default) or
+    ``prior_items=[]`` treats **any** disposition ID as unknown and raises
+    ``UnknownPriorItemDispositionError`` — there is no ``if prior_items:`` guard.
+
+    New callers with an empty ledger that want auto-recovery have two options:
+
+    * Call ``_recover_structured_response`` directly with
+      ``allowed_prior_item_ids=[]`` — the function's deterministic strip pass
+      removes all stray dispositions before revalidation.
+    * Route through ``_complete_coder_turn(..., auto_recover=True)`` — the
+      integrated path that internally calls ``_recover_structured_response``.
+
+    Note: ``_recover_structured_response`` itself has no ``auto_recover``
+    parameter; ``auto_recover`` is a flag on ``_complete_coder_turn``.
     """
     if kind not in _KINDS:
         raise ValueError(f"Unsupported response kind: {kind}")

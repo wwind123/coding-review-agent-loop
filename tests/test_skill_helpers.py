@@ -280,6 +280,105 @@ class TestValidateResponse:
             )
         assert exc_info.value.unknown_ids == ("item-unknown",)
 
+    def test_plan_revision_empty_prior_items_no_dispositions_accepted(self) -> None:
+        """plan_revision with empty prior_items and no dispositions must be accepted."""
+        from helpers.validate_response import validate_response_text
+
+        revision = json.dumps({
+            "schema_version": 1,
+            "kind": "plan_revision",
+            "state": "blocking",
+            "summary": "Revised plan.",
+            "prior_plan_item_dispositions": [],
+            "plan_steps": ["Step A", "Step B"],
+        }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
+
+        result = validate_response_text(revision, kind="plan_revision", prior_items=[])
+        assert result is not None
+        assert result.prior_plan_item_dispositions == ()
+
+    def test_plan_revision_empty_prior_items_stray_disposition_rejected(self) -> None:
+        """plan_revision with empty ledger and a stray disposition must raise
+        UnknownPriorItemDispositionError — the old ``if prior_items:`` guard is gone."""
+        from coding_review_agent_loop.errors import UnknownPriorItemDispositionError
+        from helpers.validate_response import validate_response_text
+
+        revision = json.dumps({
+            "schema_version": 1,
+            "kind": "plan_revision",
+            "state": "blocking",
+            "summary": "Revised plan.",
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-x", "disposition": "resolved"}
+            ],
+            "plan_steps": ["Step A"],
+        }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
+
+        with pytest.raises(UnknownPriorItemDispositionError) as exc_info:
+            validate_response_text(revision, kind="plan_revision", prior_items=[])
+        assert exc_info.value.unknown_ids == ("item-x",)
+        assert exc_info.value.allowed_ids == ()
+
+    def test_cli_plan_revision_no_context_file_stray_disposition_rejected(self) -> None:
+        """CLI validate_response with --kind plan_revision and no --context-file must
+        reject a stray disposition (exercises the empty-ledger default)."""
+        revision = json.dumps({
+            "schema_version": 1,
+            "kind": "plan_revision",
+            "state": "blocking",
+            "summary": "Revised plan.",
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-x", "disposition": "resolved"}
+            ],
+            "plan_steps": ["Step A"],
+        }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
+
+        path = _write_tmp(revision)
+        result = _run(
+            "helpers.validate_response",
+            "--file", path,
+            "--kind", "plan_revision",
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "validation failed: plan_revision" in result.stderr
+
+    def test_recover_structured_response_plan_revision_empty_ledger_strips_stray_disposition(
+        self, monkeypatch,
+    ) -> None:
+        """_recover_structured_response with allowed_prior_item_ids=[] strips a stray
+        disposition and revalidates successfully — proves the auto-recover safety verdict
+        for the empty-ledger case."""
+        import helpers.skill_runner as sr
+        from helpers.validate_response import validate_response_text
+
+        raw = json.dumps({
+            "schema_version": 1,
+            "kind": "plan_revision",
+            "state": "blocking",
+            "summary": "Revised plan.",
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-stray", "disposition": "resolved"}
+            ],
+            "plan_steps": ["Step A"],
+        }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
+
+        monkeypatch.setattr(sr, "attempt_repair", lambda *a, **k: pytest.fail("repair should not be needed"))
+        validate = lambda text: validate_response_text(
+            text, kind="plan_revision", prior_items=[]
+        )
+
+        recovered, parsed = sr._recover_structured_response(
+            raw,
+            expected_kind="plan_revision",
+            validate=validate,
+            allowed_prior_item_ids=[],
+        )
+
+        assert parsed is not None
+        assert parsed.prior_plan_item_dispositions == ()
+        validate(recovered)
+
 
 # ---------------------------------------------------------------------------
 # helpers/state_manager.py  (session round-trip + attach-metadata)
