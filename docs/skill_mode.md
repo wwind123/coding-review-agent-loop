@@ -13,6 +13,7 @@ instead of through `claude -p` subprocesses.
 | Gemini turns | `gemini` subprocess | Same `gemini` subprocess |
 | GitHub ops | Python `gh` wrapper | Same `gh` wrapper |
 | Session resume | AGENT_LOOP_META in GitHub comments | Same markers + local session JSON |
+| Claude token use | Usually lower because orchestration is mechanical Python control flow | Often higher because the host session also interprets and executes orchestration steps; actual usage varies with context, caching, and task shape |
 | Configuration | Exact CLI flags supplied up front | Conversational; host can explain and select helper options |
 | Quota reset | Can be rerun later by an external scheduler | User must return and resume the host session after reset |
 | Unexpected failure | Exits unless code has a retry/recovery path | Host can inspect and sometimes recover interactively |

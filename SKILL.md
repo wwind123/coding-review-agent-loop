@@ -13,7 +13,10 @@ participate/oversee, want Claude turns on your **session model** (e.g. Opus, no
 unexpected failure interactively. The skill still requires the `claude` executable to
 start Claude Code; it avoids launching a new `claude -p` process for each host turn, so
 an on-disk binary update does not affect the already-running session. Use the CLI for
-hands-off automation and externally scheduled resume after quota reset — optionally a
+lower-overhead orchestration in typical runs: its round control and state transitions are
+mechanical Python code, while skill mode also spends host-session context and output tokens
+interpreting and executing the orchestration workflow. Actual quota use varies. The CLI also
+supports hands-off automation and externally scheduled resume after quota reset — optionally a
 `--test-command` gate and, with
 `--auto-merge`, CI-wait + merge (both are configuration-dependent; without them the CLI
 runs no gate and won't poll/merge). The skill never auto-merges (merge stays a human
