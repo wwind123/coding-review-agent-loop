@@ -95,10 +95,13 @@ _REVIEWER_SETTINGS_INJECTION = {
         "allow": [
             "command(ls)",
             "command(cat)",
-            "command(which)",
-            "command(echo)",
-            "command(file)",
             "command(head)",
+            "command(git diff)",
+            "command(git show)",
+            "command(git status)",
+            "command(git log)",
+            "command(rg)",
+            "command(sed)",
         ]
     },
 }
@@ -170,11 +173,16 @@ class AntigravityBackend:
                 " invoked by an automated orchestrator. There will be no follow-up turns.\n\n"
                 "**Do NOT spawn background execution tasks or subagents under any"
                 " circumstances.**\n\n"
-                "**For code review tasks: DO NOT run tests, shell commands, or compile"
-                " code.** Review by reading files and the PR diff only. Tests are CI's"
-                " responsibility; your job is to read code and identify issues. If you find"
-                " yourself about to run `pytest`, `npm test`, `go test`, or any other"
-                " command — stop and write your review from code inspection alone.\n\n"
+                "**For code review tasks: DO NOT run tests, builds, compilation,"
+                " mutation, commits, background work, or unrelated discovery commands.**"
+                " You may use only the strict allow-listed read-only commands to inspect"
+                " the assigned checkout and local PR diff. Prefer `git diff"
+                " <base>...HEAD`, `git show`, `git status`, `git log`, `rg`, `sed`, and"
+                " direct file reads over web search. Do not fetch, checkout, reset, clean,"
+                " or write files. Tests are CI's responsibility; your job is to read code"
+                " and identify issues. If you find yourself about to run `pytest`, `npm"
+                " test`, `go test`, or any build command, stop and write your review from"
+                " code inspection alone.\n\n"
                 "For non-review tasks that require shell commands, run them synchronously"
                 " in this same turn before writing your response.\n\n"
                 "---\n\n"

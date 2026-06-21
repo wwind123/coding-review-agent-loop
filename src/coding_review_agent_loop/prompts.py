@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from textwrap import indent
 from typing import Sequence
@@ -82,6 +83,34 @@ def _coder_test_reporting_guidance() -> str:
         "locally. In your final response, include a short `Tests:` line listing "
         "the exact commands run and whether they passed. If you cannot run tests, "
         "explain why in that `Tests:` line.\n"
+    )
+
+
+def _review_command_policy(
+    config: AgentLoopConfig, pr_metadata: PullRequestMetadata
+) -> str:
+    base_branch = (pr_metadata.base_branch or config.base or "").strip()
+    if base_branch and "\n" not in base_branch and "\r" not in base_branch:
+        diff_guidance = (
+            "For this PR, inspect the authoritative local diff with "
+            f"`git diff {shlex.quote(f'{base_branch}...HEAD')}`."
+        )
+    else:
+        diff_guidance = (
+            "When the base branch is available, replace `<base>` in "
+            "`git diff <base>...HEAD` with that resolved branch name; do not run "
+            "the placeholder literally or discover branches speculatively."
+        )
+    return (
+        "Do not run tests, builds, compilation, source or worktree mutation, "
+        "commits, or unrelated discovery commands. Read-only commands used to "
+        "inspect the assigned checkout and authoritative diff are allowed, "
+        "including `git diff`, `git show`, `git status`, `git log`, `rg`, `sed`, "
+        "and equivalent direct file reads. "
+        f"{diff_guidance} Prefer the verified local checkout and direct file reads "
+        "over web search, remote PR diff retrieval, or branch discovery. Do not "
+        "fetch, checkout, reset, clean, write files, or change repository state "
+        "during review.\n"
     )
 
 
@@ -1607,7 +1636,6 @@ Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
 Do not defer your review to wait for CI checks to finish. Review the PR now and report any pending or failing check status in your findings.
-DO NOT run tests, shell commands, or compile code. Review by reading files and the PR diff only. If you find yourself about to execute `pytest`, `npm test`, or any other command — stop. Write your review from code inspection alone.
 When the PR changes files under `alembic/versions/`, verify migration topology:
 new revisions should descend from the current head unless the PR intentionally
 adds a merge migration.
@@ -1620,6 +1648,7 @@ adds a merge migration.
             f"Repository: {config.repo}",
             workdir_guidance,
             _scratch_file_guidance(),
+            _review_command_policy(config, pr_metadata),
             response_schema,
             unresolved_items_guidance,
             followup_guidance,
@@ -1697,13 +1726,19 @@ PR #{pr_number} in {config.repo} (round {volatile_round})
 - Base branch: {base_branch}
 - Head SHA: {head_sha}
 {url_line}
-Use the Head SHA above as authoritative for this review round. If local files do not match that SHA, refresh/fetch the checkout before reviewing. Do not report findings based on untracked files unless those files are present in the PR diff.
+Use the Head SHA above as authoritative for this review round. The orchestrator
+has already refreshed and verified the assigned checkout. If its HEAD does not
+match, report a blocking tooling mismatch instead of changing the checkout. Do
+not report findings based on untracked files unless those files are present in
+the PR diff.
 
 {checks_block}Suggested commands:
-- {config.gh_cmd} pr view {pr_metadata.number} --repo {pr_metadata.repo} --json title,body,headRefName,baseRefName,headRefOid,comments,reviews
-- {config.gh_cmd} pr diff {pr_number} --repo {config.repo}
+- Read the verified checkout and local base-to-head diff first.
+- Use `{config.gh_cmd} pr view {pr_metadata.number} --repo {pr_metadata.repo} --json comments,reviews` only if existing PR discussion is not already present in this prompt.
 
-If a shell/tool command requires confirmation in non-interactive mode, do not retry repeatedly. Use the PR metadata above and the suggested GitHub CLI commands, or produce a blocking review explaining the limitation.
+If a read-only shell/tool command requires confirmation in non-interactive mode,
+do not retry repeatedly. Use the PR metadata and local checkout context already
+available, or produce a blocking review explaining the limitation.
 
 Reviewer: {reviewer_name}
 Action for this call: {action}
@@ -1890,23 +1925,25 @@ PR metadata:
 - Head SHA: {head_sha}
 {url_line}
 Use this PR metadata as authoritative. The Head SHA above is the PR head this
-review round is about. If local files do not match that SHA, refresh/fetch the
-checkout before reviewing. Do not spend time discovering the PR
-branch. Do not report findings based on untracked files unless those files are
-present in the PR diff.
+review round is about. The orchestrator has already refreshed and verified the
+assigned checkout. If its HEAD does not match, report a blocking tooling
+mismatch instead of changing the checkout. Do not spend time discovering the
+PR branch. Do not report findings based on untracked files unless those files
+are present in the PR diff.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
 {_scratch_file_guidance()}
+{_review_command_policy(config, metadata)}
 {checks_block}{_issue_context_block(issue_context)}
 {_human_requirements_block(human_requirements)}
 {unresolved_items_block}{_memory_block(memory)}
 
 Suggested commands:
-- {config.gh_cmd} pr view {metadata.number} --repo {metadata.repo} --json title,body,headRefName,baseRefName,headRefOid,comments,reviews
-- {config.gh_cmd} pr diff {metadata.number} --repo {metadata.repo}
+- Read the verified checkout and local base-to-head diff first.
+- Use `{config.gh_cmd} pr view {metadata.number} --repo {metadata.repo} --json comments,reviews` only if existing PR discussion is not already present in this prompt.
 
-If a shell/tool command requires confirmation in non-interactive mode, do not
-retry repeatedly. Use the PR metadata above and the suggested GitHub CLI
-commands, or produce a blocking review explaining the limitation.
+If a read-only shell/tool command requires confirmation in non-interactive
+mode, do not retry repeatedly. Use the PR metadata and local checkout context
+already available, or produce a blocking review explaining the limitation.
 
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
@@ -1916,7 +1953,6 @@ Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
 Do not defer your review to wait for CI checks to finish. Review the PR now and report any pending or failing check status in your findings.
-DO NOT run tests, shell commands, or compile code. Review by reading files and the PR diff only. If you find yourself about to execute `pytest`, `npm test`, or any other command — stop. Write your review from code inspection alone.
 When the PR changes files under `alembic/versions/`, verify migration topology:
 new revisions should descend from the current head unless the PR intentionally
 adds a merge migration.

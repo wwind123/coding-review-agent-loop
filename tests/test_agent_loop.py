@@ -4990,7 +4990,8 @@ def test_compact_pr_review_prompt_preserves_context_and_omits_raw_history(tmp_pa
     assert "Before approving, self-check every `future_followups` entry" in prefix
     assert "Review compact PR context mode." in tail
     assert "Head SHA: abc123" in tail
-    assert "gh pr diff 77 --repo OWNER/REPO" in tail
+    assert "Read the verified checkout and local base-to-head diff first." in tail
+    assert "gh pr diff" not in tail
 
 
 def test_compact_pr_review_prompt_stable_prefix_is_byte_identical_across_rounds(tmp_path):
@@ -9090,13 +9091,12 @@ def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
     assert "- Base branch: main" in prompt
     assert "- Head SHA: abc123" in prompt
     assert "Use this PR metadata as authoritative." in prompt
-    assert "Do not spend time discovering the PR\nbranch." in prompt
-    assert (
-        "gh pr view 77 --repo OWNER/REPO --json "
-        "title,body,headRefName,baseRefName,headRefOid,comments,reviews"
-    ) in prompt
-    assert "gh pr diff 77 --repo OWNER/REPO" in prompt
-    assert "requires confirmation in non-interactive mode" in prompt
+    assert "Do not spend time discovering the\nPR branch." in prompt
+    assert "gh pr view 77 --repo OWNER/REPO --json comments,reviews" in prompt
+    assert "`git diff main...HEAD`" in prompt
+    assert "gh pr diff" not in prompt
+    assert "If a read-only shell/tool command requires confirmation" in prompt
+    assert "non-interactive\nmode" in prompt
     assert "write them outside the repository checkout" in prompt
     assert "/tmp/coding-review-agent-loop/scratch/" in prompt
     assert "GitHub PR checks:" in prompt
@@ -9363,11 +9363,48 @@ def test_review_prompt_includes_failing_github_check_status(tmp_path):
 
 
 @pytest.mark.parametrize("compact_context", [False, True])
-def test_review_prompt_includes_no_ci_wait_instruction(tmp_path, compact_context):
+def test_review_prompt_allows_read_only_local_inspection_but_prohibits_execution(
+    tmp_path, compact_context
+):
     config = make_config(tmp_path)
     prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact_context)
     assert "Do not defer your review to wait for CI" in prompt
-    assert "DO NOT run tests, shell commands, or compile code" in prompt
+    assert "`git diff main...HEAD`" in prompt
+    for command in ("`git diff`", "`git show`", "`git status`", "`git log`", "`rg`", "`sed`"):
+        assert command in prompt
+    assert "Do not run tests, builds, compilation" in prompt
+    assert "source or worktree mutation" in prompt
+    assert "Do not fetch, checkout, reset, clean, write files" in prompt
+    assert "DO NOT run tests, shell commands, or compile code" not in prompt
+    assert "gh pr diff" not in prompt
+
+
+@pytest.mark.parametrize("compact_context", [False, True])
+def test_review_prompt_uses_safe_base_placeholder_when_base_is_unknown(
+    tmp_path, compact_context
+):
+    config = make_config(tmp_path, base=None)
+    metadata = PullRequestMetadata(
+        number=77,
+        repo="OWNER/REPO",
+        title="Review prompt",
+        head_branch="feature/review",
+        base_branch=None,
+        head_sha="abc123",
+        url=None,
+    )
+
+    prompt = build_review_prompt(
+        77,
+        1,
+        config,
+        reviewer="codex",
+        pr_metadata=metadata,
+        compact_context=compact_context,
+    )
+
+    assert "`git diff <base>...HEAD`" in prompt
+    assert "do not run the placeholder literally" in prompt
 
 
 def test_review_prompt_mentions_branch_protection_forbidden_when_checks_exist(tmp_path):
@@ -12770,6 +12807,27 @@ def test_reviewer_checkout_is_refreshed_to_pr_head_before_review(tmp_path):
     assert fetch_index < pr_fetch_index < checkout_index < head_index < review_index
 
 
+def test_codex_review_prompt_prefers_pinned_checkout_local_diff(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        git_head="abc123",
+    )
+    config = make_config(tmp_path, reviewer="codex")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    codex_command, review_cwd = next(
+        (cmd, cwd) for cmd, cwd in runner.commands if cmd[:2] == ["codex", "exec"]
+    )
+    prompt = codex_command[-1]
+    assert review_cwd == config.codex_dir
+    assert f"Assigned checkout: `{config.codex_dir.resolve()}`" in prompt
+    assert "- Head SHA: abc123" in prompt
+    assert "`git diff main...HEAD`" in prompt
+    assert "Prefer the verified local checkout and direct file reads over web search" in prompt
+    assert "gh pr diff" not in prompt
+
+
 def test_reviewer_checkout_refreshes_each_round_before_review(tmp_path):
     runner = FakeRunner(
         claude_outputs=["Fixed.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
@@ -12849,8 +12907,9 @@ def test_review_prompt_warns_that_pr_head_sha_is_authoritative(tmp_path):
     codex_command = next(cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     prompt = codex_command[-1]
     assert "The Head SHA above is the PR head this\nreview round is about." in prompt
-    assert "If local files do not match that SHA, refresh/fetch the\ncheckout before reviewing." in prompt
-    assert "Do not report findings based on untracked files unless those files are\npresent in the PR diff." in prompt
+    assert "The orchestrator has already refreshed and verified the\nassigned checkout." in prompt
+    assert "report a blocking tooling\nmismatch instead of changing the checkout" in prompt
+    assert "Do not report findings based on untracked files unless those files\nare present in the PR diff." in prompt
 
 
 def test_dirty_existing_auto_agent_dir_is_cleaned_before_sync(tmp_path, capsys):
@@ -19228,6 +19287,9 @@ def test_antigravity_backend_writes_gemini_md_single_shot_instruction(tmp_path):
 
     assert captured, "run_with_log was not called"
     assert "Do NOT spawn background execution tasks" in captured[0]
+    assert "DO NOT run tests, builds, compilation" in captured[0]
+    assert "strict allow-listed read-only commands" in captured[0]
+    assert "DO NOT run tests, shell commands, or compile code" not in captured[0]
     # prefix is stripped → file deleted (no remaining content after it)
     assert not (agy_dir / "GEMINI.md").exists()
     # Lock file must not appear in the worktree root (it lives in .git/ only)
@@ -20041,6 +20103,31 @@ def test_antigravity_backend_injects_strict_mode_for_reviewer(tmp_path, monkeypa
     assert settings["toolPermission"] == "strict"
     assert settings["permissions"] == _REVIEWER_SETTINGS_INJECTION["permissions"]
     assert settings["existingKey"] == "existingValue"
+    allowed = settings["permissions"]["allow"]
+    assert "command(git)" not in allowed
+    assert {
+        "command(git diff)",
+        "command(git show)",
+        "command(git status)",
+        "command(git log)",
+        "command(rg)",
+        "command(sed)",
+        "command(cat)",
+        "command(head)",
+    } <= set(allowed)
+    assert not any(
+        command in allowed
+        for command in (
+            "command(pytest)",
+            "command(npm)",
+            "command(go)",
+            "command(make)",
+            "command(git checkout)",
+            "command(git reset)",
+            "command(git clean)",
+            "command(git commit)",
+        )
+    )
 
 
 def test_antigravity_backend_restores_original_settings_after_reviewer_run(tmp_path, monkeypatch):
