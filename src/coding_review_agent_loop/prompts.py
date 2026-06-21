@@ -1660,19 +1660,7 @@ def _build_compact_pr_review_prompt(
     human_requirements_guidance = _human_requirements_review_guidance(human_requirements)
     non_future_items = [item for item in unresolved_items if item.status != "future"]
     if non_future_items:
-        unresolved_items_guidance = """Prior unresolved items are present. Disposition every listed
-item in the JSON `prior_item_dispositions` array — do not add a separate prose section
-or bullet list for prior items outside the JSON object. Valid `disposition` values:
-- `"resolved"` — item is fixed in this PR.
-- `"blocking"` — item is still a merge-blocking problem; include it in `blocking_items`.
-- `"same-pr"` — item needs to be fixed before merge; include it in `same_pr_followups`.
-- `"future"` — deferred; must include a `"note"` field; only valid when approving.
-
-Only use `"future"` when returning `approved`. If an item should still be fixed before
-merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
-`"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
-`"blocking"`/`"same-pr"`.
-"""
+        unresolved_items_guidance = _build_unresolved_items_guidance()
     else:
         unresolved_items_guidance = ""
     followup_guidance = _build_followup_guidance(config)
@@ -1730,6 +1718,22 @@ or:
 
 Use blocking only for issues that should prevent merge. Always sign your response:
 -- {reviewer_signature}
+"""
+
+
+def _build_unresolved_items_guidance() -> str:
+    return """Prior unresolved items are present. Disposition every listed
+item in the JSON `prior_item_dispositions` array — do not add a separate prose section
+or bullet list for prior items outside the JSON object. Valid `disposition` values:
+- `"resolved"` — item is fixed in this PR.
+- `"blocking"` — item is still a merge-blocking problem; include it in `blocking_items`.
+- `"same-pr"` — item needs to be fixed before merge; include it in `same_pr_followups`.
+- `"future"` — deferred; must include a `"note"` field; only valid when approving.
+
+Only use `"future"` when returning `approved`. If an item should still be fixed before
+merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
+`"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
+`"blocking"`/`"same-pr"`.
 """
 
 
@@ -1871,19 +1875,7 @@ def build_review_prompt(
     human_requirements_guidance = _human_requirements_review_guidance(human_requirements)
     unresolved_items_block = _format_unresolved_review_items(unresolved_items)
     if unresolved_items:
-        unresolved_items_guidance = """Prior unresolved items are present. Disposition every listed
-item in the JSON `prior_item_dispositions` array — do not add a separate prose section
-or bullet list for prior items outside the JSON object. Valid `disposition` values:
-- `"resolved"` — item is fixed in this PR.
-- `"blocking"` — item is still a merge-blocking problem; include it in `blocking_items`.
-- `"same-pr"` — item needs to be fixed before merge; include it in `same_pr_followups`.
-- `"future"` — deferred; must include a `"note"` field; only valid when approving.
-
-Only use `"future"` when returning `approved`. If an item should still be fixed before
-merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
-`"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
-`"blocking"`/`"same-pr"`.
-"""
+        unresolved_items_guidance = _build_unresolved_items_guidance()
     else:
         unresolved_items_guidance = ""
     followup_guidance = _build_followup_guidance(config)

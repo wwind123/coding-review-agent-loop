@@ -128,6 +128,7 @@ from coding_review_agent_loop.prompts import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
     _build_followup_guidance,
+    _build_unresolved_items_guidance,
     build_followup_prompt,
     build_issue_implementation_prompt,
     build_issue_plan_prompt,
@@ -20560,8 +20561,82 @@ def test_run_agent_result_passes_role_to_backend(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _build_followup_guidance unit and integration tests (#413)
+# Shared PR review guidance unit and integration tests (#413, #417)
 # ---------------------------------------------------------------------------
+
+_EXPECTED_UNRESOLVED_ITEMS_GUIDANCE = """Prior unresolved items are present. Disposition every listed
+item in the JSON `prior_item_dispositions` array — do not add a separate prose section
+or bullet list for prior items outside the JSON object. Valid `disposition` values:
+- `"resolved"` — item is fixed in this PR.
+- `"blocking"` — item is still a merge-blocking problem; include it in `blocking_items`.
+- `"same-pr"` — item needs to be fixed before merge; include it in `same_pr_followups`.
+- `"future"` — deferred; must include a `"note"` field; only valid when approving.
+
+Only use `"future"` when returning `approved`. If an item should still be fixed before
+merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
+`"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
+`"blocking"`/`"same-pr"`.
+"""
+
+
+def test_build_unresolved_items_guidance_exact_output():
+    assert _build_unresolved_items_guidance() == _EXPECTED_UNRESOLVED_ITEMS_GUIDANCE
+
+
+@pytest.mark.parametrize(
+    "statuses,compact_has_guidance,full_has_guidance",
+    [
+        (None, False, False),
+        ((), False, False),
+        (("future",), False, True),
+        (("blocking",), True, True),
+        (("same-pr",), True, True),
+        (("future", "blocking"), True, True),
+    ],
+)
+def test_build_review_prompt_unresolved_items_guidance_activation(
+    tmp_path,
+    statuses,
+    compact_has_guidance,
+    full_has_guidance,
+):
+    config = make_config(tmp_path, approved_followups="fix-and-summarize")
+    unresolved_items = tuple(
+        UnresolvedReviewItem(
+            item_id=f"item-{index}",
+            reviewer="OpenAI Codex",
+            source_round=1,
+            text=f"Prior {status} item.",
+            status=status,
+        )
+        for index, status in enumerate(statuses or (), start=1)
+    )
+    prompt_items = None if statuses is None else unresolved_items
+
+    compact = build_review_prompt(
+        77,
+        2,
+        config,
+        reviewer="codex",
+        compact_context=True,
+        unresolved_items=prompt_items,
+    )
+    full = build_review_prompt(
+        77,
+        2,
+        config,
+        reviewer="codex",
+        compact_context=False,
+        unresolved_items=prompt_items,
+    )
+
+    assert (_EXPECTED_UNRESOLVED_ITEMS_GUIDANCE in compact) is compact_has_guidance
+    assert (_EXPECTED_UNRESOLVED_ITEMS_GUIDANCE in full) is full_has_guidance
+    for index, status in enumerate(statuses or (), start=1):
+        item_label = f"[item-{index}]"
+        assert (item_label in compact) is (status != "future")
+        assert item_label in full
+
 
 _EXPECTED_FOLLOWUP_IGNORE = """Do not include Same-PR follow-ups, Future follow-ups, or legacy
 Non-blocking follow-ups sections in approved reviews; this run is configured to
