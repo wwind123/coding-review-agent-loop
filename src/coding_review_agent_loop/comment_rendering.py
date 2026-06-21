@@ -28,6 +28,7 @@ from .protocol import (
 from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID
 
 if TYPE_CHECKING:
+    from .agents.base import AgentName
     from .config import AgentLoopConfig
 
 ITEM_SUMMARY_LIMIT = 100
@@ -494,6 +495,33 @@ def _render_public_plan_state_comment(
         f"-- {_comment_signature(agent, config, model_used)}",
     ]
     return "\n\n".join(section for section in sections if section)
+
+
+def normalize_freeform_signature(
+    text: str,
+    agent: AgentName,
+    config: AgentLoopConfig | None,
+    model_used: str | None,
+) -> str:
+    """Replace or append the trailing agent signature on a free-form response.
+
+    Walks back over trailing blank lines and HTML comments to find the last
+    SIGNATURE_RE line and replaces it with the canonical qualified form. If no
+    signature is found, one is appended. Structured responses already receive
+    canonical signatures via render_public_agent_comment; this function is for
+    free-form/legacy text that is posted verbatim.
+    """
+    canonical = f"-- {agent_signature(agent, config, model_used)}"
+    lines = text.rstrip("\n").splitlines()
+    tail = len(lines)
+    while tail > 0 and (
+        not lines[tail - 1].strip() or HTML_COMMENT_RE.match(lines[tail - 1])
+    ):
+        tail -= 1
+    if tail > 0 and SIGNATURE_RE.match(lines[tail - 1]):
+        lines[tail - 1] = canonical
+        return "\n".join(lines)
+    return f"{text.rstrip(chr(10))}\n{canonical}"
 
 
 def render_public_agent_comment(

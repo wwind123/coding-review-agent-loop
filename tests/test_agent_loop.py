@@ -66,6 +66,7 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_plan_review_comment,
     _render_public_plan_revision_comment,
     _render_public_pr_review_comment,
+    normalize_freeform_signature,
 )
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
@@ -97,6 +98,7 @@ from coding_review_agent_loop.orchestrator import (
     ITEM_SUMMARY_LIMIT,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     PostedRoundMetadata,
+    ValidatedAgentResponse,
     _apply_unresolved_item_dispositions,
     _attach_round_metadata,
     _decode_round_metadata,
@@ -20438,3 +20440,394 @@ def test_build_review_prompt_followup_guidance_parity(tmp_path, approved_followu
     compact = build_review_prompt(77, 1, config, reviewer="codex", compact_context=True)
     assert g in non_compact
     assert g in compact
+
+
+# ---------------------------------------------------------------------------
+# PostedRoundMetadata.model_used and normalize_freeform_signature (#416)
+# ---------------------------------------------------------------------------
+
+
+def test_posted_round_metadata_model_used_round_trip():
+    metadata = PostedRoundMetadata(
+        flow="plan",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="abc",
+        model_used="gpt-5.5 (medium)",
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.model_used == "gpt-5.5 (medium)"
+
+
+def test_posted_round_metadata_model_used_none_round_trip():
+    metadata = PostedRoundMetadata(
+        flow="plan",
+        role="coder",
+        agent="Claude",
+        round_number=1,
+        subject="abc",
+        model_used=None,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.model_used is None
+
+
+def test_posted_round_metadata_model_used_backward_compat():
+    payload = {
+        "flow": "plan",
+        "role": "coder",
+        "agent": "Claude",
+        "round_number": 1,
+        "subject": "abc",
+        "prior_items": [],
+        "dispositions": [],
+        "new_items": [],
+        "state": None,
+        "canonical_plan": None,
+        "raw_structured_coder_response": None,
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+    decoded = _decode_round_metadata(encoded)
+    assert decoded.model_used is None
+
+
+def test_resume_plan_round_preserves_stored_model_used():
+    plan = "Plan content.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
+    coder_comment = _attach_round_metadata(
+        plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject=_plan_subject(plan),
+        ),
+    )
+    review_text = structured_plan_review(state="approved", summary="LGTM.")
+    reviewer_comment = _attach_round_metadata(
+        review_text,
+        PostedRoundMetadata(
+            flow="plan",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject=_plan_subject(plan),
+            state="approved",
+            model_used="gpt-5.5 (medium)",
+        ),
+    )
+    resumed = _resume_plan_round(
+        [
+            IssueComment(author="bot", created_at="2026-05-20T09:00:00Z", body=coder_comment),
+            IssueComment(author="bot", created_at="2026-05-20T09:01:00Z", body=reviewer_comment),
+        ],
+        configured_reviewers=("codex",),
+    )
+    assert resumed is not None
+    _current_plan, state = resumed
+    assert state.completed_reviews[0].metadata.model_used == "gpt-5.5 (medium)"
+
+
+def test_resume_pr_round_preserves_stored_model_used():
+    coder_text = "Implemented the fix.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"
+    coder_comment = _attach_round_metadata(
+        coder_text,
+        PostedRoundMetadata(
+            flow="pr",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="sha123",
+        ),
+    )
+    review_text = structured_pr_review(state="approved", summary="LGTM.")
+    reviewer_comment = _attach_round_metadata(
+        review_text,
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="sha123",
+            state="approved",
+            model_used="gpt-5.5 (medium)",
+        ),
+    )
+    resumed = _resume_pr_round(
+        [
+            IssueComment(author="bot", created_at="2026-05-20T09:00:00Z", body=coder_comment),
+            IssueComment(author="bot", created_at="2026-05-20T09:01:00Z", body=reviewer_comment),
+        ],
+        head_sha="sha123",
+        configured_reviewers=("codex",),
+    )
+    assert resumed is not None
+    assert resumed.completed_reviews[0].metadata.model_used == "gpt-5.5 (medium)"
+
+
+def test_normalize_freeform_signature_replaces_existing(tmp_path):
+    config = make_config(tmp_path)
+    result = normalize_freeform_signature(
+        "Plan text.\n-- OpenAI Codex",
+        agent="codex",
+        config=config,
+        model_used="gpt-5.5 (medium)",
+    )
+    assert result.endswith("-- OpenAI Codex: gpt-5.5 (medium)")
+    assert "Plan text." in result
+
+
+def test_normalize_freeform_signature_appends_when_absent(tmp_path):
+    config = make_config(tmp_path)
+    result = normalize_freeform_signature(
+        "Plan text without a signature.",
+        agent="codex",
+        config=config,
+        model_used="gpt-5.5 (medium)",
+    )
+    assert result.endswith("-- OpenAI Codex: gpt-5.5 (medium)")
+    assert "Plan text without a signature." in result
+
+
+def test_normalize_freeform_signature_skips_html_comments(tmp_path):
+    config = make_config(tmp_path)
+    text = "Plan text.\n-- OpenAI Codex\n<!-- AGENT_PLAN_STATE: approved -->"
+    result = normalize_freeform_signature(
+        text,
+        agent="codex",
+        config=config,
+        model_used="gpt-5.5 (medium)",
+    )
+    assert "-- OpenAI Codex: gpt-5.5 (medium)" in result
+    assert "<!-- AGENT_PLAN_STATE: approved -->" in result
+    assert result.endswith("<!-- AGENT_PLAN_STATE: approved -->")
+
+
+def test_normalize_freeform_signature_no_duplicate_when_already_canonical(tmp_path):
+    config = make_config(tmp_path)
+    canonical = "Plan text.\n-- OpenAI Codex: gpt-5.5 (medium)"
+    result = normalize_freeform_signature(
+        canonical,
+        agent="codex",
+        config=config,
+        model_used="gpt-5.5 (medium)",
+    )
+    assert result == canonical
+
+
+def test_run_plan_loop_freeform_initial_plan_includes_model(tmp_path):
+    plan_text = "My initial plan.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
+    reviewer_text = structured_plan_review(summary="LGTM.")
+    reviewer_marker = parse_plan_review(reviewer_text, reviewer="OpenAI Codex")
+
+    def fake_run_validated_agent(runner, *, agent, **kwargs):
+        if agent == "claude":
+            return ValidatedAgentResponse(
+                text=plan_text,
+                model_used="gpt-5.5 (medium)",
+                session_id=None,
+                marker_value=None,
+            )
+        return ValidatedAgentResponse(
+            text=reviewer_text,
+            model_used=None,
+            session_id=None,
+            marker_value=reviewer_marker,
+        )
+
+    runner = FakeRunner()
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    with patch(
+        "coding_review_agent_loop.orchestrator._run_validated_agent",
+        side_effect=fake_run_validated_agent,
+    ):
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    posted_body = runner.issue_comments[0]["body"]
+    stripped = _strip_round_metadata(posted_body)
+    assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
+
+
+def test_run_plan_loop_freeform_revision_includes_model(tmp_path):
+    initial_plan = "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    blocking_review_text = structured_plan_review(
+        state="blocking",
+        summary="Missing test strategy.",
+        blocking_plan_issues=["Missing test strategy."],
+    )
+    blocking_review_marker = parse_plan_review(blocking_review_text, reviewer="OpenAI Codex")
+    revised_plan = "Revised plan.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
+    approved_review_text = structured_plan_review(
+        state="approved",
+        summary="LGTM.",
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    )
+    approved_review_marker = parse_plan_review(approved_review_text, reviewer="OpenAI Codex")
+
+    call_count = [0]
+
+    def fake_run_validated_agent(runner, *, agent, **kwargs):
+        call_count[0] += 1
+        if agent == "claude":
+            if call_count[0] == 1:
+                return ValidatedAgentResponse(
+                    text=initial_plan, model_used=None, session_id=None, marker_value=None
+                )
+            return ValidatedAgentResponse(
+                text=revised_plan,
+                model_used="gpt-5.5 (medium)",
+                session_id=None,
+                marker_value=None,
+            )
+        if call_count[0] == 2:
+            return ValidatedAgentResponse(
+                text=blocking_review_text,
+                model_used=None,
+                session_id=None,
+                marker_value=blocking_review_marker,
+            )
+        return ValidatedAgentResponse(
+            text=approved_review_text,
+            model_used=None,
+            session_id=None,
+            marker_value=approved_review_marker,
+        )
+
+    runner = FakeRunner()
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    with patch(
+        "coding_review_agent_loop.orchestrator._run_validated_agent",
+        side_effect=fake_run_validated_agent,
+    ):
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    # Second issue_comments entry is the plan revision (index 1: reviewer, index 2: revision)
+    revision_body = runner.issue_comments[2]["body"]
+    stripped = _strip_round_metadata(revision_body)
+    assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
+
+
+def test_run_pr_loop_freeform_coder_followup_includes_model(tmp_path):
+    blocking_review_text = structured_pr_review(
+        state="blocking",
+        summary="Add a regression test.",
+    )
+    blocking_review_marker = parse_pr_review(blocking_review_text, reviewer="OpenAI Codex")
+    coder_followup_text = (
+        "Added the regression test.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"
+    )
+    approved_review_text = structured_pr_review(
+        state="approved",
+        summary="LGTM.",
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    )
+    approved_review_marker = parse_pr_review(approved_review_text, reviewer="OpenAI Codex")
+
+    call_count = [0]
+
+    def fake_run_validated_agent(runner, *, agent, **kwargs):
+        call_count[0] += 1
+        if agent == "codex":
+            if call_count[0] == 1:
+                return ValidatedAgentResponse(
+                    text=blocking_review_text,
+                    model_used=None,
+                    session_id=None,
+                    marker_value=blocking_review_marker,
+                )
+            return ValidatedAgentResponse(
+                text=approved_review_text,
+                model_used=None,
+                session_id=None,
+                marker_value=approved_review_marker,
+            )
+        return ValidatedAgentResponse(
+            text=coder_followup_text,
+            model_used="gpt-5.5 (medium)",
+            session_id=None,
+            marker_value=None,
+        )
+
+    runner = FakeRunner()
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    with patch(
+        "coding_review_agent_loop.orchestrator._run_validated_agent",
+        side_effect=fake_run_validated_agent,
+    ):
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # First PR comment is the reviewer blocking; second is the coder followup
+    followup_body = runner.pr_payload["comments"][1]["body"]
+    stripped = _strip_round_metadata(followup_body)
+    assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
+
+
+def test_pr_initial_coder_post_includes_model(tmp_path):
+    plan_text = "Plan content.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
+    plan_review_text = structured_plan_review(summary="Approved.")
+    plan_review_marker = parse_plan_review(plan_review_text, reviewer="OpenAI Codex")
+    pr_coder_text = (
+        "Implemented the feature.\n"
+        "<!-- AGENT_PR: 77 -->\n"
+        "<!-- AGENT_STATE: blocking -->\n"
+        "-- Anthropic Claude"
+    )
+    pr_review_text = structured_pr_review(state="approved", summary="LGTM.")
+    pr_review_marker = parse_pr_review(pr_review_text, reviewer="OpenAI Codex")
+
+    call_count = [0]
+
+    def fake_run_validated_agent(runner, *, agent, **kwargs):
+        call_count[0] += 1
+        if agent == "claude":
+            if call_count[0] == 1:
+                return ValidatedAgentResponse(
+                    text=plan_text, model_used=None, session_id=None, marker_value=None
+                )
+            # PR host-coder call: advance git head so validate_assigned_head_advanced passes
+            before_head = runner.git_head
+            runner.git_head = before_head + "-coder"
+            return ValidatedAgentResponse(
+                text=pr_coder_text,
+                model_used="gpt-5.5 (medium)",
+                session_id=None,
+                marker_value=77,
+            )
+        if call_count[0] == 2:
+            return ValidatedAgentResponse(
+                text=plan_review_text,
+                model_used=None,
+                session_id=None,
+                marker_value=plan_review_marker,
+            )
+        return ValidatedAgentResponse(
+            text=pr_review_text,
+            model_used=None,
+            session_id=None,
+            marker_value=pr_review_marker,
+        )
+
+    runner = FakeRunner()
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    with patch(
+        "coding_review_agent_loop.orchestrator._run_validated_agent",
+        side_effect=fake_run_validated_agent,
+    ):
+        assert (
+            run_issue_loop(
+                runner,
+                issue_number=56,
+                config=config,
+                plan_first=True,
+                implement_after_approval=True,
+            )
+            == 0
+        )
+
+    # First PR comment is from the host-coder initial post
+    pr_initial_body = runner.pr_payload["comments"][0]["body"]
+    stripped = _strip_round_metadata(pr_initial_body)
+    assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
