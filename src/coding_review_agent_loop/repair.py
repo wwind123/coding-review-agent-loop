@@ -1,9 +1,8 @@
 """LLM repair pass for malformed review/coder-followup outputs.
 
-When an agent produces a review or coder follow-up that fails strict schema
-validation, this module attempts to recover it by calling gemini-3.1-flash-lite
-as a format-repair assistant.  If the repair also fails validation, the caller
-treats the result as blocking per the issue guardrails.
+When an agent produces a structured response that fails strict schema
+validation, this module performs a constrained format-only repair. Antigravity
+is the default backend; legacy Gemini CLI remains available when selected.
 """
 
 from __future__ import annotations
@@ -12,9 +11,17 @@ import json
 import logging
 import re
 import subprocess
+import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Literal
 
+from .agents.antigravity import AntigravityBackend
 from .agents.gemini import _parse_gemini_payload
+from .logging import agent_log_path
+from .runner import strip_ansi
+from .usage import RunUsageContext, estimate_usage
 from .protocol import (
     HUMAN_REQUIREMENTS_RESOLVED_RE,
     PLAN_STATE_RE,
@@ -23,6 +30,10 @@ from .protocol import (
 )
 
 _logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .config import AgentLoopConfig
+    from .runner import Runner
 
 _SIGNATURE_LINE_RE = re.compile(r"(?m)^--\s+\S[^\n]*")
 
@@ -640,6 +651,219 @@ Output ONLY the repaired response. No explanations.
 
 _REPAIR_MODEL = "gemini-3.1-flash-lite"
 _SUPPORTED_EXPECTED_KINDS = {"pr_review", "plan_review", "coder_followup", "plan_revision"}
+RepairOutcome = Literal[
+    "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output"
+]
+
+
+@dataclass
+class RepairAttemptResult:
+    backend: Literal["antigravity", "gemini"]
+    model: str
+    prompt: str
+    output: str
+    returncode: int | None
+    outcome: RepairOutcome
+    diagnostic: str
+    log_path: Path | None
+    fallback_planned: bool
+    validation_result: object | None = None
+
+
+_KNOWN_ERROR_RE = re.compile(
+    r"(?i)(fatal|error|exception|authentication|unauthorized|forbidden|quota|rate.?limit|timed?.?out)"
+)
+_SECRET_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|authorization|password)\b\s*[:=]\s*\S+"
+)
+
+
+def _sanitize_diagnostic(text: str, *, config: AgentLoopConfig | None = None) -> str:
+    clean = strip_ansi(text)
+    clean = _SECRET_RE.sub(r"\1=<redacted>", clean)
+    paths: list[Path] = [Path.home()]
+    repair_root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
+    if config is not None:
+        paths.extend(
+            (config.claude_dir, config.codex_dir, config.gemini_dir, config.antigravity_dir)
+        )
+    for path in paths:
+        rendered = str(path)
+        if rendered and rendered != "/":
+            clean = clean.replace(rendered, "<path>")
+    clean = clean.replace(str(repair_root), "<repair-path>")
+    lines = [line.strip() for line in clean.splitlines() if line.strip()]
+    matching = [line for line in lines if _KNOWN_ERROR_RE.search(line)]
+    selected = matching[-1:] if matching else lines[-20:]
+    encoded = "\n".join(selected).encode("utf-8")[-4096:]
+    return encoded.decode("utf-8", errors="ignore")
+
+
+def _build_repair_prompt(
+    raw: str,
+    *,
+    expected_kind: str | None = None,
+    unresolved_item_ids: Sequence[str] | None = None,
+    surfaced_requirement_ids: Sequence[str] | None = None,
+    reviewer_requirement_ids: Sequence[str] | None = None,
+    allowed_prior_item_ids: Sequence[str] | None = None,
+    unknown_prior_item_ids: Sequence[str] | None = None,
+    same_round_context: str | None = None,
+) -> str:
+    if expected_kind is not None and expected_kind not in _SUPPORTED_EXPECTED_KINDS:
+        raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
+    coder_followup_required_items_instruction = _coder_followup_required_items_instruction(
+        expected_kind, unresolved_item_ids
+    )
+    coder_followup_human_requirements_instruction = _coder_followup_human_requirements_instruction(
+        expected_kind, surfaced_requirement_ids
+    )
+    reviewer_human_requirements_instr = _reviewer_human_requirements_instruction(
+        expected_kind, reviewer_requirement_ids
+    )
+    prior_item_dispositions_instruction = _repair_prior_item_ids_instruction(
+        allowed_prior_item_ids, unknown_prior_item_ids, same_round_context
+    )
+    expected_kind_instruction = (
+        "## Expected response kind:\n"
+        f"You MUST repair this response as `{expected_kind}`. Output no other `kind` value.\n"
+        if expected_kind is not None
+        else "## Expected response kind:\nNo expected response kind was provided; choose from the format-selection rules.\n"
+    )
+    prompt = _REPAIR_PROMPT.replace("{expected_kind_instruction}", expected_kind_instruction, 1)
+    replacements = (
+        ("{coder_followup_required_items_instruction}", coder_followup_required_items_instruction),
+        ("{coder_followup_human_requirements_instruction}", coder_followup_human_requirements_instruction),
+        ("{reviewer_human_requirements_instruction}", reviewer_human_requirements_instr),
+        ("{prior_item_dispositions_instruction}", prior_item_dispositions_instruction),
+        ("{raw_response}", raw),
+    )
+    for placeholder, value in replacements:
+        prompt = prompt.replace(placeholder, value, 1)
+    return prompt
+
+
+def execute_repair(
+    raw: str,
+    *,
+    runner: Runner,
+    config: AgentLoopConfig,
+    run_id: str | None,
+    usage_context: RunUsageContext | None,
+    validate: Callable[[str], object],
+    **prompt_kwargs: object,
+) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
+    """Run the configured repair chain and validate each candidate."""
+    prompt = _build_repair_prompt(raw, **prompt_kwargs)
+    attempts: list[RepairAttemptResult] = []
+    models = config.repair_models
+    for index, model in enumerate(models):
+        fallback_planned = index + 1 < len(models)
+        log_path: Path | None = None
+        output = ""
+        returncode: int | None = None
+        diagnostic = ""
+        outcome: RepairOutcome
+        try:
+            if config.repair_backend == "antigravity":
+                log_path = agent_log_path(config, "antigravity-repair", run_id=run_id)
+                result = AntigravityBackend().run_repair(
+                    runner,
+                    config,
+                    prompt,
+                    model=model,
+                    run_id=run_id,
+                    log_path=log_path,
+                )
+                output = result.text.strip()
+                returncode = result.returncode
+                log_path = result.log_path
+                diagnostic_source = result.raw_output
+            else:
+                log_path = agent_log_path(config, "gemini-repair", run_id=run_id)
+                proc = subprocess.run(
+                    [
+                        config.gemini_cmd,
+                        "--model",
+                        model,
+                        "--skip-trust",
+                        "--prompt",
+                        prompt,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=config.repair_timeout_seconds,
+                )
+                returncode = proc.returncode
+                parsed, _, _, _, _ = _parse_gemini_payload(proc.stdout.strip())
+                output = parsed.strip()
+                diagnostic_source = f"{proc.stdout}\n{proc.stderr}"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(diagnostic_source, encoding="utf-8")
+            if returncode is None:
+                outcome = "timeout"
+            elif returncode != 0:
+                outcome = "nonzero_exit"
+            elif not output:
+                outcome = "empty_output"
+            else:
+                outcome = "succeeded"
+            diagnostic = _sanitize_diagnostic(diagnostic_source, config=config)
+        except subprocess.TimeoutExpired as exc:
+            outcome = "timeout"
+            diagnostic = _sanitize_diagnostic(str(exc), config=config)
+            if log_path is not None:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(diagnostic + "\n", encoding="utf-8")
+        except Exception as exc:
+            outcome = "spawn_error"
+            diagnostic = _sanitize_diagnostic(str(exc), config=config)
+            if log_path is not None:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(diagnostic + "\n", encoding="utf-8")
+
+        attempt = RepairAttemptResult(
+            backend=config.repair_backend,
+            model=model,
+            prompt=prompt,
+            output=output,
+            returncode=returncode,
+            outcome=outcome,
+            diagnostic=diagnostic,
+            log_path=log_path,
+            fallback_planned=fallback_planned,
+        )
+        usage_record = None
+        if usage_context is not None:
+            usage_record = usage_context.add_record(
+                agent=config.repair_backend,
+                session_id=None,
+                returncode=returncode,
+                usage=estimate_usage(prompt, output),
+                role="repair",
+                model=model,
+                outcome=outcome,
+                log_path=str(log_path) if log_path is not None else None,
+                fallback_planned=fallback_planned,
+            )
+        if outcome == "succeeded":
+            try:
+                validation_result = validate(output)
+            except Exception as exc:
+                attempt.outcome = "invalid_output"
+                attempt.diagnostic = _sanitize_diagnostic(str(exc), config=config)
+                if usage_record is not None:
+                    usage_record.outcome = "invalid_output"
+            else:
+                attempt.validation_result = validation_result
+                attempt.fallback_planned = False
+                if usage_record is not None:
+                    usage_record.validation_status = "validated"
+                    usage_record.fallback_planned = False
+                attempts.append(attempt)
+                return output, validation_result, attempts
+        attempts.append(attempt)
+    return None, None, attempts
 
 
 def _coder_followup_required_items_instruction(
@@ -752,53 +976,16 @@ def attempt_repair(
     Returns the repaired text on success, or None when the CLI fails or returns empty output.
     The caller is responsible for re-validating the returned text.
     """
-    if expected_kind is not None and expected_kind not in _SUPPORTED_EXPECTED_KINDS:
-        raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
-    coder_followup_required_items_instruction = _coder_followup_required_items_instruction(
-        expected_kind,
-        unresolved_item_ids,
+    prompt = _build_repair_prompt(
+        raw,
+        expected_kind=expected_kind,
+        unresolved_item_ids=unresolved_item_ids,
+        surfaced_requirement_ids=surfaced_requirement_ids,
+        reviewer_requirement_ids=reviewer_requirement_ids,
+        allowed_prior_item_ids=allowed_prior_item_ids,
+        unknown_prior_item_ids=unknown_prior_item_ids,
+        same_round_context=same_round_context,
     )
-    coder_followup_human_requirements_instruction = _coder_followup_human_requirements_instruction(
-        expected_kind,
-        surfaced_requirement_ids,
-    )
-    reviewer_human_requirements_instr = _reviewer_human_requirements_instruction(
-        expected_kind,
-        reviewer_requirement_ids,
-    )
-    prior_item_dispositions_instruction = _repair_prior_item_ids_instruction(
-        allowed_prior_item_ids,
-        unknown_prior_item_ids,
-        same_round_context,
-    )
-    expected_kind_instruction = (
-        "## Expected response kind:\n"
-        f"You MUST repair this response as `{expected_kind}`. Output no other `kind` value.\n"
-        if expected_kind is not None
-        else "## Expected response kind:\nNo expected response kind was provided; choose from the format-selection rules.\n"
-    )
-    prompt = _REPAIR_PROMPT.replace("{expected_kind_instruction}", expected_kind_instruction, 1)
-    prompt = prompt.replace(
-        "{coder_followup_required_items_instruction}",
-        coder_followup_required_items_instruction,
-        1,
-    )
-    prompt = prompt.replace(
-        "{coder_followup_human_requirements_instruction}",
-        coder_followup_human_requirements_instruction,
-        1,
-    )
-    prompt = prompt.replace(
-        "{reviewer_human_requirements_instruction}",
-        reviewer_human_requirements_instr,
-        1,
-    )
-    prompt = prompt.replace(
-        "{prior_item_dispositions_instruction}",
-        prior_item_dispositions_instruction,
-        1,
-    )
-    prompt = prompt.replace("{raw_response}", raw, 1)
     try:
         result = subprocess.run(
             [gemini_cmd, "--model", _REPAIR_MODEL, "--skip-trust", "--prompt", prompt],

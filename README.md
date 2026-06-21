@@ -365,11 +365,25 @@ only the standalone agent signature. The loop renders validated structured
 payloads into normal public GitHub comments, so raw JSON is not posted.
 
 When a structured plan review, plan revision, PR review, or coder follow-up is
-present but malformed, the loop may run one Gemini-backed repair pass. The
-repair pass is format-only: it asks Gemini to re-emit the agent's intent as the
+present but malformed, the loop may run a model-backed repair pass. The default
+backend is Antigravity (`agy`) with the single model `Gemini 3 Flash`. The
+repair pass is format-only: it asks the model to re-emit the agent's intent as the
 required JSON object, footer marker, and signature. The repaired response is
 accepted only if it passes the same strict validation as the original response;
 failed repairs remain local protocol errors and are not posted to GitHub.
+
+Repair runs in a fresh temporary directory with an empty tool allow-list and a
+repair-only `GEMINI.md`; it receives no checkout or repository context. Configure
+it with `--repair-backend antigravity|gemini`, repeat `--repair-model` to define
+an explicit ordered fallback chain, and set `--repair-timeout-seconds`. The
+normal Antigravity coder/reviewer model chain is never inherited. For example:
+
+`--repair-model "Gemini 3 Flash" --repair-model "Gemini 3.1 Pro (High)"`
+
+The legacy `gemini --prompt` path is used only with
+`--repair-backend gemini` and requires non-interactive enterprise/API-key/Vertex
+authentication. Every attempt, including failures and empty output, is recorded
+as estimated usage and consumes the selected provider's quota.
 
 Signed human reviewer comments are approval-critical when they end with a
 standalone `-- Human Reviewer` signature. The loop surfaces those requirements

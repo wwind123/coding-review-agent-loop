@@ -467,6 +467,7 @@ class FakeRunner(Runner):
         check=True,
         env=None,
         use_pty=False,
+        timeout_seconds=None,
     ):
         cmd, cwd_path = self._record_command(args, cwd)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -12231,7 +12232,7 @@ def test_config_preflight_checks_only_unique_configured_agents(monkeypatch, tmp_
     config = config_from_args(args, Runner())
 
     assert config.coder == "codex"
-    assert checked == ["codex"]
+    assert checked == ["codex", "agy"]
 
 
 def test_config_preflight_accepts_custom_absolute_command(tmp_path):
@@ -16956,6 +16957,7 @@ from coding_review_agent_loop.repair import (
     _REPAIR_PROMPT,
     attempt_envelope_normalization,
     attempt_repair,
+    execute_repair,
 )
 
 
@@ -17410,6 +17412,199 @@ def test_repair_prompt_substitution_leaves_json_examples_intact():
     assert raw in substituted
     assert "{raw_response}" not in substituted
     assert "schema_version" in substituted
+
+
+def test_execute_repair_defaults_to_isolated_antigravity_and_records_usage(
+    tmp_path, monkeypatch
+):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.usage import RunUsageContext
+
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+    valid = structured_pr_review(state="approved", reviewer="Google Antigravity")
+    captured = {}
+
+    class RepairRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            captured["args"] = list(args)
+            captured["cwd"] = Path(cwd)
+            captured["env"] = kwargs["env"]
+            captured["timeout"] = kwargs["timeout_seconds"]
+            captured["settings"] = json.loads(settings_file.read_text(encoding="utf-8"))
+            captured["gemini_md"] = (Path(cwd) / "GEMINI.md").read_text(encoding="utf-8")
+            assert not (Path(cwd) / ".git").exists()
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    config = make_config(
+        tmp_path,
+        antigravity_args=("--dangerously-skip-permissions",),
+        repair_models=("Gemini 3 Flash",),
+    )
+    usage = RunUsageContext("run-1", tmp_path / "usage.json")
+    repaired, marker, attempts = execute_repair(
+        "malformed",
+        runner=RepairRunner(antigravity_outputs=[(valid, 0)]),
+        config=config,
+        run_id="run-1",
+        usage_context=usage,
+        validate=lambda text: parse_structured_pr_review(
+            text, reviewer="Google Antigravity"
+        ),
+        expected_kind="pr_review",
+    )
+
+    assert repaired == valid
+    assert marker is not None
+    assert attempts[0].model == "Gemini 3 Flash"
+    assert captured["timeout"] == 120
+    assert captured["env"]["AGENT_LOOP_WORKDIR"] == str(captured["cwd"])
+    assert not captured["cwd"].exists()
+    assert "--dangerously-skip-permissions" not in captured["args"]
+    assert captured["settings"]["permissions"]["allow"] == []
+    assert "Do not inspect files" in captured["gemini_md"]
+    assert usage.records[0].role == "repair"
+    assert usage.records[0].outcome == "succeeded"
+    assert usage.records[0].validation_status == "validated"
+
+
+def test_execute_repair_explicit_chain_falls_back_after_failure_and_invalid_output(
+    tmp_path, monkeypatch
+):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.usage import RunUsageContext
+
+    monkeypatch.setattr(
+        agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json"
+    )
+    valid = structured_pr_review(state="approved", reviewer="Google Antigravity")
+    config = make_config(
+        tmp_path,
+        repair_models=("Gemini 3 Flash", "Gemini 3.1 Pro (High)"),
+    )
+    usage = RunUsageContext("run-2", tmp_path / "usage.json")
+    repaired, _, attempts = execute_repair(
+        "malformed",
+        runner=FakeRunner(antigravity_outputs=[("not structured", 0), (valid, 0)]),
+        config=config,
+        run_id="run-2",
+        usage_context=usage,
+        validate=lambda text: (
+            parse_structured_pr_review(text, reviewer="Google Antigravity")
+            or (_ for _ in ()).throw(AgentLoopError("invalid repaired output"))
+        ),
+        expected_kind="pr_review",
+    )
+
+    assert repaired == valid
+    assert [attempt.outcome for attempt in attempts] == ["invalid_output", "succeeded"]
+    assert [record.outcome for record in usage.records] == ["invalid_output", "succeeded"]
+    assert usage.records[0].fallback_planned is True
+    assert usage.records[1].fallback_planned is False
+
+
+@pytest.mark.parametrize(
+    ("output", "returncode", "expected"),
+    [
+        ("fatal auth error", 41, "nonzero_exit"),
+        ("", 0, "empty_output"),
+        (PUBLIC_RESPONSE_MARKER, 0, "empty_output"),
+        ("", None, "timeout"),
+    ],
+)
+def test_execute_repair_records_antigravity_failure_outcomes(
+    tmp_path, monkeypatch, output, returncode, expected
+):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(
+        agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json"
+    )
+    repaired, _, attempts = execute_repair(
+        "malformed",
+        runner=FakeRunner(antigravity_outputs=[(output, returncode)]),
+        config=make_config(tmp_path),
+        run_id="run-3",
+        usage_context=None,
+        validate=lambda text: text,
+        expected_kind="pr_review",
+    )
+    assert repaired is None
+    assert attempts[0].outcome == expected
+
+
+def test_execute_repair_records_spawn_error_with_log_path(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(
+        agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json"
+    )
+
+    class SpawnErrorRunner(FakeRunner):
+        def run_with_log(self, *args, **kwargs):
+            raise AgentLoopError("agy executable missing")
+
+    repaired, _, attempts = execute_repair(
+        "malformed",
+        runner=SpawnErrorRunner(),
+        config=make_config(tmp_path),
+        run_id="run-spawn",
+        usage_context=None,
+        validate=lambda text: text,
+        expected_kind="pr_review",
+    )
+    assert repaired is None
+    assert attempts[0].outcome == "spawn_error"
+    assert attempts[0].log_path is not None
+    assert attempts[0].log_path.exists()
+
+
+def test_execute_repair_uses_configured_legacy_gemini_override(tmp_path):
+    valid = structured_pr_review(state="approved", reviewer="Google Gemini")
+    proc = MagicMock(returncode=0, stdout=valid, stderr="")
+    config = make_config(
+        tmp_path,
+        repair_backend="gemini",
+        repair_models=("gemini-enterprise-flash",),
+    )
+    with patch("coding_review_agent_loop.repair.subprocess.run", return_value=proc) as run:
+        repaired, _, attempts = execute_repair(
+            "malformed",
+            runner=FakeRunner(),
+            config=config,
+            run_id="run-4",
+            usage_context=None,
+            validate=lambda text: parse_structured_pr_review(
+                text, reviewer="Google Gemini"
+            ),
+            expected_kind="pr_review",
+        )
+    assert repaired == valid
+    assert attempts[0].backend == "gemini"
+    assert "gemini-enterprise-flash" in run.call_args.args[0]
+
+
+def test_runner_pty_timeout_is_opt_in_and_retains_combined_log(tmp_path):
+    log_path = tmp_path / "logs" / "timeout.log"
+    result = Runner().run_with_log(
+        [
+            sys.executable,
+            "-c",
+            "import sys,time; print('stderr diagnostic', file=sys.stderr, flush=True); time.sleep(5)",
+        ],
+        cwd=tmp_path,
+        log_path=log_path,
+        label="timeout-test",
+        progress_interval_seconds=30,
+        check=False,
+        use_pty=True,
+        timeout_seconds=0.2,
+    )
+
+    assert result.returncode is None
+    assert result.stderr == ""
+    assert "stderr diagnostic" in result.stdout
+    assert "stderr diagnostic" in log_path.read_text(encoding="utf-8")
 
 
 def test_run_pr_loop_uses_repair_pass_on_format_failure(tmp_path):

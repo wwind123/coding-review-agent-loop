@@ -14,6 +14,7 @@ from .agents.registry import (
     agent_signature,
 )
 from .config import (
+    DEFAULT_REPAIR_MODELS,
     DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
     AgentLoopConfig,
     config_from_args,
@@ -118,6 +119,27 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--codex-cmd", default="codex")
         subparser.add_argument("--gemini-cmd", default="gemini")
         subparser.add_argument("--antigravity-cmd", default="agy")
+        subparser.add_argument(
+            "--repair-backend",
+            choices=("antigravity", "gemini"),
+            default="antigravity",
+            help="Malformed-response repair backend (default: antigravity).",
+        )
+        subparser.add_argument(
+            "--repair-model",
+            action="append",
+            default=None,
+            help=(
+                "Repair model to try. Repeat to configure an explicit fallback chain "
+                f"(default: {DEFAULT_REPAIR_MODELS[0]} only)."
+            ),
+        )
+        subparser.add_argument(
+            "--repair-timeout-seconds",
+            type=int,
+            default=120,
+            help="Per-attempt malformed-response repair timeout (default: 120).",
+        )
         agy_model_group = subparser.add_mutually_exclusive_group()
         agy_model_group.add_argument(
             "--antigravity-model",

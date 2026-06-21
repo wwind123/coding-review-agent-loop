@@ -32,7 +32,7 @@ class AgentResult:
     message_text: str | None = None
     session_id: str | None = None
     log_path: Path | None = None
-    returncode: int = 0
+    returncode: int | None = 0
     usage: UsageMetadata | None = None
     raw_usage: object | None = None
     # Human-readable label of the model that actually produced this result (e.g.

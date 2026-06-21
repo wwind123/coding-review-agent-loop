@@ -36,7 +36,7 @@ flowchart LR
 
     Orchestrator --> Prompts[Prompt builders<br/>prompts.py]
     Orchestrator --> Protocol[Structured JSON, marker,<br/>and follow-up validation<br/>protocol.py]
-    Orchestrator --> Repair[Malformed structured-response repair<br/>repair.py / Gemini CLI]
+    Orchestrator --> Repair[Malformed structured-response repair<br/>repair.py / Antigravity by default]
     Orchestrator --> RoundState[Round resume metadata<br/>round_state.py / AGENT_LOOP_META]
     Orchestrator --> Registry[Agent registry<br/>agents/registry.py]
     Orchestrator --> GitHubOps[GitHub operations<br/>github.py]
@@ -652,9 +652,13 @@ without the required marker, the loop fails locally with `AgentLoopError` and
 the attempt log path instead of posting that raw output as a review.
 
 For structured plan reviews, plan revisions, PR reviews, and coder follow-ups,
-a present but malformed structured response may get one repair pass before the
-local failure is raised. The repair pass calls the configured Gemini CLI with a
-format-repair prompt and asks it to preserve the agent's intent while emitting
+a present but malformed structured response may get a repair pass before the
+local failure is raised. By default the repair pass calls Antigravity through
+the existing PTY backend with the single model `Gemini 3 Flash`; the normal
+coder/reviewer fallback chain is not inherited. It uses a fresh temporary
+workdir, empty tool permissions, and repair-only instructions forbidding file
+inspection, tests, mutation, background work, and subagents. The format-repair
+prompt asks it to preserve the agent's intent while emitting
 only the required JSON object, matching footer marker, and standalone
 signature. Repaired output is accepted only after it passes the same schema,
 state, footer, follow-up, prior-item, and human-requirement validation as an
@@ -777,6 +781,16 @@ If strict structured-response validation fails, the log may show a repair pass:
 `repair pass recovered malformed response` or `repair pass produced invalid
 output`. A recovered response is still revalidated before posting; a failed
 repair leaves the run in local failure just like any other protocol error.
+
+Use `--repair-backend`, repeatable `--repair-model`, and
+`--repair-timeout-seconds` to configure this path. Multiple models are the only
+repair fallback chain. `--repair-backend gemini` retains the legacy CLI for
+enterprise/API-key/Vertex authentication; personal OAuth may require an
+interactive authorization and is not the default. Normal diagnostics include
+backend, model, return code, a sanitized bounded combined-PTY diagnostic, log
+path, and whether another configured model will run. Usage summaries record
+estimated prompt/output usage plus repair outcome and validation status for
+every attempt, including failed attempts, so repair consumes visible quota.
 
 Long reset or quota responses can exit early with guidance to rerun after the
 reset or switch keys/models. Narrower transient stream, tool-call, network

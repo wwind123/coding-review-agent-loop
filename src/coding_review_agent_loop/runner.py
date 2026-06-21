@@ -22,7 +22,7 @@ class CommandResult:
     cwd: Path
     stdout: str
     stderr: str
-    returncode: int
+    returncode: int | None
 
 
 # Matches ANSI/VT100 control sequences (CSI, OSC, charset selection) that a
@@ -158,6 +158,7 @@ class Runner:
         check: bool = True,
         env: Mapping[str, str] | None = None,
         use_pty: bool = False,
+        timeout_seconds: float | None = None,
     ) -> CommandResult:
         cmd = [str(a) for a in args]
         if self.dry_run:
@@ -175,6 +176,7 @@ class Runner:
                 progress_interval_seconds=progress_interval_seconds,
                 check=check,
                 env=env,
+                timeout_seconds=timeout_seconds,
             )
         started = time.monotonic()
         next_progress = started + progress_interval_seconds
@@ -242,6 +244,7 @@ class Runner:
         progress_interval_seconds: int,
         check: bool,
         env: Mapping[str, str] | None,
+        timeout_seconds: float | None = None,
     ) -> CommandResult:
         """Run a command attached to a pseudo-terminal, logging and capturing output.
 
@@ -249,12 +252,14 @@ class Runner:
         and silently drop their final response when it is not (a pipe / file /
         subprocess), see upstream antigravity-cli issue #76. Allocating a PTY makes
         the agent emit normally; we strip the resulting ANSI control sequences from
-        the captured text before returning it.
+        the captured text before returning it. stdin/stdout/stderr all share the
+        PTY slave, so returned stderr is always empty and stdout is the merged stream.
         """
         import pty
         import select
 
         started = time.monotonic()
+        deadline = started + timeout_seconds if timeout_seconds is not None else None
         next_progress = started + progress_interval_seconds
         header = f"$ {' '.join(cmd)}\n\n"
         chunks: list[bytes] = []
@@ -289,8 +294,30 @@ class Runner:
             master_fd, slave_fd = allocated_fds
             os.close(slave_fd)
             try:
+                timed_out = False
                 while True:
-                    ready, _, _ = select.select([master_fd], [], [], 1.0)
+                    now = time.monotonic()
+                    if deadline is not None and now >= deadline and proc.poll() is None:
+                        timed_out = True
+                        try:
+                            os.killpg(proc.pid, 15)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(proc.pid, 9)
+                            except ProcessLookupError:
+                                pass
+                            proc.wait()
+                    if timed_out:
+                        wait_seconds = 0.1
+                    elif deadline is not None:
+                        wait_seconds = min(1.0, max(0.0, deadline - now))
+                    else:
+                        wait_seconds = 1.0
+                    ready, _, _ = select.select([master_fd], [], [], wait_seconds)
                     if master_fd in ready:
                         try:
                             data = os.read(master_fd, 65536)
@@ -324,7 +351,7 @@ class Runner:
                 raise
             finally:
                 os.close(master_fd)
-            returncode = proc.wait()
+            returncode = None if timed_out else proc.wait()
 
         raw = b"".join(chunks).decode("utf-8", errors="replace")
         output = strip_ansi(raw)

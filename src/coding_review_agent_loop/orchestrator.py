@@ -99,7 +99,13 @@ from .protocol import (
     validate_structured_plan_revision,
 )
 from .protocol import parse_review
-from .repair import attempt_envelope_normalization, attempt_repair, strip_unknown_prior_item_dispositions
+from .repair import (
+    RepairAttemptResult,
+    attempt_envelope_normalization,
+    attempt_repair,
+    execute_repair,
+    strip_unknown_prior_item_dispositions,
+)
 from .runner import Runner
 from .transient import (
     NON_RETRYABLE_AGENT_OUTPUT_RE,
@@ -824,6 +830,64 @@ def _persist_usage_summary(config: AgentLoopConfig, usage_context: RunUsageConte
     )
 
 
+_ORIGINAL_ATTEMPT_REPAIR = attempt_repair
+
+
+def _run_structured_repair(
+    raw: str,
+    *,
+    runner: Runner,
+    config: AgentLoopConfig,
+    usage_context: RunUsageContext | None,
+    validate: Callable[[str], object],
+    repair_kwargs: dict[str, object],
+) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
+    """Run configured repair, retaining compatibility with patched legacy test hooks."""
+    if attempt_repair is not _ORIGINAL_ATTEMPT_REPAIR:
+        repaired = attempt_repair(raw, config.gemini_cmd, **repair_kwargs)
+        if repaired is None:
+            return None, None, []
+        try:
+            parsed = validate(repaired)
+        except AgentLoopError as exc:
+            return repaired, None, [
+                RepairAttemptResult(
+                    backend="gemini",
+                    model="legacy-test-hook",
+                    prompt="",
+                    output=repaired,
+                    returncode=0,
+                    outcome="invalid_output",
+                    diagnostic=str(exc),
+                    log_path=None,
+                    fallback_planned=False,
+                )
+            ]
+        return repaired, parsed, []
+    return execute_repair(
+        raw,
+        runner=runner,
+        config=config,
+        run_id=usage_context.run_id if usage_context is not None else None,
+        usage_context=usage_context,
+        validate=validate,
+        **repair_kwargs,
+    )
+
+
+def _log_repair_attempts(config: AgentLoopConfig, prefix: str, attempts: Sequence[RepairAttemptResult]) -> None:
+    for attempt in attempts:
+        diagnostic = attempt.diagnostic or "(none)"
+        log(
+            config,
+            f"{prefix}: repair backend={attempt.backend} model={attempt.model} "
+            f"outcome={attempt.outcome} returncode="
+            f"{attempt.returncode if attempt.returncode is not None else 'none'}; "
+            f"diagnostic={diagnostic}; log={attempt.log_path or '(none)'}; "
+            f"fallback_planned={'yes' if attempt.fallback_planned else 'no'}",
+        )
+
+
 def _run_validated_agent(
     runner: Runner,
     *,
@@ -1210,21 +1274,32 @@ def _run_validated_agent(
                         repair_kwargs["same_round_context"] = exc.same_round_description
                     elif repair_allowed_prior_item_ids is not None:
                         repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
-                    repaired = attempt_repair(
+                    original_validation_error = str(exc)
+                    repaired, repaired_marker, repair_attempts = _run_structured_repair(
                         normalized if normalized is not None else text,
-                        config.gemini_cmd,
-                        **repair_kwargs,
+                        runner=runner,
+                        config=config,
+                        usage_context=usage_context,
+                        validate=validate,
+                        repair_kwargs=repair_kwargs,
                     )
+                    _log_repair_attempts(config, agent_name, repair_attempts)
                     if repaired is not None:
-                        try:
-                            marker_value = validate(repaired)
-                        except AgentLoopError as repair_exc:
-                            last_error = str(repair_exc)
+                        if repaired_marker is None:
+                            repair_detail = (
+                                repair_attempts[-1].diagnostic
+                                if repair_attempts
+                                else "repair output failed validation"
+                            )
+                            last_error = (
+                                f"{original_validation_error}; repair failure: {repair_detail}"
+                            )
                             log(
                                 config,
-                                f"{agent_name}: repair pass produced invalid output ({repair_exc})",
+                                f"{agent_name}: repair pass produced invalid output ({repair_detail})",
                             )
                         else:
+                            marker_value = repaired_marker
                             if isinstance(exc, UnknownPriorItemDispositionError):
                                 removed = ", ".join(sorted(exc.unknown_ids))
                                 allowed = ", ".join(sorted(exc.allowed_ids)) or "(none)"
@@ -1244,6 +1319,13 @@ def _run_validated_agent(
                                 usage=usage,
                                 model_used=result.model_used,
                             )
+                    elif repair_attempts:
+                        details = "; ".join(
+                            f"{attempt.backend}/{attempt.model}: {attempt.outcome}"
+                            + (f" ({attempt.diagnostic})" if attempt.diagnostic else "")
+                            for attempt in repair_attempts
+                        )
+                        last_error = f"{original_validation_error}; repair invocation failure: {details}"
             else:
                 if usage_record is not None:
                     usage_record.validation_status = "validated"
@@ -1932,14 +2014,27 @@ def _run_plan_first_loop(
                         f"Planning round {round_number}: {reviewer_name} approved without "
                         "HUMAN_REQUIREMENTS_RESOLVED; attempting repair",
                     )
-                    repaired_text = attempt_repair(
+                    repaired_text, _, repair_attempts = _run_structured_repair(
                         review_output,
-                        config.gemini_cmd,
-                        expected_kind="plan_review",
-                        reviewer_requirement_ids=hr_ids,
-                        allowed_prior_item_ids=tuple(
-                            item.item_id for item in prior_unresolved_items
+                        runner=runner,
+                        config=config,
+                        usage_context=usage_context,
+                        validate=lambda candidate, reviewer_name=reviewer_name: _validate_plan_review_response(
+                            candidate,
+                            reviewer=reviewer_name,
+                            unresolved_items=prior_unresolved_items,
+                            current_round_items=round_new_unresolved_items,
                         ),
+                        repair_kwargs={
+                            "expected_kind": "plan_review",
+                            "reviewer_requirement_ids": hr_ids,
+                            "allowed_prior_item_ids": tuple(
+                                item.item_id for item in prior_unresolved_items
+                            ),
+                        },
+                    )
+                    _log_repair_attempts(
+                        config, f"Planning round {round_number}: {reviewer_name}", repair_attempts
                     )
                     if repaired_text is not None:
                         try:
@@ -2957,14 +3052,27 @@ def run_pr_loop(
                                 f"Round {round_number}: {reviewer_name} approved without "
                                 "HUMAN_REQUIREMENTS_RESOLVED; attempting repair",
                             )
-                            repaired_text = attempt_repair(
+                            repaired_text, _, repair_attempts = _run_structured_repair(
                                 review_output,
-                                config.gemini_cmd,
-                                expected_kind="pr_review",
-                                reviewer_requirement_ids=hr_ids,
-                                allowed_prior_item_ids=tuple(
-                                    item.item_id for item in prior_unresolved_items
+                                runner=runner,
+                                config=config,
+                                usage_context=usage_context,
+                                validate=lambda candidate, reviewer_name=reviewer_name: _validate_review_response(
+                                    candidate,
+                                    reviewer=reviewer_name,
+                                    unresolved_items=prior_unresolved_items,
+                                    current_round_items=round_new_unresolved_items,
                                 ),
+                                repair_kwargs={
+                                    "expected_kind": "pr_review",
+                                    "reviewer_requirement_ids": hr_ids,
+                                    "allowed_prior_item_ids": tuple(
+                                        item.item_id for item in prior_unresolved_items
+                                    ),
+                                },
+                            )
+                            _log_repair_attempts(
+                                config, f"Round {round_number}: {reviewer_name}", repair_attempts
                             )
                             if repaired_text is not None:
                                 try:

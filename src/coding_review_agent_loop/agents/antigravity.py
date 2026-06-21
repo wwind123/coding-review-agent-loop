@@ -23,7 +23,9 @@ emits no token usage (usage falls back to the estimated path).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+import tempfile
 from typing import TYPE_CHECKING
 
 from .base import (
@@ -105,6 +107,19 @@ _REVIEWER_SETTINGS_INJECTION = {
         ]
     },
 }
+_REPAIR_SETTINGS_INJECTION = {
+    "toolPermission": "strict",
+    "permissions": {"allow": []},
+}
+
+_REPAIR_GEMINI_MD = """# Agent Loop Format Repair
+
+This is a single-shot formatting-only repair task in an isolated temporary directory.
+Do not inspect files, run shell commands or tests, mutate any repository, start
+background tasks, or invoke subagents. Use only the malformed response and protocol
+examples in the prompt. Return the repaired response immediately.
+
+"""
 
 
 def _antigravity_settings_path() -> Path:
@@ -137,6 +152,7 @@ class AntigravityBackend:
         session_id: str | None = None,
         run_id: str | None = None,
         role: str | None = None,
+        log_path_override: Path | None = None,
     ) -> AgentResult:
         import json, fcntl  # Unix-only (fcntl); imported here so the module loads on Windows
         for i, model in enumerate(config.antigravity_models):
@@ -145,7 +161,7 @@ class AntigravityBackend:
                 with_public_response_file_instruction(prompt, response_path)
             )
             args = [config.antigravity_cmd, "--model", model, *config.antigravity_args]
-            if role == "reviewer":
+            if role in {"reviewer", "repair"}:
                 args = [a for a in args if a != "--dangerously-skip-permissions"]
             # agy resumes by conversation id (not gemini's --resume). agy --print does
             # not surface a conversation id in plain output, so in practice session_id
@@ -154,7 +170,7 @@ class AntigravityBackend:
                 args += ["--conversation", session_id]
             # The prompt is the value of --print (must be last), not a positional.
             args += ["--print", prompt_text]
-            log_path = agent_log_path(config, "antigravity", run_id=run_id)
+            log_path = log_path_override or agent_log_path(config, "antigravity", run_id=run_id)
             log(config, f"Starting Antigravity (model: {model}) in {config.antigravity_dir}; log: {log_path}; response: {response_path}")
             # agy reads GEMINI.md from the workdir as high-priority system context before
             # the model sees the prompt. Injecting a single-shot session rule prevents
@@ -166,8 +182,12 @@ class AntigravityBackend:
             # inject→run→strip sequence across concurrent processes sharing the same
             # default per-repo workdir.
             gemini_md_path = config.antigravity_dir / "GEMINI.md"
-            gemini_lock_path = _git_lock_path(config.antigravity_dir)
-            single_shot_instruction = (
+            gemini_lock_path = (
+                config.antigravity_dir.parent / f".{config.antigravity_dir.name}.GEMINI.md.lock"
+                if role == "repair"
+                else _git_lock_path(config.antigravity_dir)
+            )
+            single_shot_instruction = _REPAIR_GEMINI_MD if role == "repair" else (
                 "# Agent Loop Single-Shot Session\n\n"
                 "You are running in a single-shot, non-interactive `agy --print` session"
                 " invoked by an automated orchestrator. There will be no follow-up turns.\n\n"
@@ -193,7 +213,7 @@ class AntigravityBackend:
             settings_lock = settings_lock_path.open("a+")
             try:
                 fcntl.flock(settings_lock, fcntl.LOCK_EX)
-                if role == "reviewer":
+                if role in {"reviewer", "repair"}:
                     try:
                         original_settings_text = settings_path.read_text(encoding="utf-8")
                         try:
@@ -206,7 +226,12 @@ class AntigravityBackend:
                         original_settings_text = None
                         existing_settings = {}
                     try:
-                        injected = {**existing_settings, **_REVIEWER_SETTINGS_INJECTION}
+                        injection = (
+                            _REPAIR_SETTINGS_INJECTION
+                            if role == "repair"
+                            else _REVIEWER_SETTINGS_INJECTION
+                        )
+                        injected = {**existing_settings, **injection}
                         settings_path.write_text(json.dumps(injected, indent=2), encoding="utf-8")
                         # Inner: GEMINI.md lock
                         gemini_lock_file = gemini_lock_path.open("a+")
@@ -230,6 +255,11 @@ class AntigravityBackend:
                                     check=False,
                                     env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
                                     use_pty=True,
+                                    **(
+                                        {"timeout_seconds": config.repair_timeout_seconds}
+                                        if role == "repair"
+                                        else {}
+                                    ),
                                 )
                             finally:
                                 if gemini_md_path.exists():
@@ -322,6 +352,36 @@ class AntigravityBackend:
         
         # This point should not be reached since antigravity_models cannot be empty
         raise RuntimeError("No antigravity models available to run.")
+
+    def run_repair(
+        self,
+        runner: Runner,
+        config: AgentLoopConfig,
+        prompt: str,
+        *,
+        model: str,
+        run_id: str | None = None,
+        log_path: Path | None = None,
+    ) -> AgentResult:
+        """Run one isolated, no-tools Antigravity format-repair attempt."""
+        repair_root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
+        repair_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="agy-", dir=repair_root) as temp_dir:
+            workdir = Path(temp_dir)
+            repair_config = replace(
+                config,
+                antigravity_dir=workdir,
+                antigravity_model=None,
+                antigravity_models=(model,),
+            )
+            return self.run(
+                runner,
+                repair_config,
+                prompt,
+                run_id=run_id,
+                role="repair",
+                log_path_override=log_path,
+            )
 
 
 BACKEND = AntigravityBackend()

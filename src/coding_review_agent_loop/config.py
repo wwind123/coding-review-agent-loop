@@ -37,6 +37,7 @@ DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
     "Gemini 3.5 Flash (High)",
     "Gemini 3.1 Pro (High)",
 )
+DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3 Flash",)
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,9 @@ class AgentLoopConfig:
     codex_reasoning_effort: str = ""
     gemini_model: str = ""
     claude_model: str = ""
+    repair_backend: str = "antigravity"
+    repair_models: tuple[str, ...] = DEFAULT_REPAIR_MODELS
+    repair_timeout_seconds: int = 120
 
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
@@ -105,6 +109,12 @@ class AgentLoopConfig:
             object.__setattr__(self, "antigravity_models", DEFAULT_ANTIGRAVITY_MODELS)
         if any(not m.strip() for m in self.antigravity_models):
             raise AgentLoopError("antigravity_models chain cannot be empty or contain blank entries.")
+        if self.repair_backend not in {"antigravity", "gemini"}:
+            raise AgentLoopError("--repair-backend must be either 'antigravity' or 'gemini'.")
+        if not self.repair_models or any(not model.strip() for model in self.repair_models):
+            raise AgentLoopError("--repair-model must contain at least one nonblank model.")
+        if self.repair_timeout_seconds <= 0:
+            raise AgentLoopError("--repair-timeout-seconds must be greater than zero.")
         ensure_no_model_arg_conflicts(self)
         if self.planning_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--planning-context-mode must be either 'full' or 'compact'.")
@@ -609,7 +619,9 @@ def preflight_agent_commands(
         "gemini": (args.gemini_cmd, "--gemini-cmd"),
         "antigravity": (args.antigravity_cmd, "--antigravity-cmd"),
     }
-    configured_agents = dict.fromkeys((args.coder, *configured_reviewers))
+    configured_agents = dict.fromkeys(
+        (args.coder, *configured_reviewers, getattr(args, "repair_backend", "antigravity"))
+    )
     for agent in configured_agents:
         command, override_flag = command_options[agent]
         resolved = shutil.which(command)
@@ -731,6 +743,9 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         codex_reasoning_effort=getattr(args, "codex_reasoning_effort", ""),
         gemini_model=getattr(args, "gemini_model", ""),
         claude_model=getattr(args, "claude_model", ""),
+        repair_backend=getattr(args, "repair_backend", "antigravity"),
+        repair_models=tuple(getattr(args, "repair_model", None) or DEFAULT_REPAIR_MODELS),
+        repair_timeout_seconds=getattr(args, "repair_timeout_seconds", 120),
         test_command=test_command,
         pre_review_tests=args.pre_review_tests,
         ci_check_name=args.ci_check_name,

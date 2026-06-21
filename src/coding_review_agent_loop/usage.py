@@ -84,10 +84,17 @@ class UsageCallRecord:
     call_id: int
     agent: AgentName
     session_id: str | None
-    returncode: int
+    returncode: int | None
     usage: UsageMetadata
     validation_status: Literal["validated", "invalid"] = "invalid"
     raw_backend_usage: object | None = None
+    role: Literal["repair"] | None = None
+    model: str | None = None
+    outcome: Literal[
+        "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output"
+    ] | None = None
+    log_path: str | None = None
+    fallback_planned: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -100,6 +107,10 @@ class UsageCallRecord:
         }
         if self.raw_backend_usage is not None:
             payload["raw_backend_usage"] = self.raw_backend_usage
+        for key in ("role", "model", "outcome", "log_path", "fallback_planned"):
+            value = getattr(self, key)
+            if value is not None:
+                payload[key] = value
         return payload
 
 
@@ -180,9 +191,16 @@ class RunUsageContext:
         *,
         agent: AgentName,
         session_id: str | None,
-        returncode: int,
+        returncode: int | None,
         usage: UsageMetadata,
         raw_backend_usage: object | None = None,
+        role: Literal["repair"] | None = None,
+        model: str | None = None,
+        outcome: Literal[
+            "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output"
+        ] | None = None,
+        log_path: str | None = None,
+        fallback_planned: bool | None = None,
     ) -> UsageCallRecord:
         record = UsageCallRecord(
             call_id=self._next_call_id,
@@ -191,6 +209,11 @@ class RunUsageContext:
             returncode=returncode,
             usage=usage,
             raw_backend_usage=raw_backend_usage,
+            role=role,
+            model=model,
+            outcome=outcome,
+            log_path=log_path,
+            fallback_planned=fallback_planned,
         )
         self._next_call_id += 1
         self.records.append(record)

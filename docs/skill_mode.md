@@ -157,9 +157,12 @@ reviewer is marked unavailable, the remaining reviewers still run, and a round i
 never falsely reported `approved`. A malformed-but-content-bearing structured
 review is recovered automatically when possible: safe skill normalization,
 envelope normalization, deterministic unknown-prior-item stripping against the
-complete carried ledger, and then Gemini format repair. The classifier is
-conservative: only known tooling-failure signatures or truly-empty output count
-as unavailable.
+complete carried ledger, and then model format repair. Local-loop repair now
+defaults to isolated Antigravity with `Gemini 3 Flash`; explicit repeatable
+repair models define the only fallback chain. Legacy Gemini CLI repair requires
+`--repair-backend gemini` and suitable non-interactive authentication. The
+classifier is conservative: only known tooling-failure signatures or
+truly-empty output count as unavailable.
 
 The same automatic recovery pipeline covers external-coder `plan_revision`
 responses and `run-pr-fix` `coder_followup` responses. Plan revisions may also
