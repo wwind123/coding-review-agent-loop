@@ -129,28 +129,24 @@ review. See [`SKILL.md`](SKILL.md) for the step-by-step instructions and
 
 ### Skill vs CLI — which to use
 
-Both drive the same review loop; they differ in **how Claude's own turns run** and **how
-much they automate**. (External agents — Codex/Gemini/Antigravity — run as subprocesses
-either way; the difference is only the Claude turns.)
+Both drive the same review loop. External agents — Codex, Gemini, and
+Antigravity — still run as subprocesses either way; the main difference is
+whether Claude's turns run as isolated `claude -p` calls or in the active
+Claude Code session.
 
-**Use the CLI (`agent-loop`) for hands-off automation.** It's a closed-loop driver: it
-loops to approval and implements, and — when configured — runs a test gate
-(`--test-command`) and, with `--auto-merge`, waits for CI (`wait_for_ci`) and merges.
-Without those flags it runs no test gate and does not poll/merge (pending checks stop the
-run).
-It runs without an interactive session (cron/CI/scripts). Claude turns run as isolated
-`claude -p` subprocesses — which means a Claude turn uses the Claude CLI's *default* model
-unless you pass `--claude-model`, and it depends on the `claude` binary being on `PATH`.
+| Concern | CLI (`agent-loop`) | Claude Code skill |
+|---|---|---|
+| Claude runtime | Each Claude turn starts a separate `claude -p` subprocess. The `claude` binary must be installed and available for every turn; an update or replacement can affect the next turn. | The skill also requires the `claude` binary to start Claude Code. Host turns then run in that already-active session, so replacing the binary on disk does not change the running session or require a new `claude -p` process. |
+| Model selection | Uses the Claude CLI default unless `--claude-model` is supplied. | Uses the active session model. |
+| Configuration | Flags and parameters must be supplied correctly up front. `--help` documents the available choices. | Configuration is conversational: Claude can explain options, remind you of parameters, and translate intent into helper commands even when you do not remember exact flag names. |
+| Unattended operation | Best suited to scripts, cron, and fire-and-forget runs. With `--test-command` and `--auto-merge`, it can run test gates, wait for CI, and merge. Without those flags, it does not add those behaviors. | Intended for an attended session. It lets you watch and steer rounds, and it keeps merge as a human decision. It never auto-merges or waits for CI. |
+| Quota exhaustion | The process stops, but durable GitHub metadata supports resume. You can arrange a shell scheduler or other external job to rerun the command after the reported reset time and leave it unattended. | If the host Claude session exhausts its quota, that session cannot schedule or perform its own later continuation. You must return after reset and resume or start a new session. |
+| Unexpected failures | Failures outside the implemented retry/repair paths normally abort the command and require a later diagnostic or code change. | The host Claude can inspect logs and state, explain the failure, and sometimes perform a safe manual recovery or adapt the next step. This is useful but not guaranteed. |
+| Permission prompts | With the appropriate trusted-environment flags, the loop can run without interactive approvals. | Claude Code's own security policy remains in force. The host may still request tool permission during a long run even when the skill instructions ask it not to prompt for particular commands. |
 
-**Use the skill (inside a Claude Code session) for high-touch / oversight.** Claude's
-coder/reviewer turns run in *your* interactive session instead of `claude -p`, which:
-- uses **your session model** (e.g. Opus) for Claude turns — no `--claude-model` needed;
-- **doesn't depend on the `claude` binary** (immune to "claude not found" / mid-update races);
-- lets you **watch and steer** each round (plans, reviews, clarifications);
-- keeps PR **merge a human decision** — the skill never auto-merges or waits on CI.
-
-Rule of thumb: **CLI for fire-and-forget through merge; the skill when you want to
-participate, use your session model, or avoid the `claude -p` model/binary gotchas.**
+Rule of thumb: **use the CLI for predictable, unattended execution and
+scheduled resume; use the skill for conversational setup, active oversight,
+and hands-on recovery from unusual failures.**
 
 Keeping the skill also **reduces reliance on programmatic `claude -p`** for Claude turns —
 useful if `claude -p` is ever billed or restricted differently (such a change was announced

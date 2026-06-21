@@ -13,7 +13,17 @@ instead of through `claude -p` subprocesses.
 | Gemini turns | `gemini` subprocess | Same `gemini` subprocess |
 | GitHub ops | Python `gh` wrapper | Same `gh` wrapper |
 | Session resume | AGENT_LOOP_META in GitHub comments | Same markers + local session JSON |
+| Configuration | Exact CLI flags supplied up front | Conversational; host can explain and select helper options |
+| Quota reset | Can be rerun later by an external scheduler | User must return and resume the host session after reset |
+| Unexpected failure | Exits unless code has a retry/recovery path | Host can inspect and sometimes recover interactively |
+| Permissions | Can be configured for unattended trusted-environment execution | Host Claude Code policy may still require tool approval |
 | Best for | Headless CI / unattended automation | Interactive development sessions |
+
+Both modes require the `claude` executable to launch Claude. The distinction is
+that CLI mode launches a fresh `claude -p` process for each Claude turn, while
+skill mode performs host turns in the already-running Claude Code session.
+Replacing or updating the executable on disk therefore affects a later CLI turn
+but not the host turns already running in the current skill session.
 
 ## Architecture
 
