@@ -164,7 +164,9 @@ as unavailable.
 The same automatic recovery pipeline covers external-coder `plan_revision`
 responses and `run-pr-fix` `coder_followup` responses. Plan revisions may also
 recover one unique, independently valid signed-human-requirements
-acknowledgement from the external agent's captured response evidence. Use
+acknowledgement from the external agent's captured response evidence.
+`skill_runner` requests that sidecar from `run_external` with
+`--response-evidence-output PATH`, alongside `--usage-output PATH`. Use
 `--gemini-cmd PATH` to configure both Gemini agent invocations and the final
 repair pass. The original response is saved before recovery; `retry-validate`
 repair directories and PR-fix debug directories remain the final fallback for

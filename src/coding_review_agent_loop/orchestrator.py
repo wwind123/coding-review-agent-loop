@@ -1907,7 +1907,6 @@ def _run_plan_first_loop(
             _collect_prior_compact_summaries(
                 prior_unresolved_items,
                 unresolved_items,
-                (),
                 prior_dispositions,
             )
         )
@@ -2920,7 +2919,6 @@ def run_pr_loop(
                     _collect_prior_compact_summaries(
                         prior_unresolved_items,
                         unresolved_items,
-                        future_from_prior_items,
                         prior_dispositions,
                     )
                 )

@@ -101,6 +101,7 @@ from coding_review_agent_loop.orchestrator import (
     ValidatedAgentResponse,
     _apply_unresolved_item_dispositions,
     _attach_round_metadata,
+    _collect_prior_compact_summaries,
     _decode_round_metadata,
     _encode_round_metadata,
     _format_unresolved_item_label,
@@ -6140,6 +6141,41 @@ def test_apply_unresolved_item_dispositions_appends_disposition_notes_to_text():
         "Update from Anthropic Claude: include API error path too"
     )
     assert updated_items[0].notes == ("Anthropic Claude: include API error path too",)
+
+
+@pytest.mark.parametrize(
+    ("disposition", "expected_label"),
+    [("future", "future follow-up"), ("resolved", "resolved")],
+)
+def test_collect_prior_compact_summaries_infers_departed_item_label(
+    disposition, expected_label
+):
+    prior_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="OpenAI Codex",
+        source_round=1,
+        text="Preserve the original item detail.",
+        status="blocking",
+    )
+    dispositions_by_item = {
+        "item-1": [
+            ReviewItemDisposition(
+                item_id="item-1",
+                reviewer="Anthropic Claude",
+                disposition=disposition,
+                note="Reconciled in the current round.",
+            )
+        ]
+    }
+
+    summaries = _collect_prior_compact_summaries(
+        (prior_item,),
+        (),
+        dispositions_by_item,
+    )
+
+    assert summaries[0].startswith(f"[item-1] {expected_label}:")
+    assert "Anthropic Claude: " + disposition in summaries[0]
 
 
 @pytest.mark.parametrize("terminator", ["<!-- AGENT_STATE: approved -->", "-- OpenAI Codex"])

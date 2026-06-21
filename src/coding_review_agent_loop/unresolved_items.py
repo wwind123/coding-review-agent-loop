@@ -347,12 +347,10 @@ def _apply_unresolved_item_dispositions(
 def _collect_prior_compact_summaries(
     prior_items: Sequence[UnresolvedReviewItem],
     remaining_items: Sequence[UnresolvedReviewItem],
-    future_from_prior: Sequence[UnresolvedReviewItem],
     dispositions_by_item: dict[str, list[ReviewItemDisposition]],
 ) -> tuple[str, ...]:
     """Render append-only summaries for prior items that just left the active ledger."""
     remaining_ids = {item.item_id for item in remaining_items}
-    future_ids = {item.item_id for item in future_from_prior}
     summaries: list[str] = []
     for item in sorted(prior_items, key=lambda prior: prior.item_id):
         if item.item_id in remaining_ids:
@@ -360,7 +358,12 @@ def _collect_prior_compact_summaries(
         dispositions = dispositions_by_item.get(item.item_id, [])
         if not dispositions:
             continue
-        label = "future follow-up" if item.item_id in future_ids else "resolved"
+        outcomes = {disposition.disposition for disposition in dispositions}
+        label = (
+            "future follow-up"
+            if "future" in outcomes and not {"blocking", "same-pr", "same-plan"} & outcomes
+            else "resolved"
+        )
         lines = [
             f"[{item.item_id}] {label}: {item.reviewer} {item.source_status or item.status} item from round {item.source_round}",
             "Original item text:",

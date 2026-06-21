@@ -390,8 +390,10 @@ safe deterministic normalization, envelope normalization, known-ledger
 disposition cleanup, context-specific acknowledgement reconstruction, then a
 Gemini format-repair pass. Pass `--gemini-cmd PATH` to the round/fix command to
 select the Gemini executable used both for Gemini agent turns and repair. The
-agent's original output is saved before recovery. If every recovery stage fails,
-fix the preserved repair-dir `raw.md` with
+skill runner requests the recovery evidence sidecar from `run_external` with
+`--response-evidence-output PATH`, alongside the existing `--usage-output PATH`
+sidecar. The agent's original output is saved before recovery. If every recovery
+stage fails, fix the preserved repair-dir `raw.md` with
 `retry-validate --repair-dir <dir>` (or inspect the PR-fix debug directory), then
 re-run the parent command.
 
