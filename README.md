@@ -532,3 +532,34 @@ python -m pytest
 ```
 
 Tests use fake subprocess runners. They do not call real `claude`, `codex`, `gemini`, or `gh`.
+
+### Test file layout
+
+The test suite is split across focused modules for faster, targeted runs:
+
+| File | Contents |
+|------|----------|
+| `tests/test_agent_loop.py` | Main orchestration tests (PR loop, plan loop, issue loop, prompts, config) |
+| `tests/test_backends.py` | Claude, Gemini, and Codex backend output parsing and normalization |
+| `tests/test_protocol.py` | Protocol parsing and validation (parse_review, parse_plan_review, structured payloads) |
+| `tests/test_comment_rendering.py` | Comment rendering (render_canonical_plan_steps, render_public_agent_comment, etc.) |
+| `tests/test_skill_helpers.py` | Skill helper function tests |
+| `tests/test_skill_loop.py` | Skill loop integration tests |
+| `tests/test_transient.py` | Transient error detection tests |
+| `tests/agent_loop_helpers.py` | Shared helpers: FakeRunner, builder functions, utilities (not a test file) |
+
+Run a focused subsystem:
+
+```bash
+# Backend parsing only
+python -m pytest tests/test_backends.py
+
+# Protocol parsing only
+python -m pytest tests/test_protocol.py
+
+# Comment rendering only
+python -m pytest tests/test_comment_rendering.py
+
+# Full suite
+python -m pytest tests/
+```
