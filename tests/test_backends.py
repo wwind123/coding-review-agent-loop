@@ -541,32 +541,6 @@ def test_codex_backend_dry_run_sets_message_text_without_response_file(tmp_path)
     assert result.text == "dry run stdout"
 
 
-def _write_codex_rollout(
-    codex_home: Path,
-    thread_id: str,
-    records: list[object],
-    *,
-    name_prefix: str = "rollout-2026-06-18T12-00-00",
-) -> Path:
-    rollout_path = (
-        codex_home
-        / "sessions"
-        / "2026"
-        / "06"
-        / "18"
-        / f"{name_prefix}-{thread_id}.jsonl"
-    )
-    rollout_path.parent.mkdir(parents=True, exist_ok=True)
-    rollout_path.write_text(
-        "\n".join(
-            record if isinstance(record, str) else json.dumps(record)
-            for record in records
-        ),
-        encoding="utf-8",
-    )
-    return rollout_path
-
-
 @pytest.mark.parametrize(
     ("record", "expected"),
     [
