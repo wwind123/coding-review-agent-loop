@@ -1,31 +1,4 @@
-import pytest
-
 from agent_loop_helpers import *  # noqa: F403
-
-
-@pytest.fixture(autouse=True)
-def _no_real_repair():
-    """Prevent orchestrator repair from invoking a real agent in this module."""
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def _agent_commands_available(monkeypatch):
-    """Keep config tests independent of agent CLIs installed on the test host."""
-    import coding_review_agent_loop.config as config_module
-
-    real_which = config_module.shutil.which
-
-    def which(command):
-        resolved = real_which(command)
-        if resolved is not None:
-            return resolved
-        if command in {"claude", "codex", "gemini", "agy"}:
-            return f"/mock/bin/{command}"
-        return None
-
-    monkeypatch.setattr(config_module.shutil, "which", which)
 
 
 def test_codex_usage_summary_records_exact_tokens_from_jsonl_and_public_response(tmp_path):

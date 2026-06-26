@@ -2,7 +2,6 @@ import pytest
 
 from agent_loop_helpers import *  # noqa: F403
 
-
 _EXPECTED_UNRESOLVED_ITEMS_GUIDANCE = """Prior unresolved items are present. Disposition every listed
 item in the JSON `prior_item_dispositions` array — do not add a separate prose section
 or bullet list for prior items outside the JSON object. Valid `disposition` values:
@@ -94,31 +93,6 @@ current round as blocking work, not in a future issue.
 The legacy heading `### Non-blocking follow-ups` is still accepted as future
 follow-ups for compatibility, but prefer `### Future follow-ups`.
 """
-
-@pytest.fixture(autouse=True)
-def _no_real_repair():
-    """Prevent orchestrator repair from invoking a real agent in this module."""
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def _agent_commands_available(monkeypatch):
-    """Keep config tests independent of agent CLIs installed on the test host."""
-    import coding_review_agent_loop.config as config_module
-
-    real_which = config_module.shutil.which
-
-    def which(command):
-        resolved = real_which(command)
-        if resolved is not None:
-            return resolved
-        if command in {"claude", "codex", "gemini", "agy"}:
-            return f"/mock/bin/{command}"
-        return None
-
-    monkeypatch.setattr(config_module.shutil, "which", which)
-
 
 def test_coder_prompts_include_assigned_workdir_rule(tmp_path):
     config = make_config(tmp_path, coder="codex")
