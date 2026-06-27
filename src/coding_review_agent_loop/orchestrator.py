@@ -3030,8 +3030,7 @@ def run_pr_loop(
                 prior_item_ids = {item.item_id for item in prior_unresolved_items}
                 disputed_still_blocking = [
                     item for item in must_fix_items
-                    if item.status == "blocking"
-                    and item.item_id in prior_item_ids
+                    if item.item_id in prior_item_ids
                     and _is_disputed_item(item)
                 ]
                 if disputed_still_blocking:
@@ -3040,10 +3039,9 @@ def run_pr_loop(
                         for item in disputed_still_blocking
                     )
                     raise AgentLoopError(
-                        f"Reviewer maintained blocking status for "
-                        f"{len(disputed_still_blocking)} disputed item(s) after seeing "
-                        "coder counter-evidence. Human review required to resolve the "
-                        f"disagreement.\n\nDisputed items still blocking:\n{item_summaries}"
+                        f"Reviewer did not resolve {len(disputed_still_blocking)} disputed item(s) "
+                        "after seeing coder counter-evidence. Human review required to resolve the "
+                        f"disagreement.\n\nDisputed items still unresolved:\n{item_summaries}"
                     )
 
             if not must_fix_items:

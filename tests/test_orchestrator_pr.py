@@ -3480,7 +3480,47 @@ def test_pr_loop_escalates_to_human_when_reviewer_rejects_dispute(tmp_path):
 
     with pytest.raises(
         AgentLoopError,
-        match="Reviewer maintained blocking status for 1 disputed item",
+        match="Reviewer did not resolve 1 disputed item",
+    ):
+        run_pr_loop(runner, pr_number=55, config=config)
+
+
+def test_pr_loop_escalates_when_reviewer_downgrades_disputed_item_to_same_pr(tmp_path):
+    """Coder disputes a blocking item; reviewer downgrades to same-pr instead of resolving → escalate."""
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(
+                addressed_items=[],
+                remaining_items=[],
+                disputed_items=["item-1"],
+                dispute_evidence={"item-1": "Official docs confirm $1.50/1M tokens is correct."},
+                summary="Disputing item-1: reviewer pricing claim is factually incorrect.",
+            ),
+        ],
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Pricing constant is wrong.",
+                blocking_items=["The gemini-3.5-flash pricing constant is wrong ($0.30 not $1.50)."],
+                prior_item_dispositions=[],
+                reviewer="OpenAI Codex",
+            ),
+            structured_pr_review(
+                state="blocking",
+                summary="Ok I'll accept the coder's pricing evidence but still want a same-pr fix.",
+                same_pr_followups=["Please add a comment citing the pricing source."],
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "same-pr", "note": "Downgraded from blocking but still needs attention."},
+                ],
+                reviewer="OpenAI Codex",
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
+
+    with pytest.raises(
+        AgentLoopError,
+        match="Reviewer did not resolve 1 disputed item",
     ):
         run_pr_loop(runner, pr_number=55, config=config)
 
