@@ -64,7 +64,8 @@ Currently supported local agent CLIs:
 
 - Claude Code via `claude`
 - OpenAI Codex CLI via `codex`
-- Gemini CLI via `gemini`
+- Gemini CLI via `gemini` (best-effort support for users whose organization or
+  API-key setup still has Gemini CLI access)
 - Antigravity CLI via `agy` (first-class backend; also the Gemini CLI migration path — see below)
 
 The `agy` backend is supported in every role the other external agents support — `--coder antigravity` and `--reviewer antigravity` — and in skill mode (`--coder antigravity` / `--reviewers antigravity`). `agy` is also accepted as an alias for `antigravity` in these flags (e.g. `--coder agy`, `--reviewer agy`, skill `--reviewers agy`, `run_external --agent agy`); it is normalized to the canonical `antigravity` internally.
@@ -72,9 +73,11 @@ The `agy` backend is supported in every role the other external agents support �
 ### Gemini CLI → Antigravity migration
 
 Google is retiring **Gemini CLI consumer access** (free / Google AI Pro / Ultra)
-on **June 18, 2026**; personal-account `gemini` usage stops working after that
-(enterprise / API-key Gemini CLI paths remain supported). Use the Antigravity CLI
-(`agy`) instead — it runs the same Google account plans with its own quota model:
+on **June 18, 2026**; personal-account `gemini` usage stops working after that.
+Enterprise and API-key Gemini CLI paths may remain available for organizations
+that still have access, so this project keeps the `gemini` backend for those
+users. Individual users should use the Antigravity CLI (`agy`) instead — it runs
+the same Google account plans with its own quota model:
 
 ```bash
 # install agy, authenticate, then select it as a coder or reviewer:
@@ -87,6 +90,14 @@ default `Gemini 3.1 Pro (High)`). When a `gemini` invocation fails with an
 auth/quota error near or after the cutoff, the tool surfaces this migration
 guidance. Notes: Antigravity turns are single-shot (no cross-round session
 resume) and report estimated token usage (`agy` emits no token counts).
+
+Direct Gemini CLI support is best-effort because maintainers without enterprise
+Gemini CLI access cannot reproduce live `gemini` failures locally. If you report
+a Gemini CLI-specific bug, include the exact command, the raw
+`.agent-loop-logs/*gemini.log` file, the response-file contents, the Gemini CLI
+version, and any sharable account/access context. Bugs that can be reduced to a
+log/response fixture can still be regression-tested without live Gemini CLI
+access.
 
 **Billing / quota note:**
 - `agy` usage counts against a **separate Antigravity-specific quota**, not the same token pool as the Gemini app/chat in your subscription. The two meters are tracked independently and can diverge.

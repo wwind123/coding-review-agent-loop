@@ -13,7 +13,7 @@ The default flow is:
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
-Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick the model via `--antigravity-model`, default `Gemini 3.1 Pro (High)`). Enterprise / API-key Gemini CLI paths remain supported. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
+Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick the model via `--antigravity-model`, default `Gemini 3.1 Pro (High)`). Enterprise / API-key Gemini CLI paths may remain available for organizations that still have access, so the `gemini` backend is retained for those users. Direct Gemini CLI support is best-effort: maintainers without enterprise Gemini CLI access need reporter-provided `.agent-loop-logs/*gemini.log` output, response-file contents, CLI version, and any sharable account/access context to debug live `gemini` failures. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
 
 ## Architecture
 
@@ -160,14 +160,14 @@ Currently supported local agent CLIs:
 
 - Claude Code via `claude`
 - OpenAI Codex CLI via `codex`
-- Gemini CLI via `gemini`
+- Gemini CLI via `gemini` (best-effort support for users whose organization or API-key setup still has access)
 
 ## Prerequisites
 
 - `gh` is installed and authenticated for the target GitHub repository.
 - `claude` is installed and authenticated if either side uses Claude.
 - `codex` is installed and authenticated if either side uses Codex.
-- `gemini` is installed and authenticated if either side uses Gemini.
+- `gemini` is installed and authenticated if either side uses Gemini. For individual Google accounts after the consumer cutoff, prefer `agy`; direct Gemini CLI support is best-effort for enterprise/API-key users who can provide logs when issues are not locally reproducible.
 - Use separate clones or worktrees for each active agent to avoid local file conflicts. If you omit `--claude-dir`, `--codex-dir`, or `--gemini-dir` for an active agent, the tool uses a repo-scoped temporary checkout under `/tmp/coding-review-agent-loop/OWNER-REPO/{agent}/repo`.
 
 ## Usage
