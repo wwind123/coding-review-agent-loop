@@ -165,6 +165,18 @@ def main() -> None:
              "When provided, workdir is validated and re-cloned automatically.",
     )
     parser.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        help="PR number. When provided with --flow pr, syncs the workdir to the PR head "
+             "instead of leaving it on the base branch after cleaning.",
+    )
+    parser.add_argument(
+        "--pr-head-sha",
+        default=None,
+        help="Expected PR head SHA for verification (optional). Used with --pr.",
+    )
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=2,
@@ -247,7 +259,9 @@ def main() -> None:
         AgentLoopConfig,
         AgentName,
         ensure_temp_checkout,
+        sync_checkout_to_pr,
     )
+    from coding_review_agent_loop.github import PullRequestMetadata
     from coding_review_agent_loop.transient import is_transient_agent_output
     from coding_review_agent_loop.usage import estimate_usage
 
@@ -317,6 +331,26 @@ def main() -> None:
     # deterministically and re-cloning per attempt would be wasteful.
     if args.repo:
         ensure_temp_checkout(workdir, agent=agent_name, config=config, runner=runner)
+        if args.flow == "pr" and args.pr is not None:
+            # After ensure_temp_checkout leaves the workdir on the base branch,
+            # sync to the PR head so the reviewer sees the PR branch, not main.
+            sync_checkout_to_pr(
+                config,
+                runner,
+                path=workdir,
+                label=f"Default {agent_name} workdir",
+                default_owned=True,
+                pr_number=args.pr,
+                pr_metadata=PullRequestMetadata(
+                    number=args.pr,
+                    repo=args.repo,
+                    title=None,
+                    head_branch=None,
+                    base_branch=None,
+                    head_sha=args.pr_head_sha,
+                    url=None,
+                ),
+            )
     if agent_name == "codex":
         backend = CodexBackend()
     elif agent_name == "antigravity":

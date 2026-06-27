@@ -1407,6 +1407,116 @@ class TestRunExternalRetries:
 
 
 # ---------------------------------------------------------------------------
+# helpers/run_external.py  PR workdir sync (#449)
+# ---------------------------------------------------------------------------
+
+class TestRunExternalPRWorkdirSync:
+    """run_external syncs workdir to the PR head (not base) when --flow pr --pr N is given."""
+
+    def _invoke_pr(self, monkeypatch, tmp_path, *, pr=42, head_sha="abc123", repo="owner/repo"):
+        """Call run_external.main() in PR flow with mocked checkout functions and a trivial backend."""
+        import helpers.run_external as rex
+        import coding_review_agent_loop.config as cfg_mod
+        from coding_review_agent_loop.agents.base import AgentResult
+
+        ensure_calls: list[dict] = []
+        sync_calls: list[dict] = []
+
+        def fake_ensure_temp_checkout(path, *, agent, config, runner):
+            ensure_calls.append({"path": path, "agent": agent})
+
+        def fake_sync_checkout_to_pr(config, runner, *, path, label, default_owned, pr_number, pr_metadata):
+            sync_calls.append({
+                "path": path,
+                "pr_number": pr_number,
+                "head_sha": pr_metadata.head_sha,
+                "default_owned": default_owned,
+            })
+
+        monkeypatch.setattr(cfg_mod, "ensure_temp_checkout", fake_ensure_temp_checkout)
+        monkeypatch.setattr(cfg_mod, "sync_checkout_to_pr", fake_sync_checkout_to_pr)
+
+        class FakeBackend:
+            def run(self, runner, config, prompt):
+                return AgentResult(text="review body", returncode=0)
+
+        monkeypatch.setattr("coding_review_agent_loop.agents.codex.CodexBackend", FakeBackend)
+
+        prompt = tmp_path / "prompt.md"
+        output = tmp_path / "output.md"
+        prompt.write_text("Review this PR.", encoding="utf-8")
+
+        argv = [
+            "run_external", "--agent", "codex",
+            "--prompt-file", str(prompt),
+            "--output", str(output),
+            "--workdir", str(tmp_path),
+            "--flow", "pr",
+            "--repo", repo,
+            "--pr", str(pr),
+        ]
+        if head_sha:
+            argv += ["--pr-head-sha", head_sha]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        rex.main()
+
+        return ensure_calls, sync_calls, output
+
+    def test_pr_flow_calls_sync_checkout_to_pr(self, monkeypatch, tmp_path) -> None:
+        """sync_checkout_to_pr is called after ensure_temp_checkout for PR flow."""
+        ensure_calls, sync_calls, output = self._invoke_pr(monkeypatch, tmp_path)
+
+        assert len(ensure_calls) == 1, "ensure_temp_checkout must be called once"
+        assert len(sync_calls) == 1, "sync_checkout_to_pr must be called once to reach the PR branch"
+
+    def test_pr_flow_passes_pr_number(self, monkeypatch, tmp_path) -> None:
+        _ensure, sync_calls, _ = self._invoke_pr(monkeypatch, tmp_path, pr=99)
+        assert sync_calls[0]["pr_number"] == 99
+
+    def test_pr_flow_passes_head_sha(self, monkeypatch, tmp_path) -> None:
+        _ensure, sync_calls, _ = self._invoke_pr(monkeypatch, tmp_path, head_sha="deadbeef")
+        assert sync_calls[0]["head_sha"] == "deadbeef"
+
+    def test_pr_flow_no_head_sha_still_syncs(self, monkeypatch, tmp_path) -> None:
+        """--pr-head-sha is optional; sync still runs when omitted."""
+        _ensure, sync_calls, _ = self._invoke_pr(monkeypatch, tmp_path, head_sha=None)
+        assert len(sync_calls) == 1
+        assert sync_calls[0]["head_sha"] is None
+
+    def test_plan_flow_does_not_call_sync_checkout_to_pr(self, monkeypatch, tmp_path) -> None:
+        """For plan flow (not PR), sync_checkout_to_pr must not be called."""
+        import helpers.run_external as rex
+        import coding_review_agent_loop.config as cfg_mod
+        from coding_review_agent_loop.agents.base import AgentResult
+
+        sync_calls: list = []
+        monkeypatch.setattr(cfg_mod, "ensure_temp_checkout", lambda *a, **k: None)
+        monkeypatch.setattr(cfg_mod, "sync_checkout_to_pr", lambda *a, **k: sync_calls.append(True))
+
+        class FakeBackend:
+            def run(self, runner, config, prompt):
+                return AgentResult(text="ok", returncode=0)
+
+        monkeypatch.setattr("coding_review_agent_loop.agents.codex.CodexBackend", FakeBackend)
+
+        prompt = tmp_path / "prompt.md"
+        output = tmp_path / "output.md"
+        prompt.write_text("Review this plan.", encoding="utf-8")
+
+        monkeypatch.setattr(sys, "argv", [
+            "run_external", "--agent", "codex",
+            "--prompt-file", str(prompt),
+            "--output", str(output),
+            "--workdir", str(tmp_path),
+            "--flow", "plan",
+            "--repo", "owner/repo",
+        ])
+        rex.main()
+        assert sync_calls == [], "sync_checkout_to_pr must not be called for plan flow"
+
+
+# ---------------------------------------------------------------------------
 # helpers/prompt_builders.py  checkout path embedding (#297)
 # ---------------------------------------------------------------------------
 

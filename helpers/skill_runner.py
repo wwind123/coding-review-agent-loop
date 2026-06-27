@@ -1326,6 +1326,8 @@ def _run_reviewer(
         "--flow", flow,
         "--usage-output", str(usage_file),
         "--response-evidence-output", str(evidence_file),
+        *(["--pr", str(issue), "--pr-head-sha", round_subject] if flow == "pr" and round_subject else
+          ["--pr", str(issue)] if flow == "pr" else []),
         *(["--cmd", gemini_cmd] if agent == "gemini" else []),
         *external_args,
         *(["--dry-run"] if dry_run else []),
