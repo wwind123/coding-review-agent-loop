@@ -432,12 +432,25 @@ def _render_public_coder_followup_comment(
     if not remaining_items:
         remaining_items = ["- None."]
 
+    disputed_items: list[str] = []
+    for item_id in parsed_followup.disputed_items:
+        disputed_items.extend(
+            render_item(
+                item_id,
+                note_label="Counter-evidence",
+                note=parsed_followup.dispute_evidence.get(item_id),
+                placeholder="No evidence provided by coder.",
+            )
+        )
+
     sections = [
         "## Coder follow-up",
         parsed_followup.summary.strip(),
         "\n".join(["### Addressed items", *addressed_items]),
         "\n".join(["### Remaining items", *remaining_items]),
     ]
+    if disputed_items:
+        sections.append("\n".join(["### Disputed items", *disputed_items]))
     if parsed_followup.tests_run:
         sections.append(
             "\n".join(["### Tests run", *[f"- {test}" for test in parsed_followup.tests_run]])

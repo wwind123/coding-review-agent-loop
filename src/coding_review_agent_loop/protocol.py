@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+import dataclasses
+from dataclasses import dataclass, field
 
 from .errors import AgentLoopError
 
@@ -193,6 +194,8 @@ class StructuredCoderFollowup:
     addressed_item_notes: dict[str, str]
     remaining_item_notes: dict[str, str]
     tests_run: tuple[str, ...] | None = None
+    disputed_items: tuple[str, ...] = ()
+    dispute_evidence: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1151,7 +1154,13 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
             "remaining_items",
             "human_requirements",
         },
-        optional={"addressed_item_notes", "remaining_item_notes", "tests_run"},
+        optional={
+            "addressed_item_notes",
+            "remaining_item_notes",
+            "tests_run",
+            "disputed_items",
+            "dispute_evidence",
+        },
     )
     human_requirements_payload = _expect_object(
         payload["human_requirements"],
@@ -1180,6 +1189,10 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
         payload["remaining_items"],
         context="coder_followup.remaining_items",
     )
+    disputed_items = _expect_item_id_list(
+        payload.get("disputed_items", []),
+        context="coder_followup.disputed_items",
+    )
     addressed_item_notes = _expect_item_note_map(
         payload.get("addressed_item_notes", {}),
         context="coder_followup.addressed_item_notes",
@@ -1192,6 +1205,19 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
         allowed_item_ids=set(remaining_items),
         allowed_context="coder_followup.remaining_items",
     )
+    dispute_evidence = _expect_item_note_map(
+        payload.get("dispute_evidence", {}),
+        context="coder_followup.dispute_evidence",
+        allowed_item_ids=set(disputed_items),
+        allowed_context="coder_followup.disputed_items",
+    )
+    all_classified = [*addressed_items, *remaining_items, *disputed_items]
+    duplicates = sorted({item_id for item_id in all_classified if all_classified.count(item_id) > 1})
+    if duplicates:
+        raise AgentLoopError(
+            "Coder follow-up listed unresolved reviewer item IDs more than once: "
+            + ", ".join(duplicates)
+        )
     return StructuredCoderFollowup(
         schema_version=1,
         kind="coder_followup",
@@ -1212,6 +1238,8 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
         addressed_item_notes=addressed_item_notes,
         remaining_item_notes=remaining_item_notes,
         tests_run=tests_run,
+        disputed_items=disputed_items,
+        dispute_evidence=dispute_evidence,
     )
 
 

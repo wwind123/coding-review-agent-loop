@@ -853,28 +853,31 @@ def structured_coder_followup(
     human_requirement_ids: list[str] | None = None,
     checked_discussion_directly: bool = False,
     tests_run: list[str] | None = None,
+    disputed_items: list[str] | None = None,
+    dispute_evidence: dict[str, str] | None = None,
     reviewer: str = "Anthropic Claude",
 ) -> str:
-    return (
-        json.dumps(
-            {
-                "schema_version": 1,
-                "kind": "coder_followup",
-                "state": state,
-                "summary": summary,
-                "addressed_items": addressed_items or [],
-                "remaining_items": remaining_items or [],
-                "addressed_item_notes": addressed_item_notes or {},
-                "remaining_item_notes": remaining_item_notes or {},
-                "human_requirements": {
-                    "addressed_ids": human_requirement_ids or [],
-                    "checked_discussion_directly": checked_discussion_directly,
-                },
-                **({"tests_run": tests_run} if tests_run is not None else {}),
-            }
-        )
-        + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
-    )
+    payload: dict = {
+        "schema_version": 1,
+        "kind": "coder_followup",
+        "state": state,
+        "summary": summary,
+        "addressed_items": addressed_items or [],
+        "remaining_items": remaining_items or [],
+        "addressed_item_notes": addressed_item_notes or {},
+        "remaining_item_notes": remaining_item_notes or {},
+        "human_requirements": {
+            "addressed_ids": human_requirement_ids or [],
+            "checked_discussion_directly": checked_discussion_directly,
+        },
+    }
+    if tests_run is not None:
+        payload["tests_run"] = tests_run
+    if disputed_items is not None:
+        payload["disputed_items"] = disputed_items
+    if dispute_evidence is not None:
+        payload["dispute_evidence"] = dispute_evidence
+    return json.dumps(payload) + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
 
 
 def make_config(tmp_path, *, create_dirs=True, **overrides):

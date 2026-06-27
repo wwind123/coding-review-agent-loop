@@ -2126,6 +2126,112 @@ def test_validate_structured_coder_followup_rejects_trailing_prose_after_footer(
         validate_structured_coder_followup(payload)
 
 
+def test_validate_structured_coder_followup_accepts_disputed_items_with_evidence():
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "coder_followup",
+                "state": "blocking",
+                "summary": "Fixed item-1; disputing item-2 with evidence.",
+                "addressed_items": ["item-1"],
+                "remaining_items": [],
+                "disputed_items": ["item-2"],
+                "dispute_evidence": {"item-2": "Checked the official docs: $1.50/1M is correct."},
+                "human_requirements": {
+                    "addressed_ids": [],
+                    "checked_discussion_directly": False,
+                },
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+    parsed = validate_structured_coder_followup(payload)
+
+    assert parsed is not None
+    assert parsed.addressed_items == ("item-1",)
+    assert parsed.remaining_items == ()
+    assert parsed.disputed_items == ("item-2",)
+    assert parsed.dispute_evidence == {"item-2": "Checked the official docs: $1.50/1M is correct."}
+
+
+def test_validate_structured_coder_followup_accepts_empty_disputed_items():
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "coder_followup",
+                "state": "blocking",
+                "summary": "No disputes.",
+                "addressed_items": ["item-1"],
+                "remaining_items": [],
+                "disputed_items": [],
+                "human_requirements": {
+                    "addressed_ids": [],
+                    "checked_discussion_directly": False,
+                },
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+    parsed = validate_structured_coder_followup(payload)
+
+    assert parsed is not None
+    assert parsed.disputed_items == ()
+    assert parsed.dispute_evidence == {}
+
+
+def test_validate_structured_coder_followup_rejects_disputed_item_also_in_addressed():
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "coder_followup",
+                "state": "blocking",
+                "summary": "Duplicate classification.",
+                "addressed_items": ["item-1"],
+                "remaining_items": [],
+                "disputed_items": ["item-1"],
+                "human_requirements": {
+                    "addressed_ids": [],
+                    "checked_discussion_directly": False,
+                },
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+    with pytest.raises(AgentLoopError, match="listed unresolved reviewer item IDs more than once"):
+        validate_structured_coder_followup(payload)
+
+
+def test_validate_structured_coder_followup_rejects_evidence_for_non_disputed_item():
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "coder_followup",
+                "state": "blocking",
+                "summary": "Evidence for wrong item.",
+                "addressed_items": ["item-1"],
+                "remaining_items": [],
+                "disputed_items": [],
+                "dispute_evidence": {"item-1": "Evidence for an addressed item, not disputed."},
+                "human_requirements": {
+                    "addressed_ids": [],
+                    "checked_discussion_directly": False,
+                },
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+    with pytest.raises(AgentLoopError, match="item-1.*not listed in coder_followup.disputed_items"):
+        validate_structured_coder_followup(payload)
+
+
 @pytest.mark.parametrize(
     ("addressed_ids", "checked_discussion_directly", "surfaced_ids", "requires_direct_discussion_ack", "message"),
     [

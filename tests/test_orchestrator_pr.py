@@ -3402,3 +3402,141 @@ def test_pr_initial_coder_post_includes_model(tmp_path):
     stripped = _strip_round_metadata(pr_initial_body)
     assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
 
+
+def test_pr_loop_dispute_resolved_when_reviewer_reconsiders(tmp_path):
+    """Coder disputes a blocking item; reviewer sees evidence and approves."""
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(
+                addressed_items=[],
+                remaining_items=[],
+                disputed_items=["item-1"],
+                dispute_evidence={"item-1": "Official docs confirm $1.50/1M tokens is correct."},
+                summary="Disputing item-1: reviewer pricing claim is factually incorrect.",
+            ),
+        ],
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Pricing constant is wrong.",
+                blocking_items=["The gemini-3.5-flash pricing constant is wrong ($0.30 not $1.50)."],
+                prior_item_dispositions=[],
+                reviewer="OpenAI Codex",
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Coder provided valid pricing evidence; approved.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved", "note": "Coder provided valid pricing evidence."},
+                ],
+                reviewer="OpenAI Codex",
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
+
+    assert run_pr_loop(runner, pr_number=55, config=config) == 0
+
+    followup_comments = [c for c in runner.comments if "## Coder follow-up" in c]
+    assert len(followup_comments) == 1
+    followup_body = _strip_round_metadata(followup_comments[0])
+    assert "### Disputed items" in followup_body
+    assert "item-1" in followup_body
+    assert "Official docs confirm $1.50/1M tokens is correct." in followup_body
+
+
+def test_pr_loop_escalates_to_human_when_reviewer_rejects_dispute(tmp_path):
+    """Coder disputes a blocking item; reviewer still blocks after seeing evidence → escalate."""
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(
+                addressed_items=[],
+                remaining_items=[],
+                disputed_items=["item-1"],
+                dispute_evidence={"item-1": "Official docs confirm $1.50/1M tokens is correct."},
+                summary="Disputing item-1: reviewer pricing claim is factually incorrect.",
+            ),
+        ],
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Pricing constant is wrong.",
+                blocking_items=["The gemini-3.5-flash pricing constant is wrong ($0.30 not $1.50)."],
+                prior_item_dispositions=[],
+                reviewer="OpenAI Codex",
+            ),
+            structured_pr_review(
+                state="blocking",
+                summary="Pricing still incorrect despite coder evidence.",
+                blocking_items=["Pricing is still incorrect."],
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "I checked and the pricing is still wrong."},
+                ],
+                reviewer="OpenAI Codex",
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
+
+    with pytest.raises(
+        AgentLoopError,
+        match="Reviewer maintained blocking status for 1 disputed item",
+    ):
+        run_pr_loop(runner, pr_number=55, config=config)
+
+
+def test_pr_loop_dispute_note_is_visible_to_reviewer_in_next_round(tmp_path):
+    """After coder disputes, the dispute evidence note appears in prior items for reviewer."""
+    from coding_review_agent_loop.unresolved_items import CODER_DISPUTE_NOTE_PREFIX
+
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(
+                addressed_items=[],
+                remaining_items=[],
+                disputed_items=["item-1"],
+                dispute_evidence={"item-1": "Evidence: price is $1.50 not $0.30."},
+                summary="Disputing item-1.",
+            ),
+        ],
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Price is wrong.",
+                blocking_items=["Price is wrong."],
+                prior_item_dispositions=[],
+                reviewer="OpenAI Codex",
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Approved after reviewing coder evidence.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved", "note": "Accepted coder evidence."},
+                ],
+                reviewer="OpenAI Codex",
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
+    run_pr_loop(runner, pr_number=55, config=config)
+
+    # The prior_items stored in the coder's PR comment should include dispute notes
+    # runner.pr_payload["comments"] retains the raw body with AGENT_LOOP_META intact
+    coder_followup_raw = next(
+        (c["body"] for c in runner.pr_payload["comments"] if "## Coder follow-up" in c["body"]),
+        None,
+    )
+    assert coder_followup_raw is not None, "Expected a coder follow-up comment in PR"
+    meta_match = re.search(
+        r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+        coder_followup_raw,
+    )
+    assert meta_match is not None, "Expected AGENT_LOOP_META in coder followup comment"
+    metadata = _decode_round_metadata(meta_match.group("payload"))
+    assert metadata is not None
+    disputed_item = next(
+        (item for item in metadata.prior_items if item.item_id == "item-1"), None
+    )
+    assert disputed_item is not None
+    assert any(CODER_DISPUTE_NOTE_PREFIX in note for note in disputed_item.notes)
+

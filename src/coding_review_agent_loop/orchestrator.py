@@ -189,12 +189,15 @@ from .round_state import (
 )
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
+    CODER_DISPUTE_NOTE_PREFIX,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+    _apply_dispute_evidence,
     _apply_unresolved_item_dispositions,
     _collect_prior_compact_summaries,
     _clear_human_requirements_ack_item,
     _format_same_pr_unresolved_items,
     _format_unresolved_items_for_coder,
+    _is_disputed_item,
     _maybe_fill_resolved_dispositions_from_prose,
     _next_unresolved_item,
     _normalize_disposition_section_prose,
@@ -3023,6 +3026,26 @@ def run_pr_loop(
             ]
             must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-pr"}]
 
+            if must_fix_items:
+                prior_item_ids = {item.item_id for item in prior_unresolved_items}
+                disputed_still_blocking = [
+                    item for item in must_fix_items
+                    if item.status == "blocking"
+                    and item.item_id in prior_item_ids
+                    and _is_disputed_item(item)
+                ]
+                if disputed_still_blocking:
+                    item_summaries = "\n".join(
+                        f"- [{item.item_id}] from {item.reviewer}: {item.text[:300]}"
+                        for item in disputed_still_blocking
+                    )
+                    raise AgentLoopError(
+                        f"Reviewer maintained blocking status for "
+                        f"{len(disputed_still_blocking)} disputed item(s) after seeing "
+                        "coder counter-evidence. Human review required to resolve the "
+                        f"disagreement.\n\nDisputed items still blocking:\n{item_summaries}"
+                    )
+
             if not must_fix_items:
                 if human_requirements:
                     missing_acknowledgements = [
@@ -3287,6 +3310,18 @@ def run_pr_loop(
                     assigned_workdir=active_workdir(config),
                 )
                 raw_structured_coder_response = coder_output
+                if coder_response.marker_value.disputed_items:
+                    unresolved_items = _apply_dispute_evidence(
+                        unresolved_items,
+                        disputed_items=coder_response.marker_value.disputed_items,
+                        dispute_evidence=coder_response.marker_value.dispute_evidence,
+                    )
+                    disputed_names = ", ".join(coder_response.marker_value.disputed_items)
+                    log(
+                        config,
+                        f"Round {round_number}: {coder_name} disputed item(s) {disputed_names} "
+                        "with counter-evidence; will surface to human if reviewer still blocks",
+                    )
                 public_comment = render_public_agent_comment(
                     kind="coder_followup",
                     parsed=coder_response.marker_value,

@@ -21,6 +21,7 @@ from .protocol import (
 )
 
 HUMAN_REQUIREMENTS_ACK_ITEM_ID = "item-human-requirements-acknowledgement"
+CODER_DISPUTE_NOTE_PREFIX = "Coder disputes this item"
 ALL_RESOLVED_PROSE_RE = re.compile(
     r"^all (?:prior items|listed items|carried-forward items) are resolved\.?$"
     r"|^all prior unresolved items have been resolved\.?$",
@@ -71,6 +72,45 @@ def _next_unresolved_item(
         source_status=status,
         notes=tuple(notes),
     )
+
+
+def _apply_dispute_evidence(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    *,
+    disputed_items: Sequence[str],
+    dispute_evidence: dict[str, str],
+) -> list[UnresolvedReviewItem]:
+    """Annotate disputed items with coder counter-evidence in their notes field."""
+    if not disputed_items:
+        return list(unresolved_items)
+    disputed_set = set(disputed_items)
+    result: list[UnresolvedReviewItem] = []
+    for item in unresolved_items:
+        if item.item_id not in disputed_set:
+            result.append(item)
+            continue
+        evidence = dispute_evidence.get(item.item_id, "")
+        note = f"{CODER_DISPUTE_NOTE_PREFIX}: {evidence}" if evidence else CODER_DISPUTE_NOTE_PREFIX
+        if note not in item.notes:
+            result.append(
+                UnresolvedReviewItem(
+                    item_id=item.item_id,
+                    reviewer=item.reviewer,
+                    source_round=item.source_round,
+                    text=item.text,
+                    status=item.status,
+                    source_status=item.source_status,
+                    notes=(*item.notes, note),
+                )
+            )
+        else:
+            result.append(item)
+    return result
+
+
+def _is_disputed_item(item: UnresolvedReviewItem) -> bool:
+    """Return True if this item has been disputed by the coder via counter-evidence."""
+    return any(note.startswith(CODER_DISPUTE_NOTE_PREFIX) for note in item.notes)
 
 
 def _same_round_prior_disposition_description(
@@ -227,7 +267,7 @@ def _validate_structured_coder_followup_items(
     expected_ids = [
         item.item_id for item in unresolved_items if item.item_id != HUMAN_REQUIREMENTS_ACK_ITEM_ID
     ]
-    listed_ids = [*parsed.addressed_items, *parsed.remaining_items]
+    listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
     duplicates = sorted({item_id for item_id in listed_ids if listed_ids.count(item_id) > 1})
     if duplicates:
         raise AgentLoopError(
@@ -243,7 +283,8 @@ def _validate_structured_coder_followup_items(
     missing = sorted(set(expected_ids) - set(listed_ids))
     if missing:
         raise AgentLoopError(
-            "Coder follow-up did not classify all unresolved reviewer items into addressed or remaining: "
+            "Coder follow-up did not classify all unresolved reviewer items into "
+            "addressed, remaining, or disputed: "
             + ", ".join(missing)
         )
 

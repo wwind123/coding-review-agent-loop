@@ -1,4 +1,10 @@
 from agent_loop_helpers import *  # noqa: F403
+from coding_review_agent_loop.protocol import StructuredCoderFollowup
+from coding_review_agent_loop.unresolved_items import (
+    CODER_DISPUTE_NOTE_PREFIX,
+    _apply_dispute_evidence,
+    _is_disputed_item,
+)
 
 
 def test_structured_plan_review_preserves_human_requirements_resolution_marker():
@@ -520,3 +526,180 @@ def test_validate_human_requirements_acknowledgement_accepts_full_truncation_fal
         surfaced_requirement_ids=(),
         requires_direct_discussion_ack=True,
     )
+
+
+def test_validate_coder_followup_response_accepts_disputed_items():
+    unresolved_items = (
+        UnresolvedReviewItem(
+            item_id="item-1",
+            reviewer="OpenAI Codex",
+            source_round=1,
+            text="The pricing constant is wrong.",
+            status="blocking",
+        ),
+        UnresolvedReviewItem(
+            item_id="item-2",
+            reviewer="OpenAI Codex",
+            source_round=1,
+            text="Add a regression test.",
+            status="blocking",
+        ),
+    )
+    response = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "coder_followup",
+                "state": "blocking",
+                "summary": "Disputed item-1 with evidence; fixed item-2.",
+                "addressed_items": ["item-2"],
+                "remaining_items": [],
+                "disputed_items": ["item-1"],
+                "dispute_evidence": {
+                    "item-1": "Checked Google pricing page: $1.50/1M tokens is correct per official docs."
+                },
+                "human_requirements": {
+                    "addressed_ids": [],
+                    "checked_discussion_directly": False,
+                },
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+    parsed = _validate_coder_followup_response(
+        response,
+        unresolved_items=unresolved_items,
+        human_requirements=(),
+    )
+
+    assert isinstance(parsed, StructuredCoderFollowup)
+    assert parsed.addressed_items == ("item-2",)
+    assert parsed.disputed_items == ("item-1",)
+    assert "item-1" in parsed.dispute_evidence
+
+
+def test_validate_coder_followup_response_rejects_missing_item_when_disputed_not_counted():
+    unresolved_items = (
+        UnresolvedReviewItem(
+            item_id="item-1",
+            reviewer="OpenAI Codex",
+            source_round=1,
+            text="Fix the bug.",
+            status="blocking",
+        ),
+        UnresolvedReviewItem(
+            item_id="item-2",
+            reviewer="OpenAI Codex",
+            source_round=1,
+            text="Rename the variable.",
+            status="blocking",
+        ),
+    )
+    response = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "coder_followup",
+                "state": "blocking",
+                "summary": "Only addressed one item.",
+                "addressed_items": ["item-1"],
+                "remaining_items": [],
+                "disputed_items": [],
+                "human_requirements": {
+                    "addressed_ids": [],
+                    "checked_discussion_directly": False,
+                },
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match="did not classify all unresolved reviewer items",
+    ):
+        _validate_coder_followup_response(
+            response,
+            unresolved_items=unresolved_items,
+            human_requirements=(),
+        )
+
+
+def test_apply_dispute_evidence_adds_note_to_disputed_item():
+    items = [
+        UnresolvedReviewItem(
+            item_id="item-1",
+            reviewer="Antigravity",
+            source_round=1,
+            text="Pricing constant is wrong.",
+            status="blocking",
+            notes=(),
+        ),
+        UnresolvedReviewItem(
+            item_id="item-2",
+            reviewer="Antigravity",
+            source_round=1,
+            text="Add a test.",
+            status="blocking",
+            notes=(),
+        ),
+    ]
+
+    result = _apply_dispute_evidence(
+        items,
+        disputed_items=["item-1"],
+        dispute_evidence={"item-1": "Official docs confirm $1.50/1M is correct."},
+    )
+
+    assert len(result) == 2
+    item1 = next(i for i in result if i.item_id == "item-1")
+    item2 = next(i for i in result if i.item_id == "item-2")
+    assert any(CODER_DISPUTE_NOTE_PREFIX in note for note in item1.notes)
+    assert "Official docs confirm $1.50/1M is correct." in item1.notes[0]
+    assert not item2.notes
+
+
+def test_apply_dispute_evidence_is_idempotent():
+    evidence = "Official docs confirm $1.50/1M is correct."
+    items = [
+        UnresolvedReviewItem(
+            item_id="item-1",
+            reviewer="Antigravity",
+            source_round=1,
+            text="Pricing constant is wrong.",
+            status="blocking",
+            notes=(f"{CODER_DISPUTE_NOTE_PREFIX}: {evidence}",),
+        ),
+    ]
+
+    result = _apply_dispute_evidence(
+        items,
+        disputed_items=["item-1"],
+        dispute_evidence={"item-1": evidence},
+    )
+
+    assert len(result) == 1
+    assert len(result[0].notes) == 1
+
+
+def test_is_disputed_item_detects_dispute_note():
+    disputed_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Antigravity",
+        source_round=1,
+        text="Pricing constant is wrong.",
+        status="blocking",
+        notes=(f"{CODER_DISPUTE_NOTE_PREFIX}: some evidence",),
+    )
+    non_disputed_item = UnresolvedReviewItem(
+        item_id="item-2",
+        reviewer="Antigravity",
+        source_round=1,
+        text="Add a test.",
+        status="blocking",
+        notes=("Antigravity: still blocking",),
+    )
+
+    assert _is_disputed_item(disputed_item)
+    assert not _is_disputed_item(non_disputed_item)
