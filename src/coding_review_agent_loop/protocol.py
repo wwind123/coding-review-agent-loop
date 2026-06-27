@@ -1211,6 +1211,12 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
         allowed_item_ids=set(disputed_items),
         allowed_context="coder_followup.disputed_items",
     )
+    missing_evidence = sorted(item_id for item_id in disputed_items if not dispute_evidence.get(item_id))
+    if missing_evidence:
+        raise AgentLoopError(
+            "Coder dispute must include non-empty evidence for each disputed item. "
+            "Missing evidence for: " + ", ".join(missing_evidence)
+        )
     all_classified = [*addressed_items, *remaining_items, *disputed_items]
     duplicates = sorted({item_id for item_id in all_classified if all_classified.count(item_id) > 1})
     if duplicates:

@@ -2194,6 +2194,7 @@ def test_validate_structured_coder_followup_rejects_disputed_item_also_in_addres
                 "addressed_items": ["item-1"],
                 "remaining_items": [],
                 "disputed_items": ["item-1"],
+                "dispute_evidence": {"item-1": "Evidence provided but item also in addressed."},
                 "human_requirements": {
                     "addressed_ids": [],
                     "checked_discussion_directly": False,
@@ -2229,6 +2230,31 @@ def test_validate_structured_coder_followup_rejects_evidence_for_non_disputed_it
     )
 
     with pytest.raises(AgentLoopError, match="item-1.*not listed in coder_followup.disputed_items"):
+        validate_structured_coder_followup(payload)
+
+
+def test_validate_structured_coder_followup_rejects_disputed_item_without_evidence():
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "coder_followup",
+                "state": "blocking",
+                "summary": "Disputing without evidence.",
+                "addressed_items": [],
+                "remaining_items": [],
+                "disputed_items": ["item-1"],
+                "dispute_evidence": {},
+                "human_requirements": {
+                    "addressed_ids": [],
+                    "checked_discussion_directly": False,
+                },
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+    with pytest.raises(AgentLoopError, match="Missing evidence for: item-1"):
         validate_structured_coder_followup(payload)
 
 
