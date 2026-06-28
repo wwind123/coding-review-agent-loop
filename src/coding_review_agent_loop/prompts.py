@@ -86,6 +86,21 @@ def _coder_test_reporting_guidance() -> str:
     )
 
 
+def _coder_documentation_guidance() -> str:
+    return (
+        "If your implementation adds or changes a user-facing subcommand, flag, "
+        "or mode, update README.md and any relevant docs/ files as part of this PR.\n"
+    )
+
+
+def _reviewer_documentation_check() -> str:
+    return (
+        "If this PR adds or changes a user-facing subcommand, flag, or mode, "
+        "verify that README.md and any relevant docs/ files are updated. "
+        "Flag missing or stale documentation as a blocking item.\n"
+    )
+
+
 def _review_command_policy(
     config: AgentLoopConfig, pr_metadata: PullRequestMetadata
 ) -> str:
@@ -840,7 +855,7 @@ Use this local checkout as your workspace. Create a branch, implement the fix,
 run relevant tests, commit, push, and open a pull request against {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance()}
+{_coder_test_reporting_guidance()}{_coder_documentation_guidance()}
 {_issue_pr_reference_guidance(issue_number)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
@@ -1404,7 +1419,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance()}
+{_coder_test_reporting_guidance()}{_coder_documentation_guidance()}
 {_issue_pr_reference_guidance(issue_number)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
@@ -1449,7 +1464,7 @@ Use this local checkout as your workspace. Decide between two paths:
     {config.base}. Do not wait for {reviewer_name}; this local orchestrator
     will run {reviewer_name} after you create the PR.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance()}
+{_coder_test_reporting_guidance()}{_coder_documentation_guidance()}
 
 (b) If the task is genuinely ambiguous or missing information that would change
     the implementation, do NOT write code. Instead, ask focused clarifying
@@ -1496,7 +1511,7 @@ Clarification so far:
 Now proceed. Strongly prefer to implement the task and open a PR. Only ask
 again if a critical detail is still missing.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance()}
+{_coder_test_reporting_guidance()}{_coder_documentation_guidance()}
 
 Do not place your signature before the AGENT_STATE or AGENT_CLARIFY marker.
 Your response must end with, in this exact order:
@@ -1653,7 +1668,7 @@ Do not defer your review to wait for CI checks to finish. Review the PR now and 
 When the PR changes files under `alembic/versions/`, verify migration topology:
 new revisions should descend from the current head unless the PR intentionally
 adds a merge migration.
-"""
+{_reviewer_documentation_check()}"""
     non_future_items = [item for item in unresolved_items if item.status != "future"]
     return "\n".join(
         part.rstrip()
@@ -1971,7 +1986,7 @@ Do not defer your review to wait for CI checks to finish. Review the PR now and 
 When the PR changes files under `alembic/versions/`, verify migration topology:
 new revisions should descend from the current head unless the PR intentionally
 adds a merge migration.
-{human_requirements_guidance}
+{_reviewer_documentation_check()}{human_requirements_guidance}
 Only items listed under `Prior unresolved review items from earlier rounds`
 are eligible for dispositions in this round. If same-round findings from
 other reviewers appear elsewhere in the PR discussion, treat them as
@@ -2062,7 +2077,7 @@ needed, implement fixes, run relevant tests, commit, and push to the same PR.
 Do not create a new PR.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance()}
+{_coder_test_reporting_guidance()}{_coder_documentation_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory)}
@@ -2110,7 +2125,7 @@ current PR. Keep the change narrowly scoped to the listed items. Do not take on
 larger redesigns or unrelated future work; call that out instead. The PR
 remains blocked pending another review round after this cleanup.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance()}
+{_coder_test_reporting_guidance()}{_coder_documentation_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory)}

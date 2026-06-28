@@ -1867,3 +1867,32 @@ def test_compact_plan_review_stable_prefix_is_byte_identical_with_phased_guard(t
     assert first_prefix.encode() == second_prefix.encode()
     assert "Phased-delivery guard" in first_prefix
     assert "implement-by-phase" in first_prefix
+
+
+def test_coder_prompt_includes_documentation_reminder(tmp_path):
+    from coding_review_agent_loop.prompts import build_task_clarification_prompt
+
+    config = make_config(tmp_path)
+    prompts = [
+        build_issue_prompt(1, config),
+        build_issue_implementation_prompt(1, "1. Fix it.", config),
+        build_task_prompt("Fix the bug.", config),
+        build_task_clarification_prompt("Fix the bug.", [("What?", "This.")], config),
+        build_followup_prompt(77, 1, "Needs tests.", config),
+        build_same_pr_followup_prompt(77, 1, "Tighten docs.", config),
+    ]
+    for prompt in prompts:
+        assert "README.md" in prompt
+        assert "docs/" in prompt
+        assert "user-facing subcommand" in prompt
+
+
+def test_reviewer_prompt_includes_documentation_check(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex",))
+    phrase = "Flag missing or stale documentation as a blocking item"
+
+    non_compact = build_review_prompt(77, 1, config, reviewer="codex")
+    compact = build_review_prompt(77, 1, config, reviewer="codex", compact_context=True)
+
+    assert phrase in non_compact
+    assert phrase in compact
