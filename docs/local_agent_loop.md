@@ -312,8 +312,9 @@ After all reviewers respond, the orchestrator aggregates the votes and posts a
 single consensus comment to the issue. `split` proposals from multiple reviewers
 are merged into one list. Discuss runs are idempotent: the consensus comment
 includes an `<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->` marker derived
-from the issue title and body, and a re-run on an unchanged issue posts no
-second comment.
+from the issue title, body, and non-consensus comment bodies. A re-run on an
+unchanged issue posts no second comment; posting a new comment on the issue
+invalidates the cached consensus and triggers a fresh evaluation.
 
 Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
 require multiple reviewers:

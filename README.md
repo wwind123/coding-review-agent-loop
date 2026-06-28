@@ -279,8 +279,11 @@ Each reviewer returns a `discuss_review` with one of four outcome votes:
 sub-issue proposals). The orchestrator aggregates the votes into a single
 consensus comment posted to the issue. A `do-not-implement` vote from any
 reviewer vetoes the issue regardless of other votes; `split` proposals from
-multiple reviewers are merged. Discuss runs are idempotent: re-running on an
-issue whose title and body have not changed posts no second comment.
+multiple reviewers are merged. Discuss runs are idempotent: the consensus comment includes an
+`<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->` marker derived from the
+issue title, body, and non-consensus comment bodies. Re-running on an
+unchanged issue posts no second comment; posting a new comment on the issue
+invalidates the cached consensus and triggers a fresh evaluation.
 
 When `--base` is omitted, `pr` mode uses the pull request's base branch.
 `issue` and `task` modes use the repository default branch. If PR metadata does
