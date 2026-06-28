@@ -96,7 +96,7 @@ sequenceDiagram
     participant Protocol as Structured response validation
     participant Repair as Repair pass
 
-    User->>CLI: agent-loop issue | task | pr
+    User->>CLI: agent-loop issue | task | pr | discuss
     CLI->>Orch: validated config
     Orch->>Orch: ensure active agent workdirs
     Orch->>Memory: prepare advisory repo memory
@@ -289,6 +289,37 @@ Review an existing PR:
 
 ```bash
 agent-loop pr 123 --repo OWNER/REPO
+```
+
+Evaluate a GitHub issue without writing any code:
+
+```bash
+agent-loop discuss 123 --repo OWNER/REPO
+```
+
+Discuss mode sends the issue title, body, and comments to all configured
+reviewers and asks each to return a `discuss_review` response with a single
+outcome vote. The four possible votes are:
+
+| Vote | Meaning |
+|------|---------|
+| `implement` | Reviewer recommends proceeding with the issue as written. |
+| `do-not-implement` | Reviewer vetoes the issue. Any single veto overrides all other votes. |
+| `needs-human` | Reviewer cannot decide without more information from a human. |
+| `split` | Reviewer recommends breaking the issue into smaller sub-issues and may include sub-issue proposals. |
+
+After all reviewers respond, the orchestrator aggregates the votes and posts a
+single consensus comment to the issue. `split` proposals from multiple reviewers
+are merged into one list. Discuss runs are idempotent: the consensus comment
+includes an `<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->` marker derived
+from the issue title and body, and a re-run on an unchanged issue posts no
+second comment.
+
+Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
+require multiple reviewers:
+
+```bash
+agent-loop discuss 123 --repo OWNER/REPO --reviewer codex --reviewer antigravity
 ```
 
 If `--repo` is omitted, the tool runs `gh repo view` from the current working

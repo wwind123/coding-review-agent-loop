@@ -267,6 +267,21 @@ iteration pass:
 agent-loop pr 456 --repo OWNER/REPO
 ```
 
+Evaluate a GitHub issue without writing any code using discuss mode. All
+configured reviewers read the issue and vote on whether to implement it:
+
+```bash
+agent-loop discuss 123 --repo OWNER/REPO
+```
+
+Each reviewer returns a `discuss_review` with one of four outcome votes:
+`implement`, `do-not-implement` (veto), `needs-human`, or `split` (with
+sub-issue proposals). The orchestrator aggregates the votes into a single
+consensus comment posted to the issue. A `do-not-implement` vote from any
+reviewer vetoes the issue regardless of other votes; `split` proposals from
+multiple reviewers are merged. Discuss runs are idempotent: re-running on an
+issue whose title and body have not changed posts no second comment.
+
 When `--base` is omitted, `pr` mode uses the pull request's base branch.
 `issue` and `task` modes use the repository default branch. If PR metadata does
 not include a base branch, `pr` mode also falls back to the repository default.
@@ -554,6 +569,7 @@ The test suite is split across focused modules for faster, targeted runs:
 | `tests/test_backends.py` | Claude, Gemini, and Codex backend output parsing and normalization |
 | `tests/test_protocol.py` | Protocol parsing and validation (parse_review, parse_plan_review, structured payloads) |
 | `tests/test_comment_rendering.py` | Comment rendering (render_canonical_plan_steps, render_public_agent_comment, etc.) |
+| `tests/test_discuss_loop.py` | Discuss mode loop tests (happy path, veto, idempotent resume, split proposals) |
 | `tests/test_skill_helpers.py` | Skill helper function tests |
 | `tests/test_skill_loop.py` | Skill loop integration tests |
 | `tests/test_transient.py` | Transient error detection tests |
