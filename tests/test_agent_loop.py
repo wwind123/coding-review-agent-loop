@@ -37,6 +37,8 @@ from coding_review_agent_loop.orchestrator import (
     _decode_round_metadata,
     _encode_round_metadata,
     _failure_category,
+    _failure_suggestion,
+    _format_invalid_agent_response_error,
     _format_reset_duration,
     _is_transient_agent_output,
     _is_transient_public_response,
@@ -348,6 +350,7 @@ def test_diagnostic_shaped_public_response_remains_transient(tmp_path):
 
     repair_mock.assert_not_called()
     assert "Failure category: transient" in str(exc_info.value)
+    assert "Suggestion:" in str(exc_info.value)
 
 
 def test_public_response_error_payload_remains_transient():
@@ -3462,5 +3465,162 @@ def test_run_plan_loop_freeform_revision_includes_model(tmp_path):
     revision_body = runner.issue_comments[2]["body"]
     stripped = _strip_round_metadata(revision_body)
     assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
+
+
+# ── _failure_suggestion unit tests ─────────────────────────────────────────
+
+
+def _make_error(
+    *,
+    agent_name: str = "TestAgent",
+    reason: str = "something went wrong",
+    category: str | None = None,
+    classification_text: str = "",
+) -> str:
+    """Helper: call _format_invalid_agent_response_error with minimal args."""
+    return _format_invalid_agent_response_error(
+        agent_name=agent_name,
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        reason=reason,
+        result=None,
+        log_paths=[],
+        category=category,
+    )
+
+
+def test_failure_suggestion_transient_quota_in_reason():
+    msg = _failure_suggestion("transient", "HTTP 429 rate limit exceeded", "TestAgent")
+    assert msg.startswith("Suggestion:")
+    assert "quota" in msg.lower() or "rate" in msg.lower() or "wait" in msg.lower()
+
+
+def test_failure_suggestion_transient_quota_in_classification_text():
+    msg = _failure_suggestion(
+        "transient",
+        "agent command exited with 1",
+        "TestAgent",
+        classification_text="quota exceeded for model gemini",
+    )
+    assert "wait" in msg.lower()
+
+
+def test_failure_suggestion_transient_non_quota():
+    msg = _failure_suggestion(
+        "transient",
+        "network timeout",
+        "TestAgent",
+        classification_text="",
+    )
+    assert msg.startswith("Suggestion:")
+    assert "wait" not in msg.lower()
+    assert "retry" in msg.lower() or "re-run" in msg.lower()
+
+
+def test_failure_suggestion_non_retryable_billing_in_classification():
+    msg = _failure_suggestion(
+        "non-retryable",
+        "agent command exited with 1",
+        "TestAgent",
+        classification_text="credit limit exceeded for this account",
+    )
+    assert "billing" in msg.lower() or "credit" in msg.lower()
+    assert "authenticated" not in msg.lower()
+
+
+def test_failure_suggestion_non_retryable_dirty_in_classification():
+    msg = _failure_suggestion(
+        "non-retryable",
+        "agent command exited with 1",
+        "TestAgent",
+        classification_text="dirty workdir: uncommitted changes detected",
+    )
+    assert "dirty" in msg.lower() or "working tree" in msg.lower() or "workdir" in msg.lower()
+    assert "authenticated" not in msg.lower()
+
+
+def test_failure_suggestion_non_retryable_auth_in_reason():
+    msg = _failure_suggestion(
+        "non-retryable",
+        "unauthorized access",
+        "MyAgent",
+        classification_text="",
+    )
+    assert "MyAgent" in msg
+    assert "authenticated" in msg.lower()
+
+
+def test_failure_suggestion_deterministic_repair_invalid_output():
+    reason = (
+        "Agent response did not use the required structured format.; "
+        "repair invocation failure: antigravity/gemini-flash: invalid_output "
+        "(Plan review did not evaluate all prior unresolved plan items: item-1)"
+    )
+    msg = _failure_suggestion("deterministic", reason, "Antigravity")
+    assert "re-run" in msg.lower()
+    assert "inspect" not in msg.lower()
+
+
+def test_failure_suggestion_deterministic_repair_failure_path():
+    # The repair failure: path (line 1303) uses attempt.diagnostic, not the outcome token.
+    reason = (
+        "Agent response did not use the required structured format.; "
+        "repair failure: Plan review did not evaluate all prior unresolved plan items: item-1"
+    )
+    msg = _failure_suggestion("deterministic", reason, "Antigravity")
+    assert "inspect" in msg.lower()
+    assert "resumable" not in msg.lower()
+
+
+def test_failure_suggestion_deterministic_genuine():
+    msg = _failure_suggestion("deterministic", "schema validation error", "TestAgent")
+    assert "inspect" in msg.lower()
+
+
+def test_failure_suggestion_empty_response():
+    msg = _failure_suggestion("empty-response", "", "TestAgent")
+    assert msg == ""
+
+
+def test_failure_suggestion_none_category():
+    msg = _failure_suggestion(None, "unknown error", "TestAgent")
+    assert msg == ""
+
+
+def test_format_invalid_agent_response_error_includes_suggestion_transient():
+    msg = _format_invalid_agent_response_error(
+        agent_name="Gemini",
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        reason="HTTP 429 Too Many Requests",
+        result=None,
+        log_paths=[],
+        category="transient",
+    )
+    assert "Suggestion:" in msg
+    assert "Failure category: transient" in msg
+
+
+def test_format_invalid_agent_response_error_includes_suggestion_deterministic():
+    msg = _format_invalid_agent_response_error(
+        agent_name="Antigravity",
+        marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+        reason="schema validation failed",
+        result=None,
+        log_paths=[],
+        category="deterministic",
+    )
+    assert "Suggestion:" in msg
+    assert "inspect" in msg.lower()
+
+
+def test_format_invalid_agent_response_error_no_suggestion_empty_response():
+    msg = _format_invalid_agent_response_error(
+        agent_name="Codex",
+        marker_description="<!-- AGENT_PR: <number> -->",
+        reason="agent response was empty",
+        result=None,
+        log_paths=[],
+        category="empty-response",
+    )
+    assert "Suggestion:" not in msg
 
 

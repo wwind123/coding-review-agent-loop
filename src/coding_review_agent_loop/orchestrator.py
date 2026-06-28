@@ -768,6 +768,41 @@ def _retry_delay(config: AgentLoopConfig, retry_index: int) -> int:
     return delays[min(retry_index - 1, len(delays) - 1)]
 
 
+def _failure_suggestion(
+    category: str | None,
+    reason: str,
+    agent_name: str,
+    *,
+    classification_text: str = "",
+) -> str:
+    """Return a one-line actionable suggestion to append to an agent failure message."""
+    combined = f"{reason} {classification_text}"
+    if category == "transient":
+        if _QUOTA_RATE_LIMIT_RE.search(combined):
+            return (
+                "Suggestion: wait for quota reset or rate-limit window to pass, "
+                "then re-run the same command to resume."
+            )
+        return (
+            "Suggestion: re-run the same command — "
+            "this is a transient failure and a retry may succeed."
+        )
+    if category == "non-retryable":
+        if re.search(r"\b(?:credit|billing)\b", combined, re.I):
+            return "Suggestion: check your API billing / credit balance, then re-run."
+        if re.search(r"\bdirty\b", combined, re.I):
+            return "Suggestion: clean up the dirty working tree or workdir, then re-run."
+        return f"Suggestion: check that {agent_name} is installed and authenticated, then re-run."
+    if category == "deterministic":
+        if "repair invocation failure" in reason and "invalid_output" in reason:
+            return (
+                "Suggestion: re-run the same command — "
+                "the round is resumable and a retry may succeed."
+            )
+        return "Suggestion: inspect the log above, fix the underlying issue, then re-run."
+    return ""
+
+
 def _format_invalid_agent_response_error(
     *,
     agent_name: str,
@@ -788,12 +823,16 @@ def _format_invalid_agent_response_error(
         category_hint = " Failure category: non-retryable (check credentials or billing)."
     elif category == "deterministic":
         category_hint = " Failure category: deterministic (may require a code fix)."
+    classification_text = (result.raw_output or result.text or "") if result is not None else ""
+    suggestion = _failure_suggestion(category, reason, agent_name, classification_text=classification_text)
+    suggestion_line = f"\n{suggestion}" if suggestion else ""
     return (
         f"{agent_name} failed before producing a valid public response. "
         "No review result was recorded. "
         f"Required marker: {marker_description}. Reason: {reason}.{exit_context}"
         f"{category_hint}"
         f"{log_context}"
+        f"{suggestion_line}"
     )
 
 
