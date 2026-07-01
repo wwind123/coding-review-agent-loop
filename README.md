@@ -319,7 +319,10 @@ each posted comment carries round metadata the orchestrator uses to
 reconstruct completed rounds (including a partially-completed round) on the
 next run. Re-running after a final summary posts no second transcript; posting
 a new human comment on the issue invalidates the cached result and triggers a
-fresh evaluation from round 1.
+fresh evaluation from round 1. If a resumed run's next round would exceed a
+`--discuss-max-rounds` value that was lowered since the prior run, the
+orchestrator immediately posts a final `deadlock` summary from the last
+completed round instead of silently exiting without a result.
 
 When `--base` is omitted, `pr` mode uses the pull request's base branch.
 `issue` and `task` modes use the repository default branch. If PR metadata does

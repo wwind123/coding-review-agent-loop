@@ -661,3 +661,62 @@ def test_discuss_loop_idempotent_when_final_summary_metadata_exists(tmp_path):
     assert len(runner.comments) == 0
     assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
     assert not any(cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands)
+
+
+def test_discuss_loop_finalizes_from_last_completed_round_when_resumed_round_exceeds_lowered_max_rounds(tmp_path):
+    """Regression test: resuming a non-final round with a since-lowered
+    --discuss-max-rounds must post a final deadlock summary instead of silently
+    returning 0 with no final summary (review blocking-1 on PR #471)."""
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    codex_vote_r1 = ParsedDiscussReview(outcome="implement", rationale="Scoped.", split_proposals=(), reviewer="Codex")
+    gemini_vote_r1 = ParsedDiscussReview(outcome="do-not-implement", rationale="Out of scope.", split_proposals=(), reviewer="Gemini")
+    seeded = [
+        _seed_debater_comment(reviewer="Codex", round_number=1, subject=subject, outcome="implement", rationale="Scoped.", config=config),
+        _seed_debater_comment(reviewer="Gemini", round_number=1, subject=subject, outcome="do-not-implement", rationale="Out of scope.", config=config),
+        _seed_summary_comment(
+            round_number=1,
+            reviewer_votes=[codex_vote_r1, gemini_vote_r1],
+            is_final=False,
+            subject=subject,
+            agenda=("- Codex held `implement`: Scoped.", "- Gemini held `do-not-implement`: Out of scope."),
+        ),
+    ]
+    # discuss_max_rounds was previously left at the default (>=1 debate round), but this
+    # run uses 0, so the resumed round 2 is no longer allowed.
+    runner = FakeRunner(issue_comments=seeded, codex_outputs=[], gemini_outputs=[])
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
+
+    assert result == 0
+    # No debaters should be re-invoked for a round that is no longer allowed.
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert not any(cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands)
+    assert len(runner.comments) == 1
+    final = runner.comments[-1]
+    assert "Consensus: Needs Human Review (Deadlock)" in final
+    assert "Consensus kind: `deadlock` after round 1." in final
+    assert "Codex held `implement`: Scoped." in final
+    assert "Gemini held `do-not-implement`: Out of scope." in final
+    m = DISCUSS_CONSENSUS_MARKER_RE.search(final)
+    assert m is not None
+    assert m.group(1) == subject
+
+
+def test_discuss_loop_raises_when_resumed_round_exceeds_max_rounds_with_no_completed_round(tmp_path):
+    """Defensive guard: if resume ever reports a start round beyond the configured
+    limit with no completed round history to finalize from (e.g. corrupted/partial
+    metadata with no round-1 records at all), fail loudly instead of silently
+    returning 0 with no final summary."""
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    seeded = [
+        _seed_debater_comment(
+            reviewer="Codex", round_number=2, subject=subject, outcome="implement",
+            rationale="Scoped.", rebuttal="Still scoped.", config=config,
+        ),
+    ]
+    runner = FakeRunner(issue_comments=seeded, codex_outputs=[], gemini_outputs=[])
+
+    with pytest.raises(AgentLoopError, match="discuss: resumed state expects round"):
+        run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)

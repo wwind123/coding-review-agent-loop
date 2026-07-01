@@ -355,7 +355,12 @@ completed rounds — including a round that only partially posted before a
 crash — from the public comment thread on the next run, without relying on one
 aggregate comment. A re-run on an unchanged issue with a final result posts no
 second transcript; posting a new human comment on the issue invalidates the
-cached result and triggers a fresh evaluation from round 1.
+cached result and triggers a fresh evaluation from round 1. If a resumed run's
+next round would exceed a `--discuss-max-rounds` value that was lowered since
+the prior run, the orchestrator immediately posts a final `deadlock` summary
+from the last completed round instead of silently exiting without a result;
+if no completed round exists to finalize from, it raises instead of exiting
+silently.
 
 Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
 require multiple reviewers:

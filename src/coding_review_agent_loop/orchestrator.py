@@ -3517,6 +3517,57 @@ def _run_discuss_loop(
         prior_round_agenda = []
         in_progress_votes = {}
     max_round_number = discuss_max_rounds + 1
+    if start_round_number > max_round_number:
+        if not round_history:
+            raise AgentLoopError(
+                "discuss: resumed state expects round "
+                f"{start_round_number} but --discuss-max-rounds={discuss_max_rounds} allows only "
+                f"{max_round_number} round(s), and no completed round was found to finalize from. "
+                "Rerun with a --discuss-max-rounds at least as large as the rounds already posted "
+                "on the issue, or repair the discuss transcript."
+            )
+        log(
+            config,
+            f"discuss: resumed round {start_round_number} exceeds --discuss-max-rounds="
+            f"{discuss_max_rounds} (allows {max_round_number} round(s)); finalizing from the last "
+            "completed round instead of starting a new one.",
+        )
+        final_round_number = len(round_history)
+        final_votes = round_history[-1]
+        summary_body = render_discuss_round_summary_comment(
+            round_number=final_round_number,
+            reviewer_votes=final_votes,
+            is_final=True,
+            subject=subject,
+            outcome="needs-human",
+            consensus_kind="deadlock",
+            round_history=round_history,
+            split_proposals=[],
+        )
+        post_issue_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=_attach_round_metadata(
+                summary_body,
+                PostedRoundMetadata(
+                    flow="discuss",
+                    role="summary",
+                    agent="Orchestrator",
+                    round_number=final_round_number,
+                    subject=subject,
+                    is_final=True,
+                    consensus_kind="deadlock",
+                    agenda=(),
+                ),
+            ),
+        )
+        log(
+            config,
+            f"discuss: posted final summary comment for issue #{issue_number} "
+            "(outcome: needs-human; kind: deadlock)",
+        )
+        return 0
     for round_number in range(start_round_number, max_round_number + 1):
         prior_round_votes = round_history[-1] if round_history else []
         reviewer_votes: list[ParsedDiscussReview] = []
