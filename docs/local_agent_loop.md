@@ -299,28 +299,41 @@ agent-loop discuss 123 --repo OWNER/REPO
 
 Discuss mode sends the issue title, body, and comments to all configured
 reviewers and asks each to return a `discuss_review` response with a single
-outcome vote. The four possible votes are:
+outcome vote. Round 1 is independent. If reviewers disagree, each later debate
+round includes the complete prior round positions and requires each reviewer to
+include a non-empty `rebuttal` that engages the disagreement. The four possible
+votes are:
 
 | Vote | Meaning |
 |------|---------|
 | `implement` | Reviewer recommends proceeding with the issue as written. |
-| `do-not-implement` | Reviewer vetoes the issue. Any single veto overrides all other votes. |
+| `do-not-implement` | Reviewer recommends not implementing the issue. |
 | `needs-human` | Reviewer cannot decide without more information from a human. |
 | `split` | Reviewer recommends breaking the issue into smaller sub-issues and may include sub-issue proposals. |
 
-After all reviewers respond, the orchestrator aggregates the votes and posts a
-single consensus comment to the issue. `split` proposals from multiple reviewers
-are merged into one list. Discuss runs are idempotent: the consensus comment
-includes an `<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->` marker derived
-from the issue title, body, and non-consensus comment bodies. A re-run on an
-unchanged issue posts no second comment; posting a new comment on the issue
-invalidates the cached consensus and triggers a fresh evaluation.
+After each round, the orchestrator checks for same-round unanimity. Agreement in
+round 1 is marked `unanimous`; agreement after debate is marked `converged`.
+By default, the orchestrator runs up to two debate rounds after round 1. Set
+`--discuss-max-rounds 0` to post a human-needed deadlock immediately after an
+initial disagreement, or increase the value to allow more debate.
+
+If no consensus is reached after the configured debate rounds, the orchestrator
+posts a `deadlock` comment with the `needs-human` outcome, each final reviewer
+position, and the core disagreement. `split` proposals from multiple reviewers
+are merged in first-seen order only when all reviewers in the same round agree
+on `split`. Discuss runs are idempotent: the consensus comment includes an
+`<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->` marker derived from the issue
+title, body, and non-consensus comment bodies. A re-run on an unchanged issue
+posts no second comment; posting a new comment on the issue invalidates the
+cached consensus and triggers a fresh evaluation.
 
 Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
 require multiple reviewers:
 
 ```bash
-agent-loop discuss 123 --repo OWNER/REPO --reviewer codex --reviewer antigravity
+agent-loop discuss 123 --repo OWNER/REPO \
+  --reviewer codex --reviewer antigravity \
+  --discuss-max-rounds 2
 ```
 
 If `--repo` is omitted, the tool runs `gh repo view` from the current working

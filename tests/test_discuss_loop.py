@@ -6,10 +6,10 @@ import pytest
 
 from coding_review_agent_loop.orchestrator import (
     DISCUSS_CONSENSUS_MARKER_RE,
-    _aggregate_discuss_votes,
     _discuss_subject,
     run_discuss_loop,
 )
+from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment, IssueContext
 
 from agent_loop_helpers import FakeRunner, make_config
@@ -20,6 +20,7 @@ def _discuss_review_text(
     outcome: str = "implement",
     rationale: str = "Well-scoped.",
     split_proposals: list[str] | None = None,
+    rebuttal: str | None = None,
     reviewer: str = "OpenAI Codex",
 ) -> str:
     payload: dict = {
@@ -30,6 +31,8 @@ def _discuss_review_text(
     }
     if split_proposals is not None:
         payload["split_proposals"] = split_proposals
+    if rebuttal is not None:
+        payload["rebuttal"] = rebuttal
     return json.dumps(payload) + f"\n<!-- AGENT_PLAN_STATE: approved -->\n-- {reviewer}"
 
 
@@ -53,18 +56,31 @@ def test_discuss_loop_happy_path_two_implement_votes(tmp_path):
     assert "Consensus: Implement" in runner.comments[0]
 
 
-def test_discuss_loop_veto_do_not_implement(tmp_path):
+def test_discuss_loop_debates_then_deadlocks_instead_of_veto(tmp_path):
     runner = FakeRunner(
-        codex_outputs=[_discuss_review_text(outcome="implement")],
-        gemini_outputs=[_discuss_review_text(outcome="do-not-implement", rationale="Out of scope.")],
+        codex_outputs=[
+            _discuss_review_text(outcome="implement"),
+            _discuss_review_text(outcome="implement", rebuttal="The issue is scoped enough."),
+        ],
+        gemini_outputs=[
+            _discuss_review_text(outcome="do-not-implement", rationale="Out of scope."),
+            _discuss_review_text(
+                outcome="do-not-implement",
+                rationale="Still out of scope.",
+                rebuttal="The scope objection still stands.",
+            ),
+        ],
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"))
 
-    result = run_discuss_loop(runner, issue_number=56, config=config)
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
 
     assert result == 0
     assert len(runner.comments) == 1
-    assert "Do Not Implement" in runner.comments[0]
+    assert "Consensus: Needs Human Review (Deadlock)" in runner.comments[0]
+    assert "Consensus kind: `deadlock` after round 2." in runner.comments[0]
+    assert "Codex held `implement`" in runner.comments[0]
+    assert "Gemini held `do-not-implement`" in runner.comments[0]
 
 
 def test_discuss_loop_idempotent_when_consensus_comment_exists(tmp_path):
@@ -223,3 +239,93 @@ def test_discuss_loop_split_consensus_includes_proposals(tmp_path):
     assert "Consensus: Split" in posted
     assert "Auth flow" in posted
     assert "Authorization checks" in posted
+
+
+def test_discuss_loop_converges_after_debate(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            _discuss_review_text(outcome="implement"),
+            _discuss_review_text(
+                outcome="needs-human",
+                rationale="The acceptance criteria need a product decision.",
+                rebuttal="I agree the ambiguity blocks a technical verdict.",
+            ),
+        ],
+        gemini_outputs=[
+            _discuss_review_text(outcome="needs-human", rationale="Unclear requirements."),
+            _discuss_review_text(
+                outcome="needs-human",
+                rationale="Unclear requirements remain.",
+                rebuttal="The implement argument depends on unstated requirements.",
+            ),
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+
+    assert result == 0
+    posted = runner.comments[0]
+    assert "Consensus: Needs Human Review" in posted
+    assert "Consensus kind: `converged` after round 2." in posted
+    assert "### Final rebuttals" in posted
+
+
+def test_discuss_loop_zero_debate_rounds_deadlocks_after_initial_disagreement(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[_discuss_review_text(outcome="implement")],
+        gemini_outputs=[_discuss_review_text(outcome="needs-human", rationale="Needs product input.")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
+
+    assert result == 0
+    posted = runner.comments[0]
+    assert "Consensus kind: `deadlock` after round 1." in posted
+    assert "Codex held `implement`" in posted
+    assert "Gemini held `needs-human`" in posted
+
+
+def test_discuss_loop_passes_prior_round_snapshot_to_debate_prompts(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            _discuss_review_text(outcome="implement", rationale="Scoped."),
+            _discuss_review_text(
+                outcome="implement",
+                rationale="Still scoped.",
+                rebuttal="The split concern does not apply.",
+            ),
+        ],
+        gemini_outputs=[
+            _discuss_review_text(
+                outcome="split",
+                rationale="Too broad.",
+                split_proposals=["Auth flow"],
+            ),
+            _discuss_review_text(
+                outcome="implement",
+                rationale="Can proceed.",
+                rebuttal="I accept the scope argument.",
+            ),
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+
+    run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+
+    debate_commands = [cmd for cmd, _cwd in runner.commands if "debate round 2" in " ".join(cmd)]
+    assert len(debate_commands) == 2
+    for command in debate_commands:
+        prompt = " ".join(command)
+        assert "Codex: `implement`" in prompt
+        assert "Gemini: `split`" in prompt
+        assert "Auth flow" in prompt
+
+
+def test_discuss_loop_rejects_negative_discuss_max_rounds(tmp_path):
+    runner = FakeRunner(codex_outputs=[], gemini_outputs=[])
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+
+    with pytest.raises(AgentLoopError, match="--discuss-max-rounds must be zero or greater"):
+        run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=-1)

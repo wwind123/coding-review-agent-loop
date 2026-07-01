@@ -268,23 +268,38 @@ iteration pass:
 agent-loop pr 456 --repo OWNER/REPO
 ```
 
-Evaluate a GitHub issue without writing any code using discuss mode. All
-configured reviewers read the issue and vote on whether to implement it:
+Evaluate a GitHub issue without writing any code using discuss mode. Reviewers
+first evaluate independently, then debate if their outcomes disagree:
 
 ```bash
 agent-loop discuss 123 --repo OWNER/REPO
 ```
 
 Each reviewer returns a `discuss_review` with one of four outcome votes:
-`implement`, `do-not-implement` (veto), `needs-human`, or `split` (with
-sub-issue proposals). The orchestrator aggregates the votes into a single
-consensus comment posted to the issue. A `do-not-implement` vote from any
-reviewer vetoes the issue regardless of other votes; `split` proposals from
-multiple reviewers are merged. Discuss runs are idempotent: the consensus comment includes an
-`<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->` marker derived from the
-issue title, body, and non-consensus comment bodies. Re-running on an
-unchanged issue posts no second comment; posting a new comment on the issue
-invalidates the cached consensus and triggers a fresh evaluation.
+`implement`, `do-not-implement`, `needs-human`, or `split` (with sub-issue
+proposals). If all reviewers agree in round 1, the consensus comment is marked
+`unanimous`. If they disagree, each debate round sends reviewers the complete
+previous round positions and requires a non-empty `rebuttal` that engages the
+disagreement. Agreement after debate is marked `converged`.
+
+By default, discuss mode runs up to two debate rounds after the initial round.
+Use `--discuss-max-rounds` to change that limit:
+
+```bash
+agent-loop discuss 123 --repo OWNER/REPO \
+  --reviewer codex --reviewer antigravity \
+  --discuss-max-rounds 2
+```
+
+If reviewers still disagree after the configured debate rounds, the comment is
+marked `deadlock`, uses the `needs-human` outcome, and summarizes each final
+position and the core disagreement. `split` proposals are merged in first-seen
+order only when all reviewers in the same round agree on `split`. Discuss runs
+are idempotent: the consensus comment includes an
+`<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->` marker derived from the issue
+title, body, and non-consensus comment bodies. Re-running on an unchanged issue
+posts no second comment; posting a new comment on the issue invalidates the
+cached consensus and triggers a fresh evaluation.
 
 When `--base` is omitted, `pr` mode uses the pull request's base branch.
 `issue` and `task` modes use the repository default branch. If PR metadata does
@@ -573,7 +588,7 @@ The test suite is split across focused modules for faster, targeted runs:
 | `tests/test_backends.py` | Claude, Gemini, and Codex backend output parsing and normalization |
 | `tests/test_protocol.py` | Protocol parsing and validation (parse_review, parse_plan_review, structured payloads) |
 | `tests/test_comment_rendering.py` | Comment rendering (render_canonical_plan_steps, render_public_agent_comment, etc.) |
-| `tests/test_discuss_loop.py` | Discuss mode loop tests (happy path, veto, idempotent resume, split proposals) |
+| `tests/test_discuss_loop.py` | Discuss mode loop tests (happy path, debate/deadlock, idempotent resume, split proposals) |
 | `tests/test_skill_helpers.py` | Skill helper function tests |
 | `tests/test_skill_loop.py` | Skill loop integration tests |
 | `tests/test_transient.py` | Transient error detection tests |

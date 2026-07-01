@@ -55,7 +55,7 @@ from coding_review_agent_loop.protocol import (
 from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER
 from coding_review_agent_loop.errors import UnknownPriorItemDispositionError
 from coding_review_agent_loop.orchestrator import (
-    _aggregate_discuss_votes,
+    _detect_discuss_consensus,
     _decode_public_response_json_prefix,
     _failure_category,
     _is_transient_public_response,
@@ -2636,6 +2636,7 @@ def _discuss_review(
     outcome: str = "implement",
     rationale: str = "The feature is well-scoped.",
     split_proposals: list[str] | None = None,
+    rebuttal: str | None = None,
     reviewer: str = "Gemini",
     footer: str = "approved",
 ) -> str:
@@ -2647,6 +2648,8 @@ def _discuss_review(
     }
     if split_proposals is not None:
         payload["split_proposals"] = split_proposals
+    if rebuttal is not None:
+        payload["rebuttal"] = rebuttal
     return json.dumps(payload) + f"\n<!-- AGENT_PLAN_STATE: {footer} -->\n-- {reviewer}"
 
 
@@ -2684,6 +2687,13 @@ def test_parse_structured_discuss_review_accepts_split_with_proposals():
     assert result.split_proposals == ("Sub-issue A", "Sub-issue B")
 
 
+def test_parse_structured_discuss_review_accepts_rebuttal():
+    text = _discuss_review(rebuttal="I considered the opposing concern.")
+    result = parse_structured_discuss_review(text, reviewer="Gemini")
+    assert result is not None
+    assert result.rebuttal == "I considered the opposing concern."
+
+
 def test_parse_structured_discuss_review_rejects_unknown_outcome():
     from coding_review_agent_loop.errors import AgentLoopError as _AgentLoopError
     text = _discuss_review(outcome="maybe")
@@ -2696,6 +2706,20 @@ def test_parse_structured_discuss_review_rejects_split_with_empty_proposals():
     text = _discuss_review(outcome="split", split_proposals=[])
     with pytest.raises(_AgentLoopError, match="split_proposals must be non-empty"):
         parse_structured_discuss_review(text, reviewer="Gemini")
+
+
+def test_parse_structured_discuss_review_rejects_empty_rebuttal():
+    from coding_review_agent_loop.errors import AgentLoopError as _AgentLoopError
+    text = _discuss_review(rebuttal=" ")
+    with pytest.raises(_AgentLoopError, match="rebuttal must be a non-empty string"):
+        parse_structured_discuss_review(text, reviewer="Gemini")
+
+
+def test_validate_structured_discuss_review_requires_rebuttal_after_round_one():
+    from coding_review_agent_loop.errors import AgentLoopError as _AgentLoopError
+    text = _discuss_review()
+    with pytest.raises(_AgentLoopError, match="rebuttal is required for debate rounds"):
+        validate_structured_discuss_review(text, reviewer="Gemini", round_number=2)
 
 
 def test_parse_structured_discuss_review_rejects_blocking_footer():
@@ -2727,7 +2751,7 @@ def test_discuss_outcome_values_contains_all_four():
     assert DISCUSS_OUTCOME_VALUES == {"implement", "do-not-implement", "needs-human", "split"}
 
 
-# --- _aggregate_discuss_votes tests ---
+# --- _detect_discuss_consensus tests ---
 
 
 def _vote(outcome: str, rationale: str = "reason", proposals: tuple[str, ...] = ()) -> ParsedDiscussReview:
@@ -2739,37 +2763,38 @@ def _vote(outcome: str, rationale: str = "reason", proposals: tuple[str, ...] = 
     )
 
 
-def test_aggregate_discuss_votes_unanimous_implement():
+def test_detect_discuss_consensus_unanimous_implement():
     votes = [_vote("implement"), _vote("implement")]
-    outcome, proposals = _aggregate_discuss_votes(votes)
+    consensus = _detect_discuss_consensus(votes)
+    assert consensus is not None
+    outcome, proposals = consensus
     assert outcome == "implement"
     assert proposals == []
 
 
-def test_aggregate_discuss_votes_veto_do_not_implement():
+def test_detect_discuss_consensus_mixed_do_not_implement_is_not_veto():
     votes = [_vote("implement"), _vote("do-not-implement"), _vote("implement")]
-    outcome, proposals = _aggregate_discuss_votes(votes)
-    assert outcome == "do-not-implement"
+    assert _detect_discuss_consensus(votes) is None
 
 
-def test_aggregate_discuss_votes_needs_human_beats_implement():
+def test_detect_discuss_consensus_mixed_needs_human_is_disagreement():
     votes = [_vote("implement"), _vote("needs-human")]
-    outcome, proposals = _aggregate_discuss_votes(votes)
-    assert outcome == "needs-human"
+    assert _detect_discuss_consensus(votes) is None
 
 
-def test_aggregate_discuss_votes_do_not_implement_beats_needs_human():
+def test_detect_discuss_consensus_do_not_implement_requires_unanimity():
     votes = [_vote("needs-human"), _vote("do-not-implement")]
-    outcome, proposals = _aggregate_discuss_votes(votes)
-    assert outcome == "do-not-implement"
+    assert _detect_discuss_consensus(votes) is None
 
 
-def test_aggregate_discuss_votes_all_split_merges_proposals():
+def test_detect_discuss_consensus_all_split_merges_proposals():
     votes = [
         _vote("split", proposals=("Sub A", "Sub B")),
         _vote("split", proposals=("Sub B", "Sub C")),
     ]
-    outcome, proposals = _aggregate_discuss_votes(votes)
+    consensus = _detect_discuss_consensus(votes)
+    assert consensus is not None
+    outcome, proposals = consensus
     assert outcome == "split"
     assert "Sub A" in proposals
     assert "Sub B" in proposals
@@ -2777,8 +2802,6 @@ def test_aggregate_discuss_votes_all_split_merges_proposals():
     assert proposals.index("Sub A") < proposals.index("Sub B") < proposals.index("Sub C")
 
 
-def test_aggregate_discuss_votes_mixed_falls_back_to_needs_human():
+def test_detect_discuss_consensus_mixed_returns_none():
     votes = [_vote("implement"), _vote("split", proposals=("X",))]
-    outcome, proposals = _aggregate_discuss_votes(votes)
-    assert outcome == "needs-human"
-
+    assert _detect_discuss_consensus(votes) is None

@@ -704,12 +704,14 @@ def _discuss_vote(
     rationale: str = "Good scope.",
     proposals: tuple[str, ...] = (),
     reviewer: str = "Gemini",
+    rebuttal: str | None = None,
 ) -> ParsedDiscussReview:
     return ParsedDiscussReview(
         outcome=outcome,
         rationale=rationale,
         split_proposals=proposals,
         reviewer=reviewer,
+        rebuttal=rebuttal,
     )
 
 
@@ -806,4 +808,56 @@ def test_render_discuss_consensus_comment_marker_last_line(tmp_path):
     )
     assert rendered.endswith(f"<!-- AGENT_DISCUSS_CONSENSUS: {subject} -->")
 
+
+def test_render_discuss_consensus_comment_converged_kind_and_rebuttals(tmp_path):
+    config = make_config(tmp_path)
+    rendered = render_discuss_consensus_comment(
+        outcome="implement",
+        consensus_kind="converged",
+        round_number=2,
+        reviewer_votes=[
+            _discuss_vote(
+                "implement",
+                reviewer="Gemini",
+                rebuttal="The scope concern is resolved by the issue body.",
+            )
+        ],
+        round_history=[
+            [_discuss_vote("needs-human", reviewer="Gemini")],
+            [
+                _discuss_vote(
+                    "implement",
+                    reviewer="Gemini",
+                    rebuttal="The scope concern is resolved by the issue body.",
+                )
+            ],
+        ],
+        split_proposals=[],
+        subject="abc123",
+        config=config,
+    )
+    assert "Consensus kind: `converged` after round 2." in rendered
+    assert "### Final rebuttals" in rendered
+    assert "Round 1: Gemini: `needs-human`" in rendered
+
+
+def test_render_discuss_consensus_comment_deadlock_summarizes_disagreement(tmp_path):
+    config = make_config(tmp_path)
+    rendered = render_discuss_consensus_comment(
+        outcome="needs-human",
+        consensus_kind="deadlock",
+        round_number=2,
+        reviewer_votes=[
+            _discuss_vote("implement", rationale="Scoped.", reviewer="Gemini"),
+            _discuss_vote("do-not-implement", rationale="Out of scope.", reviewer="OpenAI Codex"),
+        ],
+        split_proposals=[],
+        subject="abc123",
+        config=config,
+    )
+    assert "## Consensus: Needs Human Review (Deadlock)" in rendered
+    assert "Consensus kind: `deadlock` after round 2." in rendered
+    assert "### Core disagreement" in rendered
+    assert "Gemini held `implement`: Scoped." in rendered
+    assert "OpenAI Codex held `do-not-implement`: Out of scope." in rendered
 

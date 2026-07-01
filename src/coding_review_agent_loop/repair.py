@@ -269,7 +269,8 @@ You are a format-repair assistant. An AI agent produced a code review, plan revi
   "kind": "discuss_review",
   "outcome": "implement" | "do-not-implement" | "needs-human" | "split",
   "rationale": "<short rationale>",
-  "split_proposals": ["Sub-issue title 1", "Sub-issue title 2"]
+  "split_proposals": ["Sub-issue title 1", "Sub-issue title 2"],
+  "rebuttal": "<required in debate rounds; omit in initial round>"
 }
 <!-- AGENT_PLAN_STATE: approved -->
 -- <Reviewer Name>
@@ -278,6 +279,7 @@ Notes:
 - outcome must be exactly one of the four values above.
 - rationale is required and must be non-empty.
 - split_proposals is required and must be non-empty when outcome is "split"; omit or use [] otherwise.
+- rebuttal is optional in the initial discuss round and required in debate rounds.
 - footer must always be <!-- AGENT_PLAN_STATE: approved --> (never blocking).
 
 ## Valid Format D — Plan Revision:

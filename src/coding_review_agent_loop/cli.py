@@ -438,6 +438,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run reviewers on an issue and post a consensus outcome comment.",
     )
     discuss.add_argument("issue_number", type=int)
+    discuss.add_argument(
+        "--discuss-max-rounds",
+        type=int,
+        default=2,
+        help="Maximum debate rounds after the initial discuss round (default: 2).",
+    )
     add_common(discuss)
 
     return parser
@@ -506,7 +512,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_clarification_rounds=getattr(args, "max_clarification_rounds", 0),
             )
         if args.command == "discuss":
-            return run_discuss_loop(runner, issue_number=args.issue_number, config=config)
+            return run_discuss_loop(
+                runner,
+                issue_number=args.issue_number,
+                config=config,
+                discuss_max_rounds=getattr(args, "discuss_max_rounds", 2),
+            )
         parser.error(f"unknown command: {args.command}")
     except QuotaResetExceededError as exc:
         print(f"agent-loop: {exc}", file=sys.stderr)

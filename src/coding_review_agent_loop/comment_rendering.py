@@ -622,19 +622,33 @@ def render_public_agent_comment(
 def render_discuss_consensus_comment(
     *,
     outcome: str,
+    consensus_kind: str = "unanimous",
+    round_number: int = 1,
     reviewer_votes: list[ParsedDiscussReview],
+    round_history: Sequence[Sequence[ParsedDiscussReview]] | None = None,
     split_proposals: list[str],
     subject: str,
     config: object,
 ) -> str:
+    if consensus_kind not in {"unanimous", "converged", "deadlock"}:
+        raise AgentLoopError("consensus_kind must be `unanimous`, `converged`, or `deadlock`.")
     outcome_heading = {
         "implement": "Consensus: Implement",
         "do-not-implement": "Consensus: Do Not Implement",
         "needs-human": "Consensus: Needs Human Review",
         "split": "Consensus: Split",
     }.get(outcome, f"Consensus: {outcome}")
+    if consensus_kind == "deadlock":
+        outcome_heading = "Consensus: Needs Human Review (Deadlock)"
+    kind_label = {
+        "unanimous": "unanimous",
+        "converged": "converged",
+        "deadlock": "deadlock",
+    }[consensus_kind]
     lines: list[str] = [
         f"## {outcome_heading}",
+        "",
+        f"Consensus kind: `{kind_label}` after round {round_number}.",
         "",
         "| Reviewer | Outcome | Rationale |",
         "| --- | --- | --- |",
@@ -642,12 +656,32 @@ def render_discuss_consensus_comment(
     for vote in reviewer_votes:
         rationale = vote.rationale.replace("|", "\\|").replace("\n", " ")
         lines.append(f"| {vote.reviewer} | {vote.outcome} | {rationale} |")
+    rebuttal_votes = [vote for vote in reviewer_votes if vote.rebuttal]
+    if rebuttal_votes:
+        lines.append("")
+        lines.append("### Final rebuttals")
+        lines.append("")
+        for vote in rebuttal_votes:
+            lines.append(f"- {vote.reviewer}: {vote.rebuttal}")
+    if consensus_kind == "deadlock":
+        lines.append("")
+        lines.append("### Core disagreement")
+        lines.append("")
+        for vote in reviewer_votes:
+            lines.append(f"- {vote.reviewer} held `{vote.outcome}`: {vote.rationale}")
     if outcome == "split" and split_proposals:
         lines.append("")
         lines.append("### Proposed sub-issues")
         lines.append("")
         for proposal in split_proposals:
             lines.append(f"- {proposal}")
+    if round_history:
+        lines.append("")
+        lines.append("### Round history")
+        lines.append("")
+        for index, votes in enumerate(round_history, start=1):
+            rendered_votes = ", ".join(f"{vote.reviewer}: `{vote.outcome}`" for vote in votes)
+            lines.append(f"- Round {index}: {rendered_votes}")
     lines.append("")
     lines.append("-- Orchestrator")
     lines.append(f"<!-- AGENT_DISCUSS_CONSENSUS: {subject} -->")

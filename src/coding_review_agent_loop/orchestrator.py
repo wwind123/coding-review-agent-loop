@@ -3439,26 +3439,27 @@ def _discuss_subject(issue_context: IssueContext) -> str:
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
 
-def _aggregate_discuss_votes(
+def _merge_discuss_split_proposals(votes: Sequence[ParsedDiscussReview]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for vote in votes:
+        for proposal in vote.split_proposals:
+            if proposal not in seen:
+                seen.add(proposal)
+                merged.append(proposal)
+    return merged
+
+
+def _detect_discuss_consensus(
     votes: list[ParsedDiscussReview],
-) -> tuple[str, list[str]]:
-    outcomes = [v.outcome for v in votes]
-    if any(o == "do-not-implement" for o in outcomes):
-        return "do-not-implement", []
-    if any(o == "needs-human" for o in outcomes):
-        return "needs-human", []
-    if all(o == "implement" for o in outcomes):
-        return "implement", []
-    if all(o == "split" for o in outcomes):
-        seen: set[str] = set()
-        merged: list[str] = []
-        for v in votes:
-            for p in v.split_proposals:
-                if p not in seen:
-                    seen.add(p)
-                    merged.append(p)
-        return "split", merged
-    return "needs-human", []
+) -> tuple[str, list[str]] | None:
+    if not votes:
+        return None
+    outcome = votes[0].outcome
+    if any(vote.outcome != outcome for vote in votes):
+        return None
+    split_proposals = _merge_discuss_split_proposals(votes) if outcome == "split" else []
+    return outcome, split_proposals
 
 
 def _run_discuss_loop(
@@ -3467,8 +3468,11 @@ def _run_discuss_loop(
     issue_number: int,
     config: AgentLoopConfig,
     usage_context: RunUsageContext,
+    discuss_max_rounds: int = 2,
 ) -> int:
     from .config import reviewers as _reviewers
+    if discuss_max_rounds < 0:
+        raise AgentLoopError("--discuss-max-rounds must be zero or greater.")
     issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
     subject = _discuss_subject(issue_context)
     for comment in issue_context.comments or []:
@@ -3478,41 +3482,72 @@ def _run_discuss_loop(
             log(config, f"discuss: found matching consensus comment for issue #{issue_number}; skipping")
             return 0
     memory = prepare_agent_memory(runner, config)
-    reviewer_votes: list[ParsedDiscussReview] = []
-    for reviewer in _reviewers(config):
-        reviewer_name = agent_display_name(reviewer)
-        log(config, f"discuss: invoking {reviewer_name} on issue #{issue_number}")
-        response = _run_validated_agent(
-            runner,
-            agent=reviewer,
-            config=config,
-            prompt=build_discuss_review_prompt(
-                issue_number,
+    round_history: list[list[ParsedDiscussReview]] = []
+    consensus: tuple[str, list[str]] | None = None
+    max_round_number = discuss_max_rounds + 1
+    for round_number in range(1, max_round_number + 1):
+        prior_round_votes = round_history[-1] if round_history else []
+        reviewer_votes: list[ParsedDiscussReview] = []
+        for reviewer in _reviewers(config):
+            reviewer_name = agent_display_name(reviewer)
+            log(
                 config,
-                reviewer=reviewer,
-                memory=memory,
-                issue_context=issue_context,
-            ),
-            marker_description="<!-- AGENT_PLAN_STATE: approved -->",
-            validate=lambda text, r=reviewer_name: validate_structured_discuss_review(text, reviewer=r),
-            usage_context=usage_context,
-            use_repair=True,
-            repair_expected_kind="discuss_review",
-            role="reviewer",
-        )
-        parsed = response.marker_value
-        assert isinstance(parsed, ParsedDiscussReview)
-        reviewer_votes.append(parsed)
-    outcome, split_proposals = _aggregate_discuss_votes(reviewer_votes)
+                f"discuss: invoking {reviewer_name} on issue #{issue_number} "
+                f"(round {round_number})",
+            )
+            response = _run_validated_agent(
+                runner,
+                agent=reviewer,
+                config=config,
+                prompt=build_discuss_review_prompt(
+                    issue_number,
+                    config,
+                    reviewer=reviewer,
+                    memory=memory,
+                    issue_context=issue_context,
+                    round_number=round_number,
+                    prior_round_votes=prior_round_votes,
+                ),
+                marker_description="<!-- AGENT_PLAN_STATE: approved -->",
+                validate=lambda text, r=reviewer_name, rn=round_number: validate_structured_discuss_review(
+                    text, reviewer=r, round_number=rn
+                ),
+                usage_context=usage_context,
+                use_repair=True,
+                repair_expected_kind="discuss_review",
+                role="reviewer",
+            )
+            parsed = response.marker_value
+            assert isinstance(parsed, ParsedDiscussReview)
+            reviewer_votes.append(parsed)
+        round_history.append(reviewer_votes)
+        consensus = _detect_discuss_consensus(reviewer_votes)
+        if consensus is not None:
+            break
+    final_votes = round_history[-1]
+    if consensus is None:
+        outcome = "needs-human"
+        split_proposals = []
+        consensus_kind = "deadlock"
+    else:
+        outcome, split_proposals = consensus
+        consensus_kind = "unanimous" if len(round_history) == 1 else "converged"
     body = render_discuss_consensus_comment(
         outcome=outcome,
-        reviewer_votes=reviewer_votes,
+        consensus_kind=consensus_kind,
+        round_number=len(round_history),
+        reviewer_votes=final_votes,
+        round_history=round_history,
         split_proposals=split_proposals,
         subject=subject,
         config=config,
     )
     post_issue_comment(runner, config=config, issue_number=issue_number, body=body)
-    log(config, f"discuss: posted consensus comment for issue #{issue_number} (outcome: {outcome})")
+    log(
+        config,
+        f"discuss: posted consensus comment for issue #{issue_number} "
+        f"(outcome: {outcome}; kind: {consensus_kind})",
+    )
     return 0
 
 
@@ -3521,6 +3556,7 @@ def run_discuss_loop(
     *,
     issue_number: int,
     config: AgentLoopConfig,
+    discuss_max_rounds: int = 2,
     usage_context: RunUsageContext | None = None,
 ) -> int:
     owned_usage_context = usage_context is None
@@ -3535,6 +3571,7 @@ def run_discuss_loop(
             issue_number=issue_number,
             config=config,
             usage_context=usage_context,
+            discuss_max_rounds=discuss_max_rounds,
         )
     finally:
         if owned_usage_context:

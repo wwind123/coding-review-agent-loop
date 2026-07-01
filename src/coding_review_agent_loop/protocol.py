@@ -224,6 +224,7 @@ class StructuredDiscussReview:
     outcome: str
     rationale: str
     split_proposals: tuple[str, ...]
+    rebuttal: str | None = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +233,7 @@ class ParsedDiscussReview:
     rationale: str
     split_proposals: tuple[str, ...]
     reviewer: str
+    rebuttal: str | None = None
 
 
 DISCUSS_OUTCOME_VALUES = frozenset({"implement", "do-not-implement", "needs-human", "split"})
@@ -1777,7 +1779,7 @@ def parse_non_blocking_followups(text: str, *, reviewer: str) -> list[ApprovedFo
 
 
 def parse_structured_discuss_review(
-    text: str, *, reviewer: str
+    text: str, *, reviewer: str, round_number: int = 1
 ) -> ParsedDiscussReview | None:
     payload = _extract_structured_discuss_review_payload(text)
     if payload is None:
@@ -1790,7 +1792,7 @@ def parse_structured_discuss_review(
         payload,
         context="discuss_review",
         required={"schema_version", "kind", "outcome", "rationale"},
-        optional={"split_proposals"},
+        optional={"split_proposals", "rebuttal"},
     )
     outcome = _expect_non_empty_string(payload["outcome"], context="discuss_review.outcome")
     if outcome not in DISCUSS_OUTCOME_VALUES:
@@ -1807,16 +1809,24 @@ def parse_structured_discuss_review(
         raise AgentLoopError(
             "discuss_review.split_proposals must be non-empty when outcome is `split`."
         )
+    rebuttal = None
+    if "rebuttal" in payload:
+        rebuttal = _expect_non_empty_string(payload["rebuttal"], context="discuss_review.rebuttal")
+    if round_number > 1 and rebuttal is None:
+        raise AgentLoopError("discuss_review.rebuttal is required for debate rounds.")
     return ParsedDiscussReview(
         outcome=outcome,
         rationale=rationale,
         split_proposals=split_proposals,
         reviewer=reviewer,
+        rebuttal=rebuttal,
     )
 
 
-def validate_structured_discuss_review(text: str, *, reviewer: str) -> ParsedDiscussReview:
-    parsed = parse_structured_discuss_review(text, reviewer=reviewer)
+def validate_structured_discuss_review(
+    text: str, *, reviewer: str, round_number: int = 1
+) -> ParsedDiscussReview:
+    parsed = parse_structured_discuss_review(text, reviewer=reviewer, round_number=round_number)
     if parsed is not None:
         return parsed
     raise AgentLoopError("Discuss review did not use the required structured format.")

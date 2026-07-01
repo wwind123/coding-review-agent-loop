@@ -1193,6 +1193,30 @@ def test_omitted_cli_base_is_preserved_for_runtime_resolution(tmp_path):
     assert config_from_args(args, FakeRunner()).base is None
 
 
+def test_discuss_max_rounds_cli_is_discuss_only():
+    parser = build_parser()
+    args = parser.parse_args([
+        "discuss",
+        "56",
+        "--repo",
+        "OWNER/REPO",
+        "--discuss-max-rounds",
+        "4",
+    ])
+
+    assert args.discuss_max_rounds == 4
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "pr",
+            "77",
+            "--repo",
+            "OWNER/REPO",
+            "--discuss-max-rounds",
+            "4",
+        ])
+
+
 def test_pre_review_tests_cli_defaults_on_and_can_be_disabled(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
@@ -3622,5 +3646,4 @@ def test_format_invalid_agent_response_error_no_suggestion_empty_response():
         category="empty-response",
     )
     assert "Suggestion:" not in msg
-
 

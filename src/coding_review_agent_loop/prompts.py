@@ -18,6 +18,7 @@ from .memory import AgentMemoryContext, format_agent_memory_context
 from .protocol import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
+    ParsedDiscussReview,
     UnresolvedReviewItem,
 )
 from .workdirs import agent_workdir
@@ -2154,13 +2155,45 @@ def build_discuss_review_prompt(
     reviewer: AgentName,
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
+    round_number: int = 1,
+    prior_round_votes: Sequence[ParsedDiscussReview] | None = None,
 ) -> str:
     reviewer_signature = agent_signature(reviewer, config)
+    prior_round_votes = tuple(prior_round_votes or ())
+    if round_number <= 1:
+        round_context = (
+            "This is round 1. Evaluate independently; do not assume other reviewers agree."
+        )
+        rebuttal_rule = "- `rebuttal` may be omitted in round 1."
+        rebuttal_example = ""
+    else:
+        prior_lines: list[str] = [
+            f"This is debate round {round_number}. Review the complete prior round below, "
+            "then either keep your position or change it.",
+            "",
+            "Prior round reviewer positions:",
+        ]
+        for vote in prior_round_votes:
+            prior_lines.append(f"- {vote.reviewer}: `{vote.outcome}`")
+            prior_lines.append(f"  Rationale: {vote.rationale}")
+            if vote.rebuttal:
+                prior_lines.append(f"  Rebuttal: {vote.rebuttal}")
+            if vote.split_proposals:
+                prior_lines.append("  Split proposals:")
+                for proposal in vote.split_proposals:
+                    prior_lines.append(f"  - {proposal}")
+        round_context = "\n".join(prior_lines)
+        rebuttal_rule = (
+            "- `rebuttal` is required in debate rounds and must directly engage the prior "
+            "round disagreement."
+        )
+        rebuttal_example = ',\n  "rebuttal": "I considered the scope objection, but the issue is narrow enough because the API boundary is already specified."'
     return f"""Evaluate GitHub issue #{issue_number} in {config.repo} and vote on whether it should be implemented.
 
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this evaluation.
 {_issue_context_block(issue_context)}{_memory_block(memory)}
+{round_context}
 
 Vote on one of these outcomes:
 - `implement` — the issue is well-defined and should be implemented as described.
@@ -2175,7 +2208,7 @@ Respond using this mandatory structured JSON format:
   "kind": "discuss_review",
   "outcome": "implement",
   "rationale": "The feature is clearly scoped and fills a documented user need.",
-  "split_proposals": []
+  "split_proposals": []{rebuttal_example}
 }}
 <!-- AGENT_PLAN_STATE: approved -->
 -- {reviewer_signature}
@@ -2184,6 +2217,7 @@ Rules:
 - `outcome` must be exactly one of: `implement`, `do-not-implement`, `needs-human`, `split`.
 - `rationale` is required and must be non-empty.
 - `split_proposals` is required and must be non-empty when `outcome` is `split`; omit or use `[]` for other outcomes.
+{rebuttal_rule}
 - The footer must always be `<!-- AGENT_PLAN_STATE: approved -->` regardless of your outcome.
 - Do not include prose or code fences before the JSON object.
 - Do not place your signature before the `AGENT_PLAN_STATE` footer.
