@@ -2157,9 +2157,11 @@ def build_discuss_review_prompt(
     issue_context: IssueContext | None = None,
     round_number: int = 1,
     prior_round_votes: Sequence[ParsedDiscussReview] | None = None,
+    prior_round_agenda: Sequence[str] | None = None,
 ) -> str:
     reviewer_signature = agent_signature(reviewer, config)
     prior_round_votes = tuple(prior_round_votes or ())
+    prior_round_agenda = tuple(prior_round_agenda or ())
     if round_number <= 1:
         round_context = (
             "This is round 1. Evaluate independently; do not assume other reviewers agree."
@@ -2182,6 +2184,10 @@ def build_discuss_review_prompt(
                 prior_lines.append("  Split proposals:")
                 for proposal in vote.split_proposals:
                     prior_lines.append(f"  - {proposal}")
+        if prior_round_agenda:
+            prior_lines.append("")
+            prior_lines.append("Orchestrator's round summary and agenda for this round:")
+            prior_lines.extend(prior_round_agenda)
         round_context = "\n".join(prior_lines)
         rebuttal_rule = (
             "- `rebuttal` is required in debate rounds and must directly engage the prior "

@@ -547,6 +547,7 @@ def render_public_agent_comment(
         | StructuredCoderFollowup
         | StructuredPlanRevision
         | StructuredPlanState
+        | ParsedDiscussReview
     ),
     agent: str,
     config: AgentLoopConfig | None = None,
@@ -555,6 +556,7 @@ def render_public_agent_comment(
     dispositions: Sequence[ReviewItemDisposition] = (),
     raw_text: str = "",
     human_requirements_resolved_flag: bool = False,
+    round_number: int = 1,
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -616,22 +618,101 @@ def render_public_agent_comment(
             config=config,
             model_used=model_used,
         )
+    if kind == "discuss_review":
+        if not isinstance(parsed, ParsedDiscussReview):
+            raise AgentLoopError("render_public_agent_comment expected ParsedDiscussReview.")
+        return _render_public_discuss_review_comment(
+            parsed,
+            reviewer=agent,
+            round_number=round_number,
+            config=config,
+            model_used=model_used,
+        )
     raise AgentLoopError(f"Unknown render kind: {kind}")
 
 
-def render_discuss_consensus_comment(
+_DISCUSS_OUTCOME_LABELS = {
+    "implement": "Implement",
+    "do-not-implement": "Do Not Implement",
+    "needs-human": "Needs Human Review",
+    "split": "Split",
+}
+
+
+def _render_public_discuss_review_comment(
+    parsed: ParsedDiscussReview,
     *,
-    outcome: str,
-    consensus_kind: str = "unanimous",
+    reviewer: str,
     round_number: int = 1,
-    reviewer_votes: list[ParsedDiscussReview],
-    round_history: Sequence[Sequence[ParsedDiscussReview]] | None = None,
-    split_proposals: list[str],
-    subject: str,
-    config: object,
+    config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
 ) -> str:
+    outcome_label = _DISCUSS_OUTCOME_LABELS.get(parsed.outcome, parsed.outcome)
+    sections: list[str] = [
+        f"## Round {round_number}: {reviewer} position",
+        f"**Vote:** {outcome_label} (`{parsed.outcome}`)",
+        parsed.rationale.strip(),
+    ]
+    if parsed.rebuttal:
+        sections.append("### Rebuttal\n\n" + parsed.rebuttal.strip())
+    if parsed.split_proposals:
+        proposals = "\n".join(f"- {proposal}" for proposal in parsed.split_proposals)
+        sections.append("### Proposed sub-issues\n\n" + proposals)
+    sections.append(f"-- {_comment_signature(reviewer, config, model_used)}")
+    return "\n\n".join(section for section in sections if section)
+
+
+def _render_discuss_agenda_lines(votes: Sequence[ParsedDiscussReview]) -> list[str]:
+    return [f"- {vote.reviewer} held `{vote.outcome}`: {vote.rationale}" for vote in votes]
+
+
+def render_discuss_round_summary_comment(
+    *,
+    is_final: bool,
+    subject: str,
+    round_number: int = 1,
+    reviewer_votes: Sequence[ParsedDiscussReview],
+    outcome: str | None = None,
+    consensus_kind: str = "unanimous",
+    round_history: Sequence[Sequence[ParsedDiscussReview]] | None = None,
+    split_proposals: Sequence[str] | None = None,
+) -> str:
+    """Render the orchestrator/analyzer round-summary comment.
+
+    When `is_final` is False this closes out an inconclusive round with an
+    agenda for the next round; when True it renders the same consensus/deadlock
+    content previously produced by `render_discuss_consensus_comment`, plus the
+    marker that final-only idempotency and legacy detection rely on.
+    """
+    split_proposals = list(split_proposals or ())
+    if not is_final:
+        lines: list[str] = [
+            f"## Round {round_number} summary: Consensus Pending",
+            "",
+            "| Reviewer | Outcome | Rationale |",
+            "| --- | --- | --- |",
+        ]
+        for vote in reviewer_votes:
+            rationale = vote.rationale.replace("|", "\\|").replace("\n", " ")
+            lines.append(f"| {vote.reviewer} | {vote.outcome} | {rationale} |")
+        if split_proposals:
+            lines.append("")
+            lines.append("### Proposed sub-issues raised this round")
+            lines.append("")
+            for proposal in split_proposals:
+                lines.append(f"- {proposal}")
+        lines.append("")
+        lines.append(f"### Agenda for round {round_number + 1}")
+        lines.append("")
+        lines.extend(_render_discuss_agenda_lines(reviewer_votes))
+        lines.append("")
+        lines.append("-- Orchestrator")
+        return "\n".join(lines)
+
     if consensus_kind not in {"unanimous", "converged", "deadlock"}:
         raise AgentLoopError("consensus_kind must be `unanimous`, `converged`, or `deadlock`.")
+    if outcome is None:
+        raise AgentLoopError("outcome is required when is_final=True.")
     outcome_heading = {
         "implement": "Consensus: Implement",
         "do-not-implement": "Consensus: Do Not Implement",
@@ -640,15 +721,10 @@ def render_discuss_consensus_comment(
     }.get(outcome, f"Consensus: {outcome}")
     if consensus_kind == "deadlock":
         outcome_heading = "Consensus: Needs Human Review (Deadlock)"
-    kind_label = {
-        "unanimous": "unanimous",
-        "converged": "converged",
-        "deadlock": "deadlock",
-    }[consensus_kind]
-    lines: list[str] = [
+    lines = [
         f"## {outcome_heading}",
         "",
-        f"Consensus kind: `{kind_label}` after round {round_number}.",
+        f"Consensus kind: `{consensus_kind}` after round {round_number}.",
         "",
         "| Reviewer | Outcome | Rationale |",
         "| --- | --- | --- |",
@@ -667,8 +743,7 @@ def render_discuss_consensus_comment(
         lines.append("")
         lines.append("### Core disagreement")
         lines.append("")
-        for vote in reviewer_votes:
-            lines.append(f"- {vote.reviewer} held `{vote.outcome}`: {vote.rationale}")
+        lines.extend(_render_discuss_agenda_lines(reviewer_votes))
     if outcome == "split" and split_proposals:
         lines.append("")
         lines.append("### Proposed sub-issues")

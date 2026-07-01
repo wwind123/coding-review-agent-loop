@@ -299,10 +299,35 @@ agent-loop discuss 123 --repo OWNER/REPO
 
 Discuss mode sends the issue title, body, and comments to all configured
 reviewers and asks each to return a `discuss_review` response with a single
-outcome vote. Round 1 is independent. If reviewers disagree, each later debate
-round includes the complete prior round positions and requires each reviewer to
-include a non-empty `rebuttal` that engages the disagreement. The four possible
-votes are:
+outcome vote. Instead of collapsing a round into one orchestrator comment,
+discuss mode posts a transcript to the issue, similar to how PR review mode
+posts a comment per reviewer per round:
+
+1. Each configured reviewer ("debater") posts its own issue comment with its
+   structured vote and rationale, tagged with round metadata.
+2. Once every reviewer has posted for the round, the orchestrator posts a
+   separate round-summary comment identifying consensus or disagreement.
+3. If the round is not the final one, the summary comment also lists the
+   agenda for the next round (each reviewer's held position). Unresolved
+   disagreement carries this agenda plus the prior round's comments into the
+   next round's prompts, and requires each reviewer to include a non-empty
+   `rebuttal` that engages the disagreement.
+4. The final consensus/deadlock result is always its own round-summary
+   comment, separate from the per-reviewer comments and from any interim
+   round summaries.
+
+A two-round debate transcript looks like:
+
+```text
+Round 1: Codex position
+Round 1: Antigravity position
+Round 1: Orchestrator summary (agenda for round 2)
+Round 2: Codex rebuttal
+Round 2: Antigravity rebuttal
+Round 2: Orchestrator final consensus/deadlock
+```
+
+The four possible votes are:
 
 | Vote | Meaning |
 |------|---------|
@@ -317,15 +342,20 @@ By default, the orchestrator runs up to two debate rounds after round 1. Set
 `--discuss-max-rounds 0` to post a human-needed deadlock immediately after an
 initial disagreement, or increase the value to allow more debate.
 
-If no consensus is reached after the configured debate rounds, the orchestrator
-posts a `deadlock` comment with the `needs-human` outcome, each final reviewer
-position, and the core disagreement. `split` proposals from multiple reviewers
-are merged in first-seen order only when all reviewers in the same round agree
-on `split`. Discuss runs are idempotent: the consensus comment includes an
+If no consensus is reached after the configured debate rounds, the final
+round-summary comment is a `deadlock` comment with the `needs-human` outcome,
+each final reviewer position, and the core disagreement. `split` proposals
+from multiple reviewers are merged in first-seen order only when all reviewers
+in the same round agree on `split`. Discuss runs are idempotent and resumable:
+the final round-summary comment includes an
 `<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->` marker derived from the issue
-title, body, and non-consensus comment bodies. A re-run on an unchanged issue
-posts no second comment; posting a new comment on the issue invalidates the
-cached consensus and triggers a fresh evaluation.
+title, body, and non-round comment bodies, and every posted comment carries an
+`<!-- AGENT_LOOP_META: ... -->` marker the orchestrator decodes to reconstruct
+completed rounds — including a round that only partially posted before a
+crash — from the public comment thread on the next run, without relying on one
+aggregate comment. A re-run on an unchanged issue with a final result posts no
+second transcript; posting a new human comment on the issue invalidates the
+cached result and triggers a fresh evaluation from round 1.
 
 Discuss mode accepts `--reviewer` the same way as PR mode — repeat the flag to
 require multiple reviewers:

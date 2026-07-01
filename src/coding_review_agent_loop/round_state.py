@@ -15,8 +15,10 @@ from .errors import AgentLoopError
 from .protocol import (
     HTML_COMMENT_RE,
     SIGNATURE_RE,
+    ParsedDiscussReview,
     ReviewItemDisposition,
     UnresolvedReviewItem,
+    parse_structured_discuss_review,
 )
 from .unresolved_items import _apply_unresolved_item_dispositions
 
@@ -39,6 +41,9 @@ class PostedRoundMetadata:
     compact_prior_summaries: tuple[str, ...] = ()
     usage: dict | None = None
     model_used: str | None = None
+    consensus_kind: str | None = None
+    is_final: bool = False
+    agenda: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,6 +135,9 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "compact_prior_summaries": list(metadata.compact_prior_summaries),
         "usage": metadata.usage,
         "model_used": metadata.model_used,
+        "consensus_kind": metadata.consensus_kind,
+        "is_final": metadata.is_final,
+        "agenda": list(metadata.agenda),
     }
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -168,6 +176,9 @@ def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:
             ),
             usage=payload.get("usage") if isinstance(payload.get("usage"), dict) else None,
             model_used=str(payload["model_used"]) if payload.get("model_used") is not None else None,
+            consensus_kind=str(payload["consensus_kind"]) if payload.get("consensus_kind") is not None else None,
+            is_final=bool(payload.get("is_final", False)),
+            agenda=tuple(str(item) for item in payload.get("agenda", [])),
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise AgentLoopError("Invalid AGENT_LOOP_META payload.") from exc
@@ -538,4 +549,93 @@ def _resume_plan_round(
             ledger_may_be_incomplete=ledger_may_be_incomplete,
             compact_prior_summaries=latest_coder_record.metadata.compact_prior_summaries,
         ),
+    )
+
+
+@dataclass(frozen=True)
+class ResumedDiscussState:
+    done: bool
+    round_history: tuple[tuple[ParsedDiscussReview, ...], ...]
+    next_round_number: int
+    prior_round_agenda: tuple[str, ...] = ()
+    in_progress_votes: dict[str, ParsedDiscussReview] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.in_progress_votes is None:
+            object.__setattr__(self, "in_progress_votes", {})
+
+
+def _decode_discuss_vote(record: PostedRoundRecord, *, round_number: int) -> ParsedDiscussReview:
+    text = record.metadata.raw_structured_coder_response or record.body
+    vote = parse_structured_discuss_review(text, reviewer=record.metadata.agent, round_number=round_number)
+    if vote is None:
+        raise AgentLoopError(
+            f"Could not decode discuss_review metadata for {record.metadata.agent} "
+            f"(round {round_number}); the posted comment's structured payload is missing "
+            "or invalid."
+        )
+    return vote
+
+
+def _resume_discuss_round(
+    comments: Sequence[object],
+    *,
+    subject: str,
+    configured_reviewers: Sequence[AgentName],
+) -> ResumedDiscussState | None:
+    records = _extract_round_metadata_records(comments, flow="discuss")
+    subject_records = [record for record in records if record.metadata.subject == subject]
+    if not subject_records:
+        return None
+    configured_reviewer_names = [agent_display_name(agent) for agent in configured_reviewers]
+    rounds: dict[int, list[PostedRoundRecord]] = {}
+    for record in subject_records:
+        rounds.setdefault(record.metadata.round_number, []).append(record)
+
+    round_history: list[tuple[ParsedDiscussReview, ...]] = []
+    prior_round_agenda: tuple[str, ...] = ()
+    next_round_number = 1
+    in_progress_votes: dict[str, ParsedDiscussReview] = {}
+    for round_number in sorted(rounds):
+        round_records = rounds[round_number]
+        summary_record = next(
+            (record for record in round_records if record.metadata.role == "summary"), None
+        )
+        debater_records: dict[str, PostedRoundRecord] = {}
+        for record in round_records:
+            if record.metadata.role == "debater":
+                debater_records[record.metadata.agent] = record
+        if summary_record is not None:
+            missing = [name for name in configured_reviewer_names if name not in debater_records]
+            if missing:
+                raise AgentLoopError(
+                    "Discuss round metadata is inconsistent: round "
+                    f"{round_number} has a summary comment but is missing debater "
+                    f"comments for: {', '.join(missing)}."
+                )
+            votes = tuple(
+                _decode_discuss_vote(debater_records[name], round_number=round_number)
+                for name in configured_reviewer_names
+            )
+            round_history.append(votes)
+            prior_round_agenda = summary_record.metadata.agenda
+            if summary_record.metadata.is_final:
+                return ResumedDiscussState(
+                    done=True,
+                    round_history=tuple(round_history),
+                    next_round_number=round_number,
+                    prior_round_agenda=prior_round_agenda,
+                )
+            next_round_number = round_number + 1
+        else:
+            next_round_number = round_number
+            for name, record in debater_records.items():
+                in_progress_votes[name] = _decode_discuss_vote(record, round_number=round_number)
+            break
+    return ResumedDiscussState(
+        done=False,
+        round_history=tuple(round_history),
+        next_round_number=next_round_number,
+        prior_round_agenda=prior_round_agenda,
+        in_progress_votes=in_progress_votes,
     )

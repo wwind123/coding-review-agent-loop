@@ -9,11 +9,12 @@ import pytest
 
 from coding_review_agent_loop.comment_rendering import (
     _render_public_coder_followup_comment,
+    _render_public_discuss_review_comment,
     _render_public_plan_review_comment,
     _render_public_plan_revision_comment,
     _render_public_pr_review_comment,
     normalize_freeform_signature,
-    render_discuss_consensus_comment,
+    render_discuss_round_summary_comment,
 )
 from coding_review_agent_loop.protocol import ParsedDiscussReview
 from coding_review_agent_loop.orchestrator import (
@@ -40,7 +41,6 @@ from coding_review_agent_loop.protocol import (
 
 from agent_loop_helpers import (
     blocking_issues,
-    make_config,
     prior_item_dispositions,
     prior_plan_item_dispositions,
     structured_coder_followup,
@@ -696,7 +696,7 @@ def test_render_public_review_comment_preserves_unknown_disposition_values():
     ) in rendered
 
 
-# --- render_discuss_consensus_comment tests ---
+# --- render_discuss_round_summary_comment tests ---
 
 
 def _discuss_vote(
@@ -715,50 +715,46 @@ def _discuss_vote(
     )
 
 
-def test_render_discuss_consensus_comment_implement_heading(tmp_path):
-    config = make_config(tmp_path)
-    rendered = render_discuss_consensus_comment(
+def test_render_discuss_round_summary_comment_final_implement_heading():
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
         outcome="implement",
         reviewer_votes=[_discuss_vote("implement")],
         split_proposals=[],
         subject="abc123",
-        config=config,
     )
     assert "## Consensus: Implement" in rendered
 
 
-def test_render_discuss_consensus_comment_do_not_implement_heading(tmp_path):
-    config = make_config(tmp_path)
-    rendered = render_discuss_consensus_comment(
+def test_render_discuss_round_summary_comment_final_do_not_implement_heading():
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
         outcome="do-not-implement",
         reviewer_votes=[_discuss_vote("do-not-implement", rationale="Out of scope.")],
         split_proposals=[],
         subject="deadbeef",
-        config=config,
     )
     assert "## Consensus: Do Not Implement" in rendered
 
 
-def test_render_discuss_consensus_comment_needs_human_heading(tmp_path):
-    config = make_config(tmp_path)
-    rendered = render_discuss_consensus_comment(
+def test_render_discuss_round_summary_comment_final_needs_human_heading():
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
         outcome="needs-human",
         reviewer_votes=[_discuss_vote("needs-human", rationale="Unclear requirements.")],
         split_proposals=[],
         subject="cafe1234",
-        config=config,
     )
     assert "## Consensus: Needs Human Review" in rendered
 
 
-def test_render_discuss_consensus_comment_split_heading_and_proposals(tmp_path):
-    config = make_config(tmp_path)
-    rendered = render_discuss_consensus_comment(
+def test_render_discuss_round_summary_comment_final_split_heading_and_proposals():
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
         outcome="split",
         reviewer_votes=[_discuss_vote("split", proposals=("Sub A", "Sub B"))],
         split_proposals=["Sub A", "Sub B"],
         subject="f00dbeef",
-        config=config,
     )
     assert "## Consensus: Split" in rendered
     assert "### Proposed sub-issues" in rendered
@@ -766,9 +762,9 @@ def test_render_discuss_consensus_comment_split_heading_and_proposals(tmp_path):
     assert "- Sub B" in rendered
 
 
-def test_render_discuss_consensus_comment_reviewer_table_row(tmp_path):
-    config = make_config(tmp_path)
-    rendered = render_discuss_consensus_comment(
+def test_render_discuss_round_summary_comment_final_reviewer_table_row():
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
         outcome="implement",
         reviewer_votes=[
             _discuss_vote("implement", rationale="Well-scoped.", reviewer="Gemini"),
@@ -776,7 +772,6 @@ def test_render_discuss_consensus_comment_reviewer_table_row(tmp_path):
         ],
         split_proposals=[],
         subject="abc123",
-        config=config,
     )
     assert "| Gemini |" in rendered
     assert "| OpenAI Codex |" in rendered
@@ -784,34 +779,32 @@ def test_render_discuss_consensus_comment_reviewer_table_row(tmp_path):
     assert "Clear value." in rendered
 
 
-def test_render_discuss_consensus_comment_orchestrator_footer(tmp_path):
-    config = make_config(tmp_path)
-    rendered = render_discuss_consensus_comment(
+def test_render_discuss_round_summary_comment_final_orchestrator_footer():
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
         outcome="implement",
         reviewer_votes=[_discuss_vote()],
         split_proposals=[],
         subject="abc123",
-        config=config,
     )
     assert "-- Orchestrator" in rendered
 
 
-def test_render_discuss_consensus_comment_marker_last_line(tmp_path):
-    config = make_config(tmp_path)
+def test_render_discuss_round_summary_comment_final_marker_last_line():
     subject = "deadbeef1234"
-    rendered = render_discuss_consensus_comment(
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
         outcome="implement",
         reviewer_votes=[_discuss_vote()],
         split_proposals=[],
         subject=subject,
-        config=config,
     )
     assert rendered.endswith(f"<!-- AGENT_DISCUSS_CONSENSUS: {subject} -->")
 
 
-def test_render_discuss_consensus_comment_converged_kind_and_rebuttals(tmp_path):
-    config = make_config(tmp_path)
-    rendered = render_discuss_consensus_comment(
+def test_render_discuss_round_summary_comment_final_converged_kind_and_rebuttals():
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
         outcome="implement",
         consensus_kind="converged",
         round_number=2,
@@ -834,16 +827,15 @@ def test_render_discuss_consensus_comment_converged_kind_and_rebuttals(tmp_path)
         ],
         split_proposals=[],
         subject="abc123",
-        config=config,
     )
     assert "Consensus kind: `converged` after round 2." in rendered
     assert "### Final rebuttals" in rendered
     assert "Round 1: Gemini: `needs-human`" in rendered
 
 
-def test_render_discuss_consensus_comment_deadlock_summarizes_disagreement(tmp_path):
-    config = make_config(tmp_path)
-    rendered = render_discuss_consensus_comment(
+def test_render_discuss_round_summary_comment_final_deadlock_summarizes_disagreement():
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
         outcome="needs-human",
         consensus_kind="deadlock",
         round_number=2,
@@ -853,11 +845,100 @@ def test_render_discuss_consensus_comment_deadlock_summarizes_disagreement(tmp_p
         ],
         split_proposals=[],
         subject="abc123",
-        config=config,
     )
     assert "## Consensus: Needs Human Review (Deadlock)" in rendered
     assert "Consensus kind: `deadlock` after round 2." in rendered
     assert "### Core disagreement" in rendered
     assert "Gemini held `implement`: Scoped." in rendered
     assert "OpenAI Codex held `do-not-implement`: Out of scope." in rendered
+
+
+def test_render_discuss_round_summary_comment_interim_round_has_agenda_and_no_marker():
+    rendered = render_discuss_round_summary_comment(
+        is_final=False,
+        round_number=1,
+        reviewer_votes=[
+            _discuss_vote("implement", rationale="Scoped.", reviewer="Gemini"),
+            _discuss_vote("do-not-implement", rationale="Out of scope.", reviewer="OpenAI Codex"),
+        ],
+        split_proposals=[],
+        subject="abc123",
+    )
+    assert "## Round 1 summary: Consensus Pending" in rendered
+    assert "### Agenda for round 2" in rendered
+    assert "Gemini held `implement`: Scoped." in rendered
+    assert "OpenAI Codex held `do-not-implement`: Out of scope." in rendered
+    assert "-- Orchestrator" in rendered
+    assert "AGENT_DISCUSS_CONSENSUS" not in rendered
+    assert "Consensus:" not in rendered
+
+
+def test_render_discuss_round_summary_comment_interim_round_lists_split_proposals():
+    rendered = render_discuss_round_summary_comment(
+        is_final=False,
+        round_number=1,
+        reviewer_votes=[_discuss_vote("split", proposals=("Sub A",), reviewer="Gemini")],
+        split_proposals=["Sub A"],
+        subject="abc123",
+    )
+    assert "### Proposed sub-issues raised this round" in rendered
+    assert "- Sub A" in rendered
+
+
+def test_render_discuss_round_summary_comment_final_includes_full_resumed_history():
+    """A resumed final summary must list every prior round, not just the last one."""
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
+        outcome="implement",
+        consensus_kind="converged",
+        round_number=3,
+        reviewer_votes=[
+            _discuss_vote("implement", reviewer="Gemini"),
+            _discuss_vote("implement", reviewer="OpenAI Codex"),
+        ],
+        round_history=[
+            [
+                _discuss_vote("do-not-implement", reviewer="Gemini"),
+                _discuss_vote("implement", reviewer="OpenAI Codex"),
+            ],
+            [
+                _discuss_vote("do-not-implement", reviewer="Gemini"),
+                _discuss_vote("implement", reviewer="OpenAI Codex"),
+            ],
+            [
+                _discuss_vote("implement", reviewer="Gemini"),
+                _discuss_vote("implement", reviewer="OpenAI Codex"),
+            ],
+        ],
+        split_proposals=[],
+        subject="abc123",
+    )
+    assert "Round 1: Gemini: `do-not-implement`, OpenAI Codex: `implement`" in rendered
+    assert "Round 2: Gemini: `do-not-implement`, OpenAI Codex: `implement`" in rendered
+    assert "Round 3: Gemini: `implement`, OpenAI Codex: `implement`" in rendered
+
+
+def test_render_public_discuss_review_comment_includes_vote_and_signature():
+    vote = _discuss_vote("implement", rationale="Well-scoped.", reviewer="Codex")
+    rendered = _render_public_discuss_review_comment(vote, reviewer="Codex", round_number=1)
+    assert "## Round 1: Codex position" in rendered
+    assert "**Vote:** Implement (`implement`)" in rendered
+    assert "Well-scoped." in rendered
+    assert rendered.strip().endswith("Codex")
+
+
+def test_render_public_discuss_review_comment_includes_rebuttal_and_split_proposals():
+    vote = _discuss_vote(
+        "split",
+        rationale="Too broad.",
+        proposals=("Auth flow",),
+        reviewer="Codex",
+        rebuttal="I still think it should be split.",
+    )
+    rendered = _render_public_discuss_review_comment(vote, reviewer="Codex", round_number=2)
+    assert "## Round 2: Codex position" in rendered
+    assert "### Rebuttal" in rendered
+    assert "I still think it should be split." in rendered
+    assert "### Proposed sub-issues" in rendered
+    assert "- Auth flow" in rendered
 

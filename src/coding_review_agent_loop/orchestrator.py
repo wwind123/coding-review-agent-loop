@@ -144,10 +144,11 @@ from .comment_rendering import (
     _replace_structured_section,
     _review_freeform_summary_text,
     normalize_freeform_signature,
-    render_discuss_consensus_comment,
+    render_discuss_round_summary_comment,
     render_public_agent_comment,
     render_canonical_plan_revision,
     render_canonical_plan_steps,
+    _render_discuss_agenda_lines,
 )
 from .followups import (
     APPROVED_FOLLOWUP_MARKER_RE,
@@ -185,6 +186,7 @@ from .round_state import (
     _max_unresolved_item_number_from_records,
     _plan_subject,
     _prior_item_ledger_signature,
+    _resume_discuss_round,
     _resume_plan_round,
     _resume_pr_round,
     _select_current_round_records,
@@ -3427,15 +3429,28 @@ DISCUSS_CONSENSUS_MARKER_RE = re.compile(
 )
 
 
+def _is_bot_authored_discuss_comment(body: str) -> bool:
+    if DISCUSS_CONSENSUS_MARKER_RE.search(body):
+        return True
+    match = ROUND_RESUME_MARKER_RE.search(body)
+    if match is None:
+        return False
+    try:
+        metadata = _decode_round_metadata(match.group("payload"))
+    except AgentLoopError:
+        return False
+    return metadata.flow == "discuss"
+
+
 def _discuss_subject(issue_context: IssueContext) -> str:
     text = (issue_context.title or "") + "\n\n" + (issue_context.body or "")
-    non_consensus_bodies = [
+    non_bot_bodies = [
         c.body
         for c in issue_context.comments
-        if c.body and not DISCUSS_CONSENSUS_MARKER_RE.search(c.body)
+        if c.body and not _is_bot_authored_discuss_comment(c.body)
     ]
-    if non_consensus_bodies:
-        text += "\n\n" + "\n\n".join(non_consensus_bodies)
+    if non_bot_bodies:
+        text += "\n\n" + "\n\n".join(non_bot_bodies)
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
 
@@ -3481,15 +3496,43 @@ def _run_discuss_loop(
         if m and m.group(1).lower() == subject:
             log(config, f"discuss: found matching consensus comment for issue #{issue_number}; skipping")
             return 0
+    configured_reviewers = list(_reviewers(config))
+    resume_state = _resume_discuss_round(
+        issue_context.comments, subject=subject, configured_reviewers=configured_reviewers
+    )
+    if resume_state is not None and resume_state.done:
+        log(config, f"discuss: found matching round-summary comment for issue #{issue_number}; skipping")
+        return 0
     memory = prepare_agent_memory(runner, config)
-    round_history: list[list[ParsedDiscussReview]] = []
-    consensus: tuple[str, list[str]] | None = None
+    if resume_state is not None:
+        round_history: list[list[ParsedDiscussReview]] = [list(votes) for votes in resume_state.round_history]
+        start_round_number = resume_state.next_round_number
+        prior_round_agenda: list[str] = list(resume_state.prior_round_agenda)
+        in_progress_votes: dict[str, ParsedDiscussReview] = dict(resume_state.in_progress_votes)
+        if round_history or in_progress_votes:
+            log(config, f"discuss: resuming issue #{issue_number} at round {start_round_number}")
+    else:
+        round_history = []
+        start_round_number = 1
+        prior_round_agenda = []
+        in_progress_votes = {}
     max_round_number = discuss_max_rounds + 1
-    for round_number in range(1, max_round_number + 1):
+    for round_number in range(start_round_number, max_round_number + 1):
         prior_round_votes = round_history[-1] if round_history else []
         reviewer_votes: list[ParsedDiscussReview] = []
-        for reviewer in _reviewers(config):
+        for reviewer in configured_reviewers:
             reviewer_name = agent_display_name(reviewer)
+            resumed_vote = (
+                in_progress_votes.get(reviewer_name) if round_number == start_round_number else None
+            )
+            if resumed_vote is not None:
+                log(
+                    config,
+                    f"discuss: resuming {reviewer_name}'s posted round {round_number} position "
+                    f"on issue #{issue_number}",
+                )
+                reviewer_votes.append(resumed_vote)
+                continue
             log(
                 config,
                 f"discuss: invoking {reviewer_name} on issue #{issue_number} "
@@ -3507,6 +3550,7 @@ def _run_discuss_loop(
                     issue_context=issue_context,
                     round_number=round_number,
                     prior_round_votes=prior_round_votes,
+                    prior_round_agenda=prior_round_agenda,
                 ),
                 marker_description="<!-- AGENT_PLAN_STATE: approved -->",
                 validate=lambda text, r=reviewer_name, rn=round_number: validate_structured_discuss_review(
@@ -3519,35 +3563,83 @@ def _run_discuss_loop(
             )
             parsed = response.marker_value
             assert isinstance(parsed, ParsedDiscussReview)
+            post_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=_attach_round_metadata(
+                    render_public_agent_comment(
+                        kind="discuss_review",
+                        parsed=parsed,
+                        agent=reviewer_name,
+                        config=config,
+                        model_used=response.model_used,
+                        round_number=round_number,
+                    ),
+                    PostedRoundMetadata(
+                        flow="discuss",
+                        role="debater",
+                        agent=reviewer_name,
+                        round_number=round_number,
+                        subject=subject,
+                        raw_structured_coder_response=response.text,
+                        model_used=response.model_used,
+                    ),
+                ),
+            )
             reviewer_votes.append(parsed)
         round_history.append(reviewer_votes)
         consensus = _detect_discuss_consensus(reviewer_votes)
-        if consensus is not None:
-            break
-    final_votes = round_history[-1]
-    if consensus is None:
-        outcome = "needs-human"
-        split_proposals = []
-        consensus_kind = "deadlock"
-    else:
-        outcome, split_proposals = consensus
-        consensus_kind = "unanimous" if len(round_history) == 1 else "converged"
-    body = render_discuss_consensus_comment(
-        outcome=outcome,
-        consensus_kind=consensus_kind,
-        round_number=len(round_history),
-        reviewer_votes=final_votes,
-        round_history=round_history,
-        split_proposals=split_proposals,
-        subject=subject,
-        config=config,
-    )
-    post_issue_comment(runner, config=config, issue_number=issue_number, body=body)
-    log(
-        config,
-        f"discuss: posted consensus comment for issue #{issue_number} "
-        f"(outcome: {outcome}; kind: {consensus_kind})",
-    )
+        is_final = consensus is not None or round_number == max_round_number
+        if consensus is None:
+            outcome = "needs-human"
+            round_split_proposals: list[str] = _merge_discuss_split_proposals(reviewer_votes)
+            consensus_kind = "deadlock" if is_final else None
+        else:
+            outcome, round_split_proposals = consensus
+            consensus_kind = ("unanimous" if len(round_history) == 1 else "converged") if is_final else None
+        summary_body = render_discuss_round_summary_comment(
+            round_number=round_number,
+            reviewer_votes=reviewer_votes,
+            is_final=is_final,
+            subject=subject,
+            outcome=outcome if is_final else None,
+            consensus_kind=consensus_kind,
+            round_history=round_history if is_final else None,
+            split_proposals=round_split_proposals,
+        )
+        agenda = () if is_final else tuple(_render_discuss_agenda_lines(reviewer_votes))
+        post_issue_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=_attach_round_metadata(
+                summary_body,
+                PostedRoundMetadata(
+                    flow="discuss",
+                    role="summary",
+                    agent="Orchestrator",
+                    round_number=round_number,
+                    subject=subject,
+                    is_final=is_final,
+                    consensus_kind=consensus_kind,
+                    agenda=agenda,
+                ),
+            ),
+        )
+        if is_final:
+            log(
+                config,
+                f"discuss: posted final summary comment for issue #{issue_number} "
+                f"(outcome: {outcome}; kind: {consensus_kind})",
+            )
+            return 0
+        log(
+            config,
+            f"discuss: posted round {round_number} summary comment for issue #{issue_number}; "
+            f"continuing to round {round_number + 1}",
+        )
+        prior_round_agenda = list(agenda)
     return 0
 
 

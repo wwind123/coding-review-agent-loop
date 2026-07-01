@@ -277,10 +277,25 @@ agent-loop discuss 123 --repo OWNER/REPO
 
 Each reviewer returns a `discuss_review` with one of four outcome votes:
 `implement`, `do-not-implement`, `needs-human`, or `split` (with sub-issue
-proposals). If all reviewers agree in round 1, the consensus comment is marked
-`unanimous`. If they disagree, each debate round sends reviewers the complete
-previous round positions and requires a non-empty `rebuttal` that engages the
-disagreement. Agreement after debate is marked `converged`.
+proposals). Discuss mode posts a readable transcript to the issue instead of a
+single aggregate comment: each round, every reviewer posts its own vote and
+rationale as a separate issue comment, and once all reviewers for the round
+have posted, the orchestrator posts a round-summary comment. If all reviewers
+agree in round 1, that round's summary is the final result and is marked
+`unanimous`. If they disagree, the summary lists the disagreement and the
+agenda for the next round, and each debate round sends reviewers the complete
+previous round positions plus that agenda and requires a non-empty `rebuttal`
+that engages the disagreement. Agreement after debate is marked `converged`. A
+transcript looks like:
+
+```text
+Round 1: Codex position
+Round 1: Antigravity position
+Round 1: Orchestrator summary (agenda for round 2)
+Round 2: Codex rebuttal
+Round 2: Antigravity rebuttal
+Round 2: Orchestrator final consensus/deadlock
+```
 
 By default, discuss mode runs up to two debate rounds after the initial round.
 Use `--discuss-max-rounds` to change that limit:
@@ -291,15 +306,20 @@ agent-loop discuss 123 --repo OWNER/REPO \
   --discuss-max-rounds 2
 ```
 
-If reviewers still disagree after the configured debate rounds, the comment is
-marked `deadlock`, uses the `needs-human` outcome, and summarizes each final
-position and the core disagreement. `split` proposals are merged in first-seen
-order only when all reviewers in the same round agree on `split`. Discuss runs
-are idempotent: the consensus comment includes an
-`<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->` marker derived from the issue
-title, body, and non-consensus comment bodies. Re-running on an unchanged issue
-posts no second comment; posting a new comment on the issue invalidates the
-cached consensus and triggers a fresh evaluation.
+If reviewers still disagree after the configured debate rounds, the final
+round-summary comment is marked `deadlock`, uses the `needs-human` outcome, and
+summarizes each final position and the core disagreement. `split` proposals
+are merged in first-seen order only when all reviewers in the same round agree
+on `split`. Only the final round-summary comment is marked as the result; the
+per-reviewer and interim round-summary comments remain separately identifiable
+in the issue timeline. Discuss runs are idempotent and resumable: the final
+summary comment includes an `<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->`
+marker derived from the issue title, body, and non-round comment bodies, and
+each posted comment carries round metadata the orchestrator uses to
+reconstruct completed rounds (including a partially-completed round) on the
+next run. Re-running after a final summary posts no second transcript; posting
+a new human comment on the issue invalidates the cached result and triggers a
+fresh evaluation from round 1.
 
 When `--base` is omitted, `pr` mode uses the pull request's base branch.
 `issue` and `task` modes use the repository default branch. If PR metadata does
@@ -588,7 +608,7 @@ The test suite is split across focused modules for faster, targeted runs:
 | `tests/test_backends.py` | Claude, Gemini, and Codex backend output parsing and normalization |
 | `tests/test_protocol.py` | Protocol parsing and validation (parse_review, parse_plan_review, structured payloads) |
 | `tests/test_comment_rendering.py` | Comment rendering (render_canonical_plan_steps, render_public_agent_comment, etc.) |
-| `tests/test_discuss_loop.py` | Discuss mode loop tests (happy path, debate/deadlock, idempotent resume, split proposals) |
+| `tests/test_discuss_loop.py` | Discuss mode loop tests (per-round comments, debate/deadlock, idempotent and mid-round/multi-round resume, split proposals) |
 | `tests/test_skill_helpers.py` | Skill helper function tests |
 | `tests/test_skill_loop.py` | Skill loop integration tests |
 | `tests/test_transient.py` | Transient error detection tests |
