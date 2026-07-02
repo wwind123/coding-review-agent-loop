@@ -59,6 +59,26 @@ def _pr_check_blocking_review(pr_number: int, state: str, details: list[str]) ->
     return "\n".join(lines)
 
 
+def _pending_ci_stop_message(pr_number: int, state: str, details: list[str]) -> str:
+    headline = {
+        "pending": f"Reviewers approved PR #{pr_number}, but GitHub checks are still pending.",
+        "unavailable": (
+            f"Reviewers approved PR #{pr_number}, but GitHub check status is unavailable."
+        ),
+    }[state]
+    lines = [
+        headline,
+        "",
+        "This is an external wait, not actionable coder feedback, so no new follow-up "
+        "round was started. Rerun once GitHub checks complete (or check status can be "
+        "confirmed) to finish approval.",
+        "",
+    ]
+    lines.extend(f"- {detail}" for detail in details)
+    lines.extend(["", "-- coding-review-agent-loop"])
+    return "\n".join(lines)
+
+
 def _pr_check_details(pr_checks: PullRequestChecks) -> list[str]:
     details: list[str] = []
     if pr_checks.required_checks:

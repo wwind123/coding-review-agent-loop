@@ -747,7 +747,108 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
     assert "Failing checks: tests/test_security.py (failure)" in followup_prompt
     assert "Do not claim global test success unless GitHub PR checks are green." in followup_prompt
 
-def test_pr_loop_blocks_final_approval_when_github_checks_pending(tmp_path):
+def test_pr_loop_failing_github_checks_block_approval_even_with_auto_merge(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="LGTM.")],
+        pr_check_runs_payload={
+            "check_runs": [{"name": "test", "status": "completed", "conclusion": "failure"}]
+        },
+    )
+    config = make_config(tmp_path, auto_merge=True, max_rounds=1)
+
+    with pytest.raises(AgentLoopError, match="blocking issues after round 1"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert any(
+        comment.startswith("GitHub PR checks are failing for PR #77.") for comment in runner.comments
+    )
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+def test_pr_loop_downgrades_pending_ci_only_blocking_review_without_auto_merge(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Model-default consistency gaps are fixed.",
+                blocking_items=["GitHub check `test` is still pending/in_progress."],
+            )
+        ],
+        pr_check_runs_payload={"check_runs": []},
+        pr_status_payload={"state": "pending", "statuses": []},
+        pr_branch_protection_payload={"contexts": ["test"]},
+    )
+    config = make_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    review_comment = runner.comments[0]
+    assert review_comment.startswith("**Review verdict:** Approved")
+    assert "### Blocking issues" not in review_comment
+    stop_comment = runner.comments[-1]
+    assert stop_comment.startswith("Reviewers approved PR #77, but GitHub checks are still pending.")
+
+def test_pr_loop_downgrades_pending_ci_only_blocking_review_with_auto_merge(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Model-default consistency gaps are fixed.",
+                blocking_items=["GitHub check `test` is still pending/in_progress."],
+            )
+        ],
+        pr_check_runs_payload={"check_runs": []},
+        pr_status_payload={"state": "pending", "statuses": []},
+        pr_branch_protection_payload={"contexts": ["test"]},
+    )
+    config = make_config(tmp_path, auto_merge=True)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    assert any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+    review_comment = runner.comments[0]
+    assert review_comment.startswith("**Review verdict:** Approved")
+
+def test_pr_loop_keeps_blocking_review_when_mixed_with_real_finding(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Missing null check in models.py causing a crash on empty input.",
+                blocking_items=[
+                    "Missing null check in models.py causing a crash on empty input.",
+                    "GitHub check `test` is still pending/in_progress.",
+                ],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Codex final approval.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking",
+                summary="Added the missing null check.",
+                addressed_items=["item-1"],
+                remaining_items=[],
+            ),
+        ],
+        pr_check_runs_payload={"check_runs": []},
+        pr_status_payload={"state": "pending", "statuses": []},
+        pr_branch_protection_payload={"contexts": ["test"]},
+    )
+    config = make_config(tmp_path, max_rounds=2)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    review_comment = next(comment for comment in runner.comments if "Missing null check" in comment)
+    assert review_comment.startswith("**Review verdict:** Blocking")
+    followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Missing null check in models.py" in followup_prompt
+
+def test_pr_loop_stops_gracefully_when_github_checks_pending_without_auto_merge(tmp_path):
     runner = FakeRunner(
         codex_outputs=["Looks good locally.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
         pr_check_runs_payload={"check_runs": []},
@@ -756,15 +857,18 @@ def test_pr_loop_blocks_final_approval_when_github_checks_pending(tmp_path):
     )
     config = make_config(tmp_path)
 
-    with pytest.raises(AgentLoopError, match="GitHub PR checks for PR #77 are pending"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert any(
         comment.startswith("GitHub PR checks are still pending for PR #77.")
         for comment in runner.comments
     )
+    stop_comment = runner.comments[-1]
+    assert stop_comment.startswith("Reviewers approved PR #77, but GitHub checks are still pending.")
+    assert "external wait" in stop_comment
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
-def test_pr_loop_summarizes_approved_followups_before_pending_check_exit(tmp_path):
+def test_pr_loop_summarizes_approved_followups_before_pending_check_stop(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
             "Looks good locally.\n\n### Future follow-ups\n- Add cleanup docs.\n"
@@ -776,14 +880,14 @@ def test_pr_loop_summarizes_approved_followups_before_pending_check_exit(tmp_pat
     )
     config = make_config(tmp_path, approved_followups="summarize")
 
-    with pytest.raises(AgentLoopError, match="GitHub PR checks for PR #77 are pending"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert len(runner.comments) == 3
+    assert len(runner.comments) == 4
     assert runner.comments[1].startswith("Approved-review future follow-ups for PR #77:")
     assert "- Add cleanup docs. (Codex)" in runner.comments[1]
     assert "<!-- AGENT_APPROVED_FOLLOWUPS: pr=77 head=abc123 mode=summarize -->" in runner.comments[1]
     assert runner.comments[2].startswith("GitHub PR checks are still pending for PR #77.")
+    assert runner.comments[3].startswith("Reviewers approved PR #77, but GitHub checks are still pending.")
 
 def test_pr_loop_summary_marker_has_single_blank_line_before_footer_marker(tmp_path):
     runner = FakeRunner(
@@ -803,7 +907,7 @@ def test_pr_loop_summary_marker_has_single_blank_line_before_footer_marker(tmp_p
         "-- coding-review-agent-loop"
     ) in summary
 
-def test_pr_loop_creates_approved_followup_issues_before_unavailable_check_exit(tmp_path):
+def test_pr_loop_creates_approved_followup_issues_before_unavailable_check_stop(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
             "Looks good locally.\n\n### Future follow-ups\n- Add cleanup docs.\n"
@@ -819,15 +923,17 @@ def test_pr_loop_creates_approved_followup_issues_before_unavailable_check_exit(
     )
     config = make_config(tmp_path, approved_followups="issue")
 
-    with pytest.raises(AgentLoopError, match="GitHub PR checks for PR #77 are unavailable"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert len(runner.issues) == 1
     assert runner.issues[0]["title"] == "Follow up future review note: Add cleanup docs."
-    assert len(runner.comments) == 3
+    assert len(runner.comments) == 4
     assert runner.comments[1].startswith("Created approved-review future follow-up issues for PR #77:")
     assert "<!-- AGENT_APPROVED_FOLLOWUPS: pr=77 head=abc123 mode=issue -->" in runner.comments[1]
     assert runner.comments[2].startswith("GitHub PR check status is unavailable for PR #77.")
+    assert runner.comments[3].startswith(
+        "Reviewers approved PR #77, but GitHub check status is unavailable."
+    )
 
 def test_pr_loop_skips_duplicate_approved_followup_issue_creation_when_marker_exists(tmp_path):
     runner = FakeRunner(

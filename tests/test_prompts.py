@@ -1344,6 +1344,23 @@ def test_review_prompt_includes_failing_github_check_status(tmp_path):
     assert "- Failing checks: tests/test_security.py (failure)" in prompt
 
 @pytest.mark.parametrize("compact_context", [False, True])
+def test_review_prompt_distinguishes_failing_from_pending_check_blocking_policy(
+    tmp_path, compact_context
+):
+    config = make_config(tmp_path)
+    prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact_context)
+    assert "Do not defer your review to wait for CI" in prompt
+    assert (
+        "Failing GitHub checks may justify a blocking review and a `blocking_items` entry."
+        in prompt
+    )
+    assert (
+        "Pending or unavailable GitHub checks are an external wait state: mention them"
+        in prompt
+    )
+    assert 'never as the sole reason to\nreturn `state: "blocking"`' in prompt
+
+@pytest.mark.parametrize("compact_context", [False, True])
 def test_review_prompt_allows_read_only_local_inspection_but_prohibits_execution(
     tmp_path, compact_context
 ):

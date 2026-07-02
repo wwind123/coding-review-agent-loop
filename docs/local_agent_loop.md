@@ -557,6 +557,8 @@ agent-loop pr 123 \
 
 When enabled, the tool waits for the configured GitHub check-run to pass before merging. Local `--test-command` is an additional local gate, not a replacement for CI. By default, `--test-command` also runs after coder-created or coder-updated changes before reviewer rounds, so reviewers are less likely to spend rounds on code that already fails the configured local test command. Use `--no-pre-review-tests` to keep `--test-command` as a post-approval gate only.
 
+Failing GitHub checks always block approval and can route back to the coder. Pending or unavailable GitHub checks are treated as an external wait state rather than actionable coder feedback: if every reviewer approves the code and only GitHub checks are pending/unavailable, the loop posts a comment and stops with a clear message instead of erroring or starting another coder/reviewer round. With `--auto-merge`, the loop instead keeps waiting for the configured check-run to resolve before merging, as before.
+
 ## Agent Permission Flags
 
 By default, this standalone package does not pass permission-bypass flags to either agent. This is safer for open-source use, but some CLIs may prompt or fail in non-interactive mode unless you provide suitable flags.

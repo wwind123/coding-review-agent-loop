@@ -9,7 +9,7 @@ import re
 import sys
 import zoneinfo
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclasses_replace
 
 from .agents.base import AgentName, AgentResult
 from .agents.registry import agent_display_name, run_agent_result
@@ -39,6 +39,7 @@ from .decomposition import (
 from .errors import AgentLoopError, QuotaResetExceededError, UnknownPriorItemDispositionError
 from .github import (
     IssueContext,
+    PullRequestChecks,
     PullRequestReviewContext,
     get_issue_context,
     get_pr_checks,
@@ -125,6 +126,7 @@ from .workdir_guard import (
 )
 from .checks import (
     _format_pr_checks_comment,
+    _pending_ci_stop_message,
     _pr_check_blocking_review,
     _pr_check_details,
     run_optional_tests,
@@ -1507,6 +1509,54 @@ def _validate_plan_revision_response(
             )
         return parsed
     raise AgentLoopError("Plan revision did not use the required structured format.")
+
+
+_PENDING_CI_TEXT_KEYWORDS = (
+    "pending",
+    "in progress",
+    "in_progress",
+    "queued",
+    "still running",
+    "not yet report",
+    "unavailable",
+    "check status",
+    "github check",
+    "ci check",
+)
+
+
+def _is_pending_ci_only_review(parsed_review: ParsedReview, pr_checks: PullRequestChecks) -> bool:
+    """Detect a blocking review whose only content restates pending/unavailable
+    GitHub check status rather than an actionable code-level finding.
+
+    This is a defense-in-depth backstop: the reviewer prompt already instructs
+    reviewers not to use pending/unavailable checks as the sole reason to
+    block, but a reviewer may still do so. Any other content (a distinct
+    blocking item, or a Same-PR follow-up) causes this to return False so
+    mixed responses still route back to the coder normally.
+    """
+    if pr_checks.state not in {"pending", "unavailable"}:
+        return False
+    if parsed_review.followups.same_pr:
+        return False
+    if any(item.disposition in {"blocking", "same-pr"} for item in parsed_review.dispositions):
+        return False
+    candidate_texts = [
+        item.text for item in parsed_review.blocking_items if item.text and item.text.strip()
+    ]
+    if not candidate_texts and parsed_review.summary and parsed_review.summary.strip():
+        candidate_texts = [parsed_review.summary]
+    if not candidate_texts:
+        return False
+    check_names = {check.name.lower() for check in pr_checks.pending}
+    check_names.update(name.lower() for name in pr_checks.missing_required)
+    for text in candidate_texts:
+        lowered = text.lower()
+        mentions_check_name = any(name in lowered for name in check_names)
+        mentions_ci_keyword = any(keyword in lowered for keyword in _PENDING_CI_TEXT_KEYWORDS)
+        if not (mentions_check_name or mentions_ci_keyword):
+            return False
+    return True
 
 
 def _should_record_new_blocking_item(summary: str, *, had_prior_items: bool, had_dispositions: bool) -> bool:
@@ -2897,6 +2947,20 @@ def run_pr_loop(
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = []
 
+                if (
+                    resumed_record is None
+                    and review_state == "blocking"
+                    and _is_pending_ci_only_review(parsed_review, pr_checks)
+                ):
+                    log(
+                        config,
+                        f"Round {round_number}: {reviewer_name} blocking review only restates "
+                        f"GitHub check status ({pr_checks.state}); treating as approved instead "
+                        "of starting a new coder follow-up round",
+                    )
+                    parsed_review = dataclasses_replace(parsed_review, state="approved", blocking_items=())
+                    review_state = parsed_review.state
+
                 for disposition in parsed_review.dispositions:
                     _record_prior_item_disposition(
                         prior_dispositions,
@@ -3227,15 +3291,52 @@ def run_pr_loop(
                     must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-pr"}]
                 if not must_fix_items:
                     if pr_checks.state in {"pending", "unavailable"}:
-                        _publish_approved_followups(
+                        details = _pr_check_details(pr_checks)
+                        if not config.auto_merge:
+                            # Pending/unavailable checks are an external wait, not
+                            # actionable coder feedback: stop cleanly instead of
+                            # erroring or spending another coder/reviewer round.
+                            _publish_approved_followups(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                head_sha=pr_metadata.head_sha,
+                                pr_comments=pr_comments,
+                                followups=future_followups,
+                            )
+                            post_pr_comment(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                body=_format_pr_checks_comment(pr_number, pr_checks.state, details),
+                            )
+                            post_pr_comment(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                body=_pending_ci_stop_message(pr_number, pr_checks.state, details),
+                            )
+                            log(
+                                config,
+                                f"Round {round_number}: reviewers approved PR #{pr_number}; "
+                                f"GitHub checks are {pr_checks.state}; stopping without a "
+                                "coder follow-up round",
+                            )
+                            print(
+                                f"PR #{pr_number} approved by "
+                                f"{format_agent_list(configured_reviewers)}; GitHub checks are "
+                                f"{pr_checks.state}. Rerun after CI completes."
+                            )
+                            return 0
+                        # --auto-merge: post the informational comment, then fall
+                        # through to wait for CI before merging, as today.
+                        post_pr_comment(
                             runner,
                             config=config,
                             pr_number=pr_number,
-                            head_sha=pr_metadata.head_sha,
-                            pr_comments=pr_comments,
-                            followups=future_followups,
+                            body=_format_pr_checks_comment(pr_number, pr_checks.state, details),
                         )
-                    if pr_checks.state in {"failing", "pending", "unavailable"}:
+                    elif pr_checks.state == "failing":
                         details = _pr_check_details(pr_checks)
                         post_pr_comment(
                             runner,
@@ -3243,29 +3344,23 @@ def run_pr_loop(
                             pr_number=pr_number,
                             body=_format_pr_checks_comment(pr_number, pr_checks.state, details),
                         )
-                        if pr_checks.state == "failing":
-                            log(
-                                config,
-                                f"Round {round_number}: GitHub PR checks blocked approval ({pr_checks.state})",
+                        log(
+                            config,
+                            f"Round {round_number}: GitHub PR checks blocked approval ({pr_checks.state})",
+                        )
+                        unresolved_items.append(
+                            _next_unresolved_item(
+                                item_number=next_unresolved_item_number,
+                                reviewer="GitHub PR checks",
+                                source_round=round_number,
+                                text=_pr_check_blocking_review(pr_number, pr_checks.state, details),
+                                status="blocking",
                             )
-                            unresolved_items.append(
-                                _next_unresolved_item(
-                                    item_number=next_unresolved_item_number,
-                                    reviewer="GitHub PR checks",
-                                    source_round=round_number,
-                                    text=_pr_check_blocking_review(pr_number, pr_checks.state, details),
-                                    status="blocking",
-                                )
-                            )
-                            next_unresolved_item_number += 1
-                            must_fix_items = [
-                                item for item in unresolved_items if item.status in {"blocking", "same-pr"}
-                            ]
-                        else:
-                            raise AgentLoopError(
-                                f"GitHub PR checks for PR #{pr_number} are {pr_checks.state}; "
-                                "wait for CI or investigate GitHub API access before treating the PR as approved."
-                            )
+                        )
+                        next_unresolved_item_number += 1
+                        must_fix_items = [
+                            item for item in unresolved_items if item.status in {"blocking", "same-pr"}
+                        ]
                 if not must_fix_items:
                     _publish_approved_followups(
                         runner,
