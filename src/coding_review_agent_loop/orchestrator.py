@@ -901,7 +901,7 @@ def _capture_failed_run_salvage(
             required_marker=marker_description,
             result=result,
         )
-    except AgentLoopError as exc:
+    except (AgentLoopError, OSError) as exc:
         log(
             config,
             f"{agent_name}: salvage capture failed ({exc}); preserving original agent failure",

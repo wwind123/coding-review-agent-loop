@@ -1040,6 +1040,17 @@ file is the public answer the orchestrator will validate and post. Empty
 response files, missing markers, or diagnostics-only stdout fail locally instead
 of being posted to GitHub.
 
+When a mutating coder implementation run reaches a terminal failure with a
+non-empty tracked diff, the orchestrator writes local salvage artifacts under
+`<log_dir>/salvage/<run>-<agent>-<scope>/`. That directory contains
+`partial.patch`, `changed-files.txt`, `diff-stat.txt`, best-effort
+`diff-check.txt`, `salvage-summary.md`, and `metadata.json`. The run log and
+local error point to the artifact directory. These artifacts are incomplete
+failure diagnostics only: they are not posted as a successful response, and a
+later rerun injects only the latest matching salvage summary into the coder
+prompt so the next attempt can cherry-pick or ignore it selectively. The
+orchestrator never auto-applies the patch.
+
 If strict structured-response validation fails, the log may show a repair pass:
 `schema validation failed ... attempting repair pass`, followed by either
 `repair pass recovered malformed response` or `repair pass produced invalid

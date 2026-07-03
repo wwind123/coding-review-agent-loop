@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.decomposition import approved_plan_hash, format_one_shot_impl_handoff_comment
 from coding_review_agent_loop.errors import QuotaResetExceededError
@@ -2104,6 +2105,30 @@ def test_failed_issue_implementation_with_diff_writes_salvage_artifacts(tmp_path
     assert metadata["failure_category"] == "transient"
     assert metadata["response_file_missing"] is True
     assert metadata["diff_check_returncode"] == 2
+
+
+def test_failed_issue_implementation_salvage_oserror_preserves_original_failure(
+    tmp_path, capsys, monkeypatch
+):
+    runner = FakeRunner(
+        claude_outputs=[("quota exceeded; reset in 10m", 1)],
+        post_agent_git_diff="diff --git a/file.txt b/file.txt\n",
+    )
+    config = make_config(tmp_path, quiet=False)
+
+    def fail_capture(*args, **kwargs):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(orchestrator_module, "capture_salvage_artifacts", fail_capture)
+
+    with pytest.raises(QuotaResetExceededError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert "quota exhausted" in str(excinfo.value)
+    assert "Rerun when quota resets" in str(excinfo.value)
+    assert "simulated disk full" not in str(excinfo.value)
+    assert _salvage_dirs(config) == []
+    assert "salvage capture failed (simulated disk full)" in capsys.readouterr().err
 
 
 def test_failed_issue_implementation_without_diff_writes_no_salvage_patch(tmp_path):
