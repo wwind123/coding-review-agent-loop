@@ -254,6 +254,27 @@ DISCUSS_OUTCOME_VALUES = frozenset({"implement", "do-not-implement", "needs-huma
 DISCUSS_ANALYZER_FRAMING_VALUES = frozenset({"accurate", "misframed"})
 DISCUSS_RESEARCH_STATUS_VALUES = frozenset({"sourced", "not-needed", "unavailable", "inconclusive"})
 
+# Internal-only outcome for debaters that failed or timed out in a partial
+# round (#475). Deliberately NOT in DISCUSS_OUTCOME_VALUES: real agent
+# responses cannot claim it. Placeholders are built only by the orchestrator
+# and by resume; their presence in a round blocks false-positive consensus.
+DISCUSS_FAILED_OUTCOME = "failed"
+
+
+def failed_discuss_review_placeholder(reviewer: str, category: str) -> ParsedDiscussReview:
+    return ParsedDiscussReview(
+        outcome=DISCUSS_FAILED_OUTCOME,
+        rationale=f"did not respond this round ({category})",
+        split_proposals=(),
+        reviewer=reviewer,
+    )
+
+
+def failed_discuss_review_category(vote: ParsedDiscussReview) -> str:
+    """Recover the failure category from a placeholder vote's rationale."""
+    match = re.fullmatch(r"did not respond this round \((.+)\)", vote.rationale)
+    return match.group(1) if match else vote.rationale
+
 
 @dataclass(frozen=True)
 class DiscussAgendaDisagreement:

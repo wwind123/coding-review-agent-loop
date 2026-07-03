@@ -468,6 +468,39 @@ def build_parser() -> argparse.ArgumentParser:
             "tool comparisons."
         ),
     )
+    discuss.add_argument(
+        "--discuss-parallel",
+        action="store_true",
+        help=(
+            "Run same-round debaters concurrently instead of sequentially. The "
+            "analyzer and summary still run only after every debater finishes "
+            "(or the failure policy fires). Requires a distinct workdir per "
+            "debater, even with --allow-shared-dir."
+        ),
+    )
+    discuss.add_argument(
+        "--discuss-debater-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Wall-clock limit for each debater turn in seconds (default: none). "
+            "A timed-out debater is treated per --discuss-on-debater-failure "
+            "with failure category 'timeout'."
+        ),
+    )
+    discuss.add_argument(
+        "--discuss-on-debater-failure",
+        choices=("fail", "partial"),
+        default="fail",
+        help=(
+            "Policy when a debater turn fails or times out (default: fail). "
+            "'fail' aborts the run after in-flight debaters settle; 'partial' "
+            "continues the round when at least two debaters produced votes and "
+            "records the failures in the round summary. A partial round never "
+            "declares final consensus."
+        ),
+    )
     add_common(discuss)
 
     return parser

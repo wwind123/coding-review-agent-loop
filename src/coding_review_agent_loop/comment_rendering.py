@@ -788,6 +788,26 @@ def _render_discuss_research_section(
     return lines
 
 
+def _render_discuss_failed_debater_lines(
+    failed_debaters: Sequence[tuple[str, str]],
+    *,
+    is_final: bool = False,
+) -> list[str]:
+    """Surface failed/timed-out debaters in the round summary (#475)."""
+    if not failed_debaters:
+        return []
+    lines = ["", "### Debater failures", ""]
+    for name, category in failed_debaters:
+        lines.append(f"- {name}: no vote this round ({category})")
+    if is_final:
+        lines.append("")
+        lines.append(
+            "This round completed with partial results, so it cannot declare "
+            "final consensus."
+        )
+    return lines
+
+
 def render_discuss_round_summary_comment(
     *,
     is_final: bool,
@@ -801,6 +821,7 @@ def render_discuss_round_summary_comment(
     analyzer_agenda: ParsedDiscussAgenda | None = None,
     analyzer_name: str | None = None,
     research_mode: str | None = None,
+    failed_debaters: Sequence[tuple[str, str]] = (),
 ) -> str:
     """Render the orchestrator/analyzer round-summary comment.
 
@@ -824,6 +845,7 @@ def render_discuss_round_summary_comment(
         for vote in reviewer_votes:
             rationale = vote.rationale.replace("|", "\\|").replace("\n", " ")
             lines.append(f"| {vote.reviewer} | {vote.outcome} | {rationale} |")
+        lines.extend(_render_discuss_failed_debater_lines(failed_debaters))
         if split_proposals:
             lines.append("")
             lines.append("### Proposed sub-issues raised this round")
@@ -869,6 +891,7 @@ def render_discuss_round_summary_comment(
     for vote in reviewer_votes:
         rationale = vote.rationale.replace("|", "\\|").replace("\n", " ")
         lines.append(f"| {vote.reviewer} | {vote.outcome} | {rationale} |")
+    lines.extend(_render_discuss_failed_debater_lines(failed_debaters, is_final=True))
     rebuttal_votes = [vote for vote in reviewer_votes if vote.rebuttal]
     if rebuttal_votes:
         lines.append("")

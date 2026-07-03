@@ -59,6 +59,8 @@ class AgentBackend(Protocol):
         session_id: str | None = None,
         run_id: str | None = None,
         role: str | None = None,
+        label: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> AgentResult: ...
 
 

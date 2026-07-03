@@ -147,6 +147,7 @@ def _seed_summary_comment(
     split_proposals: list[str] | None = None,
     agenda: tuple[str, ...] = (),
     analyzer_response: str | None = None,
+    failed_debaters: tuple[tuple[str, str], ...] = (),
 ) -> dict:
     """Build an issue-comment payload matching what `_run_discuss_loop` posts for a round summary."""
     body = render_discuss_round_summary_comment(
@@ -158,6 +159,7 @@ def _seed_summary_comment(
         consensus_kind=consensus_kind,
         round_history=round_history,
         split_proposals=split_proposals,
+        failed_debaters=failed_debaters,
     )
     body = _attach_round_metadata(
         body,
@@ -171,6 +173,7 @@ def _seed_summary_comment(
             consensus_kind=consensus_kind,
             agenda=agenda,
             analyzer_response=analyzer_response,
+            failed_debaters=failed_debaters,
         ),
     )
     return {"author": {"login": "bot"}, "createdAt": "2026-01-01T00:00:00Z", "body": body}
@@ -1512,3 +1515,560 @@ def test_discuss_loop_resume_is_lenient_about_prior_votes_without_research(tmp_p
     final = runner.comments[-1]
     assert "Consensus: Implement" in final
     assert "Research policy: `required`." in final
+
+
+# --- parallel debater execution tests (#475) ---
+
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+import coding_review_agent_loop.orchestrator as orchestrator_module
+from coding_review_agent_loop.runner import CommandResult, Runner
+
+from agent_loop_helpers import read_usage_summary
+
+
+def test_discuss_loop_cli_parser_accepts_parallel_flags():
+    from coding_review_agent_loop.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "discuss", "56", "--repo", "OWNER/REPO",
+            "--discuss-parallel",
+            "--discuss-debater-timeout", "900",
+            "--discuss-on-debater-failure", "partial",
+        ]
+    )
+    assert args.discuss_parallel is True
+    assert args.discuss_debater_timeout == 900.0
+    assert args.discuss_on_debater_failure == "partial"
+    plain = build_parser().parse_args(["discuss", "56", "--repo", "OWNER/REPO"])
+    assert plain.discuss_parallel is False
+    assert plain.discuss_debater_timeout is None
+    assert plain.discuss_on_debater_failure == "fail"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["discuss", "56", "--repo", "OWNER/REPO", "--discuss-on-debater-failure", "retry"]
+        )
+
+
+def test_discuss_loop_config_rejects_invalid_failure_policy_and_timeout(tmp_path):
+    with pytest.raises(AgentLoopError, match="--discuss-on-debater-failure must be one of"):
+        make_config(tmp_path, reviewer=("codex", "gemini"), discuss_on_debater_failure="retry")
+    with pytest.raises(AgentLoopError, match="--discuss-debater-timeout must be greater than zero"):
+        make_config(tmp_path, reviewer=("codex", "gemini"), discuss_debater_timeout=0)
+
+
+class _ConcurrencyProbeRunner(FakeRunner):
+    """Each debater blocks until the other has started: deadlocks (then fails
+    fast via the wait timeout) unless same-round debaters truly overlap."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.codex_started = threading.Event()
+        self.gemini_started = threading.Event()
+        self.overlap_confirmed = True
+
+    def run_with_log(self, args, *, cwd, **kwargs):
+        cmd = [str(arg) for arg in args]
+        if cmd[:2] == ["codex", "exec"]:
+            self.codex_started.set()
+            if not self.gemini_started.wait(timeout=10):
+                self.overlap_confirmed = False
+        elif cmd[:1] == ["gemini"]:
+            self.gemini_started.set()
+            if not self.codex_started.wait(timeout=10):
+                self.overlap_confirmed = False
+        return super().run_with_log(args, cwd=cwd, **kwargs)
+
+
+def test_discuss_parallel_runs_same_round_debaters_concurrently(tmp_path):
+    implement_text = _discuss_review_text(outcome="implement")
+    runner = _ConcurrencyProbeRunner(
+        codex_outputs=[implement_text],
+        gemini_outputs=[implement_text],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_parallel=True)
+
+    result = run_discuss_loop(runner, issue_number=56, config=config)
+
+    assert result == 0
+    assert runner.overlap_confirmed, "same-round debaters did not run concurrently"
+    assert len(runner.comments) == 3
+    assert "Round 1: Codex position" in runner.comments[0]
+    assert "Round 1: Gemini position" in runner.comments[1]
+    assert "Consensus: Implement" in runner.comments[2]
+
+
+def test_discuss_parallel_matches_sequential_output(tmp_path):
+    """Parity: the parallel happy path posts the same comments as sequential."""
+    outputs = {
+        "codex": [
+            _discuss_review_text(outcome="implement", rationale="Scoped."),
+            _discuss_review_text(
+                outcome="implement", rationale="Still scoped.", rebuttal="Holding.",
+            ),
+        ],
+        "gemini": [
+            _discuss_review_text(outcome="do-not-implement", rationale="Out of scope."),
+            _discuss_review_text(
+                outcome="implement", rationale="Convinced.", rebuttal="Conceding.",
+            ),
+        ],
+    }
+    sequential_runner = FakeRunner(
+        codex_outputs=list(outputs["codex"]), gemini_outputs=list(outputs["gemini"])
+    )
+    sequential_config = make_config(
+        tmp_path / "seq", reviewer=("codex", "gemini"), log_dir=tmp_path / "seq" / "logs"
+    )
+    parallel_runner = FakeRunner(
+        codex_outputs=list(outputs["codex"]), gemini_outputs=list(outputs["gemini"])
+    )
+    parallel_config = make_config(
+        tmp_path / "par",
+        reviewer=("codex", "gemini"),
+        log_dir=tmp_path / "par" / "logs",
+        discuss_parallel=True,
+    )
+
+    assert run_discuss_loop(sequential_runner, issue_number=56, config=sequential_config, discuss_max_rounds=1) == 0
+    assert run_discuss_loop(parallel_runner, issue_number=56, config=parallel_config, discuss_max_rounds=1) == 0
+
+    assert parallel_runner.comments == sequential_runner.comments
+    assert "Consensus: Implement" in parallel_runner.comments[-1]
+
+
+class _EventOrderRunner(FakeRunner):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.events = []
+        self._events_lock = threading.Lock()
+
+    def _event_name(self, cmd):
+        if cmd[:2] == ["codex", "exec"]:
+            return "codex"
+        if cmd[:1] == ["gemini"]:
+            return "gemini"
+        if cmd[:1] == ["claude"]:
+            return "analyzer" if "Summarize debate round" in " ".join(cmd) else "claude"
+        return None
+
+    def run_with_log(self, args, *, cwd, **kwargs):
+        cmd = [str(arg) for arg in args]
+        name = self._event_name(cmd)
+        if name is not None:
+            with self._events_lock:
+                self.events.append(f"{name}-start")
+        result = super().run_with_log(args, cwd=cwd, **kwargs)
+        if name is not None:
+            with self._events_lock:
+                self.events.append(f"{name}-end")
+        return result
+
+
+def test_discuss_parallel_analyzer_waits_for_debater_synchronization_point(tmp_path):
+    runner = _EventOrderRunner(
+        codex_outputs=[
+            _discuss_review_text(outcome="implement", rationale="Scoped."),
+            _discuss_review_text(
+                outcome="implement", rationale="Still scoped.", rebuttal="Holding.",
+                analyzer_framing="accurate",
+            ),
+        ],
+        gemini_outputs=[
+            _discuss_review_text(outcome="do-not-implement", rationale="Out of scope."),
+            _discuss_review_text(
+                outcome="do-not-implement", rationale="Still out.", rebuttal="Holding.",
+                analyzer_framing="accurate",
+            ),
+        ],
+        claude_outputs=[_discuss_agenda_text()],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude", discuss_parallel=True
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+
+    assert result == 0
+    analyzer_start = runner.events.index("analyzer-start")
+    assert runner.events.index("codex-end") < analyzer_start
+    assert runner.events.index("gemini-end") < analyzer_start
+    # Debater comments post after the sync point, in configured order, before
+    # the round summary.
+    assert "Round 1: Codex position" in runner.comments[0]
+    assert "Round 1: Gemini position" in runner.comments[1]
+    assert "Round 1 summary" in runner.comments[2]
+
+
+def test_discuss_parallel_fail_policy_raises_after_round_settles_and_posts_survivors(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[_discuss_review_text(outcome="implement")],
+        gemini_outputs=[("gemini exploded", 1)],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), discuss_parallel=True, agent_max_retries=0
+    )
+
+    with pytest.raises(AgentLoopError, match="Gemini"):
+        run_discuss_loop(runner, issue_number=56, config=config)
+
+    # The surviving debater's comment is posted before the abort so a rerun
+    # resumes it, and no round summary is posted.
+    assert len(runner.comments) == 1
+    assert "Round 1: Codex position" in runner.comments[0]
+
+
+def test_discuss_parallel_partial_policy_continues_round_and_records_failure(tmp_path):
+    implement_text = _discuss_review_text(outcome="implement")
+    runner = FakeRunner(
+        codex_outputs=[implement_text],
+        claude_outputs=[implement_text],
+        gemini_outputs=[("gemini exploded", 1)],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "claude"),
+        discuss_parallel=True,
+        discuss_on_debater_failure="partial",
+        agent_max_retries=0,
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
+
+    assert result == 0
+    # Codex and Claude posted; Gemini did not.
+    assert len(runner.comments) == 3
+    final = runner.comments[-1]
+    # A partial round never declares consensus even though all successful
+    # debaters voted `implement`.
+    assert "Consensus: Needs Human Review (Deadlock)" in final
+    assert "Consensus: Implement" not in final
+    assert "### Debater failures" in final
+    assert "Gemini: no vote this round (deterministic)" in final
+    assert "cannot declare final consensus" in final
+    # The placeholder is visible in round history and recorded in metadata.
+    assert "Codex: `implement`, Gemini: `failed`, Claude: `implement`" in final
+    summary_raw = runner.issue_comments[-1]["body"]
+    metadata = _decode_round_metadata(ROUND_RESUME_MARKER_RE.search(summary_raw).group("payload"))
+    assert metadata.failed_debaters == (("Gemini", "deterministic"),)
+
+
+def test_discuss_sequential_partial_policy_applies_without_parallel_flag(tmp_path):
+    implement_text = _discuss_review_text(outcome="implement")
+    runner = FakeRunner(
+        codex_outputs=[("codex exploded", 1)],
+        gemini_outputs=[implement_text],
+        claude_outputs=[implement_text],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "claude"),
+        discuss_on_debater_failure="partial",
+        agent_max_retries=0,
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
+
+    assert result == 0
+    final = runner.comments[-1]
+    assert "### Debater failures" in final
+    assert "Codex: no vote this round (deterministic)" in final
+
+
+def test_discuss_partial_policy_requires_two_successful_votes(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[_discuss_review_text(outcome="implement")],
+        gemini_outputs=[("gemini exploded", 1)],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        discuss_parallel=True,
+        discuss_on_debater_failure="partial",
+        agent_max_retries=0,
+    )
+
+    with pytest.raises(AgentLoopError, match="Gemini"):
+        run_discuss_loop(runner, issue_number=56, config=config)
+
+    # The lone surviving vote is still posted for resume; no summary follows.
+    assert len(runner.comments) == 1
+    assert "Round 1: Codex position" in runner.comments[0]
+
+
+def test_discuss_partial_round_resumes_from_failed_debater_metadata(tmp_path):
+    subject = _issue_subject()
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "claude"),
+        discuss_on_debater_failure="partial",
+    )
+    codex_vote_r1 = ParsedDiscussReview(outcome="implement", rationale="Scoped.", split_proposals=(), reviewer="Codex")
+    claude_vote_r1 = ParsedDiscussReview(outcome="do-not-implement", rationale="Out of scope.", split_proposals=(), reviewer="Claude")
+    seeded = [
+        _seed_debater_comment(reviewer="Codex", round_number=1, subject=subject, outcome="implement", rationale="Scoped.", config=config),
+        _seed_debater_comment(reviewer="Claude", round_number=1, subject=subject, outcome="do-not-implement", rationale="Out of scope.", config=config),
+        _seed_summary_comment(
+            round_number=1,
+            reviewer_votes=[codex_vote_r1, claude_vote_r1],
+            is_final=False,
+            subject=subject,
+            agenda=("- Codex held `implement`: Scoped.", "- Claude held `do-not-implement`: Out of scope."),
+            failed_debaters=(("Gemini", "timeout"),),
+        ),
+    ]
+    implement_text = _discuss_review_text(
+        outcome="implement", rationale="Agreed.", rebuttal="Conceding.",
+    )
+    runner = FakeRunner(
+        issue_comments=seeded,
+        codex_outputs=[implement_text],
+        gemini_outputs=[implement_text],
+        claude_outputs=[implement_text],
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+
+    assert result == 0
+    # Round 2 re-invokes all three debaters (the failed one gets a fresh turn)
+    # without re-running round 1 or raising the completeness error.
+    assert len(runner.comments) == 4
+    final = runner.comments[-1]
+    assert "Consensus: Implement" in final
+    assert "Round 1: Codex: `implement`, Gemini: `failed`, Claude: `do-not-implement`" in final
+    round2_commands = [cmd for cmd, _cwd in runner.commands if "debate round 2" in " ".join(cmd)]
+    assert len(round2_commands) == 3
+    # Round-2 debate prompts surface the placeholder position.
+    for command in round2_commands:
+        assert "Gemini: `failed`" in " ".join(command)
+
+
+def test_discuss_resume_still_raises_when_missing_debater_has_no_failure_metadata(tmp_path):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini", "claude"))
+    codex_vote_r1 = ParsedDiscussReview(outcome="implement", rationale="Scoped.", split_proposals=(), reviewer="Codex")
+    claude_vote_r1 = ParsedDiscussReview(outcome="do-not-implement", rationale="Out of scope.", split_proposals=(), reviewer="Claude")
+    seeded = [
+        _seed_debater_comment(reviewer="Codex", round_number=1, subject=subject, outcome="implement", rationale="Scoped.", config=config),
+        _seed_debater_comment(reviewer="Claude", round_number=1, subject=subject, outcome="do-not-implement", rationale="Out of scope.", config=config),
+        _seed_summary_comment(
+            round_number=1,
+            reviewer_votes=[codex_vote_r1, claude_vote_r1],
+            is_final=False,
+            subject=subject,
+            agenda=("- Codex held `implement`: Scoped.",),
+        ),
+    ]
+    runner = FakeRunner(issue_comments=seeded, codex_outputs=[], gemini_outputs=[], claude_outputs=[])
+
+    with pytest.raises(AgentLoopError, match="metadata is inconsistent"):
+        run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+
+
+def test_discuss_parallel_zero_pending_resume_skips_executor(tmp_path, monkeypatch):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_parallel=True)
+    seeded = [
+        _seed_debater_comment(reviewer="Codex", round_number=1, subject=subject, outcome="implement", rationale="Scoped.", config=config),
+        _seed_debater_comment(reviewer="Gemini", round_number=1, subject=subject, outcome="implement", rationale="Agreed.", config=config),
+    ]
+    runner = FakeRunner(issue_comments=seeded, codex_outputs=[], gemini_outputs=[])
+
+    def _fail_executor(*args, **kwargs):
+        raise AssertionError("ThreadPoolExecutor must not be constructed on a zero-pending resume")
+
+    monkeypatch.setattr(orchestrator_module, "ThreadPoolExecutor", _fail_executor)
+
+    result = run_discuss_loop(runner, issue_number=56, config=config)
+
+    assert result == 0
+    assert len(runner.comments) == 1
+    assert "Consensus: Implement" in runner.comments[0]
+
+
+class _TimeoutSimulatingRunner(FakeRunner):
+    """Simulates Runner.run_with_log's timeout contract (returncode=None) for gemini."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.gemini_invocations = 0
+
+    def run_with_log(self, args, *, cwd, **kwargs):
+        cmd = [str(arg) for arg in args]
+        if cmd[:1] == ["gemini"]:
+            self.gemini_invocations += 1
+            assert kwargs.get("timeout_seconds") == 45.0
+            return CommandResult(cmd, Path(cwd), "", "", None)
+        return super().run_with_log(args, cwd=cwd, **kwargs)
+
+
+def test_discuss_debater_timeout_is_partial_result_without_transient_retries(tmp_path):
+    implement_text = _discuss_review_text(outcome="implement")
+    runner = _TimeoutSimulatingRunner(
+        codex_outputs=[implement_text],
+        claude_outputs=[implement_text],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "claude"),
+        discuss_parallel=True,
+        discuss_on_debater_failure="partial",
+        discuss_debater_timeout=45.0,
+        agent_max_retries=2,
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
+
+    assert result == 0
+    # A timeout is not transient: exactly one invocation despite retries being
+    # configured.
+    assert runner.gemini_invocations == 1
+    final = runner.comments[-1]
+    assert "### Debater failures" in final
+    assert "Gemini: no vote this round (timeout)" in final
+    summary_raw = runner.issue_comments[-1]["body"]
+    metadata = _decode_round_metadata(ROUND_RESUME_MARKER_RE.search(summary_raw).group("payload"))
+    assert metadata.failed_debaters == (("Gemini", "timeout"),)
+
+
+def test_discuss_parallel_rejects_shared_debater_workdirs_even_with_allow_shared_dir(tmp_path):
+    shared = tmp_path / "shared"
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        codex_dir=shared,
+        gemini_dir=shared,
+        allow_shared_dir=True,
+        discuss_parallel=True,
+    )
+    runner = FakeRunner(codex_outputs=[], gemini_outputs=[])
+
+    with pytest.raises(AgentLoopError, match="distinct workdir per debater"):
+        run_discuss_loop(runner, issue_number=56, config=config)
+
+    assert len(runner.comments) == 0
+
+
+def test_discuss_parallel_artifacts_are_isolated_by_round_and_agent(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            _discuss_review_text(outcome="implement", rationale="Scoped."),
+            _discuss_review_text(outcome="implement", rationale="Still.", rebuttal="Holding.", analyzer_framing="accurate"),
+        ],
+        gemini_outputs=[
+            _discuss_review_text(outcome="do-not-implement", rationale="No."),
+            _discuss_review_text(outcome="implement", rationale="Now yes.", rebuttal="Conceding.", analyzer_framing="accurate"),
+        ],
+        claude_outputs=[_discuss_agenda_text()],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude", discuss_parallel=True
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+
+    assert result == 0
+    log_names = sorted(p.name for p in config.log_dir.glob("*.log"))
+    assert len([n for n in log_names if n.endswith("-codex-discuss-r1.log")]) == 1
+    assert len([n for n in log_names if n.endswith("-gemini-discuss-r1.log")]) == 1
+    assert len([n for n in log_names if n.endswith("-codex-discuss-r2.log")]) == 1
+    assert len([n for n in log_names if n.endswith("-gemini-discuss-r2.log")]) == 1
+    assert len([n for n in log_names if n.endswith("-claude-discuss-analyzer-r1.log")]) == 1
+    assert len(log_names) == len(set(log_names))
+    # Usage records from parallel calls are all present with unique call ids.
+    summary = read_usage_summary(config.log_dir)
+    call_ids = [record["call_id"] for record in summary["calls"]]
+    assert len(call_ids) == len(set(call_ids))
+    assert len(call_ids) == 5
+
+
+# --- non-pty Runner timeout tests (#475) ---
+
+
+def test_runner_non_pty_timeout_returns_none_and_keeps_log(tmp_path):
+    log_path = tmp_path / "logs" / "timeout.log"
+    started = time.monotonic()
+    result = Runner().run_with_log(
+        [sys.executable, "-c", "import sys,time; print('partial output', flush=True); time.sleep(30)"],
+        cwd=tmp_path,
+        log_path=log_path,
+        label="timeout-test",
+        progress_interval_seconds=300,
+        check=False,
+        timeout_seconds=0.3,
+    )
+
+    assert result.returncode is None
+    assert time.monotonic() - started < 10
+    assert "partial output" in result.stdout
+    assert "partial output" in log_path.read_text(encoding="utf-8")
+
+
+def test_runner_non_pty_timeout_kills_whole_process_group(tmp_path):
+    pid_file = tmp_path / "grandchild.pid"
+    log_path = tmp_path / "logs" / "group-timeout.log"
+    result = Runner().run_with_log(
+        ["bash", "-c", f"sleep 30 & echo $! > {pid_file}; wait"],
+        cwd=tmp_path,
+        log_path=log_path,
+        label="group-timeout-test",
+        progress_interval_seconds=300,
+        check=False,
+        timeout_seconds=0.3,
+    )
+
+    assert result.returncode is None
+    grandchild_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild_pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    os.kill(grandchild_pid, 9)
+    pytest.fail("grandchild process survived the process-group kill")
+
+
+def test_discuss_parallel_non_final_partial_round_continues_to_next_round(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            _discuss_review_text(outcome="implement", rationale="Scoped."),
+            _discuss_review_text(outcome="implement", rationale="Still scoped.", rebuttal="Holding."),
+        ],
+        claude_outputs=[
+            _discuss_review_text(outcome="implement", rationale="Agreed."),
+            _discuss_review_text(outcome="implement", rationale="Still agreed.", rebuttal="Holding."),
+        ],
+        gemini_outputs=[
+            ("gemini exploded", 1),
+            _discuss_review_text(outcome="implement", rationale="Back online.", rebuttal="Joining."),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "claude"),
+        discuss_parallel=True,
+        discuss_on_debater_failure="partial",
+        agent_max_retries=0,
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+
+    assert result == 0
+    # Round 1: codex + claude comments, then a non-final partial summary.
+    round1_summary = runner.comments[2]
+    assert "Round 1 summary: Consensus Pending" in round1_summary
+    assert "### Debater failures" in round1_summary
+    assert "Gemini: no vote this round (deterministic)" in round1_summary
+    # Round 2: the failed debater gets a fresh turn; all three converge.
+    final = runner.comments[-1]
+    assert "Consensus: Implement" in final
+    assert "Consensus kind: `converged` after round 2." in final
+    assert "Round 1: Codex: `implement`, Gemini: `failed`, Claude: `implement`" in final
+    assert "Round 2: Codex: `implement`, Gemini: `implement`, Claude: `implement`" in final

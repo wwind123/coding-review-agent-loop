@@ -28,6 +28,19 @@ class UnknownPriorItemDispositionError(AgentLoopError):
         super().__init__(message)
 
 
+class AgentInvocationError(AgentLoopError):
+    """Raised when an agent invocation fails after retries/repair.
+
+    Carries the failure category (`transient`, `non-retryable`, `deterministic`,
+    `timeout`, ...) so callers such as the discuss debater failure policy can
+    surface it in summaries and metadata without re-parsing the message.
+    """
+
+    def __init__(self, message: str, *, failure_category: str | None = None) -> None:
+        super().__init__(message)
+        self.failure_category = failure_category
+
+
 class QuotaResetExceededError(AgentLoopError):
     """Raised when a rate-limit reset time exceeds the auto-retry threshold.
 

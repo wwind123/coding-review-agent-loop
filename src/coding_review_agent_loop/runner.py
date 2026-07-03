@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -55,6 +56,13 @@ class Runner:
         self.dry_run = dry_run
         self._resolved_commands: dict[str, str] = {}
         self._command_override_flags: dict[str, str] = {}
+        # Parallel discuss debaters call run_with_log from worker threads (#475):
+        # guard the command caches and keep a registry of live agent processes so
+        # the main thread can kill them on KeyboardInterrupt.
+        self._commands_lock = threading.Lock()
+        self._active_procs_lock = threading.Lock()
+        self._active_procs: dict[int, subprocess.Popen] = {}
+        self._interrupted = False
 
     def remember_agent_command(
         self,
@@ -63,8 +71,48 @@ class Runner:
         override_flag: str,
     ) -> None:
         """Retain preflight evidence for a later spawn-time PATH race."""
-        self._resolved_commands[command] = resolved_path
-        self._command_override_flags[command] = override_flag
+        with self._commands_lock:
+            self._resolved_commands[command] = resolved_path
+            self._command_override_flags[command] = override_flag
+
+    def _register_active_process(self, proc: subprocess.Popen) -> None:
+        with self._active_procs_lock:
+            self._active_procs[proc.pid] = proc
+
+    def _unregister_active_process(self, proc: subprocess.Popen) -> None:
+        with self._active_procs_lock:
+            self._active_procs.pop(proc.pid, None)
+
+    @staticmethod
+    def _terminate_process_group(proc: subprocess.Popen) -> None:
+        """killpg TERM, short grace, then killpg KILL; tolerate an exited group."""
+        try:
+            os.killpg(proc.pid, 15)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, 9)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+
+    def terminate_active_processes(self) -> None:
+        """Kill every registered agent process group and refuse new spawns.
+
+        Called from the main thread on KeyboardInterrupt while parallel discuss
+        debaters run in worker threads: killing the process groups unblocks the
+        workers' wait loops so executor shutdown returns promptly, and the
+        interrupted flag stops in-flight retry logic from spawning replacements.
+        """
+        self._interrupted = True
+        with self._active_procs_lock:
+            procs = list(self._active_procs.values())
+        for proc in procs:
+            if proc.poll() is None:
+                self._terminate_process_group(proc)
 
     def _missing_command_error(self, command: str) -> AgentLoopError:
         override_flag = self._command_override_flags.get(command)
@@ -93,7 +141,8 @@ class Runner:
         command = cmd[0]
         resolved = shutil.which(command)
         if resolved is not None:
-            self._resolved_commands[command] = resolved
+            with self._commands_lock:
+                self._resolved_commands[command] = resolved
 
         for attempt in range(1, _SPAWN_ATTEMPTS + 1):
             try:
@@ -102,9 +151,10 @@ class Runner:
                 if os.path.isabs(command):
                     raise self._missing_command_error(command) from exc
                 current = shutil.which(command)
-                if current is not None:
-                    self._resolved_commands[command] = current
-                candidate = current or self._resolved_commands.get(command)
+                with self._commands_lock:
+                    if current is not None:
+                        self._resolved_commands[command] = current
+                    candidate = current or self._resolved_commands.get(command)
                 if not self._is_dangling_symlink(candidate):
                     raise self._missing_command_error(command) from exc
                 if attempt == _SPAWN_ATTEMPTS:
@@ -128,6 +178,10 @@ class Runner:
             if input_text:
                 print(input_text)
             return CommandResult(cmd, cwd, "", "", 0)
+        if self._interrupted:
+            raise AgentLoopError(
+                "Runner is shutting down after an interrupt; refusing to start new commands."
+            )
 
         proc = subprocess.run(
             cmd,
@@ -164,6 +218,10 @@ class Runner:
         if self.dry_run:
             print(f"[dry-run] ({cwd}) {' '.join(cmd)}")
             return CommandResult(cmd, cwd, "", "", 0)
+        if self._interrupted:
+            raise AgentLoopError(
+                "Runner is shutting down after an interrupt; refusing to start new commands."
+            )
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         ensure_log_dir_ignored(log_path.parent)
@@ -179,6 +237,7 @@ class Runner:
                 timeout_seconds=timeout_seconds,
             )
         started = time.monotonic()
+        deadline = started + timeout_seconds if timeout_seconds is not None else None
         next_progress = started + progress_interval_seconds
         header = f"$ {' '.join(cmd)}\n\n"
         with log_path.open("w", encoding="utf-8") as log_file:
@@ -187,6 +246,8 @@ class Runner:
             # stderr=subprocess.STDOUT merges stderr into the log file.
             # All agent backends (Claude, Codex, Gemini) use run_with_log,
             # so stderr capture is uniform across them (issue #266).
+            # start_new_session isolates the child's process group so timeout
+            # and interrupt handling can killpg the whole tree (#475).
             proc = self._spawn_with_retry(
                 cmd,
                 lambda: subprocess.Popen(
@@ -196,15 +257,23 @@ class Runner:
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    start_new_session=True,
                     env={**os.environ, **env} if env is not None else None,
                 ),
             )
+            self._register_active_process(proc)
             try:
                 while True:
                     returncode = proc.poll()
                     if returncode is not None:
                         break
                     now = time.monotonic()
+                    if deadline is not None and now >= deadline:
+                        # returncode=None marks the timeout for callers, matching
+                        # the pty branch.
+                        self._terminate_process_group(proc)
+                        returncode = None
+                        break
                     if now >= next_progress:
                         elapsed = int(now - started)
                         print(
@@ -214,15 +283,17 @@ class Runner:
                             flush=True,
                         )
                         next_progress = now + progress_interval_seconds
-                    time.sleep(1)
+                    if deadline is not None:
+                        time.sleep(min(1.0, max(0.05, deadline - now)))
+                    else:
+                        time.sleep(1)
             except KeyboardInterrupt:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                # The child runs in its own session and no longer receives the
+                # terminal SIGINT; kill its whole process group instead.
+                self._terminate_process_group(proc)
                 raise
+            finally:
+                self._unregister_active_process(proc)
 
         full_output = log_path.read_text(encoding="utf-8")
         output = full_output[len(header):] if full_output.startswith(header) else full_output
@@ -293,24 +364,14 @@ class Runner:
             assert allocated_fds is not None
             master_fd, slave_fd = allocated_fds
             os.close(slave_fd)
+            self._register_active_process(proc)
             try:
                 timed_out = False
                 while True:
                     now = time.monotonic()
                     if deadline is not None and now >= deadline and proc.poll() is None:
                         timed_out = True
-                        try:
-                            os.killpg(proc.pid, 15)
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            proc.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            try:
-                                os.killpg(proc.pid, 9)
-                            except ProcessLookupError:
-                                pass
-                            proc.wait()
+                        self._terminate_process_group(proc)
                     if timed_out:
                         wait_seconds = 0.1
                     elif deadline is not None:
@@ -342,14 +403,12 @@ class Runner:
                         )
                         next_progress = now + progress_interval_seconds
             except KeyboardInterrupt:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                # The child runs in its own session and does not receive the
+                # terminal SIGINT; kill its whole process group instead.
+                self._terminate_process_group(proc)
                 raise
             finally:
+                self._unregister_active_process(proc)
                 os.close(master_fd)
             returncode = None if timed_out else proc.wait()
 

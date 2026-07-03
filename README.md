@@ -362,6 +362,46 @@ agent-loop discuss 123 --repo OWNER/REPO \
   --discuss-research auto
 ```
 
+Pass `--discuss-parallel` to run same-round debaters concurrently instead of
+sequentially. Prompts are built from shared pre-round state before any debater
+launches and comments are posted only after every debater in the round
+finishes, so same-round debaters never see each other's in-progress output;
+the analyzer, consensus detection, and the round summary still run only after
+that synchronization point. Parallel mode requires a distinct workdir per
+debater — even with `--allow-shared-dir`, which is not honored between
+concurrently scheduled debaters because concurrent git/tool activity in one
+worktree can corrupt it (the analyzer or coder may still share a debater's
+directory). Sequential execution remains the default; keep it if you are
+concerned about concurrent quota/API pressure. On Ctrl-C, the orchestrator
+kills all in-flight debater process groups before exiting.
+
+Two companion flags control per-turn failure handling in both sequential and
+parallel discuss runs:
+
+- `--discuss-debater-timeout SECONDS` (default: none) puts a wall-clock limit
+  on each debater turn. A timed-out turn is killed (whole process group),
+  never retried as transient, and treated per the failure policy with failure
+  category `timeout`.
+- `--discuss-on-debater-failure fail|partial` (default: `fail`) sets the
+  policy when a debater turn fails or times out. `fail` aborts the run after
+  in-flight debaters settle (successful votes are still posted so a rerun
+  resumes them). `partial` continues the round when at least two debaters
+  produced votes: the failed debater is recorded in the round summary under
+  "Debater failures" (and in the summary's resume metadata), appears as a
+  `failed` entry in the round history, and gets a fresh turn in the next
+  round on resume. A partial round never declares final consensus — even if
+  all surviving debaters agree — so a partial final round ends in a
+  `needs-human` deadlock.
+
+```bash
+agent-loop discuss 123 --repo OWNER/REPO \
+  --reviewer codex --reviewer antigravity --reviewer claude \
+  --discuss-analyzer claude \
+  --discuss-parallel \
+  --discuss-debater-timeout 1800 \
+  --discuss-on-debater-failure partial
+```
+
 If reviewers still disagree after the configured debate rounds, the final
 round-summary comment is marked `deadlock`, uses the `needs-human` outcome, and
 summarizes each final position and the core disagreement. `split` proposals
@@ -667,7 +707,7 @@ The test suite is split across focused modules for faster, targeted runs:
 | `tests/test_backends.py` | Claude, Gemini, and Codex backend output parsing and normalization |
 | `tests/test_protocol.py` | Protocol parsing and validation (parse_review, parse_plan_review, structured payloads) |
 | `tests/test_comment_rendering.py` | Comment rendering (render_canonical_plan_steps, render_public_agent_comment, etc.) |
-| `tests/test_discuss_loop.py` | Discuss mode loop tests (per-round comments, debate/deadlock, idempotent and mid-round/multi-round resume, split proposals) |
+| `tests/test_discuss_loop.py` | Discuss mode loop tests (per-round comments, debate/deadlock, idempotent and mid-round/multi-round resume, split proposals, parallel debaters, debater timeout/failure policy) |
 | `tests/test_skill_helpers.py` | Skill helper function tests |
 | `tests/test_skill_loop.py` | Skill loop integration tests |
 | `tests/test_transient.py` | Transient error detection tests |

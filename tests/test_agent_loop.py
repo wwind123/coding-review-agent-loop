@@ -3195,7 +3195,18 @@ def test_reviewer_and_coder_call_sites_pass_correct_role(tmp_path):
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
     captured_roles: list = []
 
-    def mock_run(runner, *, agent, config, prompt, session_id=None, run_id=None, role=None):
+    def mock_run(
+        runner,
+        *,
+        agent,
+        config,
+        prompt,
+        session_id=None,
+        run_id=None,
+        role=None,
+        label=None,
+        timeout_seconds=None,
+    ):
         captured_roles.append(role)
         return AgentResult(text="ok")
 
@@ -3245,7 +3256,17 @@ def test_run_agent_result_passes_role_to_backend(tmp_path, monkeypatch):
         def default_args(self, *, dangerous):
             return ()
 
-        def run(self, runner, config, prompt, session_id=None, run_id=None, role=None):
+        def run(
+            self,
+            runner,
+            config,
+            prompt,
+            session_id=None,
+            run_id=None,
+            role=None,
+            label=None,
+            timeout_seconds=None,
+        ):
             captured["role"] = role
             return AgentResult(text="ok")
 

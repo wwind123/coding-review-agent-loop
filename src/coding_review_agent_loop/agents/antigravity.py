@@ -152,6 +152,8 @@ class AntigravityBackend:
         session_id: str | None = None,
         run_id: str | None = None,
         role: str | None = None,
+        label: str | None = None,
+        timeout_seconds: float | None = None,
         log_path_override: Path | None = None,
     ) -> AgentResult:
         import json, fcntl  # Unix-only (fcntl); imported here so the module loads on Windows
@@ -170,7 +172,9 @@ class AntigravityBackend:
                 args += ["--conversation", session_id]
             # The prompt is the value of --print (must be last), not a positional.
             args += ["--print", prompt_text]
-            log_path = log_path_override or agent_log_path(config, "antigravity", run_id=run_id)
+            log_path = log_path_override or agent_log_path(
+                config, "antigravity", run_id=run_id, label=label
+            )
             log(config, f"Starting Antigravity (model: {model}) in {config.antigravity_dir}; log: {log_path}; response: {response_path}")
             # agy reads GEMINI.md from the workdir as high-priority system context before
             # the model sees the prompt. Injecting a single-shot session rule prevents
@@ -264,10 +268,10 @@ class AntigravityBackend:
                                     check=False,
                                     env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
                                     use_pty=True,
-                                    **(
-                                        {"timeout_seconds": config.repair_timeout_seconds}
+                                    timeout_seconds=(
+                                        config.repair_timeout_seconds
                                         if role == "repair"
-                                        else {}
+                                        else timeout_seconds
                                     ),
                                 )
                             finally:
@@ -312,6 +316,7 @@ class AntigravityBackend:
                                 check=False,
                                 env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
                                 use_pty=True,
+                                timeout_seconds=timeout_seconds,
                             )
                         finally:
                             if gemini_md_path.exists():

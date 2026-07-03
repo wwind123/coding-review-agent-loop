@@ -19,6 +19,7 @@ from .protocol import (
     ParsedDiscussReview,
     ReviewItemDisposition,
     UnresolvedReviewItem,
+    failed_discuss_review_placeholder,
     parse_structured_discuss_agenda,
     parse_structured_discuss_review,
 )
@@ -52,6 +53,10 @@ class PostedRoundMetadata:
     # Discuss research policy in effect when the comment was posted (#477).
     # None on non-discuss flows and legacy comments.
     research_mode: str | None = None
+    # Debaters that failed or timed out in a partial round (#475), as
+    # (display name, failure category) pairs on the round summary. Resume
+    # treats these debaters' missing comments as accounted for.
+    failed_debaters: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -148,6 +153,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "agenda": list(metadata.agenda),
         "analyzer_response": metadata.analyzer_response,
         "research_mode": metadata.research_mode,
+        "failed_debaters": [list(pair) for pair in metadata.failed_debaters],
     }
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -198,6 +204,11 @@ def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:
                 str(payload["research_mode"])
                 if payload.get("research_mode") is not None
                 else None
+            ),
+            failed_debaters=tuple(
+                (str(pair[0]), str(pair[1]))
+                for pair in payload.get("failed_debaters", [])
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
             ),
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
@@ -638,7 +649,14 @@ def _resume_discuss_round(
             if record.metadata.role == "debater":
                 debater_records[record.metadata.agent] = record
         if summary_record is not None:
-            missing = [name for name in configured_reviewer_names if name not in debater_records]
+            # Debaters recorded as failed in a partial round (#475) post no
+            # comment; their summary metadata accounts for the gap.
+            failed_by_name = dict(summary_record.metadata.failed_debaters)
+            missing = [
+                name
+                for name in configured_reviewer_names
+                if name not in debater_records and name not in failed_by_name
+            ]
             if missing:
                 raise AgentLoopError(
                     "Discuss round metadata is inconsistent: round "
@@ -647,6 +665,8 @@ def _resume_discuss_round(
                 )
             votes = tuple(
                 _decode_discuss_vote(debater_records[name], round_number=round_number)
+                if name in debater_records
+                else failed_discuss_review_placeholder(name, failed_by_name[name])
                 for name in configured_reviewer_names
             )
             round_history.append(votes)

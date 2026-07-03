@@ -492,6 +492,67 @@ Rendering keeps sourced facts distinct from judgment:
   research policy never fails on old comments; enforcement applies only to
   newly invoked debaters.
 
+### Parallel debater execution
+
+`--discuss-parallel` runs same-round debaters concurrently instead of one
+after another:
+
+```bash
+agent-loop discuss 123 --repo OWNER/REPO \
+  --reviewer codex --reviewer antigravity --reviewer claude \
+  --discuss-analyzer claude \
+  --discuss-parallel \
+  --discuss-debater-timeout 1800 \
+  --discuss-on-debater-failure partial
+```
+
+Execution model:
+
+- Every pending debater's prompt is built up front from shared pre-round state
+  (issue context, prior-round votes, the analyzer agenda), then all pending
+  turns are submitted to a thread pool. Debater comments are posted only after
+  every turn settles — from the main thread, in configured `--reviewer`
+  order — so same-round debaters never see each other's in-progress output.
+- The analyzer, consensus detection, and the round summary run only after that
+  debater synchronization point.
+- Resume works unchanged: already-posted round votes are reused without
+  re-invoking their debaters, and when every configured debater's vote resumes
+  from comments, no thread pool is constructed at all.
+- Log files are isolated per turn: debater logs end in
+  `-<agent>-discuss-r<N>.log` and analyzer logs in
+  `-<agent>-discuss-analyzer-r<N>.log`; response files already use a
+  per-invocation UUID.
+- Parallel mode requires a distinct workdir per debater and rejects the run
+  otherwise — deliberately not bypassed by `--allow-shared-dir`, because
+  concurrent git/tool activity in a single worktree can corrupt it. The
+  analyzer (or the coder) may still share a debater's directory since it runs
+  only after the synchronization point.
+- Ctrl-C kills all in-flight debater process groups, waits for the workers to
+  settle, and re-raises, so no agent subprocesses are orphaned.
+- Sequential execution remains the default; prefer it when concurrent
+  quota/API pressure across providers is a concern.
+
+Two companion flags apply in both sequential and parallel discuss runs:
+
+- `--discuss-debater-timeout SECONDS` (default: none) bounds each debater
+  turn's wall-clock time. On expiry the agent's whole process group is killed
+  (SIGTERM, then SIGKILL after a short grace); the turn is classified with
+  failure category `timeout` and is never retried as transient, since a kill
+  deadline is not a provider hiccup.
+- `--discuss-on-debater-failure fail|partial` (default: `fail`) is the
+  failure/timeout policy:
+  - `fail` aborts the run after in-flight debaters settle. Successful votes
+    are posted first so a rerun resumes them instead of re-invoking.
+  - `partial` continues the round when at least two debaters produced votes
+    (otherwise the run aborts as with `fail`). The failed debater appears in
+    the round summary under "Debater failures" with its failure category, is
+    recorded in the summary's `AGENT_LOOP_META` metadata (so resume treats the
+    missing comment as accounted for and reconstructs an internal `failed`
+    placeholder in the round history), and gets a fresh turn in the next
+    round. A partial round never declares final consensus — the placeholder
+    vote can never match real outcomes — so a partial final round ends in a
+    `needs-human` deadlock, with the failures noted in the summary.
+
 If `--repo` is omitted, the tool runs `gh repo view` from the current working
 directory, or from `--codex-dir` when that flag is provided, and uses the
 detected `OWNER/REPO`. Pass `--repo` explicitly when running outside the target

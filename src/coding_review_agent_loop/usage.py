@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -185,6 +186,8 @@ class RunUsageContext:
     summary_path: Path
     records: list[UsageCallRecord] = field(default_factory=list)
     _next_call_id: int = 1
+    # Parallel discuss debaters add records from worker threads (#475).
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def add_record(
         self,
@@ -202,21 +205,22 @@ class RunUsageContext:
         log_path: str | None = None,
         fallback_planned: bool | None = None,
     ) -> UsageCallRecord:
-        record = UsageCallRecord(
-            call_id=self._next_call_id,
-            agent=agent,
-            session_id=session_id,
-            returncode=returncode,
-            usage=usage,
-            raw_backend_usage=raw_backend_usage,
-            role=role,
-            model=model,
-            outcome=outcome,
-            log_path=log_path,
-            fallback_planned=fallback_planned,
-        )
-        self._next_call_id += 1
-        self.records.append(record)
+        with self._lock:
+            record = UsageCallRecord(
+                call_id=self._next_call_id,
+                agent=agent,
+                session_id=session_id,
+                returncode=returncode,
+                usage=usage,
+                raw_backend_usage=raw_backend_usage,
+                role=role,
+                model=model,
+                outcome=outcome,
+                log_path=log_path,
+                fallback_planned=fallback_planned,
+            )
+            self._next_call_id += 1
+            self.records.append(record)
         return record
 
     def totals(self) -> UsageTotals:

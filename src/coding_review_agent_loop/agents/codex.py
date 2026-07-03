@@ -239,8 +239,10 @@ class CodexBackend:
         session_id: str | None = None,
         run_id: str | None = None,
         role: str | None = None,
+        label: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> AgentResult:
-        log_path = agent_log_path(config, "codex", run_id=run_id)
+        log_path = agent_log_path(config, "codex", run_id=run_id, label=label)
         response_path = public_response_path(config, "codex")
         prompt_with_response_file = with_public_response_file_instruction(prompt, response_path)
         log(
@@ -294,6 +296,7 @@ class CodexBackend:
                 progress_interval_seconds=config.progress_interval_seconds,
                 check=False,
                 env={"AGENT_LOOP_WORKDIR": str(config.codex_dir.resolve())},
+                timeout_seconds=timeout_seconds,
             )
             response_file_text = read_public_response_file(response_path)
             message_text = _read_codex_message_file(Path(output_path)) or result.stdout

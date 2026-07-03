@@ -9,10 +9,12 @@ import re
 import sys
 import zoneinfo
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace as dataclasses_replace
+from pathlib import Path
 
 from .agents.base import AgentName, AgentResult
-from .agents.registry import agent_display_name, run_agent_result
+from .agents.registry import agent_display_name, get_backend, run_agent_result
 from .config import (
     AgentLoopConfig,
     ensure_agent_workdirs,
@@ -36,7 +38,12 @@ from .decomposition import (
     post_one_shot_impl_handoff_comment,
     post_phase_implementation_handoff_comment,
 )
-from .errors import AgentLoopError, QuotaResetExceededError, UnknownPriorItemDispositionError
+from .errors import (
+    AgentInvocationError,
+    AgentLoopError,
+    QuotaResetExceededError,
+    UnknownPriorItemDispositionError,
+)
 from .github import (
     IssueContext,
     PullRequestChecks,
@@ -77,9 +84,12 @@ from .prompts import (
     render_coder_human_requirements_prompt_context,
 )
 from .protocol import (
+    DISCUSS_FAILED_OUTCOME,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     ParsedDiscussAgenda,
     ParsedDiscussReview,
+    failed_discuss_review_category,
+    failed_discuss_review_placeholder,
     ParsedPlanReview,
     ParsedReview,
     PUBLIC_RESPONSE_MARKER,
@@ -820,7 +830,7 @@ def _format_invalid_agent_response_error(
     category: str | None = None,
 ) -> str:
     exit_context = ""
-    if result is not None and result.returncode != 0:
+    if result is not None and result.returncode not in (0, None):
         exit_context = f" Agent exit code: {result.returncode}."
     log_context = _agent_log_context(log_paths)
     category_hint = ""
@@ -830,6 +840,8 @@ def _format_invalid_agent_response_error(
         category_hint = " Failure category: non-retryable (check credentials or billing)."
     elif category == "deterministic":
         category_hint = " Failure category: deterministic (may require a code fix)."
+    elif category == "timeout":
+        category_hint = " Failure category: timeout (the agent exceeded the configured time limit)."
     classification_text = (result.raw_output or result.text or "") if result is not None else ""
     suggestion = _failure_suggestion(category, reason, agent_name, classification_text=classification_text)
     suggestion_line = f"\n{suggestion}" if suggestion else ""
@@ -960,6 +972,8 @@ def _run_validated_agent(
     repair_allowed_prior_item_ids: Sequence[str] | None = None,
     ledger_incomplete: bool = False,
     role: str | None = None,
+    label: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> ValidatedAgentResponse:
     agent_name = agent_display_name(agent)
     log_paths: list[object] = []
@@ -978,6 +992,8 @@ def _run_validated_agent(
             session_id=session_id,
             run_id=usage_context.run_id if usage_context is not None else None,
             role=role,
+            label=label,
+            timeout_seconds=timeout_seconds,
         )
         last_result = result
         if result.log_path is not None:
@@ -995,6 +1011,16 @@ def _run_validated_agent(
             )
 
         should_retry = False
+        if result.returncode is None:
+            # Timed out (returncode=None from Runner.run_with_log). Detected
+            # before transient classification: a kill deadline is not a
+            # provider hiccup, so retrying or repairing would only waste the
+            # same wall-clock budget again (#475).
+            limit = f" after {timeout_seconds:g}s" if timeout_seconds is not None else ""
+            last_error = f"agent command timed out{limit}"
+            last_classification_text = ""
+            last_failure_category = "timeout"
+            break
         if result.returncode != 0:
             last_error = f"agent command exited with {result.returncode}"
             classification_text = _agent_failure_classification_text(result, phase="command")
@@ -1413,7 +1439,7 @@ def _run_validated_agent(
                 continue
         break
 
-    raise AgentLoopError(
+    raise AgentInvocationError(
         _format_invalid_agent_response_error(
             agent_name=agent_name,
             marker_description=marker_description,
@@ -1421,7 +1447,8 @@ def _run_validated_agent(
             result=last_result,
             log_paths=log_paths,
             category=last_failure_category,
-        )
+        ),
+        failure_category=last_failure_category,
     )
 
 
@@ -3624,6 +3651,7 @@ def _run_discuss_analyzer(
             use_repair=True,
             repair_expected_kind="discuss_agenda",
             role="reviewer",
+            label=f"discuss-analyzer-r{round_number}",
         )
     except QuotaResetExceededError:
         raise
@@ -3650,6 +3678,121 @@ def _run_discuss_analyzer(
             "forwarding as-is",
         )
     return parsed, response.text
+
+
+@dataclass(frozen=True)
+class _DiscussDebaterTurnResult:
+    """Outcome of one debater turn: a validated response or a captured failure.
+
+    Worker threads in the parallel path return these instead of raising, so
+    exceptions never cross the thread boundary; the main thread applies the
+    failure policy after all futures settle (#475).
+    """
+
+    reviewer_name: str
+    response: ValidatedAgentResponse | None = None
+    error: AgentLoopError | None = None
+
+    @property
+    def failure_category(self) -> str:
+        return getattr(self.error, "failure_category", None) or "error"
+
+
+def _ensure_parallel_discuss_workdirs(config: AgentLoopConfig) -> None:
+    """Reject shared workdirs among concurrently scheduled debaters (#475).
+
+    Deliberately NOT bypassed by --allow-shared-dir: concurrent git/tool
+    activity from two agents in one worktree can race and corrupt it. The
+    analyzer (or the coder) may still share a debater's directory because it
+    runs only after the debater synchronization point.
+    """
+    from .config import reviewers as _reviewers
+
+    seen: dict[Path, AgentName] = {}
+    for reviewer in _reviewers(config):
+        path = get_backend(reviewer).workdir(config).resolve()
+        other = seen.get(path)
+        if other is not None:
+            raise AgentLoopError(
+                "--discuss-parallel requires a distinct workdir per debater: "
+                f"{agent_display_name(other)} and {agent_display_name(reviewer)} "
+                f"both resolve to {path}. Use separate clones/worktrees per debater "
+                "or drop --discuss-parallel; --allow-shared-dir does not lift this "
+                "requirement."
+            )
+        seen[path] = reviewer
+
+
+def _run_discuss_debater_turn(
+    runner: Runner,
+    *,
+    reviewer: AgentName,
+    reviewer_name: str,
+    config: AgentLoopConfig,
+    prompt: str,
+    round_number: int,
+    usage_context: RunUsageContext,
+) -> ValidatedAgentResponse:
+    """Run one debater turn from a prebuilt prompt.
+
+    Never posts to GitHub or mutates shared round state, so it is safe to call
+    from a worker thread; the caller posts the comment after the round's
+    synchronization point.
+    """
+    return _run_validated_agent(
+        runner,
+        agent=reviewer,
+        config=config,
+        prompt=prompt,
+        marker_description="<!-- AGENT_PLAN_STATE: approved -->",
+        validate=lambda text, r=reviewer_name, rn=round_number: validate_structured_discuss_review(
+            text, reviewer=r, round_number=rn, research_mode=config.discuss_research
+        ),
+        usage_context=usage_context,
+        use_repair=True,
+        repair_expected_kind="discuss_review",
+        role="reviewer",
+        label=f"discuss-r{round_number}",
+        timeout_seconds=config.discuss_debater_timeout,
+    )
+
+
+def _post_discuss_debater_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    reviewer_name: str,
+    parsed: ParsedDiscussReview,
+    response: ValidatedAgentResponse,
+    round_number: int,
+    subject: str,
+) -> None:
+    post_issue_comment(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        body=_attach_round_metadata(
+            render_public_agent_comment(
+                kind="discuss_review",
+                parsed=parsed,
+                agent=reviewer_name,
+                config=config,
+                model_used=response.model_used,
+                round_number=round_number,
+            ),
+            PostedRoundMetadata(
+                flow="discuss",
+                role="debater",
+                agent=reviewer_name,
+                round_number=round_number,
+                subject=subject,
+                raw_structured_coder_response=response.text,
+                model_used=response.model_used,
+                research_mode=config.discuss_research,
+            ),
+        ),
+    )
 
 
 def _run_discuss_loop(
@@ -3735,9 +3878,19 @@ def _run_discuss_loop(
         )
         final_round_number = len(round_history)
         final_votes = round_history[-1]
+        # A resumed partial round (#475) may carry placeholder votes; keep the
+        # vote table to real positions and surface the rest as failures.
+        final_successful_votes = [
+            vote for vote in final_votes if vote.outcome != DISCUSS_FAILED_OUTCOME
+        ]
+        final_failed_debaters = tuple(
+            (vote.reviewer, failed_discuss_review_category(vote))
+            for vote in final_votes
+            if vote.outcome == DISCUSS_FAILED_OUTCOME
+        )
         summary_body = render_discuss_round_summary_comment(
             round_number=final_round_number,
-            reviewer_votes=final_votes,
+            reviewer_votes=final_successful_votes,
             is_final=True,
             subject=subject,
             outcome="needs-human",
@@ -3747,6 +3900,7 @@ def _run_discuss_loop(
             analyzer_agenda=prior_analyzer_agenda,
             analyzer_name=analyzer_name,
             research_mode=config.discuss_research,
+            failed_debaters=final_failed_debaters,
         )
         post_issue_comment(
             runner,
@@ -3764,6 +3918,7 @@ def _run_discuss_loop(
                     consensus_kind="deadlock",
                     agenda=(),
                     research_mode=config.discuss_research,
+                    failed_debaters=final_failed_debaters,
                 ),
             ),
         )
@@ -3775,7 +3930,9 @@ def _run_discuss_loop(
         return 0
     for round_number in range(start_round_number, max_round_number + 1):
         prior_round_votes = round_history[-1] if round_history else []
-        reviewer_votes: list[ParsedDiscussReview] = []
+        votes_by_name: dict[str, ParsedDiscussReview] = {}
+        failures_by_name: dict[str, _DiscussDebaterTurnResult] = {}
+        pending: list[AgentName] = []
         for reviewer in configured_reviewers:
             reviewer_name = agent_display_name(reviewer)
             resumed_vote = (
@@ -3787,72 +3944,189 @@ def _run_discuss_loop(
                     f"discuss: resuming {reviewer_name}'s posted round {round_number} position "
                     f"on issue #{issue_number}",
                 )
-                reviewer_votes.append(resumed_vote)
-                continue
+                votes_by_name[reviewer_name] = resumed_vote
+            else:
+                pending.append(reviewer)
+
+        def _build_debater_prompt(reviewer: AgentName) -> str:
+            return build_discuss_review_prompt(
+                issue_number,
+                config,
+                reviewer=reviewer,
+                memory=memory,
+                issue_context=prompt_issue_context,
+                round_number=round_number,
+                prior_round_votes=prior_round_votes,
+                prior_round_agenda=prior_round_agenda,
+                analyzer_agenda=prior_analyzer_agenda,
+                research_mode=config.discuss_research,
+            )
+
+        if config.discuss_parallel and pending:
+            # Same-round debaters run concurrently; prompts are built up front
+            # from shared pre-round state and comments are posted only after
+            # every future settles, so no debater can see a co-debater's
+            # in-progress round-N output. Zero-pending resumes skip this branch
+            # entirely (no executor is constructed).
+            prompts = {
+                agent_display_name(reviewer): _build_debater_prompt(reviewer)
+                for reviewer in pending
+            }
+            pending_names = [agent_display_name(reviewer) for reviewer in pending]
             log(
                 config,
-                f"discuss: invoking {reviewer_name} on issue #{issue_number} "
-                f"(round {round_number})",
+                f"discuss: invoking {', '.join(pending_names)} in parallel on "
+                f"issue #{issue_number} (round {round_number})",
             )
-            response = _run_validated_agent(
-                runner,
-                agent=reviewer,
-                config=config,
-                prompt=build_discuss_review_prompt(
-                    issue_number,
-                    config,
-                    reviewer=reviewer,
-                    memory=memory,
-                    issue_context=prompt_issue_context,
-                    round_number=round_number,
-                    prior_round_votes=prior_round_votes,
-                    prior_round_agenda=prior_round_agenda,
-                    analyzer_agenda=prior_analyzer_agenda,
-                    research_mode=config.discuss_research,
-                ),
-                marker_description="<!-- AGENT_PLAN_STATE: approved -->",
-                validate=lambda text, r=reviewer_name, rn=round_number: validate_structured_discuss_review(
-                    text, reviewer=r, round_number=rn, research_mode=config.discuss_research
-                ),
-                usage_context=usage_context,
-                use_repair=True,
-                repair_expected_kind="discuss_review",
-                role="reviewer",
-            )
-            parsed = response.marker_value
-            assert isinstance(parsed, ParsedDiscussReview)
-            post_issue_comment(
-                runner,
-                config=config,
-                issue_number=issue_number,
-                body=_attach_round_metadata(
-                    render_public_agent_comment(
-                        kind="discuss_review",
-                        parsed=parsed,
-                        agent=reviewer_name,
+
+            def _debater_worker(reviewer: AgentName, reviewer_name: str) -> _DiscussDebaterTurnResult:
+                try:
+                    response = _run_discuss_debater_turn(
+                        runner,
+                        reviewer=reviewer,
+                        reviewer_name=reviewer_name,
                         config=config,
-                        model_used=response.model_used,
+                        prompt=prompts[reviewer_name],
                         round_number=round_number,
-                    ),
-                    PostedRoundMetadata(
-                        flow="discuss",
-                        role="debater",
-                        agent=reviewer_name,
+                        usage_context=usage_context,
+                    )
+                except AgentLoopError as exc:
+                    # Includes QuotaResetExceededError: captured here and
+                    # re-raised on the main thread with priority.
+                    return _DiscussDebaterTurnResult(reviewer_name=reviewer_name, error=exc)
+                return _DiscussDebaterTurnResult(reviewer_name=reviewer_name, response=response)
+
+            executor = ThreadPoolExecutor(
+                max_workers=len(pending), thread_name_prefix=f"discuss-r{round_number}"
+            )
+            try:
+                futures = {
+                    agent_display_name(reviewer): executor.submit(
+                        _debater_worker, reviewer, agent_display_name(reviewer)
+                    )
+                    for reviewer in pending
+                }
+                # The analyzer synchronization point: wait for every debater.
+                turn_results = {name: future.result() for name, future in futures.items()}
+            except KeyboardInterrupt:
+                # Workers never receive the terminal SIGINT; kill their agent
+                # process groups so their wait loops return and the shutdown
+                # below completes promptly, then propagate the interrupt.
+                runner.terminate_active_processes()
+                raise
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+            for name in pending_names:
+                turn = turn_results[name]
+                if turn.error is None:
+                    parsed = turn.response.marker_value
+                    assert isinstance(parsed, ParsedDiscussReview)
+                    _post_discuss_debater_comment(
+                        runner,
+                        config=config,
+                        issue_number=issue_number,
+                        reviewer_name=name,
+                        parsed=parsed,
+                        response=turn.response,
                         round_number=round_number,
                         subject=subject,
-                        raw_structured_coder_response=response.text,
-                        model_used=response.model_used,
-                        research_mode=config.discuss_research,
-                    ),
-                ),
+                    )
+                    votes_by_name[name] = parsed
+                else:
+                    failures_by_name[name] = turn
+            # Successful votes are posted above even when the round is about
+            # to abort, so a rerun resumes them instead of re-invoking.
+            for name in pending_names:
+                turn = failures_by_name.get(name)
+                if turn is not None and isinstance(turn.error, QuotaResetExceededError):
+                    raise turn.error
+            if failures_by_name and config.discuss_on_debater_failure == "fail":
+                raise next(iter(failures_by_name.values())).error
+        else:
+            for reviewer in pending:
+                reviewer_name = agent_display_name(reviewer)
+                log(
+                    config,
+                    f"discuss: invoking {reviewer_name} on issue #{issue_number} "
+                    f"(round {round_number})",
+                )
+                try:
+                    response = _run_discuss_debater_turn(
+                        runner,
+                        reviewer=reviewer,
+                        reviewer_name=reviewer_name,
+                        config=config,
+                        prompt=_build_debater_prompt(reviewer),
+                        round_number=round_number,
+                        usage_context=usage_context,
+                    )
+                except QuotaResetExceededError:
+                    raise
+                except AgentLoopError as exc:
+                    if config.discuss_on_debater_failure == "fail":
+                        raise
+                    failures_by_name[reviewer_name] = _DiscussDebaterTurnResult(
+                        reviewer_name=reviewer_name, error=exc
+                    )
+                    log(
+                        config,
+                        f"discuss: {reviewer_name} failed round {round_number} "
+                        f"({failures_by_name[reviewer_name].failure_category}); continuing "
+                        "per --discuss-on-debater-failure=partial",
+                    )
+                    continue
+                parsed = response.marker_value
+                assert isinstance(parsed, ParsedDiscussReview)
+                _post_discuss_debater_comment(
+                    runner,
+                    config=config,
+                    issue_number=issue_number,
+                    reviewer_name=reviewer_name,
+                    parsed=parsed,
+                    response=response,
+                    round_number=round_number,
+                    subject=subject,
+                )
+                votes_by_name[reviewer_name] = parsed
+
+        failed_debaters: list[tuple[str, str]] = []
+        reviewer_votes: list[ParsedDiscussReview] = []
+        for reviewer in configured_reviewers:
+            reviewer_name = agent_display_name(reviewer)
+            vote = votes_by_name.get(reviewer_name)
+            if vote is not None:
+                reviewer_votes.append(vote)
+                continue
+            failure = failures_by_name[reviewer_name]
+            category = failure.failure_category
+            failed_debaters.append((reviewer_name, category))
+            reviewer_votes.append(failed_discuss_review_placeholder(reviewer_name, category))
+        if failed_debaters:
+            # Reached only under the "partial" policy: continue when at least
+            # two debaters produced votes; a partial round can never declare
+            # final consensus because the placeholder outcome differs.
+            if len(votes_by_name) < 2:
+                log(
+                    config,
+                    "discuss: --discuss-on-debater-failure=partial requires at least two "
+                    f"successful debater votes in round {round_number}, got {len(votes_by_name)}",
+                )
+                raise next(iter(failures_by_name.values())).error
+            log(
+                config,
+                f"discuss: continuing round {round_number} with partial results; failed "
+                "debater(s): "
+                + ", ".join(f"{name} ({category})" for name, category in failed_debaters),
             )
-            reviewer_votes.append(parsed)
+        successful_votes = [
+            vote for vote in reviewer_votes if vote.outcome != DISCUSS_FAILED_OUTCOME
+        ]
         round_history.append(reviewer_votes)
         consensus = _detect_discuss_consensus(reviewer_votes)
         is_final = consensus is not None or round_number == max_round_number
         if consensus is None:
             outcome = "needs-human"
-            round_split_proposals: list[str] = _merge_discuss_split_proposals(reviewer_votes)
+            round_split_proposals: list[str] = _merge_discuss_split_proposals(successful_votes)
             consensus_kind = "deadlock" if is_final else None
         else:
             outcome, round_split_proposals = consensus
@@ -3875,7 +4149,9 @@ def _run_discuss_loop(
             )
         summary_body = render_discuss_round_summary_comment(
             round_number=round_number,
-            reviewer_votes=reviewer_votes,
+            # The vote table and agenda draw from real positions only; failed
+            # debaters surface in the dedicated failures section instead.
+            reviewer_votes=successful_votes,
             is_final=is_final,
             subject=subject,
             outcome=outcome if is_final else None,
@@ -3888,8 +4164,9 @@ def _run_discuss_loop(
             analyzer_agenda=prior_analyzer_agenda if is_final else next_analyzer_agenda,
             analyzer_name=analyzer_name,
             research_mode=config.discuss_research,
+            failed_debaters=tuple(failed_debaters),
         )
-        agenda = () if is_final else tuple(_render_discuss_agenda_lines(reviewer_votes))
+        agenda = () if is_final else tuple(_render_discuss_agenda_lines(successful_votes))
         post_issue_comment(
             runner,
             config=config,
@@ -3907,6 +4184,7 @@ def _run_discuss_loop(
                     agenda=agenda,
                     analyzer_response=analyzer_response_raw,
                     research_mode=config.discuss_research,
+                    failed_debaters=tuple(failed_debaters),
                 ),
             ),
         )
@@ -3938,6 +4216,8 @@ def run_discuss_loop(
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     try:
+        if config.discuss_parallel:
+            _ensure_parallel_discuss_workdirs(config)
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
         log(config, f"discuss: validating issue #{issue_number}")

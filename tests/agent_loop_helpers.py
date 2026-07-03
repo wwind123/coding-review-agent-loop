@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -285,6 +286,10 @@ class FakeRunner(Runner):
         self.public_response_outputs = list(public_response_outputs or [])
         self.advance_git_head_on_pr = advance_git_head_on_pr
         self._agent_pr_counter = 0
+        # Parallel discuss debaters (#475) call run_with_log from worker
+        # threads; scripted outputs stay keyed per agent, but the shared
+        # bookkeeping (commands, comments, response files) needs a lock.
+        self._scripted_lock = threading.RLock()
 
     def _normalize_legacy_agent_output(self, output: str, prompt: str) -> str:
         stripped = output.lstrip()
@@ -445,6 +450,15 @@ class FakeRunner(Runner):
         use_pty=False,
         timeout_seconds=None,
     ):
+        with self._scripted_lock:
+            return self._run_with_log_locked(
+                args,
+                cwd=cwd,
+                log_path=log_path,
+                check=check,
+            )
+
+    def _run_with_log_locked(self, args, *, cwd, log_path, check):
         cmd, cwd_path = self._record_command(args, cwd)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         ensure_log_dir_ignored(log_path.parent)
@@ -511,6 +525,10 @@ class FakeRunner(Runner):
         return self.run(args, cwd=cwd, check=check)
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        with self._scripted_lock:
+            return self._run_locked(args, cwd=cwd, check=check)
+
+    def _run_locked(self, args, *, cwd, check):
         cmd, cwd_path = self._record_command(args, cwd)
 
         if cmd[:1] == ["claude"]:

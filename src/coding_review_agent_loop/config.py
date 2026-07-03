@@ -43,6 +43,9 @@ DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3 Flash",)
 # validation, and the prompt builders all derive from this set.
 DISCUSS_RESEARCH_MODES: frozenset[str] = frozenset({"none", "required", "auto"})
 
+# Discuss-mode debater failure policy values (#475).
+DISCUSS_DEBATER_FAILURE_MODES: frozenset[str] = frozenset({"fail", "partial"})
+
 
 @dataclass(frozen=True)
 class AgentLoopConfig:
@@ -108,6 +111,15 @@ class AgentLoopConfig:
     # "required" enforces sourced external facts from every debater, "auto"
     # lets debaters/analyzer decide using conservative triggers.
     discuss_research: str = "none"
+    # Parallel debater execution for discuss mode (#475). Opt-in; sequential
+    # stays the default to avoid surprise quota pressure.
+    discuss_parallel: bool = False
+    # Per-debater-turn wall-clock limit in seconds; None disables the limit.
+    discuss_debater_timeout: float | None = None
+    # What to do when a debater turn fails or times out: "fail" aborts the run
+    # (today's behavior); "partial" continues the round with >= 2 surviving
+    # votes and records the failure in the round summary.
+    discuss_on_debater_failure: str = "fail"
 
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
@@ -134,6 +146,11 @@ class AgentLoopConfig:
         if self.discuss_research not in DISCUSS_RESEARCH_MODES:
             rendered = ", ".join(f"'{mode}'" for mode in sorted(DISCUSS_RESEARCH_MODES))
             raise AgentLoopError(f"--discuss-research must be one of: {rendered}.")
+        if self.discuss_on_debater_failure not in DISCUSS_DEBATER_FAILURE_MODES:
+            rendered = ", ".join(f"'{mode}'" for mode in sorted(DISCUSS_DEBATER_FAILURE_MODES))
+            raise AgentLoopError(f"--discuss-on-debater-failure must be one of: {rendered}.")
+        if self.discuss_debater_timeout is not None and self.discuss_debater_timeout <= 0:
+            raise AgentLoopError("--discuss-debater-timeout must be greater than zero seconds.")
 
 
 def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
@@ -775,6 +792,9 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         repair_timeout_seconds=getattr(args, "repair_timeout_seconds", 120),
         discuss_analyzer=getattr(args, "discuss_analyzer", None),
         discuss_research=getattr(args, "discuss_research", "none") or "none",
+        discuss_parallel=getattr(args, "discuss_parallel", False),
+        discuss_debater_timeout=getattr(args, "discuss_debater_timeout", None),
+        discuss_on_debater_failure=getattr(args, "discuss_on_debater_failure", "fail") or "fail",
         test_command=test_command,
         pre_review_tests=args.pre_review_tests,
         ci_check_name=args.ci_check_name,

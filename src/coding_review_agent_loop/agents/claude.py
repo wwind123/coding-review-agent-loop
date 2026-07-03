@@ -108,6 +108,8 @@ class ClaudeBackend:
         session_id: str | None = None,
         run_id: str | None = None,
         role: str | None = None,
+        label: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> AgentResult:
         response_path = public_response_path(config, "claude")
         args = [config.claude_cmd, "--print", "--output-format", "json", *config.claude_args]
@@ -118,7 +120,7 @@ class ClaudeBackend:
         if session_id:
             args += ["--resume", session_id]
         args.append(with_public_response_file_instruction(prompt, response_path))
-        log_path = agent_log_path(config, "claude", run_id=run_id)
+        log_path = agent_log_path(config, "claude", run_id=run_id, label=label)
         log(config, f"Starting Claude in {config.claude_dir}; log: {log_path}; response: {response_path}")
         result = runner.run_with_log(
             args,
@@ -128,6 +130,7 @@ class ClaudeBackend:
             progress_interval_seconds=config.progress_interval_seconds,
             check=False,
             env={"AGENT_LOOP_WORKDIR": str(config.claude_dir.resolve())},
+            timeout_seconds=timeout_seconds,
         )
         log(config, f"Claude finished; log: {log_path}")
         message_text, new_session_id, usage, raw_usage, model_detected = _parse_claude_output(result.stdout)

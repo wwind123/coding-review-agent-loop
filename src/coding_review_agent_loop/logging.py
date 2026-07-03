@@ -22,10 +22,17 @@ def new_run_id() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
 
-def agent_log_path(config: AgentLoopConfig, agent: str, *, run_id: str | None = None) -> Path:
+def agent_log_path(
+    config: AgentLoopConfig,
+    agent: str,
+    *,
+    run_id: str | None = None,
+    label: str | None = None,
+) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     prefix = f"{run_id}-" if run_id else ""
-    return config.log_dir / f"{prefix}{stamp}-{agent}.log"
+    suffix = f"-{label}" if label else ""
+    return config.log_dir / f"{prefix}{stamp}-{agent}{suffix}.log"
 
 
 def run_usage_summary_path(config: AgentLoopConfig, run_id: str) -> Path:
