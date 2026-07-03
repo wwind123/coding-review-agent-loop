@@ -57,6 +57,11 @@ class PostedRoundMetadata:
     # (display name, failure category) pairs on the round summary. Resume
     # treats these debaters' missing comments as accounted for.
     failed_debaters: tuple[tuple[str, str], ...] = ()
+    # Merged discuss split proposals recorded on a final summary comment
+    # (#476), so a resumed run can materialize them into child issues without
+    # having to reconstruct them from debater comment metadata. Empty on
+    # non-final, non-split, and legacy comments.
+    split_proposals: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -154,6 +159,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "analyzer_response": metadata.analyzer_response,
         "research_mode": metadata.research_mode,
         "failed_debaters": [list(pair) for pair in metadata.failed_debaters],
+        "split_proposals": list(metadata.split_proposals),
     }
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -210,6 +216,7 @@ def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:
                 for pair in payload.get("failed_debaters", [])
                 if isinstance(pair, (list, tuple)) and len(pair) == 2
             ),
+            split_proposals=tuple(str(item) for item in payload.get("split_proposals", [])),
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise AgentLoopError("Invalid AGENT_LOOP_META payload.") from exc

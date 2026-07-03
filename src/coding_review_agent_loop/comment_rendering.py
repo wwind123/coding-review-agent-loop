@@ -16,6 +16,7 @@ from .protocol import (
     PRIOR_UNRESOLVED_ITEM_DISPOSITIONS_HEADING_RE,
     PRIOR_UNRESOLVED_PLAN_ITEM_DISPOSITIONS_HEADING_RE,
     SIGNATURE_RE,
+    DeferredStage,
     ParsedDiscussAgenda,
     ParsedDiscussReview,
     ParsedPlanReview,
@@ -207,6 +208,22 @@ def render_canonical_plan_steps(plan_steps: Sequence[str]) -> str:
     return "\n".join(f"{index}. {step}" for index, step in enumerate(plan_steps, start=1))
 
 
+def render_deferred_stages_section(deferred_stages: Sequence[DeferredStage]) -> str | None:
+    """Render declared deferred stages so they carry into the plan's markdown.
+
+    Deferred stages must survive canonical-plan rendering (#476): they feed
+    subject hashing, stored plan state, reviewer prompts, and resume, so
+    scope narrowing stays a mechanical signal instead of prose reviewers
+    might miss.
+    """
+    if not deferred_stages:
+        return None
+    lines = ["### Deferred stages (not in this plan)"]
+    for stage in deferred_stages:
+        lines.append(f"- {stage.title}: {stage.summary}")
+    return "\n".join(lines)
+
+
 def render_canonical_plan_revision(
     parsed_revision: StructuredPlanRevision,
     prior_items: Sequence[UnresolvedReviewItem],
@@ -232,6 +249,9 @@ def render_canonical_plan_revision(
             ]
         )
     )
+    deferred_section = render_deferred_stages_section(parsed_revision.deferred_stages)
+    if deferred_section:
+        sections.append(deferred_section)
     return "\n\n".join(sections)
 
 
@@ -506,9 +526,12 @@ def _render_public_plan_state_comment(
         "## Plan",
         parsed_plan.summary.strip(),
         "\n".join(["### Plan steps", render_canonical_plan_steps(parsed_plan.plan_steps)]),
-        f"<!-- AGENT_PLAN_STATE: {parsed_plan.state} -->",
-        f"-- {_comment_signature(agent, config, model_used)}",
     ]
+    deferred_section = render_deferred_stages_section(parsed_plan.deferred_stages)
+    if deferred_section:
+        sections.append(deferred_section)
+    sections.append(f"<!-- AGENT_PLAN_STATE: {parsed_plan.state} -->")
+    sections.append(f"-- {_comment_signature(agent, config, model_used)}")
     return "\n\n".join(section for section in sections if section)
 
 

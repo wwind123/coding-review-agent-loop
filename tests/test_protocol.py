@@ -21,6 +21,7 @@ from coding_review_agent_loop.orchestrator import (
 )
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
+    DeferredStage,
     DISCUSS_ANALYZER_FRAMING_VALUES,
     DISCUSS_OUTCOME_VALUES,
     DISCUSS_RESEARCH_STATUS_VALUES,
@@ -2344,6 +2345,76 @@ def test_validate_structured_plan_revision_accepts_v1_payload():
         ("item-1", "resolved")
     ]
     assert parsed.plan_steps == ("Update protocol.py.", "Add regression tests.")
+
+
+def test_validate_structured_plan_revision_accepts_deferred_stages():
+    revision = structured_plan_revision(
+        deferred_stages=[
+            {"title": "Auth flow overhaul", "summary": "Split out follow-up work."}
+        ],
+    )
+
+    parsed = validate_structured_plan_revision(revision)
+
+    assert parsed is not None
+    assert parsed.deferred_stages == (
+        DeferredStage(title="Auth flow overhaul", summary="Split out follow-up work."),
+    )
+
+
+def test_validate_structured_plan_revision_defaults_deferred_stages_to_empty():
+    revision = structured_plan_revision()
+
+    parsed = validate_structured_plan_revision(revision)
+
+    assert parsed is not None
+    assert parsed.deferred_stages == ()
+
+
+def test_validate_structured_plan_revision_rejects_duplicate_deferred_stage_title():
+    revision = structured_plan_revision(
+        deferred_stages=[
+            {"title": "Auth flow", "summary": "First."},
+            {"title": "auth   flow", "summary": "Second, duplicate title."},
+        ],
+    )
+
+    with pytest.raises(AgentLoopError, match="duplicate stage title"):
+        validate_structured_plan_revision(revision)
+
+
+def test_validate_structured_plan_state_accepts_deferred_stages():
+    plan_state = structured_plan_state(
+        deferred_stages=[{"title": "Billing follow-up", "summary": "Out of scope for now."}],
+    )
+
+    parsed = validate_structured_plan_state(plan_state)
+
+    assert parsed is not None
+    assert parsed.deferred_stages == (
+        DeferredStage(title="Billing follow-up", summary="Out of scope for now."),
+    )
+
+
+def test_render_canonical_plan_revision_includes_deferred_stages_section():
+    revision = structured_plan_revision(
+        deferred_stages=[{"title": "Auth flow overhaul", "summary": "Split out follow-up work."}],
+    )
+    parsed = validate_structured_plan_revision(revision)
+
+    canonical = render_canonical_plan_revision(parsed, ())
+
+    assert "### Deferred stages (not in this plan)" in canonical
+    assert "Auth flow overhaul: Split out follow-up work." in canonical
+
+
+def test_render_canonical_plan_revision_omits_deferred_stages_section_when_absent():
+    revision = structured_plan_revision()
+    parsed = validate_structured_plan_revision(revision)
+
+    canonical = render_canonical_plan_revision(parsed, ())
+
+    assert "Deferred stages" not in canonical
 
 
 def test_validate_plan_revision_response_rejects_marker_only_markdown():

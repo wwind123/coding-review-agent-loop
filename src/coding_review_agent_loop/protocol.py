@@ -199,6 +199,18 @@ class StructuredCoderFollowup:
 
 
 @dataclass(frozen=True)
+class DeferredStage:
+    """A stage the plan intentionally leaves out of the current scope (#476).
+
+    Declared by the coder in structured plan responses so scope narrowing is a
+    mechanical signal instead of prose the orchestrator would have to guess at.
+    """
+
+    title: str
+    summary: str
+
+
+@dataclass(frozen=True)
 class StructuredPlanRevision:
     schema_version: int
     kind: str
@@ -206,6 +218,7 @@ class StructuredPlanRevision:
     summary: str
     prior_plan_item_dispositions: tuple[ReviewItemDisposition, ...]
     plan_steps: tuple[str, ...]
+    deferred_stages: tuple[DeferredStage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -215,6 +228,7 @@ class StructuredPlanState:
     state: str
     summary: str
     plan_steps: tuple[str, ...]
+    deferred_stages: tuple[DeferredStage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -654,6 +668,37 @@ def _expect_optional_string_list(
         item_context=item_context,
         min_length=min_length,
     )
+
+
+def _expect_deferred_stage_list(
+    payload: dict[str, object],
+    field_name: str,
+    *,
+    context: str,
+) -> tuple[DeferredStage, ...]:
+    value = payload.get(field_name, [])
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    stages: list[DeferredStage] = []
+    seen_title_keys: set[str] = set()
+    for index, item in enumerate(value):
+        item_context = f"{context} at index {index}"
+        item_payload = _expect_object(item, context=item_context)
+        _expect_exact_keys(item_payload, context=item_context, required={"title", "summary"})
+        title = _expect_non_empty_string(item_payload["title"], context=f"{item_context}.title")
+        title_key = " ".join(title.lower().split())
+        if title_key in seen_title_keys:
+            raise AgentLoopError(f"{context} has a duplicate stage title: {title!r}.")
+        seen_title_keys.add(title_key)
+        stages.append(
+            DeferredStage(
+                title=title,
+                summary=_expect_non_empty_string(
+                    item_payload["summary"], context=f"{item_context}.summary"
+                ),
+            )
+        )
+    return tuple(stages)
 
 
 def _expect_state(value: object, *, context: str) -> str:
@@ -1396,6 +1441,7 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
             "prior_plan_item_dispositions",
             "plan_steps",
         },
+        optional={"deferred_stages"},
     )
     state = _expect_non_empty_string(payload["state"], context="plan_revision.state")
     if state != "blocking":
@@ -1414,6 +1460,9 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
         item_context="plan_revision.plan_steps",
         min_length=1,
     )
+    deferred_stages = _expect_deferred_stage_list(
+        payload, "deferred_stages", context="plan_revision.deferred_stages"
+    )
     return StructuredPlanRevision(
         schema_version=1,
         kind="plan_revision",
@@ -1421,6 +1470,7 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
         summary=summary,
         prior_plan_item_dispositions=dispositions,
         plan_steps=plan_steps,
+        deferred_stages=deferred_stages,
     )
 
 
@@ -1437,7 +1487,7 @@ def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
         payload,
         context="plan_state",
         required={"kind", "summary", "plan_steps"},
-        optional={"schema_version", "state"},
+        optional={"schema_version", "state", "deferred_stages"},
     )
     if "state" in payload:
         _expect_state(payload["state"], context="plan_state.state")
@@ -1451,6 +1501,9 @@ def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
             context="plan_state.plan_steps",
             item_context="plan_state.plan_steps",
             min_length=1,
+        ),
+        deferred_stages=_expect_deferred_stage_list(
+            payload, "deferred_stages", context="plan_state.deferred_stages"
         ),
     )
 

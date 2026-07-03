@@ -788,7 +788,17 @@ def _format_plan_approval_summary_with_followups(
                 ]
             )
         else:
-            lines.extend(["", "Approved plan future follow-ups:", ""])
+            lines.extend(
+                [
+                    "",
+                    "Approved plan future follow-ups:",
+                    "",
+                    "These are summarized only; they are NOT filed as GitHub issues. Rerun with "
+                    "`--approved-followups issue` (or `fix-and-issue`) to file them, or file them "
+                    "manually.",
+                    "",
+                ]
+            )
             for followup in reconciliation.selected_groups:
                 reviewers = ", ".join(followup.reviewers)
                 lines.append(f"- {_followup_main_text(followup.text)} ({reviewers})")

@@ -2424,6 +2424,43 @@ def test_round_metadata_round_trip_preserves_canonical_plan():
     assert _decode_round_metadata(_encode_round_metadata(metadata)).canonical_plan == metadata.canonical_plan
 
 
+def test_round_metadata_round_trip_preserves_split_proposals():
+    metadata = PostedRoundMetadata(
+        flow="discuss",
+        role="summary",
+        agent="Orchestrator",
+        round_number=1,
+        subject="abc",
+        is_final=True,
+        split_proposals=("Auth flow", "Billing flow"),
+    )
+
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+
+    assert decoded.split_proposals == metadata.split_proposals
+
+
+def test_decode_old_round_metadata_defaults_split_proposals_to_empty():
+    payload = {
+        "flow": "discuss",
+        "role": "summary",
+        "agent": "Orchestrator",
+        "round_number": 1,
+        "subject": "abc",
+        "prior_items": [],
+        "dispositions": [],
+        "new_items": [],
+        "state": None,
+        "canonical_plan": None,
+        "raw_structured_coder_response": None,
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+
+    assert _decode_round_metadata(encoded).split_proposals == ()
+
+
 def test_round_metadata_round_trip_preserves_compact_prior_summaries():
     metadata = PostedRoundMetadata(
         flow="plan",

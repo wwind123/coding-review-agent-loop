@@ -233,6 +233,7 @@ class FakeRunner(Runner):
         issue_urls=None,
         public_response_outputs=None,
         advance_git_head_on_pr=True,
+        search_issues_payload=None,
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -311,6 +312,11 @@ class FakeRunner(Runner):
         self.issue_urls = list(issue_urls) if issue_urls is not None else None
         self.public_response_outputs = list(public_response_outputs or [])
         self.advance_git_head_on_pr = advance_git_head_on_pr
+        # Results returned by the next `gh issue list --search` call (#476).
+        # A list of dicts with number/title/url/body keys; consumed one call
+        # at a time when a list of lists is provided, otherwise reused as-is.
+        self.search_issues_payload = search_issues_payload
+        self.search_issues_calls = []
         self._agent_pr_counter = 0
         self._agent_command_seen = False
         # Parallel discuss debaters (#475) call run_with_log from worker
@@ -679,6 +685,16 @@ class FakeRunner(Runner):
                 issue_url = self.issue_urls.pop(0)
             return CommandResult(cmd, cwd_path, f"{issue_url or ''}\n", "", 0)
 
+        if cmd[:3] == ["gh", "issue", "list"]:
+            search = cmd[cmd.index("--search") + 1] if "--search" in cmd else ""
+            self.search_issues_calls.append(search)
+            payload = self.search_issues_payload
+            if payload and isinstance(payload, list) and payload and isinstance(payload[0], list):
+                results = payload.pop(0) if payload else []
+            else:
+                results = payload or []
+            return CommandResult(cmd, cwd_path, json_dumps(results), "", 0)
+
         if cmd[:3] == ["gh", "pr", "view"]:
             if "--jq" in cmd and ".headRefOid" in cmd:
                 return CommandResult(cmd, cwd_path, "abc123\n", "", 0)
@@ -912,18 +928,20 @@ def structured_plan_revision(
     plan_steps: list[str] | None = None,
     reviewer: str = "Anthropic Claude",
     human_requirements: str = "",
+    deferred_stages: list[dict[str, str]] | None = None,
 ) -> str:
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_revision",
+        "state": "blocking",
+        "summary": summary,
+        "prior_plan_item_dispositions": prior_plan_item_dispositions or [],
+        "plan_steps": plan_steps or ["Update the plan.", "Run the relevant tests."],
+    }
+    if deferred_stages is not None:
+        payload["deferred_stages"] = deferred_stages
     return (
-        json.dumps(
-            {
-                "schema_version": 1,
-                "kind": "plan_revision",
-                "state": "blocking",
-                "summary": summary,
-                "prior_plan_item_dispositions": prior_plan_item_dispositions or [],
-                "plan_steps": plan_steps or ["Update the plan.", "Run the relevant tests."],
-            }
-        )
+        json.dumps(payload)
         + human_requirements
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n"
         + f"-- {reviewer}"
@@ -936,17 +954,19 @@ def structured_plan_state(
     summary: str = "Implementation plan.",
     plan_steps: list[str] | None = None,
     reviewer: str = "Anthropic Claude",
+    deferred_stages: list[dict[str, str]] | None = None,
 ) -> str:
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_state",
+        "state": state,
+        "summary": summary,
+        "plan_steps": plan_steps or ["Update the code.", "Run the relevant tests."],
+    }
+    if deferred_stages is not None:
+        payload["deferred_stages"] = deferred_stages
     return (
-        json.dumps(
-            {
-                "schema_version": 1,
-                "kind": "plan_state",
-                "state": state,
-                "summary": summary,
-                "plan_steps": plan_steps or ["Update the code.", "Run the relevant tests."],
-            }
-        )
+        json.dumps(payload)
         + f"\n<!-- AGENT_PLAN_STATE: {state} -->\n"
         + f"-- {reviewer}"
     )

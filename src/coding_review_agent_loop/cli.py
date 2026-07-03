@@ -398,6 +398,26 @@ def build_parser() -> argparse.ArgumentParser:
             "Defaults to plan-only unless --implement-after-approval is used."
         ),
     )
+    issue.add_argument(
+        "--materialize-split-issues",
+        action="store_true",
+        help=(
+            "File a linked child GitHub issue for each remaining discuss `split` proposal "
+            "or plan `deferred_stages` entry instead of leaving them as unfiled text "
+            "(default: off, warning-only)."
+        ),
+    )
+    issue.add_argument(
+        "--split-stage",
+        type=int,
+        default=None,
+        metavar="CHILD_ISSUE_NUMBER",
+        help=(
+            "When the parent issue's split proposals were already fully materialized into "
+            "child issues, explicitly select which child stage this run implements instead "
+            "of relying on a unique plan-title match."
+        ),
+    )
     add_common(issue)
 
     pr = subparsers.add_parser("pr", help="Run the reviewer/coder loop on an existing PR.")
@@ -499,6 +519,14 @@ def build_parser() -> argparse.ArgumentParser:
             "continues the round when at least two debaters produced votes and "
             "records the failures in the round summary. A partial round never "
             "declares final consensus."
+        ),
+    )
+    discuss.add_argument(
+        "--materialize-split-issues",
+        action="store_true",
+        help=(
+            "On a `split` consensus, file a linked child GitHub issue for each proposed "
+            "sub-issue instead of leaving them as unfiled text (default: off, warning-only)."
         ),
     )
     add_common(discuss)

@@ -748,10 +748,21 @@ Use this mandatory structured JSON response format:
     "Update `src/coding_review_agent_loop/protocol.py` to hard-fail invalid structured plan payloads after JSON-prefix detection.",
     "Normalize structured plan rendering and metadata-backed resume behavior in `src/coding_review_agent_loop/orchestrator.py`.",
     "Extend prompts and targeted tests for structured planning flows."
+  ],
+  "deferred_stages": [
+    {"title": "Follow-up stage title", "summary": "One-sentence scope this plan intentionally leaves out."}
   ]
 }
 <!-- AGENT_PLAN_STATE: blocking -->
 -- coder signature shown in the volatile tail
+
+If the plan intentionally narrows scope (mentions a later stage, follow-up
+issue, or explicitly out-of-scope work), declare EVERY such stage in the
+optional `deferred_stages` field instead of leaving it only in prose; omit the
+field entirely (or use an empty list) when the plan covers full scope. The
+orchestrator uses `deferred_stages` to file or warn about unfiled follow-up
+work before implementation, so undeclared narrowing can leave scope silently
+untracked once this plan's PR merges.
 
 The orchestrator will normalize structured plan revisions into canonical
 markdown for stored plan state, reviewer prompts, subject hashing, and resume.
@@ -835,6 +846,24 @@ def _issue_pr_reference_guidance(issue_number: int) -> str:
     return (
         f"In the pull request body, include `Fixes #{issue_number}` or another direct "
         f"reference to issue #{issue_number} so GitHub links the PR back to the issue.\n"
+    )
+
+
+def _staged_issue_pr_reference_guidance(issue_number: int, *, staged_parent_issue: int) -> str:
+    """PR-reference guidance for a staged implementation (#476).
+
+    Used when `issue_number` is one split/deferred stage of `staged_parent_issue`
+    and other stages remain unfiled or unimplemented: the PR must close only the
+    stage issue, and must NOT use a closing keyword against the parent, or the
+    parent would auto-close while the other stages are still outstanding.
+    """
+    return (
+        f"This PR implements one stage (#{issue_number}) split out of parent issue "
+        f"#{staged_parent_issue}; other stages may remain unfiled or unimplemented. In the pull "
+        f"request body, include `Closes #{issue_number}` (or another direct reference to "
+        f"#{issue_number}) plus `Refs #{staged_parent_issue}`. Do NOT use a closing keyword "
+        f"(Fixes/Closes/Resolves) against #{staged_parent_issue} — that would auto-close the "
+        "parent while other stages remain outstanding.\n"
     )
 
 
@@ -1424,6 +1453,7 @@ def build_issue_implementation_prompt(
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
     salvage_summary: str | None = None,
+    staged_parent_issue: int | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config)
@@ -1431,6 +1461,11 @@ def build_issue_implementation_prompt(
         issue_context,
         requirement_scope="implementation requirements",
         full_omission_fallback="Fetch the issue discussion directly before implementing.",
+    )
+    pr_reference_guidance = (
+        _staged_issue_pr_reference_guidance(issue_number, staged_parent_issue=staged_parent_issue)
+        if staged_parent_issue is not None
+        else _issue_pr_reference_guidance(issue_number)
     )
     return f"""Implement the approved plan for GitHub issue #{issue_number} in {config.repo}.
 
@@ -1440,7 +1475,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance()}{_coder_documentation_guidance()}
-{_issue_pr_reference_guidance(issue_number)}
+{pr_reference_guidance}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
     requirement_label="implementation requirements",

@@ -120,6 +120,16 @@ class AgentLoopConfig:
     # (today's behavior); "partial" continues the round with >= 2 surviving
     # votes and records the failure in the round summary.
     discuss_on_debater_failure: str = "fail"
+    # Materialize discuss `split` proposals and plan-first `deferred_stages`
+    # into linked child GitHub issues (#476). Default off (warning-only) so
+    # existing runs keep today's behavior; the orchestrator always warns when
+    # split follow-ups would otherwise remain unfiled.
+    materialize_split_issues: bool = False
+    # Explicit selected-stage resolution for `issue --plan-execution-mode
+    # implement-one-shot` when a parent's split proposals were already fully
+    # materialized into child issues (#476). None means resolve by unique
+    # title match instead.
+    split_stage: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
@@ -795,6 +805,8 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         discuss_parallel=getattr(args, "discuss_parallel", False),
         discuss_debater_timeout=getattr(args, "discuss_debater_timeout", None),
         discuss_on_debater_failure=getattr(args, "discuss_on_debater_failure", "fail") or "fail",
+        materialize_split_issues=getattr(args, "materialize_split_issues", False),
+        split_stage=getattr(args, "split_stage", None),
         test_command=test_command,
         pre_review_tests=args.pre_review_tests,
         ci_check_name=args.ci_check_name,

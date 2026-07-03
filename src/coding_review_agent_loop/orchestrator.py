@@ -57,8 +57,26 @@ from .github import (
     post_pr_comment,
     validate_open_issue,
     validate_open_pr,
+    validate_pr_body_does_not_close_issue,
     validate_pr_references_issue,
     wait_for_ci,
+)
+from .split_materialization import (
+    DISCUSS_SPLIT_MARKER_RE,
+    SPLIT_STAGE_HANDOFF_MARKER_RE,
+    UNFILED_SPLIT_WARNING_MARKER_RE,
+    MaterializedSplitChild,
+    SplitStageProposal,
+    dedupe_split_stage_proposals,
+    find_existing_split_materialization,
+    find_existing_split_stage_handoff,
+    has_unfiled_split_warning,
+    materialize_split_proposals,
+    post_split_stage_handoff_comment,
+    post_unfiled_split_warning,
+    resolve_selected_stage_child,
+    split_stage_proposal_from_deferred_stage,
+    split_stage_proposal_from_text,
 )
 from .logging import log, new_run_id, run_usage_summary_path
 from .memory import AgentMemoryContext, prepare_agent_memory
@@ -85,6 +103,7 @@ from .prompts import (
 )
 from .protocol import (
     DISCUSS_FAILED_OUTCOME,
+    DeferredStage,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     ParsedDiscussAgenda,
     ParsedDiscussReview,
@@ -200,6 +219,7 @@ from .round_state import (
     ResumedRoundSelection,
     ResumedReviewRound,
     _attach_round_metadata,
+    _decode_discuss_vote,
     _decode_round_metadata,
     _deserialize_disposition,
     _deserialize_unresolved_item,
@@ -1708,6 +1728,176 @@ def _describe_plan_review_outcome(parsed_review: ParsedPlanReview) -> str:
     return "blocking with blocking plan issues"
 
 
+_DEFERRED_STAGES_SECTION_RE = re.compile(
+    r"^###\s*Deferred stages \(not in this plan\)\s*$",
+    re.M,
+)
+_NEXT_HEADING_RE = re.compile(r"^#{1,6}\s", re.M)
+_PLAN_NARROWING_PHRASE_RE = re.compile(
+    r"\b(stage \d+ of|first stage|out of scope|separate issue|follow-up issue|future issue)\b",
+    re.I,
+)
+
+
+def _extract_current_deferred_stages(current_plan: str) -> tuple[DeferredStage, ...]:
+    """Recover declared `deferred_stages` from the current plan text (#476).
+
+    `current_plan` is either the raw structured `plan_state` JSON response (the
+    initial round, never revised) or the canonical revision markdown (after a
+    `plan_revision` round), so both forms are checked.
+    """
+    try:
+        structured = validate_structured_plan_state(current_plan)
+    except AgentLoopError:
+        structured = None
+    if structured is not None:
+        return structured.deferred_stages
+    match = _DEFERRED_STAGES_SECTION_RE.search(current_plan)
+    if not match:
+        return ()
+    section = current_plan[match.end():]
+    next_heading = _NEXT_HEADING_RE.search(section)
+    if next_heading:
+        section = section[: next_heading.start()]
+    stages: list[DeferredStage] = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("- "):
+            continue
+        title_and_summary = stripped[2:]
+        title, _sep, summary = title_and_summary.partition(":")
+        stages.append(DeferredStage(title=title.strip(), summary=summary.strip()))
+    return tuple(stages)
+
+
+def _prior_discuss_split_proposals(
+    issue_context: IssueContext, *, config: AgentLoopConfig
+) -> list[str]:
+    """Recover proposals from a prior discuss `split` consensus on this issue (#476).
+
+    Used by plan-first narrowing so a plan built on top of an earlier discuss
+    split still files (or warns about) the stages the plan itself doesn't
+    cover, even when discuss-mode materialization was never run.
+    """
+    records = _extract_round_metadata_records(issue_context.comments, flow="discuss")
+    final_summaries = [
+        record for record in records if record.metadata.role == "summary" and record.metadata.is_final
+    ]
+    if not final_summaries:
+        return []
+    latest = final_summaries[-1]
+    if latest.metadata.split_proposals:
+        return list(latest.metadata.split_proposals)
+    recovered = _recover_final_discuss_split_proposals(
+        issue_context,
+        subject=latest.metadata.subject,
+        configured_reviewers=reviewers(config),
+    )
+    return list(recovered[0]) if recovered else []
+
+
+def _plan_text_suggests_narrowing(plan_text: str) -> bool:
+    return bool(_PLAN_NARROWING_PHRASE_RE.search(plan_text))
+
+
+def _plan_first_line(plan_text: str) -> str:
+    """A title-like string for `plan_text`, used for split-stage title matching.
+
+    For the initial (never-revised) `plan_state` round, `plan_text` is the raw
+    structured JSON response rather than rendered markdown, so its natural
+    "title" is the structured `summary` field, not its literal first line.
+    """
+    try:
+        structured = validate_structured_plan_state(plan_text)
+    except AgentLoopError:
+        structured = None
+    if structured is not None:
+        return structured.summary
+    for line in plan_text.splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return stripped
+    return plan_text.strip()
+
+
+def _handle_plan_first_split_scope(
+    runner: Runner,
+    *,
+    issue_number: int,
+    config: AgentLoopConfig,
+    current_plan: str,
+    plan_subject: str,
+    issue_context: IssueContext,
+) -> None:
+    """Materialize (or warn about) split/deferred stages before implementation
+    handoff (#476), so a plan-first run that narrows scope to one stage cannot
+    silently leave the rest unfiled (the #467/#474 gap)."""
+    current_deferred_stages = _extract_current_deferred_stages(current_plan)
+    prior_discuss_proposals = _prior_discuss_split_proposals(issue_context, config=config)
+    remaining_proposals = dedupe_split_stage_proposals(
+        [split_stage_proposal_from_deferred_stage(stage) for stage in current_deferred_stages]
+        + [split_stage_proposal_from_text(proposal) for proposal in prior_discuss_proposals]
+    )
+    if remaining_proposals:
+        if config.materialize_split_issues:
+            materialize_split_proposals(
+                runner,
+                config=config,
+                parent_issue=issue_number,
+                subject=plan_subject,
+                proposals=remaining_proposals,
+                issue_comments=issue_context.comments,
+            )
+            return
+        log(
+            config,
+            f"Planning issue #{issue_number}: split follow-ups remain unfiled; rerun with "
+            "--materialize-split-issues or file them manually.",
+        )
+        if not has_unfiled_split_warning(
+            issue_context.comments, issue_number=issue_number, subject=plan_subject
+        ):
+            post_unfiled_split_warning(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                subject=plan_subject,
+                proposals=remaining_proposals,
+            )
+        return
+    if current_deferred_stages or prior_discuss_proposals:
+        return
+    if not _plan_text_suggests_narrowing(current_plan):
+        return
+    log(
+        config,
+        f"Planning issue #{issue_number}: approved plan text suggests scope narrowing "
+        "but no `deferred_stages` or discuss split proposals were declared or filed.",
+    )
+    if has_unfiled_split_warning(issue_context.comments, issue_number=issue_number, subject=plan_subject):
+        return
+    post_issue_comment(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        body="\n".join(
+            [
+                "### Possible unfiled scope narrowing",
+                "",
+                "The approved plan's text appears to narrow scope (mentions a stage, "
+                "follow-up issue, or out-of-scope work), but no `deferred_stages` were "
+                "structurally declared and no discuss split proposals exist for this issue. "
+                "If this plan intentionally defers work, declare it via `deferred_stages` in a "
+                "future revision or file the follow-up issue(s) manually. This is a heuristic "
+                "warning only; the orchestrator never auto-creates issues from prose.",
+                "",
+                f"<!-- AGENT_SPLIT_UNFILED_WARNING: issue={issue_number} subject={plan_subject} -->",
+                "-- coding-review-agent-loop",
+            ]
+        ),
+    )
+
+
 def _read_assigned_workdir_head(runner: Runner, config: AgentLoopConfig) -> str | None:
     result = runner.run(
         ("git", "rev-parse", "HEAD"),
@@ -1755,6 +1945,7 @@ def _implement_approved_issue(
     usage_context: RunUsageContext,
     one_shot_parent_issue: int | None = None,
     plan_subject: str | None = None,
+    staged_parent_issue: int | None = None,
 ) -> int:
     coder_name = agent_display_name(config.coder)
     plan_hash = approved_plan_hash(approved_plan)
@@ -1779,6 +1970,7 @@ def _implement_approved_issue(
             memory,
             issue_context=issue_context,
             salvage_summary=salvage_summary,
+            staged_parent_issue=staged_parent_issue,
         ),
         session_id=coder_session_id,
         marker_description="<!-- AGENT_PR: <number> --> or PR URL",
@@ -1815,6 +2007,13 @@ def _implement_approved_issue(
         pr_number=pr_number,
         issue_number=issue_number,
     )
+    if staged_parent_issue is not None:
+        validate_pr_body_does_not_close_issue(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            issue_number=staged_parent_issue,
+        )
     initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
     if one_shot_parent_issue is not None:
         post_one_shot_impl_handoff_comment(
@@ -2371,6 +2570,14 @@ def _run_plan_first_loop(
                 sources=approved_future_followup_sources,
                 allow_issue_filing=mode in {"implement-one-shot", "implement-by-phase"},
             )
+            _handle_plan_first_split_scope(
+                runner,
+                issue_number=issue_number,
+                config=config,
+                current_plan=current_plan,
+                plan_subject=plan_subject,
+                issue_context=issue_context,
+            )
             if mode == "plan-only":
                 print(
                     f"Issue #{issue_number} plan approved by {format_agent_list(configured_reviewers)}."
@@ -2455,9 +2662,59 @@ def _run_plan_first_loop(
             if mode == "implement-one-shot":
                 plan_hash = approved_plan_hash(current_plan)
                 plan_subject = _plan_subject(current_plan)
+
+                # Selected-stage handoff (#476): when the parent's split proposals were
+                # already fully materialized into child issues (discuss `split` or a prior
+                # plan-first run), implementation must target the child the approved plan
+                # actually covers instead of treating the whole parent as solved.
+                target_issue_number = issue_number
+                target_issue_context = issue_context
+                staged_parent_issue: int | None = None
+                split_metadata = find_existing_split_materialization(
+                    issue_context.comments, parent_issue=issue_number
+                )
+                if split_metadata is not None and split_metadata.children:
+                    stage_handoff = find_existing_split_stage_handoff(
+                        issue_context.comments, parent_issue=issue_number, plan_hash=plan_hash
+                    )
+                    if stage_handoff is not None:
+                        selected_child = next(
+                            (
+                                child
+                                for child in split_metadata.children
+                                if child.number == stage_handoff.child_issue_number
+                            ),
+                            None,
+                        )
+                        if selected_child is None or selected_child.number is None:
+                            raise AgentLoopError(
+                                f"Recorded split-stage handoff for issue #{issue_number} references "
+                                "a child issue that is no longer in the materialized split metadata; "
+                                "manual recovery required."
+                            )
+                    else:
+                        selected_child = resolve_selected_stage_child(
+                            split_metadata.children,
+                            parent_issue=issue_number,
+                            plan_title_or_subject=_plan_first_line(current_plan),
+                            split_stage_flag=config.split_stage,
+                        )
+                        post_split_stage_handoff_comment(
+                            runner,
+                            config=config,
+                            parent_issue=issue_number,
+                            plan_hash=plan_hash,
+                            child=selected_child,
+                        )
+                    target_issue_number = selected_child.number
+                    target_issue_context = get_issue_context(
+                        runner, config=config, issue_number=target_issue_number
+                    )
+                    staged_parent_issue = issue_number
+
                 existing_handoff = find_existing_one_shot_impl_handoff(
-                    issue_context.comments,
-                    parent_issue=issue_number,
+                    target_issue_context.comments,
+                    parent_issue=target_issue_number,
                     plan_hash=plan_hash,
                     mode="implement-one-shot",
                 )
@@ -2469,7 +2726,7 @@ def _run_plan_first_loop(
                     except AgentLoopError:
                         raise AgentLoopError(
                             f"PR #{existing_handoff.pr_number} recorded in the one-shot handoff "
-                            f"for issue #{issue_number} cannot be found in {config.repo}. "
+                            f"for issue #{target_issue_number} cannot be found in {config.repo}. "
                             f"Verify the PR exists and rerun "
                             f"`agent-loop pr {existing_handoff.pr_number}` directly to continue, "
                             "or remove the handoff comment from the issue and rerun to re-implement."
@@ -2477,40 +2734,48 @@ def _run_plan_first_loop(
                     if pr_state == "OPEN":
                         log(
                             config,
-                            f"Issue #{issue_number}: resuming PR #{existing_handoff.pr_number} "
+                            f"Issue #{target_issue_number}: resuming PR #{existing_handoff.pr_number} "
                             "review for already-handed-off plan",
                         )
                         validate_pr_references_issue(
                             runner,
                             config=config,
                             pr_number=existing_handoff.pr_number,
-                            issue_number=issue_number,
+                            issue_number=target_issue_number,
                         )
+                        if staged_parent_issue is not None:
+                            validate_pr_body_does_not_close_issue(
+                                runner,
+                                config=config,
+                                pr_number=existing_handoff.pr_number,
+                                issue_number=staged_parent_issue,
+                            )
                         return run_pr_loop(
                             runner,
                             pr_number=existing_handoff.pr_number,
                             config=config,
-                            issue_context=issue_context,
+                            issue_context=target_issue_context,
                             usage_context=usage_context,
                         )
                     else:
                         print(
-                            f"Issue #{issue_number} approved plan was handed off to "
+                            f"Issue #{target_issue_number} approved plan was handed off to "
                             f"PR #{existing_handoff.pr_number}, which is "
                             f"{pr_state.lower()}. Nothing to resume."
                         )
                         return 0
                 return _implement_approved_issue(
                     runner,
-                    issue_number=issue_number,
+                    issue_number=target_issue_number,
                     approved_plan=current_plan,
                     config=config,
                     memory=memory,
-                    issue_context=issue_context,
+                    issue_context=target_issue_context,
                     coder_session_id=coder_session_id,
                     usage_context=usage_context,
-                    one_shot_parent_issue=issue_number,
+                    one_shot_parent_issue=target_issue_number,
                     plan_subject=plan_subject,
+                    staged_parent_issue=staged_parent_issue,
                 )
             raise AgentLoopError(f"Unknown plan execution mode: {mode}")
 
@@ -3676,6 +3941,16 @@ DISCUSS_CONSENSUS_MARKER_RE = re.compile(
 def _is_bot_authored_discuss_comment(body: str) -> bool:
     if DISCUSS_CONSENSUS_MARKER_RE.search(body):
         return True
+    # Split-materialization comments (#476) can land on the same issue a
+    # discuss run is evaluating (the parent and the discuss subject are the
+    # same issue); they must not perturb subject hashing or be forwarded to
+    # debaters as fresh human discussion on a later rerun.
+    if (
+        DISCUSS_SPLIT_MARKER_RE.search(body)
+        or UNFILED_SPLIT_WARNING_MARKER_RE.search(body)
+        or SPLIT_STAGE_HANDOFF_MARKER_RE.search(body)
+    ):
+        return True
     match = ROUND_RESUME_MARKER_RE.search(body)
     if match is None:
         return False
@@ -3719,6 +3994,99 @@ def _detect_discuss_consensus(
         return None
     split_proposals = _merge_discuss_split_proposals(votes) if outcome == "split" else []
     return outcome, split_proposals
+
+
+def _handle_discuss_split_outcome(
+    runner: Runner,
+    *,
+    issue_number: int,
+    config: AgentLoopConfig,
+    subject: str,
+    split_proposals: Sequence[str],
+    final_votes: Sequence[ParsedDiscussReview],
+    issue_comments: Sequence[object],
+    post_warning_comment: bool,
+) -> None:
+    """Materialize (or warn about) a discuss `split` consensus's proposed sub-issues (#476).
+
+    Called both when the final summary is freshly posted and on a resumed/
+    already-final run, so enabling `--materialize-split-issues` on a rerun
+    still files the proposals instead of leaving them stuck in comments.
+    Idempotent: `materialize_split_proposals` finds prior children via the
+    parent marker and creates nothing when they already cover every proposal.
+    """
+    if not split_proposals:
+        return
+    proposals = dedupe_split_stage_proposals(
+        [split_stage_proposal_from_text(proposal) for proposal in split_proposals]
+    )
+    if config.materialize_split_issues:
+        rationale = tuple(
+            (vote.reviewer, vote.rationale) for vote in final_votes if vote.outcome == "split"
+        )
+        materialize_split_proposals(
+            runner,
+            config=config,
+            parent_issue=issue_number,
+            subject=subject,
+            proposals=proposals,
+            rationale=rationale,
+            issue_comments=issue_comments,
+        )
+        return
+    log(
+        config,
+        f"discuss: split follow-ups are NOT filed as issues for #{issue_number}; rerun with "
+        "--materialize-split-issues or file them manually.",
+    )
+    if post_warning_comment and not has_unfiled_split_warning(
+        issue_comments, issue_number=issue_number, subject=subject
+    ):
+        post_unfiled_split_warning(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            subject=subject,
+            proposals=proposals,
+        )
+
+
+def _recover_final_discuss_split_proposals(
+    issue_context: IssueContext,
+    *,
+    subject: str,
+    configured_reviewers: Sequence[AgentName],
+) -> tuple[list[str], list[ParsedDiscussReview]] | None:
+    """Legacy fallback (#476): reconstruct final-round votes and merged split
+    proposals from debater comment metadata when `PostedRoundMetadata` has no
+    `split_proposals` recorded on the final summary (comments posted before
+    this field existed)."""
+    records = _extract_round_metadata_records(issue_context.comments, flow="discuss")
+    subject_records = [record for record in records if record.metadata.subject == subject]
+    if not subject_records:
+        return None
+    final_round_number = max(record.metadata.round_number for record in subject_records)
+    debater_records = [
+        record
+        for record in subject_records
+        if record.metadata.round_number == final_round_number and record.metadata.role == "debater"
+    ]
+    if not debater_records:
+        return None
+    configured_reviewer_names = [agent_display_name(agent) for agent in configured_reviewers]
+    by_name = {record.metadata.agent: record for record in debater_records}
+    final_votes: list[ParsedDiscussReview] = []
+    for name in configured_reviewer_names:
+        record = by_name.get(name)
+        if record is None:
+            continue
+        final_votes.append(_decode_discuss_vote(record, round_number=final_round_number))
+    if not final_votes:
+        return None
+    consensus = _detect_discuss_consensus(final_votes)
+    if consensus is None or consensus[0] != "split":
+        return None
+    return consensus[1], final_votes
 
 
 def _run_discuss_analyzer(
@@ -3927,18 +4295,55 @@ def _run_discuss_loop(
         raise AgentLoopError("--discuss-max-rounds must be zero or greater.")
     issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
     subject = _discuss_subject(issue_context)
-    for comment in issue_context.comments or []:
-        body = comment.body or ""
-        m = DISCUSS_CONSENSUS_MARKER_RE.search(body)
-        if m and m.group(1).lower() == subject:
-            log(config, f"discuss: found matching consensus comment for issue #{issue_number}; skipping")
-            return 0
     configured_reviewers = list(_reviewers(config))
     resume_state = _resume_discuss_round(
         issue_context.comments, subject=subject, configured_reviewers=configured_reviewers
     )
-    if resume_state is not None and resume_state.done:
-        log(config, f"discuss: found matching round-summary comment for issue #{issue_number}; skipping")
+
+    def _resolve_final_split_proposals() -> tuple[list[str], Sequence[ParsedDiscussReview]] | None:
+        # Resuming (or already-final) reruns must materialize a split consensus
+        # instead of silently skipping (#476): prefer the split proposals
+        # recorded directly on the final summary metadata, and fall back to
+        # reconstructing them from debater comment metadata for legacy
+        # summaries that predate the `split_proposals` field.
+        if resume_state is not None and resume_state.done and resume_state.round_history:
+            final_votes = resume_state.round_history[-1]
+            consensus = _detect_discuss_consensus(list(final_votes))
+            if consensus is not None and consensus[0] == "split" and consensus[1]:
+                return consensus[1], final_votes
+        return _recover_final_discuss_split_proposals(
+            issue_context, subject=subject, configured_reviewers=configured_reviewers
+        )
+
+    already_final = False
+    for comment in issue_context.comments or []:
+        body = comment.body or ""
+        m = DISCUSS_CONSENSUS_MARKER_RE.search(body)
+        if m and m.group(1).lower() == subject:
+            already_final = True
+            break
+    if already_final or (resume_state is not None and resume_state.done):
+        log(config, f"discuss: found matching consensus for issue #{issue_number}; skipping debate")
+        recovered = _resolve_final_split_proposals()
+        if recovered is not None:
+            split_proposals, final_votes = recovered
+            _handle_discuss_split_outcome(
+                runner,
+                issue_number=issue_number,
+                config=config,
+                subject=subject,
+                split_proposals=split_proposals,
+                final_votes=final_votes,
+                issue_comments=issue_context.comments,
+                post_warning_comment=False,
+            )
+        elif config.materialize_split_issues:
+            log(
+                config,
+                f"discuss: issue #{issue_number} has a final consensus comment but no "
+                "recoverable split-proposal metadata; nothing to materialize (or this was not "
+                "a `split` consensus).",
+            )
         return 0
     memory = prepare_agent_memory(runner, config)
     analyzer = config.discuss_analyzer
@@ -4304,6 +4709,7 @@ def _run_discuss_loop(
                     analyzer_response=analyzer_response_raw,
                     research_mode=config.discuss_research,
                     failed_debaters=tuple(failed_debaters),
+                    split_proposals=tuple(round_split_proposals) if is_final else (),
                 ),
             ),
         )
@@ -4313,6 +4719,17 @@ def _run_discuss_loop(
                 f"discuss: posted final summary comment for issue #{issue_number} "
                 f"(outcome: {outcome}; kind: {consensus_kind})",
             )
+            if outcome == "split":
+                _handle_discuss_split_outcome(
+                    runner,
+                    issue_number=issue_number,
+                    config=config,
+                    subject=subject,
+                    split_proposals=round_split_proposals,
+                    final_votes=successful_votes,
+                    issue_comments=issue_context.comments,
+                    post_warning_comment=True,
+                )
             return 0
         log(
             config,

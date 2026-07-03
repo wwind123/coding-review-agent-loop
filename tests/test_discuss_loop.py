@@ -403,10 +403,74 @@ def test_discuss_loop_split_consensus_includes_proposals(tmp_path):
     result = run_discuss_loop(runner, issue_number=56, config=config)
 
     assert result == 0
-    posted = runner.comments[-1]
+    posted = runner.comments[-2]
     assert "Consensus: Split" in posted
     assert "Auth flow" in posted
     assert "Authorization checks" in posted
+    # --materialize-split-issues defaults off, so the orchestrator posts an
+    # explicit unfiled-split warning after the final summary (#476) instead of
+    # silently leaving the proposals as unfiled text.
+    warning = runner.comments[-1]
+    assert "NOT filed as issues" in warning
+    assert "Auth flow" in warning
+    assert "Authorization checks" in warning
+
+
+def test_discuss_loop_split_consensus_materializes_child_issues_when_enabled(tmp_path):
+    split_text = _discuss_review_text(
+        outcome="split",
+        rationale="Too broad.",
+        split_proposals=["Auth flow", "Authorization checks"],
+    )
+    runner = FakeRunner(
+        codex_outputs=[split_text],
+        gemini_outputs=[split_text],
+        issue_urls=[
+            "https://github.com/OWNER/REPO/issues/101",
+            "https://github.com/OWNER/REPO/issues/102",
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), materialize_split_issues=True)
+
+    result = run_discuss_loop(runner, issue_number=56, config=config)
+
+    assert result == 0
+    assert len(runner.issues) == 2
+    assert runner.issues[0]["title"] == "[#56 stage] Auth flow"
+    assert runner.issues[1]["title"] == "[#56 stage] Authorization checks"
+    assert "Too broad." in runner.issues[0]["body"]
+    assert "Refs #56" in runner.issues[0]["body"]
+    final_summary = runner.comments[-2]
+    assert "Consensus: Split" in final_summary
+    parent_summary = runner.comments[-1]
+    assert "<!-- AGENT_DISCUSS_SPLIT:" in parent_summary
+    assert "https://github.com/OWNER/REPO/issues/101" in parent_summary
+    assert "https://github.com/OWNER/REPO/issues/102" in parent_summary
+
+
+def test_discuss_loop_split_consensus_rerun_materializes_nothing_new(tmp_path):
+    split_text = _discuss_review_text(
+        outcome="split",
+        rationale="Too broad.",
+        split_proposals=["Auth flow"],
+    )
+    runner = FakeRunner(
+        codex_outputs=[split_text],
+        gemini_outputs=[split_text],
+        issue_urls=["https://github.com/OWNER/REPO/issues/101"],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), materialize_split_issues=True)
+    assert run_discuss_loop(runner, issue_number=56, config=config) == 0
+    assert len(runner.issues) == 1
+
+    # A second run reuses the same FakeRunner, which already accumulated the
+    # posted comments (with their AGENT_LOOP_META metadata) from the first
+    # run in `issue_comments`; it must find the existing consensus and
+    # materialization markers and create nothing new.
+    result = run_discuss_loop(runner, issue_number=56, config=config)
+
+    assert result == 0
+    assert len(runner.issues) == 1
 
 
 def test_discuss_loop_converges_after_debate(tmp_path):

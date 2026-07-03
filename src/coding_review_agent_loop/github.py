@@ -51,6 +51,14 @@ class IssueContext:
 
 
 @dataclass(frozen=True)
+class FoundIssue:
+    number: int | None
+    title: str | None
+    url: str | None
+    body: str | None
+
+
+@dataclass(frozen=True)
 class HumanReviewRequirement:
     source_type: str
     author: str | None
@@ -210,6 +218,62 @@ def validate_pr_references_issue(
         f"Edit the PR description on GitHub to include `Fixes #{issue_number}` or another direct "
         f"issue reference, then rerun the orchestrator as `agent-loop pr {pr_number}` to continue "
         "the review."
+    )
+
+
+# Matches a GitHub auto-close keyword immediately followed by an issue reference,
+# e.g. "Closes #12", "fixed #12", "resolves owner/repo#12". Used to keep staged
+# implementation PRs from accidentally auto-closing the parent issue while
+# other split stages remain unimplemented (#476).
+_CLOSE_KEYWORD_ISSUE_RE_TEMPLATE = (
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:%s#%d|#%d)\b"
+)
+
+
+def validate_pr_body_does_not_close_issue(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    issue_number: int,
+) -> None:
+    """Reject a staged-implementation PR body that would auto-close `issue_number`.
+
+    Used when split/deferred stages remain unfiled or unimplemented for the
+    parent issue (#476): a PR implementing only one stage must not use
+    `Fixes`/`Closes`/`Resolves` against the parent, or the parent would close
+    while other stages remain outstanding. `Refs #N` (or any non-closing
+    reference) is fine and is validated separately by
+    `validate_pr_references_issue`.
+    """
+    if config.dry_run:
+        return
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            config.repo,
+            "--json",
+            "body,url",
+        ],
+        cwd=active_workdir(config),
+    )
+    data = json.loads(result.stdout or "{}")
+    body = _optional_str(data.get("body")) or ""
+    close_re = re.compile(
+        _CLOSE_KEYWORD_ISSUE_RE_TEMPLATE % (re.escape(config.repo), issue_number, issue_number),
+        re.I,
+    )
+    if not close_re.search(body):
+        return
+    raise AgentLoopError(
+        f"PR #{pr_number} body uses a closing keyword (Closes/Fixes/Resolves) against parent "
+        f"issue #{issue_number}, but other split stages remain unfiled or unimplemented. Edit the "
+        f"PR description to use a non-closing reference (e.g. `Refs #{issue_number}`) instead, then "
+        f"rerun `agent-loop pr {pr_number}` to continue the review."
     )
 
 
@@ -816,6 +880,83 @@ def create_issue(
             os.unlink(path)
         except FileNotFoundError:
             pass
+
+
+def search_issues(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    search: str,
+    state: str = "all",
+) -> tuple[FoundIssue, ...]:
+    """Search issues in `config.repo`, used to recover from a create-then-crash window (#476).
+
+    Split-issue materialization posts its idempotency marker only after every
+    child issue is created; if the process crashes between a `create_issue`
+    call and posting that marker, a rerun must find already-created children
+    instead of duplicating them. This wraps `gh issue list --search` for that
+    recovery pass. Dry-run returns an empty tuple so the dry-run
+    materialization path still previews creations instead of "adopting"
+    nothing.
+    """
+    log(config, f"Searching GitHub issues in {config.repo}: {search}")
+    if config.dry_run:
+        runner.run(
+            [
+                config.gh_cmd,
+                "issue",
+                "list",
+                "--repo",
+                config.repo,
+                "--search",
+                search,
+                "--state",
+                state,
+                "--json",
+                "number,title,url,body",
+            ],
+            cwd=active_workdir(config),
+        )
+        return ()
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "issue",
+            "list",
+            "--repo",
+            config.repo,
+            "--search",
+            search,
+            "--state",
+            state,
+            "--json",
+            "number,title,url,body",
+        ],
+        cwd=active_workdir(config),
+    )
+    raw = result.stdout.strip()
+    if not raw:
+        return ()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(payload, list):
+        return ()
+    found: list[FoundIssue] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        found.append(
+            FoundIssue(
+                number=int(number) if isinstance(number, int) else None,
+                title=_optional_str(item.get("title")),
+                url=_optional_str(item.get("url")),
+                body=_optional_str(item.get("body")),
+            )
+        )
+    return tuple(found)
 
 
 def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> str:

@@ -251,6 +251,11 @@ The modes are:
 `--plan-execution-mode implement-one-shot`. It requires `--plan-first` and is
 not compatible with any other explicit `--plan-execution-mode` value.
 
+If the plan narrows scope (via `deferred_stages` or a prior discuss `split`
+consensus), see [Split issue materialization](#split-issue-materialization)
+below for how those follow-up stages are filed (or warned about) and how
+`implement-one-shot` targets the correct stage instead of the whole parent.
+
 Generated child issues are self-contained: each body includes the parent issue
 link, the relevant approved parent-plan slice, constraints/invariants,
 dependency notes, scope and non-goals, rollout risk, validation/soak
@@ -552,6 +557,97 @@ Two companion flags apply in both sequential and parallel discuss runs:
     round. A partial round never declares final consensus — the placeholder
     vote can never match real outcomes — so a partial final round ends in a
     `needs-human` deadlock, with the failures noted in the summary.
+
+### Split issue materialization
+
+By default, a discuss `split` consensus or a plan-first plan that narrows
+scope leaves its proposed follow-up stages as text in issue comments — easy to
+miss, especially when `--implement-after-approval` proceeds straight into
+implementing one stage. Pass `--materialize-split-issues` (on `discuss` or
+`issue`) to file each remaining stage as its own linked child GitHub issue
+instead:
+
+```bash
+agent-loop discuss 467 --repo OWNER/REPO --materialize-split-issues
+agent-loop issue 467 --repo OWNER/REPO --plan-first --implement-after-approval \
+  --materialize-split-issues
+```
+
+Default is off. Whether or not the flag is set, the orchestrator always warns
+explicitly when split follow-ups would otherwise go unfiled — in the discuss
+final summary, the plan-approval summary, and the CLI log — so the gap can't
+hide in a neutral listing.
+
+Two structured signals drive materialization; free-form prose narrowing is
+never enough to auto-create issues:
+
+- **Discuss `split` proposals.** When every debater's final vote is `split`,
+  the merged `split_proposals` from that round are the remaining stages (a
+  discuss run implements nothing, so every proposal is unfiled/unimplemented).
+- **Plan `deferred_stages`.** A coder's structured `plan_revision` or initial
+  `plan_state` response may declare an optional `deferred_stages` array of
+  `{"title", "summary"}` objects for scope the plan intentionally leaves out.
+  Declared stages render into the canonical plan under a `### Deferred stages
+  (not in this plan)` heading, so they carry into subject hashing, stored plan
+  state, reviewer prompts, and resume. In `--plan-first` mode, the stage the
+  approved plan actually covers is never filed as a child — only the
+  `deferred_stages` (plus any not-yet-covered discuss split proposals from an
+  earlier `discuss` run on the same issue) are remaining stages.
+- If neither signal is present but the approved plan's text still looks like
+  it narrows scope (mentions "stage 1 of", "first stage", "out of scope",
+  "separate issue", or "follow-up issue"), the orchestrator posts a
+  heuristic-only warning. It never files issues from this signal alone.
+
+Each child issue is created with a deterministic title
+(`[#<parent> stage] <proposal title>`), a `Part of #<parent>` first line, the
+proposal text, the split rationale from the debaters who voted `split` (when
+available), links to sibling stages already materialized, and execution
+instructions to run `agent-loop issue <child>` and never use a closing keyword
+against the parent. Every child body carries a durable
+`AGENT_SPLIT_CHILD: parent=<N> key=<hash>` HTML-comment marker.
+
+Materialization is idempotent and crash-safe:
+
+- The parent issue accumulates a single `<!-- AGENT_DISCUSS_SPLIT: ... -->`
+  marker recording every known child (title, key, issue number/URL, and
+  whether it was `created` or `adopted`); a rerun that finds every current
+  proposal already covered by that marker performs zero GitHub writes.
+- If a prior run crashed after creating some child issues but before posting
+  the marker, the next run searches existing issues
+  (`gh issue list --search '"[#<parent> stage]" in:title'`) before creating
+  anything, adopts any match into the metadata instead of duplicating it, and
+  files only the remaining stages.
+- Proposals are deduplicated by a normalized-title key across the whole
+  parent, not just within one run, so subject-hash drift between a discuss
+  consensus and a later plan-first run never refiles the same stage twice.
+- Materialization is capped at 8 child issues per parent; over-cap stages are
+  skipped with a logged note rather than silently dropped or endlessly
+  retried.
+- `--dry-run` previews `gh issue create`/`gh issue list --search` commands
+  without writing any state.
+
+When a parent's proposals were already fully materialized into child issues
+(from an earlier `discuss` run, or a prior `--plan-first` run on the same
+issue), a later `issue --plan-first --implement-after-approval` run on that
+parent must resolve which child stage the approved plan implements before
+handing off implementation — it never implements the parent as a monolith in
+that case. Resolution is a unique normalized-title match between the plan and
+a child's title, or an explicit `--split-stage <child-issue-number>` flag when
+the match is ambiguous or missing:
+
+```bash
+agent-loop issue 467 --repo OWNER/REPO --plan-first --implement-after-approval \
+  --split-stage 480
+```
+
+The resolution is recorded in an `<!-- AGENT_SPLIT_STAGE_HANDOFF: ... -->`
+parent comment marker so reruns reuse it instead of re-resolving. The staged
+implementation prompt then instructs the coder to use `Closes #<child>` plus
+`Refs #<parent>` in the PR body — never a closing keyword against the parent —
+and `validate_pr_body_does_not_close_issue` rejects a PR body that uses
+`Fixes`/`Closes`/`Resolves` against the parent while other stages remain
+unfiled or unimplemented, with an actionable error to edit the PR body and
+rerun `agent-loop pr <n>`.
 
 If `--repo` is omitted, the tool runs `gh repo view` from the current working
 directory, or from `--codex-dir` when that flag is provided, and uses the
