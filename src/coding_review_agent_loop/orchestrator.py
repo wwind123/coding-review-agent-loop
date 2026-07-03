@@ -125,6 +125,13 @@ from .repair import (
     strip_unknown_prior_item_dispositions,
 )
 from .runner import Runner
+from .salvage import (
+    SalvageArtifacts,
+    SalvageContext,
+    capture_salvage_artifacts,
+    format_salvage_artifacts_for_error,
+    latest_salvage_summary,
+)
 from .transient import (
     NON_RETRYABLE_AGENT_OUTPUT_RE,
     TRANSIENT_AGENT_OUTPUT_RE,
@@ -266,6 +273,8 @@ PUBLIC_RESPONSE_TRANSIENT_DIAGNOSTIC_RE = re.compile(
     r")",
     re.I | re.S,
 )
+ISSUE_IMPLEMENTATION_SALVAGE_SCOPE = "issue-implementation"
+APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE = "approved-plan-implementation"
 
 # Threshold above which a rate-limit reset time causes an immediate exit
 # rather than a silent wait (5 minutes).
@@ -855,6 +864,54 @@ def _format_invalid_agent_response_error(
     )
 
 
+def _compact_failure_reason(reason: str, classification_text: str) -> str:
+    detail = classification_text.strip()
+    if not detail or detail == reason:
+        return reason
+    lines = detail.splitlines()
+    if len(lines) > 20:
+        detail = "\n".join(lines[-20:])
+    if len(detail) > 4000:
+        detail = detail[-4000:]
+    return f"{reason}; diagnostic:\n{detail}"
+
+
+def _capture_failed_run_salvage(
+    *,
+    runner: Runner,
+    config: AgentLoopConfig,
+    agent_name: str,
+    salvage_context: SalvageContext | None,
+    failure_category: str,
+    failure_reason: str,
+    classification_text: str,
+    marker_description: str,
+    result: AgentResult | None,
+) -> SalvageArtifacts | None:
+    if salvage_context is None:
+        return None
+    try:
+        artifacts = capture_salvage_artifacts(
+            runner,
+            checkout=active_workdir(config),
+            log_dir=config.log_dir,
+            context=salvage_context,
+            failure_category=failure_category,
+            failure_reason=_compact_failure_reason(failure_reason, classification_text),
+            required_marker=marker_description,
+            result=result,
+        )
+    except AgentLoopError as exc:
+        log(
+            config,
+            f"{agent_name}: salvage capture failed ({exc}); preserving original agent failure",
+        )
+        return None
+    if artifacts is not None:
+        log(config, f"{agent_name}: salvage artifacts written to {artifacts.directory}")
+    return artifacts
+
+
 def _agent_failure_classification_text(
     result: AgentResult,
     *,
@@ -974,6 +1031,7 @@ def _run_validated_agent(
     role: str | None = None,
     label: str | None = None,
     timeout_seconds: float | None = None,
+    salvage_context: SalvageContext | None = None,
 ) -> ValidatedAgentResponse:
     agent_name = agent_display_name(agent)
     log_paths: list[object] = []
@@ -1423,10 +1481,24 @@ def _run_validated_agent(
                 if reset_secs is not None and reset_secs > LONG_RESET_THRESHOLD_SECONDS:
                     duration_str = _format_reset_duration(reset_secs)
                     at_str = _format_reset_at_utc(reset_secs)
-                    raise QuotaResetExceededError(
+                    message = (
                         f"{agent_name} quota exhausted. Reset in {duration_str} (at {at_str}). "
                         "Rerun when quota resets, or switch to a different API key / model."
                     )
+                    artifacts = _capture_failed_run_salvage(
+                        runner=runner,
+                        config=config,
+                        agent_name=agent_name,
+                        salvage_context=salvage_context,
+                        failure_category=last_failure_category,
+                        failure_reason=message,
+                        classification_text=classification_text,
+                        marker_description=marker_description,
+                        result=last_result,
+                    )
+                    if artifacts is not None:
+                        message += format_salvage_artifacts_for_error(artifacts)
+                    raise QuotaResetExceededError(message)
             if attempt < max_attempts:
                 delay = _retry_delay(config, attempt)
                 category = last_failure_category
@@ -1439,17 +1511,28 @@ def _run_validated_agent(
                 continue
         break
 
-    raise AgentInvocationError(
-        _format_invalid_agent_response_error(
-            agent_name=agent_name,
-            marker_description=marker_description,
-            reason=last_error,
-            result=last_result,
-            log_paths=log_paths,
-            category=last_failure_category,
-        ),
+    artifacts = _capture_failed_run_salvage(
+        runner=runner,
+        config=config,
+        agent_name=agent_name,
+        salvage_context=salvage_context,
         failure_category=last_failure_category,
+        failure_reason=last_error,
+        classification_text=last_classification_text,
+        marker_description=marker_description,
+        result=last_result,
     )
+    message = _format_invalid_agent_response_error(
+        agent_name=agent_name,
+        marker_description=marker_description,
+        reason=last_error,
+        result=last_result,
+        log_paths=log_paths,
+        category=last_failure_category,
+    )
+    if artifacts is not None:
+        message += format_salvage_artifacts_for_error(artifacts)
+    raise AgentInvocationError(message, failure_category=last_failure_category)
 
 
 def _require_pr_number(text: str) -> int:
@@ -1674,6 +1757,14 @@ def _implement_approved_issue(
     plan_subject: str | None = None,
 ) -> int:
     coder_name = agent_display_name(config.coder)
+    plan_hash = approved_plan_hash(approved_plan)
+    salvage_summary = latest_salvage_summary(
+        config.log_dir,
+        repo=config.repo,
+        issue_number=issue_number,
+        scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
+        approved_plan_hash=plan_hash,
+    )
     sync_coder_base_before_implementation(config, runner)
     log(config, f"Planning approved; invoking {coder_name} to implement issue #{issue_number}")
     assigned_head_before = _read_assigned_workdir_head(runner, config)
@@ -1687,6 +1778,7 @@ def _implement_approved_issue(
             config,
             memory,
             issue_context=issue_context,
+            salvage_summary=salvage_summary,
         ),
         session_id=coder_session_id,
         marker_description="<!-- AGENT_PR: <number> --> or PR URL",
@@ -1698,6 +1790,14 @@ def _implement_approved_issue(
             full_omission_fallback="Fetch the issue discussion directly before implementing.",
         ),
         usage_context=usage_context,
+        salvage_context=SalvageContext(
+            repo=config.repo,
+            issue_number=issue_number,
+            scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
+            agent=config.coder,
+            run_id=usage_context.run_id,
+            approved_plan_hash=plan_hash,
+        ),
     )
     coder_output = coder_response.text
     validate_response_tests_within_workdir(coder_output, assigned_workdir=active_workdir(config))
@@ -1722,7 +1822,7 @@ def _implement_approved_issue(
             config=config,
             parent_issue=one_shot_parent_issue,
             mode="implement-one-shot",
-            plan_hash=approved_plan_hash(approved_plan),
+            plan_hash=plan_hash,
             plan_subject=plan_subject or "",
             pr_number=pr_number,
             pr_head_sha=initial_pr_context.metadata.head_sha,
@@ -2558,11 +2658,23 @@ def run_issue_loop(
 
         sync_coder_base_before_implementation(config, runner)
         assigned_head_before = _read_assigned_workdir_head(runner, config)
+        salvage_summary = latest_salvage_summary(
+            config.log_dir,
+            repo=config.repo,
+            issue_number=issue_number,
+            scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE,
+        )
         coder_response = _run_validated_agent(
             runner,
             agent=config.coder,
             config=config,
-            prompt=build_issue_prompt(issue_number, config, memory, issue_context=issue_context),
+            prompt=build_issue_prompt(
+                issue_number,
+                config,
+                memory,
+                issue_context=issue_context,
+                salvage_summary=salvage_summary,
+            ),
             marker_description="<!-- AGENT_PR: <number> --> or PR URL",
             validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
                 text,
@@ -2572,6 +2684,13 @@ def run_issue_loop(
                 full_omission_fallback="Fetch the issue discussion directly before implementing.",
             ),
             usage_context=usage_context,
+            salvage_context=SalvageContext(
+                repo=config.repo,
+                issue_number=issue_number,
+                scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE,
+                agent=config.coder,
+                run_id=usage_context.run_id,
+            ),
         )
         coder_output = coder_response.text
         coder_session_id = coder_response.session_id

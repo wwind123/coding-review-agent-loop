@@ -838,11 +838,27 @@ def _issue_pr_reference_guidance(issue_number: int) -> str:
     )
 
 
+def _salvage_summary_block(salvage_summary: str | None) -> str:
+    if not salvage_summary:
+        return ""
+    return f"""Previous failed implementation attempt salvage:
+
+The previous attempt failed. The local salvage summary below may contain useful
+partial work, but it is incomplete context only. Do not infer a successful
+response or PR from it. Do not auto-apply the patch; cherry-pick or ignore it
+selectively, and validate any reused changes yourself.
+
+{salvage_summary}
+
+"""
+
+
 def build_issue_prompt(
     issue_number: int,
     config: AgentLoopConfig,
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
+    salvage_summary: str | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config)
@@ -865,6 +881,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 )}
 {_issue_context_block(issue_context)}
 {_memory_block(memory)}
+{_salvage_summary_block(salvage_summary)}
 
 Do not wait for {reviewer_name} yourself; this local orchestrator will run {reviewer_name} after
 you create the PR. Use blocking here to hand the PR to {reviewer_name} for review. Do not place
@@ -1406,6 +1423,7 @@ def build_issue_implementation_prompt(
     config: AgentLoopConfig,
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
+    salvage_summary: str | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config)
@@ -1429,6 +1447,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 )}
 {_issue_context_block(issue_context)}
 {_memory_block(memory)}
+{_salvage_summary_block(salvage_summary)}
 
 Approved implementation plan:
 

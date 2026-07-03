@@ -114,6 +114,35 @@ def test_coder_prompts_include_assigned_workdir_rule(tmp_path):
         assert "Do not `cd` into sibling, home, deployment, or duplicate clones" in prompt
         assert "`pwd` and `git status --branch --short`" in prompt
 
+
+def test_issue_prompts_include_salvage_guardrail_block(tmp_path):
+    config = make_config(tmp_path)
+    salvage_summary = (
+        "# Salvage Summary\n\n"
+        "The previous attempt failed.\n\n"
+        "- Partial patch: `/tmp/coding-review-agent-loop/logs/salvage/run/partial.patch`"
+    )
+
+    prompts = [
+        build_issue_prompt(56, config, salvage_summary=salvage_summary),
+        build_issue_implementation_prompt(
+            56,
+            "1. Implement the approved plan.",
+            config,
+            salvage_summary=salvage_summary,
+        ),
+    ]
+
+    for prompt in prompts:
+        assert "Previous failed implementation attempt salvage:" in prompt
+        assert "The previous attempt failed." in prompt
+        assert "incomplete context only" in prompt
+        assert "Do not infer a successful\nresponse or PR" in prompt
+        assert "Do not auto-apply the patch" in prompt
+        assert "cherry-pick or ignore it\nselectively" in prompt
+        assert "partial.patch" in prompt
+
+
 def test_reviewer_prompts_use_reviewer_assigned_workdir_rule(tmp_path):
     config = make_config(
         tmp_path,

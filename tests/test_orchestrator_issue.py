@@ -6,6 +6,7 @@ import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.decomposition import approved_plan_hash, format_one_shot_impl_handoff_comment
+from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.github import get_issue_context
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
@@ -19,6 +20,7 @@ from coding_review_agent_loop.prompts import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
 )
 from coding_review_agent_loop.protocol import UnresolvedReviewItem
+from coding_review_agent_loop.salvage import latest_salvage_summary
 from agent_loop_helpers import (
     FakeRunner,
     command_index,
@@ -2046,3 +2048,170 @@ def test_issue_loop_plan_first_one_shot_rerun_resumes_pr_loop(tmp_path):
     assert len(claude_calls) == 0
     assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
 
+
+def _salvage_dirs(config):
+    salvage_root = config.log_dir / "salvage"
+    if not salvage_root.exists():
+        return []
+    return sorted(path for path in salvage_root.iterdir() if path.is_dir())
+
+
+def test_failed_issue_implementation_with_diff_writes_salvage_artifacts(tmp_path):
+    patch_text = (
+        "diff --git a/src/coding_review_agent_loop/cli.py b/src/coding_review_agent_loop/cli.py\n"
+        "--- a/src/coding_review_agent_loop/cli.py\n"
+        "+++ b/src/coding_review_agent_loop/cli.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    runner = FakeRunner(
+        claude_outputs=[("quota exceeded; reset in 10m", 1)],
+        post_agent_git_status=" M src/coding_review_agent_loop/cli.py\n?? scratch-note.md\n",
+        post_agent_git_diff=patch_text,
+        post_agent_git_diff_stat=" src/coding_review_agent_loop/cli.py | 2 +-\n",
+        post_agent_git_diff_check="src/coding_review_agent_loop/cli.py:1: trailing whitespace.\n",
+        post_agent_git_diff_check_returncode=2,
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(QuotaResetExceededError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert "Salvage artifacts:" in str(excinfo.value)
+    salvage_dir = _salvage_dirs(config)[0]
+    assert str(salvage_dir) in str(excinfo.value)
+    assert (salvage_dir / "partial.patch").read_text(encoding="utf-8") == patch_text
+    assert "?? scratch-note.md" in (salvage_dir / "changed-files.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "2 +-" in (salvage_dir / "diff-stat.txt").read_text(encoding="utf-8")
+    assert "trailing whitespace" in (salvage_dir / "diff-check.txt").read_text(
+        encoding="utf-8"
+    )
+
+    summary = (salvage_dir / "salvage-summary.md").read_text(encoding="utf-8")
+    assert "No\nsuccessful response, review result, or pull request should be inferred" in summary
+    assert "Public response file: missing" in summary
+    assert "Required marker status: missing or invalid" in summary
+    assert "Untracked files appear in `changed-files.txt`" in summary
+
+    metadata = json.loads((salvage_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["repo"] == "OWNER/REPO"
+    assert metadata["issue_number"] == 56
+    assert metadata["scope"] == "issue-implementation"
+    assert metadata["agent"] == "claude"
+    assert metadata["failure_category"] == "transient"
+    assert metadata["response_file_missing"] is True
+    assert metadata["diff_check_returncode"] == 2
+
+
+def test_failed_issue_implementation_without_diff_writes_no_salvage_patch(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=["Created local notes but forgot the required marker."],
+        post_agent_git_status=" M src/coding_review_agent_loop/cli.py\n",
+        post_agent_git_diff="",
+    )
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert _salvage_dirs(config) == []
+
+
+def _write_salvage_summary(
+    config,
+    *,
+    name,
+    summary,
+    created_at_ns,
+    issue_number=56,
+    scope="issue-implementation",
+    approved_plan_hash_value=None,
+):
+    salvage_dir = config.log_dir / "salvage" / name
+    salvage_dir.mkdir(parents=True)
+    summary_path = salvage_dir / "salvage-summary.md"
+    summary_path.write_text(summary, encoding="utf-8")
+    metadata = {
+        "schema_version": 1,
+        "created_at_ns": created_at_ns,
+        "repo": config.repo,
+        "issue_number": issue_number,
+        "scope": scope,
+        "agent": "claude",
+        "approved_plan_hash": approved_plan_hash_value,
+        "summary": str(summary_path),
+    }
+    (salvage_dir / "metadata.json").write_text(
+        json.dumps(metadata, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_issue_implementation_rerun_prompt_includes_latest_salvage_summary(tmp_path):
+    config = make_config(tmp_path)
+    _write_salvage_summary(
+        config,
+        name="old",
+        summary="old failed attempt summary",
+        created_at_ns=1,
+    )
+    _write_salvage_summary(
+        config,
+        name="new",
+        summary="new failed attempt summary\nPartial patch: `/tmp/new.patch`",
+        created_at_ns=2,
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    coder_prompt = next(
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] and "Fix GitHub issue #56" in cmd[-1]
+    )
+    assert "Previous failed implementation attempt salvage:" in coder_prompt
+    assert "new failed attempt summary" in coder_prompt
+    assert "old failed attempt summary" not in coder_prompt
+    assert "Do not auto-apply the patch" in coder_prompt
+    assert "cherry-pick or ignore it" in coder_prompt
+    assert "selectively" in coder_prompt
+
+
+def test_latest_salvage_summary_filters_approved_plan_hash(tmp_path):
+    config = make_config(tmp_path)
+    plan_hash = approved_plan_hash("Plan:\n- Current.")
+    _write_salvage_summary(
+        config,
+        name="old-plan",
+        summary="stale approved-plan summary",
+        created_at_ns=5,
+        scope="approved-plan-implementation",
+        approved_plan_hash_value=approved_plan_hash("Plan:\n- Old."),
+    )
+    _write_salvage_summary(
+        config,
+        name="current-plan",
+        summary="current approved-plan summary",
+        created_at_ns=4,
+        scope="approved-plan-implementation",
+        approved_plan_hash_value=plan_hash,
+    )
+
+    summary = latest_salvage_summary(
+        config.log_dir,
+        repo=config.repo,
+        issue_number=56,
+        scope="approved-plan-implementation",
+        approved_plan_hash=plan_hash,
+    )
+
+    assert summary == "current approved-plan summary"

@@ -219,6 +219,17 @@ class FakeRunner(Runner):
         changed_files=None,
         diff_returncode=0,
         diff_stderr="",
+        git_diff="",
+        git_diff_stat=None,
+        git_diff_check="",
+        git_diff_check_returncode=0,
+        git_diff_check_stderr="",
+        post_agent_git_status=None,
+        post_agent_git_diff=None,
+        post_agent_git_diff_stat=None,
+        post_agent_git_diff_check=None,
+        post_agent_git_diff_check_returncode=None,
+        post_agent_git_diff_check_stderr=None,
         issue_urls=None,
         public_response_outputs=None,
         advance_git_head_on_pr=True,
@@ -282,10 +293,26 @@ class FakeRunner(Runner):
         self.changed_files = changed_files or ["src/coding_review_agent_loop/cli.py"]
         self.diff_returncode = diff_returncode
         self.diff_stderr = diff_stderr
+        self.git_diff = git_diff
+        self.git_diff_stat = (
+            git_diff_stat
+            if git_diff_stat is not None
+            else (" src/coding_review_agent_loop/cli.py | 1 +\n" if git_diff else "")
+        )
+        self.git_diff_check = git_diff_check
+        self.git_diff_check_returncode = git_diff_check_returncode
+        self.git_diff_check_stderr = git_diff_check_stderr
+        self.post_agent_git_status = post_agent_git_status
+        self.post_agent_git_diff = post_agent_git_diff
+        self.post_agent_git_diff_stat = post_agent_git_diff_stat
+        self.post_agent_git_diff_check = post_agent_git_diff_check
+        self.post_agent_git_diff_check_returncode = post_agent_git_diff_check_returncode
+        self.post_agent_git_diff_check_stderr = post_agent_git_diff_check_stderr
         self.issue_urls = list(issue_urls) if issue_urls is not None else None
         self.public_response_outputs = list(public_response_outputs or [])
         self.advance_git_head_on_pr = advance_git_head_on_pr
         self._agent_pr_counter = 0
+        self._agent_command_seen = False
         # Parallel discuss debaters (#475) call run_with_log from worker
         # threads; scripted outputs stay keyed per agent, but the shared
         # bookkeeping (commands, comments, response files) needs a lock.
@@ -437,6 +464,45 @@ class FakeRunner(Runner):
         self._agent_pr_counter += 1
         self.git_head = f"{self.git_head}-agent-{self._agent_pr_counter}"
 
+    def _mark_agent_command_seen(self) -> None:
+        self._agent_command_seen = True
+
+    def _current_git_status(self) -> str:
+        if self._agent_command_seen and self.post_agent_git_status is not None:
+            return self.post_agent_git_status
+        return self.git_status
+
+    def _current_git_diff(self) -> str:
+        if self._agent_command_seen and self.post_agent_git_diff is not None:
+            return self.post_agent_git_diff
+        return self.git_diff
+
+    def _current_git_diff_stat(self) -> str:
+        if self._agent_command_seen and self.post_agent_git_diff_stat is not None:
+            return self.post_agent_git_diff_stat
+        return self.git_diff_stat
+
+    def _current_git_diff_check(self) -> str:
+        if self._agent_command_seen and self.post_agent_git_diff_check is not None:
+            return self.post_agent_git_diff_check
+        return self.git_diff_check
+
+    def _current_git_diff_check_returncode(self) -> int:
+        if (
+            self._agent_command_seen
+            and self.post_agent_git_diff_check_returncode is not None
+        ):
+            return self.post_agent_git_diff_check_returncode
+        return self.git_diff_check_returncode
+
+    def _current_git_diff_check_stderr(self) -> str:
+        if (
+            self._agent_command_seen
+            and self.post_agent_git_diff_check_stderr is not None
+        ):
+            return self.post_agent_git_diff_check_stderr
+        return self.git_diff_check_stderr
+
     def run_with_log(
         self,
         args,
@@ -469,6 +535,7 @@ class FakeRunner(Runner):
                 output = self._normalize_legacy_agent_output(output, "\n".join(cmd))
             self._maybe_write_public_response_file(cmd)
             self._maybe_advance_git_head_for_agent_pr(output)
+            self._mark_agent_command_seen()
             log_path.write_text(f"$ {' '.join(cmd)}\n\n{output}", encoding="utf-8")
             return CommandResult(cmd, cwd_path, output, "", returncode)
 
@@ -490,6 +557,7 @@ class FakeRunner(Runner):
                 out_path = Path(cmd[cmd.index("--output-last-message") + 1])
                 out_path.write_text(public_response, encoding="utf-8")
             self._maybe_advance_git_head_for_agent_pr(public_response)
+            self._mark_agent_command_seen()
             log_path.write_text(f"$ {' '.join(cmd)}\n\ncodex completed", encoding="utf-8")
             return CommandResult(cmd, cwd_path, stdout, "", returncode)
 
@@ -507,6 +575,7 @@ class FakeRunner(Runner):
                 output = self._normalize_legacy_agent_output(output, "\n".join(cmd))
             self._maybe_write_public_response_file(cmd)
             self._maybe_advance_git_head_for_agent_pr(output)
+            self._mark_agent_command_seen()
             log_path.write_text(f"$ {' '.join(cmd)}\n\n{output}", encoding="utf-8")
             return CommandResult(cmd, cwd_path, output, "", returncode)
 
@@ -519,6 +588,7 @@ class FakeRunner(Runner):
                 stdout, returncode = output
             self._maybe_write_public_response_file(cmd)
             self._maybe_advance_git_head_for_agent_pr(stdout)
+            self._mark_agent_command_seen()
             log_path.write_text(f"$ {' '.join(cmd)}\n\n{stdout}", encoding="utf-8")
             return CommandResult(cmd, cwd_path, stdout, "", returncode)
 
@@ -536,6 +606,7 @@ class FakeRunner(Runner):
             if isinstance(output, str):
                 output = self._normalize_legacy_agent_output(output, "\n".join(cmd))
             self._maybe_advance_git_head_for_agent_pr(output)
+            self._mark_agent_command_seen()
             return CommandResult(cmd, cwd_path, output, "", returncode)
 
         if cmd[:2] == ["codex", "exec"]:
@@ -555,6 +626,7 @@ class FakeRunner(Runner):
                 out_path = Path(cmd[cmd.index("--output-last-message") + 1])
                 out_path.write_text(public_response, encoding="utf-8")
             self._maybe_advance_git_head_for_agent_pr(public_response)
+            self._mark_agent_command_seen()
             return CommandResult(cmd, cwd_path, stdout, "", returncode)
 
         if cmd[:3] == ["gh", "pr", "comment"]:
@@ -698,6 +770,23 @@ class FakeRunner(Runner):
         if cmd[:2] == ["git", "ls-files"]:
             return CommandResult(cmd, cwd_path, "\n".join(self.tracked_files) + "\n", "", 0)
 
+        if cmd == ["git", "diff", "HEAD", "--binary"]:
+            stdout = self._current_git_diff() if self.diff_returncode == 0 else ""
+            return CommandResult(cmd, cwd_path, stdout, self.diff_stderr, self.diff_returncode)
+
+        if cmd == ["git", "diff", "--stat", "HEAD"]:
+            stdout = self._current_git_diff_stat() if self.diff_returncode == 0 else ""
+            return CommandResult(cmd, cwd_path, stdout, self.diff_stderr, self.diff_returncode)
+
+        if cmd == ["git", "diff", "--check"]:
+            return CommandResult(
+                cmd,
+                cwd_path,
+                self._current_git_diff_check(),
+                self._current_git_diff_check_stderr(),
+                self._current_git_diff_check_returncode(),
+            )
+
         if cmd[:3] == ["git", "diff", "--name-only"]:
             stdout = "\n".join(self.changed_files) + "\n" if self.diff_returncode == 0 else ""
             return CommandResult(cmd, cwd_path, stdout, self.diff_stderr, self.diff_returncode)
@@ -706,7 +795,10 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, f"{self.git_remote}\n", "", 0)
 
         if cmd[:3] == ["git", "status", "--porcelain"]:
-            return CommandResult(cmd, cwd_path, self.git_status, "", 0)
+            return CommandResult(cmd, cwd_path, self._current_git_status(), "", 0)
+
+        if cmd[:3] == ["git", "status", "--short"]:
+            return CommandResult(cmd, cwd_path, self._current_git_status(), "", 0)
 
         if cmd[:3] == ["gh", "repo", "clone"]:
             Path(cmd[4]).mkdir(parents=True, exist_ok=True)
