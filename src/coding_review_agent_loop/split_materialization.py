@@ -341,8 +341,23 @@ def materialize_split_proposals(
     if not to_resolve:
         return existing
 
-    capped = to_resolve[:MAX_SPLIT_CHILDREN]
-    skipped = to_resolve[MAX_SPLIT_CHILDREN:]
+    # Remaining capacity is derived from children already recorded in the
+    # parent's cumulative metadata, not just this call's unresolved proposals,
+    # so repeated reruns with the same over-cap proposal set cannot keep
+    # filing new children past MAX_SPLIT_CHILDREN (#492 review).
+    remaining_capacity = max(0, MAX_SPLIT_CHILDREN - len(known_by_key))
+    capped = to_resolve[:remaining_capacity]
+    skipped = to_resolve[remaining_capacity:]
+
+    if not capped:
+        skipped_titles = ", ".join(proposal.title for proposal in skipped)
+        log(
+            config,
+            f"Split materialization for issue #{parent_issue}: skipped {len(skipped)} "
+            f"stage(s) by cap (MAX_SPLIT_CHILDREN={MAX_SPLIT_CHILDREN}, already at cap): "
+            f"{skipped_titles}",
+        )
+        return existing
 
     adopted_by_key = _adopt_from_search(
         runner, config=config, parent_issue=parent_issue, remaining=capped

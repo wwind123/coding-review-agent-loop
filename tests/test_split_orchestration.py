@@ -3,7 +3,16 @@ the selected-stage implementation handoff (#476)."""
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
+from coding_review_agent_loop.decomposition import (
+    approved_plan_hash,
+    format_one_shot_impl_handoff_comment,
+)
 from coding_review_agent_loop.github import validate_pr_body_does_not_close_issue
+from coding_review_agent_loop.orchestrator import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+    _plan_subject,
+)
 from coding_review_agent_loop.split_materialization import (
     MaterializedSplitChild,
     SplitMaterializationMetadata,
@@ -194,6 +203,98 @@ def test_plan_first_selected_stage_ambiguous_without_flag_raises(tmp_path):
         run_issue_loop(
             runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True
         )
+
+
+def test_plan_first_deferred_stage_rerun_resumes_parent_one_shot_handoff(tmp_path):
+    """A parent plan that declares its own `deferred_stages` keeps its primary
+    scope on the parent; materializing the deferred remainder as a child issue
+    must not make a rerun mistake the parent's own already-handed-off one-shot
+    PR for an unresolved selected-stage handoff (#492 review)."""
+    plan = structured_plan_state(
+        state="blocking",
+        summary="Implement the core parser change.",
+        deferred_stages=[{"title": "Auth flow", "summary": "Split follow-up out."}],
+    )
+    plan_subject = _plan_subject(plan)
+    plan_hash = approved_plan_hash(plan)
+    split_metadata = SplitMaterializationMetadata(
+        parent_issue=56,
+        subject=plan_subject,
+        children=(
+            MaterializedSplitChild(
+                title="Auth flow",
+                key=split_stage_proposal_from_text("Auth flow").key,
+                url="https://github.com/OWNER/REPO/issues/101",
+                number=101,
+                origin="created",
+            ),
+        ),
+    )
+    handoff = format_one_shot_impl_handoff_comment(
+        parent_issue=56,
+        mode="implement-one-shot",
+        plan_hash=plan_hash,
+        plan_subject=plan_subject,
+        pr_number=77,
+        pr_head_sha="abc123",
+    )
+    runner = FakeRunner(
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:00Z",
+                "body": _attach_round_metadata(
+                    plan,
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="coder",
+                        agent="Claude",
+                        round_number=1,
+                        subject=plan_subject,
+                    ),
+                ),
+            },
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:01Z",
+                "body": _attach_round_metadata(
+                    "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="reviewer",
+                        agent="Codex",
+                        round_number=1,
+                        subject=plan_subject,
+                        state="approved",
+                    ),
+                ),
+            },
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:02Z",
+                "body": format_split_materialization_summary(parent_issue=56, metadata=split_metadata),
+            },
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:03Z", "body": handoff},
+        ],
+        codex_outputs=[
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+    )
+    config = make_config(tmp_path, materialize_split_issues=True)
+
+    assert (
+        run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True
+        )
+        == 0
+    )
+
+    # Resumes the parent's own PR #77 review directly; no re-implementation,
+    # no new child issues, and no selected-stage handoff.
+    assert runner.issues == []
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert not any("<!-- AGENT_SPLIT_STAGE_HANDOFF:" in comment for comment in runner.comments)
 
 
 def test_validate_pr_body_does_not_close_issue_rejects_parent_fixes_for_staged_pr(tmp_path):

@@ -2667,13 +2667,30 @@ def _run_plan_first_loop(
                 # already fully materialized into child issues (discuss `split` or a prior
                 # plan-first run), implementation must target the child the approved plan
                 # actually covers instead of treating the whole parent as solved.
+                #
+                # This does NOT apply when the approved plan itself structurally declares
+                # `deferred_stages`: that plan keeps its own primary scope on the parent and
+                # only files the *remainder* as children (`_handle_plan_first_split_scope`),
+                # so the parent is never one of the materialized children. Skipping stage
+                # resolution here also fixes a rerun/resume regression (#492 review): once
+                # such a plan's own one-shot handoff is posted on the parent, a later rerun
+                # would otherwise see the freshly materialized children, find no stage-handoff
+                # marker, and fail to match the plan's own title against a sibling stage's
+                # title, raising instead of resuming the already-handed-off parent PR.
                 target_issue_number = issue_number
                 target_issue_context = issue_context
                 staged_parent_issue: int | None = None
+                current_plan_declares_own_deferred_stages = bool(
+                    _extract_current_deferred_stages(current_plan)
+                )
                 split_metadata = find_existing_split_materialization(
                     issue_context.comments, parent_issue=issue_number
                 )
-                if split_metadata is not None and split_metadata.children:
+                if (
+                    split_metadata is not None
+                    and split_metadata.children
+                    and not current_plan_declares_own_deferred_stages
+                ):
                     stage_handoff = find_existing_split_stage_handoff(
                         issue_context.comments, parent_issue=issue_number, plan_hash=plan_hash
                     )

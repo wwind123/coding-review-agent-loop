@@ -183,6 +183,45 @@ def test_materialize_split_proposals_caps_at_max_children(tmp_path):
     assert len(metadata.children) == MAX_SPLIT_CHILDREN
 
 
+def test_materialize_split_proposals_rerun_does_not_exceed_cap(tmp_path):
+    """A rerun with the same over-cap proposal set must not keep filing new
+    children past MAX_SPLIT_CHILDREN: remaining capacity must be computed from
+    children already recorded in the parent's cumulative metadata, not just
+    the proposals this call still considers unresolved (#492 review)."""
+    proposals = [split_stage_proposal_from_text(f"Stage {i}") for i in range(MAX_SPLIT_CHILDREN + 3)]
+    config = make_config(tmp_path)
+
+    first_runner = FakeRunner(
+        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + i}" for i in range(MAX_SPLIT_CHILDREN)]
+    )
+    first_metadata = materialize_split_proposals(
+        first_runner,
+        config=config,
+        parent_issue=56,
+        subject="subject-a",
+        proposals=proposals,
+        issue_comments=(),
+    )
+    assert len(first_metadata.children) == MAX_SPLIT_CHILDREN
+    parent_summary_comment = _comment(first_runner.comments[-1])
+
+    # Rerun with the identical over-cap proposal set, seeded with the parent
+    # comment history left behind by the first run.
+    second_runner = FakeRunner()
+    second_metadata = materialize_split_proposals(
+        second_runner,
+        config=config,
+        parent_issue=56,
+        subject="subject-a",
+        proposals=proposals,
+        issue_comments=[parent_summary_comment],
+    )
+
+    assert second_runner.issues == []
+    assert second_metadata.children == first_metadata.children
+    assert len(second_metadata.children) == MAX_SPLIT_CHILDREN
+
+
 def test_materialize_split_proposals_returns_none_for_no_proposals(tmp_path):
     runner = FakeRunner()
     config = make_config(tmp_path)
