@@ -1045,6 +1045,23 @@ def _extract_unsupported_model_reason(text: str) -> str | None:
     return None
 
 
+def _configured_requested_model(
+    agent: AgentName | None,
+    config: AgentLoopConfig | None,
+) -> str | None:
+    if config is None:
+        return None
+    if agent == "codex":
+        return config.codex_model.strip() if config.codex_model else None
+    if agent == "antigravity":
+        return config.antigravity_models[0].strip() if config.antigravity_models else None
+    if agent == "gemini":
+        return config.gemini_model.strip() if config.gemini_model else None
+    if agent == "claude":
+        return config.claude_model.strip() if config.claude_model else None
+    return None
+
+
 def _resolve_requested_model(
     *,
     agent: AgentName | None,
@@ -1053,23 +1070,9 @@ def _resolve_requested_model(
     classification_text: str,
 ) -> str | None:
     result_model = result.model_used.strip() if result is not None and result.model_used else None
-    if agent in {"codex", "antigravity"}:
-        return result_model or _parse_model_from_provider_text(classification_text)
-    if agent == "gemini":
-        config_model = (
-            config.gemini_model.strip()
-            if config is not None and config.gemini_model
-            else None
-        )
-        return config_model or result_model or _parse_model_from_provider_text(classification_text)
-    if agent == "claude":
-        config_model = (
-            config.claude_model.strip()
-            if config is not None and config.claude_model
-            else None
-        )
-        return result_model or config_model or _parse_model_from_provider_text(classification_text)
-    return result_model or _parse_model_from_provider_text(classification_text)
+    config_model = _configured_requested_model(agent, config)
+    parsed_model = _parse_model_from_provider_text(classification_text)
+    return result_model or config_model or parsed_model
 
 
 def _known_unsupported_model_fallback(

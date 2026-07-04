@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from coding_review_agent_loop.agents.base import with_public_response_file_instruction
+from coding_review_agent_loop.agents.base import AgentResult, with_public_response_file_instruction
 from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER
 from coding_review_agent_loop.cli import (
     AgentLoopError,
@@ -45,6 +45,7 @@ from coding_review_agent_loop.orchestrator import (
     _parse_rate_limit_reset_seconds,
     _plan_subject,
     _resume_plan_round,
+    _resolve_requested_model,
     _run_validated_agent,
     _strip_round_metadata,
     _validate_coder_followup_response,
@@ -214,6 +215,80 @@ def test_generic_provider_unsupported_model_payload_classifies_separately():
     )
 
     assert _failure_category(text) == "unsupported_model"
+
+
+@pytest.mark.parametrize(
+    ("agent", "expected_config_model"),
+    [
+        ("codex", "configured-codex"),
+        ("antigravity", "Configured Antigravity (High)"),
+        ("gemini", "configured-gemini"),
+        ("claude", "configured-claude"),
+    ],
+)
+def test_resolve_requested_model_prefers_result_then_config_for_each_agent(
+    tmp_path, agent, expected_config_model
+):
+    config = make_config(
+        tmp_path,
+        codex_model="configured-codex",
+        antigravity_model="Configured Antigravity (High)",
+        gemini_model="configured-gemini",
+        claude_model="configured-claude",
+    )
+    provider_text = "The 'provider-parsed' model is not supported for this provider."
+
+    assert (
+        _resolve_requested_model(
+            agent=agent,
+            config=config,
+            result=AgentResult(text="", model_used="actual-model"),
+            classification_text=provider_text,
+        )
+        == "actual-model"
+    )
+    assert (
+        _resolve_requested_model(
+            agent=agent,
+            config=config,
+            result=None,
+            classification_text=provider_text,
+        )
+        == expected_config_model
+    )
+    assert (
+        _resolve_requested_model(
+            agent=agent,
+            config=None,
+            result=None,
+            classification_text=provider_text,
+        )
+        == "provider-parsed"
+    )
+
+
+def test_codex_unsupported_model_diagnostic_uses_config_model_for_fallback(tmp_path):
+    provider_text = (
+        "The requested model is not supported when using Codex with a ChatGPT account."
+    )
+    config = make_config(tmp_path, codex_model="gpt-5.5-pro")
+
+    message = _format_invalid_agent_response_error(
+        agent_name="Codex",
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        reason="agent command exited with 1",
+        result=AgentResult(text="", raw_output=provider_text, returncode=1),
+        log_paths=(),
+        category="unsupported_model",
+        agent="codex",
+        config=config,
+        role="reviewer",
+        classification_text=provider_text,
+    )
+
+    assert "requested model `gpt-5.5-pro`" in message
+    assert "--codex-model gpt-5.5" in message
+    assert "fix the underlying issue" not in message
 
 
 def test_capacity_model_availability_remains_transient():
