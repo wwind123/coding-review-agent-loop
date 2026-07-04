@@ -297,6 +297,76 @@ def test_plan_first_deferred_stage_rerun_resumes_parent_one_shot_handoff(tmp_pat
     assert not any("<!-- AGENT_SPLIT_STAGE_HANDOFF:" in comment for comment in runner.comments)
 
 
+def test_plan_first_materializes_prior_discuss_split_and_hands_off_in_same_run(tmp_path):
+    """A prior `discuss` run chose `split` but never materialized. Running
+    `issue --plan-first --implement-after-approval --materialize-split-issues`
+    on the parent with a plan that itself covers one of those split proposals
+    (no `deferred_stages` declared) must, within this SAME run: file every
+    proposal as a child issue, then still resolve and hand off implementation
+    to the specific child the approved plan covers — not fall back to
+    implementing the parent as a monolith because stage resolution read a
+    stale pre-materialization issue-comments snapshot (#492 review)."""
+    plan = structured_plan_state(state="blocking", summary="Auth flow")
+    runner = FakeRunner(
+        claude_outputs=[
+            plan,
+            "Implemented the auth-flow stage.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_pr_review(state="approved", summary="LGTM."),
+        ],
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-20T00:00:00Z",
+                "body": _attach_round_metadata(
+                    "Discuss consensus: split this into stages.\n-- coding-review-agent-loop",
+                    PostedRoundMetadata(
+                        flow="discuss",
+                        role="summary",
+                        agent="coding-review-agent-loop",
+                        round_number=1,
+                        subject="prior-discuss-subject",
+                        is_final=True,
+                        split_proposals=("Auth flow", "Billing flow"),
+                    ),
+                ),
+            },
+        ],
+        issue_urls=[
+            "https://github.com/OWNER/REPO/issues/101",
+            "https://github.com/OWNER/REPO/issues/102",
+        ],
+        pr_payload={"body": "Closes #101\n\nRefs #56"},
+    )
+    config = make_config(tmp_path, materialize_split_issues=True)
+
+    assert (
+        run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True
+        )
+        == 0
+    )
+
+    # Both split proposals were filed as children in this run...
+    assert {issue["title"] for issue in runner.issues} == {
+        "[#56 stage] Auth flow",
+        "[#56 stage] Billing flow",
+    }
+    # ...and this same run still resolved and handed off to the specific
+    # child ("Auth flow" -> #101) the approved plan covers, instead of
+    # implementing the parent as a monolith.
+    assert any("<!-- AGENT_SPLIT_STAGE_HANDOFF:" in comment for comment in runner.comments)
+    stage_handoff = next(c for c in runner.comments if "<!-- AGENT_SPLIT_STAGE_HANDOFF:" in c)
+    assert "handed off to split stage" in stage_handoff
+    implement_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    implementation_prompt = implement_calls[1][-1]
+    assert "issue #101" in implementation_prompt
+    assert "Closes #101" in implementation_prompt
+    assert "Refs #56" in implementation_prompt
+
+
 def test_validate_pr_body_does_not_close_issue_rejects_parent_fixes_for_staged_pr(tmp_path):
     runner = FakeRunner(pr_payload={"body": "Fixes #56"})
     config = make_config(tmp_path)

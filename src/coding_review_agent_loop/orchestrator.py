@@ -1828,10 +1828,18 @@ def _handle_plan_first_split_scope(
     current_plan: str,
     plan_subject: str,
     issue_context: IssueContext,
-) -> None:
+) -> bool:
     """Materialize (or warn about) split/deferred stages before implementation
     handoff (#476), so a plan-first run that narrows scope to one stage cannot
-    silently leave the rest unfiled (the #467/#474 gap)."""
+    silently leave the rest unfiled (the #467/#474 gap).
+
+    Returns True when this call may have posted a fresh `AGENT_DISCUSS_SPLIT`
+    materialization comment on the parent (#492 review): the caller must then
+    refetch `issue_context` before any downstream logic (e.g. implement-one-shot
+    selected-stage resolution) reads issue comments, since the in-memory
+    `issue_context.comments` snapshot predates this call and would otherwise
+    look stale and hide children materialized moments earlier in this same run.
+    """
     current_deferred_stages = _extract_current_deferred_stages(current_plan)
     prior_discuss_proposals = _prior_discuss_split_proposals(issue_context, config=config)
     remaining_proposals = dedupe_split_stage_proposals(
@@ -1848,7 +1856,7 @@ def _handle_plan_first_split_scope(
                 proposals=remaining_proposals,
                 issue_comments=issue_context.comments,
             )
-            return
+            return True
         log(
             config,
             f"Planning issue #{issue_number}: split follow-ups remain unfiled; rerun with "
@@ -1864,18 +1872,18 @@ def _handle_plan_first_split_scope(
                 subject=plan_subject,
                 proposals=remaining_proposals,
             )
-        return
+        return False
     if current_deferred_stages or prior_discuss_proposals:
-        return
+        return False
     if not _plan_text_suggests_narrowing(current_plan):
-        return
+        return False
     log(
         config,
         f"Planning issue #{issue_number}: approved plan text suggests scope narrowing "
         "but no `deferred_stages` or discuss split proposals were declared or filed.",
     )
     if has_unfiled_split_warning(issue_context.comments, issue_number=issue_number, subject=plan_subject):
-        return
+        return False
     post_issue_comment(
         runner,
         config=config,
@@ -1896,6 +1904,7 @@ def _handle_plan_first_split_scope(
             ]
         ),
     )
+    return False
 
 
 def _read_assigned_workdir_head(runner: Runner, config: AgentLoopConfig) -> str | None:
@@ -2570,7 +2579,7 @@ def _run_plan_first_loop(
                 sources=approved_future_followup_sources,
                 allow_issue_filing=mode in {"implement-one-shot", "implement-by-phase"},
             )
-            _handle_plan_first_split_scope(
+            split_scope_materialized = _handle_plan_first_split_scope(
                 runner,
                 issue_number=issue_number,
                 config=config,
@@ -2578,6 +2587,12 @@ def _run_plan_first_loop(
                 plan_subject=plan_subject,
                 issue_context=issue_context,
             )
+            if split_scope_materialized:
+                # Refetch so downstream logic (selected-stage resolution below,
+                # decomposition, etc.) sees the `AGENT_DISCUSS_SPLIT` comment
+                # this call may have just posted, instead of the stale
+                # pre-materialization snapshot (#492 review).
+                issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
             if mode == "plan-only":
                 print(
                     f"Issue #{issue_number} plan approved by {format_agent_list(configured_reviewers)}."
