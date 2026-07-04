@@ -1033,6 +1033,12 @@ narrow and intended for stream/tool-call failures, empty responses, network
 timeouts/resets, and provider 5xx errors. Auth, credit, quota, dirty workdir,
 and normal missing-marker responses are not retried.
 
+Unsupported model/provider-auth compatibility errors are reported separately
+with failure category `unsupported_model`. These diagnostics name the agent and
+requested model when available and suggest choosing a compatible model or
+provider/auth mode instead of treating the failure as a deterministic protocol
+or code issue.
+
 When `--approved-followups` is set to `summarize`, `issue`, or a `fix-and-*`
 mode, approved reviewer responses may also include optional future-work items
 under a dedicated heading:

@@ -295,6 +295,29 @@ PUBLIC_RESPONSE_TRANSIENT_DIAGNOSTIC_RE = re.compile(
     r")",
     re.I | re.S,
 )
+UNSUPPORTED_MODEL_DIRECT_RE = re.compile(
+    r"\bmodel\b.{0,80}\b(?:is\s+)?not\s+(?:supported|available)\b|"
+    r"\bmodel\b.{0,80}\bunavailable\b|"
+    r"\bunsupported[_-]?\s*model\b|"
+    r"\bmodel[_-]?not[_-]?(?:supported|available)\b|"
+    r"\bmodel[_-]?unavailable\b",
+    re.I | re.S,
+)
+INVALID_REQUEST_RE = re.compile(r"\binvalid_request_error\b", re.I)
+MODEL_SUPPORT_OR_AVAILABILITY_RE = re.compile(
+    r"\b(?:model|deployment)\b.{0,120}\b"
+    r"(?:not\s+(?:supported|available)|unsupported|unavailable)\b|"
+    r"\b(?:not\s+(?:supported|available)|unsupported|unavailable)\b"
+    r".{0,120}\b(?:model|deployment)\b",
+    re.I | re.S,
+)
+MODEL_TOKEN_RE = re.compile(
+    r"(?:['\"`](?P<quoted>[A-Za-z0-9][A-Za-z0-9._:/+-]{1,})['\"`]\s+model\b)|"
+    r"(?:\bmodel\s*(?:name)?\s*(?:is|:)?\s*['\"`]?(?P<after>[A-Za-z0-9][A-Za-z0-9._:/+-]{1,})['\"`]?)",
+    re.I,
+)
+MODEL_PARENTHESES_SUFFIX_RE = re.compile(r"\s+\([^)]*\)\s*$")
+FAILURE_CLASSIFICATION_TEXT_LIMIT = 12000
 ISSUE_IMPLEMENTATION_SALVAGE_SCOPE = "issue-implementation"
 APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE = "approved-plan-implementation"
 
@@ -358,6 +381,25 @@ class ValidatedAgentResponse:
     # Model the agent actually ran, for the dynamic signature (#332). Carried from
     # AgentResult.model_used so the orchestrator render sites can stamp it.
     model_used: str | None = None
+
+
+@dataclass(frozen=True)
+class _UnsupportedModelDiagnostic:
+    agent: AgentName | None
+    agent_name: str
+    role: str | None
+    requested_model: str | None
+    provider_auth_context: str | None
+    fallback_flag: str | None
+    fallback_value: str | None
+    reason: str | None
+
+    @property
+    def role_qualified_agent(self) -> str:
+        role = (self.role or "").strip().lower()
+        if role in {"coder", "reviewer", "debater", "analyzer", "summary"}:
+            return f"{self.agent_name} {role}"
+        return self.agent_name
 
 
 def _parse_absolute_reset_seconds(
@@ -505,6 +547,135 @@ def _is_error_shaped_json_payload(payload: object) -> bool:
     return bool(error_keys.intersection(payload))
 
 
+def _bounded_failure_classification_text(text: str) -> str:
+    if len(text) <= FAILURE_CLASSIFICATION_TEXT_LIMIT:
+        return text
+    head_limit = FAILURE_CLASSIFICATION_TEXT_LIMIT // 3
+    tail_limit = FAILURE_CLASSIFICATION_TEXT_LIMIT - head_limit
+    return f"{text[:head_limit]}\n... [truncated] ...\n{text[-tail_limit:]}"
+
+
+def _json_error_payload_text(payload: object) -> str:
+    parts: list[str] = []
+
+    def collect(value: object) -> None:
+        if len(parts) >= 50:
+            return
+        if isinstance(value, dict):
+            preferred_keys = (
+                "error",
+                "errors",
+                "type",
+                "code",
+                "status",
+                "message",
+                "detail",
+                "details",
+            )
+            seen: set[object] = set()
+            for key in preferred_keys:
+                if key in value:
+                    seen.add(key)
+                    collect(value[key])
+            for key, item in value.items():
+                if key not in seen and isinstance(item, (str, int, float)):
+                    collect(item)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value[:20]:
+                collect(item)
+            return
+        if isinstance(value, (str, int, float)):
+            text = str(value).strip()
+            if text:
+                parts.append(text)
+
+    collect(payload)
+    return "\n".join(parts)
+
+
+def _first_json_error_payload_text(text: str) -> str | None:
+    candidates = [text.lstrip()]
+    candidates.extend(
+        line.strip()
+        for line in text.splitlines()[:80]
+        if line.strip().startswith("{")
+    )
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        payload = _decode_public_response_json_prefix(candidate)
+        if not _is_error_shaped_json_payload(payload):
+            continue
+        payload_text = _json_error_payload_text(payload)
+        if payload_text:
+            return payload_text
+    return None
+
+
+def _has_transient_availability_signal(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:429|rate[- ]?limit(?:ed)?|quota|resource[-_ ]?exhausted|"
+            r"no capacity|capacity|overloaded|internal server error|bad gateway|"
+            r"service unavailable|gateway timeout|model_capacity_exhausted)\b",
+            text,
+            re.I,
+        )
+    )
+
+
+def _looks_like_unsupported_model_text(text: str) -> bool:
+    if not text.strip():
+        return False
+    if _has_transient_availability_signal(text):
+        return False
+    if UNSUPPORTED_MODEL_DIRECT_RE.search(text):
+        return True
+    return bool(
+        INVALID_REQUEST_RE.search(text)
+        and MODEL_SUPPORT_OR_AVAILABILITY_RE.search(text)
+    )
+
+
+def _unsupported_model_classification_text(
+    text: str,
+    *,
+    public_response: bool = False,
+    repair_expected_kind: str | None = None,
+) -> str | None:
+    """Return the bounded diagnostic text when it names an unsupported model."""
+    bounded = _bounded_failure_classification_text(text)
+    if public_response:
+        payload = _decode_public_response_json_prefix(bounded)
+        if not isinstance(payload, dict):
+            return None
+        kind = payload.get("kind")
+        if (
+            kind in STRUCTURED_PUBLIC_RESPONSE_KINDS
+            and (
+                repair_expected_kind is None
+                or repair_expected_kind in STRUCTURED_PUBLIC_RESPONSE_KINDS
+            )
+        ):
+            return None
+        if not _is_error_shaped_json_payload(payload):
+            return None
+        payload_text = _json_error_payload_text(payload)
+        if _looks_like_unsupported_model_text(payload_text):
+            return payload_text
+        return None
+
+    payload_text = _first_json_error_payload_text(bounded)
+    if payload_text and _looks_like_unsupported_model_text(payload_text):
+        return payload_text
+    if _looks_like_unsupported_model_text(bounded):
+        return bounded
+    return None
+
+
 def _is_transient_public_response(text: str, *, repair_expected_kind: str | None = None) -> bool:
     """Classify extracted public responses without matching transient terms in content."""
     if NON_RETRYABLE_AGENT_OUTPUT_RE.search(text):
@@ -543,6 +714,12 @@ def _failure_category(
     """Classify a failure for logging: helps users decide whether to rerun or fix config/code."""
     if not text.strip():
         return "empty-response"
+    if _unsupported_model_classification_text(
+        text,
+        public_response=public_response,
+        repair_expected_kind=repair_expected_kind,
+    ):
+        return "unsupported_model"  # requested model is incompatible with provider/auth mode
     if NON_RETRYABLE_AGENT_OUTPUT_RE.search(text):
         return "non-retryable"  # auth/billing — fix configuration
     if public_response:
@@ -816,15 +993,178 @@ def _retry_delay(config: AgentLoopConfig, retry_index: int) -> int:
     return delays[min(retry_index - 1, len(delays) - 1)]
 
 
+def _clean_diagnostic_fragment(text: str, *, limit: int = 800) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip(" \t\r\n.;")
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "..."
+
+
+def _model_flag_value(model: str | None) -> str | None:
+    if model is None:
+        return None
+    stripped = model.strip()
+    if not stripped:
+        return None
+    return MODEL_PARENTHESES_SUFFIX_RE.sub("", stripped).strip() or stripped
+
+
+def _parse_model_from_provider_text(text: str) -> str | None:
+    for match in MODEL_TOKEN_RE.finditer(text):
+        model = match.group("quoted") or match.group("after")
+        if not model:
+            continue
+        lowered = model.lower()
+        if lowered in {"is", "not", "unsupported", "available", "unavailable", "supported"}:
+            continue
+        return model.strip(".,;:")
+    return None
+
+
+def _extract_provider_auth_context(text: str) -> str | None:
+    patterns = (
+        r"\bwhen using (?P<context>[^.\n;]+)",
+        r"\bwhen authenticated (?:as|with) (?P<context>[^.\n;]+)",
+        r"\bfor (?P<context>[^.\n;]*(?:account|auth|authentication|provider|"
+        r"api key|subscription|project|tenant|workspace|organization)[^.\n;]*)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            context = _clean_diagnostic_fragment(match.group("context"), limit=240)
+            return context or None
+    return None
+
+
+def _extract_unsupported_model_reason(text: str) -> str | None:
+    for line in text.splitlines():
+        if _looks_like_unsupported_model_text(line):
+            return _clean_diagnostic_fragment(line)
+    if _looks_like_unsupported_model_text(text):
+        return _clean_diagnostic_fragment(text)
+    return None
+
+
+def _resolve_requested_model(
+    *,
+    agent: AgentName | None,
+    config: AgentLoopConfig | None,
+    result: AgentResult | None,
+    classification_text: str,
+) -> str | None:
+    result_model = result.model_used.strip() if result is not None and result.model_used else None
+    if agent in {"codex", "antigravity"}:
+        return result_model or _parse_model_from_provider_text(classification_text)
+    if agent == "gemini":
+        config_model = (
+            config.gemini_model.strip()
+            if config is not None and config.gemini_model
+            else None
+        )
+        return config_model or result_model or _parse_model_from_provider_text(classification_text)
+    if agent == "claude":
+        config_model = (
+            config.claude_model.strip()
+            if config is not None and config.claude_model
+            else None
+        )
+        return result_model or config_model or _parse_model_from_provider_text(classification_text)
+    return result_model or _parse_model_from_provider_text(classification_text)
+
+
+def _known_unsupported_model_fallback(
+    *,
+    agent: AgentName | None,
+    requested_model: str | None,
+    provider_auth_context: str | None,
+    reason: str | None,
+) -> tuple[str | None, str | None]:
+    model = _model_flag_value(requested_model)
+    combined = f"{provider_auth_context or ''} {reason or ''}"
+    if (
+        agent == "codex"
+        and model is not None
+        and model.lower() == "gpt-5.5-pro"
+        and re.search(r"\bchatgpt\b", combined, re.I)
+    ):
+        return "--codex-model", "gpt-5.5"
+    return None, None
+
+
+def _build_unsupported_model_diagnostic(
+    *,
+    agent: AgentName | None,
+    agent_name: str,
+    config: AgentLoopConfig | None,
+    role: str | None,
+    result: AgentResult | None,
+    classification_text: str,
+) -> _UnsupportedModelDiagnostic:
+    unsupported_text = (
+        _unsupported_model_classification_text(classification_text)
+        or _bounded_failure_classification_text(classification_text)
+    )
+    requested_model = _resolve_requested_model(
+        agent=agent,
+        config=config,
+        result=result,
+        classification_text=unsupported_text,
+    )
+    provider_auth_context = _extract_provider_auth_context(unsupported_text)
+    reason = _extract_unsupported_model_reason(unsupported_text)
+    fallback_flag, fallback_value = _known_unsupported_model_fallback(
+        agent=agent,
+        requested_model=requested_model,
+        provider_auth_context=provider_auth_context,
+        reason=reason,
+    )
+    return _UnsupportedModelDiagnostic(
+        agent=agent,
+        agent_name=agent_name,
+        role=role,
+        requested_model=requested_model,
+        provider_auth_context=provider_auth_context,
+        fallback_flag=fallback_flag,
+        fallback_value=fallback_value,
+        reason=reason,
+    )
+
+
+def _unsupported_model_suggestion(diagnostic: _UnsupportedModelDiagnostic | None) -> str:
+    if diagnostic is None:
+        return (
+            "Suggestion: choose a model supported by the configured provider/auth mode, "
+            "or switch to a provider/auth configuration where the requested model is available."
+        )
+    requested = _model_flag_value(diagnostic.requested_model)
+    requested_ref = f"`{requested}`" if requested else "the requested model"
+    if diagnostic.fallback_flag and diagnostic.fallback_value:
+        return (
+            f"Suggestion: try a compatible {diagnostic.agent_name} model, for example:\n"
+            f"  {diagnostic.fallback_flag} {diagnostic.fallback_value}\n"
+            f"Alternatively, use a provider/auth configuration where {requested_ref} is "
+            "available, if supported by your setup."
+        )
+    return (
+        f"Suggestion: choose a model compatible with {diagnostic.agent_name}'s "
+        f"configured provider/auth mode, or use a provider/auth configuration where "
+        f"{requested_ref} is available. The orchestrator will not change the requested "
+        "model automatically."
+    )
+
+
 def _failure_suggestion(
     category: str | None,
     reason: str,
     agent_name: str,
     *,
     classification_text: str = "",
+    unsupported_model_diagnostic: _UnsupportedModelDiagnostic | None = None,
 ) -> str:
     """Return a one-line actionable suggestion to append to an agent failure message."""
     combined = f"{reason} {classification_text}"
+    if category == "unsupported_model":
+        return _unsupported_model_suggestion(unsupported_model_diagnostic)
     if category == "transient":
         if _QUOTA_RATE_LIMIT_RE.search(combined):
             return (
@@ -851,6 +1191,41 @@ def _failure_suggestion(
     return ""
 
 
+def _format_unsupported_model_agent_response_error(
+    *,
+    diagnostic: _UnsupportedModelDiagnostic,
+    marker_description: str,
+    reason: str,
+    exit_context: str,
+    log_context: str,
+    suggestion: str,
+) -> str:
+    if diagnostic.requested_model:
+        model_phrase = f"requested model `{diagnostic.requested_model}`"
+    else:
+        model_phrase = "the requested model"
+    context_phrase = (
+        f" when using {diagnostic.provider_auth_context}"
+        if diagnostic.provider_auth_context
+        else ""
+    )
+    provider_line = (
+        f"\nProvider diagnostic: {diagnostic.reason}"
+        if diagnostic.reason
+        else ""
+    )
+    suggestion_line = f"\n{suggestion}" if suggestion else ""
+    return (
+        f"{diagnostic.role_qualified_agent} failed because {model_phrase} is not "
+        f"supported{context_phrase}. No successful agent result was recorded. "
+        f"Required marker: {marker_description}. Reason: {reason}.{exit_context} "
+        "Failure category: unsupported_model (choose a compatible model or "
+        f"provider/auth mode).{provider_line}"
+        f"{log_context}"
+        f"{suggestion_line}"
+    )
+
+
 def _format_invalid_agent_response_error(
     *,
     agent_name: str,
@@ -859,6 +1234,10 @@ def _format_invalid_agent_response_error(
     result: AgentResult | None,
     log_paths: Sequence[object],
     category: str | None = None,
+    agent: AgentName | None = None,
+    config: AgentLoopConfig | None = None,
+    role: str | None = None,
+    classification_text: str = "",
 ) -> str:
     exit_context = ""
     if result is not None and result.returncode not in (0, None):
@@ -873,8 +1252,34 @@ def _format_invalid_agent_response_error(
         category_hint = " Failure category: deterministic (may require a code fix)."
     elif category == "timeout":
         category_hint = " Failure category: timeout (the agent exceeded the configured time limit)."
-    classification_text = (result.raw_output or result.text or "") if result is not None else ""
-    suggestion = _failure_suggestion(category, reason, agent_name, classification_text=classification_text)
+    if not classification_text:
+        classification_text = (result.raw_output or result.text or "") if result is not None else ""
+    unsupported_model_diagnostic = None
+    if category == "unsupported_model":
+        unsupported_model_diagnostic = _build_unsupported_model_diagnostic(
+            agent=agent,
+            agent_name=agent_name,
+            config=config,
+            role=role,
+            result=result,
+            classification_text=classification_text,
+        )
+    suggestion = _failure_suggestion(
+        category,
+        reason,
+        agent_name,
+        classification_text=classification_text,
+        unsupported_model_diagnostic=unsupported_model_diagnostic,
+    )
+    if category == "unsupported_model" and unsupported_model_diagnostic is not None:
+        return _format_unsupported_model_agent_response_error(
+            diagnostic=unsupported_model_diagnostic,
+            marker_description=marker_description,
+            reason=reason,
+            exit_context=exit_context,
+            log_context=log_context,
+            suggestion=suggestion,
+        )
     suggestion_line = f"\n{suggestion}" if suggestion else ""
     return (
         f"{agent_name} failed before producing a valid public response. "
@@ -1140,10 +1545,13 @@ def _run_validated_agent(
                     public_response=True,
                     repair_expected_kind=repair_expected_kind,
                 )
+                response_failure_is_unsupported = last_failure_category == "unsupported_model"
                 # Marker near-misses are a separate first-attempt nudge for common footer typos;
                 # structured JSON protocol drift still remains repairable when retries are exhausted.
                 should_retry = public_text_is_transient or (
-                    attempt == 1 and _is_retryable_marker_near_miss(classification_text)
+                    not response_failure_is_unsupported
+                    and attempt == 1
+                    and _is_retryable_marker_near_miss(classification_text)
                 )
                 if (
                     result.raw_output
@@ -1175,7 +1583,11 @@ def _run_validated_agent(
                     "markdown-or-prose",
                     "fenced-or-markdown",
                 }
-                if result.response_file_text and response_file_not_structured:
+                if (
+                    result.response_file_text
+                    and response_file_not_structured
+                    and not response_failure_is_unsupported
+                ):
                     recovered = _recover_valid_structured_candidate(
                         result,
                         validate=validate,
@@ -1195,7 +1607,8 @@ def _run_validated_agent(
                             model_used=result.model_used,
                         )
                 if (
-                    repair_expected_kind == "plan_revision"
+                    not response_failure_is_unsupported
+                    and repair_expected_kind == "plan_revision"
                     and result.response_file_text
                     and not isinstance(exc, UnknownPriorItemDispositionError)
                     and _plan_revision_missing_human_acknowledgement(
@@ -1235,6 +1648,7 @@ def _run_validated_agent(
                 if (
                     use_repair
                     and not public_text_is_transient
+                    and not response_failure_is_unsupported
                     and repair_expected_kind in STRUCTURED_PUBLIC_RESPONSE_KINDS
                     and not (
                         isinstance(exc, UnknownPriorItemDispositionError)
@@ -1344,6 +1758,7 @@ def _run_validated_agent(
                 if (
                     use_repair
                     and not public_text_is_transient
+                    and not response_failure_is_unsupported
                     and isinstance(exc, UnknownPriorItemDispositionError)
                     and not ledger_incomplete
                     and repair_expected_kind in {"pr_review", "plan_review", "plan_revision"}
@@ -1414,6 +1829,7 @@ def _run_validated_agent(
                 if (
                     use_repair
                     and not public_text_is_transient
+                    and not response_failure_is_unsupported
                     and not (
                         isinstance(exc, UnknownPriorItemDispositionError)
                         and ledger_incomplete
@@ -1551,6 +1967,10 @@ def _run_validated_agent(
         result=last_result,
         log_paths=log_paths,
         category=last_failure_category,
+        agent=agent,
+        config=config,
+        role=role,
+        classification_text=last_classification_text,
     )
     if artifacts is not None:
         message += format_salvage_artifacts_for_error(artifacts)

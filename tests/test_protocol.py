@@ -2586,6 +2586,25 @@ def test_failure_category_threads_public_response_expected_kind():
     )
 
 
+def test_failure_category_does_not_reclassify_structured_model_support_content():
+    text = structured_pr_review(
+        summary=(
+            "The implementation documents unsupported model and model availability "
+            "diagnostics without triggering provider failure handling."
+        ),
+        reviewer="OpenAI Codex",
+    )
+
+    assert (
+        _failure_category(
+            text,
+            public_response=True,
+            repair_expected_kind="pr_review",
+        )
+        == "deterministic"
+    )
+
+
 @pytest.mark.parametrize(
     "text",
     [

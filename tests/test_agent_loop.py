@@ -28,7 +28,7 @@ from coding_review_agent_loop.config import (
     default_cache_root,
     resolve_base_branch,
 )
-from coding_review_agent_loop.errors import QuotaResetExceededError
+from coding_review_agent_loop.errors import AgentInvocationError, QuotaResetExceededError
 from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
@@ -61,6 +61,7 @@ from coding_review_agent_loop.protocol import (
     validate_structured_coder_followup,
     validate_structured_plan_revision,
 )
+from coding_review_agent_loop.salvage import SalvageContext
 from agent_loop_helpers import (
     FakeRunner,
     command_index,
@@ -176,6 +177,50 @@ def test_genuine_auth_and_billing_terms_remain_non_retryable(text):
         f"NON_RETRYABLE_AGENT_OUTPUT_RE did not match: {text!r}"
     )
     assert _failure_category(text) == "non-retryable"
+
+
+def test_codex_chatgpt_unsupported_model_payload_classifies_separately():
+    text = json.dumps(
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "message": (
+                    "The 'gpt-5.5-pro' model is not supported when using "
+                    "Codex with a ChatGPT account."
+                ),
+            }
+        }
+    )
+
+    assert _failure_category(text) == "unsupported_model"
+    assert (
+        _failure_category(
+            text,
+            public_response=True,
+            repair_expected_kind="pr_review",
+        )
+        == "unsupported_model"
+    )
+
+
+def test_generic_provider_unsupported_model_payload_classifies_separately():
+    text = json.dumps(
+        {
+            "error": {
+                "code": "unsupported_model",
+                "message": "Unsupported model 'provider-ultra' for this provider auth mode.",
+            }
+        }
+    )
+
+    assert _failure_category(text) == "unsupported_model"
+
+
+def test_capacity_model_availability_remains_transient():
+    assert (
+        _failure_category("No capacity available for model gemini-3-pro-preview.")
+        == "transient"
+    )
 
 
 def test_plan_review_does_not_post_diagnostics_without_plan_state(tmp_path):
@@ -351,6 +396,83 @@ def test_diagnostic_shaped_public_response_remains_transient(tmp_path):
     repair_mock.assert_not_called()
     assert "Failure category: transient" in str(exc_info.value)
     assert "Suggestion:" in str(exc_info.value)
+
+
+def test_codex_chatgpt_unsupported_model_public_response_skips_retry_repair_and_salvages(tmp_path):
+    error_payload = json.dumps(
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "message": (
+                    "The 'gpt-5.5-pro' model is not supported when using "
+                    "Codex with a ChatGPT account."
+                ),
+            }
+        }
+    )
+    runner = FakeRunner(
+        codex_outputs=[{"stdout": error_payload, "public_response": "", "returncode": 0}],
+        public_response_outputs=[{"text": error_payload}],
+        git_diff=(
+            "diff --git a/src/coding_review_agent_loop/cli.py "
+            "b/src/coding_review_agent_loop/cli.py\n"
+            "--- a/src/coding_review_agent_loop/cli.py\n"
+            "+++ b/src/coding_review_agent_loop/cli.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        ),
+        git_status=" M src/coding_review_agent_loop/cli.py\n",
+    )
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="codex",
+        codex_model="gpt-5.5-pro",
+        agent_max_retries=2,
+    )
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+        with pytest.raises(AgentInvocationError) as exc_info:
+            _run_validated_agent(
+                runner,
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=lambda text: _validate_review_response(
+                    text,
+                    reviewer="OpenAI Codex",
+                    unresolved_items=(),
+                ),
+                use_repair=True,
+                repair_expected_kind="pr_review",
+                role="reviewer",
+                salvage_context=SalvageContext(
+                    repo=config.repo,
+                    issue_number=480,
+                    scope="unsupported-model-test",
+                    agent="codex",
+                    run_id="run-480",
+                ),
+            )
+
+    message = str(exc_info.value)
+    assert exc_info.value.failure_category == "unsupported_model"
+    repair_mock.assert_not_called()
+    assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
+    assert (
+        "Codex reviewer failed because requested model `gpt-5.5-pro` is not "
+        "supported when using Codex with a ChatGPT account."
+    ) in message
+    assert "Failure category: unsupported_model" in message
+    assert "--codex-model gpt-5.5" in message
+    assert "fix the underlying issue" not in message
+    assert "may require a code fix" not in message
+    metadata_paths = list((config.log_dir / "salvage").glob("**/metadata.json"))
+    assert len(metadata_paths) == 1
+    metadata = json.loads(metadata_paths[0].read_text(encoding="utf-8"))
+    assert metadata["failure_category"] == "unsupported_model"
 
 
 def test_public_response_error_payload_remains_transient():
@@ -684,6 +806,58 @@ def test_gemini_pre_marker_429_malformed_public_response_fails_deterministically
     message = str(exc_info.value)
     assert "Failure category: deterministic" in message
     assert "Failure category: transient" not in message
+
+
+def test_malformed_structured_review_model_support_terms_still_runs_repair(tmp_path):
+    malformed_review = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "pr_review",
+                "state": "approved",
+                "summary": (
+                    "The review discusses unsupported model and model availability "
+                    "diagnostics as domain text."
+                ),
+                "blocking_items": [],
+                "same_pr_followups": "not-a-list",
+                "future_followups": [],
+                "prior_item_dispositions": [],
+            }
+        )
+        + "\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"
+    )
+    repaired_review = structured_pr_review(
+        state="approved",
+        summary="Review passed after repair.",
+        reviewer="Google Gemini",
+    )
+    runner = FakeRunner(gemini_outputs=[malformed_review])
+    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired_review) as repair_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="gemini",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_review_response(
+                text,
+                reviewer="Google Gemini",
+                unresolved_items=(),
+            ),
+            use_repair=True,
+            repair_expected_kind="pr_review",
+        )
+
+    assert response.text == repaired_review
+    repair_mock.assert_called_once_with(
+        malformed_review,
+        config.gemini_cmd,
+        expected_kind="pr_review",
+    )
+    assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
 
 
 @pytest.mark.parametrize("text,expected_secs", [
@@ -3704,4 +3878,3 @@ def test_format_invalid_agent_response_error_no_suggestion_empty_response():
         category="empty-response",
     )
     assert "Suggestion:" not in msg
-

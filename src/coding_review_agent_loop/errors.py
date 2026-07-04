@@ -31,9 +31,10 @@ class UnknownPriorItemDispositionError(AgentLoopError):
 class AgentInvocationError(AgentLoopError):
     """Raised when an agent invocation fails after retries/repair.
 
-    Carries the failure category (`transient`, `non-retryable`, `deterministic`,
-    `timeout`, ...) so callers such as the discuss debater failure policy can
-    surface it in summaries and metadata without re-parsing the message.
+    Carries the failure category (`transient`, `non-retryable`,
+    `unsupported_model`, `deterministic`, `timeout`, ...) so callers such as
+    the discuss debater failure policy can surface it in summaries and metadata
+    without re-parsing the message.
     """
 
     def __init__(self, message: str, *, failure_category: str | None = None) -> None:
