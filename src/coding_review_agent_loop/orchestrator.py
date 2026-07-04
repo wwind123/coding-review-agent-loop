@@ -148,7 +148,6 @@ from .salvage import (
     SalvageArtifacts,
     SalvageContext,
     capture_salvage_artifacts,
-    format_salvage_artifacts_for_error,
     latest_salvage_summary,
 )
 from .transient import (
@@ -322,6 +321,8 @@ MODEL_PARENTHESES_SUFFIX_RE = re.compile(r"\s+\([^)]*\)\s*$")
 FAILURE_CLASSIFICATION_TEXT_LIMIT = 12000
 ISSUE_IMPLEMENTATION_SALVAGE_SCOPE = "issue-implementation"
 APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE = "approved-plan-implementation"
+TASK_IMPLEMENTATION_SALVAGE_SCOPE = "task-implementation"
+PR_FOLLOWUP_SALVAGE_SCOPE = "pr-followup"
 
 # Threshold above which a rate-limit reset time causes an immediate exit
 # rather than a silent wait (5 minutes).
@@ -1308,20 +1309,64 @@ def _compact_failure_reason(reason: str, classification_text: str) -> str:
     return f"{reason}; diagnostic:\n{detail}"
 
 
-def _capture_failed_run_salvage(
+@dataclass(frozen=True)
+class _PatchSalvageDiagnostic:
+    artifacts: SalvageArtifacts | None
+    line: str
+
+
+@dataclass(frozen=True)
+class _FailedRunDiagnostics:
+    patch_salvage: _PatchSalvageDiagnostic
+    response_line: str
+
+    def format_for_error(self) -> str:
+        return f"\n{self.patch_salvage.line}\n{self.response_line}"
+
+
+def _best_effort_failed_run_status(
+    runner: Runner,
+    config: AgentLoopConfig,
+) -> str | None:
+    try:
+        result = runner.run(
+            ("git", "status", "--short"),
+            cwd=active_workdir(config),
+            check=False,
+        )
+    except (AgentLoopError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _status_is_untracked_only(status_text: str | None) -> bool:
+    lines = [line for line in (status_text or "").splitlines() if line.strip()]
+    return bool(lines) and all(line.startswith("?? ") for line in lines)
+
+
+def _capture_failed_run_salvage_diagnostic(
     *,
     runner: Runner,
     config: AgentLoopConfig,
     agent_name: str,
     salvage_context: SalvageContext | None,
+    operation_description: str,
     failure_category: str,
     failure_reason: str,
     classification_text: str,
     marker_description: str,
     result: AgentResult | None,
-) -> SalvageArtifacts | None:
+) -> _PatchSalvageDiagnostic:
     if salvage_context is None:
-        return None
+        return _PatchSalvageDiagnostic(
+            artifacts=None,
+            line=(
+                "No implementation salvage was attempted because this was "
+                f"{operation_description}, not a mutating implementation attempt."
+            ),
+        )
     try:
         artifacts = capture_salvage_artifacts(
             runner,
@@ -1338,10 +1383,186 @@ def _capture_failed_run_salvage(
             config,
             f"{agent_name}: salvage capture failed ({exc}); preserving original agent failure",
         )
-        return None
+        return _PatchSalvageDiagnostic(
+            artifacts=None,
+            line=(
+                "Implementation salvage was attempted for "
+                f"{operation_description}, but capture failed ({exc}); "
+                "preserving the original agent failure."
+            ),
+        )
     if artifacts is not None:
         log(config, f"{agent_name}: salvage artifacts written to {artifacts.directory}")
-    return artifacts
+        return _PatchSalvageDiagnostic(
+            artifacts=artifacts,
+            line=(
+                "Implementation salvage artifacts were written to "
+                f"{artifacts.summary_path}; patch: {artifacts.patch_path}."
+            ),
+        )
+
+    status_text = _best_effort_failed_run_status(runner, config)
+    if _status_is_untracked_only(status_text):
+        line = (
+            "Implementation salvage was attempted for "
+            f"{operation_description}, but only untracked files were present; "
+            "no tracked/staged `git diff HEAD --binary` existed, so no patch "
+            "artifacts were created."
+        )
+    else:
+        line = (
+            "Implementation salvage was attempted for "
+            f"{operation_description}, but no tracked/staged "
+            "`git diff HEAD --binary` existed, so no patch artifacts were created."
+        )
+    return _PatchSalvageDiagnostic(artifacts=None, line=line)
+
+
+def _operation_description_from_context(
+    *,
+    salvage_context: SalvageContext | None,
+    repair_expected_kind: str | None,
+    role: str | None,
+    label: str | None,
+    marker_description: str,
+) -> str:
+    if salvage_context is not None:
+        if salvage_context.scope == ISSUE_IMPLEMENTATION_SALVAGE_SCOPE:
+            return "issue implementation"
+        if salvage_context.scope == APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE:
+            return "approved-plan implementation"
+        if salvage_context.scope == TASK_IMPLEMENTATION_SALVAGE_SCOPE:
+            return "task implementation"
+        if salvage_context.scope == PR_FOLLOWUP_SALVAGE_SCOPE:
+            return "PR feedback follow-up"
+        return salvage_context.scope.replace("-", " ")
+    if repair_expected_kind == "plan_review":
+        return "plan review"
+    if repair_expected_kind == "plan_revision":
+        return "plan revision"
+    if repair_expected_kind == "pr_review":
+        return "PR review"
+    if repair_expected_kind == "coder_followup":
+        return "structured PR feedback follow-up repair"
+    if repair_expected_kind == "discuss_review":
+        return "discuss review"
+    if repair_expected_kind == "discuss_agenda":
+        return "discuss analyzer"
+    if label and label.startswith("discuss-analyzer"):
+        return "discuss analyzer"
+    if label and label.startswith("discuss-r"):
+        return "discuss review"
+    if marker_description == "plan decomposition JSON":
+        return "plan decomposition"
+    if "AGENT_PR" in marker_description:
+        return "implementation"
+    if "AGENT_PLAN_STATE" in marker_description and "CLARIFY" in marker_description:
+        return "planning"
+    if role == "reviewer":
+        return "review"
+    return "agent operation"
+
+
+def _failed_response_recording_reason(
+    *,
+    result: AgentResult | None,
+    failure_reason: str,
+    classification_text: str,
+) -> str:
+    if result is None:
+        return "the agent run failed before a response path was available"
+    if result.returncode is None:
+        return "the agent command timed out"
+    if result.returncode != 0:
+        combined = f"{failure_reason}\n{classification_text}\n{result.raw_output}\n{result.text}"
+        if _QUOTA_RATE_LIMIT_RE.search(combined):
+            return "the agent command exited with quota/session-limit status"
+        return f"the agent command exited with failing status {result.returncode}"
+    if not result.text.strip():
+        return "the agent response was empty"
+    return f"the public response failed validation ({failure_reason})"
+
+
+def _public_response_file_diagnostic(
+    *,
+    result: AgentResult | None,
+    failure_reason: str,
+    classification_text: str,
+) -> str:
+    reason = _failed_response_recording_reason(
+        result=result,
+        failure_reason=failure_reason,
+        classification_text=classification_text,
+    )
+    if result is None:
+        return (
+            "No public response file was produced (response path unavailable); "
+            f"no result was recorded because {reason}."
+        )
+
+    response_path = result.response_file_path
+    response_file_text = result.response_file_text
+    if response_file_text is None and response_path is not None:
+        try:
+            response_file_text = response_path.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            response_file_text = None
+
+    if response_file_text:
+        if response_path is None:
+            return (
+                "A public response was present, but its file path is unavailable; "
+                f"no result was recorded because {reason}."
+            )
+        return (
+            f"A public response file exists at {response_path}, but no result was "
+            f"recorded because {reason}."
+        )
+    if response_path is not None:
+        return (
+            f"No non-empty public response file was produced at expected path "
+            f"{response_path}; no result was recorded because {reason}."
+        )
+    return (
+        "No public response file was produced (response path unavailable); "
+        f"no result was recorded because {reason}."
+    )
+
+
+def _failed_run_diagnostics(
+    *,
+    runner: Runner,
+    config: AgentLoopConfig,
+    agent_name: str,
+    salvage_context: SalvageContext | None,
+    operation_description: str,
+    failure_category: str,
+    failure_reason: str,
+    classification_text: str,
+    marker_description: str,
+    result: AgentResult | None,
+) -> _FailedRunDiagnostics:
+    patch_salvage = _capture_failed_run_salvage_diagnostic(
+        runner=runner,
+        config=config,
+        agent_name=agent_name,
+        salvage_context=salvage_context,
+        operation_description=operation_description,
+        failure_category=failure_category,
+        failure_reason=failure_reason,
+        classification_text=classification_text,
+        marker_description=marker_description,
+        result=result,
+    )
+    response_line = _public_response_file_diagnostic(
+        result=result,
+        failure_reason=failure_reason,
+        classification_text=classification_text,
+    )
+    return _FailedRunDiagnostics(
+        patch_salvage=patch_salvage,
+        response_line=response_line,
+    )
 
 
 def _agent_failure_classification_text(
@@ -1464,8 +1685,16 @@ def _run_validated_agent(
     label: str | None = None,
     timeout_seconds: float | None = None,
     salvage_context: SalvageContext | None = None,
+    operation_description: str | None = None,
 ) -> ValidatedAgentResponse:
     agent_name = agent_display_name(agent)
+    operation_description = operation_description or _operation_description_from_context(
+        salvage_context=salvage_context,
+        repair_expected_kind=repair_expected_kind,
+        role=role,
+        label=label,
+        marker_description=marker_description,
+    )
     log_paths: list[object] = []
     max_attempts = config.agent_max_retries + 1
     last_error = f"{agent_name} produced no output."
@@ -1928,19 +2157,19 @@ def _run_validated_agent(
                         f"{agent_name} quota exhausted. Reset in {duration_str} (at {at_str}). "
                         "Rerun when quota resets, or switch to a different API key / model."
                     )
-                    artifacts = _capture_failed_run_salvage(
+                    diagnostics = _failed_run_diagnostics(
                         runner=runner,
                         config=config,
                         agent_name=agent_name,
                         salvage_context=salvage_context,
+                        operation_description=operation_description,
                         failure_category=last_failure_category,
                         failure_reason=message,
                         classification_text=classification_text,
                         marker_description=marker_description,
                         result=last_result,
                     )
-                    if artifacts is not None:
-                        message += format_salvage_artifacts_for_error(artifacts)
+                    message += diagnostics.format_for_error()
                     raise QuotaResetExceededError(message)
             if attempt < max_attempts:
                 delay = _retry_delay(config, attempt)
@@ -1954,11 +2183,12 @@ def _run_validated_agent(
                 continue
         break
 
-    artifacts = _capture_failed_run_salvage(
+    diagnostics = _failed_run_diagnostics(
         runner=runner,
         config=config,
         agent_name=agent_name,
         salvage_context=salvage_context,
+        operation_description=operation_description,
         failure_category=last_failure_category,
         failure_reason=last_error,
         classification_text=last_classification_text,
@@ -1977,8 +2207,7 @@ def _run_validated_agent(
         role=role,
         classification_text=last_classification_text,
     )
-    if artifacts is not None:
-        message += format_salvage_artifacts_for_error(artifacts)
+    message += diagnostics.format_for_error()
     raise AgentInvocationError(message, failure_category=last_failure_category)
 
 
@@ -2448,6 +2677,7 @@ def _implement_approved_issue(
             run_id=usage_context.run_id,
             approved_plan_hash=plan_hash,
         ),
+        operation_description="approved-plan implementation",
     )
     coder_output = coder_response.text
     validate_response_tests_within_workdir(coder_output, assigned_workdir=active_workdir(config))
@@ -2560,6 +2790,7 @@ def _decompose_approved_plan(
         marker_description="plan decomposition JSON",
         validate=parse_plan_decomposition,
         usage_context=usage_context,
+        operation_description="plan decomposition",
     )
     decomposition = decomposition_response.marker_value
     created = create_decomposition_child_issues(
@@ -2614,6 +2845,7 @@ def _run_plan_first_loop(
                 full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
             ),
             usage_context=usage_context,
+            operation_description="planning",
         )
         plan_output = plan_response.text
         coder_session_id = plan_response.session_id
@@ -2769,6 +3001,7 @@ def _run_plan_first_loop(
                     repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
                     ledger_incomplete=round_ledger_incomplete,
                     role="reviewer",
+                    operation_description="plan review",
                 )
                 review_output = review_response.text
                 review_model_used = review_response.model_used
@@ -3320,6 +3553,7 @@ def _run_plan_first_loop(
             ),
             repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
             ledger_incomplete=round_ledger_incomplete,
+            operation_description="plan revision",
         )
         canonical_plan: str | None = None
         public_comment = plan_response.text
@@ -3437,6 +3671,7 @@ def run_issue_loop(
                 agent=config.coder,
                 run_id=usage_context.run_id,
             ),
+            operation_description="issue implementation",
         )
         coder_output = coder_response.text
         coder_session_id = coder_response.session_id
@@ -3547,6 +3782,14 @@ def run_task_loop(
                 marker_description="<!-- AGENT_PR: <number> -->, PR URL, or <!-- AGENT_CLARIFY -->",
                 validate=_require_pr_number_or_clarification,
                 usage_context=usage_context,
+                salvage_context=SalvageContext(
+                    repo=config.repo,
+                    issue_number=None,
+                    scope=TASK_IMPLEMENTATION_SALVAGE_SCOPE,
+                    agent=config.coder,
+                    run_id=usage_context.run_id,
+                ),
+                operation_description="task implementation",
             )
             coder_output = coder_response.text
             session_id = coder_response.session_id
@@ -3833,6 +4076,7 @@ def run_pr_loop(
                         repair_allowed_prior_item_ids=tuple(item.item_id for item in prior_unresolved_items),
                         ledger_incomplete=round_ledger_incomplete,
                         role="reviewer",
+                        operation_description="PR review",
                     )
                     review_output = review_response.text
                     review_model_used = review_response.model_used
@@ -4333,6 +4577,14 @@ def run_pr_loop(
                 repair_expected_kind="coder_followup",
                 repair_unresolved_item_ids=repair_unresolved_item_ids,
                 repair_surfaced_requirement_ids=coder_human_requirements_context.surfaced_requirement_ids,
+                salvage_context=SalvageContext(
+                    repo=config.repo,
+                    issue_number=None if issue_context is None else issue_context.number,
+                    scope=PR_FOLLOWUP_SALVAGE_SCOPE,
+                    agent=config.coder,
+                    run_id=usage_context.run_id,
+                ),
+                operation_description="PR feedback follow-up",
             )
             coder_output = coder_response.text
             coder_session_id = coder_response.session_id
@@ -4621,6 +4873,7 @@ def _run_discuss_analyzer(
             repair_expected_kind="discuss_agenda",
             role="reviewer",
             label=f"discuss-analyzer-r{round_number}",
+            operation_description="discuss analyzer",
         )
     except QuotaResetExceededError:
         raise
@@ -4723,6 +4976,7 @@ def _run_discuss_debater_turn(
         role="reviewer",
         label=f"discuss-r{round_number}",
         timeout_seconds=config.discuss_debater_timeout,
+        operation_description="discuss review",
     )
 
 

@@ -2079,9 +2079,13 @@ def test_failed_issue_implementation_with_diff_writes_salvage_artifacts(tmp_path
     with pytest.raises(QuotaResetExceededError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config)
 
-    assert "Salvage artifacts:" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "Implementation salvage artifacts were written to" in message
+    assert "patch:" in message
+    assert "No non-empty public response file was produced at expected path" in message
+    assert "no result was recorded because the agent command exited with quota/session-limit status" in message
     salvage_dir = _salvage_dirs(config)[0]
-    assert str(salvage_dir) in str(excinfo.value)
+    assert str(salvage_dir / "salvage-summary.md") in message
     assert (salvage_dir / "partial.patch").read_text(encoding="utf-8") == patch_text
     assert "?? scratch-note.md" in (salvage_dir / "changed-files.txt").read_text(
         encoding="utf-8"
@@ -2124,9 +2128,12 @@ def test_failed_issue_implementation_salvage_oserror_preserves_original_failure(
     with pytest.raises(QuotaResetExceededError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config)
 
-    assert "quota exhausted" in str(excinfo.value)
-    assert "Rerun when quota resets" in str(excinfo.value)
-    assert "simulated disk full" not in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "quota exhausted" in message
+    assert "Rerun when quota resets" in message
+    assert "Implementation salvage was attempted for issue implementation" in message
+    assert "capture failed (simulated disk full)" in message
+    assert "preserving the original agent failure" in message
     assert _salvage_dirs(config) == []
     assert "salvage capture failed (simulated disk full)" in capsys.readouterr().err
 
@@ -2139,10 +2146,85 @@ def test_failed_issue_implementation_without_diff_writes_no_salvage_patch(tmp_pa
     )
     config = make_config(tmp_path, agent_max_retries=0)
 
-    with pytest.raises(AgentLoopError):
+    with pytest.raises(AgentLoopError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config)
 
+    message = str(excinfo.value)
+    assert "Implementation salvage was attempted for issue implementation" in message
+    assert "no tracked/staged `git diff HEAD --binary` existed" in message
+    assert "no patch artifacts were created" in message
     assert _salvage_dirs(config) == []
+
+
+def test_failed_issue_implementation_with_untracked_only_diff_reports_untracked_only(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=["Created local notes but forgot the required marker."],
+        post_agent_git_status="?? scratch-note.md\n",
+        post_agent_git_diff="",
+    )
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(excinfo.value)
+    assert "only untracked files were present" in message
+    assert "no tracked/staged `git diff HEAD --binary` existed" in message
+    assert _salvage_dirs(config) == []
+
+
+def test_plan_revision_quota_failure_reports_response_file_without_recording(tmp_path):
+    valid_revision = structured_plan_revision(
+        summary="Revised plan with a regression test.",
+        prior_plan_item_dispositions=[
+            {"item_id": "item-1", "disposition": "resolved", "note": "Added the test step."}
+        ],
+        plan_steps=["Add the regression test.", "Run the focused suite."],
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            ("quota exceeded; reset in 10m", 1),
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                summary="Missing a regression test.",
+                blocking_plan_issues=["Missing a regression test."],
+            )
+        ],
+        public_response_outputs=["", "", valid_revision],
+    )
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(QuotaResetExceededError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    message = str(excinfo.value)
+    assert "No implementation salvage was attempted because this was plan revision" in message
+    assert "not a mutating implementation attempt" in message
+    assert "A public response file exists at" in message
+    assert "no result was recorded because the agent command exited with quota/session-limit status" in message
+    assert "Revised plan with a regression test" not in "".join(runner.comments)
+
+
+def test_plan_review_failure_without_response_file_reports_non_mutating_skip(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[
+            "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["Plan review without the required structured response."],
+    )
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    message = str(excinfo.value)
+    assert "No implementation salvage was attempted because this was plan review" in message
+    assert "not a mutating implementation attempt" in message
+    assert "No non-empty public response file was produced at expected path" in message
+    assert "no result was recorded because the public response failed validation" in message
 
 
 def _write_salvage_summary(

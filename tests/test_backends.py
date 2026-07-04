@@ -404,6 +404,8 @@ def test_claude_backend_prefers_response_file_over_message_text(tmp_path):
     result = CLAUDE_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
 
     assert result.response_file_text == "response file text"
+    assert result.response_file_path is not None
+    assert result.response_file_path.read_text(encoding="utf-8").strip() == "response file text"
     assert result.message_text == "stdout message text"
     assert result.text == "response file text"
     assert result.session_id == "claude-session-1"
@@ -426,6 +428,8 @@ def test_gemini_backend_prefers_response_file_over_message_text(tmp_path):
     result = GEMINI_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
 
     assert result.response_file_text == "response file text"
+    assert result.response_file_path is not None
+    assert result.response_file_path.read_text(encoding="utf-8").strip() == "response file text"
     assert result.message_text == "stdout message text"
     assert result.text == "response file text"
     assert result.session_id == "gemini-session-1"
@@ -462,6 +466,8 @@ def test_codex_backend_prefers_response_file_over_last_message_and_stdout(tmp_pa
     result = CODEX_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
 
     assert result.response_file_text == "response file text"
+    assert result.response_file_path is not None
+    assert result.response_file_path.read_text(encoding="utf-8").strip() == "response file text"
     assert result.message_text == "last message text"
     assert result.text == "response file text"
     assert result.usage is not None
@@ -741,5 +747,4 @@ def test_codex_backend_invalid_rollout_falls_back_to_declared_model(tmp_path, mo
     result = CODEX_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
 
     assert result.model_used == "gpt-5.4"
-
 

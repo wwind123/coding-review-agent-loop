@@ -140,6 +140,7 @@ class ClaudeBackend:
             raw_output=result.stdout,
             text_source="response_file" if response_file_text is not None else "stdout",
             response_file_text=response_file_text,
+            response_file_path=response_path,
             message_text=message_text,
             session_id=new_session_id,
             log_path=log_path,

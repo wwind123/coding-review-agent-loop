@@ -354,6 +354,7 @@ class AntigravityBackend:
                 raw_output=result.stdout,
                 text_source=text_source,
                 response_file_text=response_file_text,
+                response_file_path=response_path,
                 message_text=message_text,
                 session_id=None,
                 log_path=log_path,

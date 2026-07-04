@@ -26,6 +26,8 @@ def test_antigravity_backend_command_and_prefers_response_file(tmp_path):
     assert cmd[-2] == "--print"
     assert "Review this PR." in cmd[-1]
     assert result.text == "response file text"
+    assert result.response_file_path is not None
+    assert result.response_file_path.read_text(encoding="utf-8").strip() == "response file text"
     assert result.session_id is None  # agy --print exposes no conversation id
 
 def test_antigravity_backend_stdout_fallback(tmp_path):

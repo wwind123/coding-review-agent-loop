@@ -29,6 +29,7 @@ class AgentResult:
     raw_output: str = ""
     text_source: AgentTextSource = "stdout"
     response_file_text: str | None = None
+    response_file_path: Path | None = None
     message_text: str | None = None
     session_id: str | None = None
     log_path: Path | None = None
