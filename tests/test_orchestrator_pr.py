@@ -840,14 +840,17 @@ def test_pr_loop_keeps_blocking_review_when_mixed_with_real_finding(tmp_path):
             structured_pr_review(
                 state="approved",
                 summary="Codex final approval.",
-                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
             ),
         ],
         claude_outputs=[
             structured_coder_followup(
                 state="blocking",
                 summary="Added the missing null check.",
-                addressed_items=["item-1"],
+                addressed_items=["item-1", "item-2"],
                 remaining_items=[],
             ),
         ],
@@ -863,6 +866,7 @@ def test_pr_loop_keeps_blocking_review_when_mixed_with_real_finding(tmp_path):
     assert review_comment.startswith("**Review verdict:** Blocking")
     followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
     assert "Missing null check in models.py" in followup_prompt
+    assert "GitHub check `test` is still pending/in_progress." in followup_prompt
 
 def test_pr_loop_stops_gracefully_when_github_checks_pending_without_auto_merge(tmp_path, capsys):
     runner = FakeRunner(
@@ -1098,13 +1102,13 @@ def test_pr_loop_keeps_blocking_review_when_future_followups_are_misclassified(t
             "<!-- AGENT_STATE: blocking -->\n"
             "-- Google Gemini",
             "LGTM."
-            + prior_item_dispositions("[item-1] resolved", "[item-2] resolved")
+            + prior_item_dispositions("[item-1] resolved")
             + "\n<!-- AGENT_STATE: approved -->\n-- Google Gemini",
         ],
         codex_outputs=[
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
             "LGTM."
-            + prior_item_dispositions("[item-1] resolved", "[item-2] resolved")
+            + prior_item_dispositions("[item-1] resolved")
             + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         claude_outputs=["Fixed review.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
@@ -1119,10 +1123,17 @@ def test_pr_loop_keeps_blocking_review_when_future_followups_are_misclassified(t
 
     assert runner.comments[0].startswith("**Review verdict:** Blocking\n\nStill blocked.")
     assert "Consider a broader cleanup later." not in runner.comments[0]
+    # Only the same-PR item ("Tighten the reset helper.") is tracked -- the
+    # blocking summary prose ("Still blocked.") is never itemized when a
+    # same_pr_followups entry already represents the actionable concern, so
+    # this routes through the lean same-PR-only coder prompt.
     followup_prompt = next(
-        cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"] and "Address the review below" in cmd[-1]
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] and "Tighten the reset helper." in cmd[-1]
     )
-    assert "Still blocked." in followup_prompt
+    assert "Address the follow-up items below" in followup_prompt
+    assert "Still blocked." not in followup_prompt
 
 def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
     runner = FakeRunner(
@@ -2136,7 +2147,9 @@ def test_pr_loop_posts_human_readable_item_labels_in_new_and_prior_sections(tmp_
         "-- OpenAI Codex"
     )
 
-def test_pr_loop_tracks_only_summary_when_blocking_items_phrase_the_issue_differently(tmp_path):
+def test_pr_loop_tracks_blocking_items_text_not_summary_when_they_differ(tmp_path):
+    """The tracked unresolved item must use the blocking_items bullet text, not the
+    summary prose, so summary is never itemized when blocking_items is populated."""
     runner = FakeRunner(
         claude_outputs=["Implemented fixes.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
         codex_outputs=[
@@ -2153,8 +2166,8 @@ def test_pr_loop_tracks_only_summary_when_blocking_items_phrase_the_issue_differ
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     second_coder_prompt = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]][0]
-    assert "Needs one more regression test before merge." in second_coder_prompt
-    assert "Add the mixed-history resume case" not in second_coder_prompt
+    assert "Add the mixed-history resume case to `tests/test_agent_loop.py`." in second_coder_prompt
+    assert "Needs one more regression test before merge." not in second_coder_prompt
     assert runner.comments[0] == (
         "**Review verdict:** Blocking\n\n"
         "Needs one more regression test before merge.\n\n"
@@ -2162,6 +2175,135 @@ def test_pr_loop_tracks_only_summary_when_blocking_items_phrase_the_issue_differ
         "- Add the mixed-history resume case to `tests/test_agent_loop.py`.\n"
         "<!-- AGENT_STATE: blocking -->\n"
         "-- OpenAI Codex"
+    )
+    second_review_prompt = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]][1]
+    assert "[item-1]" in second_review_prompt
+    assert "Add the mixed-history resume case to `tests/test_agent_loop.py`." in second_review_prompt
+
+def test_pr_loop_same_pr_only_review_does_not_duplicate_summary_as_blocking_item(tmp_path):
+    """Regression test for issue #501 / llm-dialectic PR #257: a blocking review whose
+    summary prose restates the same concern as its lone same_pr_followups entry must
+    produce exactly one tracked item (the same-PR follow-up), not a second,
+    summary-derived blocking item."""
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="The PR is docs-only; the new audit doc contains stale path references.",
+                same_pr_followups=[
+                    "Update docs/SECURITY_FINDINGS.md references to docs/audit/SECURITY_FINDINGS.md."
+                ],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Stale references fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking",
+                summary="Updated the stale path references.",
+                addressed_items=["item-1"],
+                remaining_items=[],
+            ),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        reviewer="codex",
+        max_rounds=2,
+        approved_followups="fix-and-summarize",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert (
+        "Update docs/SECURITY_FINDINGS.md references to docs/audit/SECURITY_FINDINGS.md."
+        in followup_prompt
+    )
+    assert "The PR is docs-only" not in followup_prompt
+    # Routed through the lean same-PR-only prompt, confirming no separate blocking
+    # item was created alongside the same-PR item.
+    assert "Address the follow-up items below" in followup_prompt
+
+def test_pr_loop_creates_one_tracked_item_per_blocking_items_entry(tmp_path):
+    """Each blocking_items entry gets its own tracked item; the summary is never
+    itemized when blocking_items is populated."""
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Two separate problems found.",
+                blocking_items=[
+                    "Fix the null pointer dereference in parser.py.",
+                    "Add missing docstring to the public API.",
+                ],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Both issues fixed.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking",
+                summary="Fixed both issues.",
+                addressed_items=["item-1", "item-2"],
+                remaining_items=[],
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "[item-1]" in followup_prompt
+    assert "[item-2]" in followup_prompt
+    assert "Fix the null pointer dereference in parser.py." in followup_prompt
+    assert "Add missing docstring to the public API." in followup_prompt
+    assert "Two separate problems found." not in followup_prompt
+
+def test_pr_loop_falls_back_to_summary_item_when_no_structured_fields_present(tmp_path):
+    """When a blocking review has neither blocking_items nor same_pr_followups, the
+    summary must still become the tracked item so a genuine blocking verdict is not
+    silently dropped from the ledger."""
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="I have concerns about this approach but cannot pinpoint a specific line.",
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Satisfied after discussion.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking",
+                summary="Clarified the approach.",
+                addressed_items=["item-1"],
+                remaining_items=[],
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert (
+        "I have concerns about this approach but cannot pinpoint a specific line."
+        in followup_prompt
     )
 
 def test_resume_pr_round_reparses_orchestrator_rendered_blocking_issues_comment():

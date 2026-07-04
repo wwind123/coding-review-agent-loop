@@ -264,8 +264,17 @@ def _validate_structured_coder_followup_items(
     *,
     unresolved_items: Sequence[UnresolvedReviewItem],
 ) -> None:
-    expected_ids = [
+    allowed_ids = [
         item.item_id for item in unresolved_items if item.item_id != HUMAN_REQUIREMENTS_ACK_ITEM_ID
+    ]
+    # Future follow-ups are informational carry-forwards, not actionable this round --
+    # they are not shown in the same-PR-only follow-up prompt, so the coder cannot
+    # always classify them into addressed/remaining/disputed. Allow (but do not
+    # require) referencing them when they are shown in the general prompt.
+    required_ids = [
+        item.item_id
+        for item in unresolved_items
+        if item.item_id != HUMAN_REQUIREMENTS_ACK_ITEM_ID and item.status != "future"
     ]
     listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
     duplicates = sorted({item_id for item_id in listed_ids if listed_ids.count(item_id) > 1})
@@ -274,13 +283,13 @@ def _validate_structured_coder_followup_items(
             "Coder follow-up listed unresolved reviewer item IDs more than once: "
             + ", ".join(duplicates)
         )
-    unknown = sorted(set(listed_ids) - set(expected_ids))
+    unknown = sorted(set(listed_ids) - set(allowed_ids))
     if unknown:
         raise AgentLoopError(
             "Coder follow-up referenced unknown unresolved reviewer item IDs: "
             + ", ".join(unknown)
         )
-    missing = sorted(set(expected_ids) - set(listed_ids))
+    missing = sorted(set(required_ids) - set(listed_ids))
     if missing:
         raise AgentLoopError(
             "Coder follow-up did not classify all unresolved reviewer items into "

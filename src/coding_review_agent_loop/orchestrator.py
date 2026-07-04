@@ -2365,7 +2365,8 @@ def _describe_pr_review_outcome(parsed_review: ParsedReview, *, has_blocking_sum
     if parsed_review.state == "approved":
         return "approved"
     has_same_pr = bool(parsed_review.followups.same_pr)
-    if has_blocking_summary and has_same_pr:
+    has_blocking_findings = bool(parsed_review.blocking_items) or has_blocking_summary
+    if has_blocking_findings and has_same_pr:
         return "blocking with blocking findings and same-PR follow-ups"
     if has_same_pr:
         return "blocking with same-PR follow-ups"
@@ -4110,7 +4111,10 @@ def run_pr_loop(
                         reviewer_name=reviewer_name,
                     )
                 blocking_summary = parsed_review.summary
-                has_blocking_summary = _should_record_new_blocking_item(
+                has_structured_blocking_content = bool(
+                    parsed_review.blocking_items or parsed_review.followups.same_pr
+                )
+                has_blocking_summary = not has_structured_blocking_content and _should_record_new_blocking_item(
                     blocking_summary,
                     had_prior_items=bool(prior_unresolved_items),
                     had_dispositions=bool(parsed_review.dispositions),
@@ -4122,7 +4126,19 @@ def run_pr_loop(
                 )
                 if review_state == "blocking":
                     if resumed_record is None:
-                        if has_blocking_summary:
+                        if parsed_review.blocking_items:
+                            for blocking_item in parsed_review.blocking_items:
+                                tracked_item = _next_unresolved_item(
+                                    item_number=next_unresolved_item_number,
+                                    reviewer=blocking_item.reviewer,
+                                    source_round=round_number,
+                                    text=blocking_item.text,
+                                    status="blocking",
+                                )
+                                round_new_unresolved_items.append(tracked_item)
+                                reviewer_new_unresolved_items.append(tracked_item)
+                                next_unresolved_item_number += 1
+                        elif has_blocking_summary:
                             tracked_item = _next_unresolved_item(
                                 item_number=next_unresolved_item_number,
                                 reviewer=reviewer_name,
