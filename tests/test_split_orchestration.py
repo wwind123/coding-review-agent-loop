@@ -367,8 +367,87 @@ def test_plan_first_materializes_prior_discuss_split_and_hands_off_in_same_run(t
     assert "Refs #56" in implementation_prompt
 
 
+def test_plan_first_excludes_own_scope_from_prior_discuss_proposals(tmp_path):
+    """A prior `discuss` split named both `Auth flow` and `Billing flow`, but
+    was never materialized. The approved plan implements `Auth flow` directly
+    on the parent and structurally declares `Billing flow` as its own
+    `deferred_stages` remainder. Only `Billing flow` (the true remainder) may
+    be filed as a child issue: filing `Auth flow` too would create a
+    duplicate child for scope the parent PR is about to implement and close
+    directly, since a plan with its own `deferred_stages` never hands off to
+    a selected-stage child (#492 review)."""
+    plan = structured_plan_state(
+        state="blocking",
+        summary="Auth flow",
+        deferred_stages=[{"title": "Billing flow", "summary": "Split follow-up out."}],
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            plan,
+            "Implemented the auth-flow scope.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_pr_review(state="approved", summary="LGTM."),
+        ],
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-20T00:00:00Z",
+                "body": _attach_round_metadata(
+                    "Discuss consensus: split this into stages.\n-- coding-review-agent-loop",
+                    PostedRoundMetadata(
+                        flow="discuss",
+                        role="summary",
+                        agent="coding-review-agent-loop",
+                        round_number=1,
+                        subject="prior-discuss-subject",
+                        is_final=True,
+                        split_proposals=("Auth flow", "Billing flow"),
+                    ),
+                ),
+            },
+        ],
+        issue_urls=["https://github.com/OWNER/REPO/issues/102"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(tmp_path, materialize_split_issues=True)
+
+    assert (
+        run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True
+        )
+        == 0
+    )
+
+    # Only the true remainder is filed; the plan's own covered scope is not
+    # filed as a duplicate child.
+    assert [issue["title"] for issue in runner.issues] == ["[#56 stage] Billing flow"]
+    # No selected-stage handoff: the parent PR implements and closes Auth
+    # flow directly, since the plan declares its own deferred_stages.
+    assert not any("<!-- AGENT_SPLIT_STAGE_HANDOFF:" in comment for comment in runner.comments)
+    assert "Fixes #56" in runner.pr_payload["body"]
+
+
 def test_validate_pr_body_does_not_close_issue_rejects_parent_fixes_for_staged_pr(tmp_path):
     runner = FakeRunner(pr_payload={"body": "Fixes #56"})
     config = make_config(tmp_path)
     with pytest.raises(AgentLoopError, match="closing keyword"):
         validate_pr_body_does_not_close_issue(runner, config=config, pr_number=77, issue_number=56)
+
+
+def test_validate_pr_body_does_not_close_issue_rejects_full_issue_url(tmp_path):
+    """GitHub also treats a closing keyword followed by a full issue URL as an
+    auto-close reference, e.g. `Closes https://github.com/OWNER/REPO/issues/56`;
+    the close-keyword guard must reject that form too, not just `#56` /
+    `owner/repo#56` (#492 review)."""
+    runner = FakeRunner(pr_payload={"body": "Closes https://github.com/OWNER/REPO/issues/56"})
+    config = make_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="closing keyword"):
+        validate_pr_body_does_not_close_issue(runner, config=config, pr_number=77, issue_number=56)
+
+
+def test_validate_pr_body_does_not_close_issue_accepts_refs_url(tmp_path):
+    runner = FakeRunner(pr_payload={"body": "Refs https://github.com/OWNER/REPO/issues/56"})
+    config = make_config(tmp_path)
+    validate_pr_body_does_not_close_issue(runner, config=config, pr_number=77, issue_number=56)

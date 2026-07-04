@@ -1842,6 +1842,19 @@ def _handle_plan_first_split_scope(
     """
     current_deferred_stages = _extract_current_deferred_stages(current_plan)
     prior_discuss_proposals = _prior_discuss_split_proposals(issue_context, config=config)
+    if current_deferred_stages:
+        # This plan structurally declares its own deferred_stages, so it keeps
+        # a primary scope on the parent (the implement-one-shot branch below
+        # never hands that scope off to a child in this case). If a prior
+        # discuss split proposal names that same primary scope, it must be
+        # excluded here rather than filed as a duplicate child issue for work
+        # the parent PR is about to implement and close directly (#492 review).
+        plan_own_key = split_stage_proposal_from_text(_plan_first_line(current_plan)).key
+        prior_discuss_proposals = [
+            proposal
+            for proposal in prior_discuss_proposals
+            if split_stage_proposal_from_text(proposal).key != plan_own_key
+        ]
     remaining_proposals = dedupe_split_stage_proposals(
         [split_stage_proposal_from_deferred_stage(stage) for stage in current_deferred_stages]
         + [split_stage_proposal_from_text(proposal) for proposal in prior_discuss_proposals]

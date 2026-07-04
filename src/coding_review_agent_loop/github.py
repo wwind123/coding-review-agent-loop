@@ -222,11 +222,13 @@ def validate_pr_references_issue(
 
 
 # Matches a GitHub auto-close keyword immediately followed by an issue reference,
-# e.g. "Closes #12", "fixed #12", "resolves owner/repo#12". Used to keep staged
-# implementation PRs from accidentally auto-closing the parent issue while
-# other split stages remain unimplemented (#476).
+# e.g. "Closes #12", "fixed #12", "resolves owner/repo#12", or
+# "closes https://github.com/owner/repo/issues/12" (GitHub also treats a full
+# issue URL as a closing reference). Used to keep staged implementation PRs
+# from accidentally auto-closing the parent issue while other split stages
+# remain unimplemented (#476, #492 review).
 _CLOSE_KEYWORD_ISSUE_RE_TEMPLATE = (
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:%s#%d|#%d)\b"
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:%s#%d|#%d|\S*/issues/%d)\b"
 )
 
 
@@ -264,7 +266,8 @@ def validate_pr_body_does_not_close_issue(
     data = json.loads(result.stdout or "{}")
     body = _optional_str(data.get("body")) or ""
     close_re = re.compile(
-        _CLOSE_KEYWORD_ISSUE_RE_TEMPLATE % (re.escape(config.repo), issue_number, issue_number),
+        _CLOSE_KEYWORD_ISSUE_RE_TEMPLATE
+        % (re.escape(config.repo), issue_number, issue_number, issue_number),
         re.I,
     )
     if not close_re.search(body):
