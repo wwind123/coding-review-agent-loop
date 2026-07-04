@@ -24,6 +24,7 @@ from agent_loop_helpers import (
     command_index,
     make_config,
     structured_plan_review,
+    structured_plan_revision,
     structured_plan_state,
     structured_pr_review,
 )
@@ -92,6 +93,53 @@ def test_plan_first_no_prior_split_materializes_deferred_stages_before_implement
     # its own PR still closes the parent issue normally (default PR body
     # scripted by FakeRunner is "Fixes #56").
     assert "Fixes #56" in runner.pr_payload["body"]
+
+
+def test_plan_first_deferred_stage_title_with_colon_round_trips_through_canonical_markdown(tmp_path):
+    """A revised plan's `deferred_stages` are carried in `current_plan` as the
+    canonical revision markdown (not the raw structured JSON), which renders
+    each stage as a human-readable `- {title}: {summary}` bullet. A title that
+    itself contains a colon (e.g. "Stage 2: API follow-up") must still
+    round-trip exactly through materialization instead of being corrupted by
+    a naive split-on-first-colon parse (#492 review)."""
+    runner = FakeRunner(
+        claude_outputs=[
+            "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_revision(
+                summary="Implement the core parser change.",
+                deferred_stages=[
+                    {"title": "Stage 2: API follow-up", "summary": "Split out the API work."}
+                ],
+            ),
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                summary="Needs a revision.",
+                blocking_plan_issues=["Needs a revision."],
+            ),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+            structured_pr_review(state="approved", summary="LGTM."),
+        ],
+        issue_urls=["https://github.com/OWNER/REPO/issues/101"],
+    )
+    config = make_config(tmp_path, materialize_split_issues=True)
+
+    assert (
+        run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True
+        )
+        == 0
+    )
+
+    assert len(runner.issues) == 1
+    assert runner.issues[0]["title"] == "[#56 stage] Stage 2: API follow-up"
+    assert "Part of #56" in runner.issues[0]["body"]
+    assert "Split out the API work." in runner.issues[0]["body"]
 
 
 def test_plan_first_no_prior_split_warns_when_materialization_disabled(tmp_path):

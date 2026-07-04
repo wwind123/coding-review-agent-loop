@@ -7,6 +7,7 @@ import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from .decomposition import _decode_json_payload, _encode_json_payload
 from .errors import AgentLoopError
 from .agents.registry import agent_display_name, agent_signature
 from .protocol import (
@@ -215,13 +216,50 @@ def render_deferred_stages_section(deferred_stages: Sequence[DeferredStage]) -> 
     subject hashing, stored plan state, reviewer prompts, and resume, so
     scope narrowing stays a mechanical signal instead of prose reviewers
     might miss.
+
+    The human-readable `- {title}: {summary}` bullets are for reviewers; they
+    are NOT what resume parses back, because a title containing its own colon
+    (e.g. "Stage 2: API follow-up") would corrupt a naive split-on-first-colon
+    parse. An `AGENT_DEFERRED_STAGES` HTML-comment marker carries the
+    structured title/summary pairs verbatim so they round-trip exactly
+    regardless of their text content (#492 review).
     """
     if not deferred_stages:
         return None
     lines = ["### Deferred stages (not in this plan)"]
     for stage in deferred_stages:
         lines.append(f"- {stage.title}: {stage.summary}")
+    lines.append(f"<!-- AGENT_DEFERRED_STAGES: {_encode_deferred_stages_marker(deferred_stages)} -->")
     return "\n".join(lines)
+
+
+def _encode_deferred_stages_marker(deferred_stages: Sequence[DeferredStage]) -> str:
+    return _encode_json_payload(
+        {"stages": [{"title": stage.title, "summary": stage.summary} for stage in deferred_stages]}
+    )
+
+
+DEFERRED_STAGES_MARKER_RE = re.compile(
+    r"<!--\s*AGENT_DEFERRED_STAGES:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.I,
+)
+
+
+def decode_deferred_stages_marker(encoded: str) -> tuple[DeferredStage, ...]:
+    payload = _decode_json_payload(encoded, marker_name="AGENT_DEFERRED_STAGES")
+    stages_payload = payload.get("stages")
+    if not isinstance(stages_payload, list):
+        raise AgentLoopError("Invalid AGENT_DEFERRED_STAGES payload.")
+    stages: list[DeferredStage] = []
+    for entry in stages_payload:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("title"), str)
+            or not isinstance(entry.get("summary"), str)
+        ):
+            raise AgentLoopError("Invalid AGENT_DEFERRED_STAGES payload.")
+        stages.append(DeferredStage(title=entry["title"], summary=entry["summary"]))
+    return tuple(stages)
 
 
 def render_canonical_plan_revision(

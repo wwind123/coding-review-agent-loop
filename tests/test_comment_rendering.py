@@ -4,6 +4,7 @@ Tests for render_canonical_plan_steps, render_canonical_plan_revision,
 render_public_agent_comment, _render_public_*_comment, and related functions.
 """
 import json
+import re
 
 import pytest
 
@@ -13,13 +14,16 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_plan_review_comment,
     _render_public_plan_revision_comment,
     _render_public_pr_review_comment,
+    decode_deferred_stages_marker,
     normalize_freeform_signature,
+    render_deferred_stages_section,
     render_discuss_round_summary_comment,
 )
 from coding_review_agent_loop.protocol import ParsedDiscussReview
 from coding_review_agent_loop.orchestrator import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     ITEM_SUMMARY_LIMIT,
+    _extract_current_deferred_stages,
     _format_unresolved_item_label,
     _render_public_review_comment,
     _review_freeform_summary_text,
@@ -28,6 +32,7 @@ from coding_review_agent_loop.orchestrator import (
     render_public_agent_comment,
 )
 from coding_review_agent_loop.protocol import (
+    DeferredStage,
     ReviewItemDisposition,
     UnresolvedReviewItem,
     parse_pr_review,
@@ -53,6 +58,51 @@ from agent_loop_helpers import (
 def test_render_canonical_plan_steps_numbers_items():
     assert render_canonical_plan_steps(("Update protocol.py.", "Add tests.")) == (
         "1. Update protocol.py.\n2. Add tests."
+    )
+
+
+def test_render_deferred_stages_section_marker_round_trips_colon_in_title():
+    """A title containing its own colon must not be corrupted: the human
+    readable `- {title}: {summary}` bullet is not what gets parsed back, an
+    AGENT_DEFERRED_STAGES marker carrying the exact structured pairs is
+    (#492 review)."""
+    stages = (
+        DeferredStage(title="Stage 2: API follow-up", summary="Split out the API work."),
+        DeferredStage(title="Billing", summary="Reconcile invoices."),
+    )
+
+    section = render_deferred_stages_section(stages)
+
+    assert "- Stage 2: API follow-up: Split out the API work." in section
+    marker_match = re.search(r"<!--\s*AGENT_DEFERRED_STAGES:\s*(?P<payload>\S+)\s*-->", section)
+    assert marker_match is not None
+    assert decode_deferred_stages_marker(marker_match.group("payload")) == stages
+
+
+def test_extract_current_deferred_stages_recovers_colon_title_from_canonical_markdown():
+    revision = validate_structured_plan_revision(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "plan_revision",
+                "state": "blocking",
+                "summary": "Implement the core parser change.",
+                "prior_plan_item_dispositions": [],
+                "plan_steps": ["Update the parser."],
+                "deferred_stages": [
+                    {"title": "Stage 2: API follow-up", "summary": "Split out the API work."}
+                ],
+            }
+        )
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    assert revision is not None
+    canonical = render_canonical_plan_revision(revision, ())
+
+    recovered = _extract_current_deferred_stages(canonical)
+
+    assert recovered == (
+        DeferredStage(title="Stage 2: API follow-up", summary="Split out the API work."),
     )
 
 

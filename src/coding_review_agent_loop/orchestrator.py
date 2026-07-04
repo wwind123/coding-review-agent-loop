@@ -172,6 +172,7 @@ from .checks import (
     run_pre_review_tests,
 )
 from .comment_rendering import (
+    DEFERRED_STAGES_MARKER_RE,
     ITEM_SUMMARY_LIMIT,
     _append_before_trailing_metadata,
     _format_unresolved_item_label,
@@ -184,6 +185,7 @@ from .comment_rendering import (
     _render_public_review_comment,
     _replace_structured_section,
     _review_freeform_summary_text,
+    decode_deferred_stages_marker,
     normalize_freeform_signature,
     render_discuss_round_summary_comment,
     render_public_agent_comment,
@@ -1752,6 +1754,15 @@ def _extract_current_deferred_stages(current_plan: str) -> tuple[DeferredStage, 
         structured = None
     if structured is not None:
         return structured.deferred_stages
+    # The canonical markdown carries an AGENT_DEFERRED_STAGES marker with the
+    # exact structured title/summary pairs (#492 review): a title containing
+    # its own colon (e.g. "Stage 2: API follow-up") would corrupt the
+    # human-readable `- {title}: {summary}` bullets if split on the first
+    # colon, so the marker is authoritative and the prose is parsed only as a
+    # fallback for text that predates it.
+    marker_match = DEFERRED_STAGES_MARKER_RE.search(current_plan)
+    if marker_match:
+        return decode_deferred_stages_marker(marker_match.group("payload"))
     match = _DEFERRED_STAGES_SECTION_RE.search(current_plan)
     if not match:
         return ()
