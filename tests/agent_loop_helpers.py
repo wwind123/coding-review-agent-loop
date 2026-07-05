@@ -234,6 +234,7 @@ class FakeRunner(Runner):
         public_response_outputs=None,
         advance_git_head_on_pr=True,
         search_issues_payload=None,
+        open_prs_payload=None,
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -317,6 +318,11 @@ class FakeRunner(Runner):
         # at a time when a list of lists is provided, otherwise reused as-is.
         self.search_issues_payload = search_issues_payload
         self.search_issues_calls = []
+        # Results returned by `gh pr list --state open` calls, used to fake
+        # `find_open_pr_referencing_issue` (#495). A list of dicts with
+        # number/body keys; defaults to no open PRs found.
+        self.open_prs_payload = open_prs_payload if open_prs_payload is not None else []
+        self.open_prs_calls = 0
         self._agent_pr_counter = 0
         self._agent_command_seen = False
         # Parallel discuss debaters (#475) call run_with_log from worker
@@ -694,6 +700,10 @@ class FakeRunner(Runner):
             else:
                 results = payload or []
             return CommandResult(cmd, cwd_path, json_dumps(results), "", 0)
+
+        if cmd[:3] == ["gh", "pr", "list"]:
+            self.open_prs_calls += 1
+            return CommandResult(cmd, cwd_path, json_dumps(self.open_prs_payload), "", 0)
 
         if cmd[:3] == ["gh", "pr", "view"]:
             if "--jq" in cmd and ".headRefOid" in cmd:

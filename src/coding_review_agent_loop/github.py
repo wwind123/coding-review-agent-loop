@@ -280,6 +280,68 @@ def validate_pr_body_does_not_close_issue(
     )
 
 
+def find_open_pr_referencing_issue(
+    runner: Runner, *, config: AgentLoopConfig, issue_number: int
+) -> int | None:
+    """Find an open PR whose body already references `issue_number`.
+
+    Used to resume PR review instead of re-invoking the coder when a prior
+    implementation attempt created a PR but the run aborted before recording
+    any handoff marker or comment (#495): the marker-based resume checks only
+    help once the marker exists, so a rerun otherwise has no trace of the PR
+    and would invoke the coder again, creating a duplicate (as happened with
+    #492/#494).
+    """
+    if config.dry_run:
+        return None
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "pr",
+            "list",
+            "--repo",
+            config.repo,
+            "--state",
+            "open",
+            "--json",
+            "number,body",
+            "--limit",
+            "100",
+        ],
+        cwd=active_workdir(config),
+    )
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    reference_re = re.compile(ISSUE_REFERENCE_RE_TEMPLATE % (issue_number, issue_number), re.I)
+    matches: list[int] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        body = _optional_str(item.get("body")) or ""
+        if not reference_re.search(body):
+            continue
+        number = item.get("number")
+        if isinstance(number, int):
+            matches.append(number)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        joined = ", ".join(f"#{n}" for n in sorted(matches))
+        raise AgentLoopError(
+            f"Multiple open PRs ({joined}) reference issue #{issue_number}; cannot automatically "
+            "determine which to resume. Close or merge the duplicate PR(s), then rerun "
+            "`agent-loop pr <number>` directly to continue review on the correct one."
+        )
+    return matches[0]
+
+
 def _parse_pr_metadata(
     data: dict[str, object], *, config: AgentLoopConfig, pr_number: int
 ) -> PullRequestMetadata:

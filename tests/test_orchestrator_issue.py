@@ -1849,6 +1849,161 @@ def test_issue_loop_plan_first_one_shot_rerun_pr_missing_issue_reference(tmp_pat
     assert "rerun the orchestrator as `agent-loop pr 77` to continue the review" in str(excinfo.value)
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
+def test_issue_loop_plan_first_one_shot_resumes_existing_pr_after_crash_before_handoff_comment(tmp_path):
+    """Reproduces #492/#494: implementation created a PR but the run aborted before
+    posting any handoff marker/comment (e.g. the #493 test-report false positive). A
+    rerun must resume PR review on the existing PR instead of invoking the coder again,
+    which is what previously produced the duplicate PR #494 (#495).
+    """
+    plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    runner = FakeRunner(
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:00Z",
+                "body": _attach_round_metadata(
+                    plan,
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="coder",
+                        agent="Claude",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                    ),
+                ),
+            },
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:01Z",
+                "body": _attach_round_metadata(
+                    "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="reviewer",
+                        agent="Codex",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                        state="approved",
+                    ),
+                ),
+            },
+        ],
+        codex_outputs=[
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
+    )
+    config = make_config(tmp_path)
+
+    assert (
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
+        == 0
+    )
+
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    handoff_comments = [c for c in runner.comments if "<!-- AGENT_PLAN_ONE_SHOT_IMPL:" in c]
+    assert len(handoff_comments) == 1
+    assert f"Plan hash: {approved_plan_hash(plan)}" in handoff_comments[0]
+    assert "PR #77" in handoff_comments[0]
+
+def test_issue_loop_plan_first_one_shot_resume_existing_pr_logs_clear_message(tmp_path, capsys):
+    plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    runner = FakeRunner(
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:00Z",
+                "body": _attach_round_metadata(
+                    plan,
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="coder",
+                        agent="Claude",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                    ),
+                ),
+            },
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:01Z",
+                "body": _attach_round_metadata(
+                    "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="reviewer",
+                        agent="Codex",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                        state="approved",
+                    ),
+                ),
+            },
+        ],
+        codex_outputs=[
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        open_prs_payload=[{"number": 492, "body": "Fixes #56"}],
+    )
+    config = make_config(tmp_path, quiet=False)
+
+    assert (
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
+        == 0
+    )
+
+    output = capsys.readouterr().err
+    assert (
+        f"Existing implementation PR #492 found for issue #56 / approved plan {approved_plan_hash(plan)}; "
+        "resuming PR review instead of invoking Claude." in output
+    )
+
+def test_issue_loop_plan_first_one_shot_rerun_raises_on_ambiguous_existing_prs(tmp_path):
+    plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    runner = FakeRunner(
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:00Z",
+                "body": _attach_round_metadata(
+                    plan,
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="coder",
+                        agent="Claude",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                    ),
+                ),
+            },
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:01Z",
+                "body": _attach_round_metadata(
+                    "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="reviewer",
+                        agent="Codex",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                        state="approved",
+                    ),
+                ),
+            },
+        ],
+        open_prs_payload=[
+            {"number": 492, "body": "Fixes #56"},
+            {"number": 494, "body": "Closes #56"},
+        ],
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match=r"Multiple open PRs \(#492, #494\)"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
+
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
 def test_codex_issue_loop_creates_pr_then_claude_approves(tmp_path):
     runner = FakeRunner(
         codex_outputs=[

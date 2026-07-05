@@ -1,7 +1,11 @@
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError
-from coding_review_agent_loop.github import IssueComment, validate_pr_body_does_not_close_issue
+from coding_review_agent_loop.github import (
+    IssueComment,
+    find_open_pr_referencing_issue,
+    validate_pr_body_does_not_close_issue,
+)
 from coding_review_agent_loop.split_materialization import (
     MAX_SPLIT_CHILDREN,
     dedupe_split_stage_proposals,
@@ -377,3 +381,55 @@ def test_validate_pr_body_does_not_close_issue_skips_in_dry_run(tmp_path):
     runner = FakeRunner(pr_payload={"body": "Fixes #56"})
     config = make_config(tmp_path, dry_run=True)
     validate_pr_body_does_not_close_issue(runner, config=config, pr_number=77, issue_number=56)
+
+
+def test_find_open_pr_referencing_issue_returns_none_when_no_match(tmp_path):
+    runner = FakeRunner(open_prs_payload=[{"number": 12, "body": "Unrelated change."}])
+    config = make_config(tmp_path)
+    assert find_open_pr_referencing_issue(runner, config=config, issue_number=56) is None
+
+
+def test_find_open_pr_referencing_issue_returns_none_when_no_open_prs(tmp_path):
+    runner = FakeRunner(open_prs_payload=[])
+    config = make_config(tmp_path)
+    assert find_open_pr_referencing_issue(runner, config=config, issue_number=56) is None
+
+
+def test_find_open_pr_referencing_issue_matches_direct_reference(tmp_path):
+    runner = FakeRunner(
+        open_prs_payload=[
+            {"number": 12, "body": "Unrelated change."},
+            {"number": 492, "body": "Implements the approved plan.\n\nFixes #476"},
+        ]
+    )
+    config = make_config(tmp_path)
+    assert find_open_pr_referencing_issue(runner, config=config, issue_number=476) == 492
+
+
+def test_find_open_pr_referencing_issue_matches_issue_url_reference(tmp_path):
+    runner = FakeRunner(
+        open_prs_payload=[
+            {"number": 492, "body": "See https://github.com/OWNER/REPO/issues/476 for context."},
+        ]
+    )
+    config = make_config(tmp_path)
+    assert find_open_pr_referencing_issue(runner, config=config, issue_number=476) == 492
+
+
+def test_find_open_pr_referencing_issue_raises_on_ambiguous_matches(tmp_path):
+    runner = FakeRunner(
+        open_prs_payload=[
+            {"number": 492, "body": "Fixes #476"},
+            {"number": 494, "body": "Closes #476"},
+        ]
+    )
+    config = make_config(tmp_path)
+    with pytest.raises(AgentLoopError, match=r"Multiple open PRs \(#492, #494\)"):
+        find_open_pr_referencing_issue(runner, config=config, issue_number=476)
+
+
+def test_find_open_pr_referencing_issue_skips_in_dry_run(tmp_path):
+    runner = FakeRunner(open_prs_payload=[{"number": 492, "body": "Fixes #476"}])
+    config = make_config(tmp_path, dry_run=True)
+    assert find_open_pr_referencing_issue(runner, config=config, issue_number=476) is None
+    assert runner.open_prs_calls == 0

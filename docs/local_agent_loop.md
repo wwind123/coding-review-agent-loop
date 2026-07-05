@@ -247,6 +247,17 @@ The modes are:
   `agent-loop issue <child>`. Older decomposition summaries without this marker
   are treated as not yet handed off, so the first child handoff is recorded once.
 
+Before invoking the coder for an approved-plan implementation, the
+orchestrator also checks GitHub directly for an already-open PR that
+references the target issue, independent of any handoff marker. This closes a
+crash window that a marker-only check cannot cover: if implementation created
+a PR but the run aborted afterward — before the `AGENT_PLAN_ONE_SHOT_IMPL`
+handoff comment (or the first PR round-metadata comment) could be posted — a
+rerun still resumes PR review on that PR instead of invoking the coder again
+and creating a duplicate. If more than one open PR references the issue, the
+orchestrator raises an error instead of guessing which one to resume; close or
+merge the extra PR and rerun `agent-loop pr <number>` directly.
+
 `--implement-after-approval` is a compatibility shortcut for
 `--plan-execution-mode implement-one-shot`. It requires `--plan-first` and is
 not compatible with any other explicit `--plan-execution-mode` value.

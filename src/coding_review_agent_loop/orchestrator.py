@@ -48,6 +48,7 @@ from .github import (
     IssueContext,
     PullRequestChecks,
     PullRequestReviewContext,
+    find_open_pr_referencing_issue,
     get_issue_context,
     get_pr_checks,
     get_pr_review_context,
@@ -2637,6 +2638,56 @@ def _implement_approved_issue(
 ) -> int:
     coder_name = agent_display_name(config.coder)
     plan_hash = approved_plan_hash(approved_plan)
+
+    # A prior implementation attempt may have created a PR and then aborted
+    # before recording any handoff marker/comment (e.g. the #493 test-report
+    # false positive, which produced the duplicate PR #494 for #492). Check
+    # GitHub directly for an already-open PR referencing this issue before
+    # invoking the coder again (#495).
+    existing_pr_number = find_open_pr_referencing_issue(
+        runner, config=config, issue_number=issue_number
+    )
+    if existing_pr_number is not None:
+        log(
+            config,
+            f"Existing implementation PR #{existing_pr_number} found for issue #{issue_number} "
+            f"/ approved plan {plan_hash}; resuming PR review instead of invoking {coder_name}.",
+        )
+        validate_pr_references_issue(
+            runner,
+            config=config,
+            pr_number=existing_pr_number,
+            issue_number=issue_number,
+        )
+        if staged_parent_issue is not None:
+            validate_pr_body_does_not_close_issue(
+                runner,
+                config=config,
+                pr_number=existing_pr_number,
+                issue_number=staged_parent_issue,
+            )
+        if one_shot_parent_issue is not None:
+            resumed_pr_context = get_pr_review_context(
+                runner, config=config, pr_number=existing_pr_number
+            )
+            post_one_shot_impl_handoff_comment(
+                runner,
+                config=config,
+                parent_issue=one_shot_parent_issue,
+                mode="implement-one-shot",
+                plan_hash=plan_hash,
+                plan_subject=plan_subject or "",
+                pr_number=existing_pr_number,
+                pr_head_sha=resumed_pr_context.metadata.head_sha,
+            )
+        return run_pr_loop(
+            runner,
+            pr_number=existing_pr_number,
+            config=config,
+            issue_context=issue_context,
+            usage_context=usage_context,
+        )
+
     salvage_summary = latest_salvage_summary(
         config.log_dir,
         repo=config.repo,
