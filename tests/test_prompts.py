@@ -998,6 +998,38 @@ def test_format_issue_context_truncates_oversized_newest_comment():
     assert "[Newest comment truncated to keep this prompt bounded.]" in text
     assert "Older detail should not be kept instead of the newest comment." not in text
 
+
+def test_format_issue_context_filters_out_agent_salvage_breadcrumb_comments():
+    salvage_comment_body = (
+        "### Implementation salvage breadcrumb\n\n"
+        "<!-- AGENT_SALVAGE: eyJzY2hlbWFfdmVyc2lvbiI6IDF9 -->\n"
+    )
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Support issue comments",
+        body="Original request.",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(
+            IssueComment(
+                author="human-user",
+                created_at="2026-05-17T09:00:00Z",
+                body="A real discussion comment that must stay visible.",
+            ),
+            IssueComment(
+                author="coding-review-agent-loop",
+                created_at="2026-05-17T10:00:00Z",
+                body=salvage_comment_body,
+            ),
+        ),
+    )
+
+    text = format_issue_context(issue_context)
+
+    assert "A real discussion comment that must stay visible." in text
+    assert "AGENT_SALVAGE" not in text
+    assert "Implementation salvage breadcrumb" not in text
+
 def test_format_human_requirements_uses_distinct_high_priority_section():
     text = format_human_requirements(
         (

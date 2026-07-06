@@ -15,6 +15,7 @@ from .config import AgentLoopConfig, reviewers
 from .decomposition import MAX_DECOMPOSITION_PHASES
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .memory import AgentMemoryContext, format_agent_memory_context
+from .salvage import AGENT_SALVAGE_MARKER_RE
 from .protocol import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
@@ -178,6 +179,10 @@ def _truncate_issue_text(text: str, *, max_chars: int, label: str) -> str:
     return text[: max(0, max_chars - len(suffix))].rstrip() + suffix
 
 
+def _is_salvage_breadcrumb_comment(comment) -> bool:
+    return bool(comment.body) and bool(AGENT_SALVAGE_MARKER_RE.search(comment.body))
+
+
 def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000) -> str:
     raw_body = issue_context.body if issue_context.body else "(none)"
     body = _truncate_issue_text(raw_body, max_chars=max_chars // 3, label="Issue body")
@@ -193,7 +198,14 @@ def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000
         "",
         "Comments, oldest to newest:",
     ]
-    if issue_context.comments:
+    # AGENT_SALVAGE breadcrumb comments carry a bounded but potentially large
+    # embedded patch/metadata payload for cross-workdir salvage discovery
+    # (#507); they are consumed separately via latest_salvage_context and
+    # would otherwise bloat/displace real discussion in this raw rendering.
+    visible_comments = tuple(
+        comment for comment in issue_context.comments if not _is_salvage_breadcrumb_comment(comment)
+    )
+    if visible_comments:
         comments = [
             "\n".join(
                 [
@@ -205,7 +217,7 @@ def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000
                     comment.body if comment.body else "(none)",
                 ]
             )
-            for comment in issue_context.comments
+            for comment in visible_comments
         ]
         issue_header = "\n".join(lines)
         full_text = issue_header + "\n".join(comments)

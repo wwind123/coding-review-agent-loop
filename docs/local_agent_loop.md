@@ -1200,7 +1200,11 @@ when it is under `--salvage-comment-patch-max-bytes` (default 20000), has no
 `GIT binary patch` section, and does not match a conservative secret scan
 (private keys, AWS key ids, `ghp_`/`github_pat_` tokens, bearer/authorization
 headers, `password=`/`secret=`-style assignments); otherwise the comment notes
-the patch is local-only. Posting failures are logged and never mask the
+the patch is local-only. `AGENT_SALVAGE` breadcrumb comments are excluded from
+the raw issue-comment context sent to the coder (they are consumed only
+through the parsed salvage summary above) so they cannot bloat or displace
+real discussion when the issue-context prompt is truncated. Posting failures
+are logged and never mask the
 original agent failure. Use `--no-salvage-comments` to keep salvage entirely
 local (matching prior behavior).
 

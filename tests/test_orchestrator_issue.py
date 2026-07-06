@@ -2650,6 +2650,11 @@ def test_issue_implementation_rerun_discovers_remote_salvage_when_local_log_dir_
     assert "remote-only failure summary" in coder_prompt
     assert "```diff" in coder_prompt
     assert "-old" in coder_prompt and "+new" in coder_prompt
+    # The raw AGENT_SALVAGE breadcrumb comment must not also be rendered
+    # verbatim via the ordinary issue-context comment block (#507 follow-up):
+    # it is consumed only through the parsed salvage_summary injection above.
+    assert "AGENT_SALVAGE" not in coder_prompt
+    assert "Implementation salvage breadcrumb" not in coder_prompt
 
 
 def test_issue_implementation_rerun_remote_salvage_with_omitted_patch_renders_local_only_note(tmp_path):
