@@ -86,6 +86,11 @@ class AgentLoopConfig:
     planning_context_mode: str = "compact"
     pr_review_context_mode: str = "full"
     auto_agent_dirs: tuple[AgentName, ...] = ()
+    # Optional plan-first override: use the main coder for planning/revision,
+    # then switch only the approved implementation and PR follow-up coder/model.
+    implementation_coder: AgentName | None = None
+    implementation_coder_model: str = ""
+    implementation_codex_reasoning_effort: str = ""
     # Antigravity (`agy`) backend (#215). Defaulted so existing AgentLoopConfig
     # constructions keep working; real values are set when antigravity is used.
     antigravity_dir: Path = Path("antigravity")
@@ -148,6 +153,12 @@ class AgentLoopConfig:
             raise AgentLoopError("--repair-model must contain at least one nonblank model.")
         if self.repair_timeout_seconds <= 0:
             raise AgentLoopError("--repair-timeout-seconds must be greater than zero.")
+        if self.implementation_coder_model and self.implementation_coder is None:
+            object.__setattr__(self, "implementation_coder", self.coder)
+        if self.implementation_codex_reasoning_effort and self.implementation_coder is None:
+            object.__setattr__(self, "implementation_coder", self.coder)
+        if self.implementation_codex_reasoning_effort and self.implementation_coder != "codex":
+            raise AgentLoopError("--implementation-codex-reasoning-effort requires --implementation-coder codex.")
         ensure_no_model_arg_conflicts(self)
         if self.planning_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--planning-context-mode must be either 'full' or 'compact'.")
@@ -213,6 +224,8 @@ def resolve_base_branch(
 
 def required_agents(config: AgentLoopConfig) -> set[AgentName]:
     required: set[AgentName] = {config.coder, *reviewers(config)}
+    if config.implementation_coder is not None:
+        required.add(config.implementation_coder)
     if config.discuss_analyzer is not None:
         required.add(config.discuss_analyzer)
     return required
@@ -286,6 +299,36 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
     if config.claude_model and _args_have_model_flag(config.claude_args):
         raise AgentLoopError(
             "--claude-arg --model conflicts with --claude-model; use --claude-model only."
+        )
+    if config.implementation_coder_model:
+        if config.implementation_coder == "antigravity" and _args_have_model_flag(config.antigravity_args):
+            raise AgentLoopError(
+                "--antigravity-arg --model conflicts with --implementation-coder-model; "
+                "use --implementation-coder-model only."
+            )
+        if config.implementation_coder == "codex" and _args_have_model_flag(config.codex_args):
+            raise AgentLoopError(
+                "--codex-arg --model conflicts with --implementation-coder-model; "
+                "use --implementation-coder-model only."
+            )
+        if config.implementation_coder == "gemini" and _args_have_model_flag(config.gemini_args):
+            raise AgentLoopError(
+                "--gemini-arg --model conflicts with --implementation-coder-model; "
+                "use --implementation-coder-model only."
+            )
+        if config.implementation_coder == "claude" and _args_have_model_flag(config.claude_args):
+            raise AgentLoopError(
+                "--claude-arg --model conflicts with --implementation-coder-model; "
+                "use --implementation-coder-model only."
+            )
+    if (
+        config.implementation_codex_reasoning_effort
+        and config.implementation_coder == "codex"
+        and _args_have_reasoning_effort(config.codex_args)
+    ):
+        raise AgentLoopError(
+            "--codex-arg model_reasoning_effort conflicts with "
+            "--implementation-codex-reasoning-effort; use --implementation-codex-reasoning-effort only."
         )
 
 
@@ -668,9 +711,11 @@ def preflight_agent_commands(
         "antigravity": (args.antigravity_cmd, "--antigravity-cmd"),
     }
     discuss_analyzer = getattr(args, "discuss_analyzer", None)
+    implementation_coder = getattr(args, "implementation_coder", None)
     configured_agents = dict.fromkeys(
         (
             args.coder,
+            *((implementation_coder,) if implementation_coder is not None else ()),
             *configured_reviewers,
             *((discuss_analyzer,) if discuss_analyzer is not None else ()),
             getattr(args, "repair_backend", "antigravity"),
@@ -797,6 +842,9 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         codex_reasoning_effort=getattr(args, "codex_reasoning_effort", ""),
         gemini_model=getattr(args, "gemini_model", ""),
         claude_model=getattr(args, "claude_model", ""),
+        implementation_coder=getattr(args, "implementation_coder", None),
+        implementation_coder_model=getattr(args, "implementation_coder_model", ""),
+        implementation_codex_reasoning_effort=getattr(args, "implementation_codex_reasoning_effort", ""),
         repair_backend=getattr(args, "repair_backend", "antigravity"),
         repair_models=tuple(getattr(args, "repair_model", None) or DEFAULT_REPAIR_MODELS),
         repair_timeout_seconds=getattr(args, "repair_timeout_seconds", 120),

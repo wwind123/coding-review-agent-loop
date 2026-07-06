@@ -1605,6 +1605,43 @@ def test_plan_execution_mode_cli_is_configurable(tmp_path, mode):
     assert config.plan_execution_mode == mode
 
 
+
+def test_plan_first_implementation_coder_cli_is_configurable(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "issue",
+        "56",
+        "--repo",
+        "OWNER/REPO",
+        "--plan-first",
+        "--implement-after-approval",
+        "--coder",
+        "claude",
+        "--claude-model",
+        "claude-fable-5",
+        "--implementation-coder",
+        "codex",
+        "--implementation-coder-model",
+        "gpt-5.5",
+        "--implementation-codex-reasoning-effort",
+        "xhigh",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+        "--gemini-dir",
+        str(tmp_path / "gemini"),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.coder == "claude"
+    assert config.claude_model == "claude-fable-5"
+    assert config.implementation_coder == "codex"
+    assert config.implementation_coder_model == "gpt-5.5"
+    assert config.implementation_codex_reasoning_effort == "xhigh"
+
+
 def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):
     parser = build_parser()
     codex_dir = tmp_path / "codex"

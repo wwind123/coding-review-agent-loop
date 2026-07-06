@@ -116,6 +116,32 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-rounds", type=int, default=5)
         subparser.add_argument("--auto-merge", action="store_true")
         subparser.add_argument("--dry-run", action="store_true")
+        subparser.add_argument(
+            "--implementation-coder",
+            type=normalize_agent_name,
+            choices=("claude", "codex", "gemini", "antigravity"),
+            default=None,
+            help=(
+                "With issue --plan-first implementation, use this coder only after the "
+                "plan is approved. Planning still uses --coder."
+            ),
+        )
+        subparser.add_argument(
+            "--implementation-coder-model",
+            default="",
+            help=(
+                "Model to use for approved implementation and PR follow-up. If "
+                "--implementation-coder is omitted, applies to --coder."
+            ),
+        )
+        subparser.add_argument(
+            "--implementation-codex-reasoning-effort",
+            default="",
+            help=(
+                "Codex reasoning effort to use with --implementation-coder codex during "
+                "approved implementation and PR follow-up."
+            ),
+        )
         subparser.add_argument("--claude-cmd", default="claude")
         subparser.add_argument("--codex-cmd", default="codex")
         subparser.add_argument("--gemini-cmd", default="gemini")
@@ -557,11 +583,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     runner = Runner(dry_run=args.dry_run)
     try:
         config = config_from_args(args, runner)
+        implementation_override_requested = (
+            args.implementation_coder is not None
+            or args.implementation_coder_model
+            or args.implementation_codex_reasoning_effort
+        )
+        if args.command != "issue" and implementation_override_requested:
+            raise AgentLoopError("--implementation-coder options are only supported with issue --plan-first.")
         if args.command == "issue":
             if args.implement_after_approval and not args.plan_first:
                 raise AgentLoopError("--implement-after-approval requires --plan-first.")
             if args.plan_execution_mode and not args.plan_first:
                 raise AgentLoopError("--plan-execution-mode requires --plan-first.")
+            if implementation_override_requested and not args.plan_first:
+                raise AgentLoopError("--implementation-coder options require --plan-first.")
+            implementation_coder = args.implementation_coder or args.coder
+            if args.implementation_codex_reasoning_effort and implementation_coder != "codex":
+                raise AgentLoopError(
+                    "--implementation-codex-reasoning-effort requires --implementation-coder codex "
+                    "or --coder codex."
+                )
             plan_execution_mode = args.plan_execution_mode
             if plan_execution_mode is None:
                 plan_execution_mode = (

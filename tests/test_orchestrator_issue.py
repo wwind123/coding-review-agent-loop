@@ -1601,6 +1601,48 @@ def test_issue_loop_plan_first_can_implement_after_approval(tmp_path):
     assert runner.comments[4].startswith("Implemented approved plan.")
     assert runner.comments[5].startswith("**Review verdict:** Approved\n\nLGTM.")
 
+
+def test_issue_loop_plan_first_can_override_implementation_model(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[
+            json.dumps(
+                {
+                    "result": "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+                    "session_id": "planning-session",
+                }
+            ),
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        claude_model="claude-fable-5",
+        implementation_coder_model="claude-sonnet-5",
+    )
+
+    assert (
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=config,
+            plan_first=True,
+            implement_after_approval=True,
+        )
+        == 0
+    )
+
+    claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert len(claude_calls) == 2
+    assert claude_calls[0][claude_calls[0].index("--model") + 1] == "claude-fable-5"
+    assert claude_calls[1][claude_calls[1].index("--model") + 1] == "claude-sonnet-5"
+    assert "--resume" not in claude_calls[1]
+    assert runner.comments[4].startswith("Implemented approved plan.")
+
+
 def test_issue_loop_rejects_pr_without_issue_reference_in_body(tmp_path):
     runner = FakeRunner(
         claude_outputs=[

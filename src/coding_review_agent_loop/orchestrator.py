@@ -2622,6 +2622,35 @@ def _round_ledger_may_be_incomplete(
     return same_subject_incomplete or cross_subject_incomplete
 
 
+def _approved_implementation_config(config: AgentLoopConfig) -> tuple[AgentLoopConfig, bool]:
+    """Return the config and session-reuse policy for approved plan implementation."""
+    implementation_coder = config.implementation_coder or config.coder
+    updates: dict[str, object] = {"coder": implementation_coder}
+    reuse_session = implementation_coder == config.coder
+
+    model = config.implementation_coder_model.strip()
+    if model:
+        reuse_session = False
+        if implementation_coder == "claude":
+            updates["claude_model"] = model
+        elif implementation_coder == "codex":
+            updates["codex_model"] = model
+        elif implementation_coder == "gemini":
+            updates["gemini_model"] = model
+        elif implementation_coder == "antigravity":
+            updates["antigravity_model"] = None
+            updates["antigravity_models"] = (model,)
+
+    effort = config.implementation_codex_reasoning_effort.strip()
+    if effort:
+        reuse_session = False
+        updates["codex_reasoning_effort"] = effort
+
+    if updates == {"coder": config.coder}:
+        return config, True
+    return dataclasses_replace(config, **updates), reuse_session
+
+
 def _implement_approved_issue(
     runner: Runner,
     *,
@@ -2636,7 +2665,9 @@ def _implement_approved_issue(
     plan_subject: str | None = None,
     staged_parent_issue: int | None = None,
 ) -> int:
-    coder_name = agent_display_name(config.coder)
+    implementation_config, reuse_planning_session = _approved_implementation_config(config)
+    coder_name = agent_display_name(implementation_config.coder)
+    implementation_session_id = coder_session_id if reuse_planning_session else None
     plan_hash = approved_plan_hash(approved_plan)
 
     # A prior implementation attempt may have created a PR and then aborted
@@ -2655,24 +2686,24 @@ def _implement_approved_issue(
         )
         validate_pr_references_issue(
             runner,
-            config=config,
+            config=implementation_config,
             pr_number=existing_pr_number,
             issue_number=issue_number,
         )
         if staged_parent_issue is not None:
             validate_pr_body_does_not_close_issue(
                 runner,
-                config=config,
+                config=implementation_config,
                 pr_number=existing_pr_number,
                 issue_number=staged_parent_issue,
             )
         if one_shot_parent_issue is not None:
             resumed_pr_context = get_pr_review_context(
-                runner, config=config, pr_number=existing_pr_number
+                runner, config=implementation_config, pr_number=existing_pr_number
             )
             post_one_shot_impl_handoff_comment(
                 runner,
-                config=config,
+                config=implementation_config,
                 parent_issue=one_shot_parent_issue,
                 mode="implement-one-shot",
                 plan_hash=plan_hash,
@@ -2683,35 +2714,35 @@ def _implement_approved_issue(
         return run_pr_loop(
             runner,
             pr_number=existing_pr_number,
-            config=config,
+            config=implementation_config,
             issue_context=issue_context,
             usage_context=usage_context,
         )
 
     salvage_summary = latest_salvage_summary(
-        config.log_dir,
-        repo=config.repo,
+        implementation_config.log_dir,
+        repo=implementation_config.repo,
         issue_number=issue_number,
         scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
         approved_plan_hash=plan_hash,
     )
-    sync_coder_base_before_implementation(config, runner)
+    sync_coder_base_before_implementation(implementation_config, runner)
     log(config, f"Planning approved; invoking {coder_name} to implement issue #{issue_number}")
-    assigned_head_before = _read_assigned_workdir_head(runner, config)
+    assigned_head_before = _read_assigned_workdir_head(runner, implementation_config)
     coder_response = _run_validated_agent(
         runner,
-        agent=config.coder,
-        config=config,
+        agent=implementation_config.coder,
+        config=implementation_config,
         prompt=build_issue_implementation_prompt(
             issue_number,
             approved_plan,
-            config,
+            implementation_config,
             memory,
             issue_context=issue_context,
             salvage_summary=salvage_summary,
             staged_parent_issue=staged_parent_issue,
         ),
-        session_id=coder_session_id,
+        session_id=implementation_session_id,
         marker_description="<!-- AGENT_PR: <number> --> or PR URL",
         validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
             text,
@@ -2722,43 +2753,43 @@ def _implement_approved_issue(
         ),
         usage_context=usage_context,
         salvage_context=SalvageContext(
-            repo=config.repo,
+            repo=implementation_config.repo,
             issue_number=issue_number,
             scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
-            agent=config.coder,
+            agent=implementation_config.coder,
             run_id=usage_context.run_id,
             approved_plan_hash=plan_hash,
         ),
         operation_description="approved-plan implementation",
     )
     coder_output = coder_response.text
-    validate_response_tests_within_workdir(coder_output, assigned_workdir=active_workdir(config))
+    validate_response_tests_within_workdir(coder_output, assigned_workdir=active_workdir(implementation_config))
     validate_assigned_head_advanced(
         before_head=assigned_head_before,
-        after_head=_read_assigned_workdir_head(runner, config),
-        assigned_workdir=active_workdir(config),
+        after_head=_read_assigned_workdir_head(runner, implementation_config),
+        assigned_workdir=active_workdir(implementation_config),
     )
     pr_number = int(coder_response.marker_value)
     log(config, f"{coder_name} reported PR #{pr_number}; validating it is open")
-    validate_open_pr(runner, config=config, pr_number=pr_number)
+    validate_open_pr(runner, config=implementation_config, pr_number=pr_number)
     validate_pr_references_issue(
         runner,
-        config=config,
+        config=implementation_config,
         pr_number=pr_number,
         issue_number=issue_number,
     )
     if staged_parent_issue is not None:
         validate_pr_body_does_not_close_issue(
             runner,
-            config=config,
+            config=implementation_config,
             pr_number=pr_number,
             issue_number=staged_parent_issue,
         )
-    initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    initial_pr_context = get_pr_review_context(runner, config=implementation_config, pr_number=pr_number)
     if one_shot_parent_issue is not None:
         post_one_shot_impl_handoff_comment(
             runner,
-            config=config,
+            config=implementation_config,
             parent_issue=one_shot_parent_issue,
             mode="implement-one-shot",
             plan_hash=plan_hash,
@@ -2768,10 +2799,15 @@ def _implement_approved_issue(
         )
     post_pr_comment(
         runner,
-        config=config,
+        config=implementation_config,
         pr_number=pr_number,
         body=_attach_round_metadata(
-            normalize_freeform_signature(coder_output, agent=config.coder, config=config, model_used=coder_response.model_used),
+            normalize_freeform_signature(
+                coder_output,
+                agent=implementation_config.coder,
+                config=implementation_config,
+                model_used=coder_response.model_used,
+            ),
             PostedRoundMetadata(
                 flow="pr",
                 role="coder",
@@ -2786,7 +2822,7 @@ def _implement_approved_issue(
     return run_pr_loop(
         runner,
         pr_number=pr_number,
-        config=config,
+        config=implementation_config,
         coder_session_id=coder_response.session_id,
         issue_context=issue_context,
         workdirs_ready=True,
