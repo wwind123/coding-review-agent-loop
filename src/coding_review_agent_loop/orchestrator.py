@@ -149,7 +149,8 @@ from .salvage import (
     SalvageArtifacts,
     SalvageContext,
     capture_salvage_artifacts,
-    latest_salvage_summary,
+    latest_salvage_context,
+    post_salvage_comment,
 )
 from .transient import (
     NON_RETRYABLE_AGENT_OUTPUT_RE,
@@ -1368,6 +1369,7 @@ def _capture_failed_run_salvage_diagnostic(
                 f"{operation_description}, not a mutating implementation attempt."
             ),
         )
+    compacted_failure_reason = _compact_failure_reason(failure_reason, classification_text)
     try:
         artifacts = capture_salvage_artifacts(
             runner,
@@ -1375,7 +1377,7 @@ def _capture_failed_run_salvage_diagnostic(
             log_dir=config.log_dir,
             context=salvage_context,
             failure_category=failure_category,
-            failure_reason=_compact_failure_reason(failure_reason, classification_text),
+            failure_reason=compacted_failure_reason,
             required_marker=marker_description,
             result=result,
         )
@@ -1394,11 +1396,24 @@ def _capture_failed_run_salvage_diagnostic(
         )
     if artifacts is not None:
         log(config, f"{agent_name}: salvage artifacts written to {artifacts.directory}")
+        comment_posted = post_salvage_comment(
+            runner,
+            config=config,
+            artifacts=artifacts,
+            context=salvage_context,
+            failure_category=failure_category,
+            failure_reason=compacted_failure_reason,
+        )
+        comment_note = (
+            f" A GitHub salvage comment was posted to issue #{salvage_context.issue_number}."
+            if comment_posted
+            else " No GitHub salvage comment was posted."
+        )
         return _PatchSalvageDiagnostic(
             artifacts=artifacts,
             line=(
                 "Implementation salvage artifacts were written to "
-                f"{artifacts.summary_path}; patch: {artifacts.patch_path}."
+                f"{artifacts.summary_path}; patch: {artifacts.patch_path}.{comment_note}"
             ),
         )
 
@@ -2719,8 +2734,9 @@ def _implement_approved_issue(
             usage_context=usage_context,
         )
 
-    salvage_summary = latest_salvage_summary(
+    salvage_summary = latest_salvage_context(
         implementation_config.log_dir,
+        issue_context.comments,
         repo=implementation_config.repo,
         issue_number=issue_number,
         scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
@@ -3726,8 +3742,9 @@ def run_issue_loop(
 
         sync_coder_base_before_implementation(config, runner)
         assigned_head_before = _read_assigned_workdir_head(runner, config)
-        salvage_summary = latest_salvage_summary(
+        salvage_summary = latest_salvage_context(
             config.log_dir,
+            issue_context.comments,
             repo=config.repo,
             issue_number=issue_number,
             scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE,

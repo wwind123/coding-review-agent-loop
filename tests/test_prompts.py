@@ -143,6 +143,40 @@ def test_issue_prompts_include_salvage_guardrail_block(tmp_path):
         assert "partial.patch" in prompt
 
 
+def test_issue_prompts_render_remote_salvage_summary_shape(tmp_path):
+    from coding_review_agent_loop.salvage import RemoteSalvageRecord, render_remote_salvage_summary
+
+    config = make_config(tmp_path)
+    record = RemoteSalvageRecord(
+        created_at_ns=1,
+        repo="OWNER/REPO",
+        issue_number=56,
+        scope="issue-implementation",
+        agent="claude",
+        run_id="run-1",
+        approved_plan_hash=None,
+        failure_category="transient",
+        failure_reason="agent failed on a different machine",
+        changed_files=" M file.txt",
+        diff_stat=" file.txt | 2 +-",
+        local_directory="/tmp/other-workdir/.agent-loop-logs/salvage/run-1-claude-issue-implementation",
+        patch_exists=True,
+        patch_included=True,
+        patch_text="diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n",
+    )
+    salvage_summary = render_remote_salvage_summary(record)
+
+    prompt = build_issue_prompt(56, config, salvage_summary=salvage_summary)
+
+    assert "Previous failed implementation attempt salvage:" in prompt
+    assert "recovered from a GitHub issue comment" in prompt
+    assert "agent failed on a different machine" in prompt
+    assert "```diff" in prompt
+    assert "-old" in prompt and "+new" in prompt
+    assert "Do not auto-apply the patch" in prompt
+    assert "may not exist here" in prompt
+
+
 def test_reviewer_prompts_use_reviewer_assigned_workdir_rule(tmp_path):
     config = make_config(
         tmp_path,

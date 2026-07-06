@@ -1186,6 +1186,24 @@ later rerun injects only the latest matching salvage summary into the coder
 prompt so the next attempt can cherry-pick or ignore it selectively. The
 orchestrator never auto-applies the patch.
 
+For `issue-implementation` and `approved-plan-implementation` scopes (the two
+whose rerun prompts consume a salvage summary), the orchestrator also posts a
+best-effort GitHub issue comment with a hidden `<!-- AGENT_SALVAGE: ... -->`
+marker alongside the local artifacts. This makes salvage durable across a
+different coder, workdir, or machine: a rerun with an empty local `--log-dir`
+can still discover the latest matching comment (filtered by repo, issue,
+scope, and approved-plan hash) and inject it into the coder prompt, noting
+that the referenced local artifact paths may not exist on this machine. Local
+and remote salvage are merged deterministically by timestamp, with ties
+preferring the local copy. The partial patch is embedded in the comment only
+when it is under `--salvage-comment-patch-max-bytes` (default 20000), has no
+`GIT binary patch` section, and does not match a conservative secret scan
+(private keys, AWS key ids, `ghp_`/`github_pat_` tokens, bearer/authorization
+headers, `password=`/`secret=`-style assignments); otherwise the comment notes
+the patch is local-only. Posting failures are logged and never mask the
+original agent failure. Use `--no-salvage-comments` to keep salvage entirely
+local (matching prior behavior).
+
 If strict structured-response validation fails, the log may show a repair pass:
 `schema validation failed ... attempting repair pass`, followed by either
 `repair pass recovered malformed response` or `repair pass produced invalid

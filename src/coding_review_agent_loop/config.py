@@ -135,6 +135,13 @@ class AgentLoopConfig:
     # materialized into child issues (#476). None means resolve by unique
     # title match instead.
     split_stage: int | None = None
+    # GitHub-backed salvage breadcrumbs (#507): post a hidden AGENT_SALVAGE marker
+    # comment for failed mutating implementation attempts so a rerun with a
+    # different coder/workdir/machine can still discover the latest salvage
+    # context. Defaulted on so existing AgentLoopConfig constructions keep
+    # working with the new behavior enabled.
+    salvage_comments: bool = True
+    salvage_comment_patch_max_bytes: int = 20000
 
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
@@ -182,6 +189,8 @@ class AgentLoopConfig:
             raise AgentLoopError(f"--discuss-on-debater-failure must be one of: {rendered}.")
         if self.discuss_debater_timeout is not None and self.discuss_debater_timeout <= 0:
             raise AgentLoopError("--discuss-debater-timeout must be greater than zero seconds.")
+        if self.salvage_comment_patch_max_bytes <= 0:
+            raise AgentLoopError("--salvage-comment-patch-max-bytes must be greater than zero.")
 
 
 def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
@@ -865,6 +874,8 @@ def config_from_args(args: argparse.Namespace, runner: Runner) -> AgentLoopConfi
         discuss_on_debater_failure=getattr(args, "discuss_on_debater_failure", "fail") or "fail",
         materialize_split_issues=getattr(args, "materialize_split_issues", False),
         split_stage=getattr(args, "split_stage", None),
+        salvage_comments=getattr(args, "salvage_comments", True),
+        salvage_comment_patch_max_bytes=getattr(args, "salvage_comment_patch_max_bytes", 20000),
         test_command=test_command,
         pre_review_tests=args.pre_review_tests,
         ci_check_name=args.ci_check_name,

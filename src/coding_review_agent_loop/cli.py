@@ -369,6 +369,33 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="Regenerate the cached execution/test profile before invoking agents.",
         )
+        salvage_comments_group = subparser.add_mutually_exclusive_group()
+        salvage_comments_group.add_argument(
+            "--salvage-comments",
+            dest="salvage_comments",
+            action="store_true",
+            default=True,
+            help=(
+                "Post a hidden AGENT_SALVAGE marker comment to the issue when a mutating "
+                "implementation attempt fails, so a rerun with a different coder/workdir/"
+                "machine can still discover the latest salvage context (default)."
+            ),
+        )
+        salvage_comments_group.add_argument(
+            "--no-salvage-comments",
+            dest="salvage_comments",
+            action="store_false",
+            help="Do not post GitHub salvage breadcrumb comments for failed implementation attempts.",
+        )
+        subparser.add_argument(
+            "--salvage-comment-patch-max-bytes",
+            type=int,
+            default=20000,
+            help=(
+                "Maximum size of a partial patch embedded in a GitHub salvage comment; "
+                "larger (or unsafe) patches are omitted with a local-only note (default: 20000)."
+            ),
+        )
         subparser.add_argument(
             "--approved-followups",
             choices=("ignore", "summarize", "issue", "fix-and-summarize", "fix-and-issue"),

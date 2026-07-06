@@ -21,7 +21,12 @@ from coding_review_agent_loop.prompts import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
 )
 from coding_review_agent_loop.protocol import UnresolvedReviewItem
-from coding_review_agent_loop.salvage import latest_salvage_summary
+from coding_review_agent_loop.salvage import (
+    SalvageContext,
+    capture_salvage_artifacts,
+    latest_salvage_summary,
+    post_salvage_comment,
+)
 from agent_loop_helpers import (
     FakeRunner,
     command_index,
@@ -2519,3 +2524,302 @@ def test_latest_salvage_summary_filters_approved_plan_hash(tmp_path):
     )
 
     assert summary == "current approved-plan summary"
+
+
+def test_failed_issue_implementation_posts_github_salvage_comment(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[("quota exceeded; reset in 10m", 1)],
+        post_agent_git_status=" M src/coding_review_agent_loop/cli.py\n",
+        post_agent_git_diff=(
+            "diff --git a/src/coding_review_agent_loop/cli.py b/src/coding_review_agent_loop/cli.py\n"
+            "--- a/src/coding_review_agent_loop/cli.py\n"
+            "+++ b/src/coding_review_agent_loop/cli.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        ),
+        post_agent_git_diff_stat=" src/coding_review_agent_loop/cli.py | 2 +-\n",
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(QuotaResetExceededError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(excinfo.value)
+    assert "A GitHub salvage comment was posted to issue #56." in message
+    assert len(runner.issue_comments) == 1
+    posted_body = runner.issue_comments[0]["body"]
+    assert "<!-- AGENT_SALVAGE:" in posted_body
+    assert "Implementation salvage breadcrumb" in posted_body
+
+
+def test_failed_issue_implementation_salvage_comment_disabled_posts_nothing(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[("quota exceeded; reset in 10m", 1)],
+        post_agent_git_status=" M src/coding_review_agent_loop/cli.py\n",
+        post_agent_git_diff=(
+            "diff --git a/src/coding_review_agent_loop/cli.py b/src/coding_review_agent_loop/cli.py\n"
+            "--- a/src/coding_review_agent_loop/cli.py\n"
+            "+++ b/src/coding_review_agent_loop/cli.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        ),
+    )
+    config = make_config(tmp_path, salvage_comments=False)
+
+    with pytest.raises(QuotaResetExceededError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(excinfo.value)
+    assert "No GitHub salvage comment was posted." in message
+    assert runner.issue_comments == []
+
+
+def _build_remote_salvage_comment(
+    tmp_path,
+    *,
+    issue_number=56,
+    scope="issue-implementation",
+    approved_plan_hash_value=None,
+    patch_text=None,
+    failure_reason="remote-only failure summary",
+    patch_max_bytes=20000,
+):
+    patch_text = patch_text or (
+        "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    checkout = tmp_path / "remote-source-checkout"
+    checkout.mkdir(parents=True, exist_ok=True)
+    seed_runner = FakeRunner(
+        git_diff=patch_text,
+        git_status=" M file.txt\n",
+        git_diff_stat=" file.txt | 2 +-\n",
+    )
+    context = SalvageContext(
+        repo="OWNER/REPO",
+        issue_number=issue_number,
+        scope=scope,
+        agent="claude",
+        approved_plan_hash=approved_plan_hash_value,
+    )
+    artifacts = capture_salvage_artifacts(
+        seed_runner,
+        checkout=checkout,
+        log_dir=tmp_path / "remote-source-logs",
+        context=context,
+        failure_category="transient",
+        failure_reason=failure_reason,
+        required_marker="<!-- AGENT_PR: <number> -->",
+        result=None,
+    )
+    post_config = make_config(tmp_path, salvage_comment_patch_max_bytes=patch_max_bytes)
+    posted = post_salvage_comment(
+        seed_runner,
+        config=post_config,
+        artifacts=artifacts,
+        context=context,
+        failure_category="transient",
+        failure_reason=failure_reason,
+    )
+    assert posted
+    return seed_runner.issue_comments[-1]
+
+
+def test_issue_implementation_rerun_discovers_remote_salvage_when_local_log_dir_is_empty(tmp_path):
+    remote_comment = _build_remote_salvage_comment(
+        tmp_path,
+        issue_number=56,
+        scope="issue-implementation",
+        failure_reason="remote-only failure summary",
+    )
+    runner = FakeRunner(
+        issue_comments=[remote_comment],
+        claude_outputs=[
+            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    coder_prompt = next(
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] and "Fix GitHub issue #56" in cmd[-1]
+    )
+    assert "Previous failed implementation attempt salvage:" in coder_prompt
+    assert "recovered from a GitHub issue comment" in coder_prompt
+    assert "remote-only failure summary" in coder_prompt
+    assert "```diff" in coder_prompt
+    assert "-old" in coder_prompt and "+new" in coder_prompt
+
+
+def test_issue_implementation_rerun_remote_salvage_with_omitted_patch_renders_local_only_note(tmp_path):
+    oversized_patch = (
+        "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
+    ) + ("+padding\n" * 5000)
+    remote_comment = _build_remote_salvage_comment(
+        tmp_path,
+        issue_number=56,
+        scope="issue-implementation",
+        patch_text=oversized_patch,
+        patch_max_bytes=100,
+        failure_reason="remote failure with an oversized patch",
+    )
+    runner = FakeRunner(
+        issue_comments=[remote_comment],
+        claude_outputs=[
+            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    coder_prompt = next(
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] and "Fix GitHub issue #56" in cmd[-1]
+    )
+    assert "recovered from a GitHub issue comment" in coder_prompt
+    assert "local-only" in coder_prompt
+    assert "```diff" not in coder_prompt
+
+
+def test_issue_implementation_rerun_ignores_remote_salvage_for_a_different_issue(tmp_path):
+    remote_comment = _build_remote_salvage_comment(
+        tmp_path,
+        issue_number=999,
+        scope="issue-implementation",
+        failure_reason="unrelated issue failure",
+    )
+    runner = FakeRunner(
+        issue_comments=[remote_comment],
+        claude_outputs=[
+            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    coder_prompt = next(
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] and "Fix GitHub issue #56" in cmd[-1]
+    )
+    assert "Previous failed implementation attempt salvage:" not in coder_prompt
+
+
+def test_approved_plan_implementation_rerun_discovers_remote_salvage_with_matching_plan_hash(tmp_path):
+    approved_plan = "Plan:\n- Do the thing."
+    plan_hash = approved_plan_hash(approved_plan)
+    remote_comment = _build_remote_salvage_comment(
+        tmp_path,
+        issue_number=56,
+        scope="approved-plan-implementation",
+        approved_plan_hash_value=plan_hash,
+        failure_reason="remote approved-plan failure",
+    )
+    runner = FakeRunner(
+        issue_comments=[remote_comment],
+        claude_outputs=[
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+    issue_context = get_issue_context(runner, config=config, issue_number=56)
+    usage_context = orchestrator_module._new_usage_context(config)
+
+    result = orchestrator_module._implement_approved_issue(
+        runner,
+        issue_number=56,
+        approved_plan=approved_plan,
+        config=config,
+        memory=None,
+        issue_context=issue_context,
+        coder_session_id=None,
+        usage_context=usage_context,
+    )
+
+    assert result == 0
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Previous failed implementation attempt salvage:" in coder_prompt
+    assert "recovered from a GitHub issue comment" in coder_prompt
+    assert "remote approved-plan failure" in coder_prompt
+
+
+def test_approved_plan_implementation_rerun_ignores_remote_salvage_on_plan_hash_mismatch(tmp_path):
+    approved_plan = "Plan:\n- Do the current thing."
+    stale_plan_hash = approved_plan_hash("Plan:\n- Do the old thing.")
+    remote_comment = _build_remote_salvage_comment(
+        tmp_path,
+        issue_number=56,
+        scope="approved-plan-implementation",
+        approved_plan_hash_value=stale_plan_hash,
+        failure_reason="stale plan failure",
+    )
+    runner = FakeRunner(
+        issue_comments=[remote_comment],
+        claude_outputs=[
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+    issue_context = get_issue_context(runner, config=config, issue_number=56)
+    usage_context = orchestrator_module._new_usage_context(config)
+
+    result = orchestrator_module._implement_approved_issue(
+        runner,
+        issue_number=56,
+        approved_plan=approved_plan,
+        config=config,
+        memory=None,
+        issue_context=issue_context,
+        coder_session_id=None,
+        usage_context=usage_context,
+    )
+
+    assert result == 0
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Previous failed implementation attempt salvage:" not in coder_prompt
+
+
+def test_task_and_pr_followup_salvage_scopes_post_no_github_comment(tmp_path):
+    config = make_config(tmp_path)
+    runner = FakeRunner(
+        post_agent_git_status=" M file.txt\n",
+        post_agent_git_diff=(
+            "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        ),
+    )
+    runner._mark_agent_command_seen()
+
+    for scope in (
+        orchestrator_module.TASK_IMPLEMENTATION_SALVAGE_SCOPE,
+        orchestrator_module.PR_FOLLOWUP_SALVAGE_SCOPE,
+    ):
+        diagnostic = orchestrator_module._capture_failed_run_salvage_diagnostic(
+            runner=runner,
+            config=config,
+            agent_name="claude",
+            salvage_context=SalvageContext(
+                repo=config.repo,
+                issue_number=56,
+                scope=scope,
+                agent="claude",
+            ),
+            operation_description="task implementation",
+            failure_category="transient",
+            failure_reason="agent failed",
+            classification_text="",
+            marker_description="<!-- AGENT_PR: <number> -->",
+            result=None,
+        )
+        assert diagnostic.artifacts is not None
+        assert "No GitHub salvage comment was posted." in diagnostic.line
+
+    assert runner.comments == []
+    assert runner.issue_comments == []
