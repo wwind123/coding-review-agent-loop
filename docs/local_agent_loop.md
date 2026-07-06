@@ -262,6 +262,28 @@ merge the extra PR and rerun `agent-loop pr <number>` directly.
 `--plan-execution-mode implement-one-shot`. It requires `--plan-first` and is
 not compatible with any other explicit `--plan-execution-mode` value.
 
+Approved-plan implementation can switch to a different coder after planning:
+
+```bash
+agent-loop issue 56 --repo OWNER/REPO --plan-first --implement-after-approval \
+  --coder claude \
+  --implementation-coder codex \
+  --implementation-coder-model gpt-5.5 \
+  --implementation-codex-reasoning-effort high
+```
+
+Planning and plan revisions always use `--coder`; the `--implementation-*`
+flags apply only after reviewers approve the plan and the run enters
+implementation. `--implementation-coder` accepts the same values as `--coder`.
+`--implementation-coder-model` sets that implementation coder's model only for
+the approved-plan implementation. When `--implementation-coder-model` is set
+without `--implementation-coder`, implementation keeps using `--coder` but with
+the implementation-only model. `--implementation-codex-reasoning-effort` can
+only be used when the implementation coder is Codex, either explicitly via
+`--implementation-coder codex` or implicitly via `--coder codex`; it also
+requires `--implementation-coder-model` or `--codex-model` so the Codex
+implementation signature can name the model reliably.
+
 If the plan narrows scope (via `deferred_stages` or a prior discuss `split`
 consensus), see [Split issue materialization](#split-issue-materialization)
 below for how those follow-up stages are filed (or warned about) and how

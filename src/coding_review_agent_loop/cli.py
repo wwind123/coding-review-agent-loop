@@ -597,12 +597,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError("--plan-execution-mode requires --plan-first.")
             if implementation_override_requested and not args.plan_first:
                 raise AgentLoopError("--implementation-coder options require --plan-first.")
-            implementation_coder = args.implementation_coder or args.coder
-            if args.implementation_codex_reasoning_effort and implementation_coder != "codex":
-                raise AgentLoopError(
-                    "--implementation-codex-reasoning-effort requires --implementation-coder codex "
-                    "or --coder codex."
-                )
             plan_execution_mode = args.plan_execution_mode
             if plan_execution_mode is None:
                 plan_execution_mode = (

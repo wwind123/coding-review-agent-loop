@@ -247,6 +247,29 @@ is recorded once. If the first phase is `human-action` or `manual-close`, the
 loop creates and reports all child issues but stops so a human can do the
 required work, add a remark/update, and close that child issue.
 
+Plan-first implementation can use a different implementation agent than the
+planning agent. Planning and plan revisions still use `--coder`; the override
+applies only after the plan is approved and implementation begins:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO --plan-first --implement-after-approval \
+  --coder claude \
+  --implementation-coder codex \
+  --implementation-coder-model gpt-5.5 \
+  --implementation-codex-reasoning-effort high
+```
+
+`--implementation-coder` accepts the same agent names as `--coder`.
+`--implementation-coder-model` sets the selected implementation coder's model
+for the approved-plan implementation only. If `--implementation-coder-model` is
+provided without `--implementation-coder`, the implementation still uses
+`--coder` but with that implementation-only model.
+`--implementation-codex-reasoning-effort` is valid only when the implementation
+coder is Codex, either explicitly with `--implementation-coder codex` or because
+`--coder codex` is the planning and implementation coder. It also requires a
+declared Codex model via `--implementation-coder-model` or `--codex-model` so
+the implementation signature can name the model reliably.
+
 Each generated child issue copies the relevant parent-plan slice, constraints
 and invariants, dependency notes, scope and non-goals, rollout risk,
 validation/soak requirements, automation classification, and instructions for

@@ -159,6 +159,16 @@ class AgentLoopConfig:
             object.__setattr__(self, "implementation_coder", self.coder)
         if self.implementation_codex_reasoning_effort and self.implementation_coder != "codex":
             raise AgentLoopError("--implementation-codex-reasoning-effort requires --implementation-coder codex.")
+        if (
+            self.implementation_codex_reasoning_effort
+            and self.implementation_coder == "codex"
+            and not (self.implementation_coder_model or self.codex_model)
+        ):
+            raise AgentLoopError(
+                "--implementation-codex-reasoning-effort requires "
+                "--implementation-coder-model or --codex-model so the implementation "
+                "signature can reliably name the Codex model."
+            )
         ensure_no_model_arg_conflicts(self)
         if self.planning_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--planning-context-mode must be either 'full' or 'compact'.")

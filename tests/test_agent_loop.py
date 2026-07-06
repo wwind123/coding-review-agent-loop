@@ -17,6 +17,7 @@ from coding_review_agent_loop.cli import (
     config_from_args,
     ensure_log_dir_ignored,
     is_clarification_request,
+    main,
     run_issue_loop,
     run_pr_loop,
     run_task_loop,
@@ -1640,6 +1641,166 @@ def test_plan_first_implementation_coder_cli_is_configurable(tmp_path):
     assert config.implementation_coder == "codex"
     assert config.implementation_coder_model == "gpt-5.5"
     assert config.implementation_codex_reasoning_effort == "xhigh"
+
+
+def test_implementation_coder_options_require_issue_plan_first(capsys):
+    assert main(["pr", "77", "--repo", "OWNER/REPO", "--implementation-coder", "codex"]) == 1
+    assert (
+        "--implementation-coder options are only supported with issue --plan-first"
+        in capsys.readouterr().err
+    )
+
+    assert main(["issue", "56", "--repo", "OWNER/REPO", "--implementation-coder", "codex"]) == 1
+    assert "--implementation-coder options require --plan-first" in capsys.readouterr().err
+
+
+def test_plan_first_post_approval_options_require_plan_first(capsys):
+    assert main(["issue", "56", "--repo", "OWNER/REPO", "--implement-after-approval"]) == 1
+    assert "--implement-after-approval requires --plan-first" in capsys.readouterr().err
+
+    assert (
+        main([
+            "issue",
+            "56",
+            "--repo",
+            "OWNER/REPO",
+            "--plan-execution-mode",
+            "implement-one-shot",
+        ])
+        == 1
+    )
+    assert "--plan-execution-mode requires --plan-first" in capsys.readouterr().err
+
+
+def test_implementation_codex_reasoning_effort_requires_codex_and_model(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "issue",
+        "56",
+        "--repo",
+        "OWNER/REPO",
+        "--plan-first",
+        "--implement-after-approval",
+        "--coder",
+        "claude",
+        "--implementation-codex-reasoning-effort",
+        "high",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+        "--gemini-dir",
+        str(tmp_path / "gemini"),
+    ])
+    with pytest.raises(AgentLoopError, match="requires --implementation-coder codex"):
+        config_from_args(args, FakeRunner())
+
+    args = parser.parse_args([
+        "issue",
+        "56",
+        "--repo",
+        "OWNER/REPO",
+        "--plan-first",
+        "--implement-after-approval",
+        "--coder",
+        "codex",
+        "--implementation-codex-reasoning-effort",
+        "high",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+        "--gemini-dir",
+        str(tmp_path / "gemini"),
+    ])
+    with pytest.raises(AgentLoopError, match="requires --implementation-coder-model or --codex-model"):
+        config_from_args(args, FakeRunner())
+
+
+def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_path):
+    plan_text = "Approved plan.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
+    plan_review_text = structured_plan_review(summary="Plan approved.")
+    pr_review_text = structured_pr_review(state="approved", summary="PR approved.")
+    plan_review_marker = parse_plan_review(plan_review_text, reviewer="Google Gemini")
+    pr_review_marker = parse_pr_review(pr_review_text, reviewer="Google Gemini")
+    implementation_text = (
+        "Created PR.\nTests: python -m pytest passed.\n"
+        "<!-- AGENT_PR: 77 -->\n-- OpenAI Codex"
+    )
+    calls = []
+    runner = FakeRunner()
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        reviewer="gemini",
+        implementation_coder="codex",
+        implementation_coder_model="gpt-5.5",
+        implementation_codex_reasoning_effort="high",
+    )
+
+    def fake_run_validated_agent(runner_arg, *, agent, config, session_id=None, **kwargs):
+        calls.append(
+            {
+                "agent": agent,
+                "coder": config.coder,
+                "codex_model": config.codex_model,
+                "codex_reasoning_effort": config.codex_reasoning_effort,
+                "session_id": session_id,
+                "operation": kwargs.get("operation_description"),
+            }
+        )
+        operation = kwargs.get("operation_description")
+        if operation == "planning":
+            return ValidatedAgentResponse(
+                text=plan_text,
+                model_used="claude-fable-5",
+                session_id="planning-session",
+                marker_value=None,
+            )
+        if operation == "plan review":
+            return ValidatedAgentResponse(
+                text=plan_review_text,
+                model_used="gemini-3-pro",
+                session_id=None,
+                marker_value=plan_review_marker,
+            )
+        if operation == "approved-plan implementation":
+            runner_arg.git_head = "def456"
+            return ValidatedAgentResponse(
+                text=implementation_text,
+                model_used="gpt-5.5 (high)",
+                session_id="implementation-session",
+                marker_value="77",
+            )
+        return ValidatedAgentResponse(
+            text=pr_review_text,
+            model_used="gemini-3-pro",
+            session_id=None,
+            marker_value=pr_review_marker,
+        )
+
+    with patch(
+        "coding_review_agent_loop.orchestrator._run_validated_agent",
+        side_effect=fake_run_validated_agent,
+    ):
+        assert (
+            run_issue_loop(
+                runner,
+                issue_number=56,
+                config=config,
+                plan_first=True,
+                implement_after_approval=True,
+            )
+            == 0
+        )
+
+    assert [call["agent"] for call in calls] == ["claude", "gemini", "codex", "gemini"]
+    implementation_call = calls[2]
+    assert implementation_call["coder"] == "codex"
+    assert implementation_call["codex_model"] == "gpt-5.5"
+    assert implementation_call["codex_reasoning_effort"] == "high"
+    assert implementation_call["session_id"] is None
+    assert calls[0]["coder"] == "claude"
 
 
 def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):
