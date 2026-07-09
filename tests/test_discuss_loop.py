@@ -1747,6 +1747,7 @@ def test_discuss_loop_auto_mode_analyzer_can_decide_no_research(tmp_path):
             ),
         ],
         claude_outputs=[agenda_text],
+        issue_payload=_grounded_agenda_issue_payload(),
     )
     config = make_config(
         tmp_path,
@@ -2015,6 +2016,7 @@ def test_discuss_parallel_analyzer_waits_for_debater_synchronization_point(tmp_p
             ),
         ],
         claude_outputs=[_discuss_agenda_text()],
+        issue_payload=_grounded_agenda_issue_payload(),
     )
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude", discuss_parallel=True
@@ -2293,6 +2295,7 @@ def test_discuss_parallel_artifacts_are_isolated_by_round_and_agent(tmp_path):
             _discuss_review_text(outcome="implement", rationale="Now yes.", rebuttal="Conceding.", analyzer_framing="accurate"),
         ],
         claude_outputs=[_discuss_agenda_text()],
+        issue_payload=_grounded_agenda_issue_payload(),
     )
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude", discuss_parallel=True
