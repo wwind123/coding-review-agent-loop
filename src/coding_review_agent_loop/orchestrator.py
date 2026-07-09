@@ -4986,6 +4986,235 @@ def _recover_final_discuss_split_proposals(
     return consensus[1], final_votes
 
 
+_DISCUSS_AGENDA_SUPPORT_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "but",
+        "by",
+        "can",
+        "could",
+        "do",
+        "does",
+        "for",
+        "from",
+        "has",
+        "have",
+        "if",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "our",
+        "so",
+        "than",
+        "that",
+        "the",
+        "their",
+        "this",
+        "to",
+        "use",
+        "was",
+        "we",
+        "what",
+        "when",
+        "whether",
+        "which",
+        "while",
+        "with",
+        "would",
+        # Low-signal discuss/analyzer boilerplate. These terms are common in
+        # agenda summaries and should not validate invented content alone.
+        "approach",
+        "change",
+        "custom",
+        "existing",
+        "implementation",
+        "issue",
+        "next",
+        "objection",
+        "question",
+        "round",
+        "scope",
+        "strategy",
+    }
+)
+
+
+def _normalize_discuss_agenda_phrase(text: str) -> str:
+    return " ".join(re.findall(r"[A-Za-z0-9_]+", text.lower()))
+
+
+def _tokenize_discuss_agenda_support(
+    text: str,
+    *,
+    ignored_names: Sequence[str] = (),
+) -> tuple[str, ...]:
+    ignored_tokens = {
+        token
+        for name in ignored_names
+        for token in re.findall(r"[A-Za-z0-9_]+", name.lower())
+    }
+    tokens: list[str] = []
+    for token in re.findall(r"[A-Za-z0-9_]+", text.lower()):
+        if len(token) <= 2 and not token.isdigit():
+            continue
+        if token in ignored_tokens or token in _DISCUSS_AGENDA_SUPPORT_STOP_WORDS:
+            continue
+        tokens.append(token)
+    return tuple(tokens)
+
+
+@dataclass(frozen=True)
+class _DiscussAgendaSupportCorpus:
+    phrase_segments: tuple[str, ...]
+    tokens: frozenset[str]
+
+
+def _build_discuss_agenda_support_corpus(
+    *,
+    issue_context: IssueContext,
+    round_history: Sequence[Sequence[ParsedDiscussReview]],
+    prior_agenda: ParsedDiscussAgenda | None,
+    configured_reviewers: Sequence[AgentName],
+    analyzer: AgentName,
+) -> _DiscussAgendaSupportCorpus:
+    segments: list[str] = []
+    phrase_segments: list[str] = []
+
+    def add(value: object, *, phrase_support: bool = False) -> None:
+        if isinstance(value, str) and value.strip():
+            segments.append(value)
+            if phrase_support:
+                phrase_segments.append(value)
+
+    add(issue_context.title, phrase_support=True)
+    add(issue_context.body, phrase_support=True)
+    for comment in issue_context.comments:
+        add(comment.author)
+        add(comment.created_at)
+        add(comment.body, phrase_support=True)
+    for reviewer in configured_reviewers:
+        add(agent_display_name(reviewer))
+    for round_index, votes in enumerate(round_history, start=1):
+        add(f"Round {round_index}")
+        for vote in votes:
+            add(vote.reviewer)
+            add(vote.outcome)
+            add(vote.rationale, phrase_support=True)
+            add(vote.rebuttal, phrase_support=True)
+            add(vote.analyzer_framing)
+            add(vote.framing_note, phrase_support=True)
+            for proposal in vote.split_proposals:
+                add(proposal, phrase_support=True)
+            add(vote.research_status)
+            for fact in vote.sourced_facts:
+                add(fact.fact, phrase_support=True)
+                add(fact.source, phrase_support=True)
+    if prior_agenda is not None:
+        for point in prior_agenda.consensus:
+            add(point, phrase_support=True)
+        for disagreement in prior_agenda.disagreements:
+            add(disagreement.topic, phrase_support=True)
+            for name, position in disagreement.positions:
+                add(name)
+                add(position, phrase_support=True)
+            add(disagreement.question_for_next_round, phrase_support=True)
+        for fact in prior_agenda.missing_facts:
+            add(fact, phrase_support=True)
+        for question in prior_agenda.research_questions:
+            add(question, phrase_support=True)
+
+    ignored_names = [
+        agent_display_name(analyzer),
+        *(agent_display_name(r) for r in configured_reviewers),
+    ]
+    tokens = frozenset(
+        token
+        for segment in segments
+        for token in _tokenize_discuss_agenda_support(segment, ignored_names=ignored_names)
+    )
+    return _DiscussAgendaSupportCorpus(
+        phrase_segments=tuple(
+            normalized
+            for segment in phrase_segments
+            if (normalized := _normalize_discuss_agenda_phrase(segment))
+        ),
+        tokens=tokens,
+    )
+
+
+def _discuss_agenda_text_has_support(
+    text: str,
+    *,
+    corpus: _DiscussAgendaSupportCorpus,
+    ignored_names: Sequence[str],
+) -> bool:
+    tokens = _tokenize_discuss_agenda_support(text, ignored_names=ignored_names)
+    if tokens:
+        supported = sum(1 for token in set(tokens) if token in corpus.tokens)
+        required = 1 if len(set(tokens)) <= 4 else 2
+        return supported >= required
+    normalized = _normalize_discuss_agenda_phrase(text)
+    return bool(
+        normalized
+        and any(
+            normalized == segment or normalized in segment
+            for segment in corpus.phrase_segments
+        )
+    )
+
+
+def _validate_discuss_analyzer_agenda_fidelity(
+    agenda: ParsedDiscussAgenda,
+    *,
+    issue_context: IssueContext,
+    round_history: Sequence[Sequence[ParsedDiscussReview]],
+    prior_agenda: ParsedDiscussAgenda | None,
+    configured_reviewers: Sequence[AgentName],
+    analyzer: AgentName,
+) -> None:
+    allowed_names = {agent_display_name(reviewer) for reviewer in configured_reviewers}
+    unknown_names = sorted(
+        {name for disagreement in agenda.disagreements for name, _position in disagreement.positions}
+        - allowed_names
+    )
+    if unknown_names:
+        raise AgentLoopError(
+            "analyzer agenda used unknown debater name(s): " + ", ".join(unknown_names)
+        )
+
+    ignored_names = [agent_display_name(analyzer), *sorted(allowed_names)]
+    corpus = _build_discuss_agenda_support_corpus(
+        issue_context=issue_context,
+        round_history=round_history,
+        prior_agenda=prior_agenda,
+        configured_reviewers=configured_reviewers,
+        analyzer=analyzer,
+    )
+
+    fields: list[tuple[str, str]] = []
+    fields.extend(("consensus", point) for point in agenda.consensus)
+    for disagreement in agenda.disagreements:
+        fields.append(("disagreement topic", disagreement.topic))
+        fields.extend(("position", position) for _name, position in disagreement.positions)
+        fields.append(("question_for_next_round", disagreement.question_for_next_round))
+    fields.extend(("missing_fact", fact) for fact in agenda.missing_facts)
+    fields.extend(("research_question", question) for question in agenda.research_questions)
+
+    for field, text in fields:
+        if not _discuss_agenda_text_has_support(text, corpus=corpus, ignored_names=ignored_names):
+            raise AgentLoopError(f"analyzer agenda {field} lacks transcript support: {text}")
+
+
 def _run_discuss_analyzer(
     runner: Runner,
     *,
@@ -5049,19 +5278,22 @@ def _run_discuss_analyzer(
         return None, None
     parsed = response.marker_value
     assert isinstance(parsed, ParsedDiscussAgenda)
-    known_names = {agent_display_name(reviewer) for reviewer in configured_reviewers}
-    unknown_names = sorted(
-        {name for disagreement in parsed.disagreements for name, _position in disagreement.positions}
-        - known_names
-    )
-    if unknown_names:
-        # Non-authoritative analyzer output is forwarded as-is; debaters and the
-        # public summary can audit and correct it.
+    try:
+        _validate_discuss_analyzer_agenda_fidelity(
+            parsed,
+            issue_context=issue_context,
+            round_history=round_history,
+            prior_agenda=prior_agenda,
+            configured_reviewers=configured_reviewers,
+            analyzer=analyzer,
+        )
+    except AgentLoopError as exc:
         log(
             config,
-            f"discuss: analyzer agenda names unknown debater(s): {', '.join(unknown_names)}; "
-            "forwarding as-is",
+            f"discuss: analyzer {analyzer_name} agenda rejected ({exc}); falling back to the "
+            f"mechanical agenda for round {round_number + 1}",
         )
+        return None, None
     return parsed, response.text
 
 

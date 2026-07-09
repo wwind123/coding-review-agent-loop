@@ -3209,3 +3209,5 @@ def test_build_repair_prompt_accepts_discuss_agenda_expected_kind():
     assert "You MUST repair this response as `discuss_agenda`." in prompt
     assert "Valid Format F — Discuss Agenda" in prompt
     assert "question_for_next_round" in prompt
+    assert "Never invent topics, debater positions, facts, or questions" in prompt
+    assert "If no agenda content is recoverable" in prompt

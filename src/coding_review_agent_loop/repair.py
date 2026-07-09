@@ -315,6 +315,9 @@ Notes:
 - positions maps debater display names to short position statements and must not be empty.
 - research_required/research_questions (optional): keep them only when present in the original; never invent research questions or drop ones the original stated.
 - research_questions must be non-empty when research_required is true, and empty or omitted when it is false or absent.
+- Repair only agenda content that is recoverable from the malformed response and supplied context.
+- Never invent topics, debater positions, facts, or questions to make the agenda schema-valid.
+- If no agenda content is recoverable, return the closest faithful output even if it remains invalid; the orchestrator will fall back mechanically.
 - footer must always be <!-- AGENT_PLAN_STATE: approved --> (never blocking).
 
 ## Valid Format D — Plan Revision:

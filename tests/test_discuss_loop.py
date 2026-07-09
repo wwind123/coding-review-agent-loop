@@ -11,13 +11,19 @@ from coding_review_agent_loop.orchestrator import (
     _attach_round_metadata,
     _decode_round_metadata,
     _discuss_subject,
+    _validate_discuss_analyzer_agenda_fidelity,
     render_public_agent_comment,
     run_discuss_loop,
 )
 from coding_review_agent_loop.comment_rendering import render_discuss_round_summary_comment
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment, IssueContext
-from coding_review_agent_loop.protocol import ParsedDiscussReview
+from coding_review_agent_loop.protocol import (
+    DiscussAgendaDisagreement,
+    DiscussSourcedFact,
+    ParsedDiscussAgenda,
+    ParsedDiscussReview,
+)
 
 from agent_loop_helpers import FakeRunner, make_config
 
@@ -86,6 +92,18 @@ def _discuss_agenda_text(
 def _issue_subject(title: str = "Fix issue-mode context", body: str = "Original issue body.") -> str:
     text = title + "\n\n" + body
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _grounded_agenda_issue_payload() -> dict[str, str]:
+    return {
+        "body": (
+            "Original issue body. The issue is well-motivated. Scope of the change. "
+            "Would splitting resolve the scope objection? Whether the API boundary is specified. "
+            "Narrow enough. Too broad. "
+            "Round-one agenda marker. Round-two agenda marker. "
+            "Everyone agrees to implement. Is Gemini CLI still available for enterprise users?"
+        )
+    }
 
 
 def _seed_debater_comment(
@@ -365,6 +383,170 @@ def test_discuss_subject_excludes_debater_and_summary_comments_from_hash():
         ),
     )
     assert _discuss_subject(ctx_with_rounds) == subject
+
+
+def _validate_agenda_for_test(
+    agenda: ParsedDiscussAgenda,
+    *,
+    issue_context: IssueContext | None = None,
+    round_history: list[list[ParsedDiscussReview]] | None = None,
+    prior_agenda: ParsedDiscussAgenda | None = None,
+) -> None:
+    _validate_discuss_analyzer_agenda_fidelity(
+        agenda,
+        issue_context=issue_context
+        or IssueContext(
+            number=1,
+            repo="OWNER/REPO",
+            title="Supported title",
+            body="Supported body",
+            url=None,
+            comments=(),
+        ),
+        round_history=round_history or [],
+        prior_agenda=prior_agenda,
+        configured_reviewers=("codex", "gemini"),
+        analyzer="claude",
+    )
+
+
+def _agenda_for_fidelity(
+    *,
+    consensus: tuple[str, ...] = (),
+    topic: str = "Supported title",
+    positions: tuple[tuple[str, str], ...] = (("Codex", "Supported body"),),
+    question: str = "Supported title?",
+    missing_facts: tuple[str, ...] = (),
+    research_questions: tuple[str, ...] = (),
+) -> ParsedDiscussAgenda:
+    return ParsedDiscussAgenda(
+        consensus=consensus,
+        disagreements=(
+            DiscussAgendaDisagreement(
+                topic=topic,
+                positions=positions,
+                question_for_next_round=question,
+            ),
+        ),
+        missing_facts=missing_facts,
+        research_required=bool(research_questions),
+        research_questions=research_questions,
+    )
+
+
+def test_discuss_analyzer_fidelity_rejects_unknown_position_key():
+    agenda = _agenda_for_fidelity(positions=(("Developer", "Supported body"),))
+
+    with pytest.raises(AgentLoopError, match="unknown debater"):
+        _validate_agenda_for_test(agenda)
+
+
+@pytest.mark.parametrize(
+    ("field", "agenda"),
+    [
+        ("topic", _agenda_for_fidelity(topic="Levitation library strategy")),
+        ("position", _agenda_for_fidelity(positions=(("Codex", "Use levitation libraries"),))),
+        ("question", _agenda_for_fidelity(question="Should custom field manipulation win?")),
+        ("missing_fact", _agenda_for_fidelity(missing_facts=("Levitation benchmark data",))),
+        ("consensus", _agenda_for_fidelity(consensus=("Levitation is agreed",))),
+        (
+            "research_question",
+            _agenda_for_fidelity(research_questions=("Which levitation library is fastest?",)),
+        ),
+    ],
+)
+def test_discuss_analyzer_fidelity_rejects_unsupported_agenda_text(field, agenda):
+    with pytest.raises(AgentLoopError, match=field):
+        _validate_agenda_for_test(agenda)
+
+
+def test_discuss_analyzer_fidelity_accepts_issue_comment_and_body_support():
+    ctx = IssueContext(
+        number=1,
+        repo="OWNER/REPO",
+        title="API boundary",
+        body="The scoped change is the implementation approach.",
+        url=None,
+        comments=(
+            IssueComment(author="user", created_at="2026-01-01", body="Missing migration facts."),
+        ),
+    )
+    agenda = _agenda_for_fidelity(
+        consensus=("API boundary",),
+        topic="scoped change",
+        positions=(("Codex", "implementation approach"),),
+        question="API boundary?",
+        missing_facts=("Missing migration facts",),
+    )
+
+    _validate_agenda_for_test(agenda, issue_context=ctx)
+
+
+def test_discuss_analyzer_fidelity_accepts_vote_research_and_prior_agenda_support():
+    round_history = [
+        [
+            ParsedDiscussReview(
+                outcome="split",
+                rationale="Codex wants adapter cleanup.",
+                split_proposals=("Extract parser stage",),
+                reviewer="Codex",
+                rebuttal="Keep adapter cleanup small.",
+                analyzer_framing="misframed",
+                framing_note="The API migration risk was overstated.",
+                research_status="sourced",
+                sourced_facts=(
+                    DiscussSourcedFact(
+                        fact="Gemini CLI remains available.",
+                        source="https://example.com/gemini",
+                    ),
+                ),
+            ),
+            ParsedDiscussReview(
+                outcome="implement",
+                rationale="Gemini accepts parser stage.",
+                split_proposals=(),
+                reviewer="Gemini",
+            ),
+        ]
+    ]
+    prior_agenda = ParsedDiscussAgenda(
+        consensus=("Prior analyzer agenda",),
+        disagreements=(),
+        missing_facts=("Prior missing fact",),
+    )
+    agenda = _agenda_for_fidelity(
+        consensus=("Prior analyzer agenda",),
+        topic="adapter cleanup",
+        positions=(("Codex", "Extract parser stage"), ("Gemini", "accepts parser stage")),
+        question="API migration risk?",
+        missing_facts=("Prior missing fact",),
+        research_questions=("Gemini CLI remains available?",),
+    )
+
+    _validate_agenda_for_test(agenda, round_history=round_history, prior_agenda=prior_agenda)
+
+
+def test_discuss_analyzer_fidelity_accepts_empty_agenda_collections():
+    agenda = ParsedDiscussAgenda(consensus=(), disagreements=(), missing_facts=())
+
+    _validate_agenda_for_test(agenda)
+
+
+def test_discuss_analyzer_fidelity_requires_exact_support_for_generic_only_text():
+    agenda = _agenda_for_fidelity(topic="Scope of the change")
+
+    with pytest.raises(AgentLoopError, match="topic"):
+        _validate_agenda_for_test(agenda)
+
+    ctx = IssueContext(
+        number=1,
+        repo="OWNER/REPO",
+        title="My issue",
+        body="Scope of the change. Supported body. Supported title.",
+        url=None,
+        comments=(),
+    )
+    _validate_agenda_for_test(agenda, issue_context=ctx)
 
 
 def test_discuss_loop_reruns_when_human_comment_added(tmp_path):
@@ -908,6 +1090,7 @@ def test_discuss_loop_analyzer_agenda_focuses_debate_and_final_summary_distingui
             ),
         ],
         claude_outputs=[agenda_text],
+        issue_payload=_grounded_agenda_issue_payload(),
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
 
@@ -987,6 +1170,7 @@ def test_discuss_loop_debater_misframing_correction_is_rendered(tmp_path):
             ),
         ],
         claude_outputs=[_discuss_agenda_text()],
+        issue_payload=_grounded_agenda_issue_payload(),
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
 
@@ -1047,6 +1231,83 @@ def test_discuss_loop_analyzer_failure_falls_back_to_mechanical_agenda(tmp_path)
     assert "Analyzer-extracted consensus" not in final
 
 
+def test_discuss_loop_rejects_repaired_hallucinated_analyzer_agenda(tmp_path):
+    from unittest.mock import patch
+
+    repaired = _discuss_agenda_text(
+        disagreements=[
+            {
+                "topic": "Antigravity implementation strategy",
+                "positions": {
+                    "Developer": "Use existing levitation libraries.",
+                    "Reviewer": "Implement custom field manipulation for performance.",
+                },
+                "question_for_next_round": (
+                    "Does custom field manipulation provide significant enough performance "
+                    "gains to justify the maintenance overhead?"
+                ),
+            }
+        ],
+        missing_facts=["Performance benchmarks for existing levitation libraries."],
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            _discuss_review_text(outcome="implement", rationale="Codex round-one rationale."),
+            _discuss_review_text(
+                outcome="implement", rationale="Still scoped.", rebuttal="Scope holds."
+            ),
+        ],
+        gemini_outputs=[
+            _discuss_review_text(
+                outcome="split",
+                rationale="Gemini round-one rationale.",
+                split_proposals=["Extract setup work"],
+            ),
+            _discuss_review_text(
+                outcome="split",
+                rationale="Still split.",
+                split_proposals=["Extract setup work"],
+                rebuttal="Split still fits.",
+            ),
+        ],
+        claude_outputs=[
+            "I've drafted the round-1 agenda but the write to the required response file needs your permission."
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+        result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+
+    assert result == 0
+    rendered = "\n".join(runner.comments)
+    assert "Antigravity implementation strategy" not in rendered
+    assert "levitation libraries" not in rendered
+    assert "custom field manipulation" not in rendered
+    round1_summary = runner.comments[2]
+    assert "### Agenda for round 2" in round1_summary
+    assert "(analyzer:" not in round1_summary
+    assert "- Codex held `implement`: Codex round-one rationale." in round1_summary
+    assert "- Gemini held `split`: Gemini round-one rationale." in round1_summary
+    assert "### Analyzer-extracted consensus" not in round1_summary
+    match = ROUND_RESUME_MARKER_RE.search(runner.issue_comments[2]["body"])
+    assert match is not None
+    metadata = _decode_round_metadata(match.group("payload"))
+    assert metadata is not None
+    assert metadata.analyzer_response is None
+    debate_commands = [cmd for cmd, _cwd in runner.commands if "debate round 2" in " ".join(cmd)]
+    assert len(debate_commands) == 2
+    for command in debate_commands:
+        prompt = " ".join(command)
+        assert "Prior round reviewer positions:" in prompt
+        assert "Codex round-one rationale." in prompt
+        assert "Gemini round-one rationale." in prompt
+        assert "Antigravity implementation strategy" not in prompt
+        assert "levitation libraries" not in prompt
+    final = runner.comments[-1]
+    assert "Analyzer-extracted consensus" not in final
+
+
 def test_discuss_loop_three_rounds_second_analyzer_prompt_includes_full_history(tmp_path):
     agenda_round1 = _discuss_agenda_text(consensus=["Round-one agenda marker."])
     agenda_round2 = _discuss_agenda_text(consensus=["Round-two agenda marker."])
@@ -1084,6 +1345,7 @@ def test_discuss_loop_three_rounds_second_analyzer_prompt_includes_full_history(
             ),
         ],
         claude_outputs=[agenda_round1, agenda_round2],
+        issue_payload=_grounded_agenda_issue_payload(),
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
 
@@ -1249,6 +1511,7 @@ def test_discuss_loop_agenda_claiming_consensus_is_forwarded_but_votes_rule(tmp_
             ),
         ],
         claude_outputs=[agenda_text],
+        issue_payload=_grounded_agenda_issue_payload(),
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
 
@@ -1419,6 +1682,7 @@ def test_discuss_loop_auto_mode_analyzer_brief_propagates_to_next_round(tmp_path
             ),
         ],
         claude_outputs=[agenda_text],
+        issue_payload=_grounded_agenda_issue_payload(),
     )
     config = make_config(
         tmp_path,
