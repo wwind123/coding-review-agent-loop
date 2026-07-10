@@ -399,6 +399,12 @@ def test_attempt_repair_format_d_marks_human_requirements_optional():
     assert "omit the `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` marker" in _REPAIR_PROMPT
     assert "the `### Human requirements` section from Format D" in _REPAIR_PROMPT
 
+
+def test_repair_prompt_makes_research_intent_conditional_on_active_status():
+    assert '`target` and `questions` are conditional intent fields' in _REPAIR_PROMPT
+    assert 'omit both for `status: "not-needed"`' in _REPAIR_PROMPT
+    assert 'For `status: "not-needed"`,' in _REPAIR_PROMPT
+
 def test_attempt_repair_includes_prior_item_disposition_repair_context():
     repaired = structured_plan_revision(prior_plan_item_dispositions=[])
     mock_result = MagicMock()

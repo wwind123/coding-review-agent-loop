@@ -289,6 +289,7 @@ Notes:
 - analyzer_framing (optional) must be "accurate" or "misframed"; framing_note is required when analyzer_framing is "misframed".
 - research (optional): keep it only when the original reported research; never invent statuses, facts, or sources, and never drop ones the original stated.
 - research.sourced_facts must be non-empty when research.status is "sourced" (each entry needs non-empty fact and source) and empty or omitted for other statuses.
+- In the research examples above, `target` and `questions` are conditional intent fields: include them together only when research is active (any status other than `not-needed`); omit both for `status: "not-needed"`. Never add them just to match the example shape.
 - Preserve recoverable research.target and research.questions together; use only the allowed targets (example-validation, solution-design, cost-latency, implementation-feasibility, policy/legal/current-facts). Never infer missing intent.
 - footer must always be <!-- AGENT_PLAN_STATE: approved --> (never blocking).
 
@@ -339,7 +340,8 @@ Notes: preserve answer-mode fields, never convert this payload to `outcome` or
 deadlock caused by disagreement.
 
 When research intent is present, preserve `target` and `questions` together;
-never invent either field or a source while repairing.
+never invent either field or a source while repairing. For `status: "not-needed"`,
+omit both intent fields because they are valid only for active research.
 
 Notes:
 - consensus, disagreements, and missing_facts may be empty arrays.
