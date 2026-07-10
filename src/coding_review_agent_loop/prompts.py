@@ -2493,7 +2493,7 @@ def build_discuss_review_prompt(
                 + "  }"
             )
             research_rules = (
-                " Research is required by the selected policy; when active, include "
+                " When research is active under the selected policy, include "
                 "research.target and non-empty research.questions before sourced_facts. "
                 "Use only the targets example-validation, solution-design, cost-latency, "
                 "implementation-feasibility, or policy/legal/current-facts."

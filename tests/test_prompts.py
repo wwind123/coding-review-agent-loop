@@ -2262,6 +2262,15 @@ def test_build_discuss_review_prompt_research_auto_documents_triggers(tmp_path):
     assert "must not be `not-needed`" not in prompt
     assert "illustrative incident" in prompt
 
+    answer_config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer"
+    )
+    answer_prompt = build_discuss_review_prompt(
+        56, answer_config, reviewer="codex", round_number=1, research_mode="auto"
+    )
+    assert "Research is required by the selected policy" not in answer_prompt
+    assert "When research is active under the selected policy" in answer_prompt
+
 
 def test_build_discuss_review_prompt_renders_shared_research_brief(tmp_path):
     config = make_config(tmp_path, reviewer=("codex", "gemini"))
