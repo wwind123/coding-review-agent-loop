@@ -405,6 +405,13 @@ agent-loop discuss 123 --repo OWNER/REPO \
   --discuss-research auto
 ```
 
+For design or implementation issues, round-one research defaults to the
+decision-relevant tradeoff: solution design and prior art, cost/latency,
+implementation feasibility, and guardrails. Validate a motivating example only
+when its truth is disputed or outcome-critical. Active research records a target
+and concrete questions; targets are `example-validation`, `solution-design`,
+`cost-latency`, `implementation-feasibility`, and `policy/legal/current-facts`.
+
 Pass `--discuss-parallel` to run same-round debaters concurrently instead of
 sequentially. Prompts are built from shared pre-round state before any debater
 launches and comments are posted only after every debater in the round

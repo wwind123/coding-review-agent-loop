@@ -127,6 +127,12 @@ def test_discuss_answer_parser_enforces_escalation_rebuttal_research_and_analyze
         _discuss_answer_text(base), reviewer="Reviewer", round_number=2, research_mode="required"
     )
     assert parsed.research_status == "sourced"
+    intent = {**base, "research": {**base["research"], "target": "cost-latency", "questions": ["What latency cost applies?"]}}
+    parsed_intent = validate_structured_discuss_answer(
+        _discuss_answer_text(intent), reviewer="Reviewer", round_number=2, research_mode="required"
+    )
+    assert parsed_intent.research_target == "cost-latency"
+    assert parsed_intent.research_questions == ("What latency cost applies?",)
     with pytest.raises(AgentLoopError, match="framing_note requires"):
         validate_structured_discuss_answer(
             _discuss_answer_text({**base, "analyzer_framing": None, "framing_note": "note"}),
@@ -3263,6 +3269,35 @@ def test_parse_structured_discuss_review_research_rejects_empty_source():
         parse_structured_discuss_review(text, reviewer="Gemini")
 
 
+def test_discuss_research_intent_round_trips_and_rejects_inconsistent_metadata():
+    text = _discuss_review_with_research(research={
+        "status": "sourced",
+        "target": "solution-design",
+        "questions": ["What prior art and guardrails apply?"],
+        "sourced_facts": [{"fact": "Prior art exists.", "source": "https://example.test/prior-art"}],
+    })
+    result = parse_structured_discuss_review(text, reviewer="Gemini")
+    assert result is not None
+    assert result.research_target == "solution-design"
+    assert result.research_questions == ("What prior art and guardrails apply?",)
+    with pytest.raises(AgentLoopError, match="target must be one of"):
+        parse_structured_discuss_review(
+            _discuss_review_with_research(research={
+                "status": "sourced", "target": "incident", "questions": ["Why?"],
+                "sourced_facts": [{"fact": "Fact", "source": "https://example.test"}],
+            }),
+            reviewer="Gemini",
+        )
+    with pytest.raises(AgentLoopError, match="supplied together"):
+        parse_structured_discuss_review(
+            _discuss_review_with_research(research={
+                "status": "sourced", "target": "solution-design",
+                "sourced_facts": [{"fact": "Fact", "source": "https://example.test"}],
+            }),
+            reviewer="Gemini",
+        )
+
+
 def test_parse_structured_discuss_review_research_rejects_facts_without_sourced_status():
     text = _discuss_review_with_research(
         research={
@@ -3347,6 +3382,24 @@ def test_parse_structured_discuss_agenda_research_round_trip():
     assert result.research_questions == (
         "Is Gemini CLI still available for enterprise users?",
     )
+
+
+def test_parse_structured_discuss_agenda_classified_questions_align():
+    payload = json.loads(_discuss_agenda_with_research(
+        research_required=True,
+        research_questions=["What implementation strategy is safest?", "What is the latency cost?"],
+    ).split("\n", 1)[0])
+    payload["research_question_targets"] = ["solution-design", "cost-latency"]
+    result = parse_structured_discuss_agenda(
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Claude"
+    )
+    assert result is not None
+    assert result.research_question_targets == ("solution-design", "cost-latency")
+    payload["research_question_targets"] = ["solution-design"]
+    with pytest.raises(AgentLoopError, match="align one-to-one"):
+        parse_structured_discuss_agenda(
+            json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Claude"
+        )
 
 
 def test_parse_structured_discuss_agenda_accepts_explicit_no_research():

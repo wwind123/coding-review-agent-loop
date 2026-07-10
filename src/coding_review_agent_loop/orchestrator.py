@@ -104,6 +104,7 @@ from .prompts import (
 )
 from .protocol import (
     DISCUSS_FAILED_OUTCOME,
+    DISCUSS_RESEARCH_TARGET_VALUES,
     DeferredStage,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     ParsedDiscussAgenda,
@@ -5150,6 +5151,9 @@ def _build_discuss_agenda_support_corpus(
             add(getattr(vote, "analyzer_framing", None))
             add(getattr(vote, "framing_note", None), phrase_support=True)
             add(getattr(vote, "research_status", None))
+            add(getattr(vote, "research_target", None))
+            for question in getattr(vote, "research_questions", ()):
+                add(question, phrase_support=True)
             for fact in getattr(vote, "sourced_facts", ()):
                 add(fact.fact, phrase_support=True)
                 add(fact.source, phrase_support=True)
@@ -5166,6 +5170,8 @@ def _build_discuss_agenda_support_corpus(
             add(fact, phrase_support=True)
         for question in prior_agenda.research_questions:
             add(question, phrase_support=True)
+        for target in prior_agenda.research_question_targets:
+            add(target)
 
     ignored_names = [
         agent_display_name(analyzer),
@@ -5217,6 +5223,16 @@ def _validate_discuss_analyzer_agenda_fidelity(
     analyzer: AgentName,
 ) -> None:
     allowed_names = {agent_display_name(reviewer) for reviewer in configured_reviewers}
+    targets = agenda.research_question_targets
+    if targets and len(targets) != len(agenda.research_questions):
+        raise AgentLoopError(
+            "analyzer agenda research_question_targets must align one-to-one with research_questions."
+        )
+    invalid_targets = sorted(set(targets) - DISCUSS_RESEARCH_TARGET_VALUES)
+    if invalid_targets:
+        raise AgentLoopError(
+            "analyzer agenda used invalid research target(s): " + ", ".join(invalid_targets)
+        )
     unknown_names = sorted(
         {name for disagreement in agenda.disagreements for name, _position in disagreement.positions}
         - allowed_names

@@ -273,6 +273,8 @@ You are a format-repair assistant. An AI agent produced a code review, plan revi
   "rebuttal": "<required in debate rounds; omit in initial round>",
   "research": {
     "status": "sourced" | "not-needed" | "unavailable" | "inconclusive",
+    "target": "solution-design",
+    "questions": ["<concrete research question>"],
     "sourced_facts": [{"fact": "<external fact>", "source": "<URL or reference>"}]
   }
 }
@@ -287,6 +289,7 @@ Notes:
 - analyzer_framing (optional) must be "accurate" or "misframed"; framing_note is required when analyzer_framing is "misframed".
 - research (optional): keep it only when the original reported research; never invent statuses, facts, or sources, and never drop ones the original stated.
 - research.sourced_facts must be non-empty when research.status is "sourced" (each entry needs non-empty fact and source) and empty or omitted for other statuses.
+- Preserve recoverable research.target and research.questions together; use only the allowed targets (example-validation, solution-design, cost-latency, implementation-feasibility, policy/legal/current-facts). Never infer missing intent.
 - footer must always be <!-- AGENT_PLAN_STATE: approved --> (never blocking).
 
 ## Valid Format F — Discuss Agenda:
@@ -304,7 +307,8 @@ Notes:
   ],
   "missing_facts": ["<missing fact or assumption>"],
   "research_required": false,
-  "research_questions": []
+  "research_questions": [],
+  "research_question_targets": []
 }
 <!-- AGENT_PLAN_STATE: approved -->
 -- <Analyzer Name>
@@ -320,7 +324,12 @@ Notes:
   "confidence": "low" | "medium" | "high",
   "open_questions": ["<question; required for needs-human>"],
   "rebuttal": "<required after round one>",
-  "research": {"status": "sourced" | "not-needed" | "unavailable" | "inconclusive", "sourced_facts": []}
+  "research": {
+    "status": "sourced" | "not-needed" | "unavailable" | "inconclusive",
+    "target": "solution-design",
+    "questions": ["<concrete research question>"],
+    "sourced_facts": []
+  }
 }
 <!-- AGENT_PLAN_STATE: approved -->
 -- <Reviewer Name>
@@ -329,12 +338,16 @@ Notes: preserve answer-mode fields, never convert this payload to `outcome` or
 `split_proposals`; `needs-human` is explicit escalation and is distinct from
 deadlock caused by disagreement.
 
+When research intent is present, preserve `target` and `questions` together;
+never invent either field or a source while repairing.
+
 Notes:
 - consensus, disagreements, and missing_facts may be empty arrays.
 - each disagreement requires non-empty topic, positions, and question_for_next_round.
 - positions maps debater display names to short position statements and must not be empty.
 - research_required/research_questions (optional): keep them only when present in the original; never invent research questions or drop ones the original stated.
 - research_questions must be non-empty when research_required is true, and empty or omitted when it is false or absent.
+- research_question_targets, when present, must preserve the original one-to-one alignment with research_questions; never invent classifications.
 - Repair only agenda content that is recoverable from the malformed response and supplied context.
 - Never invent topics, debater positions, facts, or questions to make the agenda schema-valid.
 - If no agenda content is recoverable, return the closest faithful output even if it remains invalid; the orchestrator will fall back mechanically.

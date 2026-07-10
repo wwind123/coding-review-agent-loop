@@ -506,6 +506,17 @@ agent-loop discuss 123 --repo OWNER/REPO \
   --discuss-research auto
 ```
 
+For design issues, round-one research focuses on the decision under debate
+(solution design, prior art, cost/latency, feasibility, or guardrails), not just
+verification of an illustrative incident. Example validation is appropriate
+when the example is disputed or outcome-critical. Active research records a
+target and concrete questions. Allowed targets are `example-validation`,
+`solution-design`, `cost-latency`, `implementation-feasibility`, and
+`policy/legal/current-facts`.
+New active responses and research-required agendas should include these fields;
+older transcripts may omit them and remain resumable as legacy, unclassified
+research.
+
 - `none`: prompts explicitly forbid online research; plain discuss mode and
   analyzer mode remain usable without network-dependent behavior. Best for
   internal design questions.
@@ -527,11 +538,12 @@ add a shared research brief:
 ```json
 {
   "research_required": true,
-  "research_questions": ["Is Gemini CLI still available for enterprise users?"]
+  "research_questions": ["Is Gemini CLI still available for enterprise users?"],
+  "research_question_targets": ["policy/legal/current-facts"]
 }
 ```
 
-The orchestrator forwards those questions to the next round's debater prompts
+The orchestrator forwards those questions and their aligned classifications to the next round's debater prompts
 ("Shared research brief") so parallel or repeated debater turns do not
 duplicate work, and carries unresolved questions forward between rounds. In
 `auto` mode the analyzer is told to set `research_required: true` only when a

@@ -2252,7 +2252,11 @@ def _render_discuss_agenda_prompt_block(agenda: ParsedDiscussAgenda) -> list[str
             "Shared research brief — answer these with cited sources before "
             "restating positions, so parallel debater turns do not duplicate work:"
         )
-        lines.extend(f"- {question}" for question in agenda.research_questions)
+        for index, question in enumerate(agenda.research_questions):
+            target = (agenda.research_question_targets[index]
+                      if index < len(agenda.research_question_targets) else "legacy/unclassified")
+            suffix = f" (target: `{target}`)" if target != "legacy/unclassified" else ""
+            lines.append(f"- {question}{suffix}")
         lines.append("")
     return lines
 
@@ -2269,8 +2273,11 @@ DISCUSS_RESEARCH_AUTO_TRIGGERS = (
 def _discuss_research_policy_block(research_mode: str) -> str:
     if research_mode == "required":
         return (
-            "Research policy: `required`. Before answering, do online research on the\n"
-            "external facts this question depends on. Cite a source (URL or equivalent\n"
+            "Research policy: `required`. Before answering, research the decision-relevant\n"
+            "implementation/design tradeoff: prior art, cost/latency, feasibility, and\n"
+            "guardrails. Do not spend the budget merely validating an illustrative incident\n"
+            "unless its truth is disputed or outcome-critical. State the target and concrete\n"
+            "question(s) you researched before listing sourced facts. Cite a source (URL or equivalent\n"
             "reference) for every external fact via `research.sourced_facts`, and keep\n"
             "sourced facts separate from your own judgment. If research is unavailable\n"
             "or inconclusive, say so via `research.status` instead of presenting stale\n"
@@ -2280,6 +2287,10 @@ def _discuss_research_policy_block(research_mode: str) -> str:
         return (
             "Research policy: `auto`. Do online research only if the question materially\n"
             f"depends on current external facts — conservative triggers: {DISCUSS_RESEARCH_AUTO_TRIGGERS}.\n"
+            "When research is needed, prioritize the decision-relevant design, prior art,\n"
+            "cost/latency, feasibility, and guardrails over validating an illustrative incident\n"
+            "unless its truth is disputed or outcome-critical. State the target and concrete\n"
+            "question(s) before listing sourced facts.\n"
             "If no trigger applies, set `research.status` to `not-needed` and use only\n"
             "repo/issue context. If you do research, cite a source (URL or equivalent\n"
             "reference) for every external fact via `research.sourced_facts`, and keep\n"
@@ -2368,9 +2379,13 @@ def build_discuss_agenda_prompt(
             )
         research_example = (
             ',\n  "research_required": true,\n'
-            '  "research_questions": ["Is Gemini CLI still available for enterprise users?"]'
+            '  "research_questions": ["Is Gemini CLI still available for enterprise users?"],\n'
+            '  "research_question_targets": ["policy/legal/current-facts"]'
         )
         research_rules = (
+            "\n- `research_question_targets` must align one-to-one with `research_questions` "
+            "when supplied; each target is one of `example-validation`, `solution-design`, "
+            "`cost-latency`, `implementation-feasibility`, or `policy/legal/current-facts`."
             "\n- `research_questions` must be non-empty when `research_required` is "
             "true, and empty or omitted when it is false."
         )
@@ -2461,6 +2476,28 @@ def build_discuss_review_prompt(
             )
         rebuttal = "omit `rebuttal` in round 1" if round_number == 1 else "include a non-empty `rebuttal` directly addressing the prior round"
         research = _discuss_research_policy_block(research_mode)
+        research_example = ""
+        research_rules = ""
+        if research_mode in {"required", "auto"}:
+            status = "sourced" if research_mode == "required" else "not-needed"
+            research_example = (
+                ',\n  "research": {\n'
+                f'    "status": "{status}"'
+                + (
+                    ',\n    "target": "solution-design",\n'
+                    '    "questions": ["What implementation strategy and guardrails best resolve this tradeoff?"],\n'
+                    '    "sourced_facts": [{"fact": "A sourced design fact.", "source": "https://example.com/source"}]\n'
+                    if status == "sourced"
+                    else ',\n    "sourced_facts": []\n'
+                )
+                + "  }"
+            )
+            research_rules = (
+                " Research is required by the selected policy; when active, include "
+                "research.target and non-empty research.questions before sourced_facts. "
+                "Use only the targets example-validation, solution-design, cost-latency, "
+                "implementation-feasibility, or policy/legal/current-facts."
+            )
         return f"""Evaluate GitHub issue #{issue_number} in {config.repo} as an open-ended system/design question.
 
 Use this local checkout only to inspect context. Do not edit files, create a branch, commit, push, or open a pull request.
@@ -2479,9 +2516,9 @@ Respond with exactly this JSON object followed by the approved plan footer:
   "rationale": "Why this answer follows from the evidence.",
   "confidence": "medium",
   "open_questions": [],
-  "rebuttal": "..."
+  "rebuttal": "..."{research_example}
 }}
-Rules: position is exactly `answer` or `needs-human`; `answer` requires non-empty answer; `needs-human` requires non-empty open_questions and may omit answer; {rebuttal}.
+Rules: position is exactly `answer` or `needs-human`; `answer` requires non-empty answer; `needs-human` requires non-empty open_questions and may omit answer; {rebuttal}.{research_rules}
 Do not include triage fields such as outcome or split_proposals. The analyzer is not authoritative and is context only; sourced research facts must remain distinct from judgment.
 <!-- AGENT_PLAN_STATE: approved -->
 -- {reviewer_signature}
@@ -2574,9 +2611,12 @@ Do not include triage fields such as outcome or split_proposals. The analyzer is
         )
         research_example = (
             ',\n  "research": {\n'
-            f'    "status": "{example_status}",\n'
-            f'    "sourced_facts": {example_facts}\n'
-            "  }"
+            + f'    "status": "{example_status}",\n'
+            + ('    "target": "solution-design",\n'
+             '    "questions": ["What implementation strategy and guardrails best resolve this tradeoff?"],\n'
+             if example_status == "sourced" else '')
+            + f'    "sourced_facts": {example_facts}\n'
+            + "  }"
         )
         research_rules = (
             "\n- The `research` object is required. `research.status` must be one of: "
@@ -2584,6 +2624,9 @@ Do not include triage fields such as outcome or split_proposals. The analyzer is
             "\n- `research.sourced_facts` must be non-empty when `research.status` is "
             "`sourced`; each entry needs a non-empty `fact` and `source`. Omit or use "
             "`[]` for other statuses."
+            "\n- When research is active, include `research.target` and non-empty `research.questions` "
+            "before the facts. Target must be one of `example-validation`, `solution-design`, "
+            "`cost-latency`, `implementation-feasibility`, or `policy/legal/current-facts`."
         )
         if research_mode == "required":
             research_rules += (

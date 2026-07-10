@@ -1175,6 +1175,8 @@ def _discuss_research_vote(
     outcome: str = "implement",
     research_status: str | None = None,
     sourced_facts: tuple[DiscussSourcedFact, ...] = (),
+    research_target: str | None = None,
+    research_questions: tuple[str, ...] = (),
 ) -> ParsedDiscussReview:
     return ParsedDiscussReview(
         outcome=outcome,
@@ -1183,6 +1185,8 @@ def _discuss_research_vote(
         reviewer=reviewer,
         research_status=research_status,
         sourced_facts=sourced_facts,
+        research_target=research_target,
+        research_questions=research_questions,
     )
 
 
@@ -1196,10 +1200,15 @@ def test_render_public_discuss_comment_renders_sourced_facts():
                 source="https://example.com/gemini-cli-notice",
             ),
         ),
+        research_target="solution-design",
+        research_questions=("What prior art and guardrails apply?",),
     )
     rendered = _render_public_discuss_review_comment(parsed, reviewer="Codex", round_number=1)
     assert "**Research:** done, sourced facts cited below (`sourced`)" in rendered
     assert "### Sourced facts" in rendered
+    assert "### Research intent" in rendered
+    assert "Target: `solution-design`" in rendered
+    assert "What prior art and guardrails apply?" in rendered
     assert (
         "- Gemini CLI remains available for enterprise users. — source: "
         "https://example.com/gemini-cli-notice" in rendered

@@ -2181,8 +2181,10 @@ def test_build_discuss_answer_prompt_keeps_analyzer_and_research_non_authoritati
     assert '"kind": "discuss_answer"' in prompt
     assert '"position": "answer"' in prompt
     assert "The analyzer is not authoritative" in prompt
-    assert "Research policy: `required`" in prompt
+    assert "Research policy:" in prompt
     assert "sourced_facts" in prompt
+    assert '"target": "solution-design"' in prompt
+    assert '"questions":' in prompt
     assert '"outcome":' not in prompt
     assert '"split_proposals":' not in prompt
 
@@ -2241,6 +2243,8 @@ def test_build_discuss_review_prompt_research_required_enforces_sources(tmp_path
     assert '"research"' in prompt
     assert '"status": "sourced"' in prompt
     assert "sourced_facts" in prompt
+    assert "decision-relevant" in prompt
+    assert "solution-design" in prompt
     assert "must not be `not-needed`" in prompt
     assert "instead of presenting stale\nassumptions as fact" in prompt
 
@@ -2256,6 +2260,7 @@ def test_build_discuss_review_prompt_research_auto_documents_triggers(tmp_path):
     assert "`not-needed`" in prompt
     assert '"status": "not-needed"' in prompt
     assert "must not be `not-needed`" not in prompt
+    assert "illustrative incident" in prompt
 
 
 def test_build_discuss_review_prompt_renders_shared_research_brief(tmp_path):

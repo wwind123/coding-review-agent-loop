@@ -676,6 +676,7 @@ def _agenda_for_fidelity(
     question: str = "Supported title?",
     missing_facts: tuple[str, ...] = (),
     research_questions: tuple[str, ...] = (),
+    research_question_targets: tuple[str, ...] = (),
 ) -> ParsedDiscussAgenda:
     return ParsedDiscussAgenda(
         consensus=consensus,
@@ -689,7 +690,21 @@ def _agenda_for_fidelity(
         missing_facts=missing_facts,
         research_required=bool(research_questions),
         research_questions=research_questions,
+        research_question_targets=research_question_targets,
     )
+
+
+def test_discuss_analyzer_fidelity_accepts_classified_supported_research_question():
+    vote = ParsedDiscussReview(
+        outcome="implement", rationale="Research the design.", split_proposals=(), reviewer="Codex",
+        research_status="sourced", research_target="solution-design",
+        research_questions=("What prior art supports this design?",),
+    )
+    agenda = _agenda_for_fidelity(
+        research_questions=("What prior art supports this design?",),
+        research_question_targets=("solution-design",),
+    )
+    _validate_agenda_for_test(agenda, round_history=[[vote]])
 
 
 def test_discuss_analyzer_fidelity_rejects_unknown_position_key():

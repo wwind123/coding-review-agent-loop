@@ -747,6 +747,12 @@ def _render_public_discuss_review_comment(
     if parsed.research_status is not None:
         label = _DISCUSS_RESEARCH_STATUS_LABELS.get(parsed.research_status, parsed.research_status)
         sections.append(f"**Research:** {label} (`{parsed.research_status}`)")
+    if parsed.research_target:
+        sections.append(
+            "### Research intent\n\n"
+            f"- Target: `{parsed.research_target}`\n"
+            + "\n".join(f"- Question: {question}" for question in parsed.research_questions)
+        )
     if parsed.sourced_facts:
         facts = "\n".join(
             f"- {fact.fact} — source: {fact.source}" for fact in parsed.sourced_facts
@@ -771,6 +777,12 @@ def _render_public_discuss_answer_comment(
         sections.append("### Rebuttal\n\n" + parsed.rebuttal.strip())
     if parsed.research_status is not None:
         sections.append(f"**Research:** `{parsed.research_status}`")
+    if parsed.research_target:
+        sections.append(
+            "### Research intent\n\n"
+            f"- Target: `{parsed.research_target}`\n"
+            + "\n".join(f"- Question: {question}" for question in parsed.research_questions)
+        )
     if parsed.sourced_facts:
         sections.append("### Sourced facts\n\n" + "\n".join(f"- {f.fact} — source: {f.source}" for f in parsed.sourced_facts))
     sections.append(f"-- {_comment_signature(reviewer, config, model_used)}")
@@ -815,7 +827,11 @@ def _render_analyzer_agenda_lines(agenda: ParsedDiscussAgenda) -> list[str]:
         if lines:
             lines.append("")
         lines.append("Research brief for the next round (answer with cited sources):")
-        lines.extend(f"- {question}" for question in agenda.research_questions)
+        for index, question in enumerate(agenda.research_questions):
+            target = (agenda.research_question_targets[index]
+                      if index < len(agenda.research_question_targets) else "legacy/unclassified")
+            suffix = f" (target: `{target}`)" if target != "legacy/unclassified" else ""
+            lines.append(f"- {question}{suffix}")
     return lines
 
 
@@ -846,6 +862,9 @@ def _render_discuss_research_section(
                 vote.research_status, vote.research_status
             )
             lines.append(f"- {vote.reviewer}: {label} (`{vote.research_status}`)")
+        if getattr(vote, "research_target", None):
+            lines.append(f"  Target: `{vote.research_target}`")
+            lines.extend(f"  Question: {question}" for question in vote.research_questions)
     fact_rounds = round_history if round_history else [reviewer_votes]
     sourced: list[str] = []
     seen: set[tuple[str, str, str]] = set()
