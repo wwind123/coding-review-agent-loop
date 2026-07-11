@@ -8,6 +8,18 @@ implementation vote. Answer-mode transcripts are mode-bound for repair and
 resume, while analyzer observations and sourced research remain clearly
 separate from debater-confirmed conclusions.
 
+Answer-mode uses classified `unresolved_items`, not generic questions. Each item
+is exactly `{"status": "blocker" | "human-decision" | "follow-up", "text":
+"..."}`. `position` describes the debater's asserted response shape; it does
+not override the final outcome. An asserted answer can still carry a blocker
+or human decision. On the final complete round, `human-decision` takes
+precedence over `blocker`, which takes precedence over answer convergence;
+follow-ups alone are non-blocking. Each completed round replaces the prior
+round's active classifications, so concerns may be cleared or reclassified.
+Existing persisted answer-mode transcripts using `open_questions` remain
+resumable: old `needs-human` questions map to `human-decision` and old answer
+questions map conservatively to `blocker`.
+
 When answer-mode final answers differ, semantic convergence is opt-in through
 `--discuss-analyzer`. The explicitly configured analyzer (never an implicit
 reviewer fallback) receives only the final answers and performs no research or

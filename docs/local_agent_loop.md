@@ -348,12 +348,21 @@ agent-loop discuss 123 --repo OWNER/REPO \
 
 Debaters return `kind: "discuss_answer"` with `position: "answer"` or
 `"needs-human"`, plus `answer`, `rationale`, `confidence`, and
-`open_questions`. A unanimous normalized answer is rendered as **Consensus
-Answer** in round one; later convergence is **Converged Answer**. When every
-successful debater has an explicit `needs-human` position, the
-result is **Needs Human Decision**. Otherwise disagreement or partial failure
-is **Deadlock**—a lone `needs-human` position and disagreement alone never
-become escalation.
+`unresolved_items`. Each item has exactly a non-empty `text` and a `status` of
+`blocker`, `human-decision`, or `follow-up`. `position: "answer"` requires an
+answer and may include any classification; for example, an otherwise useful
+answer with a pricing `blocker` is valid but cannot conclude successfully.
+`position: "needs-human"` omits `answer` and requires at least one
+`human-decision` item.
+
+The final complete round is authoritative: later rounds can clear or
+reclassify earlier concerns. Final precedence is `human-decision` (Needs Human
+Decision), then `blocker` (Deadlock), then answer convergence; follow-ups alone
+remain non-blocking. Summaries list Blockers, Human decisions, and Non-blocking
+follow-ups separately. Legacy persisted transcripts that use `open_questions`
+are accepted only while resuming: old `needs-human` questions map to
+`human-decision`, while old asserted-answer questions map conservatively to
+`blocker`. New live responses must use `unresolved_items`.
 Analyzer observations remain non-authoritative and cited research remains a
 separate sourced-facts section. Repair and resume preserve the selected mode;
 transcripts cannot mix answer and triage responses.

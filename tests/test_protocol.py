@@ -26,6 +26,7 @@ from coding_review_agent_loop.protocol import (
     DISCUSS_OUTCOME_VALUES,
     DISCUSS_RESEARCH_STATUS_VALUES,
     DiscussAgendaDisagreement,
+    DiscussUnresolvedItem,
     DiscussSourcedFact,
     ParsedDiscussAgenda,
     ParsedDiscussReview,
@@ -44,6 +45,7 @@ from coding_review_agent_loop.protocol import (
     parse_plan_state,
     parse_structured_discuss_agenda,
     parse_structured_discuss_answer,
+    parse_legacy_structured_discuss_answer,
     parse_structured_discuss_review,
     parse_structured_plan_review,
     parse_structured_pr_review,
@@ -77,7 +79,7 @@ def test_discuss_answer_parser_requires_answer_fields_and_is_mode_isolated():
             "answer": "Use an adapter.",
             "rationale": "It preserves a replaceable boundary.",
             "confidence": "high",
-            "open_questions": [],
+            "unresolved_items": [],
         }),
         reviewer="Reviewer",
     )
@@ -86,7 +88,7 @@ def test_discuss_answer_parser_requires_answer_fields_and_is_mode_isolated():
         validate_structured_discuss_answer(
             _discuss_answer_text({
                 "position": "answer", "rationale": "Reason", "confidence": "medium",
-                "open_questions": [],
+                "unresolved_items": [],
             }),
             reviewer="Reviewer",
         )
@@ -101,11 +103,11 @@ def test_discuss_answer_parser_requires_answer_fields_and_is_mode_isolated():
 
 
 def test_discuss_answer_parser_enforces_escalation_rebuttal_research_and_analyzer_rules():
-    with pytest.raises(AgentLoopError, match="open_questions must be non-empty"):
+    with pytest.raises(AgentLoopError, match="human-decision"):
         validate_structured_discuss_answer(
             _discuss_answer_text({
                 "position": "needs-human", "rationale": "Blocked", "confidence": "low",
-                "open_questions": [],
+                "unresolved_items": [],
             }),
             reviewer="Reviewer",
         )
@@ -113,13 +115,13 @@ def test_discuss_answer_parser_enforces_escalation_rebuttal_research_and_analyze
         validate_structured_discuss_answer(
             _discuss_answer_text({
                 "position": "answer", "answer": "Use an adapter.", "rationale": "Reason",
-                "confidence": "medium", "open_questions": [],
+                "confidence": "medium", "unresolved_items": [],
             }),
             reviewer="Reviewer", round_number=2,
         )
     base = {
         "position": "answer", "answer": "Use an adapter.", "rationale": "Reason",
-        "confidence": "medium", "open_questions": [], "analyzer_framing": "accurate",
+        "confidence": "medium", "unresolved_items": [], "analyzer_framing": "accurate",
         "rebuttal": "Addressed the objection.",
         "research": {"status": "sourced", "sourced_facts": [{"fact": "Fact", "source": "https://example.test"}]},
     }
@@ -143,6 +145,58 @@ def test_discuss_answer_parser_enforces_escalation_rebuttal_research_and_analyze
             _discuss_answer_text({k: v for k, v in base.items() if k != "research"}),
             reviewer="Reviewer", research_mode="required",
         )
+
+
+def test_discuss_answer_classifies_items_strictly_and_keeps_material_answers_valid():
+    material_answer = _discuss_answer_text({
+        "position": "answer", "answer": "Use the existing API.", "rationale": "It is compatible.",
+        "confidence": "medium", "unresolved_items": [
+            {"status": "blocker", "text": "Verify the capability before rollout."},
+            {"status": "human-decision", "text": "Choose the supported product tier."},
+            {"status": "follow-up", "text": "Refresh the pricing appendix."},
+        ],
+    })
+    parsed = validate_structured_discuss_answer(material_answer, reviewer="Reviewer")
+    assert parsed.unresolved_items == (
+        DiscussUnresolvedItem("blocker", "Verify the capability before rollout."),
+        DiscussUnresolvedItem("human-decision", "Choose the supported product tier."),
+        DiscussUnresolvedItem("follow-up", "Refresh the pricing appendix."),
+    )
+    for bad_item in (
+        {"status": "unknown", "text": "Question"},
+        {"status": "blocker", "text": "   "},
+        {"status": "blocker", "text": "Question", "extra": True},
+    ):
+        with pytest.raises(AgentLoopError):
+            validate_structured_discuss_answer(_discuss_answer_text({
+                "position": "answer", "answer": "Answer", "rationale": "Reason",
+                "confidence": "medium", "unresolved_items": [bad_item],
+            }), reviewer="Reviewer")
+    with pytest.raises(AgentLoopError, match="unknown field"):
+        validate_structured_discuss_answer(_discuss_answer_text({
+            "position": "answer", "answer": "Answer", "rationale": "Reason",
+            "confidence": "medium", "unresolved_items": [], "open_questions": [],
+        }), reviewer="Reviewer")
+
+
+def test_discuss_answer_needs_human_contract_and_legacy_decoder_are_isolated():
+    with pytest.raises(AgentLoopError, match="must be omitted"):
+        validate_structured_discuss_answer(_discuss_answer_text({
+            "position": "needs-human", "answer": "Do it", "rationale": "Reason",
+            "confidence": "low", "unresolved_items": [
+                {"status": "human-decision", "text": "Choose a policy."},
+            ],
+        }), reviewer="Reviewer")
+    legacy = _discuss_answer_text({
+        "position": "answer", "answer": "Use an API.", "rationale": "Reason",
+        "confidence": "medium", "open_questions": ["Verify availability."],
+    })
+    with pytest.raises(AgentLoopError, match="unresolved_items"):
+        validate_structured_discuss_answer(legacy, reviewer="Reviewer")
+    decoded = parse_legacy_structured_discuss_answer(legacy, reviewer="Reviewer")
+    assert decoded and decoded.unresolved_items == (
+        DiscussUnresolvedItem("blocker", "Verify availability."),
+    )
 from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER
 from coding_review_agent_loop.errors import UnknownPriorItemDispositionError
 from coding_review_agent_loop.orchestrator import (

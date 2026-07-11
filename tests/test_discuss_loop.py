@@ -27,6 +27,7 @@ from coding_review_agent_loop.protocol import (
     ParsedDiscussAgenda,
     ParsedDiscussReview,
     ParsedDiscussAnswer,
+    DiscussUnresolvedItem,
 )
 
 from agent_loop_helpers import FakeRunner, make_config
@@ -34,7 +35,7 @@ from agent_loop_helpers import FakeRunner, make_config
 
 def test_answer_consensus_does_not_escalate_for_one_early_needs_human():
     responses = [
-        ParsedDiscussAnswer("needs-human", "unclear", "low", ("scope",), "Codex"),
+        ParsedDiscussAnswer("needs-human", "unclear", "low", (DiscussUnresolvedItem("human-decision", "scope"),), "Codex"),
         ParsedDiscussAnswer("answer", "clear", "medium", (), "Claude", answer="Use an API."),
     ]
     assert _detect_discuss_answer_consensus(responses) is None
@@ -42,8 +43,8 @@ def test_answer_consensus_does_not_escalate_for_one_early_needs_human():
 
 def test_answer_consensus_escalates_when_all_debaters_request_human_decision():
     responses = [
-        ParsedDiscussAnswer("needs-human", "unclear", "low", ("scope",), "Codex"),
-        ParsedDiscussAnswer("needs-human", "unclear", "low", ("security",), "Claude"),
+        ParsedDiscussAnswer("needs-human", "unclear", "low", (DiscussUnresolvedItem("human-decision", "scope"),), "Codex"),
+        ParsedDiscussAnswer("needs-human", "unclear", "low", (DiscussUnresolvedItem("human-decision", "security"),), "Claude"),
     ]
     assert _detect_discuss_answer_consensus(responses) == ("needs-human", [])
 
@@ -99,6 +100,7 @@ def _discuss_answer_text(
     rationale: str = "It keeps the integration replaceable.",
     confidence: str = "medium",
     open_questions: list[str] | None = None,
+    unresolved_items: list[dict[str, str]] | None = None,
     rebuttal: str | None = None,
     research: dict | None = None,
     reviewer: str = "OpenAI Codex",
@@ -109,7 +111,10 @@ def _discuss_answer_text(
         "position": position,
         "rationale": rationale,
         "confidence": confidence,
-        "open_questions": open_questions or [],
+        "unresolved_items": unresolved_items if unresolved_items is not None else [
+            {"status": "human-decision" if position == "needs-human" else "blocker", "text": question}
+            for question in (open_questions or [])
+        ],
     }
     if answer is not None:
         payload["answer"] = answer
@@ -249,15 +254,22 @@ def _seed_debater_comment(
 def _seed_answer_debater_comment(
     *, reviewer: str, round_number: int, subject: str, answer: str,
     rationale: str = "The evidence supports this recommendation.",
-    rebuttal: str | None = None, config=None,
+    rebuttal: str | None = None, config=None, legacy: bool = False,
 ) -> dict:
     vote = ParsedDiscussAnswer(
         position="answer", rationale=rationale, confidence="medium",
-        open_questions=(), reviewer=reviewer, answer=answer, rebuttal=rebuttal,
+        unresolved_items=(), reviewer=reviewer, answer=answer, rebuttal=rebuttal,
     )
-    raw_text = _discuss_answer_text(
-        answer=answer, rationale=rationale, rebuttal=rebuttal, reviewer=reviewer,
-    )
+    if legacy:
+        raw_text = json.dumps({
+            "schema_version": 1, "kind": "discuss_answer", "position": "answer",
+            "answer": answer, "rationale": rationale, "confidence": "medium",
+            "open_questions": ["Verify availability."],
+        }) + f"\n<!-- AGENT_PLAN_STATE: approved -->\n-- {reviewer}"
+    else:
+        raw_text = _discuss_answer_text(
+            answer=answer, rationale=rationale, rebuttal=rebuttal, reviewer=reviewer,
+        )
     body = render_public_agent_comment(
         kind="discuss_answer", parsed=vote, agent=reviewer, config=config,
         round_number=round_number,
@@ -343,6 +355,37 @@ def test_discuss_loop_unanimous_answer_is_not_triage(tmp_path):
     assert "Consensus Answer" in runner.comments[-1]
     assert "Use an API boundary." in runner.comments[-1]
     assert "Consensus: Implement" not in runner.comments[-1]
+
+
+def test_answer_mode_followups_succeed_but_material_items_select_final_outcome(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
+    followups = FakeRunner(
+        codex_outputs=[_discuss_answer_text(unresolved_items=[{"status": "follow-up", "text": "Refresh pricing."}])],
+        gemini_outputs=[_discuss_answer_text(unresolved_items=[{"status": "follow-up", "text": "Refresh pricing."}])],
+    )
+    assert run_discuss_loop(followups, issue_number=56, config=config, discuss_max_rounds=0) == 0
+    assert "Consensus Answer" in followups.comments[-1]
+    assert "Non-blocking follow-ups" in followups.comments[-1]
+
+    material = FakeRunner(
+        codex_outputs=[_discuss_answer_text(unresolved_items=[{"status": "blocker", "text": "Verify capability."}])],
+        gemini_outputs=[_discuss_answer_text(unresolved_items=[{"status": "human-decision", "text": "Choose a product tier."}])],
+    )
+    assert run_discuss_loop(material, issue_number=56, config=config, discuss_max_rounds=0) == 0
+    final = material.comments[-1]
+    assert "Needs Human Decision" in final
+    assert "Blockers" in final and "Human decisions" in final
+
+
+def test_answer_mode_blocker_suppresses_exact_and_semantic_convergence(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[_discuss_answer_text(unresolved_items=[{"status": "blocker", "text": "Verify capability."}])],
+        gemini_outputs=[_discuss_answer_text(unresolved_items=[{"status": "blocker", "text": "Verify capability."}])],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
+    assert run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0) == 0
+    assert "Deadlock" in runner.comments[-1]
+    assert "Verify capability." in runner.comments[-1]
 
 
 def test_discuss_loop_answer_converges_after_rebuttal(tmp_path):
@@ -610,6 +653,22 @@ def test_discuss_loop_resumes_answer_partial_round_and_is_idempotent(tmp_path):
 
     assert run_discuss_loop(runner, issue_number=56, config=config) == 0
     assert len(runner.comments) == comment_count
+
+
+def test_discuss_loop_resumes_legacy_answer_metadata_conservatively(tmp_path):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
+    seeded = _seed_answer_debater_comment(
+        reviewer="Codex", round_number=1, subject=subject, answer="Use an API.",
+        config=config, legacy=True,
+    )
+    runner = FakeRunner(
+        issue_comments=[seeded],
+        gemini_outputs=[_discuss_answer_text(answer="Use an API.", reviewer="Google Gemini")],
+    )
+    assert run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0) == 0
+    assert "Deadlock" in runner.comments[-1]
+    assert "Verify availability." in runner.comments[-1]
 
 
 def test_discuss_loop_debates_then_deadlocks_instead_of_veto(tmp_path):

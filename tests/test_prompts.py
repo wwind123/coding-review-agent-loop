@@ -2020,6 +2020,7 @@ from coding_review_agent_loop.prompts import (
 )
 from coding_review_agent_loop.protocol import (
     DiscussAgendaDisagreement,
+    DiscussUnresolvedItem,
     ParsedDiscussAnswer,
     ParsedDiscussAgenda,
     ParsedDiscussReview,
@@ -2106,7 +2107,7 @@ def test_build_discuss_agenda_prompt_supports_answer_history(tmp_path):
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
     answer = ParsedDiscussAnswer(
         position="answer", rationale="The evidence favors the API.", confidence="high",
-        open_questions=(), reviewer="Codex", answer="Use an API.", rebuttal="Addressed the concern.",
+        unresolved_items=(), reviewer="Codex", answer="Use an API.", rebuttal="Addressed the concern.",
     )
     prompt = build_discuss_agenda_prompt(
         56, config, analyzer="claude", round_number=2, round_history=[[answer]]
@@ -2172,7 +2173,7 @@ def test_build_discuss_answer_prompt_keeps_analyzer_and_research_non_authoritati
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
     prior = ParsedDiscussAnswer(
         position="answer", rationale="Prior rationale.", confidence="medium",
-        open_questions=("Which latency target applies?",), reviewer="Codex",
+        unresolved_items=(DiscussUnresolvedItem("follow-up", "Which latency target applies?"),), reviewer="Codex",
         answer="Use an API.", rebuttal="The boundary reduces coupling.",
     )
     prompt = build_discuss_review_prompt(

@@ -771,8 +771,7 @@ def _render_public_discuss_answer_comment(
         sections.append("### Answer\n\n" + parsed.answer.strip())
     sections.append("### Rationale\n\n" + parsed.rationale.strip())
     sections.append(f"**Confidence:** `{parsed.confidence}`")
-    if parsed.open_questions:
-        sections.append("### Open questions\n\n" + "\n".join(f"- {q}" for q in parsed.open_questions))
+    sections.extend(_render_discuss_unresolved_item_sections([parsed]))
     if parsed.rebuttal:
         sections.append("### Rebuttal\n\n" + parsed.rebuttal.strip())
     if parsed.research_status is not None:
@@ -787,6 +786,28 @@ def _render_public_discuss_answer_comment(
         sections.append("### Sourced facts\n\n" + "\n".join(f"- {f.fact} — source: {f.source}" for f in parsed.sourced_facts))
     sections.append(f"-- {_comment_signature(reviewer, config, model_used)}")
     return "\n\n".join(sections)
+
+
+def _render_discuss_unresolved_item_sections(
+    votes: Sequence[ParsedDiscussAnswer],
+) -> list[str]:
+    headings = (
+        ("blocker", "Blockers"),
+        ("human-decision", "Human decisions"),
+        ("follow-up", "Non-blocking follow-ups"),
+    )
+    sections: list[str] = []
+    for status, heading in headings:
+        seen: set[str] = set()
+        texts: list[str] = []
+        for vote in votes:
+            for item in vote.unresolved_items:
+                if item.status == status and item.text not in seen:
+                    seen.add(item.text)
+                    texts.append(item.text)
+        if texts:
+            sections.append(f"### {heading}\n\n" + "\n".join(f"- {text}" for text in texts))
+    return sections
 
 
 def _render_discuss_agenda_lines(votes: Sequence[ParsedDiscussResponse]) -> list[str]:
@@ -1147,11 +1168,20 @@ def _render_discuss_answer_summary(*, is_final: bool, subject: str, round_number
         lines.append(f"| {vote.reviewer} | {vote.position} | {vote.confidence} | {answer} |")
     if failed_debaters:
         lines.extend(_render_discuss_failed_debater_lines(failed_debaters, is_final=is_final))
-    questions = [q for v in reviewer_votes for q in v.open_questions]
-    if questions:
-        lines.extend(["", "### Open questions", "", *[f"- {q}" for q in dict.fromkeys(questions)]])
+    item_sections = _render_discuss_unresolved_item_sections(reviewer_votes)
+    for section in item_sections:
+        lines.extend(["", section])
+    if is_final:
+        statuses = {item.status for vote in reviewer_votes for item in vote.unresolved_items}
+        if outcome == "needs-human":
+            lines.extend(["", "The run needs human input because the listed human decisions remain."])
+        elif outcome == "deadlock" and "blocker" in statuses:
+            lines.extend(["", "The run is deadlocked because the listed blockers remain."])
+        elif outcome not in {"deadlock", "needs-human"}:
+            lines.extend(["", "The answer can proceed because no material items remain; non-blocking follow-ups do not block it."])
     if outcome == "deadlock":
-        lines.extend(["", "### Unresolved disagreement", "", "The debaters did not converge on one normalized answer."])
+        if not any(item.status == "blocker" for vote in reviewer_votes for item in vote.unresolved_items):
+            lines.extend(["", "### Unresolved disagreement", "", "The debaters did not converge on one normalized answer, or a required semantic check or debater failed."])
     if semantic_comparison is not None:
         lines.extend(["", "### Semantic comparison (advisory; not a debater vote)", "",
             f"Analyzer: {semantic_comparison.get('analyzer', 'configured analyzer')}",

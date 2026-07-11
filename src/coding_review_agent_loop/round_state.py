@@ -26,6 +26,7 @@ from .protocol import (
     parse_structured_discuss_agenda,
     parse_structured_discuss_review,
     parse_structured_discuss_answer,
+    parse_legacy_structured_discuss_answer,
 )
 from .unresolved_items import _apply_unresolved_item_dispositions
 
@@ -643,7 +644,17 @@ def _decode_analyzer_agenda(raw: str | None) -> ParsedDiscussAgenda | None:
 def _decode_discuss_vote(record: PostedRoundRecord, *, round_number: int) -> ParsedDiscussResponse:
     text = record.metadata.raw_structured_coder_response or record.body
     if record.metadata.result_mode == "answer":
-        vote = parse_structured_discuss_answer(text, reviewer=record.metadata.agent, round_number=round_number)
+        try:
+            vote = parse_structured_discuss_answer(
+                text, reviewer=record.metadata.agent, round_number=round_number
+            )
+        except AgentLoopError:
+            # Only persisted round metadata gets the explicitly opt-in legacy
+            # decoder. Its exact-key validation still rejects malformed/mixed
+            # payloads rather than hiding a corrupt transcript.
+            vote = parse_legacy_structured_discuss_answer(
+                text, reviewer=record.metadata.agent, round_number=round_number
+            )
     else:
         vote = parse_structured_discuss_review(text, reviewer=record.metadata.agent, round_number=round_number)
     if vote is None:

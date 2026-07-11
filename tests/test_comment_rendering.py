@@ -19,7 +19,7 @@ from coding_review_agent_loop.comment_rendering import (
     render_deferred_stages_section,
     render_discuss_round_summary_comment,
 )
-from coding_review_agent_loop.protocol import ParsedDiscussAnswer, ParsedFailedDiscussResponse, ParsedDiscussReview
+from coding_review_agent_loop.protocol import DiscussUnresolvedItem, ParsedDiscussAnswer, ParsedFailedDiscussResponse, ParsedDiscussReview
 from coding_review_agent_loop.orchestrator import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     ITEM_SUMMARY_LIMIT,
@@ -58,7 +58,7 @@ from agent_loop_helpers import (
 
 def test_answer_research_rendering_ignores_failed_resume_placeholder():
     answer = ParsedDiscussAnswer(
-        position="answer", rationale="Supported.", confidence="medium", open_questions=(),
+        position="answer", rationale="Supported.", confidence="medium", unresolved_items=(),
         reviewer="Codex", answer="Use an API.", research_status="not-needed",
     )
     failed = ParsedFailedDiscussResponse("Claude", "timeout", "answer")
@@ -68,6 +68,28 @@ def test_answer_research_rendering_ignores_failed_resume_placeholder():
         research_mode="auto", result_mode="answer",
     )
     assert "Use an API." in rendered
+
+
+def test_answer_summary_groups_classified_items_without_cross_status_deduplication():
+    answer = ParsedDiscussAnswer(
+        position="answer", rationale="Supported.", confidence="medium", reviewer="Codex",
+        answer="Use an API.", unresolved_items=(
+            DiscussUnresolvedItem("blocker", "Verify capability."),
+            DiscussUnresolvedItem("human-decision", "Choose tier."),
+            DiscussUnresolvedItem("follow-up", "Refresh pricing."),
+            DiscussUnresolvedItem("follow-up", "Verify capability."),
+        ),
+    )
+    rendered = render_discuss_round_summary_comment(
+        is_final=True, subject="subject", round_number=1, reviewer_votes=[answer],
+        round_history=[[answer]], outcome="needs-human", consensus_kind="unanimous",
+        result_mode="answer",
+    )
+    assert "### Blockers" in rendered
+    assert "### Human decisions" in rendered
+    assert "### Non-blocking follow-ups" in rendered
+    assert rendered.count("Verify capability.") == 2
+    assert "because the listed human decisions remain" in rendered
     assert "Claude" not in rendered
 
 def test_render_canonical_plan_steps_numbers_items():
@@ -1065,7 +1087,7 @@ def test_render_discuss_answer_summary_non_final_uses_analyzer_agenda_with_attri
         position="answer",
         rationale="An API has the clearest boundary.",
         confidence="high",
-        open_questions=(),
+        unresolved_items=(),
         reviewer="Codex",
         answer="Use an API.",
     )

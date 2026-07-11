@@ -323,7 +323,9 @@ Notes:
   "answer": "<answer or recommendation; required for answer>",
   "rationale": "<why>",
   "confidence": "low" | "medium" | "high",
-  "open_questions": ["<question; required for needs-human>"],
+  "unresolved_items": [
+    {"status": "blocker" | "human-decision" | "follow-up", "text": "<non-empty concern>"}
+  ],
   "rebuttal": "<required after round one>",
   "research": {
     "status": "sourced" | "not-needed" | "unavailable" | "inconclusive",
@@ -337,7 +339,8 @@ Notes:
 
 Notes: preserve answer-mode fields, never convert this payload to `outcome` or
 `split_proposals`; `needs-human` is explicit escalation and is distinct from
-deadlock caused by disagreement.
+deadlock caused by disagreement. Preserve every valid unresolved-item status
+and text verbatim; do not downgrade, discard, or invent a classification.
 
 When research intent is present, preserve `target` and `questions` together;
 never invent either field or a source while repairing. For `status: "not-needed"`,
@@ -931,20 +934,22 @@ the AGENT_PLAN_STATE footer:
   "answer": "Use an API boundary with an explicit adapter.",
   "rationale": "This keeps the integration replaceable without duplicating policy.",
   "confidence": "medium",
-  "open_questions": []
+  "unresolved_items": []
 }
 <!-- AGENT_PLAN_STATE: approved -->
 -- Reviewer
 
 For an escalation, use `position: "needs-human"`, omit `answer` when there is
-no asserted answer, and include at least one concrete `open_questions` entry:
+no asserted answer, and include at least one concrete `human-decision` item:
 {
   "schema_version": 1,
   "kind": "discuss_answer",
   "position": "needs-human",
   "rationale": "The requirements conflict and cannot be resolved from the issue.",
   "confidence": "low",
-  "open_questions": ["Which latency target should control the design?"]
+  "unresolved_items": [
+    {"status": "human-decision", "text": "Which latency target should control the design?"}
+  ]
 }
 <!-- AGENT_PLAN_STATE: approved -->
 -- Reviewer

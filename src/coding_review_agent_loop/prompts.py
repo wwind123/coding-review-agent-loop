@@ -2480,8 +2480,11 @@ def build_discuss_final_analysis_prompt(
             transcript_lines.extend(
                 [f"- {vote.reviewer}: `{vote.position}`", f"  Answer: {vote.answer or '(none)'}"]
             )
-            if vote.open_questions:
-                transcript_lines.extend(f"  Open question: {question}" for question in vote.open_questions)
+            if vote.unresolved_items:
+                transcript_lines.extend(
+                    f"  Unresolved item ({item.status}): {item.text}"
+                    for item in vote.unresolved_items
+                )
         else:
             transcript_lines.append(f"- {vote.reviewer}: `{vote.outcome}`")
         transcript_lines.append(f"  Rationale: {vote.rationale}")
@@ -2584,11 +2587,16 @@ def build_discuss_review_prompt(
                         '    "updates": []\n'
                         '  }')
     if config.discuss_result_mode == "answer":
-        history = "\n".join(
-            f"- {getattr(v, 'reviewer', 'unknown')}: position={getattr(v, 'position', 'failed')}; "
-            f"answer={getattr(v, 'answer', None) or '(none)'}; rationale={getattr(v, 'rationale', getattr(v, 'category', ''))}"
-            for v in prior_round_votes
-        ) or "(no prior round)"
+        history_lines: list[str] = []
+        for vote in prior_round_votes:
+            history_lines.append(
+                f"- {getattr(vote, 'reviewer', 'unknown')}: position={getattr(vote, 'position', 'failed')}; "
+                f"answer={getattr(vote, 'answer', None) or '(none)'}; "
+                f"rationale={getattr(vote, 'rationale', getattr(vote, 'category', ''))}"
+            )
+            for item in getattr(vote, "unresolved_items", ()):
+                history_lines.append(f"  Unresolved item ({item.status}): {item.text}")
+        history = "\n".join(history_lines) or "(no prior round)"
         analyzer_context = ""
         if analyzer_agenda is not None:
             analyzer_context = (
@@ -2638,10 +2646,10 @@ Respond with exactly this JSON object followed by the approved plan footer:
   "answer": "A concise answer or recommendation.",
   "rationale": "Why this answer follows from the evidence.",
   "confidence": "medium",
-  "open_questions": [],
+  "unresolved_items": [],
   "rebuttal": "..."{research_example}{evidence_example}
 }}
-Rules: position is exactly `answer` or `needs-human`; `answer` requires non-empty answer; `needs-human` requires non-empty open_questions and may omit answer; {rebuttal}.{research_rules} {DISCUSS_EVIDENCE_PROMPT_RULES}
+Rules: position is exactly `answer` or `needs-human`; `answer` requires a non-empty answer; `needs-human` omits `answer` and requires at least one unresolved item with status `human-decision`. Every unresolved item is exactly `{{"status": "blocker" | "human-decision" | "follow-up", "text": "..."}}`. `blocker` prevents implementation, `human-decision` requires a human choice, and `follow-up` is non-blocking. An answer may include any status, but a material status changes the final outcome. {rebuttal}.{research_rules} {DISCUSS_EVIDENCE_PROMPT_RULES}
 Do not include triage fields such as outcome or split_proposals. The analyzer is not authoritative and is context only; sourced research facts must remain distinct from judgment.
 <!-- AGENT_PLAN_STATE: approved -->
 -- {reviewer_signature}

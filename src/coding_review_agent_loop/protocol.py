@@ -244,13 +244,30 @@ class StructuredDiscussReview:
 
 
 @dataclass(frozen=True)
+class DiscussUnresolvedItem:
+    """A classified unresolved concern from an answer-mode discuss vote.
+
+    This is intentionally distinct from ``UnresolvedReviewItem``, which is the
+    PR/plan-review ledger type and has unrelated lifecycle semantics.
+    """
+
+    status: str
+    text: str
+
+
+DISCUSS_UNRESOLVED_ITEM_STATUS_VALUES = frozenset(
+    {"blocker", "human-decision", "follow-up"}
+)
+
+
+@dataclass(frozen=True)
 class StructuredDiscussAnswer:
     schema_version: int
     kind: str
     position: str
     rationale: str
     confidence: str
-    open_questions: tuple[str, ...]
+    unresolved_items: tuple[DiscussUnresolvedItem, ...]
     answer: str | None = None
     rebuttal: str | None = None
     analyzer_framing: str | None = None
@@ -285,7 +302,7 @@ class ParsedDiscussAnswer:
     position: str
     rationale: str
     confidence: str
-    open_questions: tuple[str, ...]
+    unresolved_items: tuple[DiscussUnresolvedItem, ...]
     reviewer: str
     answer: str | None = None
     rebuttal: str | None = None
@@ -2280,6 +2297,52 @@ DISCUSS_ANSWER_CONFIDENCE_VALUES = frozenset({"low", "medium", "high"})
 def parse_structured_discuss_answer(
     text: str, *, reviewer: str, round_number: int = 1, research_mode: str | None = None
 ) -> ParsedDiscussAnswer | None:
+    return _parse_structured_discuss_answer(
+        text, reviewer=reviewer, round_number=round_number, research_mode=research_mode,
+        allow_legacy_open_questions=False,
+    )
+
+
+def parse_legacy_structured_discuss_answer(
+    text: str, *, reviewer: str, round_number: int = 1, research_mode: str | None = None
+) -> ParsedDiscussAnswer | None:
+    """Decode only persisted pre-#536 answer votes.
+
+    New agent output must use ``unresolved_items``.  Legacy untyped questions
+    are conservatively mapped to blockers for asserted answers, and to human
+    decisions for escalations, so a resumed run cannot silently proceed.
+    """
+    return _parse_structured_discuss_answer(
+        text, reviewer=reviewer, round_number=round_number, research_mode=research_mode,
+        allow_legacy_open_questions=True,
+    )
+
+
+def _parse_discuss_unresolved_items(value: object, *, context: str) -> tuple[DiscussUnresolvedItem, ...]:
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    items: list[DiscussUnresolvedItem] = []
+    for index, item in enumerate(value):
+        item_context = f"{context}[{index}]"
+        if not isinstance(item, dict):
+            raise AgentLoopError(f"{item_context} must be an object.")
+        _expect_exact_keys(item, context=item_context, required={"status", "text"})
+        status = _expect_non_empty_string(item["status"], context=f"{item_context}.status")
+        if status not in DISCUSS_UNRESOLVED_ITEM_STATUS_VALUES:
+            raise AgentLoopError(
+                f"{item_context}.status must be one of: blocker, human-decision, follow-up."
+            )
+        items.append(DiscussUnresolvedItem(
+            status=status,
+            text=_expect_non_empty_string(item["text"], context=f"{item_context}.text"),
+        ))
+    return tuple(items)
+
+
+def _parse_structured_discuss_answer(
+    text: str, *, reviewer: str, round_number: int, research_mode: str | None,
+    allow_legacy_open_questions: bool,
+) -> ParsedDiscussAnswer | None:
     payload = _extract_structured_discuss_review_payload(
         text, context_label="Structured discuss answer"
     )
@@ -2288,10 +2351,11 @@ def parse_structured_discuss_answer(
     _require_supported_schema_version(payload)
     if payload.get("kind") != "discuss_answer":
         raise AgentLoopError("Structured response kind mismatch: expected `discuss_answer`.")
+    item_key = "open_questions" if allow_legacy_open_questions else "unresolved_items"
     _expect_exact_keys(
         payload,
         context="discuss_answer",
-        required={"schema_version", "kind", "position", "rationale", "confidence", "open_questions"},
+        required={"schema_version", "kind", "position", "rationale", "confidence", item_key},
         optional={"answer", "rebuttal", "analyzer_framing", "framing_note", "research", "evidence"},
     )
     position = _expect_non_empty_string(payload["position"], context="discuss_answer.position")
@@ -2301,18 +2365,32 @@ def parse_structured_discuss_answer(
     confidence = _expect_non_empty_string(payload["confidence"], context="discuss_answer.confidence")
     if confidence not in DISCUSS_ANSWER_CONFIDENCE_VALUES:
         raise AgentLoopError("discuss_answer.confidence must be one of: low, medium, high.")
-    open_questions = _expect_string_list(
-        payload.get("open_questions", []),
-        context="discuss_answer.open_questions",
-        item_context="discuss_answer.open_questions",
-    )
+    if allow_legacy_open_questions:
+        legacy_questions = _expect_string_list(
+            payload["open_questions"], context="discuss_answer.open_questions",
+            item_context="discuss_answer.open_questions",
+        )
+        legacy_status = "human-decision" if position == "needs-human" else "blocker"
+        unresolved_items = tuple(
+            DiscussUnresolvedItem(status=legacy_status, text=question)
+            for question in legacy_questions
+        )
+    else:
+        unresolved_items = _parse_discuss_unresolved_items(
+            payload["unresolved_items"], context="discuss_answer.unresolved_items"
+        )
     answer = None
     if "answer" in payload:
         answer = _expect_non_empty_string(payload["answer"], context="discuss_answer.answer")
     if position == "answer" and answer is None:
         raise AgentLoopError("discuss_answer.answer is required when position is `answer`.")
-    if position == "needs-human" and not open_questions:
-        raise AgentLoopError("discuss_answer.open_questions must be non-empty for `needs-human`.")
+    if position == "needs-human":
+        if answer is not None:
+            raise AgentLoopError("discuss_answer.answer must be omitted when position is `needs-human`.")
+        if not any(item.status == "human-decision" for item in unresolved_items):
+            raise AgentLoopError(
+                "discuss_answer.unresolved_items must include a human-decision for `needs-human`."
+            )
     rebuttal = None
     if "rebuttal" in payload:
         rebuttal = _expect_non_empty_string(payload["rebuttal"], context="discuss_answer.rebuttal")
@@ -2342,7 +2420,7 @@ def parse_structured_discuss_answer(
         raise AgentLoopError("discuss_answer.research with sourced, unavailable, or inconclusive status is required.")
     return ParsedDiscussAnswer(
         position=position, rationale=rationale, confidence=confidence,
-        open_questions=open_questions, reviewer=reviewer, answer=answer,
+        unresolved_items=unresolved_items, reviewer=reviewer, answer=answer,
         rebuttal=rebuttal, analyzer_framing=analyzer_framing, framing_note=framing_note,
         research_status=research_status, sourced_facts=sourced_facts,
         research_target=research_target, research_questions=research_questions,

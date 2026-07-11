@@ -18,7 +18,7 @@ def test_answer_repair_prompt_has_mode_specific_schema_and_examples():
     )
     assert '"kind": "discuss_answer"' in prompt
     assert '"position": "needs-human"' in prompt
-    assert '"open_questions"' in prompt
+    assert '"unresolved_items"' in prompt
     assert "Do not repair answer mode into `discuss_review`" in prompt
     assert "split_proposals" in prompt
 
@@ -27,13 +27,13 @@ def test_answer_repair_shape_preserves_answer_and_rejects_triage_fields():
     valid = json.dumps({
         "schema_version": 1, "kind": "discuss_answer", "position": "answer",
         "answer": "Use an adapter.", "rationale": "It isolates policy.",
-        "confidence": "medium", "open_questions": [],
+        "confidence": "medium", "unresolved_items": [],
     }) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Reviewer"
     assert validate_structured_discuss_answer(valid, reviewer="Reviewer").position == "answer"
     malformed = json.dumps({
         "schema_version": 1, "kind": "discuss_answer", "position": "answer",
         "answer": "Use an adapter.", "rationale": "Reason", "confidence": "medium",
-        "open_questions": [], "outcome": "implement",
+        "unresolved_items": [], "outcome": "implement",
     }) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Reviewer"
     with pytest.raises(AgentLoopError, match="unknown field.*outcome"):
         validate_structured_discuss_answer(malformed, reviewer="Reviewer")

@@ -120,6 +120,7 @@ from .protocol import (
     ParsedDiscussAgenda,
     ParsedDiscussEvidenceReconciliation,
     ParsedDiscussAnswer,
+    DiscussUnresolvedItem,
     ParsedDiscussSemanticComparison,
     ParsedDiscussResponse,
     ParsedDiscussReview,
@@ -4947,6 +4948,11 @@ def _detect_discuss_answer_consensus(
 ) -> tuple[str, list[str]] | None:
     if partial or not responses:
         return None
+    if _discuss_has_material_items(responses):
+        # A final round applies explicit outcome precedence. Before then,
+        # classified material prevents normalized-text convergence.
+        if not all(response.position == "needs-human" for response in responses):
+            return None
     if all(response.position == "needs-human" for response in responses):
         return "needs-human", []
     answers = [response.answer for response in responses]
@@ -4954,6 +4960,43 @@ def _detect_discuss_answer_consensus(
         normalized = {_normalize_discuss_answer(answer or "") for answer in answers}
         if len(normalized) == 1:
             return "answer", []
+    return None
+
+
+def _aggregate_discuss_unresolved_items(
+    responses: Sequence[ParsedDiscussAnswer],
+) -> tuple[DiscussUnresolvedItem, ...]:
+    """Return current-round classified items, deduplicated within a status.
+
+    We deliberately retain identical text under different statuses: a blocker
+    must not disappear merely because another debater calls it a follow-up.
+    """
+    seen: set[tuple[str, str]] = set()
+    merged: list[DiscussUnresolvedItem] = []
+    for response in responses:
+        for item in response.unresolved_items:
+            key = (item.status, item.text)
+            if key not in seen:
+                seen.add(key)
+                merged.append(item)
+    return tuple(merged)
+
+
+def _discuss_has_material_items(responses: Sequence[ParsedDiscussAnswer]) -> bool:
+    return any(
+        item.status in {"blocker", "human-decision"}
+        for item in _aggregate_discuss_unresolved_items(responses)
+    )
+
+
+def _final_discuss_answer_item_outcome(
+    responses: Sequence[ParsedDiscussAnswer],
+) -> str | None:
+    statuses = {item.status for item in _aggregate_discuss_unresolved_items(responses)}
+    if "human-decision" in statuses:
+        return "needs-human"
+    if "blocker" in statuses:
+        return "deadlock"
     return None
 
 
@@ -5176,8 +5219,9 @@ def _build_discuss_agenda_support_corpus(
                 add(vote.position)
                 add(vote.answer, phrase_support=True)
                 add(vote.rationale, phrase_support=True)
-                for question in vote.open_questions:
-                    add(question, phrase_support=True)
+                for item in vote.unresolved_items:
+                    add(item.status)
+                    add(item.text, phrase_support=True)
             elif isinstance(vote, ParsedDiscussReview):
                 add(vote.outcome)
                 add(vote.rationale, phrase_support=True)
@@ -5594,7 +5638,7 @@ def _run_discuss_semantic_finalization(
     analyzer = config.discuss_analyzer
     if analyzer is None or len(answers) != len(configured_reviewers):
         return "deadlock", "deadlock", None
-    if any(item.position != "answer" or not item.answer for item in answers):
+    if any(item.position != "answer" or not item.answer for item in answers) or _discuss_has_material_items(answers):
         return "deadlock", "deadlock", None
     names = [item.reviewer for item in answers]
     try:
@@ -6110,13 +6154,21 @@ def _run_discuss_loop(
         ]
         round_history.append(reviewer_votes)
         if config.discuss_result_mode == "answer":
-            consensus = _detect_discuss_answer_consensus(
-                [vote for vote in successful_votes if isinstance(vote, ParsedDiscussAnswer)],
-                partial=bool(failed_debaters),
-            )
+            answer_votes = [vote for vote in successful_votes if isinstance(vote, ParsedDiscussAnswer)]
+            consensus = _detect_discuss_answer_consensus(answer_votes, partial=bool(failed_debaters))
         else:
             consensus = _detect_discuss_consensus(reviewer_votes)  # type: ignore[arg-type]
         is_final = consensus is not None or round_number == max_round_number
+        # The completed current round is authoritative: a later round can
+        # clear/reclassify earlier items. At the final round, classified
+        # material selects a fail-closed outcome before text comparison.
+        if (
+            is_final and config.discuss_result_mode == "answer" and not failed_debaters
+            and len(answer_votes) == len(configured_reviewers)
+        ):
+            material_outcome = _final_discuss_answer_item_outcome(answer_votes)
+            if material_outcome is not None:
+                consensus = (material_outcome, [])
         semantic_comparison: dict[str, object] | None = None
         semantic_finalization_ran = False
         # Keep normalized equality as the zero-call fast path.  Only a complete,
@@ -6126,6 +6178,9 @@ def _run_discuss_loop(
             and not failed_debaters
             and len(successful_votes) == len(configured_reviewers)
             and all(isinstance(vote, ParsedDiscussAnswer) and vote.position == "answer" and vote.answer for vote in successful_votes)
+            and not _discuss_has_material_items(
+                [vote for vote in successful_votes if isinstance(vote, ParsedDiscussAnswer)]
+            )
         ):
             semantic_finalization_ran = True
             outcome, semantic_kind, semantic_comparison = _run_discuss_semantic_finalization(
