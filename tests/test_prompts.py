@@ -947,6 +947,7 @@ def test_issue_loop_includes_issue_comments_in_coder_and_review_prompts(tmp_path
         codex_outputs=[
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
+        pr_payload={"body": "Fixes #56"},
     )
     config = make_config(tmp_path)
 

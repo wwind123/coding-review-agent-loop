@@ -257,7 +257,7 @@ class FakeRunner(Runner):
             "state": "OPEN",
             "url": "https://github.com/OWNER/REPO/pull/77",
             "title": "Improve review prompt context",
-            "body": "Fixes #56",
+            "body": "PR description.",
             "headRefName": "feature/review-context",
             "baseRefName": "main",
             "headRefOid": "abc123",

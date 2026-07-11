@@ -50,6 +50,7 @@ from .github import (
     PullRequestReviewContext,
     find_open_pr_referencing_issue,
     get_issue_context,
+    parse_linked_issue_numbers,
     get_pr_checks,
     get_pr_review_context,
     get_pr_state,
@@ -4056,6 +4057,30 @@ def run_pr_loop(
             pr_number=pr_number,
             cwd=bootstrap_cwd,
         )
+        if issue_context is None:
+            linked_issue_numbers = parse_linked_issue_numbers(
+                initial_pr_context.metadata.body,
+                repo=config.repo,
+            )
+            if len(linked_issue_numbers) == 1:
+                linked_issue_number = linked_issue_numbers[0]
+                log(
+                    config,
+                    f"PR #{pr_number} references issue #{linked_issue_number}; "
+                    "including linked issue context in review prompts",
+                )
+                issue_context = get_issue_context(
+                    runner, config=config, issue_number=linked_issue_number
+                )
+            elif linked_issue_numbers:
+                candidates = ", ".join(f"#{number}" for number in linked_issue_numbers)
+                log(
+                    config,
+                    f"PR #{pr_number} references multiple issues ({candidates}); "
+                    "linked issue context is ambiguous and will not be included",
+                )
+            else:
+                log(config, f"PR #{pr_number} has no linked issue context to include in review prompts")
         config = resolve_base_branch(
             config,
             runner,

@@ -98,6 +98,65 @@ PR_METADATA_FIELDS = "number,title,headRefName,baseRefName,headRefOid,url,body"
 PR_REVIEW_CONTEXT_FIELDS = f"{PR_METADATA_FIELDS},comments,reviews"
 ISSUE_REFERENCE_RE_TEMPLATE = r"(?:#%d\b|/issues/%d\b)"
 
+# A direct issue URL is meaningful without an auto-close keyword.  Shorthand
+# references, on the other hand, are only linked here when they are part of a
+# GitHub closing phrase so ordinary discussion of ``#123`` stays untouched.
+_GITHUB_ISSUE_URL_RE = re.compile(
+    r"https?://github\.com/(?P<repo>[^/\s#]+/[^/\s#]+)/issues/(?P<number>[1-9]\d*)\b",
+    re.IGNORECASE,
+)
+_CLOSING_ISSUE_REFERENCE_RE = re.compile(
+    r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\b"
+    r"\s*:?[ \t]*(?:"
+    r"(?P<unqualified>#[1-9]\d*)|"
+    r"(?P<qualified>[^\s/#]+/[^\s/#]+#[1-9]\d*)|"
+    r"(?P<url>https?://github\.com/[^/\s#]+/[^/\s#]+/issues/[1-9]\d*\b)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def parse_linked_issue_numbers(pr_body: str | None, *, repo: str) -> tuple[int, ...]:
+    """Return same-repository issues linked by a PR body, in first-seen order.
+
+    GitHub closing phrases accept unqualified and ``owner/repo#N`` forms.  A
+    same-repository issue URL is also a link even without a closing phrase.
+    Repository comparison is case-insensitive because GitHub repository names
+    are case-insensitive.
+    """
+    if not pr_body:
+        return ()
+
+    normalized_repo = repo.casefold()
+    matches: list[tuple[int, int]] = []
+    for match in _CLOSING_ISSUE_REFERENCE_RE.finditer(pr_body):
+        reference = match.group("unqualified") or match.group("qualified") or match.group("url")
+        if reference is None:
+            continue
+        if reference.startswith("#"):
+            matches.append((match.start(), int(reference[1:])))
+            continue
+        if reference.lower().startswith(("http://", "https://")):
+            url_match = _GITHUB_ISSUE_URL_RE.fullmatch(reference)
+            if url_match and url_match.group("repo").casefold() == normalized_repo:
+                matches.append((match.start(), int(url_match.group("number"))))
+            continue
+        qualified_repo, number = reference.rsplit("#", 1)
+        if qualified_repo.casefold() == normalized_repo:
+            matches.append((match.start(), int(number)))
+
+    for match in _GITHUB_ISSUE_URL_RE.finditer(pr_body):
+        if match.group("repo").casefold() == normalized_repo:
+            matches.append((match.start(), int(match.group("number"))))
+
+    seen: set[int] = set()
+    numbers: list[int] = []
+    for _, number in sorted(matches, key=lambda item: item[0]):
+        if number not in seen:
+            seen.add(number)
+            numbers.append(number)
+    return tuple(numbers)
+
 
 def detect_repo(runner: Runner, cwd: Path, gh_cmd: str) -> str:
     result = runner.run(

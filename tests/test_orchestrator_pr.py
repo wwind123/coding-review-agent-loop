@@ -72,6 +72,103 @@ def _assert_pending_ci_stop_guidance(text):
     assert "because GitHub check status is unavailable" not in text
 
 
+def _issue_view_commands(runner):
+    return [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "issue", "view"]]
+
+
+def test_direct_pr_resolves_single_linked_issue_context_for_reviewer(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "LGTM.\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        ],
+        issue_payload={
+            "number": 56,
+            "title": "Original acceptance criteria",
+            "body": "Keep compatibility.\n\n-- Human Reviewer",
+        },
+        issue_comments=[
+            {"author": {"login": "maintainer"}, "createdAt": "2026-06-01T00:00:00Z", "body": "Later clarification."}
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(tmp_path, quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(_issue_view_commands(runner)) == 1
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "Original acceptance criteria" in prompt
+    assert "Keep compatibility." in prompt
+    assert "Later clarification." in prompt
+    assert "Human requirements" in prompt
+
+
+def test_direct_pr_keeps_linked_issue_context_for_coder_followup(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Needs a small correction.\n\n### Same-PR follow-ups\n"
+            "- Correct the implementation.\n\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "LGTM."
+            + prior_item_dispositions("[item-1] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=["Corrected it.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+        issue_payload={"title": "Linked issue title", "body": "Linked issue body"},
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    followup_prompt = next(
+        cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]
+    )
+    assert "Linked issue title" in followup_prompt
+    assert "Linked issue body" in followup_prompt
+
+
+@pytest.mark.parametrize(
+    "body, issue_views",
+    [
+        ("https://github.com/owner/repo/issues/56", 1),
+        ("No issue reference.", 0),
+        ("Fixes #56; Resolves #57", 0),
+        ("Fixes #56; https://github.com/OWNER/REPO/issues/56", 1),
+        ("Fixes other/repo#56 https://github.com/other/repo/issues/57", 0),
+    ],
+)
+def test_direct_pr_linked_issue_resolution_handles_urls_absence_and_ambiguity(
+    tmp_path, body, issue_views
+):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": body},
+    )
+    config = make_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(_issue_view_commands(runner)) == issue_views
+
+
+def test_issue_mode_context_is_not_replaced_by_pr_link(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #99"},
+    )
+    config = make_config(tmp_path)
+    supplied_context = IssueContext(
+        number=56, repo="OWNER/REPO", title="Caller issue", body="Caller body", url=None, comments=()
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config, issue_context=supplied_context) == 0
+
+    assert not _issue_view_commands(runner)
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "Caller issue" in prompt
+
+
 def test_pr_loop_runs_tests_and_merge_only_after_codex_approval(tmp_path):
     runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
     config = make_config(
@@ -3654,7 +3751,7 @@ def test_pr_initial_coder_post_includes_model(tmp_path):
             marker_value=pr_review_marker,
         )
 
-    runner = FakeRunner()
+    runner = FakeRunner(pr_payload={"body": "Fixes #56"})
     config = make_config(tmp_path, coder="claude", reviewer="codex")
     with patch(
         "coding_review_agent_loop.orchestrator._run_validated_agent",

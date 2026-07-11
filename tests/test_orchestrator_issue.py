@@ -28,7 +28,7 @@ from coding_review_agent_loop.salvage import (
     post_salvage_comment,
 )
 from agent_loop_helpers import (
-    FakeRunner,
+    FakeRunner as _FakeRunner,
     command_index,
     make_config,
     prior_item_dispositions,
@@ -38,6 +38,14 @@ from agent_loop_helpers import (
     structured_plan_state,
     structured_pr_review,
 )
+
+
+class FakeRunner(_FakeRunner):
+    """Issue-loop fixtures model the PR created for issue #56 explicitly."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("pr_payload", {"body": "Fixes #56"})
+        super().__init__(**kwargs)
 
 
 def test_issue_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):

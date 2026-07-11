@@ -83,6 +83,7 @@ def test_pre_review_tests_can_be_disabled(tmp_path):
             "Created PR.\nTests: pytest passed.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
         ],
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #56"},
     )
     config = make_config(
         tmp_path,
@@ -1728,7 +1729,7 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
         "<!-- AGENT_PR: 77 -->\n-- OpenAI Codex"
     )
     calls = []
-    runner = FakeRunner()
+    runner = FakeRunner(pr_payload={"body": "Fixes #56"})
     config = make_config(
         tmp_path,
         coder="claude",
@@ -1974,7 +1975,7 @@ def test_issue_and_task_loops_use_repo_default_when_base_is_omitted(tmp_path, mo
             "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
-        pr_payload={"baseRefName": "develop"},
+        pr_payload={"baseRefName": "develop", "body": "Fixes #56"},
         repo_default_branch="develop",
     )
     config = make_config(

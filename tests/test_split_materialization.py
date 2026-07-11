@@ -4,6 +4,7 @@ from coding_review_agent_loop.cli import AgentLoopError
 from coding_review_agent_loop.github import (
     IssueComment,
     find_open_pr_referencing_issue,
+    parse_linked_issue_numbers,
     validate_pr_body_does_not_close_issue,
 )
 from coding_review_agent_loop.split_materialization import (
@@ -26,6 +27,25 @@ from agent_loop_helpers import FakeRunner, make_config
 
 def _comment(body: str) -> IssueComment:
     return IssueComment(author="bot", created_at="2026-05-23T00:00:00Z", body=body)
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        ("Close #1 closes: #2 CLOSED #3", (1, 2, 3)),
+        ("fix #4 fixes #5 fixed #6", (4, 5, 6)),
+        ("resolve #7 resolves #8 resolved #9", (7, 8, 9)),
+        ("FIXES Owner/Repo#10", (10,)),
+        ("https://github.com/OWNER/repo/issues/11", (11,)),
+        ("Fixes #12 and https://github.com/owner/repo/issues/12", (12,)),
+        ("Fixes #13; Resolves owner/repo#14", (13, 14)),
+        ("", ()),
+        ("Fixes #0; refs #15; Fixes github.com/owner/repo/pull/16", ()),
+        ("Fixes other/repo#17 https://github.com/other/repo/issues/18", ()),
+    ],
+)
+def test_parse_linked_issue_numbers_recognizes_only_same_repo_issues(body, expected):
+    assert parse_linked_issue_numbers(body, repo="OWNER/REPO") == expected
 
 
 def test_split_stage_proposal_from_text_uses_first_line_as_title():
