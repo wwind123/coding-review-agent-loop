@@ -1060,6 +1060,32 @@ def test_render_discuss_summary_non_final_uses_analyzer_agenda_with_attribution(
     assert "- Codex held `implement`: Mechanical rationale." not in rendered
 
 
+def test_render_discuss_answer_summary_non_final_uses_analyzer_agenda_with_attribution():
+    answer = ParsedDiscussAnswer(
+        position="answer",
+        rationale="An API has the clearest boundary.",
+        confidence="high",
+        open_questions=(),
+        reviewer="Codex",
+        answer="Use an API.",
+    )
+    rendered = render_discuss_round_summary_comment(
+        is_final=False,
+        subject="abc123",
+        round_number=1,
+        reviewer_votes=[answer],
+        analyzer_agenda=_rendering_agenda(),
+        analyzer_name="Anthropic Claude",
+        result_mode="answer",
+    )
+
+    assert "## Round 1 summary: Answer Pending" in rendered
+    assert "### Agenda for round 2 (analyzer: Anthropic Claude)" in rendered
+    assert "Analyzer-extracted consensus so far (not debater-confirmed):" in rendered
+    assert "**Scope of the change**" in rendered
+    assert "Question for next round: Would splitting resolve the scope objection?" in rendered
+
+
 def test_render_discuss_summary_non_final_without_agenda_keeps_mechanical_lines():
     rendered = render_discuss_round_summary_comment(
         is_final=False,

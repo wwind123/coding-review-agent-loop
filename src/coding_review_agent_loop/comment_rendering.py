@@ -1140,6 +1140,11 @@ def _render_discuss_answer_summary(*, is_final: bool, subject: str, round_number
                     lines.append(f"- {reviewer}: {supports}")
         if semantic_comparison.get("confirmed_answer"):
             lines.extend(["", "The recommendation above was explicitly confirmed by every debater."])
+    if not is_final and analyzer_agenda is not None:
+        heading = f"### Agenda for round {round_number + 1}"
+        if analyzer_name:
+            heading += f" (analyzer: {analyzer_name})"
+        lines.extend(["", heading, "", *_render_analyzer_agenda_lines(analyzer_agenda)])
     if final_analyzer_agenda is not None:
         lines.extend(["", "### Final analyzer observations (not debater-confirmed)", "", "The analyzer is non-authoritative; these observations use only final-round responses.", "", *_render_analyzer_agenda_lines(final_analyzer_agenda)])
     if prior_analyzer_agenda is not None:

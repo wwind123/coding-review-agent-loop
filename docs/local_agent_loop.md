@@ -492,8 +492,17 @@ Guardrails — the analyzer is never authoritative:
   votes rule and the divergence stays visible in the summary.
 - The agenda is rendered in the non-final round summary ("Agenda for round
   N+1 (analyzer: ...)"), so it is auditable on the issue.
-- The final summary adds an "Analyzer-extracted consensus (not
-  debater-confirmed)" section kept distinct from the debater vote table.
+- After the final debater responses arrive, the analyzer gets a separate
+  best-effort pass over only those successful final-round responses. A valid
+  result is rendered as "Final analyzer observations (not debater-confirmed)"
+  after the authoritative debater vote table. It is rejected if it names a
+  non-debater or asserts a position, topic, consensus, disagreement, or missing
+  fact unsupported by the final-round text.
+- If an agenda from the preceding non-final round exists, the final summary
+  renders it separately as "Agenda before final round." This is explicitly
+  historical and is never presented as current disagreements. If final analysis
+  fails validation or the final round is partial, the observations are omitted
+  while the answer/vote table and mechanical outcome remain available.
 - If the analyzer invocation fails even after the malformed-response repair
   pass, the orchestrator logs a warning and falls back to the plain mechanical
   agenda for that round (and full prior positions in the next debate prompt)
@@ -502,9 +511,10 @@ Guardrails — the analyzer is never authoritative:
 The raw agenda rides in the round summary's `AGENT_LOOP_META` metadata, so a
 resumed run restores the structured agenda for the next debate round. Legacy
 summaries without an analyzer payload resume in plain mode. With
-`--discuss-max-rounds 0` there is no non-final round, so the analyzer never
-runs (a note is logged). Omitting `--discuss-analyzer` keeps plain #465-style
-direct deliberation unchanged.
+`--discuss-max-rounds 0`, there is no non-final agenda pass, but a configured
+analyzer still receives the final-only pass after the initial final round.
+Omitting `--discuss-analyzer` keeps plain #465-style direct deliberation
+unchanged.
 
 ### Discuss research policy
 

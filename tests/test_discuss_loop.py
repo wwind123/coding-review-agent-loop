@@ -585,6 +585,12 @@ def test_discuss_loop_answer_debater_sees_analyzer_agenda_on_rebuttal_round(tmp_
     assert len(round2) == 2, runner.commands
     assert all("Scope of the change" in prompt for prompt in round2)
     assert all("Would splitting resolve the scope objection?" in prompt for prompt in round2)
+    round_one_summary = next(
+        comment for comment in runner.comments
+        if "## Round 1 summary: Answer Pending" in comment
+    )
+    assert "### Agenda for round 2 (analyzer: Claude)" in round_one_summary
+    assert "**Scope of the change**" in round_one_summary
 
 
 def test_discuss_loop_resumes_answer_partial_round_and_is_idempotent(tmp_path):
