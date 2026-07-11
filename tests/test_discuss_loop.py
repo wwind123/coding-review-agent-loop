@@ -13,6 +13,7 @@ from coding_review_agent_loop.orchestrator import (
     _encode_round_metadata,
     _discuss_subject,
     _validate_discuss_analyzer_agenda_fidelity,
+    _validate_discuss_final_analyzer_fidelity,
     render_public_agent_comment,
     run_discuss_loop,
     _detect_discuss_answer_consensus,
@@ -1437,7 +1438,7 @@ def test_discuss_loop_cli_parser_accepts_discuss_analyzer():
     assert plain.discuss_analyzer is None
 
 
-def test_discuss_loop_unanimous_round1_never_invokes_analyzer(tmp_path):
+def test_discuss_loop_unanimous_round1_attempts_final_only_analyzer(tmp_path):
     implement_text = _discuss_review_text(outcome="implement")
     runner = FakeRunner(
         codex_outputs=[implement_text],
@@ -1451,11 +1452,12 @@ def test_discuss_loop_unanimous_round1_never_invokes_analyzer(tmp_path):
     assert result == 0
     assert len(runner.comments) == 3
     assert "Consensus: Implement" in runner.comments[-1]
-    assert not _claude_commands(runner)
+    assert len(_claude_commands(runner)) == 1
+    assert "Analyze only these completed final-round debater responses" in " ".join(_claude_commands(runner)[0])
     assert "Analyzer" not in runner.comments[-1]
 
 
-def test_discuss_loop_max_rounds_zero_never_invokes_analyzer(tmp_path):
+def test_discuss_loop_max_rounds_zero_runs_final_only_analyzer(tmp_path):
     runner = FakeRunner(
         codex_outputs=[_discuss_review_text(outcome="implement")],
         gemini_outputs=[_discuss_review_text(outcome="needs-human", rationale="Needs input.")],
@@ -1466,7 +1468,8 @@ def test_discuss_loop_max_rounds_zero_never_invokes_analyzer(tmp_path):
     result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
 
     assert result == 0
-    assert not _claude_commands(runner)
+    assert len(_claude_commands(runner)) == 1
+    assert "Analyze only these completed final-round debater responses" in " ".join(_claude_commands(runner)[0])
     assert "Consensus kind: `deadlock` after round 1." in runner.comments[-1]
 
 
@@ -1542,16 +1545,54 @@ def test_discuss_loop_analyzer_agenda_focuses_debate_and_final_summary_distingui
     assert "Gemini round-one rationale." not in codex_prompt
     assert "Gemini round-one rationale." in gemini_prompt
     assert "Codex round-one rationale." not in gemini_prompt
-    # The deadlock final summary keeps analyzer-extracted consensus distinct
-    # from the authoritative debater vote table.
+    # The prior agenda is historical only when the final-only analyzer fails.
     final = runner.comments[-1]
     assert "Consensus kind: `deadlock` after round 2." in final
-    assert (
-        "### Analyzer-extracted consensus (analyzer: Claude; not debater-confirmed)"
-        in final
-    )
-    assert "The debater vote table above is the authoritative consensus." in final
+    assert "### Final analyzer observations" not in final
+    assert "### Agenda before final round" in final
+    assert "Historical analyzer agenda only" in final
     assert "The issue is well-motivated." in final
+
+
+def test_discuss_loop_final_analyzer_uses_only_final_responses_and_preserves_prior_agenda(tmp_path):
+    prior = _discuss_agenda_text()
+    final = _discuss_agenda_text(consensus=["Concession check injection is accepted."], disagreements=[])
+    runner = FakeRunner(
+        codex_outputs=[
+            _discuss_review_text(outcome="implement", rationale="Prior scope dispute."),
+            _discuss_review_text(outcome="implement", rationale="Concession check injection is accepted.", rebuttal="Resolved."),
+        ],
+        gemini_outputs=[
+            _discuss_review_text(outcome="do-not-implement", rationale="Prior scope dispute."),
+            _discuss_review_text(outcome="implement", rationale="Concession check injection is accepted.", rebuttal="Resolved."),
+        ],
+        claude_outputs=[prior, final], issue_payload=_grounded_agenda_issue_payload(),
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
+    assert run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1) == 0
+    final_prompt = next(" ".join(command) for command in _claude_commands(runner) if "Analyze only these completed final-round" in " ".join(command))
+    assert "Concession check injection is accepted." in final_prompt
+    assert "Scope of the change" not in final_prompt
+    summary = runner.comments[-1]
+    assert "### Final analyzer observations (analyzer: Claude; not debater-confirmed)" in summary
+    assert "### Agenda before final round" in summary
+
+
+def test_final_analyzer_fidelity_rejects_unknown_debater_and_unsupported_topic(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
+    votes = [
+        ParsedDiscussReview(outcome="implement", rationale="Use concession checks.", split_proposals=(), reviewer="Codex"),
+        ParsedDiscussReview(outcome="implement", rationale="Use concession checks.", split_proposals=(), reviewer="Gemini"),
+    ]
+    bad = ParsedDiscussAgenda(
+        disagreements=(DiscussAgendaDisagreement("Invented synthesis", (("Claude", "Use synthesis."),), "Why?"),),
+        consensus=(), missing_facts=(),
+    )
+    with pytest.raises(AgentLoopError, match="unknown or absent debater"):
+        _validate_discuss_final_analyzer_fidelity(bad, final_votes=votes, configured_reviewers=("codex", "gemini"), analyzer="claude")
+    unsupported = ParsedDiscussAgenda(consensus=("Invented synthesis injection.",), disagreements=(), missing_facts=())
+    with pytest.raises(AgentLoopError, match="lacks final-round support"):
+        _validate_discuss_final_analyzer_fidelity(unsupported, final_votes=votes, configured_reviewers=("codex", "gemini"), analyzer="claude")
 
 
 def test_discuss_loop_debater_misframing_correction_is_rendered(tmp_path):
@@ -1931,7 +1972,8 @@ def test_discuss_loop_agenda_claiming_consensus_is_forwarded_but_votes_rule(tmp_
     # visible next to the vote table.
     assert "Consensus kind: `deadlock` after round 2." in final
     assert "Everyone agrees to implement." in final
-    assert "The debater vote table above is the authoritative consensus." in final
+    assert "### Agenda before final round" in final
+    assert "Historical analyzer agenda only" in final
 
 
 # --- discuss research policy tests (#477) ---

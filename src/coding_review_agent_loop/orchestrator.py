@@ -88,6 +88,7 @@ from .prompts import (
     CompactPriorContext,
     CompactPrReviewTailContext,
     build_discuss_agenda_prompt,
+    build_discuss_final_analysis_prompt,
     build_discuss_answer_confirmation_prompt,
     build_discuss_semantic_comparison_prompt,
     build_discuss_review_prompt,
@@ -5377,6 +5378,91 @@ def _run_discuss_analyzer(
     return parsed, response.text
 
 
+def _validate_discuss_final_analyzer_fidelity(
+    agenda: ParsedDiscussAgenda,
+    *,
+    final_votes: Sequence[ParsedDiscussResponse],
+    configured_reviewers: Sequence[AgentName],
+    analyzer: AgentName,
+) -> None:
+    """Validate an advisory final pass against final debater text only (#529)."""
+    if len(final_votes) != len(configured_reviewers) or any(
+        is_failed_discuss_response(vote) for vote in final_votes
+    ):
+        raise AgentLoopError("final analyzer requires a complete successful final round.")
+    if agenda.research_required or agenda.research_questions or agenda.research_question_targets:
+        raise AgentLoopError("final analyzer output must not include next-round research fields.")
+    allowed_names = {agent_display_name(reviewer) for reviewer in configured_reviewers}
+    final_names = {vote.reviewer for vote in final_votes}
+    unknown_names = sorted(
+        {name for disagreement in agenda.disagreements for name, _position in disagreement.positions}
+        - allowed_names.intersection(final_names)
+    )
+    if unknown_names:
+        raise AgentLoopError("final analyzer used unknown or absent debater name(s): " + ", ".join(unknown_names))
+    empty_context = IssueContext(0, "", None, None, None, ())
+    corpus = _build_discuss_agenda_support_corpus(
+        issue_context=empty_context,
+        round_history=(tuple(final_votes),),
+        prior_agenda=None,
+        configured_reviewers=configured_reviewers,
+        analyzer=analyzer,
+    )
+    ignored_names = [agent_display_name(analyzer), *sorted(allowed_names)]
+    fields: list[tuple[str, str]] = [("consensus", point) for point in agenda.consensus]
+    for disagreement in agenda.disagreements:
+        fields.append(("disagreement topic", disagreement.topic))
+        fields.extend(("position", position) for _name, position in disagreement.positions)
+        fields.append(("question_for_next_round", disagreement.question_for_next_round))
+    fields.extend(("missing_fact", fact) for fact in agenda.missing_facts)
+    for field, text in fields:
+        if not _discuss_agenda_text_has_support(text, corpus=corpus, ignored_names=ignored_names):
+            raise AgentLoopError(f"final analyzer {field} lacks final-round support: {text}")
+
+
+def _run_discuss_final_analyzer(
+    runner: Runner,
+    *,
+    issue_number: int,
+    config: AgentLoopConfig,
+    analyzer: AgentName | None,
+    round_number: int,
+    final_votes: Sequence[ParsedDiscussResponse],
+    configured_reviewers: Sequence[AgentName],
+    usage_context: RunUsageContext,
+) -> tuple[ParsedDiscussAgenda | None, str | None]:
+    """Best-effort final-only analyzer pass; failures never affect finalization."""
+    if analyzer is None or len(final_votes) != len(configured_reviewers) or any(
+        is_failed_discuss_response(vote) for vote in final_votes
+    ):
+        return None, None
+    analyzer_name = agent_display_name(analyzer)
+    try:
+        response = _run_validated_agent(
+            runner, agent=analyzer, config=config,
+            prompt=build_discuss_final_analysis_prompt(
+                issue_number, config, analyzer=analyzer, round_number=round_number,
+                final_votes=final_votes,
+            ),
+            marker_description="<!-- AGENT_PLAN_STATE: approved -->",
+            validate=validate_structured_discuss_agenda, usage_context=usage_context,
+            use_repair=True, repair_expected_kind="discuss_agenda", role="reviewer",
+            label=f"discuss-final-analyzer-r{round_number}",
+            operation_description="final discuss analyzer",
+        )
+        parsed = response.marker_value
+        assert isinstance(parsed, ParsedDiscussAgenda)
+        _validate_discuss_final_analyzer_fidelity(
+            parsed, final_votes=final_votes, configured_reviewers=configured_reviewers, analyzer=analyzer,
+        )
+        return parsed, response.text
+    except QuotaResetExceededError:
+        raise
+    except Exception as exc:
+        log(config, f"discuss: final analyzer {analyzer_name} unavailable ({exc}); omitting advisory observations")
+        return None, None
+
+
 @dataclass(frozen=True)
 class _DiscussDebaterTurnResult:
     """Outcome of one debater turn: a validated response or a captured failure.
@@ -5699,6 +5785,16 @@ def _run_discuss_loop(
             for vote in final_votes
             if vote.outcome == DISCUSS_FAILED_OUTCOME
         )
+        final_analyzer_agenda, final_analyzer_response_raw = _run_discuss_final_analyzer(
+            runner,
+            issue_number=issue_number,
+            config=config,
+            analyzer=analyzer,
+            round_number=final_round_number,
+            final_votes=final_successful_votes,
+            configured_reviewers=configured_reviewers,
+            usage_context=usage_context,
+        )
         summary_body = render_discuss_round_summary_comment(
             round_number=final_round_number,
             reviewer_votes=final_successful_votes,
@@ -5708,7 +5804,8 @@ def _run_discuss_loop(
             consensus_kind="deadlock",
             round_history=round_history,
             split_proposals=[],
-            analyzer_agenda=prior_analyzer_agenda,
+            prior_analyzer_agenda=prior_analyzer_agenda,
+            final_analyzer_agenda=final_analyzer_agenda,
             analyzer_name=analyzer_name,
             research_mode=config.discuss_research,
             failed_debaters=final_failed_debaters,
@@ -5729,6 +5826,7 @@ def _run_discuss_loop(
                     is_final=True,
                     consensus_kind="deadlock",
                     agenda=(),
+                    final_analyzer_response=final_analyzer_response_raw,
                     research_mode=config.discuss_research,
                     failed_debaters=final_failed_debaters,
                 ),
@@ -5979,6 +6077,8 @@ def _run_discuss_loop(
                 consensus_kind = ("unanimous" if len(round_history) == 1 else "converged") if is_final else None
         next_analyzer_agenda: ParsedDiscussAgenda | None = None
         analyzer_response_raw: str | None = None
+        final_analyzer_agenda: ParsedDiscussAgenda | None = None
+        final_analyzer_response_raw: str | None = None
         if not is_final and analyzer is not None:
             next_analyzer_agenda, analyzer_response_raw = _run_discuss_analyzer(
                 runner,
@@ -5993,6 +6093,17 @@ def _run_discuss_loop(
                 configured_reviewers=configured_reviewers,
                 usage_context=usage_context,
             )
+        elif is_final:
+            final_analyzer_agenda, final_analyzer_response_raw = _run_discuss_final_analyzer(
+                runner,
+                issue_number=issue_number,
+                config=config,
+                analyzer=analyzer,
+                round_number=round_number,
+                final_votes=successful_votes,
+                configured_reviewers=configured_reviewers,
+                usage_context=usage_context,
+            )
         summary_body = render_discuss_round_summary_comment(
             round_number=round_number,
             # The vote table and agenda draw from real positions only; failed
@@ -6004,10 +6115,9 @@ def _run_discuss_loop(
             consensus_kind=consensus_kind,
             round_history=round_history if is_final else None,
             split_proposals=round_split_proposals,
-            # Final summaries surface the last non-final round's agenda so
-            # analyzer-extracted consensus stays auditable and distinct from
-            # the debater vote table; non-final summaries show the fresh one.
-            analyzer_agenda=prior_analyzer_agenda if is_final else next_analyzer_agenda,
+            analyzer_agenda=next_analyzer_agenda,
+            prior_analyzer_agenda=prior_analyzer_agenda if is_final else None,
+            final_analyzer_agenda=final_analyzer_agenda,
             analyzer_name=analyzer_name,
             research_mode=config.discuss_research,
             failed_debaters=tuple(failed_debaters),
@@ -6031,6 +6141,7 @@ def _run_discuss_loop(
                     consensus_kind=consensus_kind,
                     agenda=agenda,
                     analyzer_response=analyzer_response_raw,
+                    final_analyzer_response=final_analyzer_response_raw,
                     research_mode=config.discuss_research,
                     failed_debaters=tuple(failed_debaters),
                     split_proposals=tuple(round_split_proposals) if is_final else (),

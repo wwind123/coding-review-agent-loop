@@ -941,6 +941,8 @@ def render_discuss_round_summary_comment(
     round_history: Sequence[Sequence[ParsedDiscussResponse]] | None = None,
     split_proposals: Sequence[str] | None = None,
     analyzer_agenda: ParsedDiscussAgenda | None = None,
+    prior_analyzer_agenda: ParsedDiscussAgenda | None = None,
+    final_analyzer_agenda: ParsedDiscussAgenda | None = None,
     analyzer_name: str | None = None,
     research_mode: str | None = None,
     failed_debaters: Sequence[tuple[str, str]] = (),
@@ -964,6 +966,8 @@ def render_discuss_round_summary_comment(
             is_final=is_final, subject=subject, round_number=round_number,
             reviewer_votes=reviewer_votes, consensus_kind=consensus_kind,
             round_history=round_history, analyzer_agenda=analyzer_agenda,
+            prior_analyzer_agenda=prior_analyzer_agenda,
+            final_analyzer_agenda=final_analyzer_agenda,
             analyzer_name=analyzer_name, research_mode=research_mode,
             failed_debaters=failed_debaters, outcome=outcome,
             semantic_comparison=semantic_comparison,
@@ -1043,20 +1047,25 @@ def render_discuss_round_summary_comment(
         lines.append("")
         for proposal in split_proposals:
             lines.append(f"- {proposal}")
-    if analyzer_agenda is not None:
-        heading = "### Analyzer-extracted consensus (not debater-confirmed)"
+    # `analyzer_agenda` is retained as the non-final API for compatibility.
+    # Final callers must pass a final-only analysis and a distinct historical agenda.
+    if final_analyzer_agenda is not None:
+        heading = "### Final analyzer observations (not debater-confirmed)"
         if analyzer_name:
-            heading = f"### Analyzer-extracted consensus (analyzer: {analyzer_name}; not debater-confirmed)"
+            heading = f"### Final analyzer observations (analyzer: {analyzer_name}; not debater-confirmed)"
         lines.append("")
         lines.append(heading)
         lines.append("")
         lines.append(
-            "The debater vote table above is the authoritative consensus. The analyzer's "
-            "last agenda extracted the following; it may misclassify consensus or omit "
-            "minority arguments."
+            "The debater vote table above is authoritative. These advisory observations "
+            "were derived only from final-round responses and are not debater-confirmed."
         )
         lines.append("")
-        agenda_lines = _render_analyzer_agenda_lines(analyzer_agenda)
+        agenda_lines = _render_analyzer_agenda_lines(final_analyzer_agenda)
+        lines.extend(agenda_lines if agenda_lines else ["(the analyzer extracted no points)"])
+    if prior_analyzer_agenda is not None:
+        lines.extend(["", "### Agenda before final round", "", "Historical analyzer agenda only; it is not a statement of current disagreements.", ""])
+        agenda_lines = _render_analyzer_agenda_lines(prior_analyzer_agenda)
         lines.extend(agenda_lines if agenda_lines else ["(the analyzer extracted no points)"])
     if research_mode is not None:
         lines.append("")
@@ -1083,7 +1092,8 @@ def render_discuss_round_summary_comment(
 def _render_discuss_answer_summary(*, is_final: bool, subject: str, round_number: int,
     reviewer_votes: Sequence[ParsedDiscussAnswer], consensus_kind: str,
     round_history: Sequence[Sequence[ParsedDiscussAnswer]] | None,
-    analyzer_agenda: ParsedDiscussAgenda | None, analyzer_name: str | None,
+    analyzer_agenda: ParsedDiscussAgenda | None, prior_analyzer_agenda: ParsedDiscussAgenda | None,
+    final_analyzer_agenda: ParsedDiscussAgenda | None, analyzer_name: str | None,
     research_mode: str | None, failed_debaters: Sequence[tuple[str, str]], outcome: str | None,
     semantic_comparison: dict[str, object] | None = None) -> str:
     if not is_final:
@@ -1130,8 +1140,10 @@ def _render_discuss_answer_summary(*, is_final: bool, subject: str, round_number
                     lines.append(f"- {reviewer}: {supports}")
         if semantic_comparison.get("confirmed_answer"):
             lines.extend(["", "The recommendation above was explicitly confirmed by every debater."])
-    if analyzer_agenda is not None:
-        lines.extend(["", "### Analyzer observations (not debater-confirmed)", "", "The analyzer is non-authoritative.", "", *_render_analyzer_agenda_lines(analyzer_agenda)])
+    if final_analyzer_agenda is not None:
+        lines.extend(["", "### Final analyzer observations (not debater-confirmed)", "", "The analyzer is non-authoritative; these observations use only final-round responses.", "", *_render_analyzer_agenda_lines(final_analyzer_agenda)])
+    if prior_analyzer_agenda is not None:
+        lines.extend(["", "### Agenda before final round", "", "Historical analyzer agenda only; it is not current-state analysis.", "", *_render_analyzer_agenda_lines(prior_analyzer_agenda)])
     if research_mode is not None:
         lines.extend(["", *_render_discuss_research_section(research_mode=research_mode, reviewer_votes=reviewer_votes, round_history=round_history)])
     lines.extend(["", "-- Orchestrator", f"<!-- AGENT_DISCUSS_CONSENSUS: {subject} -->"] if is_final else ["", "-- Orchestrator"])

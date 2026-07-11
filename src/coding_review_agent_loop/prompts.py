@@ -2445,6 +2445,74 @@ Rules:
 """
 
 
+def build_discuss_final_analysis_prompt(
+    issue_number: int,
+    config: AgentLoopConfig,
+    *,
+    analyzer: AgentName,
+    round_number: int,
+    final_votes: Sequence[ParsedDiscussResponse],
+) -> str:
+    """Ask for advisory observations about *only* the completed final round."""
+    transcript_lines: list[str] = []
+    for vote in final_votes:
+        if isinstance(vote, ParsedDiscussAnswer):
+            transcript_lines.extend(
+                [f"- {vote.reviewer}: `{vote.position}`", f"  Answer: {vote.answer or '(none)'}"]
+            )
+            if vote.open_questions:
+                transcript_lines.extend(f"  Open question: {question}" for question in vote.open_questions)
+        else:
+            transcript_lines.append(f"- {vote.reviewer}: `{vote.outcome}`")
+        transcript_lines.append(f"  Rationale: {vote.rationale}")
+        if vote.rebuttal:
+            transcript_lines.append(f"  Rebuttal: {vote.rebuttal}")
+    transcript = "\n".join(transcript_lines)
+    signature = agent_signature(analyzer, config)
+    return f"""Analyze only these completed final-round debater responses for GitHub issue #{issue_number} in {config.repo}.
+
+You are an advisory analyzer, not a debater. Do not use or infer any earlier
+round, issue context, prior agenda, or external information. Do not edit files.
+
+Final round {round_number} responses:
+
+{transcript}
+
+Report only observations directly supported by the responses above. Every named
+position must belong to a listed debater, and every topic, position, consensus,
+or missing fact must be grounded in their final-round text. This output is not a
+debater-confirmed vote and must not manufacture unresolved disagreements.
+
+Respond using this mandatory structured JSON format:
+
+{{
+  "schema_version": 1,
+  "kind": "discuss_agenda",
+  "consensus": ["A final-round point directly supported by every response."],
+  "disagreements": [
+    {{
+      "topic": "A final-round unresolved topic",
+      "positions": {{"Codex": "A final-round position", "Gemini": "Another final-round position"}},
+      "question_for_next_round": "A question directly raised by the final responses"
+    }}
+  ],
+  "missing_facts": ["A fact the final responses explicitly identify as missing."]
+}}
+<!-- AGENT_PLAN_STATE: approved -->
+-- {signature}
+
+Rules:
+- `consensus`, `disagreements`, and `missing_facts` may be empty arrays.
+- Do not include research fields: there is no next round.
+- The footer must always be `<!-- AGENT_PLAN_STATE: approved -->`.
+- Do not include prose or code fences before the JSON object.
+- Your response must end with, in this exact order:
+
+<!-- AGENT_PLAN_STATE: approved -->
+-- {signature}
+"""
+
+
 def build_discuss_review_prompt(
     issue_number: int,
     config: AgentLoopConfig,

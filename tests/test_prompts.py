@@ -2015,6 +2015,7 @@ def test_reviewer_prompt_includes_documentation_check(tmp_path):
 
 from coding_review_agent_loop.prompts import (
     build_discuss_agenda_prompt,
+    build_discuss_final_analysis_prompt,
     build_discuss_review_prompt,
 )
 from coding_review_agent_loop.protocol import (
@@ -2352,3 +2353,18 @@ def test_build_discuss_agenda_prompt_research_required_focuses_questions(tmp_pat
     )
     assert "debaters must research" in prompt
     assert "`research_required` / `research_questions`" in prompt
+
+
+def test_build_discuss_final_analysis_prompt_excludes_prior_context(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
+    prompt = build_discuss_final_analysis_prompt(
+        56, config, analyzer="claude", round_number=3,
+        final_votes=[
+            ParsedDiscussReview(outcome="implement", rationale="Accept concession checks.", split_proposals=(), reviewer="Codex"),
+            ParsedDiscussReview(outcome="implement", rationale="Accept concession checks.", split_proposals=(), reviewer="Gemini"),
+        ],
+    )
+    assert "Analyze only these completed final-round debater responses" in prompt
+    assert "Accept concession checks." in prompt
+    assert "Your previous agenda" not in prompt
+    assert "Complete debate transcript so far" not in prompt

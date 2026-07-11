@@ -54,6 +54,9 @@ class PostedRoundMetadata:
     # Raw structured discuss-agenda response from the optional analyzer (#467).
     # None on final summaries, plain-mode rounds, and legacy comments.
     analyzer_response: str | None = None
+    # Raw structured final-only analyzer response (#529).  Kept separate from
+    # the prior-round agenda so resumes/audit cannot treat history as current.
+    final_analyzer_response: str | None = None
     # Discuss research policy in effect when the comment was posted (#477).
     # None on non-discuss flows and legacy comments.
     research_mode: str | None = None
@@ -163,6 +166,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "is_final": metadata.is_final,
         "agenda": list(metadata.agenda),
         "analyzer_response": metadata.analyzer_response,
+        "final_analyzer_response": metadata.final_analyzer_response,
         "research_mode": metadata.research_mode,
         "failed_debaters": [list(pair) for pair in metadata.failed_debaters],
         "split_proposals": list(metadata.split_proposals),
@@ -211,6 +215,11 @@ def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:
             analyzer_response=(
                 str(payload["analyzer_response"])
                 if payload.get("analyzer_response") is not None
+                else None
+            ),
+            final_analyzer_response=(
+                str(payload["final_analyzer_response"])
+                if payload.get("final_analyzer_response") is not None
                 else None
             ),
             research_mode=(
