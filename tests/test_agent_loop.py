@@ -3438,6 +3438,161 @@ def test_runner_dangling_symlink_spawn_retry_is_bounded(
     assert sleep_calls == [2, 2]
 
 
+@pytest.mark.parametrize("use_pty", [False, True])
+def test_runner_retries_preflighted_command_disappearance_and_recovers(
+    monkeypatch,
+    tmp_path,
+    use_pty,
+):
+    """A bare CLI that vanishes after preflight can return during spawn retry."""
+    import coding_review_agent_loop.runner as runner_module
+
+    command_name = "bare-agent"
+    command = tmp_path / command_name
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+    runner = Runner()
+    runner.remember_agent_command(
+        command_name,
+        str(tmp_path / "preflight-agent-path"),
+        "--codex-cmd",
+    )
+    original_popen = runner_module.subprocess.Popen
+    original_which = runner_module.shutil.which
+    popen_calls = []
+    which_calls = []
+    sleep_calls = []
+
+    def tracking_which(name):
+        which_calls.append(name)
+        return original_which(name)
+
+    def flaky_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        if len(popen_calls) < 3:
+            raise FileNotFoundError(command_name)
+        return original_popen(*args, **kwargs)
+
+    def restore_command(delay):
+        sleep_calls.append(delay)
+        if delay == 2 and not command.exists():
+            command.symlink_to(sys.executable)
+
+    monkeypatch.setattr(runner_module.shutil, "which", tracking_which)
+    monkeypatch.setattr(runner_module.subprocess, "Popen", flaky_popen)
+    monkeypatch.setattr(runner_module.time, "sleep", restore_command)
+
+    result = runner.run_with_log(
+        [command_name, "-c", "print('recovered after preflight')"],
+        cwd=tmp_path,
+        log_path=tmp_path / "logs" / f"preflight-retry-{use_pty}.log",
+        label="Preflight retry probe",
+        progress_interval_seconds=999,
+        use_pty=use_pty,
+    )
+
+    assert result.returncode == 0
+    assert "recovered after preflight" in result.stdout
+    assert len(popen_calls) == 3
+    assert which_calls == [command_name, command_name, command_name]
+    assert runner._resolved_commands[command_name] == str(command)
+    assert sleep_calls[:2] == [2, 2]
+    assert all(delay == 1 for delay in sleep_calls[2:])
+
+
+@pytest.mark.parametrize("use_pty", [False, True])
+def test_runner_preflighted_command_disappearance_retry_is_bounded(
+    monkeypatch,
+    tmp_path,
+    use_pty,
+):
+    """A post-preflight PATH disappearance gives a specific bounded error."""
+    import coding_review_agent_loop.runner as runner_module
+
+    command_name = "bare-agent"
+    runner = Runner()
+    runner.remember_agent_command(
+        command_name,
+        str(tmp_path / "preflight-agent-path"),
+        "--codex-cmd",
+    )
+    popen_calls = []
+    which_calls = []
+    sleep_calls = []
+
+    def missing_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        raise FileNotFoundError(command_name)
+
+    def missing_which(name):
+        which_calls.append(name)
+        return None
+
+    monkeypatch.setattr(runner_module.shutil, "which", missing_which)
+    monkeypatch.setattr(runner_module.subprocess, "Popen", missing_popen)
+    monkeypatch.setattr(
+        runner_module.time,
+        "sleep",
+        lambda delay: sleep_calls.append(delay),
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match=r"disappeared after successful preflight and may be updating",
+    ):
+        runner.run_with_log(
+            [command_name, "--version"],
+            cwd=tmp_path,
+            log_path=tmp_path / "logs" / f"preflight-bounded-{use_pty}.log",
+            label="Preflight bounded retry probe",
+            progress_interval_seconds=999,
+            use_pty=use_pty,
+        )
+
+    assert len(popen_calls) == 3
+    assert which_calls == [command_name] * 4
+    assert sleep_calls == [2, 2]
+
+
+@pytest.mark.parametrize("use_pty", [False, True])
+def test_runner_preflighted_command_permission_error_does_not_retry(
+    monkeypatch,
+    tmp_path,
+    use_pty,
+):
+    """Only FileNotFoundError can use the preflighted-command retry."""
+    import coding_review_agent_loop.runner as runner_module
+
+    command_name = "bare-agent"
+    runner = Runner()
+    runner.remember_agent_command(command_name, "/bin/bare-agent", "--codex-cmd")
+    popen_calls = []
+    sleep_calls = []
+
+    def denied_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        raise PermissionError(command_name)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", denied_popen)
+    monkeypatch.setattr(
+        runner_module.time,
+        "sleep",
+        lambda delay: sleep_calls.append(delay),
+    )
+
+    with pytest.raises(PermissionError):
+        runner.run_with_log(
+            [command_name, "--version"],
+            cwd=tmp_path,
+            log_path=tmp_path / "logs" / f"permission-no-retry-{use_pty}.log",
+            label="Permission no-retry probe",
+            progress_interval_seconds=999,
+            use_pty=use_pty,
+        )
+
+    assert len(popen_calls) == 1
+    assert sleep_calls == []
+
+
 def test_runner_missing_command_without_dangling_evidence_does_not_retry(
     monkeypatch,
     tmp_path,
@@ -3446,12 +3601,17 @@ def test_runner_missing_command_without_dangling_evidence_does_not_retry(
 
     popen_calls = []
     sleep_calls = []
+    which_calls = []
+
+    def runtime_only_which(command):
+        which_calls.append(command)
+        return "/tmp/runtime-agent" if len(which_calls) == 1 else None
 
     def missing_popen(*args, **kwargs):
         popen_calls.append(args[0])
         raise FileNotFoundError("missing-agent")
 
-    monkeypatch.setattr(runner_module.shutil, "which", lambda command: None)
+    monkeypatch.setattr(runner_module.shutil, "which", runtime_only_which)
     monkeypatch.setattr(runner_module.subprocess, "Popen", missing_popen)
     monkeypatch.setattr(
         runner_module.time,
@@ -3469,6 +3629,7 @@ def test_runner_missing_command_without_dangling_evidence_does_not_retry(
         )
 
     assert len(popen_calls) == 1
+    assert which_calls == ["missing-agent", "missing-agent"]
     assert sleep_calls == []
 
 

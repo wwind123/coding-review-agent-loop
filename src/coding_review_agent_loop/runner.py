@@ -56,6 +56,7 @@ class Runner:
         self.dry_run = dry_run
         self._resolved_commands: dict[str, str] = {}
         self._command_override_flags: dict[str, str] = {}
+        self._preflighted_commands: set[str] = set()
         # Parallel discuss debaters call run_with_log from worker threads (#475):
         # guard the command caches and keep a registry of live agent processes so
         # the main thread can kill them on KeyboardInterrupt.
@@ -74,6 +75,7 @@ class Runner:
         with self._commands_lock:
             self._resolved_commands[command] = resolved_path
             self._command_override_flags[command] = override_flag
+            self._preflighted_commands.add(command)
 
     def _register_active_process(self, proc: subprocess.Popen) -> None:
         with self._active_procs_lock:
@@ -129,6 +131,17 @@ class Runner:
             f"{override_flag} <path>."
         )
 
+    def _command_disappeared_after_preflight_error(self, command: str) -> AgentLoopError:
+        override_flag = self._command_override_flags.get(command)
+        if override_flag is None:
+            command_name = Path(command).name
+            override_flag = f"--{command_name}-cmd"
+        return AgentLoopError(
+            f"{command} CLI disappeared after successful preflight and may be updating; "
+            f"it did not return on PATH after {_SPAWN_ATTEMPTS} spawn attempts. "
+            f"Retry shortly or pass {override_flag} <path>."
+        )
+
     @staticmethod
     def _is_dangling_symlink(path: str | None) -> bool:
         return bool(path and os.path.islink(path) and not os.path.exists(path))
@@ -144,6 +157,7 @@ class Runner:
             with self._commands_lock:
                 self._resolved_commands[command] = resolved
 
+        saw_preflight_disappearance = False
         for attempt in range(1, _SPAWN_ATTEMPTS + 1):
             try:
                 return spawn_attempt()
@@ -155,9 +169,14 @@ class Runner:
                     if current is not None:
                         self._resolved_commands[command] = current
                     candidate = current or self._resolved_commands.get(command)
-                if not self._is_dangling_symlink(candidate):
+                    preflighted = command in self._preflighted_commands
+                dangling_symlink = self._is_dangling_symlink(candidate)
+                saw_preflight_disappearance |= preflighted and current is None
+                if not dangling_symlink and not preflighted:
                     raise self._missing_command_error(command) from exc
                 if attempt == _SPAWN_ATTEMPTS:
+                    if saw_preflight_disappearance and not dangling_symlink:
+                        raise self._command_disappeared_after_preflight_error(command) from exc
                     raise self._missing_command_error(command) from exc
                 time.sleep(_SPAWN_RETRY_BACKOFF_SECONDS)
 
