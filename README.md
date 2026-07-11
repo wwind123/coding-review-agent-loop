@@ -28,7 +28,9 @@ material conflict fails closed to deadlock; and compatible answers get at most
 one extra, budget-exempt confirmation phase. Every debater must then confirm
 the canonical recommendation or refine it, and the effective answers must be
 identical after whitespace/case normalization. The summary preserves the
-analyzer classification separately for audit.
+analyzer classification separately for audit. When that confirmation succeeds,
+the recorded semantic comparison is reused and no duplicate final-observations
+analyzer pass runs; the debaters' confirmation remains authoritative.
 
 Local command-line orchestration for a coding PR review loop.
 

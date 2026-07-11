@@ -5438,10 +5438,8 @@ def _validate_discuss_final_analyzer_fidelity(
     analyzer: AgentName,
 ) -> None:
     """Validate an advisory final pass against final debater text only (#529)."""
-    if len(final_votes) != len(configured_reviewers) or any(
-        is_failed_discuss_response(vote) for vote in final_votes
-    ):
-        raise AgentLoopError("final analyzer requires a complete successful final round.")
+    if not final_votes or any(is_failed_discuss_response(vote) for vote in final_votes):
+        raise AgentLoopError("final analyzer requires successful final-round responses.")
     if agenda.research_required or agenda.research_questions or agenda.research_question_targets:
         raise AgentLoopError("final analyzer output must not include next-round research fields.")
     allowed_names = {agent_display_name(reviewer) for reviewer in configured_reviewers}
@@ -5484,9 +5482,7 @@ def _run_discuss_final_analyzer(
     usage_context: RunUsageContext,
 ) -> tuple[ParsedDiscussAgenda | None, str | None]:
     """Best-effort final-only analyzer pass; failures never affect finalization."""
-    if analyzer is None or len(final_votes) != len(configured_reviewers) or any(
-        is_failed_discuss_response(vote) for vote in final_votes
-    ):
+    if analyzer is None or not final_votes or any(is_failed_discuss_response(vote) for vote in final_votes):
         return None, None
 
 
@@ -6220,7 +6216,12 @@ def _run_discuss_loop(
                 configured_reviewers=configured_reviewers,
                 usage_context=usage_context,
             )
-        elif is_final:
+        elif is_final and consensus_kind != "debater-confirmed":
+            # Semantic finalization already used the configured analyzer to
+            # compare the completed final-round answers. When every debater
+            # confirms that recommendation, keep that audit as the final
+            # analyzer record rather than invoking the same analyzer again
+            # for advisory observations over identical input.
             final_analyzer_agenda, final_analyzer_response_raw = _run_discuss_final_analyzer(
                 runner,
                 issue_number=issue_number,

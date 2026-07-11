@@ -376,8 +376,11 @@ bounded, budget-exempt confirmation phase: each original debater confirms the
 canonical recommendation or supplies a refinement, and only exact normalized
 agreement among those effective answers finalizes. Invalid comparator output,
 comparison failure, failed confirmation, or material conflict safely remains a
-deadlock. This makes resumed finalization idempotent once a final summary is
-recorded.
+deadlock. A successful debater-confirmed recommendation reuses the recorded
+semantic comparison audit and does not invoke a second final-observations pass
+over the same final answers; that advisory comparison remains distinct from the
+authoritative debater confirmation. This makes resumed finalization idempotent
+once a final summary is recorded.
 
 Discuss mode sends the issue title, body, and comments to all configured
 reviewers and asks each to return a `discuss_review` response with a single
@@ -506,12 +509,17 @@ Guardrails — the analyzer is never authoritative:
   result is rendered as "Final analyzer observations (not debater-confirmed)"
   after the authoritative debater vote table. It is rejected if it names a
   non-debater or asserts a position, topic, consensus, disagreement, or missing
-  fact unsupported by the final-round text.
+  fact unsupported by the final-round text. The exception is a successful
+  answer-mode compatible-answer confirmation: its semantic comparison already
+  analyzed those final answers, so the recorded comparison is reused instead
+  of making a duplicate advisory pass. Debater confirmation is still the
+  authoritative finalization step.
 - If an agenda from the preceding non-final round exists, the final summary
   renders it separately as "Agenda before final round." This is explicitly
   historical and is never presented as current disagreements. If final analysis
-  fails validation or the final round is partial, the observations are omitted
-  while the answer/vote table and mechanical outcome remain available.
+  fails validation, the observations are omitted while the answer/vote table
+  and mechanical outcome remain available. For a partial round, any retained
+  observations are grounded only in its successful final-round responses.
 - If the analyzer invocation fails even after the malformed-response repair
   pass, the orchestrator logs a warning and falls back to the plain mechanical
   agenda for that round (and full prior positions in the next debate prompt)

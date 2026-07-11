@@ -445,6 +445,10 @@ def test_discuss_loop_semantic_equivalent_paraphrases_converge(tmp_path):
     assert "Consensus kind: `semantic-equivalent`" in final
     assert "targeted, budget-capped verification subphase" in final
     assert "Semantic comparison (advisory; not a debater vote)" in final
+    assert any(
+        "Analyze only these completed final-round debater responses" in " ".join(command)
+        for command in _claude_commands(runner)
+    )
     metadata = ROUND_RESUME_MARKER_RE.search(runner.issue_comments[-1]["body"])
     assert metadata is not None
     assert _decode_round_metadata(metadata.group("payload")).consensus_kind == "semantic-equivalent"
@@ -479,9 +483,43 @@ def test_discuss_loop_semantic_compatible_answers_require_debater_confirmation(t
     assert "Consensus kind: `debater-confirmed`" in final
     assert "The recommendation above was explicitly confirmed by every debater." in final
     assert "Residual decisions:" in final
+    assert "### Final analyzer observations" not in final
+    claude_commands = _claude_commands(runner)
+    assert len(claude_commands) == 1
+    assert "discuss_semantic_comparison" in " ".join(claude_commands[0])
     metadata = ROUND_RESUME_MARKER_RE.search(runner.issue_comments[-1]["body"])
     assert metadata is not None
-    assert _decode_round_metadata(metadata.group("payload")).consensus_kind == "debater-confirmed"
+    parsed_metadata = _decode_round_metadata(metadata.group("payload"))
+    assert parsed_metadata.consensus_kind == "debater-confirmed"
+    assert parsed_metadata.final_analyzer_response is None
+
+
+def test_discuss_loop_confirmation_failure_still_attempts_final_analyzer(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            _discuss_answer_text(answer="Add bounded verification."),
+            _answer_confirmation_text(reviewer="Codex"),
+        ],
+        gemini_outputs=[
+            _discuss_answer_text(answer="Use targeted verification with a cap."),
+            "not structured",
+        ],
+        claude_outputs=[_semantic_comparison_text(
+            classification="compatible_with_residual_decisions",
+            shared_recommendation="Add a targeted, budget-capped verification subphase.",
+            remaining_decisions=["Choose the cap."],
+        )],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer", discuss_analyzer="claude",
+    )
+
+    assert run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0) == 0
+    assert "Consensus kind: `confirmation-failed`" in runner.comments[-1]
+    assert any(
+        "Analyze only these completed final-round debater responses" in " ".join(command)
+        for command in _claude_commands(runner)
+    )
 
 
 @pytest.mark.parametrize("failed_comparison", [("comparator unavailable", 1), "not structured"])
@@ -505,6 +543,10 @@ def test_discuss_loop_semantic_material_conflict_and_failure_are_auditable_deadl
     assert "Deadlock" in conflict
     assert "Consensus kind: `material-conflict`" in conflict
     assert "Classification: `material_conflict`" in conflict
+    assert any(
+        "Analyze only these completed final-round debater responses" in " ".join(command)
+        for command in _claude_commands(conflict_runner)
+    )
     metadata = ROUND_RESUME_MARKER_RE.search(conflict_runner.issue_comments[-1]["body"])
     assert metadata is not None
     assert _decode_round_metadata(metadata.group("payload")).consensus_kind == "material-conflict"
@@ -514,6 +556,10 @@ def test_discuss_loop_semantic_material_conflict_and_failure_are_auditable_deadl
     assert "Deadlock" in failure
     assert "Consensus kind: `semantic-comparison-failed`" in failure
     assert "Classification: `failed`" in failure
+    assert any(
+        "Analyze only these completed final-round debater responses" in " ".join(command)
+        for command in _claude_commands(failure_runner)
+    )
     metadata = ROUND_RESUME_MARKER_RE.search(failure_runner.issue_comments[-1]["body"])
     assert metadata is not None
     assert _decode_round_metadata(metadata.group("payload")).consensus_kind == "semantic-comparison-failed"
@@ -527,6 +573,10 @@ def test_discuss_loop_triage_mode_does_not_invoke_semantic_comparator(tmp_path):
     assert run_discuss_loop(runner, issue_number=56, config=config) == 0
     assert "Consensus: Implement" in runner.comments[-1]
     assert not any("discuss_semantic_comparison" in " ".join(command) for command, _ in runner.commands)
+    assert any(
+        "Analyze only these completed final-round debater responses" in " ".join(command)
+        for command in _claude_commands(runner)
+    )
 
 
 def test_discuss_loop_answer_research_required_and_analyzer_prompt_are_mode_aware(tmp_path):
@@ -540,6 +590,10 @@ def test_discuss_loop_answer_research_required_and_analyzer_prompt_are_mode_awar
     assert run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0) == 0
     assert "Use an API boundary." in runner.comments[-1]
     assert all('"kind": "discuss_answer"' in " ".join(cmd) for cmd, _ in runner.commands if cmd[:1] in (["codex"], ["gemini"]))
+    assert any(
+        "Analyze only these completed final-round debater responses" in " ".join(command)
+        for command in _claude_commands(runner)
+    )
 
 
 def test_discuss_loop_answer_partial_live_round_records_failure_and_deadlocks(tmp_path):
@@ -554,6 +608,7 @@ def test_discuss_loop_answer_partial_live_round_records_failure_and_deadlocks(tm
         reviewer=("codex", "gemini", "claude"),
         discuss_result_mode="answer",
         discuss_on_debater_failure="partial",
+        discuss_analyzer="antigravity",
     )
 
     assert run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0) == 0
@@ -562,6 +617,11 @@ def test_discuss_loop_answer_partial_live_round_records_failure_and_deadlocks(tm
     assert "Claude" in final
     assert "Debater failures" in final
     assert "Consensus Answer" not in final
+    assert any(
+        "Analyze only these completed final-round debater responses" in " ".join(command)
+        for command, _ in runner.commands
+        if command[:1] == ["agy"]
+    )
 
 
 def test_discuss_loop_answer_mode_never_materializes_split_issues(tmp_path):
