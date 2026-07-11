@@ -116,11 +116,15 @@ class Runner:
             if proc.poll() is None:
                 self._terminate_process_group(proc)
 
-    def _missing_command_error(self, command: str) -> AgentLoopError:
+    def _override_flag_for(self, command: str) -> str:
         override_flag = self._command_override_flags.get(command)
         if override_flag is None:
             command_name = Path(command).name
             override_flag = f"--{command_name}-cmd"
+        return override_flag
+
+    def _missing_command_error(self, command: str) -> AgentLoopError:
+        override_flag = self._override_flag_for(command)
         if os.path.isabs(command):
             return AgentLoopError(
                 f"{command} not found or not executable; "
@@ -132,10 +136,7 @@ class Runner:
         )
 
     def _command_disappeared_after_preflight_error(self, command: str) -> AgentLoopError:
-        override_flag = self._command_override_flags.get(command)
-        if override_flag is None:
-            command_name = Path(command).name
-            override_flag = f"--{command_name}-cmd"
+        override_flag = self._override_flag_for(command)
         return AgentLoopError(
             f"{command} CLI disappeared after successful preflight and may be updating; "
             f"it did not return on PATH after {_SPAWN_ATTEMPTS} spawn attempts. "
