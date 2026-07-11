@@ -60,6 +60,7 @@ def _existing_split_children_comment() -> dict:
 
 def test_plan_first_no_prior_split_materializes_deferred_stages_before_implementation(tmp_path):
     runner = FakeRunner(
+        pr_payload={"body": "Fixes #56"},
         claude_outputs=[
             structured_plan_state(
                 state="blocking",
@@ -103,6 +104,7 @@ def test_plan_first_deferred_stage_title_with_colon_round_trips_through_canonica
     round-trip exactly through materialization instead of being corrupted by
     a naive split-on-first-colon parse (#492 review)."""
     runner = FakeRunner(
+        pr_payload={"body": "Fixes #56"},
         claude_outputs=[
             "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
             structured_plan_revision(
@@ -144,6 +146,7 @@ def test_plan_first_deferred_stage_title_with_colon_round_trips_through_canonica
 
 def test_plan_first_no_prior_split_warns_when_materialization_disabled(tmp_path):
     runner = FakeRunner(
+        pr_payload={"body": "Fixes #56"},
         claude_outputs=[
             structured_plan_state(
                 state="blocking",
@@ -287,6 +290,7 @@ def test_plan_first_deferred_stage_rerun_resumes_parent_one_shot_handoff(tmp_pat
         pr_head_sha="abc123",
     )
     runner = FakeRunner(
+        pr_payload={"body": "Fixes #56"},
         issue_comments=[
             {
                 "author": {"login": "bot"},

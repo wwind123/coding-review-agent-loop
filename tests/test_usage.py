@@ -74,6 +74,7 @@ def test_usage_summary_keeps_retry_attempts_and_marks_only_validated_call_succes
 
 def test_plan_first_issue_run_writes_one_summary_for_planning_implementation_and_review(tmp_path):
     runner = FakeRunner(
+        pr_payload={"body": "Fixes #56"},
         claude_outputs=[
             "Plan:\n- Implement usage logging.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude",
             "Opened PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
