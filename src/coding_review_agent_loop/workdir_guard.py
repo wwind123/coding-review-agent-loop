@@ -175,9 +175,20 @@ def validate_checkout_inspected_evidence(
             )
         line_number = int(line_part)
         line_count = 0
-        with resolved.open("rb") as handle:
-            for line_count, _ in enumerate(handle, start=1):
-                pass
+        try:
+            with resolved.open("rb") as handle:
+                for line_count, _ in enumerate(handle, start=1):
+                    pass
+        except OSError as exc:
+            # The already-validated path can still fail to open (deleted or
+            # made unreadable between is_file() and open()); translate this
+            # the same way as any other unresolvable reference instead of
+            # letting an OSError escape past the AgentLoopError/repair
+            # contract every other call site of this function relies on.
+            raise AgentLoopError(
+                "checkout-inspected evidence claim references a path that could "
+                f"not be read: {source!r} for fact {claim.fact!r} ({exc})."
+            ) from exc
         if not (1 <= line_number <= line_count):
             raise AgentLoopError(
                 "checkout-inspected evidence claim references a line number "

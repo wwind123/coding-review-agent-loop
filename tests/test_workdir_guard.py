@@ -159,6 +159,24 @@ def test_checkout_inspected_evidence_rejects_implausibly_large_line_number_witho
         )
 
 
+def test_checkout_inspected_evidence_rejects_unreadable_file_without_crashing(tmp_path):
+    # is_file() only checks the path resolves to a regular file; it does not
+    # guarantee the file can actually be opened (deleted or made unreadable
+    # between the check and open() -- e.g. a permission race). An OSError
+    # from open() must be translated into AgentLoopError like every other
+    # unresolvable reference, not left to escape and bypass the repair path.
+    target = tmp_path / "src.py"
+    target.write_text("line1\nline2\n", encoding="utf-8")
+    target.chmod(0o000)
+    try:
+        with pytest.raises(AgentLoopError, match="could not be read"):
+            validate_checkout_inspected_evidence(
+                [_checkout_claim("src.py:1")], assigned_workdir=tmp_path
+            )
+    finally:
+        target.chmod(0o644)
+
+
 def test_checkout_inspected_evidence_rejects_line_zero(tmp_path):
     (tmp_path / "src.py").write_text("line1\n", encoding="utf-8")
 
