@@ -8,7 +8,7 @@ import json
 import re
 import sys
 import zoneinfo
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
@@ -183,6 +183,7 @@ from .usage import RunUsageContext, UsageMetadata, estimate_usage
 from .workdirs import active_workdir
 from .workdir_guard import (
     validate_assigned_head_advanced,
+    validate_checkout_inspected_evidence,
     validate_response_tests_within_workdir,
     validate_test_commands_within_workdir,
 )
@@ -2492,10 +2493,15 @@ def _prior_discuss_split_proposals(
     latest = final_summaries[-1]
     if latest.metadata.split_proposals:
         return list(latest.metadata.split_proposals)
+    configured_reviewers = reviewers(config)
+    reviewer_workdirs = {
+        agent_display_name(agent): get_backend(agent).workdir(config) for agent in configured_reviewers
+    }
     recovered = _recover_final_discuss_split_proposals(
         issue_context,
         subject=latest.metadata.subject,
-        configured_reviewers=reviewers(config),
+        configured_reviewers=configured_reviewers,
+        reviewer_workdirs=reviewer_workdirs,
     )
     return list(recovered[0]) if recovered else []
 
@@ -5060,6 +5066,7 @@ def _recover_final_discuss_split_proposals(
     *,
     subject: str,
     configured_reviewers: Sequence[AgentName],
+    reviewer_workdirs: Mapping[str, Path],
 ) -> tuple[list[str], list[ParsedDiscussReview]] | None:
     """Legacy fallback (#476): reconstruct final-round votes and merged split
     proposals from debater comment metadata when `PostedRoundMetadata` has no
@@ -5084,7 +5091,9 @@ def _recover_final_discuss_split_proposals(
         record = by_name.get(name)
         if record is None:
             continue
-        final_votes.append(_decode_discuss_vote(record, round_number=final_round_number))
+        final_votes.append(
+            _decode_discuss_vote(record, round_number=final_round_number, reviewer_workdirs=reviewer_workdirs)
+        )
     if not final_votes:
         return None
     consensus = _detect_discuss_consensus(final_votes)
@@ -5589,6 +5598,30 @@ def _ensure_parallel_discuss_workdirs(config: AgentLoopConfig) -> None:
         seen[path] = reviewer
 
 
+def _validate_structured_discuss_vote_with_evidence(
+    text: str,
+    *,
+    reviewer_name: str,
+    round_number: int,
+    config: AgentLoopConfig,
+    assigned_workdir: Path,
+) -> ParsedDiscussResponse:
+    """Parse a debater's structured vote, then reject any checkout-inspected
+    evidence claim whose path:line reference does not resolve inside the
+    reviewer's own assigned checkout right now (#541)."""
+    parsed = (
+        validate_structured_discuss_answer(
+            text, reviewer=reviewer_name, round_number=round_number, research_mode=config.discuss_research
+        )
+        if config.discuss_result_mode == "answer"
+        else validate_structured_discuss_review(
+            text, reviewer=reviewer_name, round_number=round_number, research_mode=config.discuss_research
+        )
+    )
+    validate_checkout_inspected_evidence(parsed.evidence_claims, assigned_workdir=assigned_workdir)
+    return parsed
+
+
 def _run_discuss_debater_turn(
     runner: Runner,
     *,
@@ -5605,16 +5638,17 @@ def _run_discuss_debater_turn(
     from a worker thread; the caller posts the comment after the round's
     synchronization point.
     """
+    assigned_workdir = get_backend(reviewer).workdir(config)
     return _run_validated_agent(
         runner,
         agent=reviewer,
         config=config,
         prompt=prompt,
         marker_description="<!-- AGENT_PLAN_STATE: approved -->",
-        validate=lambda text, r=reviewer_name, rn=round_number: (
-            validate_structured_discuss_answer(text, reviewer=r, round_number=rn, research_mode=config.discuss_research)
-            if config.discuss_result_mode == "answer"
-            else validate_structured_discuss_review(text, reviewer=r, round_number=rn, research_mode=config.discuss_research)
+        validate=lambda text, r=reviewer_name, rn=round_number, wd=assigned_workdir: (
+            _validate_structured_discuss_vote_with_evidence(
+                text, reviewer_name=r, round_number=rn, config=config, assigned_workdir=wd
+            )
         ),
         usage_context=usage_context,
         use_repair=True,
@@ -5762,9 +5796,12 @@ def _run_discuss_loop(
     issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
     subject = _discuss_subject(issue_context)
     configured_reviewers = list(_reviewers(config))
+    reviewer_workdirs = {
+        agent_display_name(agent): get_backend(agent).workdir(config) for agent in configured_reviewers
+    }
     resume_state = _resume_discuss_round(
         issue_context.comments, subject=subject, configured_reviewers=configured_reviewers,
-        result_mode=config.discuss_result_mode,
+        reviewer_workdirs=reviewer_workdirs, result_mode=config.discuss_result_mode,
     )
 
     def _resolve_final_split_proposals() -> tuple[list[str], Sequence[ParsedDiscussReview]] | None:
@@ -5781,7 +5818,8 @@ def _run_discuss_loop(
             if consensus is not None and consensus[0] == "split" and consensus[1]:
                 return consensus[1], final_votes
         return _recover_final_discuss_split_proposals(
-            issue_context, subject=subject, configured_reviewers=configured_reviewers
+            issue_context, subject=subject, configured_reviewers=configured_reviewers,
+            reviewer_workdirs=reviewer_workdirs,
         )
 
     already_final = False

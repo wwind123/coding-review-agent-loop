@@ -1,5 +1,7 @@
 """Integration tests for plan-first split/deferred-stage materialization and
 the selected-stage implementation handoff (#476)."""
+import json
+
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
@@ -417,6 +419,133 @@ def test_plan_first_materializes_prior_discuss_split_and_hands_off_in_same_run(t
     assert "issue #101" in implementation_prompt
     assert "Closes #101" in implementation_prompt
     assert "Refs #56" in implementation_prompt
+
+
+def _legacy_split_debater_comment(*, evidence: dict | None = None) -> dict:
+    """A final-round debater comment predating the `split_proposals` metadata
+    field, forcing `_recover_final_discuss_split_proposals`'s legacy fallback
+    to reconstruct proposals from the debater's own vote."""
+    payload: dict = {
+        "schema_version": 1,
+        "kind": "discuss_review",
+        "outcome": "split",
+        "rationale": "Too broad for one PR.",
+        "split_proposals": ["Auth flow", "Billing flow"],
+    }
+    if evidence is not None:
+        payload["evidence"] = evidence
+    body = _attach_round_metadata(
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+        PostedRoundMetadata(
+            flow="discuss", role="debater", agent="Codex", round_number=1,
+            subject="prior-discuss-subject",
+        ),
+    )
+    return {"author": {"login": "bot"}, "createdAt": "2026-05-20T00:00:00Z", "body": body}
+
+
+def _legacy_split_final_summary_comment() -> dict:
+    """A final discuss summary predating `split_proposals` metadata (empty
+    here), so recovery must fall back to the debater comment above."""
+    return {
+        "author": {"login": "bot"},
+        "createdAt": "2026-05-20T00:00:01Z",
+        "body": _attach_round_metadata(
+            "Discuss consensus: split this into stages.\n-- coding-review-agent-loop",
+            PostedRoundMetadata(
+                flow="discuss",
+                role="summary",
+                agent="coding-review-agent-loop",
+                round_number=1,
+                subject="prior-discuss-subject",
+                is_final=True,
+            ),
+        ),
+    }
+
+
+def test_plan_first_recovers_legacy_split_proposals_with_valid_checkout_inspected_claim(tmp_path):
+    """`_prior_discuss_split_proposals`'s legacy fallback
+    (`_recover_final_discuss_split_proposals`) must checkout-validate a
+    `checkout-inspected` evidence claim on the reconstructed debater vote,
+    exactly like the primary discuss-loop recovery paths (#541)."""
+    config = make_config(tmp_path, materialize_split_issues=True)
+    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
+    plan = structured_plan_state(state="blocking", summary="Auth flow")
+    runner = FakeRunner(
+        claude_outputs=[
+            plan,
+            "Implemented the auth-flow stage.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_pr_review(state="approved", summary="LGTM."),
+        ],
+        issue_comments=[
+            _legacy_split_debater_comment(
+                evidence={
+                    "claims": [
+                        {
+                            "fact": "The referenced line supports splitting the work.",
+                            "status": "verified",
+                            "source": "src.py:2",
+                            "verification_basis": "checkout-inspected",
+                        }
+                    ],
+                    "updates": [],
+                },
+            ),
+            _legacy_split_final_summary_comment(),
+        ],
+        issue_urls=[
+            "https://github.com/OWNER/REPO/issues/101",
+            "https://github.com/OWNER/REPO/issues/102",
+        ],
+        pr_payload={"body": "Closes #101\n\nRefs #56"},
+    )
+
+    assert (
+        run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True
+        )
+        == 0
+    )
+
+    assert {issue["title"] for issue in runner.issues} == {
+        "[#56 stage] Auth flow",
+        "[#56 stage] Billing flow",
+    }
+    assert any("<!-- AGENT_SPLIT_STAGE_HANDOFF:" in comment for comment in runner.comments)
+
+
+def test_plan_first_legacy_split_recovery_rejects_invalid_checkout_inspected_claim(tmp_path):
+    config = make_config(tmp_path, materialize_split_issues=True)
+    plan = structured_plan_state(state="blocking", summary="Auth flow")
+    runner = FakeRunner(
+        claude_outputs=[plan],
+        codex_outputs=[structured_plan_review(state="approved")],
+        issue_comments=[
+            _legacy_split_debater_comment(
+                evidence={
+                    "claims": [
+                        {
+                            "fact": "The referenced line supports splitting the work.",
+                            "status": "verified",
+                            "source": "src/missing.py:1",
+                            "verification_basis": "checkout-inspected",
+                        }
+                    ],
+                    "updates": [],
+                },
+            ),
+            _legacy_split_final_summary_comment(),
+        ],
+    )
+
+    with pytest.raises(AgentLoopError, match="not a file in the assigned checkout"):
+        run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True
+        )
 
 
 def test_plan_first_excludes_own_scope_from_prior_discuss_proposals(tmp_path):

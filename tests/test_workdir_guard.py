@@ -115,3 +115,88 @@ def test_workdir_guard_extracts_tests_section_only(tmp_path):
         "python -m pytest tests/test_agent_loop.py passed.",
     )
     validate_response_tests_within_workdir(text, assigned_workdir=assigned)
+
+
+def _checkout_claim(source, *, verification_basis="checkout-inspected", status="verified", fact="fact"):
+    return DiscussEvidenceClaim(fact=fact, status=status, source=source, verification_basis=verification_basis)
+
+
+def test_checkout_inspected_evidence_accepts_valid_in_range_reference(tmp_path):
+    (tmp_path / "src.py").write_text("line1\nline2\nline3\n", encoding="utf-8")
+
+    validate_checkout_inspected_evidence(
+        [_checkout_claim("src.py:2")], assigned_workdir=tmp_path
+    )
+
+
+def test_checkout_inspected_evidence_rejects_missing_file(tmp_path):
+    with pytest.raises(AgentLoopError, match="not a file"):
+        validate_checkout_inspected_evidence(
+            [_checkout_claim("nope.py:1")], assigned_workdir=tmp_path
+        )
+
+
+def test_checkout_inspected_evidence_rejects_out_of_range_line(tmp_path):
+    (tmp_path / "src.py").write_text("line1\nline2\n", encoding="utf-8")
+
+    with pytest.raises(AgentLoopError, match="outside the file's range"):
+        validate_checkout_inspected_evidence(
+            [_checkout_claim("src.py:99")], assigned_workdir=tmp_path
+        )
+
+
+def test_checkout_inspected_evidence_rejects_line_zero(tmp_path):
+    (tmp_path / "src.py").write_text("line1\n", encoding="utf-8")
+
+    with pytest.raises(AgentLoopError, match="outside the file's range"):
+        validate_checkout_inspected_evidence(
+            [_checkout_claim("src.py:0")], assigned_workdir=tmp_path
+        )
+
+
+def test_checkout_inspected_evidence_rejects_absolute_path(tmp_path):
+    with pytest.raises(AgentLoopError, match="absolute path"):
+        validate_checkout_inspected_evidence(
+            [_checkout_claim("/etc/passwd:1")], assigned_workdir=tmp_path
+        )
+
+
+def test_checkout_inspected_evidence_rejects_parent_traversal(tmp_path):
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("secret\n", encoding="utf-8")
+    assigned = tmp_path / "repo"
+    assigned.mkdir()
+
+    with pytest.raises(AgentLoopError, match="traversal"):
+        validate_checkout_inspected_evidence(
+            [_checkout_claim("../outside.py:1")], assigned_workdir=assigned
+        )
+
+
+def test_checkout_inspected_evidence_rejects_symlink_escape(tmp_path):
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    target = outside_dir / "secret.py"
+    target.write_text("secret line\n", encoding="utf-8")
+    assigned = tmp_path / "repo"
+    assigned.mkdir()
+    link = assigned / "escape.py"
+    link.symlink_to(target)
+
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_checkout_inspected_evidence(
+            [_checkout_claim("escape.py:1")], assigned_workdir=assigned
+        )
+
+
+def test_checkout_inspected_evidence_leaves_external_source_claim_alone(tmp_path):
+    validate_checkout_inspected_evidence(
+        [_checkout_claim("https://example.com/spec:1", verification_basis="external-source-inspected")],
+        assigned_workdir=tmp_path,
+    )
+
+
+def test_checkout_inspected_evidence_leaves_missing_status_claim_alone(tmp_path):
+    claim = DiscussEvidenceClaim(fact="fact", status="missing", source=None, verification_basis=None)
+
+    validate_checkout_inspected_evidence([claim], assigned_workdir=tmp_path)

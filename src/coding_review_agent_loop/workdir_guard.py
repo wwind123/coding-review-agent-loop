@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .errors import AgentLoopError
+from .protocol import DiscussEvidenceClaim
 
 
 TEST_SECTION_RE = re.compile(r"(?im)^\s*tests(?:\s+run)?\s*:\s*(?P<body>.*)$")
@@ -117,6 +118,62 @@ def validate_response_tests_within_workdir(text: str, *, assigned_workdir: Path)
         extract_reported_tests_from_response(text),
         assigned_workdir=assigned_workdir,
     )
+
+
+def validate_checkout_inspected_evidence(
+    claims: Sequence[DiscussEvidenceClaim],
+    *,
+    assigned_workdir: Path,
+) -> None:
+    """Reject a ``checkout-inspected`` evidence claim whose ``path:line``
+    source does not resolve to a real, in-range line inside the reviewer's
+    assigned checkout right now.
+
+    This is structural containment/existence checking only -- it does not
+    verify the claimed fact is actually supported by that line's content.
+    Claims with any other (or no) verification_basis are left untouched.
+    """
+    assigned = _canonical(assigned_workdir)
+    for claim in claims:
+        if claim.verification_basis != "checkout-inspected":
+            continue
+        # The parser (protocol.py) already guarantees `source` fullmatches
+        # `[^\s:][^:]*:\d+`, i.e. a single colon separating a path with no
+        # embedded colons from a trailing line number.
+        source = claim.source or ""
+        path_part, _, line_part = source.rpartition(":")
+        if path_part.startswith("/") or path_part.startswith("~"):
+            raise AgentLoopError(
+                "checkout-inspected evidence claim used an absolute path outside "
+                f"the assigned checkout: {source!r} for fact {claim.fact!r}."
+            )
+        if any(segment == ".." for segment in Path(path_part).parts):
+            raise AgentLoopError(
+                "checkout-inspected evidence claim used a path traversal segment: "
+                f"{source!r} for fact {claim.fact!r}."
+            )
+        resolved = _canonical(assigned / path_part)
+        if not _is_inside(resolved, assigned):
+            raise AgentLoopError(
+                "checkout-inspected evidence claim resolves outside the assigned "
+                f"checkout: {source!r} for fact {claim.fact!r}."
+            )
+        if not resolved.is_file():
+            raise AgentLoopError(
+                "checkout-inspected evidence claim references a path that is not "
+                f"a file in the assigned checkout: {source!r} for fact {claim.fact!r}."
+            )
+        line_number = int(line_part)
+        line_count = 0
+        with resolved.open("rb") as handle:
+            for line_count, _ in enumerate(handle, start=1):
+                pass
+        if not (1 <= line_number <= line_count):
+            raise AgentLoopError(
+                "checkout-inspected evidence claim references a line number "
+                f"outside the file's range: {source!r} for fact {claim.fact!r} "
+                f"(file has {line_count} lines)."
+            )
 
 
 def validate_assigned_head_advanced(

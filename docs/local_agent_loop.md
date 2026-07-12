@@ -632,6 +632,26 @@ final-round claims, verified, reported, missing, and old history. Omitted
 counts and a digest point to the complete per-round comments and replay
 metadata, which remain the audit trail.
 
+A `checkout-inspected` claim's `path:line` is mechanically cross-checked
+against the reviewer's assigned checkout: the path must resolve inside that
+checkout (no absolute paths, `..` traversal, or symlink escapes), exist as a
+file, and the line number must fall within its current line count, or the
+loop raises and fails the turn/resume/recovery outright. This is a bounded,
+structural guarantee only — it confirms the referenced line exists, not that
+it actually supports the claimed fact. The check always runs against
+whatever is on disk in the assigned checkout *right now*, at live, repair,
+resume, and legacy split-proposal-recovery time alike; there is no persisted
+historical snapshot to compare against, so a claim can stop resolving later
+if the checkout's contents have since changed. A default (tool-managed)
+reviewer checkout is kept at the current base-branch tip by the same
+`ensure_agent_workdirs` sync used everywhere else, so it can drift past a
+debater's persisted claim as the base branch advances. An explicit reviewer
+checkout (e.g. `--codex-dir`) is only checked for cleanliness and remote by
+`validate_explicit_workdir` when it happens to already be a Git work tree —
+a non-Git explicit directory receives no such check and is used exactly as
+the user left it — but its contents are still validated live against the
+persisted claim like any other checkout.
+
 ### Parallel debater execution
 
 `--discuss-parallel` runs same-round debaters concurrently instead of one

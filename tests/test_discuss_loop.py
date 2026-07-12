@@ -73,6 +73,7 @@ def _discuss_review_text(
     analyzer_framing: str | None = None,
     framing_note: str | None = None,
     research: dict | None = None,
+    evidence: dict | None = None,
 ) -> str:
     payload: dict = {
         "schema_version": 1,
@@ -90,7 +91,23 @@ def _discuss_review_text(
         payload["framing_note"] = framing_note
     if research is not None:
         payload["research"] = research
+    if evidence is not None:
+        payload["evidence"] = evidence
     return json.dumps(payload) + f"\n<!-- AGENT_PLAN_STATE: approved -->\n-- {reviewer}"
+
+
+def _checkout_inspected_evidence(source: str) -> dict:
+    return {
+        "claims": [
+            {
+                "fact": "The referenced line supports this outcome.",
+                "status": "verified",
+                "source": source,
+                "verification_basis": "checkout-inspected",
+            }
+        ],
+        "updates": [],
+    }
 
 
 def _discuss_answer_text(
@@ -103,6 +120,7 @@ def _discuss_answer_text(
     unresolved_items: list[dict[str, str]] | None = None,
     rebuttal: str | None = None,
     research: dict | None = None,
+    evidence: dict | None = None,
     reviewer: str = "OpenAI Codex",
 ) -> str:
     payload: dict = {
@@ -122,6 +140,8 @@ def _discuss_answer_text(
         payload["rebuttal"] = rebuttal
     if research is not None:
         payload["research"] = research
+    if evidence is not None:
+        payload["evidence"] = evidence
     return json.dumps(payload) + f"\n<!-- AGENT_PLAN_STATE: approved -->\n-- {reviewer}"
 
 
@@ -213,6 +233,7 @@ def _seed_debater_comment(
     rationale: str = "Well-scoped.",
     split_proposals: list[str] | None = None,
     rebuttal: str | None = None,
+    evidence: dict | None = None,
     config=None,
 ) -> dict:
     """Build an issue-comment payload matching what `_run_discuss_loop` posts for a debater."""
@@ -229,6 +250,7 @@ def _seed_debater_comment(
         split_proposals=split_proposals,
         rebuttal=rebuttal,
         reviewer=reviewer,
+        evidence=evidence,
     )
     body = render_public_agent_comment(
         kind="discuss_review",
@@ -254,7 +276,7 @@ def _seed_debater_comment(
 def _seed_answer_debater_comment(
     *, reviewer: str, round_number: int, subject: str, answer: str,
     rationale: str = "The evidence supports this recommendation.",
-    rebuttal: str | None = None, config=None, legacy: bool = False,
+    rebuttal: str | None = None, evidence: dict | None = None, config=None, legacy: bool = False,
 ) -> dict:
     vote = ParsedDiscussAnswer(
         position="answer", rationale=rationale, confidence="medium",
@@ -269,6 +291,7 @@ def _seed_answer_debater_comment(
     else:
         raw_text = _discuss_answer_text(
             answer=answer, rationale=rationale, rebuttal=rebuttal, reviewer=reviewer,
+            evidence=evidence,
         )
     body = render_public_agent_comment(
         kind="discuss_answer", parsed=vote, agent=reviewer, config=config,
@@ -713,6 +736,37 @@ def test_discuss_loop_resumes_answer_partial_round_and_is_idempotent(tmp_path):
 
     assert run_discuss_loop(runner, issue_number=56, config=config) == 0
     assert len(runner.comments) == comment_count
+
+
+def test_discuss_loop_resume_mid_round_answer_mode_accepts_valid_checkout_inspected_reference(tmp_path):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
+    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
+    seeded = _seed_answer_debater_comment(
+        reviewer="Codex", round_number=1, subject=subject,
+        answer="Use an API.", evidence=_checkout_inspected_evidence("src.py:2"), config=config,
+    )
+    answer = _discuss_answer_text(answer="Use an API.", reviewer="Google Gemini")
+    runner = FakeRunner(issue_comments=[seeded], gemini_outputs=[answer])
+
+    assert run_discuss_loop(runner, issue_number=56, config=config) == 0
+    assert "Consensus Answer" in runner.comments[-1]
+
+
+def test_discuss_loop_resume_mid_round_answer_mode_rejects_invalid_checkout_inspected_reference(tmp_path):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
+    seeded = _seed_answer_debater_comment(
+        reviewer="Codex", round_number=1, subject=subject,
+        answer="Use an API.", evidence=_checkout_inspected_evidence("src/missing.py:1"), config=config,
+    )
+    runner = FakeRunner(
+        issue_comments=[seeded],
+        gemini_outputs=[_discuss_answer_text(answer="Use an API.", reviewer="Google Gemini")],
+    )
+
+    with pytest.raises(AgentLoopError, match="not a file in the assigned checkout"):
+        run_discuss_loop(runner, issue_number=56, config=config)
 
 
 def test_discuss_loop_resumes_legacy_answer_metadata_conservatively(tmp_path):
@@ -1187,6 +1241,42 @@ def test_discuss_loop_split_consensus_rerun_materializes_nothing_new(tmp_path):
     assert len(runner.issues) == 1
 
 
+def test_discuss_loop_marker_only_final_recovers_split_proposals_via_legacy_fallback(tmp_path):
+    """An issue carries a bare `AGENT_DISCUSS_CONSENSUS` marker comment (from
+    an old run) with no matching final-round summary metadata, so
+    `resume_state.done` is False for this subject and `_run_discuss_loop`'s
+    own `_resolve_final_split_proposals` must fall through to
+    `_recover_final_discuss_split_proposals` -- the same shared,
+    reviewer-workdir-validated recovery function used by the plan-first path
+    -- to reconstruct and materialize the split proposal instead of crashing
+    on the now-required `reviewer_workdirs` parameter (#541)."""
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), materialize_split_issues=True)
+    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
+    seeded = [
+        {
+            "author": {"login": "bot"},
+            "createdAt": "2026-01-01T00:00:00Z",
+            "body": f"Old consensus record.\n<!-- AGENT_DISCUSS_CONSENSUS: {subject} -->",
+        },
+        _seed_debater_comment(
+            reviewer="Codex", round_number=1, subject=subject, outcome="split",
+            rationale="Too broad.", split_proposals=["Auth flow"],
+            evidence=_checkout_inspected_evidence("src.py:2"), config=config,
+        ),
+    ]
+    runner = FakeRunner(
+        issue_comments=seeded, codex_outputs=[], gemini_outputs=[],
+        issue_urls=["https://github.com/OWNER/REPO/issues/101"],
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config)
+
+    assert result == 0
+    assert len(runner.issues) == 1
+    assert runner.issues[0]["title"] == "[#56 stage] Auth flow"
+
+
 def test_discuss_loop_converges_after_debate(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
@@ -1337,6 +1427,83 @@ def test_discuss_loop_resumes_missing_debater_mid_round(tmp_path):
     assert "Consensus: Implement" in runner.comments[-1]
 
 
+def test_discuss_loop_resume_mid_round_accepts_valid_checkout_inspected_reference(tmp_path):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
+    seeded = _seed_debater_comment(
+        reviewer="Codex",
+        round_number=1,
+        subject=subject,
+        outcome="implement",
+        rationale="Scoped.",
+        evidence=_checkout_inspected_evidence("src.py:2"),
+        config=config,
+    )
+    implement_text = _discuss_review_text(outcome="implement", rationale="Agreed.", reviewer="Gemini")
+    runner = FakeRunner(
+        issue_comments=[seeded],
+        codex_outputs=[],
+        gemini_outputs=[implement_text],
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config)
+
+    assert result == 0
+    assert "Consensus: Implement" in runner.comments[-1]
+
+
+def test_discuss_loop_resume_mid_round_rejects_invalid_checkout_inspected_reference(tmp_path):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    seeded = _seed_debater_comment(
+        reviewer="Codex",
+        round_number=1,
+        subject=subject,
+        outcome="implement",
+        rationale="Scoped.",
+        evidence=_checkout_inspected_evidence("src/missing.py:1"),
+        config=config,
+    )
+    runner = FakeRunner(
+        issue_comments=[seeded],
+        codex_outputs=[],
+        gemini_outputs=[_discuss_review_text(outcome="implement", rationale="Agreed.", reviewer="Gemini")],
+    )
+
+    with pytest.raises(AgentLoopError, match="not a file in the assigned checkout"):
+        run_discuss_loop(runner, issue_number=56, config=config)
+
+
+def test_discuss_loop_resume_mid_round_rejects_unconfigured_reviewer_debater_comment(tmp_path):
+    # A debater comment posted by a reviewer who is no longer part of the
+    # configured --reviewers set (e.g. dropped before resuming an interrupted
+    # round) cannot be checkout-validated, since we have no known assigned
+    # workdir for it; only the in-progress mid-round decode loop can ever
+    # encounter this, since completed-round resume and legacy split recovery
+    # both key strictly off configured reviewer names (#541).
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    seeded = [
+        _seed_debater_comment(
+            reviewer="Codex", round_number=1, subject=subject,
+            outcome="implement", rationale="Scoped.", config=config,
+        ),
+        _seed_debater_comment(
+            reviewer="ThirdParty", round_number=1, subject=subject,
+            outcome="implement", rationale="Also scoped.", config=config,
+        ),
+    ]
+    runner = FakeRunner(
+        issue_comments=seeded,
+        codex_outputs=[],
+        gemini_outputs=[],
+    )
+
+    with pytest.raises(AgentLoopError, match="ThirdParty"):
+        run_discuss_loop(runner, issue_number=56, config=config)
+
+
 def test_discuss_loop_resumes_after_closed_non_final_round(tmp_path):
     subject = _issue_subject()
     config = make_config(tmp_path, reviewer=("codex", "gemini"))
@@ -1392,6 +1559,88 @@ def test_discuss_loop_resumes_after_closed_non_final_round(tmp_path):
     for command in round2_commands:
         prompt = " ".join(command)
         assert "Out of scope." in prompt
+
+
+def test_discuss_loop_resume_completed_round_accepts_valid_checkout_inspected_reference(tmp_path):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
+    codex_vote_r1 = ParsedDiscussReview(outcome="implement", rationale="Scoped.", split_proposals=(), reviewer="Codex")
+    gemini_vote_r1 = ParsedDiscussReview(outcome="do-not-implement", rationale="Out of scope.", split_proposals=(), reviewer="Gemini")
+    agenda = (
+        "- Codex held `implement`: Scoped.",
+        "- Gemini held `do-not-implement`: Out of scope.",
+    )
+    seeded = [
+        _seed_debater_comment(
+            reviewer="Codex", round_number=1, subject=subject,
+            outcome="implement", rationale="Scoped.",
+            evidence=_checkout_inspected_evidence("src.py:2"), config=config,
+        ),
+        _seed_debater_comment(
+            reviewer="Gemini", round_number=1, subject=subject,
+            outcome="do-not-implement", rationale="Out of scope.", config=config,
+        ),
+        _seed_summary_comment(
+            round_number=1,
+            reviewer_votes=[codex_vote_r1, gemini_vote_r1],
+            is_final=False,
+            subject=subject,
+            split_proposals=[],
+            agenda=agenda,
+        ),
+    ]
+    implement_text = _discuss_review_text(
+        outcome="implement", rationale="Still scoped.", rebuttal="The split concern does not apply.",
+    )
+    runner = FakeRunner(
+        issue_comments=seeded,
+        codex_outputs=[implement_text],
+        gemini_outputs=[implement_text],
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
+
+    assert result == 0
+    assert "Consensus: Implement" in runner.comments[-1]
+
+
+def test_discuss_loop_resume_completed_round_rejects_invalid_checkout_inspected_reference(tmp_path):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    codex_vote_r1 = ParsedDiscussReview(outcome="implement", rationale="Scoped.", split_proposals=(), reviewer="Codex")
+    gemini_vote_r1 = ParsedDiscussReview(outcome="do-not-implement", rationale="Out of scope.", split_proposals=(), reviewer="Gemini")
+    agenda = (
+        "- Codex held `implement`: Scoped.",
+        "- Gemini held `do-not-implement`: Out of scope.",
+    )
+    seeded = [
+        _seed_debater_comment(
+            reviewer="Codex", round_number=1, subject=subject,
+            outcome="implement", rationale="Scoped.",
+            evidence=_checkout_inspected_evidence("src/missing.py:1"), config=config,
+        ),
+        _seed_debater_comment(
+            reviewer="Gemini", round_number=1, subject=subject,
+            outcome="do-not-implement", rationale="Out of scope.", config=config,
+        ),
+        _seed_summary_comment(
+            round_number=1,
+            reviewer_votes=[codex_vote_r1, gemini_vote_r1],
+            is_final=False,
+            subject=subject,
+            split_proposals=[],
+            agenda=agenda,
+        ),
+    ]
+    runner = FakeRunner(
+        issue_comments=seeded,
+        codex_outputs=[],
+        gemini_outputs=[],
+    )
+
+    with pytest.raises(AgentLoopError, match="not a file in the assigned checkout"):
+        run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
 
 
 def test_discuss_loop_resume_reconstructs_full_round_history_across_multiple_closed_rounds(tmp_path):
@@ -2837,6 +3086,50 @@ def test_discuss_debater_timeout_is_partial_result_without_transient_retries(tmp
     summary_raw = runner.issue_comments[-1]["body"]
     metadata = _decode_round_metadata(ROUND_RESUME_MARKER_RE.search(summary_raw).group("payload"))
     assert metadata.failed_debaters == (("Gemini", "timeout"),)
+
+
+def test_discuss_debater_checkout_inspected_claim_valid_reference_passes_through(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
+    valid = _discuss_review_text(
+        outcome="implement", evidence=_checkout_inspected_evidence("src.py:2")
+    )
+    runner = FakeRunner(
+        codex_outputs=[valid],
+        gemini_outputs=[_discuss_review_text(outcome="implement")],
+    )
+
+    result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
+
+    assert result == 0
+    assert "Consensus kind: `unanimous` after round 1." in runner.comments[-1]
+
+
+def test_discuss_debater_checkout_inspected_claim_invalid_reference_triggers_repair(tmp_path):
+    # A debater cites a checkout-inspected path:line that does not exist in its
+    # own assigned checkout; the evidence check rejects the vote the same way
+    # any other malformed structured response is rejected, so the existing
+    # repair path re-checks the repaired text against the same validator (#541).
+    from unittest.mock import patch
+
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
+    invalid = _discuss_review_text(
+        outcome="implement", evidence=_checkout_inspected_evidence("src/missing.py:1")
+    )
+    repaired = _discuss_review_text(
+        outcome="implement", evidence=_checkout_inspected_evidence("src.py:2")
+    )
+    runner = FakeRunner(
+        codex_outputs=[invalid],
+        gemini_outputs=[_discuss_review_text(outcome="implement")],
+    )
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+        result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
+
+    assert result == 0
+    assert "Consensus kind: `unanimous` after round 1." in runner.comments[-1]
 
 
 def test_discuss_parallel_rejects_shared_debater_workdirs_even_with_allow_shared_dir(tmp_path):

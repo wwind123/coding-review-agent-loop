@@ -153,6 +153,7 @@ from coding_review_agent_loop.prompts import (
 )
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
+    DiscussEvidenceClaim,
     _expect_string_list,
     _extract_structured_coder_followup_payload,
     _extract_structured_plan_review_payload,
@@ -182,6 +183,7 @@ from coding_review_agent_loop.protocol import (
 )
 from coding_review_agent_loop.workdir_guard import (
     extract_reported_tests_from_response,
+    validate_checkout_inspected_evidence,
     validate_response_tests_within_workdir,
     validate_test_commands_within_workdir,
 )

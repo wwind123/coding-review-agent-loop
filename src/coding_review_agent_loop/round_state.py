@@ -6,12 +6,14 @@ import base64
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
 from .errors import AgentLoopError
+from .workdir_guard import validate_checkout_inspected_evidence
 from .protocol import (
     HTML_COMMENT_RE,
     SIGNATURE_RE,
@@ -641,7 +643,9 @@ def _decode_analyzer_agenda(raw: str | None) -> ParsedDiscussAgenda | None:
         return None
 
 
-def _decode_discuss_vote(record: PostedRoundRecord, *, round_number: int) -> ParsedDiscussResponse:
+def _decode_discuss_vote(
+    record: PostedRoundRecord, *, round_number: int, reviewer_workdirs: Mapping[str, Path]
+) -> ParsedDiscussResponse:
     text = record.metadata.raw_structured_coder_response or record.body
     if record.metadata.result_mode == "answer":
         try:
@@ -663,6 +667,14 @@ def _decode_discuss_vote(record: PostedRoundRecord, *, round_number: int) -> Par
             f"(round {round_number}); the posted comment's structured payload is missing "
             "or invalid."
         )
+    workdir = reviewer_workdirs.get(record.metadata.agent)
+    if workdir is None:
+        raise AgentLoopError(
+            f"Discuss round metadata references reviewer {record.metadata.agent!r} "
+            "with no known assigned checkout (it is not in the currently configured "
+            "reviewers); a persisted vote from it cannot be checkout-validated."
+        )
+    validate_checkout_inspected_evidence(vote.evidence_claims, assigned_workdir=workdir)
     return vote
 
 
@@ -671,6 +683,7 @@ def _resume_discuss_round(
     *,
     subject: str,
     configured_reviewers: Sequence[AgentName],
+    reviewer_workdirs: Mapping[str, Path],
     result_mode: str = "triage",
 ) -> ResumedDiscussState | None:
     records = _extract_round_metadata_records(comments, flow="discuss")
@@ -718,7 +731,9 @@ def _resume_discuss_round(
                     f"comments for: {', '.join(missing)}."
                 )
             votes = tuple(
-                _decode_discuss_vote(debater_records[name], round_number=round_number)
+                _decode_discuss_vote(
+                    debater_records[name], round_number=round_number, reviewer_workdirs=reviewer_workdirs
+                )
                 if name in debater_records
                 else (
                     failed_discuss_answer_placeholder(name, failed_by_name[name])
@@ -742,7 +757,9 @@ def _resume_discuss_round(
         else:
             next_round_number = round_number
             for name, record in debater_records.items():
-                in_progress_votes[name] = _decode_discuss_vote(record, round_number=round_number)
+                in_progress_votes[name] = _decode_discuss_vote(
+                    record, round_number=round_number, reviewer_workdirs=reviewer_workdirs
+                )
             break
     return ResumedDiscussState(
         done=False,

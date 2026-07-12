@@ -794,6 +794,13 @@ bytes. The rendered ledger is capped at 50 entries / 16,000 bytes, prioritizing
 updates and targets, final-round claims, verified, reported, missing, then old
 history. Round comments and replay metadata retain the full raw audit trail.
 
+A `checkout-inspected` claim's `path:line` is mechanically cross-checked
+against the reviewer's assigned checkout at live, repair, resume, and split-
+recovery time: the path must resolve inside that checkout, exist as a file,
+and the line number must be in range, or the loop fails outright. This only
+confirms the referenced line exists, not that it supports the claim; see
+`docs/local_agent_loop.md` for the full current-checkout semantics.
+
 ### Test file layout
 
 The test suite is split across focused modules for faster, targeted runs:
