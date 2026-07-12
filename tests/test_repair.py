@@ -8,7 +8,24 @@ from coding_review_agent_loop.repair import (
     attempt_repair,
     execute_repair,
 )
-from coding_review_agent_loop.protocol import validate_structured_discuss_answer
+from coding_review_agent_loop.protocol import (
+    validate_structured_discuss_answer,
+    validate_structured_plan_state,
+)
+from coding_review_agent_loop.orchestrator import _structured_response_candidates
+
+
+def _initial_plan_with_human_requirements() -> str:
+    acknowledgement = (
+        f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+        "### Human requirements\n"
+        "- Requirement 1: keep the public API unchanged."
+    )
+    return structured_plan_state().replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        acknowledgement + "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
 
 
 def test_answer_repair_prompt_has_mode_specific_schema_and_examples():
@@ -100,6 +117,48 @@ def test_envelope_normalization_duplicate_plan_state_footer():
         ("item-1", "resolved")
     ]
     assert normalized.count("<!-- AGENT_PLAN_STATE: approved -->") == 1
+
+
+def test_envelope_normalization_plan_state_preserves_signed_human_requirements():
+    acknowledgement = (
+        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n"
+        "- Requirement 1: Keep the public API unchanged."
+    )
+    raw = structured_plan_state().replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        acknowledgement + "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    ) + "\nExtra prose"
+
+    normalized = attempt_envelope_normalization(raw, expected_kind="plan_state")
+
+    assert normalized is not None
+    assert "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->" in normalized
+    assert "### Human requirements" in normalized
+    assert "Extra prose" not in normalized
+    assert validate_structured_plan_state(normalized) is not None
+
+
+def test_envelope_normalization_plan_state_rejects_invalid_prefix_material():
+    raw = structured_plan_state().replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        "\nUnauthorized prose\n<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+
+    assert attempt_envelope_normalization(raw, expected_kind="plan_state") is None
+
+
+def test_fenced_plan_state_is_recoverable_as_a_structured_candidate():
+    plan_state = structured_plan_state()
+    json_text, footer = plan_state.split("\n<!-- AGENT_PLAN_STATE:", 1)
+    wrapped = f"Response:\n```json\n{json_text}\n```\n<!-- AGENT_PLAN_STATE:{footer}"
+
+    candidates = _structured_response_candidates(wrapped)
+
+    assert plan_state in candidates
+    assert validate_structured_plan_state(plan_state) is not None
 
 def test_envelope_normalization_preserves_hr_resolved_before_footer_for_reviews():
     for expected_kind, raw, parser in (
@@ -1686,13 +1745,7 @@ def _issue_with_human_requirement():
 
 def test_plan_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
     """Plan loop: repair returning approved+marker suppresses synthetic."""
-    plan = (
-        "Initial plan.\n"
-        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-        "### Human requirements\n"
-        "- Requirement 1: keep the public API unchanged.\n"
-        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
+    plan = _initial_plan_with_human_requirements()
     approved_without_marker = structured_plan_review(
         state="approved",
         reviewer="OpenAI Codex",
@@ -1729,13 +1782,7 @@ def test_plan_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
 
 def test_plan_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_path):
     """Plan loop: repair returning blocking is treated as reviewer's blocking, not synthetic."""
-    plan = (
-        "Initial plan.\n"
-        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-        "### Human requirements\n"
-        "- Requirement 1: keep the public API unchanged.\n"
-        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
+    plan = _initial_plan_with_human_requirements()
     approved_without_marker = structured_plan_review(
         state="approved",
         reviewer="OpenAI Codex",
@@ -1792,13 +1839,7 @@ def test_plan_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_p
 
 def test_plan_loop_repair_missing_hr_marker_failure_uses_synthetic(tmp_path):
     """Plan loop: when repair fails, synthetic blocking item is injected."""
-    plan = (
-        "Initial plan.\n"
-        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-        "### Human requirements\n"
-        "- Requirement 1: keep the public API unchanged.\n"
-        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
+    plan = _initial_plan_with_human_requirements()
     approved_without_marker = structured_plan_review(
         state="approved",
         reviewer="OpenAI Codex",
@@ -1990,13 +2031,7 @@ def test_pr_loop_repair_blocking_records_same_pr_followups(tmp_path):
 
 def test_plan_loop_repair_blocking_records_same_plan_followups(tmp_path):
     """When repair returns blocking with same_plan_followups, those are recorded as same-plan items."""
-    plan = (
-        "Initial plan.\n"
-        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-        "### Human requirements\n"
-        "- Requirement 1: keep the public API unchanged.\n"
-        "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
+    plan = _initial_plan_with_human_requirements()
     approved_without_marker = structured_plan_review(
         state="approved",
         reviewer="OpenAI Codex",

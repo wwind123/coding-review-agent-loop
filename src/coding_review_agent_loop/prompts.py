@@ -953,8 +953,26 @@ def build_issue_plan_prompt(
 
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this planning stage.
-Write a concise implementation plan covering the intended approach, key files or
-areas to change, edge cases, and test strategy.
+For a plan (rather than a clarification), respond with exactly one structured JSON
+`plan_state` object. It must have this complete contract:
+
+{{
+  "schema_version": 1,
+  "kind": "plan_state",
+  "state": "blocking",
+  "summary": "<non-empty concise implementation summary>",
+  "plan_steps": ["<non-empty step>"]
+}}
+
+`plan_steps` must be a non-empty list of non-empty strings and should cover the
+intended approach, key files or areas to change, edge cases, and test strategy.
+The optional `deferred_stages` field is a list of objects with non-empty `title`
+and `summary` strings.
+Do not substitute a generic `implementation_plan` object or markdown plan for this
+schema. If signed human-requirements acknowledgement is required, put its
+`<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` marker and `### Human requirements` section
+after the JSON object and before the AGENT_PLAN_STATE footer. Do not put any other
+prose between the JSON object and footer.
 {_coder_workdir_guidance(config, implementation=False)}
 {_scratch_file_guidance()}
 {human_requirements_context.block}{_coder_human_requirements_guidance(

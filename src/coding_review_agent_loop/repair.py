@@ -85,7 +85,7 @@ def strip_unknown_prior_item_dispositions(
 
 def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> str | None:
     """Trim envelope-only trailing material without changing structured JSON."""
-    if expected_kind not in {"pr_review", "plan_review", "plan_revision", "coder_followup", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
+    if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "coder_followup", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
         return None
 
     stripped = raw.lstrip()
@@ -100,7 +100,7 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
 
     json_text = stripped[:json_end].rstrip()
     trailing = stripped[json_end:]
-    state_re = PLAN_STATE_RE if expected_kind in {"plan_review", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation"} else STATE_RE
+    state_re = PLAN_STATE_RE if expected_kind in {"plan_state", "plan_review", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation"} else STATE_RE
     state_match = state_re.search(trailing)
     if state_match is None:
         return None
@@ -133,7 +133,7 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
             preserved_before = before_lstripped[: marker_match.end()].strip()
         elif before_footer.strip():
             return None
-    elif expected_kind == "plan_revision" and before_footer.strip():
+    elif expected_kind in {"plan_state", "plan_revision"} and before_footer.strip():
         parsed_human_requirements = parse_human_requirements_acknowledgement(before_footer)
         if (
             parsed_human_requirements.marker_present
@@ -196,7 +196,7 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
 # Uses str.replace("{raw_response}", raw, 1) for substitution because the prompt
 # itself contains literal { } characters in the JSON examples.
 _REPAIR_PROMPT = """\
-You are a format-repair assistant. An AI agent produced a code review, plan review, plan revision, coder follow-up, discuss review, discuss agenda, semantic comparison, or answer confirmation that failed strict schema validation. Extract its intent and reformat it into one of these valid formats.
+You are a format-repair assistant. An AI agent produced an initial plan state, code review, plan review, plan revision, coder follow-up, discuss review, discuss agenda, semantic comparison, or answer confirmation that failed strict schema validation. Extract its intent and reformat it into one of these valid formats.
 
 {expected_kind_instruction}
 
@@ -394,6 +394,25 @@ Notes:
 - If no agenda content is recoverable, return the closest faithful output even if it remains invalid; the orchestrator will fall back mechanically.
 - footer must always be <!-- AGENT_PLAN_STATE: approved --> (never blocking).
 
+## Valid Format J — Initial Plan State:
+
+{
+  "schema_version": 1,
+  "kind": "plan_state",
+  "state": "blocking",
+  "summary": "<short implementation summary>",
+  "plan_steps": ["Update the parser.", "Add regression tests."]
+}
+<!-- HUMAN_REQUIREMENTS_ADDRESSED -->
+
+### Human requirements
+
+- Requirement 1: <how the plan addresses this signed human requirement, if present in the original>
+<!-- AGENT_PLAN_STATE: blocking -->
+-- <Coder Name>
+
+Only include the optional signed human requirements acknowledgement when it was present in the malformed original.
+
 ## Valid Format D — Plan Revision:
 
 When the malformed plan_revision did not include a signed human requirements
@@ -478,7 +497,8 @@ the `### Human requirements` section from Format D.
 ## FORMAT SELECTION:
 - If an expected response kind is provided above, use ONLY that format. Do not infer a different kind from keywords in the malformed response.
 - Use Format C if the original contains "coder_followup" or "addressed_items" or "remaining_items".
-- Use Format D if the original contains "plan_revision" or "plan_steps".
+- Use Format D if the original contains "plan_revision".
+- Use Format J if the original contains "plan_state" or "plan_steps".
 - Use Format H if the original contains "discuss_semantic_comparison" or "remaining_decisions".
 - Use Format I if the original contains "discuss_answer_confirmation" or "decision".
 - Use Format F if the original contains "discuss_agenda" or "question_for_next_round".
@@ -963,8 +983,8 @@ sourced fact. Do not repair answer mode into `discuss_review`, and do not add
 1. Start DIRECTLY with { — no prose, no markdown fences.
 2. After }: For approved `pr_review` or `plan_review` that now includes `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`,
    place that marker immediately after the JSON and before the AGENT_STATE/AGENT_PLAN_STATE footer.
-   For `plan_revision`, place the optional signed human requirements acknowledgement before the footer only when it was present in the malformed original.
-   Then: <!-- AGENT_STATE: X --> (pr_review or coder_followup) OR <!-- AGENT_PLAN_STATE: X --> (plan_review or plan_revision). DIFFERENT MARKERS.
+   For `plan_state` or `plan_revision`, place the optional signed human requirements acknowledgement before the footer only when it was present in the malformed original.
+   Then: <!-- AGENT_STATE: X --> (pr_review or coder_followup) OR <!-- AGENT_PLAN_STATE: X --> (plan_state, plan_review, or plan_revision). DIFFERENT MARKERS.
 3. JSON "state" matches X. Then: -- Agent Name. STOP. Nothing else.
 
 Output ONLY the repaired response. No explanations.
@@ -974,7 +994,7 @@ Output ONLY the repaired response. No explanations.
 {raw_response}"""
 
 _REPAIR_MODEL = "gemini-3.1-flash-lite"
-_SUPPORTED_EXPECTED_KINDS = {"pr_review", "plan_review", "coder_followup", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation"}
+_SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_followup", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation"}
 RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output"
 ]

@@ -73,6 +73,7 @@ from agent_loop_helpers import (
     structured_coder_followup,
     structured_plan_review,
     structured_plan_revision,
+    structured_plan_state,
     structured_pr_review,
 )
 
@@ -304,7 +305,7 @@ def test_plan_review_does_not_post_diagnostics_without_plan_state(tmp_path):
     diagnostic = "[ERROR] Invalid stream: The model returned an empty response or malformed tool call."
     runner = FakeRunner(
         claude_outputs=[
-            "Plan:\n- Update the CLI.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(summary="Update the CLI.", plan_steps=["Update the CLI."]),
         ],
         gemini_outputs=[diagnostic, diagnostic, diagnostic],
     )
@@ -314,7 +315,7 @@ def test_plan_review_does_not_post_diagnostics_without_plan_state(tmp_path):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert len(runner.comments) == 1
-    assert runner.comments[0].startswith("Plan:")
+    assert runner.comments[0].startswith("## Plan")
     assert not any(diagnostic in comment for comment in runner.comments)
 
 
@@ -323,7 +324,7 @@ def test_plan_loop_retries_plain_agent_plan_state_near_miss_once(tmp_path):
     valid = "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Google Gemini"
     runner = FakeRunner(
         claude_outputs=[
-            "Plan:\n- Update the CLI.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(summary="Update the CLI.", plan_steps=["Update the CLI."]),
         ],
         gemini_outputs=[near_miss, valid],
     )

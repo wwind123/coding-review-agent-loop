@@ -2533,6 +2533,38 @@ def test_validate_structured_plan_state_accepts_deferred_stages():
     )
 
 
+def test_validate_structured_plan_state_accepts_signed_human_requirements_before_footer():
+    acknowledgement = (
+        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n"
+        "- Requirement 1: The plan keeps the public API unchanged."
+    )
+    plan_state = structured_plan_state().replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        acknowledgement + "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+
+    parsed = validate_structured_plan_state(plan_state)
+
+    assert parsed is not None
+    assert parsed.state == "blocking"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"kind": "plan_state", "summary": "Plan", "plan_steps": ["Add tests."]},
+        {"schema_version": 1, "kind": "implementation_plan", "summary": "Plan", "plan_steps": ["Add tests."], "state": "blocking"},
+    ],
+)
+def test_validate_structured_plan_state_requires_complete_plan_state_schema(payload):
+    text = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+    with pytest.raises(AgentLoopError):
+        validate_structured_plan_state(text)
+
+
 def test_render_canonical_plan_revision_includes_deferred_stages_section():
     revision = structured_plan_revision(
         deferred_stages=[{"title": "Auth flow overhaul", "summary": "Split out follow-up work."}],

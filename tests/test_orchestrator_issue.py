@@ -44,8 +44,37 @@ class FakeRunner(_FakeRunner):
     """Issue-loop fixtures model the PR created for issue #56 explicitly."""
 
     def __init__(self, **kwargs):
+        # Most of these long-lived fixtures predate the initial plan_state
+        # contract. Upgrade their two common initial-plan shorthands while
+        # leaving malformed marker-only cases with non-blocking states intact
+        # for their explicit rejection tests below.
+        legacy_initial_plans = {
+            "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex",
+            "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Google Gemini",
+            "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Google Gemini",
+        }
+        for output_key in ("claude_outputs", "codex_outputs", "gemini_outputs", "antigravity_outputs"):
+            outputs = kwargs.get(output_key)
+            if outputs is None:
+                continue
+            kwargs[output_key] = [
+                structured_plan_state(summary="Initial plan.", plan_steps=["Make the change."])
+                if output in legacy_initial_plans
+                else output
+                for output in outputs
+            ]
         kwargs.setdefault("pr_payload", {"body": "Fixes #56"})
         super().__init__(**kwargs)
+
+
+def _initial_plan_state(*, summary: str = "Initial plan.", human_requirements: str = "") -> str:
+    return structured_plan_state(summary=summary).replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        human_requirements + "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
 
 
 def test_issue_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):
@@ -254,7 +283,10 @@ def test_issue_loop_rejects_pr_number_before_running_claude(tmp_path):
 def test_issue_loop_plan_first_stops_after_approved_plan(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
-            "Plan:\n- Update the CLI.\n- Add tests.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(
+                summary="Update the CLI and cover it with regression tests.",
+                plan_steps=["Update the CLI.", "Add tests."],
+            ),
         ],
         codex_outputs=[
             "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
@@ -268,7 +300,7 @@ def test_issue_loop_plan_first_stops_after_approved_plan(tmp_path):
     assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
     assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in runner.commands)
     assert len(runner.comments) == 3
-    assert runner.comments[0].startswith("Plan:")
+    assert runner.comments[0].startswith("## Plan")
     assert runner.comments[1].startswith("**Review verdict:** Approved\n\nPlan looks sound.")
     assert "Outcome: implement" in runner.comments[2]
     assert not any(cmd[:2] == ["git", "fetch"] for cmd, _cwd in runner.commands)
@@ -284,7 +316,7 @@ def test_issue_loop_plan_first_rejects_missing_initial_plan_human_requirements_a
             "body": "Keep the public API unchanged.\n\n-- Human Reviewer",
         },
         claude_outputs=[
-            "Plan:\n- Update the parser.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+            structured_plan_state()
         ],
     )
     config = make_config(tmp_path)
@@ -300,11 +332,15 @@ def test_issue_loop_plan_first_accepts_initial_plan_human_requirements_acknowled
             "body": "Keep the public API unchanged.\n\n-- Human Reviewer",
         },
         claude_outputs=[
-            "Plan:\n- Update the parser.\n"
-            f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-            "### Human requirements\n"
-            "- Requirement 1: the plan keeps the public API unchanged.\n"
-            "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+            structured_plan_state().replace(
+                "\n<!-- AGENT_PLAN_STATE: blocking -->",
+                "\n"
+                f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+                "### Human requirements\n"
+                "- Requirement 1: the plan keeps the public API unchanged.\n"
+                "<!-- AGENT_PLAN_STATE: blocking -->",
+                1,
+            )
         ],
         codex_outputs=[structured_plan_review(summary="Plan looks sound.", human_requirements_resolved=True)],
     )
@@ -315,7 +351,7 @@ def test_issue_loop_plan_first_accepts_initial_plan_human_requirements_acknowled
 def test_issue_loop_plan_first_revises_until_all_reviewers_approve(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
-            "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(summary="Initial plan."),
             structured_plan_revision(summary="Revised plan with tests."),
         ],
         codex_outputs=[
@@ -360,7 +396,7 @@ def test_issue_loop_structured_plan_state_public_comment_renders_markdown_and_pr
     assert metadata.canonical_plan == raw_structured_plan
     assert metadata.raw_structured_coder_response == raw_structured_plan
 
-def test_issue_loop_markdown_plan_state_public_comment_passes_through(tmp_path):
+def test_issue_loop_plan_first_rejects_marker_only_plan_before_posting_or_reviewer_dispatch(tmp_path):
     markdown_plan = "Initial markdown plan.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
     runner = FakeRunner(
         claude_outputs=[markdown_plan],
@@ -368,21 +404,26 @@ def test_issue_loop_markdown_plan_state_public_comment_passes_through(tmp_path):
     )
     config = make_config(tmp_path, reviewer="codex")
 
-    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    with pytest.raises(AgentLoopError, match="structured `plan_state` JSON object"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
-    raw_comment = runner.issue_comments[0]["body"]
-    metadata_match = re.search(
-        r"\n?<!--\s*AGENT_LOOP_META:\s*[A-Za-z0-9+/=_-]+\s*-->\n?",
-        raw_comment,
-    )
-    assert metadata_match is not None
-    assert raw_comment.replace(metadata_match.group(0), "\n").strip() == markdown_plan
-    metadata = _decode_round_metadata(
-        re.search(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", raw_comment)
-        .group("payload")
-    )
-    assert metadata.canonical_plan is None
-    assert metadata.raw_structured_coder_response is None
+    assert runner.comments == []
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+def test_issue_loop_plan_first_rejects_generic_implementation_plan_before_posting(tmp_path):
+    generic_plan = json.dumps({
+        "summary": "Plan the fix.",
+        "implementation_plan": ["Update the parser.", "Add tests."],
+    }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    runner = FakeRunner(claude_outputs=[generic_plan])
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(AgentLoopError, match="kind mismatch|missing required field"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert runner.comments == []
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 def test_issue_loop_plan_revision_stores_raw_structured_metadata(tmp_path):
     raw_structured_revision = (
@@ -402,7 +443,7 @@ def test_issue_loop_plan_revision_stores_raw_structured_metadata(tmp_path):
     )
     runner = FakeRunner(
         claude_outputs=[
-            "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            _initial_plan_state(),
             raw_structured_revision,
         ],
         codex_outputs=[
@@ -437,11 +478,11 @@ def test_issue_loop_plan_revision_rejects_missing_human_requirements_acknowledge
             "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
         },
         claude_outputs=[
-            "Initial plan.\n"
-            f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-            "### Human requirements\n"
-            "- Requirement 1: the plan preserves backward compatibility.\n"
-            "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            _initial_plan_state(human_requirements=(
+                f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+                "### Human requirements\n"
+                "- Requirement 1: the plan preserves backward compatibility."
+            )),
             structured_plan_revision(summary="Revised plan."),
             "Revised plan.\n"
             f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
@@ -470,11 +511,11 @@ def test_issue_loop_plan_revision_accepts_human_requirements_acknowledgement(tmp
             "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
         },
         claude_outputs=[
-            "Initial plan.\n"
-            f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-            "### Human requirements\n"
-            "- Requirement 1: the plan preserves backward compatibility.\n"
-            "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            _initial_plan_state(human_requirements=(
+                f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+                "### Human requirements\n"
+                "- Requirement 1: the plan preserves backward compatibility."
+            )),
             structured_plan_revision(
                 summary="Revised plan.",
                 human_requirements=(
@@ -542,11 +583,11 @@ def test_issue_loop_plan_revision_repair_preserves_signed_human_requirements(tmp
             "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
         },
         claude_outputs=[
-            "Initial plan.\n"
-            f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-            "### Human requirements\n"
-            "- Requirement 1: the plan preserves backward compatibility.\n"
-            "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            _initial_plan_state(human_requirements=(
+                f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+                "### Human requirements\n"
+                "- Requirement 1: the plan preserves backward compatibility."
+            )),
             malformed_revision,
         ],
         codex_outputs=[
@@ -613,11 +654,11 @@ def test_issue_loop_plan_revision_repair_rejects_wrong_kind_from_human_requireme
             "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
         },
         claude_outputs=[
-            "Initial plan.\n"
-            f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-            "### Human requirements\n"
-            "- Requirement 1: the plan preserves backward compatibility.\n"
-            "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            _initial_plan_state(human_requirements=(
+                f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+                "### Human requirements\n"
+                "- Requirement 1: the plan preserves backward compatibility."
+            )),
             malformed_revision,
         ],
         codex_outputs=[
@@ -661,11 +702,11 @@ def test_issue_loop_plan_revision_repair_without_human_ack_fails_clearly(tmp_pat
             "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
         },
         claude_outputs=[
-            "Initial plan.\n"
-            f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-            "### Human requirements\n"
-            "- Requirement 1: the plan preserves backward compatibility.\n"
-            "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            _initial_plan_state(human_requirements=(
+                f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+                "### Human requirements\n"
+                "- Requirement 1: the plan preserves backward compatibility."
+            )),
             malformed_revision,
         ],
         codex_outputs=[
@@ -878,11 +919,14 @@ def test_issue_loop_plan_first_requires_reviewer_human_requirements_resolution(t
             "body": "Keep compact context cache-aware.\n\n-- Human Reviewer",
         },
         claude_outputs=[
-            "Initial plan covers cache-aware compact context.\n"
-            "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
-            "### Human requirements\n"
-            "- Requirement 1: The plan keeps compact context cache-aware.\n"
-            "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            _initial_plan_state(
+                summary="Initial plan covers cache-aware compact context.",
+                human_requirements=(
+                    "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+                    "### Human requirements\n"
+                    "- Requirement 1: The plan keeps compact context cache-aware."
+                ),
+            ),
             structured_plan_revision(
                 summary="Revised plan requires explicit reviewer acknowledgement.",
                 prior_plan_item_dispositions=[
@@ -1620,7 +1664,9 @@ def test_issue_loop_plan_first_can_override_implementation_model(tmp_path):
         claude_outputs=[
             json.dumps(
                 {
-                    "result": "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+                    "result": structured_plan_state(
+                        summary="Make the change.", plan_steps=["Make the change."]
+                    ),
                     "session_id": "planning-session",
                 }
             ),
@@ -1707,7 +1753,7 @@ def test_issue_loop_plan_first_implementation_rejects_pr_without_issue_reference
     assert "rerun the orchestrator as `agent-loop pr 77` to continue the review" in str(excinfo.value)
 
 def test_issue_loop_plan_first_one_shot_posts_handoff_after_pr_creation(tmp_path):
-    plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    plan = _initial_plan_state(summary="Make the change.")
     runner = FakeRunner(
         claude_outputs=[
             plan,

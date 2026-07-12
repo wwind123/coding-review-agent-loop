@@ -115,6 +115,19 @@ def test_coder_prompts_include_assigned_workdir_rule(tmp_path):
         assert "`pwd` and `git status --branch --short`" in prompt
 
 
+def test_issue_plan_prompt_requires_complete_structured_plan_state_contract(tmp_path):
+    prompt = build_issue_plan_prompt(56, make_config(tmp_path))
+
+    assert '"schema_version": 1' in prompt
+    assert '"kind": "plan_state"' in prompt
+    assert '"state": "blocking"' in prompt
+    assert '"summary": "<non-empty concise implementation summary>"' in prompt
+    assert '"plan_steps": ["<non-empty step>"]' in prompt
+    assert "optional `deferred_stages`" in prompt
+    assert "generic `implementation_plan`" in prompt
+    assert "after the JSON object and before the AGENT_PLAN_STATE footer" in prompt
+
+
 def test_issue_prompts_include_salvage_guardrail_block(tmp_path):
     config = make_config(tmp_path)
     salvage_summary = (

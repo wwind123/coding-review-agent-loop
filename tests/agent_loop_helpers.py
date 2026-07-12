@@ -962,7 +962,7 @@ def structured_plan_revision(
 
 def structured_plan_state(
     *,
-    state: str = "approved",
+    state: str = "blocking",
     summary: str = "Implementation plan.",
     plan_steps: list[str] | None = None,
     reviewer: str = "Anthropic Claude",

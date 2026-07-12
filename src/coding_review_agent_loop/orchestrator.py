@@ -300,7 +300,7 @@ PUBLIC_RESPONSE_ARTIFACT_PREFIX_RE = re.compile(
     re.I,
 )
 STRUCTURED_PUBLIC_RESPONSE_KINDS = frozenset(
-    {"plan_review", "pr_review", "coder_followup", "plan_revision", "discuss_review", "discuss_answer", "discuss_semantic_comparison", "discuss_answer_confirmation"}
+    {"plan_state", "plan_review", "pr_review", "coder_followup", "plan_revision", "discuss_review", "discuss_answer", "discuss_semantic_comparison", "discuss_answer_confirmation"}
 )
 PLAN_REVISION_FOOTER_RE = re.compile(r"(?m)^<!--\s*AGENT_PLAN_STATE:\s*(approved|blocking)\s*-->\s*$")
 STRUCTURED_FENCE_RE = re.compile(
@@ -2271,7 +2271,12 @@ def _require_pr_number_or_clarification(text: str) -> int | str:
 def _require_plan_state_or_clarification(text: str) -> str:
     if is_clarification_request(text):
         return "clarification"
-    return parse_plan_state(text)
+    structured_plan = validate_structured_plan_state(text)
+    if structured_plan is None:
+        raise AgentLoopError(
+            "Initial planning response must include a structured `plan_state` JSON object."
+        )
+    return structured_plan.state
 def _validate_response_with_human_requirements(
     text: str,
     *,
@@ -3010,6 +3015,8 @@ def _run_plan_first_loop(
                 full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
             ),
             usage_context=usage_context,
+            use_repair=True,
+            repair_expected_kind="plan_state",
             operation_description="planning",
         )
         plan_output = plan_response.text

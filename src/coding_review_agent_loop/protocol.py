@@ -1061,6 +1061,7 @@ def _extract_structured_plan_state_payload(text: str) -> dict[str, object] | Non
         state_re=PLAN_STATE_RE,
         state_marker_name="AGENT_PLAN_STATE",
         context_label="Structured plan state",
+        allow_human_requirements_prefix=True,
     )
 
 
@@ -1622,19 +1623,19 @@ def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
     payload = _extract_structured_plan_state_payload(text)
     if payload is None:
         return None
-    if "schema_version" in payload:
-        _require_supported_schema_version(payload)
+    _require_supported_schema_version(payload)
     kind = payload.get("kind")
-    if isinstance(kind, str) and kind != "plan_state":
+    if kind != "plan_state":
         raise AgentLoopError("Structured response kind mismatch: expected `plan_state`.")
     _expect_exact_keys(
         payload,
         context="plan_state",
-        required={"kind", "summary", "plan_steps"},
-        optional={"schema_version", "state", "deferred_stages"},
+        required={"schema_version", "kind", "state", "summary", "plan_steps"},
+        optional={"deferred_stages"},
     )
-    if "state" in payload:
-        _expect_state(payload["state"], context="plan_state.state")
+    state = _expect_state(payload["state"], context="plan_state.state")
+    if state != "blocking":
+        raise AgentLoopError("plan_state.state must be `blocking`.")
     return StructuredPlanState(
         schema_version=int(payload.get("schema_version", 1)),
         kind="plan_state",
