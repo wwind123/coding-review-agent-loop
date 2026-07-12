@@ -152,6 +152,16 @@ def validate_checkout_inspected_evidence(
                 "checkout-inspected evidence claim used a path traversal segment: "
                 f"{source!r} for fact {claim.fact!r}."
             )
+        # No real file has anywhere near this many lines; reject before ever
+        # calling int() on it. Python 3.11+ raises ValueError (not
+        # AgentLoopError) for int()/str() conversions beyond its default
+        # 4300-digit limit, and an unbounded `\d+` source is otherwise free
+        # to carry an arbitrarily long digit string.
+        if len(line_part) > 15:
+            raise AgentLoopError(
+                "checkout-inspected evidence claim references an implausibly "
+                f"large line number: {source!r} for fact {claim.fact!r}."
+            )
         resolved = _canonical(assigned / path_part)
         if not _is_inside(resolved, assigned):
             raise AgentLoopError(

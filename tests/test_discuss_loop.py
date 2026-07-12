@@ -3132,6 +3132,34 @@ def test_discuss_debater_checkout_inspected_claim_invalid_reference_triggers_rep
     assert "Consensus kind: `unanimous` after round 1." in runner.comments[-1]
 
 
+def test_discuss_debater_checkout_inspected_claim_implausibly_large_line_triggers_repair(tmp_path):
+    # A debater cites a checkout-inspected line number far beyond Python
+    # 3.11+'s default int-conversion digit limit; this must be rejected as
+    # AgentLoopError (triggering the normal repair path) rather than crashing
+    # the debater turn with an uncaught ValueError (#541 review).
+    from unittest.mock import patch
+
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    (config.codex_dir / "src.py").write_text("line one\nline two\n", encoding="utf-8")
+    huge_line = "9" * 4500
+    invalid = _discuss_review_text(
+        outcome="implement", evidence=_checkout_inspected_evidence(f"src.py:{huge_line}")
+    )
+    repaired = _discuss_review_text(
+        outcome="implement", evidence=_checkout_inspected_evidence("src.py:2")
+    )
+    runner = FakeRunner(
+        codex_outputs=[invalid],
+        gemini_outputs=[_discuss_review_text(outcome="implement")],
+    )
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+        result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
+
+    assert result == 0
+    assert "Consensus kind: `unanimous` after round 1." in runner.comments[-1]
+
+
 def test_discuss_parallel_rejects_shared_debater_workdirs_even_with_allow_shared_dir(tmp_path):
     shared = tmp_path / "shared"
     config = make_config(

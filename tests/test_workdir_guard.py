@@ -145,6 +145,20 @@ def test_checkout_inspected_evidence_rejects_out_of_range_line(tmp_path):
         )
 
 
+def test_checkout_inspected_evidence_rejects_implausibly_large_line_number_without_crashing(tmp_path):
+    # Python 3.11+ raises ValueError (not AgentLoopError) converting a
+    # digit string beyond its default int-conversion digit limit; the
+    # parser's `\d+` source pattern is otherwise unbounded, so this must be
+    # rejected as AgentLoopError before ever calling int() on it.
+    (tmp_path / "src.py").write_text("line1\nline2\n", encoding="utf-8")
+    huge_line = "9" * 4500
+
+    with pytest.raises(AgentLoopError, match="implausibly large line number"):
+        validate_checkout_inspected_evidence(
+            [_checkout_claim(f"src.py:{huge_line}")], assigned_workdir=tmp_path
+        )
+
+
 def test_checkout_inspected_evidence_rejects_line_zero(tmp_path):
     (tmp_path / "src.py").write_text("line1\n", encoding="utf-8")
 
