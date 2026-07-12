@@ -108,7 +108,7 @@ def test_plan_first_deferred_stage_title_with_colon_round_trips_through_canonica
     runner = FakeRunner(
         pr_payload={"body": "Fixes #56"},
         claude_outputs=[
-            "Initial plan.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(state="blocking", summary="Initial plan."),
             structured_plan_revision(
                 summary="Implement the core parser change.",
                 deferred_stages=[

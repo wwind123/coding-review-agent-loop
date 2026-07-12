@@ -199,12 +199,14 @@ def test_render_structured_plan_state_to_public_markdown():
     raw = (
         json.dumps(
             {
+                "schema_version": 1,
                 "kind": "plan_state",
+                "state": "blocking",
                 "summary": "Plan the renderer fix.",
                 "plan_steps": ["Detect structured plan_state.", "Render public markdown."],
             }
         )
-        + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Google Antigravity"
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Google Antigravity"
     )
     parsed = validate_structured_plan_state(raw)
 
@@ -222,7 +224,7 @@ def test_render_structured_plan_state_to_public_markdown():
         "### Plan steps\n"
         "1. Detect structured plan_state.\n"
         "2. Render public markdown.\n\n"
-        "<!-- AGENT_PLAN_STATE: approved -->\n\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->\n\n"
         "-- Google Antigravity: Gemini 3.1 Pro (High)"
     )
     assert '"kind": "plan_state"' not in public

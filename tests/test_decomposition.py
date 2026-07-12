@@ -13,7 +13,13 @@ from coding_review_agent_loop.decomposition import (
 )
 from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.orchestrator import PostedRoundMetadata, _attach_round_metadata, _plan_subject
-from agent_loop_helpers import FakeRunner, make_config, plan_decomposition_json, structured_plan_review
+from agent_loop_helpers import (
+    FakeRunner,
+    make_config,
+    plan_decomposition_json,
+    structured_plan_review,
+    structured_plan_state,
+)
 
 
 def test_parse_plan_decomposition_accepts_agent_and_human_phases():
@@ -173,7 +179,7 @@ def test_parse_plan_decomposition_rejects_duplicates_and_over_cap():
 def test_issue_loop_plan_first_decompose_only_summarizes_instead_of_filing_plan_followups(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
-            "Plan:\n- Split the implementation into phases.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(summary="Split the implementation into phases."),
             plan_decomposition_json(
                 {
                     "title": "Schema helpers",
@@ -221,7 +227,7 @@ def test_issue_loop_plan_first_decompose_only_summarizes_instead_of_filing_plan_
 def test_issue_loop_plan_first_decompose_only_creates_child_issues(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
-            "Plan:\n- Add schema helpers.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(summary="Add schema helpers."),
             plan_decomposition_json(
                 {
                     "title": "Schema helpers",
@@ -273,7 +279,7 @@ def test_issue_loop_plan_first_decompose_only_creates_child_issues(tmp_path):
     assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in runner.commands)
 
 def test_issue_loop_plan_first_decompose_only_is_idempotent(tmp_path):
-    plan = "Plan:\n- Add schema helpers.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    plan = structured_plan_state(summary="Add schema helpers.")
     summary = format_decomposition_parent_summary(
         parent_issue=56,
         mode="decompose-only",
@@ -322,7 +328,7 @@ def test_issue_loop_plan_first_decompose_only_is_idempotent(tmp_path):
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 def test_issue_loop_plan_first_implement_by_phase_rerun_without_handoff_implements_once(tmp_path):
-    plan = "Plan:\n- Add schema helpers.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    plan = structured_plan_state(summary="Add schema helpers.")
     child = CreatedPhaseIssue(
         phase=RecordedPhase(title="Schema helpers", automation="agent-pr"),
         issue_url="https://github.com/OWNER/REPO/issues/99",
@@ -386,7 +392,7 @@ def test_issue_loop_plan_first_implement_by_phase_rerun_without_handoff_implemen
     assert "GitHub issue #99" in claude_calls[0][-1]
 
 def test_issue_loop_plan_first_implement_by_phase_rerun_with_handoff_stops(tmp_path, capsys):
-    plan = "Plan:\n- Add schema helpers.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    plan = structured_plan_state(summary="Add schema helpers.")
     child = CreatedPhaseIssue(
         phase=RecordedPhase(title="Schema helpers", automation="agent-pr"),
         issue_url="https://github.com/OWNER/REPO/issues/99",
@@ -452,7 +458,7 @@ def test_issue_loop_plan_first_implement_by_phase_rerun_with_handoff_stops(tmp_p
     assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
 
 def test_issue_loop_plan_first_implement_by_phase_human_first_rerun_does_not_handoff(tmp_path):
-    plan = "Plan:\n- Validate migration manually first.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    plan = structured_plan_state(summary="Validate migration manually first.")
     child = CreatedPhaseIssue(
         phase=RecordedPhase(title="Manual readiness check", automation="human-action"),
         issue_url="https://github.com/OWNER/REPO/issues/99",
@@ -509,7 +515,7 @@ def test_issue_loop_plan_first_implement_by_phase_human_first_rerun_does_not_han
 def test_issue_loop_plan_first_implement_by_phase_stops_on_human_first_phase(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
-            "Plan:\n- Validate migration manually first.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(summary="Validate migration manually first."),
             plan_decomposition_json(
                 {
                     "title": "Manual readiness check",
@@ -538,7 +544,7 @@ def test_issue_loop_plan_first_implement_by_phase_stops_on_human_first_phase(tmp
 def test_issue_loop_plan_first_implement_by_phase_implements_first_agent_phase(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
-            "Plan:\n- Add schema helpers.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(summary="Add schema helpers."),
             plan_decomposition_json(),
             "Implemented first phase.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],
@@ -572,7 +578,7 @@ def test_issue_loop_plan_first_implement_by_phase_implements_first_agent_phase(t
 def test_issue_loop_plan_first_implement_by_phase_missing_child_number_does_not_handoff(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
-            "Plan:\n- Add schema helpers.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_state(summary="Add schema helpers."),
             plan_decomposition_json(),
         ],
         codex_outputs=[
@@ -603,4 +609,3 @@ def test_phase_implementation_handoff_rejects_malformed_marker():
             phase_index=1,
             child_issue_number=99,
         )
-

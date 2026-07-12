@@ -2326,12 +2326,14 @@ class TestRetryValidateCoder:
             raw_plan = (
                 json.dumps(
                     {
+                        "schema_version": 1,
                         "kind": "plan_state",
+                        "state": "blocking",
                         "summary": "Plan the renderer fix.",
                         "plan_steps": ["Detect structured plan_state.", "Render markdown."],
                     }
                 )
-                + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Codex"
+                + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Codex"
             )
             (repair_dir / "raw.md").write_text(raw_plan, encoding="utf-8")
 

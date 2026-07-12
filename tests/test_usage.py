@@ -76,7 +76,9 @@ def test_plan_first_issue_run_writes_one_summary_for_planning_implementation_and
     runner = FakeRunner(
         pr_payload={"body": "Fixes #56"},
         claude_outputs=[
-            "Plan:\n- Implement usage logging.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude",
+            structured_plan_state(
+                state="blocking", summary="Implement usage logging."
+            ),
             "Opened PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],
         codex_outputs=[
