@@ -1,6 +1,8 @@
 import pytest
 
 from agent_loop_helpers import *  # noqa: F403
+from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
+from coding_review_agent_loop.prompts import format_pr_checks
 
 _EXPECTED_UNRESOLVED_ITEMS_GUIDANCE = """Prior unresolved items are present. Disposition every listed
 item in the JSON `prior_item_dispositions` array — do not add a separate prose section
@@ -1451,6 +1453,33 @@ def test_review_prompt_includes_failing_github_check_status(tmp_path):
     assert "GitHub PR checks:" in prompt
     assert "- Overall state: failing" in prompt
     assert "- Failing checks: tests/test_security.py (failure)" in prompt
+
+
+@pytest.mark.parametrize("url", [None, "", "https://github.com/OWNER/REPO/actions/runs/555"])
+def test_format_pr_checks_renders_failure_url_when_available_without_empty_link(url):
+    check = PullRequestCheck(
+        name="test",
+        kind="check_run",
+        status="FAILURE",
+        url=url,
+    )
+    checks = PullRequestChecks(
+        state="failing",
+        required_checks=(),
+        passing=(),
+        pending=(),
+        failing=(check,),
+        missing_required=(),
+        branch_protection_status="not_found",
+    )
+
+    rendered = format_pr_checks(checks)
+
+    assert "- Failing checks: test (failure)" in rendered
+    if url:
+        assert f"— {url}" in rendered
+    else:
+        assert "—" not in rendered
 
 @pytest.mark.parametrize("compact_context", [False, True])
 def test_review_prompt_distinguishes_failing_from_pending_check_blocking_policy(

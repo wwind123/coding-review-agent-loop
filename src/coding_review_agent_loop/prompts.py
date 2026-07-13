@@ -593,7 +593,11 @@ def format_pr_checks(checks: PullRequestChecks) -> str:
     if checks.failing:
         lines.append(
             "- Failing checks: "
-            + ", ".join(f"{check.name} ({check.status})" for check in checks.failing)
+            + ", ".join(
+                f"{check.name} ({check.status.lower()})"
+                + (f" — {check.url.strip()}" if check.url and check.url.strip() else "")
+                for check in checks.failing
+            )
         )
     if checks.pending:
         lines.append(

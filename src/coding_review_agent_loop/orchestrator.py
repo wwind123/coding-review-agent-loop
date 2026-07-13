@@ -4197,7 +4197,6 @@ def run_pr_loop(
                 else None
             )
             approved_review_outputs: list[tuple[str, str]] = []
-            pr_checks = get_pr_checks(runner, config=config, metadata=pr_metadata)
             resumed_by_name = {
                 record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
             }
@@ -4236,6 +4235,7 @@ def run_pr_loop(
                         f"(context mode: {context_mode})",
                     )
                     sync_reviewer_pr_before_review(config, runner, reviewer, pr_number, pr_metadata)
+                    reviewer_pr_checks = get_pr_checks(runner, config=config, metadata=pr_metadata)
                     compact_tail = (
                         CompactPrReviewTailContext(
                             head_sha=pr_metadata.head_sha,
@@ -4254,7 +4254,7 @@ def run_pr_loop(
                             config,
                             reviewer=reviewer,
                             pr_metadata=pr_metadata,
-                            pr_checks=pr_checks,
+                            pr_checks=reviewer_pr_checks,
                             memory=memory,
                             issue_context=issue_context,
                             human_requirements=human_requirements,
@@ -4296,12 +4296,12 @@ def run_pr_loop(
                 if (
                     resumed_record is None
                     and review_state == "blocking"
-                    and _is_pending_ci_only_review(parsed_review, pr_checks)
+                    and _is_pending_ci_only_review(parsed_review, reviewer_pr_checks)
                 ):
                     log(
                         config,
                         f"Round {round_number}: {reviewer_name} blocking review only restates "
-                        f"GitHub check status ({pr_checks.state}); treating as approved instead "
+                        f"GitHub check status ({reviewer_pr_checks.state}); treating as approved instead "
                         "of starting a new coder follow-up round",
                     )
                     parsed_review = dataclasses_replace(parsed_review, state="approved", blocking_items=())
@@ -4650,6 +4650,7 @@ def run_pr_loop(
                     )
                     next_unresolved_item_number += 1
                     must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-pr"}]
+                pr_checks = get_pr_checks(runner, config=config, metadata=pr_metadata)
                 if not must_fix_items:
                     if pr_checks.state in {"pending", "unavailable"}:
                         details = _pr_check_details(pr_checks)

@@ -828,9 +828,25 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
             {
                 "check_runs": [
                     {"name": "tests/test_server.py", "status": "completed", "conclusion": "success"},
-                    {"name": "tests/test_security.py", "status": "completed", "conclusion": "failure"},
+                    {
+                        "name": "tests/test_security.py",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "html_url": "https://github.com/OWNER/REPO/actions/runs/555",
+                    },
                 ]
             },
+            {
+                "check_runs": [
+                    {
+                        "name": "tests/test_security.py",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "html_url": "https://github.com/OWNER/REPO/actions/runs/555",
+                    }
+                ]
+            },
+            {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]},
             {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]},
         ]
     )
@@ -856,7 +872,120 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
         and "GitHub PR checks unresolved blocking item [item-1] from round 1:" in cmd[-1]
     )
     assert "Failing checks: tests/test_security.py (failure)" in followup_prompt
+    assert "https://github.com/OWNER/REPO/actions/runs/555" in followup_prompt
     assert "Do not claim global test success unless GitHub PR checks are green." in followup_prompt
+
+
+def test_pr_loop_refreshes_checks_between_reviewers_and_before_coder(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Codex approves."),
+            structured_pr_review(
+                state="approved",
+                summary="Codex approves after the fix.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[
+            structured_pr_review(state="approved", summary="Gemini approves."),
+            structured_pr_review(
+                state="approved",
+                summary="Gemini approves after the fix.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="approved", summary="Coder addressed the failure.", addressed_items=["item-1"]
+            )
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2)
+    failure_url = "https://github.com/OWNER/REPO/actions/runs/555"
+    check_states = iter(
+        [
+            {"check_runs": [{"name": "test", "status": "in_progress", "conclusion": None}]},
+            {
+                "check_runs": [
+                    {
+                        "name": "test",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "html_url": failure_url,
+                    }
+                ]
+            },
+            {
+                "check_runs": [
+                    {
+                        "name": "test",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "html_url": failure_url,
+                    }
+                ]
+            },
+            {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]},
+            {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]},
+            {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]},
+        ]
+    )
+
+    def next_checks(*args, **kwargs):
+        runner.pr_check_runs_payload = next(check_states)
+        return original_get_pr_checks(*args, **kwargs)
+
+    from coding_review_agent_loop import orchestrator as orchestrator_module
+
+    original_get_pr_checks = orchestrator_module.get_pr_checks
+    monkeypatch.setattr(orchestrator_module, "get_pr_checks", next_checks)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    review_prompts = [
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if cmd[:2] == ["codex", "exec"] or cmd[:1] == ["gemini"]
+    ]
+    assert "- Overall state: pending" in review_prompts[0]
+    assert "- Overall state: failing" in review_prompts[1]
+    assert f"- Failing checks: test (failure) — {failure_url}" in review_prompts[1]
+    assert any(
+        comment.startswith("GitHub PR checks are failing for PR #77.")
+        and failure_url in comment
+        for comment in runner.comments
+    )
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert f"Failing checks: test (failure) — {failure_url}" in coder_prompt
+    assert "Overall state: pending" not in coder_prompt
+
+
+def test_pr_loop_refreshes_pending_to_passing_without_ci_coder_round(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Codex approves.")],
+        gemini_outputs=[structured_pr_review(state="approved", summary="Gemini approves.")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=1)
+    check_states = iter(
+        [
+            {"check_runs": [{"name": "test", "status": "in_progress", "conclusion": None}]},
+            {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]},
+            {"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]},
+        ]
+    )
+
+    def next_checks(*args, **kwargs):
+        runner.pr_check_runs_payload = next(check_states)
+        return original_get_pr_checks(*args, **kwargs)
+
+    from coding_review_agent_loop import orchestrator as orchestrator_module
+
+    original_get_pr_checks = orchestrator_module.get_pr_checks
+    monkeypatch.setattr(orchestrator_module, "get_pr_checks", next_checks)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    assert not any("checks are still pending" in comment for comment in runner.comments)
 
 def test_pr_loop_failing_github_checks_block_approval_even_with_auto_merge(tmp_path):
     runner = FakeRunner(

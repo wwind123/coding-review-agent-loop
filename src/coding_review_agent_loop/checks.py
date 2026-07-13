@@ -104,7 +104,11 @@ def _pr_check_details(pr_checks: PullRequestChecks) -> list[str]:
     if pr_checks.failing:
         details.append(
             "Failing checks: "
-            + ", ".join(f"{check.name} ({check.status})" for check in pr_checks.failing)
+            + ", ".join(
+                f"{check.name} ({check.status.lower()})"
+                + (f" — {check.url.strip()}" if check.url and check.url.strip() else "")
+                for check in pr_checks.failing
+            )
         )
     if pr_checks.pending:
         details.append(
