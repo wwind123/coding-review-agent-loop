@@ -2496,11 +2496,6 @@ def _prior_discuss_split_proposals(
     if not final_summaries:
         return []
     latest = final_summaries[-1]
-    # Open-ended answer-mode discussions have positions rather than triage
-    # outcomes, and cannot produce a `split` consensus. Do not feed their
-    # persisted debater records into the legacy triage recovery below.
-    if latest.metadata.result_mode == "answer":
-        return []
     if latest.metadata.split_proposals:
         return list(latest.metadata.split_proposals)
     configured_reviewers = reviewers(config)

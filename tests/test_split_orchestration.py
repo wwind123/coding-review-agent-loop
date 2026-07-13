@@ -484,6 +484,41 @@ def _answer_mode_final_summary_comment() -> dict:
     }
 
 
+def _answer_mode_debater_comment() -> dict:
+    """An answer-mode vote as `_post_discuss_debater_comment` persists it."""
+    response = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "discuss_answer",
+                "position": "answer",
+                "rationale": "The proposal is sufficiently scoped.",
+                "confidence": "high",
+                "unresolved_items": [],
+                "answer": "Proceed with the proposal.",
+                "rebuttal": "No triage outcome applies to answer-mode discussion.",
+            }
+        )
+        + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"
+    )
+    return {
+        "author": {"login": "bot"},
+        "createdAt": "2026-07-12T00:00:00Z",
+        "body": _attach_round_metadata(
+            "Proceed with the proposal.\n-- Codex",
+            PostedRoundMetadata(
+                flow="discuss",
+                role="debater",
+                agent="Codex",
+                round_number=6,
+                subject="prior-discuss-subject",
+                raw_structured_coder_response=response,
+                result_mode="answer",
+            ),
+        ),
+    }
+
+
 def test_plan_first_skips_split_recovery_for_answer_mode_discuss_summary(tmp_path):
     """An answer-mode summary has no triage outcome to recover.
 
@@ -500,7 +535,7 @@ def test_plan_first_skips_split_recovery_for_answer_mode_discuss_summary(tmp_pat
             structured_plan_review(state="approved"),
             structured_pr_review(state="approved", summary="LGTM."),
         ],
-        issue_comments=[_answer_mode_final_summary_comment()],
+        issue_comments=[_answer_mode_debater_comment(), _answer_mode_final_summary_comment()],
     )
     config = make_config(tmp_path)
 
