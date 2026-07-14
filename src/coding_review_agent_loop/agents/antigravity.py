@@ -39,7 +39,7 @@ from .base import (
 from ..errors import AgentLoopError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
-from ..runner import Runner
+from ..runner import Runner, strip_ansi
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
@@ -133,6 +133,22 @@ def _strip_public_response_marker(raw: str) -> tuple[str, AgentTextSource]:
     return raw.rsplit(PUBLIC_RESPONSE_MARKER, 1)[1].lstrip("\n"), "stdout_marker"
 
 
+def _parse_model_catalog(raw: str) -> set[str]:
+    """Extract model labels from the human-readable ``agy models`` output."""
+    models: set[str] = set()
+    for line in strip_ansi(raw).splitlines():
+        value = line.strip().lstrip("-*• ").strip()
+        if not value or set(value) <= {"-", "=", "_"}:
+            continue
+        lowered = value.lower().rstrip(":")
+        if lowered in {"models", "available models", "available model", "name", "model"}:
+            continue
+        if lowered.startswith(("error:", "warning:", "usage:", "command:")):
+            continue
+        models.add(value)
+    return models
+
+
 class AntigravityBackend:
     name: AgentName = "antigravity"
     display_name = "Antigravity"
@@ -143,6 +159,35 @@ class AntigravityBackend:
 
     def default_args(self, *, dangerous: bool) -> tuple[str, ...]:
         return ("--dangerously-skip-permissions",) if dangerous else ()
+
+    def discover_models(
+        self, runner: Runner, config: AgentLoopConfig, *, timeout_seconds: float
+    ) -> tuple[set[str] | None, str]:
+        """Query agy's model catalog once, preserving the PTY requirement."""
+        repair_root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
+        repair_root.mkdir(parents=True, exist_ok=True)
+        log_path = agent_log_path(config, "antigravity-repair-models")
+        with tempfile.TemporaryDirectory(prefix="agy-catalog-", dir=repair_root) as temp_dir:
+            try:
+                result = runner.run_with_log(
+                    [config.antigravity_cmd, *config.antigravity_args, "models"],
+                    cwd=Path(temp_dir),
+                    log_path=log_path,
+                    label="Antigravity model catalog",
+                    progress_interval_seconds=config.progress_interval_seconds,
+                    check=False,
+                    env={"AGENT_LOOP_WORKDIR": str(Path(temp_dir).resolve())},
+                    use_pty=True,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as exc:
+                return None, str(exc)
+        if result.returncode != 0:
+            return None, result.stdout or result.stderr or f"agy models exited with {result.returncode}"
+        models = _parse_model_catalog(result.stdout)
+        if not models:
+            return None, "agy models returned no parseable model choices"
+        return models, result.stdout
 
     def run(
         self,

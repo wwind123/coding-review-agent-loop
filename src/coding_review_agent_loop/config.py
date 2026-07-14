@@ -37,7 +37,7 @@ DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
     "Gemini 3.5 Flash (High)",
     "Gemini 3.1 Pro (High)",
 )
-DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3 Flash",)
+DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3.5 Flash (Medium)",)
 
 # Discuss-mode research policy values (#477). The CLI flag choices, the config
 # validation, and the prompt builders all derive from this set.

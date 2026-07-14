@@ -1005,7 +1005,8 @@ Output ONLY the repaired response. No explanations.
 _REPAIR_MODEL = "gemini-3.1-flash-lite"
 _SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_followup", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation"}
 RepairOutcome = Literal[
-    "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output"
+    "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
+    "unavailable_model",
 ]
 
 
@@ -1109,7 +1110,15 @@ def execute_repair(
     """Run the configured repair chain and validate each candidate."""
     prompt = _build_repair_prompt(raw, **prompt_kwargs)
     attempts: list[RepairAttemptResult] = []
-    models = config.repair_models
+    if config.repair_backend == "antigravity":
+        models = tuple(dict.fromkeys((*config.repair_models, *config.antigravity_models)))
+        catalog, catalog_diagnostic = AntigravityBackend().discover_models(
+            runner, config, timeout_seconds=min(float(config.repair_timeout_seconds), 30.0)
+        )
+    else:
+        models = config.repair_models
+        catalog = None
+        catalog_diagnostic = ""
     for index, model in enumerate(models):
         fallback_planned = index + 1 < len(models)
         log_path: Path | None = None
@@ -1117,6 +1126,25 @@ def execute_repair(
         returncode: int | None = None
         diagnostic = ""
         outcome: RepairOutcome
+        if catalog is not None and model not in catalog:
+            choices = ", ".join(sorted(catalog))
+            diagnostic = _sanitize_diagnostic(
+                f"Repair model {model!r} is not available in agy models. "
+                f"Available choices: {choices}", config=config
+            )
+            attempts.append(RepairAttemptResult(
+                backend="antigravity", model=model, prompt=prompt, output="",
+                returncode=None, outcome="unavailable_model", diagnostic=diagnostic,
+                log_path=None, fallback_planned=fallback_planned,
+            ))
+            if usage_context is not None:
+                usage_context.add_record(
+                    agent="antigravity", session_id=None, returncode=None,
+                    usage=estimate_usage(prompt, ""), role="repair", model=model,
+                    outcome="unavailable_model", log_path=None,
+                    fallback_planned=fallback_planned,
+                )
+            continue
         try:
             if config.repair_backend == "antigravity":
                 log_path = agent_log_path(config, "antigravity-repair", run_id=run_id)
@@ -1174,6 +1202,16 @@ def execute_repair(
             if log_path is not None:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 log_path.write_text(diagnostic + "\n", encoding="utf-8")
+
+        if config.repair_backend == "antigravity" and catalog is None and catalog_diagnostic:
+            diagnostic = (
+                _sanitize_diagnostic(
+                    "agy model catalog unavailable; attempting configured candidates directly: "
+                    + catalog_diagnostic,
+                    config=config,
+                )
+                + (f"\n{diagnostic}" if diagnostic else "")
+            )
 
         attempt = RepairAttemptResult(
             backend=config.repair_backend,

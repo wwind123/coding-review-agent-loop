@@ -1177,8 +1177,8 @@ the attempt log path instead of posting that raw output as a review.
 For structured plan reviews, plan revisions, PR reviews, and coder follow-ups,
 a present but malformed structured response may get a repair pass before the
 local failure is raised. By default the repair pass calls Antigravity through
-the existing PTY backend with the single model `Gemini 3 Flash`; the normal
-coder/reviewer fallback chain is not inherited. It uses a fresh temporary
+the existing PTY backend with the default model `Gemini 3.5 Flash (Medium)`;
+explicit repair models are followed by the configured coder/reviewer chain. It uses a fresh temporary
 workdir, empty tool permissions, and repair-only instructions forbidding file
 inspection, tests, mutation, background work, and subagents. The format-repair
 prompt asks it to preserve the agent's intent while emitting
@@ -1345,8 +1345,11 @@ output`. A recovered response is still revalidated before posting; a failed
 repair leaves the run in local failure just like any other protocol error.
 
 Use `--repair-backend`, repeatable `--repair-model`, and
-`--repair-timeout-seconds` to configure this path. Multiple models are the only
-repair fallback chain. `--repair-backend gemini` retains the legacy CLI for
+`--repair-timeout-seconds` to configure this path. The repair chain is the explicit
+prefix followed by `antigravity_models`, with duplicates removed. It queries `agy
+models` once through the same PTY-safe runner as `agy --print`, rejects stale names
+with available-choice guidance, and attempts candidates directly when discovery is
+unavailable. `--repair-backend gemini` retains the legacy CLI for
 enterprise/API-key/Vertex authentication; personal OAuth may require an
 interactive authorization and is not the default. Normal diagnostics include
 backend, model, return code, a sanitized bounded combined-PTY diagnostic, log

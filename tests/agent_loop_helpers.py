@@ -199,6 +199,7 @@ class FakeRunner(Runner):
         codex_outputs=None,
         gemini_outputs=None,
         antigravity_outputs=None,
+        antigravity_catalog_outputs=None,
         issue_payload=None,
         issue_comments=None,
         pr_payload=None,
@@ -243,6 +244,7 @@ class FakeRunner(Runner):
         self.codex_outputs = list(codex_outputs or [])
         self.gemini_outputs = list(gemini_outputs or [])
         self.antigravity_outputs = list(antigravity_outputs or [])
+        self.antigravity_catalog_outputs = list(antigravity_catalog_outputs or [])
         self.issue_payload = {
             "number": 56,
             "state": "open",
@@ -594,7 +596,9 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, output, "", returncode)
 
         if cmd[:1] == ["agy"]:
-            output = self._next_agent_output(self.antigravity_outputs)
+            output = self._next_agent_output(
+                self.antigravity_catalog_outputs if "models" in cmd else self.antigravity_outputs
+            )
             if isinstance(output, dict):
                 stdout = output.get("stdout", "")
                 returncode = output.get("returncode", 0)

@@ -804,6 +804,62 @@ def test_execute_repair_uses_configured_legacy_gemini_override(tmp_path):
     assert attempts[0].backend == "gemini"
     assert "gemini-enterprise-flash" in run.call_args.args[0]
 
+
+def test_antigravity_repair_validates_once_and_falls_back_to_catalog_chain(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    valid = structured_pr_review(state="approved", reviewer="Google Antigravity")
+    calls = []
+
+    class CatalogRunner(FakeRunner):
+        def run_with_log(self, args, *, use_pty=False, **kwargs):
+            calls.append((list(args), use_pty))
+            return super().run_with_log(args, use_pty=use_pty, **kwargs)
+
+    runner = CatalogRunner(
+        antigravity_catalog_outputs=[("Available models:\nModelB\n", 0)],
+        antigravity_outputs=[(valid, 0)],
+    )
+    config = make_config(
+        tmp_path,
+        repair_models=("StaleModel", "ModelB"),
+        antigravity_models=("ModelB", "ModelC"),
+    )
+    repaired, _, attempts = execute_repair(
+        "malformed", runner=runner, config=config, run_id="catalog",
+        usage_context=None,
+        validate=lambda text: parse_structured_pr_review(text, reviewer="Google Antigravity"),
+        expected_kind="pr_review",
+    )
+
+    assert repaired == valid
+    assert [attempt.model for attempt in attempts] == ["StaleModel", "ModelB"]
+    assert attempts[0].outcome == "unavailable_model"
+    assert "Available choices: ModelB" in attempts[0].diagnostic
+    assert sum("models" in args for args, _ in calls) == 1
+    assert all(use_pty for _, use_pty in calls)
+
+
+def test_antigravity_repair_attempts_directly_when_catalog_fails(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    runner = FakeRunner(
+        antigravity_catalog_outputs=[("catalog unavailable", 2)],
+        antigravity_outputs=[("first failed", 1), ("second failed", 1)],
+    )
+    config = make_config(tmp_path, repair_models=("ModelA",), antigravity_models=("ModelB",))
+    _, _, attempts = execute_repair(
+        "malformed", runner=runner, config=config, run_id="catalog-failure",
+        usage_context=None, validate=lambda text: text, expected_kind="pr_review",
+    )
+
+    assert [attempt.model for attempt in attempts] == ["ModelA", "ModelB"]
+    assert all(attempt.outcome == "nonzero_exit" for attempt in attempts)
+    assert all("catalog unavailable" in attempt.diagnostic for attempt in attempts)
+    assert sum("models" in command for command, _ in runner.commands) == 1
+
 def test_runner_pty_timeout_is_opt_in_and_retains_combined_log(tmp_path):
     log_path = tmp_path / "logs" / "timeout.log"
     result = Runner().run_with_log(

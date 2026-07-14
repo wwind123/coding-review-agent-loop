@@ -158,7 +158,7 @@ never falsely reported `approved`. A malformed-but-content-bearing structured
 review is recovered automatically when possible: safe skill normalization,
 envelope normalization, deterministic unknown-prior-item stripping against the
 complete carried ledger, and then model format repair. Local-loop repair now
-defaults to isolated Antigravity with `Gemini 3 Flash`; explicit repeatable
+defaults to isolated Antigravity with `Gemini 3.5 Flash (Medium)`; explicit repeatable
 repair models define the only fallback chain. Legacy Gemini CLI repair requires
 `--repair-backend gemini` and suitable non-interactive authentication. The
 classifier is conservative: only known tooling-failure signatures or

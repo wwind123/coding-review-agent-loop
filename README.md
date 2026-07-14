@@ -604,7 +604,7 @@ payloads into normal public GitHub comments, so raw JSON is not posted.
 
 When a structured plan review, plan revision, PR review, or coder follow-up is
 present but malformed, the loop may run a model-backed repair pass. The default
-backend is Antigravity (`agy`) with the single model `Gemini 3 Flash`. The
+backend is Antigravity (`agy`) with the default model `Gemini 3.5 Flash (Medium)`. The
 repair pass is format-only: it asks the model to re-emit the agent's intent as the
 required JSON object, footer marker, and signature. The repaired response is
 accepted only if it passes the same strict validation as the original response;
@@ -613,10 +613,13 @@ failed repairs remain local protocol errors and are not posted to GitHub.
 Repair runs in a fresh temporary directory with an empty tool allow-list and a
 repair-only `GEMINI.md`; it receives no checkout or repository context. Configure
 it with `--repair-backend antigravity|gemini`, repeat `--repair-model` to define
-an explicit ordered fallback chain, and set `--repair-timeout-seconds`. The
-normal Antigravity coder/reviewer model chain is never inherited. For example:
+an explicit ordered fallback chain, and set `--repair-timeout-seconds`. Explicit
+repair models are tried first, followed by the configured Antigravity chain with
+duplicates removed. The loop validates candidates once with `agy models`, reports
+available choices for stale names, and attempts candidates directly when discovery
+is unavailable. For example:
 
-`--repair-model "Gemini 3 Flash" --repair-model "Gemini 3.1 Pro (High)"`
+`--repair-model "Gemini 3.5 Flash (Medium)" --repair-model "Gemini 3.1 Pro (High)"`
 
 The legacy `gemini --prompt` path is used only with
 `--repair-backend gemini` and requires non-interactive enterprise/API-key/Vertex
