@@ -860,6 +860,7 @@ def test_antigravity_repair_attempts_directly_when_catalog_fails(tmp_path, monke
     assert all("catalog unavailable" in attempt.diagnostic for attempt in attempts)
     assert sum("models" in command for command, _ in runner.commands) == 1
 
+
 def test_runner_pty_timeout_is_opt_in_and_retains_combined_log(tmp_path):
     log_path = tmp_path / "logs" / "timeout.log"
     result = Runner().run_with_log(

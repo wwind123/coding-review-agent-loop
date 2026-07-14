@@ -92,7 +92,8 @@ class UsageCallRecord:
     role: Literal["repair"] | None = None
     model: str | None = None
     outcome: Literal[
-        "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output"
+        "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
+        "unavailable_model",
     ] | None = None
     log_path: str | None = None
     fallback_planned: bool | None = None
@@ -200,7 +201,8 @@ class RunUsageContext:
         role: Literal["repair"] | None = None,
         model: str | None = None,
         outcome: Literal[
-            "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output"
+            "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
+            "unavailable_model",
         ] | None = None,
         log_path: str | None = None,
         fallback_planned: bool | None = None,

@@ -159,7 +159,8 @@ review is recovered automatically when possible: safe skill normalization,
 envelope normalization, deterministic unknown-prior-item stripping against the
 complete carried ledger, and then model format repair. Local-loop repair now
 defaults to isolated Antigravity with `Gemini 3.5 Flash (Medium)`; explicit repeatable
-repair models define the only fallback chain. Legacy Gemini CLI repair requires
+repair models are tried first, followed by the configured Antigravity chain. Legacy
+Gemini CLI repair requires
 `--repair-backend gemini` and suitable non-interactive authentication. The
 classifier is conservative: only known tooling-failure signatures or
 truly-empty output count as unavailable.
