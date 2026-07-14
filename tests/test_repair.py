@@ -457,8 +457,76 @@ def test_attempt_repair_includes_expected_kind_instruction():
     assert "Output no other `kind` value" in prompt
 
 def test_attempt_repair_format_d_marks_human_requirements_optional():
-    assert "omit the `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` marker" in _REPAIR_PROMPT
-    assert "the `### Human requirements` section from Format D" in _REPAIR_PROMPT
+    assert "active planning human-requirements context is authoritative" in _REPAIR_PROMPT
+    assert "malformed response cannot establish a requirement" in _build_repair_prompt(
+        "malformed", expected_kind="plan_revision", surfaced_requirement_ids=()
+    )
+    assert "preserve both after the JSON" not in _REPAIR_PROMPT
+
+
+@pytest.mark.parametrize(
+    ("surfaced_ids", "requires_direct", "must_contain"),
+    [
+        ((), False, "remove any legacy `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` marker"),
+        (("Requirement 1",), False, "Surfaced signed requirement IDs: Requirement 1"),
+        ((), True, "Direct-discussion acknowledgement required: yes"),
+    ],
+)
+def test_planning_repair_prompt_uses_active_context(
+    surfaced_ids, requires_direct, must_contain
+):
+    prompt = _build_repair_prompt(
+        "malformed plan revision with Requirement 1 acceptance criteria",
+        expected_kind="plan_revision",
+        surfaced_requirement_ids=surfaced_ids,
+        requires_direct_discussion_ack=requires_direct,
+    )
+    assert must_contain in prompt
+    assert "malformed response cannot establish a requirement" in prompt
+
+
+def test_plan_revision_repair_strips_fabricated_ack_without_signed_requirement_context(tmp_path):
+    malformed = structured_plan_revision(reviewer="Anthropic Claude").replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n"
+        "- Requirement 1: acceptance criteria mentioned in the issue.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+    repaired = structured_plan_revision(reviewer="Anthropic Claude")
+    runner = FakeRunner(claude_outputs=[malformed])
+    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired) as repair_mock:
+        def validate_without_ack(text):
+            if HUMAN_REQUIREMENTS_ADDRESSED_MARKER in text or "### Human requirements" in text:
+                raise AgentLoopError("fabricated human requirements acknowledgement")
+            return _validate_plan_revision_response(text)
+
+        response = _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Revise the plan.",
+            marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+            validate=validate_without_ack,
+            use_repair=True,
+            repair_expected_kind="plan_revision",
+            repair_surfaced_requirement_ids=(),
+            repair_requires_direct_discussion_ack=False,
+        )
+
+    assert response.text == repaired
+    assert HUMAN_REQUIREMENTS_ADDRESSED_MARKER not in response.text
+    assert "### Human requirements" not in response.text
+    repair_mock.assert_called_once_with(
+        malformed,
+        config.gemini_cmd,
+        expected_kind="plan_revision",
+        surfaced_requirement_ids=(),
+        requires_direct_discussion_ack=False,
+    )
 
 
 def test_repair_prompt_makes_research_intent_conditional_on_active_status():
@@ -903,7 +971,7 @@ def test_run_pr_loop_uses_repair_pass_on_format_failure(tmp_path):
 
     captured_repairs = []
 
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
+    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
         captured_repairs.append(raw)
         assert expected_kind == "pr_review"
         return repaired_review
@@ -1316,7 +1384,7 @@ def test_run_pr_loop_repairs_format_failure_with_5xx_source_line_reference(tmp_p
 
     captured_repairs = []
 
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
+    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
         captured_repairs.append(raw)
         assert expected_kind == "pr_review"
         return repaired_review
@@ -1339,7 +1407,7 @@ def test_run_pr_loop_falls_back_to_error_when_repair_also_fails(tmp_path):
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", agent_max_retries=0)
 
-    def fake_attempt_repair_fails(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
+    def fake_attempt_repair_fails(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
         assert expected_kind == "pr_review"
         return "still broken output without valid schema"
 
@@ -1393,7 +1461,7 @@ def test_run_pr_loop_uses_repair_pass_on_coder_followup_format_failure(tmp_path)
     captured_repairs = []
     captured_unresolved_item_ids = []
 
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
+    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
         captured_repairs.append(raw)
         captured_unresolved_item_ids.append(tuple(unresolved_item_ids or ()))
         assert expected_kind == "coder_followup"
@@ -1510,7 +1578,8 @@ def test_repair_prompt_coder_followup_fenced_json_example():
 def test_repair_prompt_plan_revision_preserves_human_requirements_acknowledgement():
     assert "WORKED EXAMPLE 4" in _REPAIR_PROMPT
     assert "do not output coder_followup" in _REPAIR_PROMPT
-    assert "preserve both after the JSON and before <!-- AGENT_PLAN_STATE: blocking -->" in _REPAIR_PROMPT
+    assert "preserve the acknowledgement only when it requires surfaced signed requirements" in _REPAIR_PROMPT
+    assert "If the original plan revision includes <!-- HUMAN_REQUIREMENTS_ADDRESSED -->" not in _REPAIR_PROMPT
 
 def test_repair_prompt_does_not_suggest_ack_pseudo_item_in_addressed_items():
     """The ack pseudo-item must never be suggested as a value for addressed_items.
@@ -2930,6 +2999,8 @@ def test_structured_plan_revision_transient_terms_before_footer_runs_repair(tmp_
         malformed_revision,
         config.gemini_cmd,
         expected_kind="plan_revision",
+        surfaced_requirement_ids=("Requirement 1",),
+        requires_direct_discussion_ack=False,
     )
     assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
 

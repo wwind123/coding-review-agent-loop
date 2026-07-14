@@ -402,7 +402,7 @@ def test_gemini_pre_marker_429_does_not_suppress_structured_review_repair(tmp_pa
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
     captured_repairs = []
 
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
+    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
         captured_repairs.append(raw)
         assert expected_kind == "pr_review"
         return repaired_review
@@ -446,7 +446,7 @@ def test_gemini_response_file_repair_ignores_raw_stdout_transient_diagnostics(tm
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
     captured_repairs = []
 
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
+    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
         captured_repairs.append(raw)
         return repaired_review
 

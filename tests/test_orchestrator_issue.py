@@ -694,7 +694,7 @@ def test_issue_loop_plan_revision_repair_preserves_signed_human_requirements(tmp
     config = make_config(tmp_path, agent_max_retries=0)
     captured_repairs = []
 
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
+    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
         captured_repairs.append((raw, expected_kind))
         return repaired_revision
 
@@ -760,7 +760,7 @@ def test_issue_loop_plan_revision_repair_rejects_wrong_kind_from_human_requireme
     config = make_config(tmp_path, agent_max_retries=0)
     captured_kinds = []
 
-    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
+    def fake_attempt_repair(raw: str, gemini_cmd: str, *, expected_kind: str | None = None, unresolved_item_ids=None, surfaced_requirement_ids=None, requires_direct_discussion_ack=False, allowed_prior_item_ids=None, unknown_prior_item_ids=None, same_round_context=None) -> str | None:
         captured_kinds.append(expected_kind)
         return wrong_kind_repair
 

@@ -2131,7 +2131,14 @@ def _run_validated_agent(
                     repair_kwargs: dict[str, object] = {"expected_kind": repair_expected_kind}
                     if repair_unresolved_item_ids is not None:
                         repair_kwargs["unresolved_item_ids"] = tuple(repair_unresolved_item_ids)
-                    if (
+                    if repair_expected_kind in {"plan_state", "plan_revision"}:
+                        repair_kwargs["surfaced_requirement_ids"] = tuple(
+                            repair_surfaced_requirement_ids or ()
+                        )
+                        repair_kwargs["requires_direct_discussion_ack"] = (
+                            repair_requires_direct_discussion_ack
+                        )
+                    elif (
                         repair_expected_kind == "coder_followup"
                         and repair_surfaced_requirement_ids is not None
                     ):
@@ -3055,6 +3062,11 @@ def _run_plan_first_loop(
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
     if resume_state is None:
         log(config, f"Planning issue #{issue_number}: invoking {coder_name} (context mode: full)")
+        plan_human_requirements_context = render_coder_human_requirements_prompt_context(
+            issue_context.human_requirements,
+            requirement_scope="planning requirements",
+            full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
+        )
         plan_response = _run_validated_agent(
             runner,
             agent=config.coder,
@@ -3071,6 +3083,8 @@ def _run_plan_first_loop(
             usage_context=usage_context,
             use_repair=True,
             repair_expected_kind="plan_state",
+            repair_surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
+            repair_requires_direct_discussion_ack=plan_human_requirements_context.requires_direct_discussion_ack,
             operation_description="planning",
         )
         plan_output = plan_response.text

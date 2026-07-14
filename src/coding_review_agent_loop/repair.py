@@ -204,6 +204,8 @@ You are a format-repair assistant. An AI agent produced an initial plan state, c
 
 {coder_followup_human_requirements_instruction}
 
+{planning_human_requirements_instruction}
+
 {reviewer_human_requirements_instruction}
 
 {prior_item_dispositions_instruction}
@@ -417,13 +419,9 @@ Notes:
 <!-- AGENT_PLAN_STATE: blocking -->
 -- <Coder Name>
 
-Only include the optional signed human requirements acknowledgement when it was present in the malformed original.
+The active planning human-requirements context above is authoritative. Do not use an acknowledgement marker or section in the malformed response as evidence that a signed requirement exists.
 
 ## Valid Format D — Plan Revision:
-
-When the malformed plan_revision did not include a signed human requirements
-acknowledgement, omit the `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` marker and
-the `### Human requirements` section from Format D.
 
 {
   "schema_version": 1,
@@ -649,8 +647,8 @@ CORRECT repair — output plan_revision JSON first, preserve the human requireme
 
 Notes:
 - When repairing plan_revision, do not output coder_followup even if the original contains a Human requirements section.
-- If the original plan revision includes <!-- HUMAN_REQUIREMENTS_ADDRESSED --> and a ### Human requirements section, preserve both after the JSON and before <!-- AGENT_PLAN_STATE: blocking -->.
-- If the original plan revision does not include both that marker and section, do not fabricate a human requirements acknowledgement.
+- Preserve the acknowledgement after the JSON and before the footer only when the active planning context requires it; never infer a requirement from the malformed response.
+- The active planning human-requirements context is authoritative: preserve the acknowledgement only when it requires surfaced signed requirements or direct-discussion acknowledgement; otherwise remove both legacy markdown elements.
 
 ## WORKED EXAMPLE 5 — coder follow-up with no signed human requirements:
 
@@ -1059,6 +1057,7 @@ def _build_repair_prompt(
     expected_kind: str | None = None,
     unresolved_item_ids: Sequence[str] | None = None,
     surfaced_requirement_ids: Sequence[str] | None = None,
+    requires_direct_discussion_ack: bool = False,
     reviewer_requirement_ids: Sequence[str] | None = None,
     allowed_prior_item_ids: Sequence[str] | None = None,
     unknown_prior_item_ids: Sequence[str] | None = None,
@@ -1066,11 +1065,29 @@ def _build_repair_prompt(
 ) -> str:
     if expected_kind is not None and expected_kind not in _SUPPORTED_EXPECTED_KINDS:
         raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
+    if (
+        (surfaced_requirement_ids is not None or requires_direct_discussion_ack)
+        and expected_kind not in {"coder_followup", "plan_state", "plan_revision"}
+    ):
+        raise ValueError(
+            "surfaced_requirement_ids may only be used for coder_followup, plan_state, or plan_revision repair"
+        )
     coder_followup_required_items_instruction = _coder_followup_required_items_instruction(
         expected_kind, unresolved_item_ids
     )
-    coder_followup_human_requirements_instruction = _coder_followup_human_requirements_instruction(
-        expected_kind, surfaced_requirement_ids
+    coder_followup_human_requirements_instruction = (
+        _coder_followup_human_requirements_instruction(expected_kind, surfaced_requirement_ids)
+        if expected_kind == "coder_followup"
+        else ""
+    )
+    planning_human_requirements_instruction = (
+        _planning_human_requirements_instruction(
+            expected_kind,
+            surfaced_requirement_ids,
+            requires_direct_discussion_ack,
+        )
+        if expected_kind in {"plan_state", "plan_revision"}
+        else ""
     )
     reviewer_human_requirements_instr = _reviewer_human_requirements_instruction(
         expected_kind, reviewer_requirement_ids
@@ -1088,6 +1105,7 @@ def _build_repair_prompt(
     replacements = (
         ("{coder_followup_required_items_instruction}", coder_followup_required_items_instruction),
         ("{coder_followup_human_requirements_instruction}", coder_followup_human_requirements_instruction),
+        ("{planning_human_requirements_instruction}", planning_human_requirements_instruction),
         ("{reviewer_human_requirements_instruction}", reviewer_human_requirements_instr),
         ("{prior_item_dispositions_instruction}", prior_item_dispositions_instruction),
         ("{raw_response}", raw),
@@ -1297,6 +1315,45 @@ def _coder_followup_human_requirements_instruction(
     )
 
 
+def _planning_human_requirements_instruction(
+    expected_kind: str | None,
+    surfaced_requirement_ids: Sequence[str] | None,
+    requires_direct_discussion_ack: bool,
+) -> str:
+    if surfaced_requirement_ids is None and not requires_direct_discussion_ack:
+        return ""
+    if expected_kind not in {"plan_state", "plan_revision"}:
+        raise ValueError(
+            "surfaced_requirement_ids may only be used for plan_state or plan_revision repair"
+        )
+    ids = tuple(surfaced_requirement_ids or ())
+    rendered_ids = ", ".join(ids) or "(none)"
+    if not ids and not requires_direct_discussion_ack:
+        return (
+            "## Active planning human-requirements context:\n"
+            "No signed human requirements were surfaced and direct-discussion acknowledgement is not required. "
+            "This context is authoritative: remove any legacy `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` marker "
+            "and `### Human requirements` section from the repaired output, emit no human-requirement "
+            "dispositions, and do not treat those malformed-response elements or issue acceptance criteria as evidence; "
+            "the malformed response cannot establish a requirement.\n"
+        )
+    disposition_rule = (
+        "Include one `human_requirement_dispositions` object for every surfaced ID, using the exact ID, "
+        "a valid disposition (`addressed`, `blocked`, or `not-applicable`), and non-empty evidence."
+        if ids
+        else "No surfaced IDs exist, so emit no fabricated requirement dispositions."
+    )
+    return (
+        "## Active planning human-requirements context:\n"
+        f"Surfaced signed requirement IDs: {rendered_ids}\n"
+        f"Direct-discussion acknowledgement required: {'yes' if requires_direct_discussion_ack else 'no'}\n"
+        "This active context is authoritative; the malformed response cannot establish a requirement. "
+        "Preserve or add the `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` marker and `### Human requirements` "
+        "section in the required position after the JSON and before the plan-state footer. "
+        f"{disposition_rule}\n"
+    )
+
+
 def _reviewer_human_requirements_instruction(
     expected_kind: str | None,
     reviewer_requirement_ids: Sequence[str] | None,
@@ -1365,6 +1422,7 @@ def attempt_repair(
     expected_kind: str | None = None,
     unresolved_item_ids: Sequence[str] | None = None,
     surfaced_requirement_ids: Sequence[str] | None = None,
+    requires_direct_discussion_ack: bool = False,
     reviewer_requirement_ids: Sequence[str] | None = None,
     allowed_prior_item_ids: Sequence[str] | None = None,
     unknown_prior_item_ids: Sequence[str] | None = None,
@@ -1381,6 +1439,7 @@ def attempt_repair(
         expected_kind=expected_kind,
         unresolved_item_ids=unresolved_item_ids,
         surfaced_requirement_ids=surfaced_requirement_ids,
+        requires_direct_discussion_ack=requires_direct_discussion_ack,
         reviewer_requirement_ids=reviewer_requirement_ids,
         allowed_prior_item_ids=allowed_prior_item_ids,
         unknown_prior_item_ids=unknown_prior_item_ids,
