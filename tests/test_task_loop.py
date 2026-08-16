@@ -180,7 +180,7 @@ def test_task_loop_terminates_on_no_pr_blocking_result(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
             "Local test `python -m pytest tests/test_foo.py -q` exceeded its "
-            "900 second bound; terminated and did not open a PR.\n"
+            "1800 second bound; terminated and did not open a PR.\n"
             "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],
     )
@@ -232,4 +232,3 @@ def test_codex_task_loop_rejects_empty_task_text(tmp_path):
         run_task_loop(runner, task_text="   ", config=config)
 
     assert runner.commands == []
-

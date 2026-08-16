@@ -109,6 +109,10 @@ def _coder_test_reporting_guidance(*, structured: bool = False) -> str:
     )
 
 
+CODER_TEST_COMMAND_TIMEOUT_SECONDS = 1800
+"""Maximum foreground timeout for one required coder test command (#648)."""
+
+
 def _coder_local_test_scope_guidance(*, structured: bool = False) -> str:
     if structured:
         rationale = (
@@ -138,8 +142,9 @@ def _coder_local_test_scope_guidance(*, structured: bool = False) -> str:
         "cover it, or a human or the issue explicitly asked for full-suite "
         f"verification — and when a broad run is justified, state that reason in {broad_reason_location}. "
         "Run required completion tests in the foreground with visible output "
-        "and an explicit bounded timeout (a concrete stated cap, at most 900 "
-        "seconds per required test command). Never launch pytest in the "
+        "and an explicit bounded timeout (a concrete stated cap, at most "
+        f"{CODER_TEST_COMMAND_TIMEOUT_SECONDS} seconds per required test command). "
+        "Never launch pytest in the "
         "background (`&`, `nohup`, background task/tool invocations) and never "
         "spawn auxiliary shell loops that poll process IDs, `ps`/`kill -0`/"
         "`wait`, or task-output files to learn whether it finished. If a "

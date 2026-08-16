@@ -1770,6 +1770,15 @@ def test_coder_prompts_forbid_unbounded_ci_waits_with_exact_bound(tmp_path, buil
         lambda config: build_task_clarification_prompt("Fix the bug.", [], config),
         lambda config: build_followup_prompt(77, 1, "Needs tests.", config),
         lambda config: build_same_pr_followup_prompt(77, 1, "Tighten docs.", config),
+        lambda config: build_merge_conflict_prompt(
+            77,
+            1,
+            "Resolve the conflict.",
+            config,
+            base_branch="main",
+            head_sha="deadbeef",
+            merge_state_detail="mergeable=CONFLICTING",
+        ),
     ],
 )
 def test_coder_prompts_require_focused_bounded_local_tests(tmp_path, builder):
@@ -1781,13 +1790,15 @@ def test_coder_prompts_require_focused_bounded_local_tests(tmp_path, builder):
     assert "one-line rationale for each" in prompt
     assert "Do not run the whole `tests/` suite" in prompt
     assert "broad server/database/integration/end-to-end suites" in prompt
-    assert "at most 900" in prompt
+    assert "at most 1800" in prompt
+    assert "at most 900" not in prompt
     assert "Never launch pytest in the background" in prompt
     assert "poll process IDs" in prompt
     assert "`ps`/`kill -0`/`wait`" in prompt
     assert "task-output files" in prompt
     assert "terminate the run and return a valid" in prompt
     assert "naming the exact command and the timeout" in prompt
+    assert "Reserve agent-unavailable for a genuine environment/tooling failure" in prompt
 
 
 @pytest.mark.parametrize(

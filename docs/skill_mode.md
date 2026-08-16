@@ -96,7 +96,10 @@ output signatures that trigger fallback. Use
 `--antigravity-print-timeout-seconds SECONDS` (default `600`, matching the
 `agent-loop` CLI) to override the `--print-timeout` passed to each `agy
 --print` call, which otherwise falls back to `agy`'s own five-minute
-print-mode default. These options are available on plan, task, PR-review,
+print-mode default. For a required local test that may run up to 1,800
+seconds, configure this whole-invocation deadline above that cap with
+additional budget for analysis, edits, reporting, and other turn work; the
+default cannot accommodate it. These options are available on plan, task, PR-review,
 implementation, decomposition, phased implementation, and PR-fix commands.
 Antigravity turns are single-shot (no cross-round session resume) and report
 estimated token usage.
@@ -232,11 +235,14 @@ module to a changed file or reviewer item. Broad suites remain available when
 the change genuinely touches those surfaces, focused tests demonstrably do
 not cover it, or a human or the issue explicitly asked for full-suite
 verification. Required completion tests must run in the foreground with
-visible output under an explicit bounded timeout; never launch pytest in the
-background or poll a process ID, `ps`/`kill -0`/`wait`, or a task-output file
-to learn whether it finished. If a required test exceeds its bound, terminate
-it and report the blocker immediately, naming the exact command and the
-timeout, instead of waiting silently or retrying with a broader selection.
+visible output under an explicit bounded timeout (at most 1,800 seconds per
+required test command). That maximum allowance requires an individually
+justified command; it is not a reason to choose a broad suite. Never launch
+pytest in the background or poll a process ID, `ps`/`kill -0`/`wait`, or a
+task-output file to learn whether it finished. If a required test exceeds its
+bound, terminate it and report the blocker immediately, naming the exact
+command and the timeout, instead of waiting silently or retrying with a
+broader selection.
 
 Every coder prompt built by `coding_review_agent_loop.prompts` — including the
 ones `helpers/prompt_builders.py` reuses for skill mode's `run-pr-fix` —

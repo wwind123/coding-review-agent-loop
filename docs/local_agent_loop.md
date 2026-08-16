@@ -1461,10 +1461,11 @@ Every coder prompt built by `coding_review_agent_loop.prompts` requires:
   the unnecessary or mis-targeted case is prohibited.
 - **Foreground execution under a bounded timeout.** Required completion
   tests run in the foreground with visible output and a concrete stated cap
-  (at most 900 seconds per required test command). Coders must not launch
-  pytest in the background or spawn auxiliary shell loops that poll process
-  IDs, `ps`/`kill -0`/`wait`, or task-output files to learn whether a test
-  finished.
+  (at most 1,800 seconds per required test command). This is a maximum
+  allowance for one individually justified command, not a default reason to
+  choose a broad suite. Coders must not launch pytest in the background or
+  spawn auxiliary shell loops that poll process IDs, `ps`/`kill -0`/`wait`,
+  or task-output files to learn whether a test finished.
 - **A valid terminal path on timeout.** If a required test exceeds its
   bound, the coder terminates the run and returns a valid terminal response
   immediately, naming the exact command and the timeout, rather than
@@ -1474,6 +1475,16 @@ Every coder prompt built by `coding_review_agent_loop.prompts` requires:
   stop after a bounded timeout has an ordinary terminal path instead of
   being forced into an `agent_unavailable` report reserved for genuine
   environment/tooling failure.
+
+This per-command coder policy is separate from the three-snapshot,
+120-second GitHub CI observation limit and from the orchestrator's optional
+`--test-command` parsing and execution path; it does not change either one.
+When `antigravity` is the coder, configure
+`--antigravity-print-timeout-seconds` above the 1,800-second command cap and
+leave additional budget for analysis, edits, reporting, and other turn work.
+Its default 600-second whole-invocation deadline cannot accommodate even one
+such command. Apply the same headroom principle to any other backend-imposed
+whole-turn deadline.
 
 The completion-recovery prompt (sent once, when a prior implementation turn
 ended without a valid terminal marker and its text suggested deferring to

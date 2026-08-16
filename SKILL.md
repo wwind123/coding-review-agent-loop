@@ -89,6 +89,9 @@ the two model options are mutually exclusive. Customize fallback detection with
 call passes `--print-timeout` from `--antigravity-print-timeout-seconds`
 (default `600`, i.e. ten minutes, matching the `agent-loop` CLI), overriding
 `agy`'s own five-minute print-mode default so long turns are not cut short.
+For a required local test that may run up to 1,800 seconds, configure this
+whole-invocation deadline above that cap with additional budget for analysis,
+edits, reporting, and other turn work; the default cannot accommodate it.
 Provider capacity failures retry the active model before fallback; the
 `--max-retries` allowance is shared across the chain, capping calls at
 `models + retries`. Custom quota signatures control eligibility, while settings,
@@ -386,10 +389,12 @@ python -m helpers.skill_runner run-task-round \
   touches those surfaces, focused tests demonstrably do not cover it, or a
   human or the issue explicitly asked for full-suite verification. Run
   required completion tests in the foreground with visible output under an
-  explicit bounded timeout; never launch pytest (or any required test) in the
-  background, and never spawn a shell loop that polls a process ID, `ps`/
-  `kill -0`/`wait`, or a task-output file to learn whether it finished. If a
-  required test exceeds its bound, terminate it and report the blocker
+  explicit bounded timeout (at most 1,800 seconds per required test command).
+  That maximum allowance requires an individually justified command; it is not
+  a reason to choose a broad suite. Never launch pytest (or any required test)
+  in the background, and never spawn a shell loop that polls a process ID,
+  `ps`/`kill -0`/`wait`, or a task-output file to learn whether it finished. If
+  a required test exceeds its bound, terminate it and report the blocker
   immediately, naming the exact command and the timeout, rather than waiting
   silently or retrying with a broader selection. The `coding_review_agent_loop`
   CLI orchestrator's coder prompts carry the same policy; this bullet covers
