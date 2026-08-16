@@ -178,6 +178,9 @@ class AgentLoopConfig:
     # Optional v2 managed-CI identity. A repository must independently opt in
     # with its Actions variable before this can suppress any automatic matrix.
     managed_ci_trusted_actor: str | None = None
+    # Explicit PR-mode opt-in for adopting an already-open PR into the v2
+    # managed-CI protocol.  Kept separate from the issue-created v2 flow.
+    managed_ci_adopt_existing_pr: bool = False
     invocation_argv: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -954,6 +957,7 @@ def config_from_args(
             else bool(args.watch_pending_ci)
         ),
         managed_ci_trusted_actor=getattr(args, "managed_ci_trusted_actor", None),
+        managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
         invocation_argv=invocation_argv,
         ci_queued_grace_seconds=getattr(args, "ci_queued_grace_seconds", 1200),
         mergeability_poll_attempts=getattr(args, "mergeability_poll_attempts", 3),

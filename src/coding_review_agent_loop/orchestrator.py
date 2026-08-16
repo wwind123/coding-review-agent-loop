@@ -107,6 +107,8 @@ from .managed_ci import (
     preflight_managed_ci_creation,
     prepare_v2_merge,
     publish_round_readiness,
+    release_adopted_managed_ci,
+    revalidate_adopted_managed_ci,
     wait_for_final_qualification,
 )
 from .migrations import validate_pr_migration_topology
@@ -5644,6 +5646,8 @@ def run_pr_loop(
 ) -> int:
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
+    managed_ci = None
+    managed_ci_qualified = False
     try:
         bootstrap_cwd = github_bootstrap_cwd(config)
         initial_pr_context = get_pr_review_context(
@@ -5694,6 +5698,24 @@ def run_pr_loop(
             pr_number=pr_number,
             metadata=initial_pr_context.metadata,
         )
+
+        def managed_ci_active(metadata: PullRequestMetadata) -> bool:
+            """Drop adopted filtering immediately when its live handshake changes."""
+            nonlocal managed_ci
+            if managed_ci is None:
+                return False
+            if revalidate_adopted_managed_ci(
+                runner, config=config, pr_number=pr_number, metadata=metadata, contract=managed_ci
+            ):
+                return True
+            if managed_ci.adopted_existing_pr:
+                if not release_adopted_managed_ci(
+                    runner, config=config, pr_number=pr_number, contract=managed_ci
+                ):
+                    log(config, f"PR #{pr_number}: unable to release invocation-owned managed-CI label")
+            log(config, f"PR #{pr_number}: managed-CI adoption provenance changed; using ordinary CI")
+            managed_ci = None
+            return False
         memory = prepare_agent_memory(runner, config)
         reviewer_session_ids: dict[AgentName, str | None] = {}
         unavailable_reviewer_failures: dict[AgentName, AgentInvocationError] = {}
@@ -5760,7 +5782,7 @@ def run_pr_loop(
             initial_pr_context = pr_context
             pr_metadata = pr_context.metadata
             pr_comments = pr_context.comments
-            if managed_ci is not None and pre_review_tests_passed and pr_metadata.head_sha:
+            if managed_ci_active(pr_metadata) and pre_review_tests_passed and pr_metadata.head_sha:
                 publish_round_readiness(
                     runner,
                     config=config,
@@ -5960,7 +5982,7 @@ def run_pr_loop(
                         shared_reviewer_pr_checks = get_pr_checks(
                             runner, config=config, metadata=pr_metadata
                         )
-                        if managed_ci is not None:
+                        if managed_ci_active(pr_metadata):
                             shared_reviewer_pr_checks = intermediate_managed_checks(
                                 shared_reviewer_pr_checks
                             )
@@ -6203,7 +6225,7 @@ def run_pr_loop(
                     reviewer_pr_checks = get_pr_checks(
                         runner, config=config, metadata=pr_metadata
                     )
-                    if managed_ci is not None:
+                    if managed_ci_active(pr_metadata):
                         reviewer_pr_checks = intermediate_managed_checks(reviewer_pr_checks)
                     compact_tail = (
                         CompactPrReviewTailContext(
@@ -6741,7 +6763,7 @@ def run_pr_loop(
                     pr_checks = None
                 else:
                     pr_checks = get_pr_checks(runner, config=config, metadata=pr_metadata)
-                    if managed_ci is not None:
+                    if managed_ci_active(pr_metadata):
                         pr_checks = intermediate_managed_checks(pr_checks)
                 if pr_checks is not None and not must_fix_items and is_wholly_infrastructure_blocked(pr_checks):
                     # Every remaining blocking/pending signal is external GitHub
@@ -6784,7 +6806,7 @@ def run_pr_loop(
                         "Actions runners recover."
                     )
                     return 0
-                if not must_fix_items and config.watch_pending_ci and managed_ci is None:
+                if not must_fix_items and config.watch_pending_ci and not managed_ci_active(pr_metadata):
                     if watch_deadline is None:
                         watch_deadline = time.monotonic() + config.ci_timeout_seconds
                         watch_attempts_remaining = max(
@@ -7031,7 +7053,7 @@ def run_pr_loop(
                     )
                     run_optional_tests(runner, config)
                     if config.auto_merge:
-                        if managed_ci is not None:
+                        if managed_ci_active(pr_metadata):
                             assert pr_metadata.head_sha is not None
                             assert pr_metadata.head_branch is not None
                             dispatch_final_qualification(
@@ -7050,6 +7072,7 @@ def run_pr_loop(
                                 contract=managed_ci,
                             )
                             if managed_outcome.status == "passed":
+                                managed_ci_qualified = True
                                 prepare_v2_merge(
                                     runner,
                                     config=config,
@@ -7468,6 +7491,15 @@ def run_pr_loop(
             f"Reached max rounds ({config.max_rounds}) for PR #{pr_number}; human review required."
         )
     finally:
+        if (
+            managed_ci is not None
+            and managed_ci.adopted_existing_pr
+            and not managed_ci_qualified
+            and not release_adopted_managed_ci(
+                runner, config=config, pr_number=pr_number, contract=managed_ci
+            )
+        ):
+            log(config, f"PR #{pr_number}: unable to release invocation-owned managed-CI label")
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)
 

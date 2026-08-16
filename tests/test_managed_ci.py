@@ -12,6 +12,7 @@ from coding_review_agent_loop.github import (
 from coding_review_agent_loop.managed_ci import (
     FINAL_CONTEXT,
     MANAGED_LABEL,
+    MANAGED_OPT_OUT_LABEL,
     READINESS_CONTEXT,
     ManagedCiContract,
     _dispatch_v2_qualification,
@@ -23,6 +24,8 @@ from coding_review_agent_loop.managed_ci import (
     preflight_managed_ci_creation,
     prepare_v2_merge,
     publish_round_readiness,
+    release_adopted_managed_ci,
+    revalidate_adopted_managed_ci,
     wait_for_final_qualification,
 )
 from coding_review_agent_loop.runner import CommandResult
@@ -78,7 +81,10 @@ class ManagedRunner(FakeRunner):
 
     def _run_locked(self, args, *, cwd, check):
         cmd = list(args)
-        if cmd[:3] == ["gh", "api", "repos/OWNER/REPO/contents/.github/workflows/ci.yml"]:
+        if (
+            cmd[:2] == ["gh", "api"]
+            and cmd[2].startswith("repos/OWNER/REPO/contents/.github/workflows/ci.yml")
+        ):
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, self.workflow, "", 0)
         if cmd[:3] == ["gh", "api", "repos/OWNER/REPO/pulls/7"]:
@@ -122,6 +128,8 @@ class V2ManagedRunner(ManagedRunner):
         actor_login="agent-loop",
         actor_id=1,
         advertised_actor=None,
+        issue_events=None,
+        unreadable_issue_events_after_label=False,
         **kwargs,
     ):
         workflow = kwargs.pop("workflow", V2_WORKFLOW)
@@ -145,6 +153,9 @@ class V2ManagedRunner(ManagedRunner):
         self.actor_login = actor_login
         self.actor_id = actor_id
         self.advertised_actor = advertised_actor or actor_login
+        self.issue_events = list(issue_events or [])
+        self.unreadable_issue_events_after_label = unreadable_issue_events_after_label
+        self.labels_posted = False
 
     def _run_locked(self, args, *, cwd, check):
         cmd = list(args)
@@ -169,6 +180,22 @@ class V2ManagedRunner(ManagedRunner):
         if endpoint == "repos/OWNER/REPO/pulls/7":
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, json.dumps(self.rest_pr), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/issues/7/events?"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            if self.unreadable_issue_events_after_label and self.labels_posted:
+                return CommandResult(cmd, cwd_path, "", "events unavailable", 1)
+            return CommandResult(cmd, cwd_path, json.dumps(self.issue_events), "", 0)
+        if endpoint == "repos/OWNER/REPO/issues/7/labels" and "POST" in cmd:
+            cmd, cwd_path = self._record_command(args, cwd)
+            self.labels_posted = True
+            self.rest_pr["labels"] = [{"name": MANAGED_LABEL}]
+            self.issue_events.append(label_event())
+            return CommandResult(cmd, cwd_path, "{}", "", 0)
+        if endpoint == f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}" and "DELETE" in cmd:
+            cmd, cwd_path = self._record_command(args, cwd)
+            self.rest_pr["labels"] = []
+            self.issue_events.append(label_event(event="unlabeled"))
+            return CommandResult(cmd, cwd_path, "", "", 0)
         if endpoint == "repos/OWNER/REPO/commits/main":
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, json.dumps({"sha": "base-sha"}), "", 0)
@@ -690,6 +717,164 @@ def test_v2_activation_and_preflight_require_authenticated_actor(tmp_path):
     assert contract is not None
     assert contract.protocol_version == 2
     assert contract.trusted_actor_login == "agent-loop"
+
+
+def adoption_workflow():
+    return V2_WORKFLOW + "\n# AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION\n"
+
+
+def label_event(event_id=101, *, event="labeled", login="agent-loop", actor_id=1):
+    return {
+        "id": event_id,
+        "event": event,
+        "label": {"name": MANAGED_LABEL},
+        "actor": {"login": login, "id": actor_id},
+    }
+
+
+def test_existing_pr_adoption_requires_separate_marker_but_keeps_draft_v2(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = V2ManagedRunner(
+        rest_pr={"draft": False, "user": {"login": "someone", "id": 55}},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+    # A complete existing v2 contract still serves issue-created drafts, but
+    # does not silently turn on adoption.
+    assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
+
+
+def test_existing_pr_adoption_rejects_null_head_repository_name(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=adoption_workflow(),
+        rest_pr={
+            "draft": False,
+            "state": "open",
+            "head": {"repo": {"full_name": None}, "sha": "abc123", "ref": "feature"},
+            "labels": [],
+        },
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
+
+
+def test_existing_pr_adoption_reuses_trusted_label_and_revalidates(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=adoption_workflow(),
+        rest_pr={
+            "draft": False,
+            "state": "open",
+            "user": {"login": "someone", "id": 55},
+            "head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "abc123", "ref": "feature"},
+            "labels": [{"name": MANAGED_LABEL}],
+        },
+        issue_events=[label_event()],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.adopted_existing_pr is True
+    assert contract.invocation_applied_label is False
+    assert revalidate_adopted_managed_ci(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+    runner.rest_pr["labels"].append({"name": []})
+    assert revalidate_adopted_managed_ci(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+    assert release_adopted_managed_ci(runner, config=config, pr_number=7, contract=contract)
+    assert not any(
+        cmd[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for cmd, _ in runner.commands
+    )
+
+
+def test_existing_pr_adoption_applies_and_releases_invocation_label(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=adoption_workflow(),
+        rest_pr={"draft": False, "state": "open", "labels": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.invocation_applied_label is True
+    assert contract.active_label_event_id == 101
+    assert any(
+        cmd[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]
+        for cmd, _ in runner.commands
+    )
+    assert release_adopted_managed_ci(runner, config=config, pr_number=7, contract=contract)
+    assert any(
+        cmd[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for cmd, _ in runner.commands
+    )
+
+
+def test_existing_pr_adoption_removes_unprovable_invocation_label(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=adoption_workflow(),
+        rest_pr={"draft": False, "state": "open", "labels": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        unreadable_issue_events_after_label=True,
+    )
+
+    assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
+    assert any(
+        cmd[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]
+        for cmd, _ in runner.commands
+    )
+    assert any(
+        cmd[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for cmd, _ in runner.commands
+    )
+
+
+@pytest.mark.parametrize(
+    "labels,events,protection",
+    [
+        ([{"name": MANAGED_OPT_OUT_LABEL}], [], {"contexts": [FINAL_CONTEXT]}),
+        ([{"name": MANAGED_LABEL}], [label_event(login="collaborator", actor_id=2)], {"contexts": [FINAL_CONTEXT]}),
+        ([], [], {"contexts": []}),
+    ],
+)
+def test_existing_pr_adoption_fails_closed_before_suppression(tmp_path, labels, events, protection):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=adoption_workflow(), rest_pr={"draft": False, "labels": labels},
+        issue_events=events, pr_branch_protection_payload=protection,
+    )
+
+    assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
+    assert not any(
+        cmd[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]
+        for cmd, _ in runner.commands
+    )
 
 
 @pytest.mark.parametrize(

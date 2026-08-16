@@ -1266,6 +1266,18 @@ def test_config_enables_ci_watch_with_auto_merge_without_rebuilding_antigravity_
     assert config.antigravity_models == ("Gemini 3.1 Pro (High)",)
 
 
+def test_config_records_explicit_existing_pr_managed_ci_adoption(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr", "77", "--repo", "OWNER/REPO", "--auto-merge",
+        "--managed-ci-trusted-actor", "agent-loop", "--managed-ci-adopt-existing-pr",
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.managed_ci_adopt_existing_pr is True
+
+
 def test_config_does_not_enable_ci_watch_without_auto_merge(tmp_path):
     parser = build_parser()
     args = parser.parse_args(["pr", "77", "--repo", "OWNER/REPO"])
