@@ -358,7 +358,7 @@ def test_validate_coder_followup_response_requires_regular_synthetic_human_requi
             human_requirements=(),
         )
 
-def test_apply_unresolved_item_dispositions_appends_disposition_notes_to_text():
+def test_apply_unresolved_item_dispositions_preserves_claim_and_appends_notes():
     unresolved_items = (
         UnresolvedReviewItem(
             item_id="item-1",
@@ -383,10 +383,7 @@ def test_apply_unresolved_item_dispositions_appends_disposition_notes_to_text():
 
     assert len(updated_items) == 1
     assert future_items == []
-    assert updated_items[0].text == (
-        "Needs regression coverage before merge.\n\n"
-        "Update from Anthropic Claude: include API error path too"
-    )
+    assert updated_items[0].text == "Needs regression coverage before merge."
     assert updated_items[0].notes == ("Anthropic Claude: include API error path too",)
 
 @pytest.mark.parametrize(

@@ -733,14 +733,15 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
         "Prior unresolved review items from earlier rounds",
         "",
         "Explicitly evaluate every item below before approving. Use the item IDs exactly as written.",
-        "For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge.",
+        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge.",
         "",
     ]
     for item in unresolved_items:
-        details = [indent(item.text, "  ")]
-        if item.notes:
-            details.append("  Latest reviewer updates:")
-            details.extend(f"  - {note}" for note in item.notes)
+        claim, updates = _render_unresolved_item_claim_and_updates(item)
+        details = ["  Original claim:", indent(claim, "    ")]
+        if updates:
+            details.append("  Updates/evidence:")
+            details.extend(f"  - {note}" for note in updates)
         lines.extend(
             [
                 f"- [{item.item_id}] {item.status} from {item.reviewer} in round {item.source_round}",
@@ -758,14 +759,15 @@ def _format_unresolved_plan_items(unresolved_items: Sequence[UnresolvedReviewIte
         "Prior unresolved plan items from earlier rounds",
         "",
         "Explicitly evaluate every item below before approving. Use the item IDs exactly as written.",
-        "For carried future follow-ups, record their status only in `prior_plan_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later plan changes already handled it, or promote it to `same-plan`/`still blocking` if it must be fixed before implementation.",
+        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_plan_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later plan changes already handled it, or promote it to `same-plan`/`still blocking` if it must be fixed before implementation.",
         "",
     ]
     for item in unresolved_items:
-        details = [indent(item.text, "  ")]
-        if item.notes:
-            details.append("  Latest reviewer updates:")
-            details.extend(f"  - {note}" for note in item.notes)
+        claim, updates = _render_unresolved_item_claim_and_updates(item)
+        details = ["  Original claim:", indent(claim, "    ")]
+        if updates:
+            details.append("  Updates/evidence:")
+            details.extend(f"  - {note}" for note in updates)
         lines.extend(
             [
                 f"- [{item.item_id}] {item.status} from {item.reviewer} in round {item.source_round}",
@@ -774,6 +776,34 @@ def _format_unresolved_plan_items(unresolved_items: Sequence[UnresolvedReviewIte
         )
     lines.append("")
     return "\n".join(lines)
+
+
+_LEGACY_ITEM_UPDATE_SUFFIX_RE = re.compile(
+    r"(?s)(?P<claim>.*?)(?:\n{2,}Update from (?P<updates>[^\n]+(?:\n{2,}Update from [^\n]+)*))$"
+)
+
+
+def _render_unresolved_item_claim_and_updates(item: UnresolvedReviewItem) -> tuple[str, tuple[str, ...]]:
+    """Split legacy text updates only while rendering reviewer context.
+
+    Earlier ledgers appended ``Update from ...`` lines to text.  Preserve that
+    serialized form for resume signatures, but expose the pre-update claim as
+    the canonical predicate to new reviewers.
+    """
+    match = _LEGACY_ITEM_UPDATE_SUFFIX_RE.fullmatch(item.text)
+    claim = item.text
+    legacy_updates: tuple[str, ...] = ()
+    if match is not None:
+        claim = match.group("claim")
+        legacy_updates = tuple(
+            f"Update from {entry}"
+            for entry in match.group("updates").split("\n\nUpdate from ")
+        )
+    updates: list[str] = []
+    for update in (*legacy_updates, *item.notes):
+        if update not in updates:
+            updates.append(update)
+    return claim, tuple(updates)
 
 
 def format_pr_checks(checks: PullRequestChecks) -> str:
@@ -940,6 +970,14 @@ eligible for dispositions in this round. If same-round findings from other
 reviewers appear elsewhere in the issue discussion, treat them as
 informational only and do not disposition them until a later round carries
 them forward explicitly.
+When prior items are present, evaluate each displayed Original claim rather
+than replacing its meaning. Narrower evidence for the same defect may remain
+on that ID. If you accept the original predicate but discover a materially
+different defect, resolve the old item and report the new defect in a separate
+`blocking_plan_issues` or `same_plan_followups` entry in the same response.
+Those arrays contain new findings only; an active carried item is represented
+solely by its `blocking` or `same-plan` disposition and note. Use `same-plan`,
+never `same-pr`, for plan-only work.
 Structured responses must start with one top-level JSON object, place the
 `AGENT_PLAN_STATE` footer immediately after that payload, and end with only
 your standalone signature. Do not include prose or code fences before the JSON
@@ -1259,21 +1297,7 @@ def build_plan_review_prompt(
         requirement_label="signed human issue requirements",
         require_plan_dispositions=True,
     )
-    if unresolved_items:
-        unresolved_items_guidance = """Prior unresolved plan items are present. Disposition every listed item
-in the JSON `prior_plan_item_dispositions` array — do not add a separate prose section
-or bullet list for prior items outside the JSON object. Valid `disposition` values:
-- `"resolved"` — item is fixed in this revision.
-- `"blocking"` — item is still a blocking plan problem; include it in `blocking_plan_issues`.
-- `"same-plan"` — item needs to be incorporated before implementation; include it in `same_plan_followups`.
-- `"future"` — deferred; must include a `"note"` field; only valid when approving.
-
-Only use `"future"` when returning `approved`. If a plan item still needs to be fixed
-before implementation starts, use `"blocking"` or `"same-plan"` instead. For any prior
-item already marked `"future"`, explicitly re-evaluate.
-"""
-    else:
-        unresolved_items_guidance = ""
+    unresolved_items_guidance = _build_unresolved_plan_items_guidance() if unresolved_items else ""
     return f"""Review the implementation plan for GitHub issue #{issue_number} in {config.repo} (planning round {round_number}).
 
 Use this local checkout only to inspect context. Do not edit files, create a
@@ -1380,21 +1404,7 @@ def _build_compact_plan_review_prompt(
         requirement_label="signed human issue requirements",
         require_plan_dispositions=True,
     )
-    if unresolved_items:
-        unresolved_items_guidance = """Prior unresolved plan items are present. Disposition every listed item
-in the JSON `prior_plan_item_dispositions` array — do not add a separate prose section
-or bullet list for prior items outside the JSON object. Valid `disposition` values:
-- `"resolved"` — item is fixed in this revision.
-- `"blocking"` — item is still a blocking plan problem; include it in `blocking_plan_issues`.
-- `"same-plan"` — item needs to be incorporated before implementation; include it in `same_plan_followups`.
-- `"future"` — deferred; must include a `"note"` field; only valid when approving.
-
-Only use `"future"` when returning `approved`. If a plan item still needs to be fixed
-before implementation starts, use `"blocking"` or `"same-plan"` instead. For any prior
-item already marked `"future"`, explicitly re-evaluate.
-"""
-    else:
-        unresolved_items_guidance = ""
+    unresolved_items_guidance = _build_unresolved_plan_items_guidance() if unresolved_items else ""
     stable_prefix = _compact_plan_stable_prefix(
         config=config,
         workdir_guidance=_coder_workdir_guidance(config, implementation=False, agent=reviewer),
@@ -2160,14 +2170,45 @@ def _build_unresolved_items_guidance() -> str:
 item in the JSON `prior_item_dispositions` array — do not add a separate prose section
 or bullet list for prior items outside the JSON object. Valid `disposition` values:
 - `"resolved"` — item is fixed in this PR.
-- `"blocking"` — item is still a merge-blocking problem; include it in `blocking_items`.
-- `"same-pr"` — item needs to be fixed before merge; include it in `same_pr_followups`.
+- `"blocking"` — the displayed Original claim is still a merge-blocking problem.
+- `"same-pr"` — the displayed Original claim needs to be fixed before merge.
 - `"future"` — deferred; must include a `"note"` field; only valid when approving.
 
 Only use `"future"` when returning `approved`. If an item should still be fixed before
 merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
 `"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
 `"blocking"`/`"same-pr"`.
+
+The displayed Original claim is this stable item ID's predicate. Narrower evidence
+for that same defect may remain on the old ID. If you accept the original predicate
+but discover a materially different defect, mark the old item `"resolved"` and put
+the new defect in a separate `blocking_items` or `same_pr_followups` entry in this
+same response. The new-finding arrays contain new findings only: never restate an
+active carried item there. A resolved carried item and a new blocker may appear in
+the same response.
+"""
+
+
+def _build_unresolved_plan_items_guidance() -> str:
+    return """Prior unresolved plan items are present. Disposition every listed item
+in the JSON `prior_plan_item_dispositions` array — do not add a separate prose section
+or bullet list for prior items outside the JSON object. Valid `disposition` values:
+- `"resolved"` — the displayed Original claim is fixed in this revision.
+- `"blocking"` — the displayed Original claim is still a blocking plan problem.
+- `"same-plan"` — the displayed Original claim needs to be incorporated before implementation.
+- `"future"` — deferred; must include a `"note"` field; only valid when approving.
+
+Only use `"future"` when returning `approved`. If a plan item still needs to be fixed
+before implementation starts, use `"blocking"` or `"same-plan"` instead. For any prior
+item already marked `"future"`, explicitly re-evaluate.
+
+The displayed Original claim is this stable item ID's predicate. Narrower evidence
+for that same defect may remain on the old ID. If you accept the original predicate
+but discover a materially different defect, mark the old item `"resolved"` and put
+the new defect in a separate `blocking_plan_issues` or `same_plan_followups` entry
+in the same response. The new-finding arrays contain new findings only: never
+restate an active carried item there. A resolved carried item and a new blocker may
+appear in the same response. Use `same-plan`, never `same-pr`, for plan-only work.
 """
 
 

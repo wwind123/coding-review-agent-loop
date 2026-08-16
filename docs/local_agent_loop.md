@@ -1859,6 +1859,36 @@ The remaining legacy compatibility surface is intentionally narrow:
 - Resume reconstruction should rely on `AGENT_LOOP_META` instead of reparsing
   old prose whenever metadata exists for the active round.
 
+### Carried item identity
+
+Every unresolved item has an immutable canonical claim (`text`) and accumulated
+reviewer/coder evidence (`notes`). Review prompts show these separately as
+**Original claim** and **Updates/evidence**. Legacy records that appended
+`Update from ...` lines to the claim are split only when displayed; the stored
+record and resume signatures remain unchanged.
+
+When reviewing a carried item, reviewers must evaluate its original predicate.
+More specific evidence for the same defect may keep the same ID. If the old
+predicate is accepted but a materially different defect is found, resolve the
+old item and add the different concern as a new `blocking_items` or
+`same_pr_followups` entry (or `blocking_plan_issues` / `same_plan_followups`
+for a plan review) in the same response. Those arrays contain new findings
+only; an active carried claim appears only as a `blocking`, `same-pr`, or
+`same-plan` disposition plus its note. Each explicit new finding receives a
+fresh stable ID.
+
+Reconciliation remains conservative for a genuine same-claim disagreement: a
+valid active disposition still outweighs another reviewer's `resolved` vote.
+An active carried disposition is actionable even without a new-finding array,
+so it is neither classified as an incomplete review nor converted from summary
+prose into a duplicate new item. Summary fallback remains available only when
+there is no explicit new finding and no active carried disposition.
+
+Fresh findings do not inherit coder-dispute lineage because semantic
+equivalence cannot be inferred safely. If a disputed claim is improperly
+re-filed as a fresh item, the coder gets one additional dispute on that new ID
+before the existing continued-blocking escalation applies.
+
 ## Logs
 
 Agent stdout/stderr is written to `.agent-loop-logs/` under the active coder

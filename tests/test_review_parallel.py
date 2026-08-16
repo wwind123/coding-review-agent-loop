@@ -178,6 +178,79 @@ def test_pr_loop_parallel_matches_sequential_comments(tmp_path):
     assert "reconciliation" in parallel_runner.comments[-1]
 
 
+def test_pr_parallel_resolves_disputed_scope_claim_and_tracks_translation_defect_as_fresh_item(tmp_path):
+    """PR #802 shape: accept the old premise, then file the distinct defect anew."""
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Scope completeness is not established.",
+                blocking_items=["Only 3 of 14 locale catalogs appear to be evaluated."],
+            ),
+            structured_pr_review(
+                summary="The scope-completeness evidence is sufficient.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+            structured_pr_review(
+                summary="Codex approves the translation correction.",
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[
+            structured_pr_review(summary="Gemini approves the initial diff.", reviewer="Google Gemini"),
+            structured_pr_review(
+                state="blocking",
+                summary="The scope premise is accepted, but a retained translation is wrong.",
+                blocking_items=["The retained German translation reverses the confirmation action."],
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                reviewer="Google Gemini",
+            ),
+            structured_pr_review(
+                summary="Gemini approves the translation correction.",
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+                reviewer="Google Gemini",
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                summary="All 14 locales and 49 keys were evaluated.",
+                disputed_items=["item-1"],
+                dispute_evidence={"item-1": "The approved no-churn audit covers every locale/key pair."},
+            ),
+            structured_coder_followup(
+                summary="Corrected the retained German translation.",
+                addressed_items=["item-2"],
+            ),
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True, max_rounds=3)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    reviewer_metadata = [
+        orchestrator._decode_round_metadata(match["payload"])
+        for comment in runner.pr_payload["comments"]
+        if (match := orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"]))
+    ]
+    gemini_round_two = next(
+        record for record in reviewer_metadata
+        if record.agent == "Gemini" and record.round_number == 2
+    )
+    # Parallel reviewer comments are published before deterministic allocation;
+    # reconciliation metadata is the authoritative fresh/resume ledger.
+    reconciliation = next(
+        record for record in reviewer_metadata
+        if record.role == "summary" and record.round_number == 2
+    )
+    assert gemini_round_two.dispositions[0].disposition == "resolved"
+    assert [item.item_id for item in reconciliation.new_items] == ["item-2"]
+    assert reconciliation.new_items[0].text == (
+        "The retained German translation reverses the confirmation action."
+    )
+    assert all(
+        item.item_id != "item-1" for item in reconciliation.new_items
+    )
+
+
 class _EarlyPublicationBarrierRunner(FakeRunner):
     """Makes Gemini slow enough to observe completion-order publication."""
 
