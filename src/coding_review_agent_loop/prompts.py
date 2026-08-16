@@ -779,7 +779,7 @@ def _format_unresolved_plan_items(unresolved_items: Sequence[UnresolvedReviewIte
 
 
 _LEGACY_ITEM_UPDATE_SUFFIX_RE = re.compile(
-    r"(?s)(?P<claim>.*?)(?:\n{2,}Update from (?P<updates>[^\n]+(?:\n{2,}Update from [^\n]+)*))$"
+    r"(?s)(?P<claim>.*?)(?:\n{2,}Update from (?P<updates>.*))$"
 )
 
 
@@ -801,7 +801,8 @@ def _render_unresolved_item_claim_and_updates(item: UnresolvedReviewItem) -> tup
         )
     updates: list[str] = []
     for update in (*legacy_updates, *item.notes):
-        if update not in updates:
+        normalized_update = update.removeprefix("Update from ")
+        if not any(existing.removeprefix("Update from ") == normalized_update for existing in updates):
             updates.append(update)
     return claim, tuple(updates)
 

@@ -618,6 +618,66 @@ def test_is_incomplete_plan_review_matches_disposition_note():
     )
     assert orchestrator_module._is_incomplete_plan_review(parsed_review) is True
 
+
+def test_is_incomplete_plan_review_allows_active_carried_disposition():
+    parsed_review = ParsedPlanReview(
+        state="blocking",
+        summary="",
+        items=PlanReviewItems(blocking=(), same_plan=(), future=()),
+        dispositions=(
+            ReviewItemDisposition(
+                item_id="item-1",
+                reviewer="Codex",
+                disposition="blocking",
+                note="Could not confirm the revised plan covers migration ordering.",
+            ),
+        ),
+    )
+
+    assert orchestrator_module._is_incomplete_plan_review(parsed_review) is False
+
+
+def test_issue_loop_plan_review_allows_active_carried_blocking_disposition(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_plan_state(summary="Initial plan.", plan_steps=["Document migration ordering."]),
+            structured_plan_revision(
+                summary="Added migration ordering.",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                plan_steps=["Document migration ordering."],
+            ),
+            structured_plan_revision(
+                summary="Clarified migration ordering.",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                plan_steps=["Document migration ordering."],
+            ),
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                blocking_plan_issues=["Document migration ordering."],
+            ),
+            structured_plan_review(
+                state="blocking",
+                summary="Could not confirm the revised plan covers migration ordering.",
+                prior_plan_item_dispositions=[{
+                    "item_id": "item-1",
+                    "disposition": "blocking",
+                    "note": "Could not confirm the revised plan covers migration ordering.",
+                }],
+            ),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert any("Could not confirm the revised plan" in comment for comment in runner.comments)
+
+
 def test_issue_loop_structured_plan_state_public_comment_renders_markdown_and_preserves_metadata(tmp_path):
     raw_structured_plan = structured_plan_state(
         summary="Plan the issue fix.",

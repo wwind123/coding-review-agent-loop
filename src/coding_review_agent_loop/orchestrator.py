@@ -3397,6 +3397,8 @@ def _is_incomplete_plan_review(parsed_review: ParsedPlanReview) -> bool:
         return False
     if parsed_review.items.blocking or parsed_review.items.same_plan:
         return False
+    if any(disposition.disposition in {"blocking", "same-plan"} for disposition in parsed_review.dispositions):
+        return False
     candidate_texts = [parsed_review.summary]
     candidate_texts.extend(disposition.note for disposition in parsed_review.dispositions)
     return any(text and _INCOMPLETE_PR_REVIEW_RE.search(text) for text in candidate_texts)
@@ -6582,7 +6584,12 @@ def run_pr_loop(
                 ]
                 if disputed_still_blocking:
                     item_summaries = "\n".join(
-                        f"- [{item.item_id}] from {item.reviewer}: {item.text[:300]}"
+                        "\n".join(
+                            [
+                                f"- [{item.item_id}] from {item.reviewer}: {item.text[:300]}",
+                                *[f"  Update/evidence: {note}" for note in item.notes],
+                            ]
+                        )
                         for item in disputed_still_blocking
                     )
                     raise AgentLoopError(

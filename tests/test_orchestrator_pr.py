@@ -5564,8 +5564,10 @@ def test_pr_loop_escalates_to_human_when_reviewer_rejects_dispute(tmp_path):
     with pytest.raises(
         AgentLoopError,
         match="Reviewer did not resolve 1 disputed item",
-    ):
+    ) as excinfo:
         run_pr_loop(runner, pr_number=55, config=config)
+
+    assert "Update/evidence: Codex: I checked and the pricing is still wrong." in str(excinfo.value)
 
 
 def test_pr_loop_escalates_when_reviewer_downgrades_disputed_item_to_same_pr(tmp_path):

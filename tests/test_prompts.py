@@ -418,6 +418,30 @@ def test_review_prompt_splits_legacy_updates_without_mutating_claim_and_preserve
     assert "accept the original predicate\nbut discover a materially different defect" in prompt
 
 
+def test_review_prompt_splits_multiline_legacy_updates_and_deduplicates_notes(tmp_path):
+    config = make_config(tmp_path, approved_followups="fix-and-summarize")
+    prompt = build_review_prompt(
+        77, 2, config, reviewer="codex",
+        unresolved_items=(UnresolvedReviewItem(
+            item_id="item-1", reviewer="Anthropic Claude", source_round=1,
+            text=(
+                "Scope completeness requires every locale.\n\n"
+                "Update from Anthropic Claude: Scope evidence was rechecked.\n"
+                "The audit covered the remaining catalogs."
+            ),
+            status="blocking",
+            notes=(
+                "Anthropic Claude: Scope evidence was rechecked.\n"
+                "The audit covered the remaining catalogs.",
+            ),
+        ),),
+    )
+
+    assert "Original claim:\n    Scope completeness requires every locale." in prompt
+    assert prompt.count("Scope evidence was rechecked.") == 1
+    assert "The audit covered the remaining catalogs." in prompt
+
+
 def test_plan_review_prompts_require_new_findings_for_changed_carried_claims(tmp_path):
     config = make_config(tmp_path, reviewer=("codex",))
     item = UnresolvedReviewItem(
