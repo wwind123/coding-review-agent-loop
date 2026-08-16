@@ -12,14 +12,22 @@ _EXPECTED_UNRESOLVED_ITEMS_GUIDANCE = """Prior unresolved items are present. Dis
 item in the JSON `prior_item_dispositions` array — do not add a separate prose section
 or bullet list for prior items outside the JSON object. Valid `disposition` values:
 - `"resolved"` — item is fixed in this PR.
-- `"blocking"` — item is still a merge-blocking problem; include it in `blocking_items`.
-- `"same-pr"` — item needs to be fixed before merge; include it in `same_pr_followups`.
+- `"blocking"` — the displayed Original claim is still a merge-blocking problem.
+- `"same-pr"` — the displayed Original claim needs to be fixed before merge.
 - `"future"` — deferred; must include a `"note"` field; only valid when approving.
 
 Only use `"future"` when returning `approved`. If an item should still be fixed before
 merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
 `"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
 `"blocking"`/`"same-pr"`.
+
+The displayed Original claim is this stable item ID's predicate. Narrower evidence
+for that same defect may remain on the old ID. If you accept the original predicate
+but discover a materially different defect, mark the old item `"resolved"` and put
+the new defect in a separate `blocking_items` or `same_pr_followups` entry in this
+same response. The new-finding arrays contain new findings only: never restate an
+active carried item there. A resolved carried item and a new blocker may appear in
+the same response.
 """
 
 _EXPECTED_FOLLOWUP_IGNORE = """Do not include Same-PR follow-ups, Future follow-ups, or legacy
@@ -373,6 +381,8 @@ def test_review_prompt_includes_prior_unresolved_items_and_disposition_instructi
     assert "Prior unresolved review items from earlier rounds" in prompt
     assert "[item-1] blocking from Anthropic Claude in round 1" in prompt
     assert "[item-2] same-pr from OpenAI Codex in round 1" in prompt
+    assert "Original claim:" in prompt
+    assert "Updates/evidence:" not in prompt
     assert "### Prior unresolved item dispositions" not in prompt
     assert 'Disposition every listed\nitem in the JSON `prior_item_dispositions` array' in prompt
     assert '"resolved"' in prompt
@@ -388,6 +398,64 @@ def test_review_prompt_includes_prior_unresolved_items_and_disposition_instructi
     assert "After the JSON object, include only:" in prompt
     assert "Use this mandatory structured PR review format" in prompt
     assert "Markdown fallback" not in prompt
+
+
+def test_review_prompt_splits_legacy_updates_without_mutating_claim_and_preserves_notes(tmp_path):
+    config = make_config(tmp_path, approved_followups="fix-and-summarize")
+    prompt = build_review_prompt(
+        77, 2, config, reviewer="codex",
+        unresolved_items=(UnresolvedReviewItem(
+            item_id="item-1", reviewer="Anthropic Claude", source_round=1,
+            text="Scope completeness requires every locale.\n\nUpdate from Anthropic Claude: Scope evidence was rechecked.",
+            status="blocking", notes=("Coder disputes this item: all locales were evaluated.",),
+        ),),
+    )
+
+    assert "Original claim:\n    Scope completeness requires every locale." in prompt
+    assert "Updates/evidence:" in prompt
+    assert "Update from Anthropic Claude: Scope evidence was rechecked." in prompt
+    assert "Coder disputes this item: all locales were evaluated." in prompt
+    assert "accept the original predicate\nbut discover a materially different defect" in prompt
+
+
+def test_review_prompt_splits_multiline_legacy_updates_and_deduplicates_notes(tmp_path):
+    config = make_config(tmp_path, approved_followups="fix-and-summarize")
+    prompt = build_review_prompt(
+        77, 2, config, reviewer="codex",
+        unresolved_items=(UnresolvedReviewItem(
+            item_id="item-1", reviewer="Anthropic Claude", source_round=1,
+            text=(
+                "Scope completeness requires every locale.\n\n"
+                "Update from Anthropic Claude: Scope evidence was rechecked.\n"
+                "The audit covered the remaining catalogs."
+            ),
+            status="blocking",
+            notes=(
+                "Anthropic Claude: Scope evidence was rechecked.\n"
+                "The audit covered the remaining catalogs.",
+            ),
+        ),),
+    )
+
+    assert "Original claim:\n    Scope completeness requires every locale." in prompt
+    assert prompt.count("Scope evidence was rechecked.") == 1
+    assert "The audit covered the remaining catalogs." in prompt
+
+
+def test_plan_review_prompts_require_new_findings_for_changed_carried_claims(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex",))
+    item = UnresolvedReviewItem(
+        item_id="item-1", reviewer="Anthropic Claude", source_round=1,
+        text="The plan must cover all locales.", status="blocking",
+    )
+    for compact in (False, True):
+        prompt = build_plan_review_prompt(
+            56, 2, "1. Update locales.", config, reviewer="codex",
+            unresolved_items=(item,), compact_context=compact,
+        )
+        assert "Original claim:" in prompt
+        assert "new-finding arrays contain new findings only" in prompt
+        assert "Use `same-plan`, never `same-pr`" in prompt
 
 def test_compact_review_prompt_excludes_prose_disposition_heading(tmp_path):
     config = make_config(tmp_path, approved_followups="fix-and-summarize")
@@ -419,6 +487,8 @@ def test_compact_review_prompt_excludes_prose_disposition_heading(tmp_path):
     assert "### Prior unresolved item dispositions" not in prompt
     assert 'Disposition every listed\nitem in the JSON `prior_item_dispositions` array' in prompt
     assert "do not add a separate prose section" in prompt
+    assert "Original claim:" in prompt
+    assert "materially different defect" in prompt
 
 def test_review_prompt_indents_multiline_prior_unresolved_item_text(tmp_path):
     config = make_config(tmp_path, approved_followups="fix-and-summarize")
@@ -448,7 +518,7 @@ def test_review_prompt_indents_multiline_prior_unresolved_item_text(tmp_path):
     )
 
     assert "  Needs a regression test before merge." in prompt
-    assert "\n\n  Include the mixed-reviewer approval case." in prompt
+    assert "\n\n    Include the mixed-reviewer approval case." in prompt
 
 def test_plan_review_prompt_includes_structured_sections_and_prior_items(tmp_path):
     config = make_config(tmp_path, reviewer=("codex", "gemini"))

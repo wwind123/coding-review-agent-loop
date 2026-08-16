@@ -14,7 +14,9 @@ from coding_review_agent_loop.round_state import (
     _decode_round_metadata,
     _encode_round_metadata,
     _extract_round_metadata_records,
+    _prior_item_ledger_signature,
 )
+from coding_review_agent_loop.protocol import UnresolvedReviewItem
 
 
 def _random_text(size: int) -> str:
@@ -195,3 +197,29 @@ def test_round_metadata_decode_uses_mapping_without_reencoding() -> None:
     )
 
     assert _decode_round_metadata(_encode_round_metadata(metadata)) == metadata
+
+
+def test_round_metadata_preserves_mixed_legacy_claim_and_modern_evidence_exactly() -> None:
+    legacy_and_modern_item = UnresolvedReviewItem(
+        item_id="item-4",
+        reviewer="Anthropic Claude",
+        source_round=3,
+        text=(
+            "Only three of fourteen locales were updated.\n\n"
+            "Update from Anthropic Claude: Original scope evidence was rechecked."
+        ),
+        status="blocking",
+        source_status="blocking",
+        notes=("OpenAI Codex: all fourteen locales and 49 keys were evaluated.",),
+    )
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=4, subject="head",
+        prior_items=(legacy_and_modern_item,),
+    )
+
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+
+    assert decoded.prior_items == (legacy_and_modern_item,)
+    assert _prior_item_ledger_signature(decoded.prior_items) == _prior_item_ledger_signature(
+        (legacy_and_modern_item,)
+    )

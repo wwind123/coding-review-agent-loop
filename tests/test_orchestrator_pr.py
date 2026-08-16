@@ -3671,7 +3671,7 @@ def test_pr_loop_stops_on_incomplete_review_without_coder_followup(tmp_path):
             "Review incomplete; item-1 requires further inspection of the PR diff "
             "and referenced files before a disposition can be confirmed."
             + prior_item_dispositions(
-                "[item-1] still blocking: Resolution could not be confirmed; "
+                "[item-1] resolved: Resolution could not be confirmed; "
                 "PR diff and referenced files need review."
             )
             + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
@@ -3690,6 +3690,47 @@ def test_pr_loop_stops_on_incomplete_review_without_coder_followup(tmp_path):
     assert len(runner.comments) == 2
     assert "Review incomplete" not in "\n".join(runner.comments)
 
+
+def test_pr_loop_keeps_active_carried_disposition_actionable_without_duplicate_summary_item(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Initial scope concern.",
+                blocking_items=["All 14 locale catalogs must be evaluated."],
+            ),
+            structured_pr_review(
+                state="blocking", summary="Unable to verify the translation detail today.",
+                prior_item_dispositions=[{
+                    "item_id": "item-1", "disposition": "blocking",
+                    "note": "The original scope-completeness claim remains unresolved.",
+                }],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Evaluated every locale.",
+                addressed_items=["item-1"], remaining_items=[],
+            ),
+            structured_coder_followup(
+                state="blocking", summary="Need more evidence for the carried claim.",
+                addressed_items=[], remaining_items=["item-1"],
+            ),
+        ],
+    )
+    config = make_config(tmp_path, max_rounds=2)
+
+    with pytest.raises(AgentLoopError, match="still reported blocking issues after round 2"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    reviewer_records = [
+        _decode_round_metadata(orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"])
+        for comment in runner.pr_payload["comments"]
+        if orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+    ]
+    round_two = next(record for record in reviewer_records if record.agent == "Codex" and record.round_number == 2)
+    assert round_two.new_items == ()
+    assert round_two.dispositions[0].disposition == "blocking"
+    assert not any("agent-unavailable" in comment["body"] for comment in runner.pr_payload["comments"])
 
 def test_pr_loop_quarantines_unavailable_reviewer_while_healthy_reviewer_finishes(tmp_path):
     unavailable = json.dumps(
@@ -4405,7 +4446,7 @@ def test_resume_pr_round_recovers_reviewer_only_with_aggregated_dispositions():
     assert resumed.unrecorded_head_advance is True
     assert [item.item_id for item in resumed.prior_items] == ["item-2", "item-4"]
     assert resumed.prior_items[0].status == "same-pr"
-    assert "Still needed before merge." in resumed.prior_items[0].text
+    assert "Google Gemini: Still needed before merge." in resumed.prior_items[0].notes
 
 def test_resume_pr_round_ignores_unrecorded_head_advance_with_no_active_items():
     future_item = UnresolvedReviewItem(
@@ -5523,8 +5564,10 @@ def test_pr_loop_escalates_to_human_when_reviewer_rejects_dispute(tmp_path):
     with pytest.raises(
         AgentLoopError,
         match="Reviewer did not resolve 1 disputed item",
-    ):
+    ) as excinfo:
         run_pr_loop(runner, pr_number=55, config=config)
+
+    assert "Update/evidence: Codex: I checked and the pricing is still wrong." in str(excinfo.value)
 
 
 def test_pr_loop_escalates_when_reviewer_downgrades_disputed_item_to_same_pr(tmp_path):

@@ -3288,13 +3288,21 @@ def _is_infrastructure_ci_only_review(parsed_review: ParsedReview, pr_checks: Pu
     return True
 
 
-def _should_record_new_blocking_item(summary: str, *, had_prior_items: bool, had_dispositions: bool) -> bool:
+def _should_record_new_blocking_item(
+    summary: str,
+    *,
+    had_prior_items: bool,
+    had_dispositions: bool,
+    has_active_carried_disposition: bool = False,
+) -> bool:
     if not summary:
         return False
     if summary.strip() in {"Review complete.", "Plan review complete."}:
         return False
     if not had_prior_items or not had_dispositions:
         return True
+    if has_active_carried_disposition:
+        return False
     non_empty_lines = [line.strip() for line in summary.splitlines() if line.strip()]
     if len(non_empty_lines) > 1:
         return True
@@ -3321,6 +3329,8 @@ def _is_incomplete_pr_review(parsed_review: ParsedReview) -> bool:
     if parsed_review.state != "blocking":
         return False
     if parsed_review.blocking_items or parsed_review.followups.same_pr:
+        return False
+    if any(disposition.disposition in {"blocking", "same-pr"} for disposition in parsed_review.dispositions):
         return False
     candidate_texts = [parsed_review.summary]
     candidate_texts.extend(disposition.note for disposition in parsed_review.dispositions)
@@ -3386,6 +3396,8 @@ def _is_incomplete_plan_review(parsed_review: ParsedPlanReview) -> bool:
     if parsed_review.state != "blocking":
         return False
     if parsed_review.items.blocking or parsed_review.items.same_plan:
+        return False
+    if any(disposition.disposition in {"blocking", "same-plan"} for disposition in parsed_review.dispositions):
         return False
     candidate_texts = [parsed_review.summary]
     candidate_texts.extend(disposition.note for disposition in parsed_review.dispositions)
@@ -6387,10 +6399,15 @@ def run_pr_loop(
                 has_structured_blocking_content = bool(
                     parsed_review.blocking_items or parsed_review.followups.same_pr
                 )
+                has_active_carried_disposition = any(
+                    disposition.disposition in {"blocking", "same-pr"}
+                    for disposition in parsed_review.dispositions
+                )
                 has_blocking_summary = not has_structured_blocking_content and _should_record_new_blocking_item(
                     blocking_summary,
                     had_prior_items=bool(prior_unresolved_items),
                     had_dispositions=bool(parsed_review.dispositions),
+                    has_active_carried_disposition=has_active_carried_disposition,
                 )
                 log(
                     config,
@@ -6567,7 +6584,12 @@ def run_pr_loop(
                 ]
                 if disputed_still_blocking:
                     item_summaries = "\n".join(
-                        f"- [{item.item_id}] from {item.reviewer}: {item.text[:300]}"
+                        "\n".join(
+                            [
+                                f"- [{item.item_id}] from {item.reviewer}: {item.text[:300]}",
+                                *[f"  Update/evidence: {note}" for note in item.notes],
+                            ]
+                        )
                         for item in disputed_still_blocking
                     )
                     raise AgentLoopError(
