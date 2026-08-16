@@ -11,6 +11,10 @@ HEADING_TEXT = "Phased decomposition versus split materialization"
 CI_STALL_HEADING_TEXT = "External CI infrastructure stalls"
 MANAGED_CI_HEADING_TEXT = "Managed exact-head CI"
 LOCAL_TEST_SCOPE_HEADING_TEXT = "Focused, bounded local test selection"
+SKILL_LOCAL_TEST_SCOPE_HEADING_TEXT = "Gates & guardrails"
+SKILL_MODE_LOCAL_TEST_SCOPE_HEADING_TEXT = "Focused, bounded local test runs"
+SKILL = REPO_ROOT / "SKILL.md"
+SKILL_MODE_DOC = REPO_ROOT / "docs" / "skill_mode.md"
 
 
 def _github_anchor(heading_text: str) -> str:
@@ -123,7 +127,8 @@ def test_local_agent_loop_doc_has_focused_bounded_local_test_section():
 
     assert "External CI infrastructure" in section
     assert "distinct from" in section
-    assert "900 seconds" in section
+    assert "1,800 seconds" in section
+    assert section.count("1,800 seconds") == 1
     assert "must not launch pytest in the background" in section
     assert "poll process" in section
     assert "`ps`/`kill -0`/`wait`" in section
@@ -131,6 +136,34 @@ def test_local_agent_loop_doc_has_focused_bounded_local_test_section():
     assert "a human or the issue explicitly asked for full-suite" in section
     assert "no-PR `AGENT_STATE: blocking`" in section
     assert "agent_unavailable" in section
+    assert "three-snapshot" in section
+    assert "120-second GitHub CI observation limit" in section
+    assert "`--test-command` parsing and execution path" in section
+    assert "`--antigravity-print-timeout-seconds` above the 1,800-second command cap" in section
+    assert "default 600-second whole-invocation deadline cannot accommodate" in section
+    assert "additional budget for analysis, edits, reporting, and other turn work" in section
+    assert "other backend-imposed whole-turn deadline" in section
+
+
+def test_skill_docs_keep_focused_bounded_local_test_policy_aligned():
+    skill_text = SKILL.read_text(encoding="utf-8")
+    skill_section_start = skill_text.index(f"## {SKILL_LOCAL_TEST_SCOPE_HEADING_TEXT}")
+    skill_section_end = skill_text.index("\n---", skill_section_start)
+    skill_section = " ".join(skill_text[skill_section_start:skill_section_end].split())
+
+    skill_mode_text = SKILL_MODE_DOC.read_text(encoding="utf-8")
+    skill_mode_section_start = skill_mode_text.index(f"## {SKILL_MODE_LOCAL_TEST_SCOPE_HEADING_TEXT}")
+    skill_mode_section_end = skill_mode_text.index("## Session state", skill_mode_section_start)
+    skill_mode_section = " ".join(skill_mode_text[skill_mode_section_start:skill_mode_section_end].split())
+
+    for section in (skill_section, skill_mode_section):
+        assert section.count("1,800 seconds per required test command") == 1
+        assert "individually justified command" in section
+        assert "not a reason to choose a broad suite" in section
+        assert "foreground with visible output" in section
+        assert "background" in section
+        assert "`ps`/`kill -0`/`wait`" in section
+        assert "naming the exact command and the timeout" in section
 
 
 def test_cli_help_documents_ci_queued_grace_seconds():
