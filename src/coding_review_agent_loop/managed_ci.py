@@ -576,7 +576,8 @@ def _activate_v2_existing_pr_adoption(
     live_sha, head_ref = head.get("sha"), head.get("ref")
     if (
         pr.get("state") not in {None, "open"}
-        or head_repo.get("full_name", "").casefold() != config.repo.casefold()
+        or not isinstance(head_repo.get("full_name"), str)
+        or head_repo["full_name"].casefold() != config.repo.casefold()
         or not isinstance(head_ref, str) or not head_ref
         or not isinstance(live_sha, str) or live_sha != metadata.head_sha
         or base.get("ref") != base_ref
@@ -610,6 +611,7 @@ def _activate_v2_existing_pr_adoption(
         release_adopted_managed_ci(runner, config=config, pr_number=pr_number, contract=provisional)
         return None
     revision = _api_json(runner, config, f"repos/{config.repo}/commits/{base_ref}", quiet=True).get("sha")
+    log(config, f"PR #{pr_number}: activated authenticated managed exact-head CI v2 adoption")
     return ManagedCiContract(
         protocol_version=2, base_ref=base_ref, trusted_actor_login=actor_login,
         trusted_actor_id=actor_id, workflow_revision=revision if isinstance(revision, str) else None,
@@ -627,7 +629,10 @@ def revalidate_adopted_managed_ci(
         return True
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    labels = {item.get("name") for item in (pr.get("labels") or []) if isinstance(item, dict)}
+    labels = {
+        item.get("name") for item in (pr.get("labels") or [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
     live_sha = head.get("sha")
     if (
         not isinstance(live_sha, str) or live_sha != metadata.head_sha
@@ -653,12 +658,18 @@ def revalidate_adopted_managed_ci(
 def release_adopted_managed_ci(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, contract: ManagedCiContract
 ) -> bool:
-    """Remove only the still-current label event created by this invocation."""
+    """Remove an invocation-owned adoption label without removing a later label.
+
+    If post-apply provenance is unreadable, the label cannot safely remain as
+    our claimed suppression.  It is then removed unconditionally; when an
+    event ID was recorded, retain the normal fresh event-ID ownership check.
+    """
     if not contract.adopted_existing_pr or not contract.invocation_applied_label:
         return True
-    event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
-    if event is None or event[0] != contract.active_label_event_id:
-        return True
+    if contract.active_label_event_id is not None:
+        event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+        if event is None or event[0] != contract.active_label_event_id:
+            return True
     result = runner.run(
         [config.gh_cmd, "api", "--method", "DELETE", f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}"],
         cwd=active_workdir(config), check=False,

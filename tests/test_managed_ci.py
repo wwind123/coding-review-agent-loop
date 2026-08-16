@@ -129,6 +129,7 @@ class V2ManagedRunner(ManagedRunner):
         actor_id=1,
         advertised_actor=None,
         issue_events=None,
+        unreadable_issue_events_after_label=False,
         **kwargs,
     ):
         workflow = kwargs.pop("workflow", V2_WORKFLOW)
@@ -153,6 +154,8 @@ class V2ManagedRunner(ManagedRunner):
         self.actor_id = actor_id
         self.advertised_actor = advertised_actor or actor_login
         self.issue_events = list(issue_events or [])
+        self.unreadable_issue_events_after_label = unreadable_issue_events_after_label
+        self.labels_posted = False
 
     def _run_locked(self, args, *, cwd, check):
         cmd = list(args)
@@ -179,7 +182,20 @@ class V2ManagedRunner(ManagedRunner):
             return CommandResult(cmd, cwd_path, json.dumps(self.rest_pr), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/issues/7/events?"):
             cmd, cwd_path = self._record_command(args, cwd)
+            if self.unreadable_issue_events_after_label and self.labels_posted:
+                return CommandResult(cmd, cwd_path, "", "events unavailable", 1)
             return CommandResult(cmd, cwd_path, json.dumps(self.issue_events), "", 0)
+        if endpoint == "repos/OWNER/REPO/issues/7/labels" and "POST" in cmd:
+            cmd, cwd_path = self._record_command(args, cwd)
+            self.labels_posted = True
+            self.rest_pr["labels"] = [{"name": MANAGED_LABEL}]
+            self.issue_events.append(label_event())
+            return CommandResult(cmd, cwd_path, "{}", "", 0)
+        if endpoint == f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}" and "DELETE" in cmd:
+            cmd, cwd_path = self._record_command(args, cwd)
+            self.rest_pr["labels"] = []
+            self.issue_events.append(label_event(event="unlabeled"))
+            return CommandResult(cmd, cwd_path, "", "", 0)
         if endpoint == "repos/OWNER/REPO/commits/main":
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, json.dumps({"sha": "base-sha"}), "", 0)
@@ -730,6 +746,25 @@ def test_existing_pr_adoption_requires_separate_marker_but_keeps_draft_v2(tmp_pa
     assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
 
 
+def test_existing_pr_adoption_rejects_null_head_repository_name(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=adoption_workflow(),
+        rest_pr={
+            "draft": False,
+            "state": "open",
+            "head": {"repo": {"full_name": None}, "sha": "abc123", "ref": "feature"},
+            "labels": [],
+        },
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
+
+
 def test_existing_pr_adoption_reuses_trusted_label_and_revalidates(tmp_path):
     config = make_config(
         tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
@@ -756,8 +791,65 @@ def test_existing_pr_adoption_reuses_trusted_label_and_revalidates(tmp_path):
     assert revalidate_adopted_managed_ci(
         runner, config=config, pr_number=7, metadata=metadata(), contract=contract
     )
+    runner.rest_pr["labels"].append({"name": []})
+    assert revalidate_adopted_managed_ci(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
     assert release_adopted_managed_ci(runner, config=config, pr_number=7, contract=contract)
-    assert not any("DELETE" in cmd and MANAGED_LABEL in cmd for cmd, _ in runner.commands)
+    assert not any(
+        cmd[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for cmd, _ in runner.commands
+    )
+
+
+def test_existing_pr_adoption_applies_and_releases_invocation_label(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=adoption_workflow(),
+        rest_pr={"draft": False, "state": "open", "labels": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.invocation_applied_label is True
+    assert contract.active_label_event_id == 101
+    assert any(
+        cmd[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]
+        for cmd, _ in runner.commands
+    )
+    assert release_adopted_managed_ci(runner, config=config, pr_number=7, contract=contract)
+    assert any(
+        cmd[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for cmd, _ in runner.commands
+    )
+
+
+def test_existing_pr_adoption_removes_unprovable_invocation_label(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=adoption_workflow(),
+        rest_pr={"draft": False, "state": "open", "labels": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        unreadable_issue_events_after_label=True,
+    )
+
+    assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
+    assert any(
+        cmd[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]
+        for cmd, _ in runner.commands
+    )
+    assert any(
+        cmd[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for cmd, _ in runner.commands
+    )
 
 
 @pytest.mark.parametrize(
@@ -779,7 +871,10 @@ def test_existing_pr_adoption_fails_closed_before_suppression(tmp_path, labels, 
     )
 
     assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
-    assert not any("issues/7/labels" in cmd and "POST" in cmd for cmd, _ in runner.commands)
+    assert not any(
+        cmd[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]
+        for cmd, _ in runner.commands
+    )
 
 
 @pytest.mark.parametrize(

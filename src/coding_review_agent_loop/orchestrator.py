@@ -6806,7 +6806,7 @@ def run_pr_loop(
                         "Actions runners recover."
                     )
                     return 0
-                if not must_fix_items and config.watch_pending_ci and managed_ci is None:
+                if not must_fix_items and config.watch_pending_ci and not managed_ci_active(pr_metadata):
                     if watch_deadline is None:
                         watch_deadline = time.monotonic() + config.ci_timeout_seconds
                         watch_attempts_remaining = max(
