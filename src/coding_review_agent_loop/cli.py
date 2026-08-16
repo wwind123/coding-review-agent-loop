@@ -558,6 +558,14 @@ def build_parser() -> argparse.ArgumentParser:
     pr = subparsers.add_parser("pr", help="Run the reviewer/coder loop on an existing PR.")
     pr.add_argument("pr_number", type=int)
     add_common(pr)
+    pr.add_argument(
+        "--managed-ci-adopt-existing-pr",
+        action="store_true",
+        help=(
+            "Explicitly adopt an eligible already-open PR into the separately advertised "
+            "v2 managed-CI protocol. Requires --auto-merge and --managed-ci-trusted-actor."
+        ),
+    )
     add_review_parallel(pr)
 
     task = subparsers.add_parser(
@@ -716,6 +724,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if args.command != "issue" and implementation_override_requested:
             raise AgentLoopError("--implementation-coder options are only supported with issue --plan-first.")
+        if getattr(args, "managed_ci_adopt_existing_pr", False):
+            if args.command != "pr":
+                raise AgentLoopError("--managed-ci-adopt-existing-pr is only supported with `agent-loop pr <n>`.")
+            if not args.auto_merge:
+                raise AgentLoopError("--managed-ci-adopt-existing-pr requires --auto-merge.")
+            if not (args.managed_ci_trusted_actor or "").strip():
+                raise AgentLoopError(
+                    "--managed-ci-adopt-existing-pr requires --managed-ci-trusted-actor."
+                )
         if args.command == "issue":
             if args.implement_after_approval and not args.plan_first:
                 raise AgentLoopError("--implement-after-approval requires --plan-first.")

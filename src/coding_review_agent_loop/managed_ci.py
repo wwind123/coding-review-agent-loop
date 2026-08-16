@@ -30,6 +30,7 @@ from .workdirs import active_workdir
 
 
 MANAGED_LABEL = "agent-loop-managed"
+MANAGED_OPT_OUT_LABEL = "agent-loop-managed-opt-out"
 QUALIFIED_LABEL = "agent-loop-exact-head-qualified"
 FINAL_CONTEXT = "final-ci/exact-head"
 READINESS_CONTEXT = "agent-loop/round-readiness"
@@ -38,6 +39,11 @@ _CONTRACT_MARKERS = (MANAGED_LABEL, FINAL_CONTEXT, "expected_head_sha")
 V2_MARKER = "AGENT_LOOP_MANAGED_CI_V2"
 INTENT_MARKER = "AGENT_MANAGED_CI_INTENT_V2"
 V2_FEATURE_MARKERS = (V2_MARKER, "workflow_dispatch", "managed_nonce", FINAL_CONTEXT)
+# Adoption is deliberately not a v2 feature marker: repositories which have
+# deployed the safe issue-created draft flow do not implicitly opt in to
+# suppressing CI for existing PRs.
+V2_ADOPTION_MARKER = "AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION"
+V2_ADOPTION_FEATURE_MARKERS = (V2_ADOPTION_MARKER,)
 
 
 @dataclass
@@ -56,6 +62,10 @@ class ManagedCiContract:
     expected_head_sha: str | None = None
     repository: str | None = None
     created_at: int | None = None
+    adopted_existing_pr: bool = False
+    guard_head_sha: str | None = None
+    active_label_event_id: int | None = None
+    invocation_applied_label: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,11 +109,15 @@ def activate_managed_ci(
     if not config.auto_merge or config.dry_run:
         return None
 
+    workflow_ref = metadata.base_branch or config.base
+    workflow_endpoint = f"repos/{config.repo}/contents/.github/workflows/{WORKFLOW_FILE}"
+    if workflow_ref:
+        workflow_endpoint += f"?ref={workflow_ref}"
     result = runner.run(
         [
             config.gh_cmd,
             "api",
-            f"repos/{config.repo}/contents/.github/workflows/{WORKFLOW_FILE}",
+            workflow_endpoint,
             "-H",
             "Accept: application/vnd.github.raw+json",
         ],
@@ -134,7 +148,18 @@ def activate_managed_ci(
                 "Repository CI advertises an incomplete managed-CI v2 contract; missing marker(s): "
                 + ", ".join(missing_v2)
             )
-        return _activate_v2_managed_ci(
+        contract = _activate_v2_managed_ci(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            metadata=metadata,
+        )
+        if contract is not None or not config.managed_ci_adopt_existing_pr:
+            return contract
+        # A complete ordinary v2 workflow is not an adoption contract.  This
+        # path is intentionally quiet/fallback-compatible when the optional
+        # marker has not been deployed.
+        return _activate_v2_existing_pr_adoption(
             runner,
             config=config,
             pr_number=pr_number,
@@ -379,6 +404,266 @@ def _activate_v2_managed_ci(
         trusted_actor_id=actor_id,
         workflow_revision=revision,
     )
+
+
+def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[dict[str, object]] | None:
+    """Fetch a paginated GitHub list, returning None for an uninspectable response."""
+    result = runner.run(
+        [config.gh_cmd, "api", "--paginate", "--slurp", endpoint], cwd=active_workdir(config), check=False
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    # `gh api --paginate --slurp` returns one array per page.  Accept a plain
+    # list too so single-page API implementations remain compatible.
+    if all(isinstance(item, list) for item in payload):
+        return [entry for page in payload for entry in page if isinstance(entry, dict)]
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def _active_managed_label_event(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int
+) -> tuple[int, str, int] | None:
+    """Return the last label application, but only while it remains active.
+
+    Timeline provenance is an enforcement input for adoption.  Treat missing
+    actor IDs, malformed pagination, and an intervening unlabel as untrusted.
+    """
+    events = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
+    )
+    if events is None:
+        return None
+    latest: dict[str, object] | None = None
+    for event in events:
+        label = event.get("label") if isinstance(event.get("label"), dict) else {}
+        if label.get("name") == MANAGED_LABEL and event.get("event") in {"labeled", "unlabeled"}:
+            latest = event
+    if latest is None or latest.get("event") != "labeled":
+        return None
+    actor = latest.get("actor") if isinstance(latest.get("actor"), dict) else {}
+    event_id = latest.get("id")
+    login, actor_id = actor.get("login"), actor.get("id")
+    if not isinstance(event_id, int) or not isinstance(login, str) or not isinstance(actor_id, int):
+        return None
+    return event_id, login, actor_id
+
+
+def _has_exact_head_protection(runner: Runner, *, config: AgentLoopConfig, base_ref: str) -> bool:
+    """Require a concrete classic protection rule; ambiguity is unsupported."""
+    result = runner.run(
+        [
+            config.gh_cmd, "api",
+            f"repos/{config.repo}/branches/{base_ref}/protection/required_status_checks",
+        ],
+        cwd=active_workdir(config), check=False,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    contexts = payload.get("contexts")
+    checks = payload.get("checks")
+    return (
+        isinstance(contexts, list) and FINAL_CONTEXT in contexts
+    ) or (
+        isinstance(checks, list)
+        and any(isinstance(check, dict) and check.get("context") == FINAL_CONTEXT for check in checks)
+    )
+
+
+def _publish_adoption_guard(
+    runner: Runner, *, config: AgentLoopConfig, head_sha: str
+) -> bool:
+    result = runner.run(
+        [
+            config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/statuses/{head_sha}",
+            "-f", "state=pending", "-f", f"context={FINAL_CONTEXT}",
+            "-f", "description=Managed CI adoption awaits exact-head qualification",
+        ], cwd=active_workdir(config), check=False,
+    )
+    return result.returncode == 0
+
+
+def _ensure_managed_label(runner: Runner, *, config: AgentLoopConfig) -> bool:
+    """Create the repository label only when GitHub reports it absent."""
+    existing = runner.run(
+        [config.gh_cmd, "api", f"repos/{config.repo}/labels/{MANAGED_LABEL}"],
+        cwd=active_workdir(config), check=False,
+    )
+    if existing.returncode == 0:
+        return True
+    created = runner.run(
+        [
+            config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/labels",
+            "-f", f"name={MANAGED_LABEL}", "-f", "color=1f6feb",
+            "-f", "description=Suppress intermediate CI; agent-loop dispatches exact-head final CI",
+        ], cwd=active_workdir(config), check=False,
+    )
+    return created.returncode == 0
+
+
+def _adoption_identity(
+    runner: Runner, *, config: AgentLoopConfig
+) -> tuple[str, int] | None:
+    configured = (config.managed_ci_trusted_actor or "").strip()
+    if not configured:
+        return None
+    who = _api_json(runner, config, "user", quiet=True)
+    login, actor_id = who.get("login"), who.get("id")
+    advertised = _api_json(
+        runner, config, f"repos/{config.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR", quiet=True
+    ).get("value")
+    if (
+        not isinstance(login, str) or not isinstance(actor_id, int)
+        or not isinstance(advertised, str)
+        or login.casefold() != configured.casefold()
+        or login.casefold() != advertised.casefold()
+    ):
+        return None
+    return login, actor_id
+
+
+def _activate_v2_existing_pr_adoption(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    metadata: PullRequestMetadata,
+) -> ManagedCiContract | None:
+    """Explicitly adopt an already-open same-repository PR into v2.
+
+    All mutations occur only after capability, identity, branch protection and
+    stable-head checks.  The workflow remains the security boundary; this
+    client-side handshake is deliberately fail-closed hygiene.
+    """
+    identity = _adoption_identity(runner, config=config)
+    if identity is None:
+        return None
+    actor_login, actor_id = identity
+    base_ref = metadata.base_branch or config.base
+    if not base_ref:
+        return None
+    workflow = runner.run(
+        [config.gh_cmd, "api", f"repos/{config.repo}/contents/.github/workflows/{WORKFLOW_FILE}?ref={base_ref}",
+         "-H", "Accept: application/vnd.github.raw+json"],
+        cwd=active_workdir(config), check=False,
+    )
+    if workflow.returncode != 0:
+        return None
+    source = workflow.stdout or ""
+    # Incomplete optional adoption advertisement is unsupported rather than a
+    # reason to break the existing issue-created v2 route.
+    if any(marker not in source for marker in (*V2_FEATURE_MARKERS, *V2_ADOPTION_FEATURE_MARKERS)):
+        return None
+    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    labels = {
+        item.get("name") for item in (pr.get("labels") or [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    live_sha, head_ref = head.get("sha"), head.get("ref")
+    if (
+        pr.get("state") not in {None, "open"}
+        or head_repo.get("full_name", "").casefold() != config.repo.casefold()
+        or not isinstance(head_ref, str) or not head_ref
+        or not isinstance(live_sha, str) or live_sha != metadata.head_sha
+        or base.get("ref") != base_ref
+        or MANAGED_OPT_OUT_LABEL in labels
+        or not _has_exact_head_protection(runner, config=config, base_ref=base_ref)
+    ):
+        return None
+    # Publish the required blocking context before any possible suppression.
+    if not _publish_adoption_guard(runner, config=config, head_sha=live_sha):
+        return None
+    existing = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+    applied = False
+    if MANAGED_LABEL not in labels:
+        if not _ensure_managed_label(runner, config=config):
+            return None
+        created = runner.run(
+            [config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/labels",
+             "-f", f"labels[]={MANAGED_LABEL}"], cwd=active_workdir(config), check=False,
+        )
+        if created.returncode != 0:
+            return None
+        applied = True
+        existing = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+    if existing is None or existing[1].casefold() != actor_login.casefold() or existing[2] != actor_id:
+        # A newly-created but unprovable label must not remain as our claimed
+        # suppression.  The release helper fresh-checks event ownership.
+        provisional = ManagedCiContract(
+            protocol_version=2, adopted_existing_pr=True, active_label_event_id=existing[0] if existing else None,
+            invocation_applied_label=applied,
+        )
+        release_adopted_managed_ci(runner, config=config, pr_number=pr_number, contract=provisional)
+        return None
+    revision = _api_json(runner, config, f"repos/{config.repo}/commits/{base_ref}", quiet=True).get("sha")
+    return ManagedCiContract(
+        protocol_version=2, base_ref=base_ref, trusted_actor_login=actor_login,
+        trusted_actor_id=actor_id, workflow_revision=revision if isinstance(revision, str) else None,
+        adopted_existing_pr=True, guard_head_sha=live_sha, active_label_event_id=existing[0],
+        invocation_applied_label=applied,
+    )
+
+
+def revalidate_adopted_managed_ci(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, metadata: PullRequestMetadata,
+    contract: ManagedCiContract,
+) -> bool:
+    """Recheck adoption security inputs before filtering or final dispatch."""
+    if not contract.adopted_existing_pr or not contract.base_ref:
+        return True
+    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    labels = {item.get("name") for item in (pr.get("labels") or []) if isinstance(item, dict)}
+    live_sha = head.get("sha")
+    if (
+        not isinstance(live_sha, str) or live_sha != metadata.head_sha
+        or MANAGED_OPT_OUT_LABEL in labels
+        or MANAGED_LABEL not in labels
+        or not _has_exact_head_protection(runner, config=config, base_ref=contract.base_ref)
+    ):
+        return False
+    event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+    if (
+        event is None or event[0] != contract.active_label_event_id
+        or event[1].casefold() != (contract.trusted_actor_login or "").casefold()
+        or event[2] != contract.trusted_actor_id
+    ):
+        return False
+    if contract.guard_head_sha != live_sha:
+        if not _publish_adoption_guard(runner, config=config, head_sha=live_sha):
+            return False
+        contract.guard_head_sha = live_sha
+    return True
+
+
+def release_adopted_managed_ci(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, contract: ManagedCiContract
+) -> bool:
+    """Remove only the still-current label event created by this invocation."""
+    if not contract.adopted_existing_pr or not contract.invocation_applied_label:
+        return True
+    event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+    if event is None or event[0] != contract.active_label_event_id:
+        return True
+    result = runner.run(
+        [config.gh_cmd, "api", "--method", "DELETE", f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}"],
+        cwd=active_workdir(config), check=False,
+    )
+    return result.returncode == 0
 
 
 def _api_json(runner: Runner, config: AgentLoopConfig, endpoint: str, *, quiet: bool = False) -> dict[str, object]:

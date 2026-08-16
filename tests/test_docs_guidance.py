@@ -118,6 +118,15 @@ def test_readme_links_to_managed_exact_head_ci_and_scopes_watch_mode():
     )
 
 
+def test_managed_ci_docs_describe_explicit_existing_pr_adoption_and_opt_out():
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    assert "#### Optional adoption of an existing PR" in text
+    assert "--managed-ci-adopt-existing-pr" in text
+    assert "AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION" in text
+    assert "agent-loop-managed-opt-out" in text
+    assert "triage/write collaborators" in text
+
+
 def test_local_agent_loop_doc_has_focused_bounded_local_test_section():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert f"### {LOCAL_TEST_SCOPE_HEADING_TEXT}" in text

@@ -1304,9 +1304,58 @@ intent: create or verify `agent-loop-managed`, use the reserved
 agent-loop-managed`. The workflow can suppress opened/reopened/synchronize
 matrices only for the complete tuple: same-repository head, trusted REST
 author, reserved branch, draft, and label. A contributor-editable label,
-branch, or body alone is never trusted. Forks, ordinary PRs, and prematurely
-ready managed PRs retain regular CI; removing the managed label from a draft is
-the explicit recovery path back to ordinary current-head CI.
+branch, or body alone is never trusted. Forks and ordinary PRs retain regular
+CI unless they are explicitly adopted as described below. The issue-created
+opening tuple remains unchanged: it alone requires a trusted author, reserved
+branch, and draft state.
+
+#### Optional adoption of an existing PR
+
+Existing same-repository PRs, whether draft or ready and regardless of their
+author, may be adopted only when all of the following are true:
+
+```bash
+agent-loop pr <number> --auto-merge \
+  --managed-ci-trusted-actor <trusted-login> \
+  --managed-ci-adopt-existing-pr
+```
+
+This is a distinct opt-in capability. The base-ref workflow must contain the
+literal `AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION` marker in addition to the normal
+complete v2 markers. Its absence never changes issue-created v2 drafts; an
+adoption attempt simply retains ordinary CI. Agent-loop reads this workflow
+from the live base ref, rejects forks, base/head races, closed PRs, and a PR
+with `agent-loop-managed-opt-out`.
+
+Before it applies or trusts `agent-loop-managed`, agent-loop must be able to
+inspect the base branch's required-status-check protection and find
+`final-ci/exact-head`. It publishes a pending `final-ci/exact-head` guard on
+the live SHA before suppression and repeats that guard after each adopted head
+change. Missing, inaccessible, malformed, or ambiguous protection is
+unsupported: no label mutation occurs. This keeps every suppressed adopted
+head non-mergeable until nonce/run/attempt-correlated qualification.
+
+The workflow is the security boundary. For every adoption evaluation on
+`opened`, `reopened`, `labeled`, `unlabeled`, `synchronize`,
+`ready_for_review`, and `converted_to_draft`, it must query the complete issue
+event timeline from the base workflow and suppress only if the currently active
+managed-label application's actor login and immutable ID match the actor named
+by `AGENT_LOOP_MANAGED_ACTOR`. It must also require no opt-out label. API,
+pagination, or provenance failures, or a collaborator relabeling the PR, must
+fail open to the ordinary matrix. This prevents triage/write collaborators from
+suppressing CI by manipulating labels.
+
+The handshake records the active label event ID. A trusted existing label is
+reused and never removed by that invocation; a label created by the invocation
+is removed only if its exact application is still current on a terminal
+unqualified exit (max rounds, agent/reviewer error, interrupt, ordinary
+non-zero exit, or head movement). A relabel race is left untouched and ordinary
+CI resumes. After qualification/merge the label is retained.
+
+To opt out durably, apply `agent-loop-managed-opt-out` and remove
+`agent-loop-managed`: this immediately restores current-head CI and prevents a
+later explicit adoption. Removing only `agent-loop-managed` also restores CI
+immediately, but a later explicit adoption may apply it again.
 
 V2 dispatches `ci.yml` at the base ref with protocol version, PR, exact SHA,
 and a random nonce. The workflow run name, checkout verification, per-PR/SHA
@@ -1331,7 +1380,7 @@ publisher/aggregate minute—about 11–14 minutes for a 10–13 minute matrix.
 roughly the earlier 20–25-minute shape plus recovery work. Keep routing,
 aggregate, and qualification telemetry separate for billing comparisons.
 
-Under `--auto-merge`, agent-loop automatically detects a same-repository PR
+For the legacy v1 contract only, under `--auto-merge`, agent-loop automatically detects a same-repository PR
 whose `.github/workflows/ci.yml` advertises the `agent-loop-managed`,
 `final-ci/exact-head`, and `expected_head_sha` contract. It applies the managed
 label before iterative review, allowing that repository to suppress full

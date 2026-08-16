@@ -652,6 +652,12 @@ qualified SHA with `--match-head-commit`. `--watch-pending-ci` and
 [Managed exact-head CI](docs/local_agent_loop.md#managed-exact-head-ci) for the
 repository contract and failure behavior.
 
+Already-open PRs remain ordinary CI by default. A repository can separately
+advertise safe adoption and an operator can explicitly request it only with
+`agent-loop pr <n> --auto-merge --managed-ci-trusted-actor <login>
+--managed-ci-adopt-existing-pr`. The managed-CI guide documents the required
+branch-protection guard, timeline provenance, and durable opt-out.
+
 For repositories without that contract, `--auto-merge` foreground-polls the
 complete check board after approval with
 `--ci-timeout-seconds` and
