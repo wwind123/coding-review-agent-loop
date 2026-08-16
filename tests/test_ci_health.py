@@ -43,6 +43,26 @@ def _check(**overrides):
     return PullRequestCheck(**defaults)
 
 
+def test_check_run_parser_uses_github_app_slug_without_misattributing_app_id():
+    checks, errors = github_module._parse_check_runs_payload(
+        {
+            "check_runs": [
+                {
+                    "id": 7,
+                    "name": "CI",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "app": {"slug": "github-actions", "id": 15368},
+                }
+            ]
+        }
+    )
+
+    assert errors == []
+    assert checks[0].creator_login == "github-actions"
+    assert checks[0].creator_id is None
+
+
 # --- classify_ci_infrastructure_stall ---------------------------------------
 
 

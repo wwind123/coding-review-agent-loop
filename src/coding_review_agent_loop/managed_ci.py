@@ -7,6 +7,7 @@ import secrets
 import time
 from dataclasses import dataclass, replace
 from typing import Literal
+from urllib.parse import urlparse
 
 from .ci_health import (
     CiInfrastructureStall,
@@ -138,7 +139,6 @@ def activate_managed_ci(
             config=config,
             pr_number=pr_number,
             metadata=metadata,
-            workflow=workflow,
         )
 
     pr_result = runner.run(
@@ -298,7 +298,6 @@ def _activate_v2_managed_ci(
     config: AgentLoopConfig,
     pr_number: int,
     metadata: PullRequestMetadata,
-    workflow: str,
 ) -> ManagedCiContract | None:
     """Validate the non-forgeable v2 opening tuple without mutating a PR.
 
@@ -610,8 +609,8 @@ def _ensure_v2_intent(
         try:
             parsed = json.loads(comments_result.stdout or "[]")
             comments = parsed if isinstance(parsed, list) else []
-        except json.JSONDecodeError:
-            raise AgentLoopError("Managed-CI intent comments response was invalid JSON.")
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError("Managed-CI intent comments response was invalid JSON.") from exc
     matching: list[tuple[int, dict[str, object]]] = []
     for raw in comments:
         if not isinstance(raw, dict):
@@ -689,7 +688,6 @@ def _discover_v2_run(runner: Runner, *, config: AgentLoopConfig, contract: Manag
     if not contract.nonce:
         return None
     run_name = _v2_run_name(contract)
-    candidates: list[dict[str, object]] = []
     for attempt in range(retries):
         result = runner.run(
             [config.gh_cmd, "api", f"repos/{config.repo}/actions/workflows/{contract.workflow_file}/runs?event=workflow_dispatch&per_page=100"],
@@ -715,6 +713,41 @@ def _discover_v2_run(runner: Runner, *, config: AgentLoopConfig, contract: Manag
         if attempt < retries - 1:
             runner.run(["sleep", str(min(config.ci_poll_interval_seconds, 2))], cwd=active_workdir(config))
     return None
+
+
+def _refresh_v2_attached_run_attempt(
+    runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract
+) -> int | None:
+    """Read the current attempt for the already-attached workflow run.
+
+    GitHub increments ``run_attempt`` when a run is re-run.  The run ID remains
+    the durable correlation key, so status validation must follow that current
+    attempt rather than the attempt present when agent-loop dispatched it.
+    """
+    if contract.attached_run_id is None or not contract.nonce:
+        return None
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "api",
+            f"repos/{config.repo}/actions/runs/{contract.attached_run_id}",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        run = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(run, dict) or run.get("id") != contract.attached_run_id:
+        return None
+    run_name = _v2_run_name(contract)
+    if not _is_v2_intent_run(run, contract=contract, run_name=run_name):
+        return None
+    attempt = run.get("run_attempt")
+    return attempt if isinstance(attempt, int) else None
 
 
 def _v2_run_name(contract: ManagedCiContract) -> str:
@@ -779,6 +812,13 @@ def wait_for_final_qualification(
                 attached = _discover_v2_run(runner, config=config, contract=contract, retries=1)
                 if attached is not None:
                     contract.attached_run_id, contract.run_attempt = attached
+                    _patch_intent(runner, config=config, contract=contract, state="attached")
+            else:
+                current_attempt = _refresh_v2_attached_run_attempt(
+                    runner, config=config, contract=contract
+                )
+                if current_attempt is not None and current_attempt != contract.run_attempt:
+                    contract.run_attempt = current_attempt
                     _patch_intent(runner, config=config, contract=contract, state="attached")
             final = _v2_correlated_status(
                 runner, config=config, expected_head=expected_head, contract=contract
@@ -862,9 +902,16 @@ def _v2_correlated_status(
             (login or "").casefold() == "github-actions[bot]"
             or (login == contract.trusted_actor_login and creator_id == contract.trusted_actor_id)
         )
-        if not allowed_publisher or not all(token in description for token in required):
+        description_tokens = {token.strip() for token in description.split(";") if token.strip()}
+        if not allowed_publisher or not set(required).issubset(description_tokens):
             continue
-        if f"/actions/runs/{contract.attached_run_id}" not in target:
+        target_path = urlparse(target).path.rstrip("/")
+        target_segments = target_path.split("/")
+        if (
+            len(target_segments) < 3
+            or target_segments[-3:-1] != ["actions", "runs"]
+            or target_segments[-1] != str(contract.attached_run_id)
+        ):
             continue
         return PullRequestCheck(
             name=FINAL_CONTEXT,
@@ -919,12 +966,14 @@ def prepare_v2_merge(
     )
     if labelled.returncode != 0:
         raise AgentLoopError(f"Unable to apply `{QUALIFIED_LABEL}` before readying PR #{pr_number}.")
-    ready = runner.run(
-        [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
-        cwd=active_workdir(config), check=False,
-    )
-    if ready.returncode != 0:
-        raise AgentLoopError(f"Unable to mark qualified PR #{pr_number} ready for review.")
+    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    if pr.get("draft") is True:
+        ready = runner.run(
+            [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
+            cwd=active_workdir(config), check=False,
+        )
+        if ready.returncode != 0:
+            raise AgentLoopError(f"Unable to mark qualified PR #{pr_number} ready for review.")
     if get_pr_head_sha(runner, config, pr_number) != expected_head_sha:
         raise AgentLoopError(f"PR #{pr_number} head changed while it was being readied for merge.")
 

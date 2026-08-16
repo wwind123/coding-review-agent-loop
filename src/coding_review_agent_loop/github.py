@@ -47,11 +47,6 @@ class PullRequestMetadata:
     head_sha: str | None
     url: str | None
     body: str | None = None
-    author_login: str | None = None
-    author_id: int | None = None
-    head_repo: str | None = None
-    is_draft: bool | None = None
-    labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -424,23 +419,12 @@ def _parse_pr_metadata(
         head_sha=_optional_str(data.get("headRefOid")),
         url=_optional_str(data.get("url")),
         body=_optional_str(data.get("body")),
-        author_login=_author_login(data.get("author")),
-        author_id=_author_id(data.get("author")),
-        head_repo=_optional_str((data.get("headRepository") or {}).get("nameWithOwner"))
-        if isinstance(data.get("headRepository"), dict)
-        else None,
-        is_draft=data.get("isDraft") if isinstance(data.get("isDraft"), bool) else None,
-        labels=tuple(
-            label.get("name")
-            for label in ((data.get("labels") or {}).get("nodes") or [])
-            if isinstance(label, dict) and isinstance(label.get("name"), str)
-        ) if isinstance(data.get("labels"), dict) else (),
     )
 
 
 def _author_login(raw: object) -> str | None:
     if isinstance(raw, dict):
-        login = raw.get("login")
+        login = raw.get("login") or raw.get("slug")
         return str(login) if login else None
     return None
 
@@ -695,7 +679,6 @@ def _parse_check_runs_payload(payload: object) -> tuple[list[PullRequestCheck], 
                 started_at=_optional_str(raw_check.get("started_at")),
                 completed_at=_optional_str(raw_check.get("completed_at")),
                 creator_login=_author_login(raw_check.get("app")),
-                creator_id=_author_id(raw_check.get("app")),
                 description=(
                     _optional_str(raw_check["output"].get("summary"))
                     if isinstance(raw_check.get("output"), dict)

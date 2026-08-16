@@ -1272,6 +1272,32 @@ the resolved base ref, and requires its `AGENT_LOOP_MANAGED_CI_V2` marker.
 Missing/mismatched trust disables v2 suppression; marker-free repositories use
 ordinary CI and complete v1 workflows keep their post-open label handoff.
 
+Participating repositories must make the v2 workflow contract literal and
+complete. The committed `.github/workflows/ci.yml` must contain all of these
+feature markers exactly: `AGENT_LOOP_MANAGED_CI_V2`, `workflow_dispatch`,
+`managed_nonce`, and `final-ci/exact-head`. Its `workflow_dispatch` inputs must
+be named `protocol_version`, `pr_number`, `expected_head_sha`, and
+`managed_nonce`. The dispatched workflow must set this exact run name (where
+`managed_nonce` is the input):
+
+```yaml
+run-name: managed-ci-v2 nonce=${{ inputs.managed_nonce }}
+```
+
+The final publisher must post the `final-ci/exact-head` commit status to
+`expected_head_sha`, with a semicolon-delimited description containing these
+exact tokens (in any order):
+
+```text
+nonce=<managed_nonce>;run_id=<github.run_id>;attempt=<github.run_attempt>
+```
+
+Its `target_url` must end in `/actions/runs/<github.run_id>`. Agent-loop
+matches each token and the final URL path segment exactly; a matching prefix,
+another run, or an earlier rerun attempt is not accepted. The publisher should
+run under `github-actions[bot]` (or the configured trusted actor when posting
+through that account).
+
 For auto-merge issue work, a v2 preflight gives the coder an atomic creation
 intent: create or verify `agent-loop-managed`, use the reserved
 `agent-loop/managed-<issue>` branch, then run `gh pr create --draft --label

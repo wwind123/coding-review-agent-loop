@@ -14,9 +14,14 @@ from coding_review_agent_loop.managed_ci import (
     MANAGED_LABEL,
     READINESS_CONTEXT,
     ManagedCiContract,
+    _dispatch_v2_qualification,
+    _ensure_v2_intent,
+    _v2_failed_jobs,
     activate_managed_ci,
     dispatch_final_qualification,
     intermediate_managed_checks,
+    preflight_managed_ci_creation,
+    prepare_v2_merge,
     publish_round_readiness,
     wait_for_final_qualification,
 )
@@ -34,6 +39,23 @@ on:
 jobs:
   route:
     if: contains(github.event.pull_request.labels.*.name, 'agent-loop-managed')
+  aggregate:
+    name: final-ci/exact-head
+"""
+
+V2_WORKFLOW = """
+# agent-loop-managed
+# expected_head_sha
+# AGENT_LOOP_MANAGED_CI_V2
+name: CI
+on:
+  workflow_dispatch:
+    inputs:
+      protocol_version: {required: true}
+      pr_number: {required: true}
+      expected_head_sha: {required: true}
+      managed_nonce: {required: true}
+jobs:
   aggregate:
     name: final-ci/exact-head
 """
@@ -89,6 +111,93 @@ class ManagedRunner(FakeRunner):
         return super()._run_locked(args, cwd=cwd, check=check)
 
 
+class V2ManagedRunner(ManagedRunner):
+    def __init__(
+        self,
+        *,
+        rest_pr=None,
+        workflow_runs=None,
+        intent_comments=None,
+        jobs=None,
+        actor_login="agent-loop",
+        actor_id=1,
+        advertised_actor=None,
+        **kwargs,
+    ):
+        workflow = kwargs.pop("workflow", V2_WORKFLOW)
+        super().__init__(workflow=workflow, **kwargs)
+        self.rest_pr = {
+            "head": {
+                "repo": {"full_name": "OWNER/REPO"},
+                "sha": "abc123",
+                "ref": "agent-loop/managed-643",
+            },
+            "base": {"ref": "main"},
+            "user": {"login": actor_login, "id": actor_id},
+            "labels": [{"name": MANAGED_LABEL}],
+            "draft": True,
+        }
+        if rest_pr:
+            self.rest_pr.update(rest_pr)
+        self.workflow_runs = list(workflow_runs or [])
+        self.intent_comments = list(intent_comments or [])
+        self.jobs = list(jobs or [])
+        self.actor_login = actor_login
+        self.actor_id = actor_id
+        self.advertised_actor = advertised_actor or actor_login
+
+    def _run_locked(self, args, *, cwd, check):
+        cmd = list(args)
+        endpoint = next(
+            (part for part in cmd if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if cmd == ["gh", "api", "user"]:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                cmd,
+                cwd_path,
+                json.dumps({"login": self.actor_login, "id": self.actor_id}),
+                "",
+                0,
+            )
+        if endpoint.endswith("/actions/variables/AGENT_LOOP_MANAGED_ACTOR"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, json.dumps({"value": self.advertised_actor}), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/contents/.github/workflows/ci.yml"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, self.workflow, "", 0)
+        if endpoint == "repos/OWNER/REPO/pulls/7":
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, json.dumps(self.rest_pr), "", 0)
+        if endpoint == "repos/OWNER/REPO/commits/main":
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, json.dumps({"sha": "base-sha"}), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, json.dumps(self.intent_comments), "", 0)
+        if endpoint == "repos/OWNER/REPO/issues/7/comments" and "POST" in cmd:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, json.dumps({"id": 17}), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/issues/comments/"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, "{}", "", 0)
+        if "/actions/workflows/ci.yml/runs?event=workflow_dispatch" in endpoint:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, json.dumps({"workflow_runs": self.workflow_runs}), "", 0)
+        if endpoint.endswith("/jobs?filter=latest&per_page=100"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, json.dumps({"jobs": self.jobs}), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/actions/runs/"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            run_id = endpoint.rsplit("/", 1)[-1]
+            run = next((run for run in self.workflow_runs if str(run.get("id")) == run_id), {})
+            return CommandResult(cmd, cwd_path, json.dumps(run), "", 0)
+        if cmd[:3] == ["gh", "pr", "view"] and "--jq" in cmd and ".headRefOid" in cmd:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, f"{self.pr_payload.get('headRefOid')}\n", "", 0)
+        return super()._run_locked(args, cwd=cwd, check=check)
+
+
 def metadata(*, base_branch="main"):
     return PullRequestMetadata(
         number=7,
@@ -99,6 +208,50 @@ def metadata(*, base_branch="main"):
         head_sha="abc123",
         url="https://github.com/OWNER/REPO/pull/7",
     )
+
+
+def v2_contract(**overrides):
+    fields = {
+        "protocol_version": 2,
+        "base_ref": "main",
+        "trusted_actor_login": "agent-loop",
+        "trusted_actor_id": 1,
+        "workflow_revision": "base-sha",
+        "nonce": "nonce-1",
+    }
+    fields.update(overrides)
+    return ManagedCiContract(**fields)
+
+
+def v2_run(*, run_id=100, attempt=1, status="completed", conclusion="success"):
+    return {
+        "id": run_id,
+        "run_attempt": attempt,
+        "name": "managed-ci-v2 nonce=nonce-1",
+        "event": "workflow_dispatch",
+        "path": ".github/workflows/ci.yml@main",
+        "head_branch": "main",
+        "head_sha": "base-sha",
+        "status": status,
+        "conclusion": conclusion,
+    }
+
+
+def v2_intent_comment(*, nonce="nonce-1", run_id=None, run_attempt=None):
+    payload = {
+        "repository": "OWNER/REPO",
+        "pr": 7,
+        "expected_head_sha": "abc123",
+        "nonce": nonce,
+        "created_at": 1,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+    }
+    return {
+        "id": 17,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": f"<!-- AGENT_MANAGED_CI_INTENT_V2 {json.dumps(payload)} -->",
+    }
 
 
 def checks(*, pending=(), passing=(), failing=(), required=(FINAL_CONTEXT,), missing=()):
@@ -421,6 +574,243 @@ def test_v2_qualification_accepts_only_attached_run_status(tmp_path):
     )
 
     assert outcome.status == "passed"
+
+
+def test_v2_qualification_rejects_numeric_prefix_tokens_and_run_url(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(run_id=100, attempt=1)],
+        pr_payload={
+            "headRefOid": "abc123",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        },
+        pr_status_payload={
+            "statuses": [
+                {
+                    "context": FINAL_CONTEXT,
+                    "state": "success",
+                    "description": "nonce=nonce-1;run_id=1001;attempt=10",
+                    "target_url": "https://github.com/OWNER/REPO/actions/runs/1001",
+                    "creator": {"login": "github-actions[bot]", "id": 41898282},
+                }
+            ]
+        },
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+
+    outcome = wait_for_final_qualification(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=metadata(),
+        contract=v2_contract(attached_run_id=100, run_attempt=1),
+    )
+
+    assert outcome.status == "timeout"
+
+
+def test_v2_qualification_refreshes_rerun_attempt_before_correlating_status(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(run_id=100, attempt=2)],
+        pr_payload={
+            "headRefOid": "abc123",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        },
+        pr_status_payload={
+            "statuses": [
+                {
+                    "context": FINAL_CONTEXT,
+                    "state": "success",
+                    "description": "nonce=nonce-1;run_id=100;attempt=2",
+                    "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
+                    "creator": {"login": "github-actions[bot]", "id": 41898282},
+                }
+            ]
+        },
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract(attached_run_id=100, run_attempt=1)
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "passed"
+    assert contract.run_attempt == 2
+
+
+@pytest.mark.parametrize(
+    ("rest_pr", "config_overrides"),
+    [
+        ({"head": {"repo": {"full_name": "FORK/REPO"}, "sha": "abc123", "ref": "agent-loop/managed-643"}}, {}),
+        ({"draft": False}, {}),
+        ({"labels": []}, {}),
+        ({"head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "new-head", "ref": "agent-loop/managed-643"}}, {}),
+        ({"user": {"login": "other", "id": 1}}, {}),
+        ({}, {"managed_ci_trusted_actor": "other"}),
+    ],
+)
+def test_v2_activation_rejects_untrusted_or_incomplete_opening_tuple(
+    tmp_path, rest_pr, config_overrides
+):
+    settings = {"auto_merge": True, "managed_ci_trusted_actor": "agent-loop"}
+    settings.update(config_overrides)
+    config = make_config(tmp_path, **settings)
+    runner = V2ManagedRunner(rest_pr=rest_pr, pr_payload={"headRefOid": "abc123"})
+
+    assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
+
+
+def test_v2_activation_and_preflight_require_authenticated_actor(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(pr_payload={"headRefOid": "abc123"})
+
+    intent = preflight_managed_ci_creation(runner, config=config, issue_number=643)
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert intent is not None
+    assert intent.branch == "agent-loop/managed-643"
+    assert contract is not None
+    assert contract.protocol_version == 2
+    assert contract.trusted_actor_login == "agent-loop"
+
+
+@pytest.mark.parametrize(
+    "runner_kwargs",
+    [
+        {"actor_login": "other"},
+        {"advertised_actor": "other"},
+    ],
+)
+def test_v2_preflight_rejects_configured_or_advertised_actor_mismatch(tmp_path, runner_kwargs):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+
+    assert preflight_managed_ci_creation(
+        V2ManagedRunner(**runner_kwargs), config=config, issue_number=643
+    ) is None
+
+
+def test_v2_preflight_fails_closed_for_incomplete_markers(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(workflow="# AGENT_LOOP_MANAGED_CI_V2\n")
+
+    with pytest.raises(AgentLoopError, match="incomplete managed-CI v2 contract"):
+        preflight_managed_ci_creation(runner, config=config, issue_number=643)
+
+
+def test_v2_intent_resumes_matching_comment_and_rejects_competing_nonce(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    comment = v2_intent_comment(run_id=100, run_attempt=1)
+    runner = V2ManagedRunner(intent_comments=[comment])
+    contract = v2_contract()
+
+    _ensure_v2_intent(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert (contract.intent_comment_id, contract.nonce, contract.attached_run_id) == (17, "nonce-1", 100)
+    competing = dict(comment)
+    competing["id"] = 18
+    competing["body"] = v2_intent_comment(nonce="nonce-2")["body"]
+    runner = V2ManagedRunner(intent_comments=[comment, competing])
+    with pytest.raises(AgentLoopError, match="Competing managed-CI v2 intent"):
+        _ensure_v2_intent(
+            runner, config=config, pr_number=7, expected_head_sha="abc123", contract=v2_contract()
+        )
+
+
+def test_v2_dispatch_discovers_existing_run_before_dispatching(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(workflow_runs=[v2_run()], intent_comments=[v2_intent_comment()])
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert contract.attached_run_id == 100
+    assert not any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
+
+
+def test_v2_dispatch_rejects_a_stale_approved_head(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(pr_payload={"headRefOid": "new-head"})
+
+    with pytest.raises(AgentLoopError, match="head moved from approved SHA"):
+        dispatch_final_qualification(
+            runner,
+            config=config,
+            pr_number=7,
+            expected_head_sha="abc123",
+            head_ref="agent-loop/managed-643",
+            contract=v2_contract(),
+        )
+
+
+def test_v2_qualification_reports_failed_jobs_from_the_attached_run(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run()],
+        jobs=[{"name": "unit", "conclusion": "failure", "html_url": "https://example.test/job/1"}],
+        pr_payload={
+            "headRefOid": "abc123",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        },
+        pr_status_payload={
+            "statuses": [
+                {
+                    "context": FINAL_CONTEXT,
+                    "state": "failure",
+                    "description": "nonce=nonce-1;run_id=100;attempt=1",
+                    "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
+                    "creator": {"login": "github-actions[bot]", "id": 41898282},
+                }
+            ]
+        },
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+
+    outcome = wait_for_final_qualification(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=metadata(),
+        contract=v2_contract(attached_run_id=100, run_attempt=1),
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.failure_details == ("unit: failure (https://example.test/job/1)",)
+
+
+def test_v2_failed_jobs_and_ready_merge_recovery(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(
+        rest_pr={"draft": False},
+        jobs=[{"name": "unit", "conclusion": "failure", "html_url": "https://example.test/job/1"}],
+    )
+
+    assert _v2_failed_jobs(runner, config=config, run_id=100) == (
+        "unit: failure (https://example.test/job/1)",
+    )
+    prepare_v2_merge(
+        runner,
+        config=config,
+        pr_number=7,
+        expected_head_sha="abc123",
+        contract=v2_contract(),
+    )
+
+    assert not any(cmd[:3] == ["gh", "pr", "ready"] for cmd, _cwd in runner.commands)
 
 
 def test_merge_pr_uses_expected_head_guard(tmp_path):

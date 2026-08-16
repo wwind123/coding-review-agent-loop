@@ -15,6 +15,7 @@ from .config import AgentLoopConfig, reviewers
 from .decomposition import MAX_DECOMPOSITION_PHASES
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .memory import AgentMemoryContext, format_agent_memory_context
+from .managed_ci import ManagedCiCreationIntent
 from .salvage import AGENT_SALVAGE_MARKER_RE
 from .round_transport import is_round_transport_sidecar
 from .protocol import (
@@ -1703,7 +1704,7 @@ def build_issue_implementation_prompt(
     issue_context: IssueContext | None = None,
     salvage_summary: str | None = None,
     staged_parent_issue: int | None = None,
-    managed_ci_creation_intent: object | None = None,
+    managed_ci_creation_intent: ManagedCiCreationIntent | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config)
@@ -1719,7 +1720,7 @@ def build_issue_implementation_prompt(
     )
     managed_creation_guidance = ""
     if managed_ci_creation_intent is not None:
-        branch = getattr(managed_ci_creation_intent, "branch", "agent-loop/managed-<issue>")
+        branch = managed_ci_creation_intent.branch
         managed_creation_guidance = (
             "\nThis repository has authenticated managed-CI v2 enabled. Create the PR atomically: "
             f"use the reserved branch `{branch}`, create/verify the `agent-loop-managed` label first, "

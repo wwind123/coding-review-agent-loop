@@ -641,7 +641,10 @@ With `--auto-merge`, repositories that advertise the managed exact-head CI
 contract use a dedicated flow. The v2 rollout atomically opens a trusted draft
 with `agent-loop-managed`, dispatches qualification from the base workflow,
 and accepts only nonce/run/attempt-correlated statuses; v1 keeps its post-open
-label handoff. Agent-loop may
+label handoff. V2 is enabled only when `--managed-ci-trusted-actor <login>`
+matches both the authenticated GitHub CLI user and the repository Actions
+variable `AGENT_LOOP_MANAGED_ACTOR`; without that explicit trust configuration,
+the normal CI path remains in effect. Agent-loop may
 publish local round readiness after a configured pre-review test succeeds,
 dispatches final CI for the reviewers' exact approved SHA, and merges only that
 qualified SHA with `--match-head-commit`. `--watch-pending-ci` and
