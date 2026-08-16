@@ -104,6 +104,8 @@ from .managed_ci import (
     activate_managed_ci,
     dispatch_final_qualification,
     intermediate_managed_checks,
+    preflight_managed_ci_creation,
+    prepare_v2_merge,
     publish_round_readiness,
     wait_for_final_qualification,
 )
@@ -3866,6 +3868,9 @@ def _implement_approved_issue(
         approved_plan_hash=plan_hash,
     )
     sync_coder_base_before_implementation(implementation_config, runner)
+    managed_ci_creation_intent = preflight_managed_ci_creation(
+        runner, config=implementation_config, issue_number=issue_number
+    )
     log(config, f"Planning approved; invoking {coder_name} to implement issue #{issue_number}")
     assigned_head_before = _read_assigned_workdir_head(runner, implementation_config)
     coder_response = _run_validated_agent(
@@ -3880,6 +3885,7 @@ def _implement_approved_issue(
             issue_context=issue_context,
             salvage_summary=salvage_summary,
             staged_parent_issue=staged_parent_issue,
+            managed_ci_creation_intent=managed_ci_creation_intent,
         ),
         session_id=implementation_session_id,
         marker_description="positive <!-- AGENT_PR: <number> -->, PR URL, blocking, or clarification",
@@ -7041,8 +7047,16 @@ def run_pr_loop(
                                 config=config,
                                 pr_number=pr_number,
                                 metadata=pr_metadata,
+                                contract=managed_ci,
                             )
                             if managed_outcome.status == "passed":
+                                prepare_v2_merge(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    expected_head_sha=pr_metadata.head_sha,
+                                    contract=managed_ci,
+                                )
                                 merge_pr(
                                     runner,
                                     config,
@@ -7111,7 +7125,9 @@ def run_pr_loop(
                                 return 0
                             elif managed_outcome.status == "failed":
                                 details = (
-                                    _pr_check_details(managed_outcome.checks)
+                                    list(managed_outcome.failure_details)
+                                    if managed_outcome.failure_details
+                                    else _pr_check_details(managed_outcome.checks)
                                     if managed_outcome.checks
                                     else ["Managed exact-head CI failed."]
                                 )

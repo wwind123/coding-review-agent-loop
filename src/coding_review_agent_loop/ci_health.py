@@ -25,6 +25,9 @@ class PullRequestCheck:
     created_at: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
+    creator_login: str | None = None
+    creator_id: int | None = None
+    description: str | None = None
 
 
 @dataclass(frozen=True)

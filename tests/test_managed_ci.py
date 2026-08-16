@@ -345,6 +345,84 @@ def test_wait_for_final_qualification_treats_all_terminal_failures_as_failed(
     assert outcome.status == "failed"
 
 
+def test_v2_qualification_ignores_same_context_status_from_another_run(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1
+    )
+    runner = ManagedRunner(
+        pr_payload={
+            "headRefOid": "abc123",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        },
+        pr_status_payload={
+            "statuses": [
+                {
+                    "context": FINAL_CONTEXT,
+                    "state": "failure",
+                    "description": "nonce=nonce-1;run_id=99;attempt=1",
+                    "target_url": "https://github.com/OWNER/REPO/actions/runs/99",
+                    "creator": {"login": "github-actions[bot]", "id": 41898282},
+                }
+            ]
+        },
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = ManagedCiContract(
+        protocol_version=2,
+        trusted_actor_login="agent-loop",
+        trusted_actor_id=1,
+        nonce="nonce-1",
+        attached_run_id=100,
+        run_attempt=1,
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "timeout"
+
+
+def test_v2_qualification_accepts_only_attached_run_status(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1
+    )
+    runner = ManagedRunner(
+        pr_payload={
+            "headRefOid": "abc123",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        },
+        pr_status_payload={
+            "statuses": [
+                {
+                    "context": FINAL_CONTEXT,
+                    "state": "success",
+                    "description": "nonce=nonce-1;run_id=100;attempt=1",
+                    "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
+                    "creator": {"login": "github-actions[bot]", "id": 41898282},
+                }
+            ]
+        },
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = ManagedCiContract(
+        protocol_version=2,
+        trusted_actor_login="agent-loop",
+        trusted_actor_id=1,
+        nonce="nonce-1",
+        attached_run_id=100,
+        run_attempt=1,
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "passed"
+
+
 def test_merge_pr_uses_expected_head_guard(tmp_path):
     config = make_config(tmp_path, auto_merge=True)
     runner = FakeRunner()
