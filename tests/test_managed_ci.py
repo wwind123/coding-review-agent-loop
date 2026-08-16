@@ -223,13 +223,23 @@ def v2_contract(**overrides):
     return ManagedCiContract(**fields)
 
 
-def v2_run(*, run_id=100, attempt=1, status="completed", conclusion="success"):
+def v2_run(
+    *,
+    run_id=100,
+    attempt=1,
+    status="completed",
+    conclusion="success",
+    name="managed-ci-v2 nonce=nonce-1",
+    display_title=None,
+    path=".github/workflows/ci.yml@main",
+):
     return {
         "id": run_id,
         "run_attempt": attempt,
-        "name": "managed-ci-v2 nonce=nonce-1",
+        "name": name,
+        "display_title": display_title,
         "event": "workflow_dispatch",
-        "path": ".github/workflows/ci.yml@main",
+        "path": path,
         "head_branch": "main",
         "head_sha": "base-sha",
         "status": status,
@@ -729,6 +739,28 @@ def test_v2_intent_resumes_matching_comment_and_rejects_competing_nonce(tmp_path
 def test_v2_dispatch_discovers_existing_run_before_dispatching(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     runner = V2ManagedRunner(workflow_runs=[v2_run()], intent_comments=[v2_intent_comment()])
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert contract.attached_run_id == 100
+    assert not any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
+
+
+def test_v2_dispatch_discovers_run_with_display_title_and_qualified_path(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(
+        workflow_runs=[
+            v2_run(
+                name="CI",
+                display_title="managed-ci-v2 nonce=nonce-1",
+                path="OWNER/REPO/.github/workflows/ci.yml@refs/heads/main",
+            )
+        ],
+        intent_comments=[v2_intent_comment()],
+    )
     contract = v2_contract()
 
     _dispatch_v2_qualification(

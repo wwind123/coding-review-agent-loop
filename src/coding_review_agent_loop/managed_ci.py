@@ -758,10 +758,13 @@ def _is_v2_intent_run(
     run: dict[str, object], *, contract: ManagedCiContract, run_name: str
 ) -> bool:
     """Validate the API fields available for a dispatched base workflow."""
-    if run.get("name") != run_name or run.get("event") != "workflow_dispatch":
+    if (
+        run_name not in (run.get("name"), run.get("display_title"))
+        or run.get("event") != "workflow_dispatch"
+    ):
         return False
     path = run.get("path")
-    if isinstance(path, str) and contract.base_ref and path != f".github/workflows/{WORKFLOW_FILE}@{contract.base_ref}":
+    if isinstance(path, str) and f".github/workflows/{WORKFLOW_FILE}" not in path:
         return False
     if isinstance(run.get("head_branch"), str) and contract.base_ref and run["head_branch"] != contract.base_ref:
         return False
