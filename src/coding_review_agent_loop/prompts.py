@@ -15,6 +15,7 @@ from .config import AgentLoopConfig, reviewers
 from .decomposition import MAX_DECOMPOSITION_PHASES
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .memory import AgentMemoryContext, format_agent_memory_context
+from .managed_ci import ManagedCiCreationIntent
 from .salvage import AGENT_SALVAGE_MARKER_RE
 from .round_transport import is_round_transport_sidecar
 from .protocol import (
@@ -1703,6 +1704,7 @@ def build_issue_implementation_prompt(
     issue_context: IssueContext | None = None,
     salvage_summary: str | None = None,
     staged_parent_issue: int | None = None,
+    managed_ci_creation_intent: ManagedCiCreationIntent | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config)
@@ -1716,6 +1718,15 @@ def build_issue_implementation_prompt(
         if staged_parent_issue is not None
         else _issue_pr_reference_guidance(issue_number)
     )
+    managed_creation_guidance = ""
+    if managed_ci_creation_intent is not None:
+        branch = managed_ci_creation_intent.branch
+        managed_creation_guidance = (
+            "\nThis repository has authenticated managed-CI v2 enabled. Create the PR atomically: "
+            f"use the reserved branch `{branch}`, create/verify the `agent-loop-managed` label first, "
+            "then run `gh pr create --draft --label agent-loop-managed`. Do not mark it ready until "
+            "agent-loop's final exact-head qualification succeeds.\n"
+        )
     return f"""Implement the approved plan for GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout as your workspace. Create a branch, implement the
@@ -1725,6 +1736,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {pr_reference_guidance}
+{managed_creation_guidance}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
     requirement_label="implementation requirements",

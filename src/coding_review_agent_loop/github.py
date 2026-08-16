@@ -424,8 +424,14 @@ def _parse_pr_metadata(
 
 def _author_login(raw: object) -> str | None:
     if isinstance(raw, dict):
-        login = raw.get("login")
+        login = raw.get("login") or raw.get("slug")
         return str(login) if login else None
+    return None
+
+
+def _author_id(raw: object) -> int | None:
+    if isinstance(raw, dict) and isinstance(raw.get("id"), int):
+        return raw["id"]
     return None
 
 
@@ -672,6 +678,12 @@ def _parse_check_runs_payload(payload: object) -> tuple[list[PullRequestCheck], 
                 created_at=_optional_str(raw_check.get("created_at")),
                 started_at=_optional_str(raw_check.get("started_at")),
                 completed_at=_optional_str(raw_check.get("completed_at")),
+                creator_login=_author_login(raw_check.get("app")),
+                description=(
+                    _optional_str(raw_check["output"].get("summary"))
+                    if isinstance(raw_check.get("output"), dict)
+                    else None
+                ),
             )
         )
     return checks, errors
@@ -697,6 +709,9 @@ def _parse_commit_statuses_payload(payload: object) -> tuple[list[PullRequestChe
                 url=_optional_str(raw_status.get("target_url")),
                 created_at=_optional_str(raw_status.get("created_at")),
                 completed_at=_optional_str(raw_status.get("updated_at")),
+                creator_login=_author_login(raw_status.get("creator")),
+                creator_id=_author_id(raw_status.get("creator")),
+                description=_optional_str(raw_status.get("description")),
             )
         )
     return checks, errors

@@ -137,6 +137,14 @@ def build_parser() -> argparse.ArgumentParser:
             help=f"Maximum review/revision rounds (default: {DEFAULT_MAX_ROUNDS}).",
         )
         subparser.add_argument("--auto-merge", action="store_true")
+        subparser.add_argument(
+            "--managed-ci-trusted-actor",
+            default=None,
+            help=(
+                "GitHub login trusted for v2 managed CI; must match the repository "
+                "Actions variable AGENT_LOOP_MANAGED_ACTOR."
+            ),
+        )
         subparser.add_argument("--dry-run", action="store_true")
         subparser.add_argument(
             "--implementation-coder",

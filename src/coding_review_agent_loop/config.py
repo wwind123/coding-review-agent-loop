@@ -175,6 +175,9 @@ class AgentLoopConfig:
     # invocations enable this automatically with --auto-merge; direct config
     # constructions remain conservative unless they set it explicitly.
     watch_pending_ci: bool = False
+    # Optional v2 managed-CI identity. A repository must independently opt in
+    # with its Actions variable before this can suppress any automatic matrix.
+    managed_ci_trusted_actor: str | None = None
     invocation_argv: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -950,6 +953,7 @@ def config_from_args(
             if getattr(args, "watch_pending_ci", None) is None
             else bool(args.watch_pending_ci)
         ),
+        managed_ci_trusted_actor=getattr(args, "managed_ci_trusted_actor", None),
         invocation_argv=invocation_argv,
         ci_queued_grace_seconds=getattr(args, "ci_queued_grace_seconds", 1200),
         mergeability_poll_attempts=getattr(args, "mergeability_poll_attempts", 3),

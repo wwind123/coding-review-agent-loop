@@ -1262,6 +1262,75 @@ Failing GitHub checks always block approval and can route back to the coder. Pen
 
 ### Managed exact-head CI
 
+#### v2 authenticated opening and exact-head provenance
+
+V2 is an explicit opt-in migration that prevents the opening-event matrix race.
+Set the base repository Actions variable `AGENT_LOOP_MANAGED_ACTOR` and pass
+the same login with `--managed-ci-trusted-actor`. Agent-loop verifies both that
+variable and the authenticated `gh api user` login/ID, reads the workflow from
+the resolved base ref, and requires its `AGENT_LOOP_MANAGED_CI_V2` marker.
+Missing/mismatched trust disables v2 suppression; marker-free repositories use
+ordinary CI and complete v1 workflows keep their post-open label handoff.
+
+Participating repositories must make the v2 workflow contract literal and
+complete. The committed `.github/workflows/ci.yml` must contain all of these
+feature markers exactly: `AGENT_LOOP_MANAGED_CI_V2`, `workflow_dispatch`,
+`managed_nonce`, and `final-ci/exact-head`. Its `workflow_dispatch` inputs must
+be named `protocol_version`, `pr_number`, `expected_head_sha`, and
+`managed_nonce`. The dispatched workflow must set this exact run name (where
+`managed_nonce` is the input):
+
+```yaml
+run-name: managed-ci-v2 nonce=${{ inputs.managed_nonce }}
+```
+
+The final publisher must post the `final-ci/exact-head` commit status to
+`expected_head_sha`, with a semicolon-delimited description containing these
+exact tokens (in any order):
+
+```text
+nonce=<managed_nonce>;run_id=<github.run_id>;attempt=<github.run_attempt>
+```
+
+Its `target_url` must end in `/actions/runs/<github.run_id>`. Agent-loop
+matches each token and the final URL path segment exactly; a matching prefix,
+another run, or an earlier rerun attempt is not accepted. The publisher should
+run under `github-actions[bot]` (or the configured trusted actor when posting
+through that account).
+
+For auto-merge issue work, a v2 preflight gives the coder an atomic creation
+intent: create or verify `agent-loop-managed`, use the reserved
+`agent-loop/managed-<issue>` branch, then run `gh pr create --draft --label
+agent-loop-managed`. The workflow can suppress opened/reopened/synchronize
+matrices only for the complete tuple: same-repository head, trusted REST
+author, reserved branch, draft, and label. A contributor-editable label,
+branch, or body alone is never trusted. Forks, ordinary PRs, and prematurely
+ready managed PRs retain regular CI; removing the managed label from a draft is
+the explicit recovery path back to ordinary current-head CI.
+
+V2 dispatches `ci.yml` at the base ref with protocol version, PR, exact SHA,
+and a random nonce. The workflow run name, checkout verification, per-PR/SHA
+concurrency group, and always-running publisher must carry those inputs. Its
+`final-ci/exact-head` status description includes nonce, run ID, and attempt,
+and targets that run. Agent-loop persists one actor-owned hidden
+`AGENT_MANAGED_CI_INTENT_V2` comment, rediscovers it after interruption, and
+converges same-nonce duplicate dispatches to the newest surviving run. It
+accepts neither green nor red same-context statuses unless publisher, nonce,
+attached run, and latest attempt all correlate. A failure is reported from the
+validated run's failing jobs, not base-ref PR checks.
+
+After correlated success, agent-loop applies `agent-loop-exact-head-qualified`,
+marks the PR ready, rechecks its head, and merges with `--match-head-commit`.
+Interrupted labeled drafts remain non-mergeable; rerun the issue loop to resume
+the intent, or remove the managed label to deliberately release ordinary CI.
+
+A v2 issue-created PR has zero billed routing jobs at opening, zero hosted
+minutes per intermediate revision, one final matrix, and one rounded
+publisher/aggregate minute—about 11–14 minutes for a 10–13 minute matrix.
+`agent-loop pr <n>` has already paid the ordinary opening matrix and remains
+roughly the earlier 20–25-minute shape plus recovery work. Keep routing,
+aggregate, and qualification telemetry separate for billing comparisons.
+
 Under `--auto-merge`, agent-loop automatically detects a same-repository PR
 whose `.github/workflows/ci.yml` advertises the `agent-loop-managed`,
 `final-ci/exact-head`, and `expected_head_sha` contract. It applies the managed
