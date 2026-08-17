@@ -101,9 +101,11 @@ from .evidence_reconciliation import (
 )
 from .memory import AgentMemoryContext, prepare_agent_memory
 from .managed_ci import (
+    MANAGED_LABEL,
     activate_managed_ci,
     dispatch_final_qualification,
     intermediate_managed_checks,
+    managed_label_present,
     preflight_managed_ci_creation,
     prepare_v2_merge,
     publish_round_readiness,
@@ -3885,6 +3887,12 @@ def _implement_approved_issue(
     managed_ci_creation_intent = preflight_managed_ci_creation(
         runner, config=implementation_config, issue_number=issue_number
     )
+    if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
+        print(
+            "WARNING: --allow-unprotected-managed-ci is active for this invocation. GitHub cannot "
+            "prevent a manual merge, other automation, a compromised credential, or an agent-loop "
+            "defect from bypassing the voluntary final-ci/exact-head gate."
+        )
     log(config, f"Planning approved; invoking {coder_name} to implement issue #{issue_number}")
     assigned_head_before = _read_assigned_workdir_head(runner, implementation_config)
     coder_response = _run_validated_agent(
@@ -4009,6 +4017,11 @@ def _implement_approved_issue(
             ),
         ),
     )
+    if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
+        implementation_config = dataclasses_replace(
+            implementation_config,
+            managed_ci_expected_override_nonce=managed_ci_creation_intent.audit_nonce,
+        )
     return run_pr_loop(
         runner,
         pr_number=pr_number,
@@ -6864,6 +6877,18 @@ def run_pr_loop(
                         print(f"PR #{pr_number} approval found; dry-run preview did not perform live CI watching.")
                         return 0
                     if watch_outcome.status in {"passed", "no_checks"}:
+                        # A later invocation may omit the explicit override
+                        # while the opening label still suppresses pull_request
+                        # CI.  `no_checks` must never become a merge permit in
+                        # that state.
+                        label_live = managed_label_present(
+                            runner, config=config, pr_number=pr_number
+                        )
+                        if watch_outcome.status == "no_checks" and label_live is not False:
+                            raise AgentLoopError(
+                                f"PR #{pr_number} has no ordinary CI checks while `{MANAGED_LABEL}` "
+                                "is present or unreadable; remove the label and wait for real CI before merging."
+                            )
                         _publish_approved_followups(
                             runner,
                             config=config,

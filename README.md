@@ -658,6 +658,24 @@ advertise safe adoption and an operator can explicitly request it only with
 --managed-ci-adopt-existing-pr`. The managed-CI guide documents the required
 branch-protection guard, timeline provenance, and durable opt-out.
 
+Before enabling managed CI, run the read-only readiness report:
+
+```bash
+agent-loop managed-ci preflight --repo OWNER/REPO --base main --trusted-actor LOGIN
+```
+
+It exits `0` only for GitHub-enforced exact-head protection, `10` for a
+deterministic configuration/fallback/explicit-override result, and `11` when
+GitHub evidence is unavailable or ambiguous. It makes no writes. Protected mode
+is the default. A personal, consciously supervised private repository that is
+otherwise ready but cannot use GitHub protection may use the deliberately
+per-invocation `--allow-unprotected-managed-ci` flag on authenticated plan-first
+issue work; it never applies to existing-PR adoption or dangerous permissions.
+This is an intentional tightening for suppression-capable v2 workflows: a
+repository that previously used issue-created v2 without non-bypassable GitHub
+protection now returns to ordinary CI unless that explicit per-run waiver is
+present.
+
 For repositories without that contract, `--auto-merge` foreground-polls the
 complete check board after approval with
 `--ci-timeout-seconds` and

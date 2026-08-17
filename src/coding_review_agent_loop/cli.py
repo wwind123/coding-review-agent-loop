@@ -26,6 +26,14 @@ from .config import (
     reviewers,
 )
 from .errors import AgentLoopError, QuotaResetExceededError
+from .managed_ci import (
+    PREFLIGHT_INDETERMINATE,
+    PREFLIGHT_KNOWN_NOT_READY,
+    PREFLIGHT_STRICT_READY,
+    ManagedCiProbeContext,
+    evaluate_managed_ci_readiness,
+    render_managed_ci_preflight,
+)
 from .github import (
     detect_repo,
     get_check_status,
@@ -553,11 +561,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_common(issue)
+    issue.add_argument(
+        "--allow-unprotected-managed-ci", action="store_true",
+        help=(
+            "Per-invocation waiver for plan-first issue-created managed CI when GitHub "
+            "cannot independently enforce final-ci/exact-head. Requires --auto-merge and "
+            "--managed-ci-trusted-actor; never applies to existing-PR adoption."
+        ),
+    )
     add_review_parallel(issue)
 
     pr = subparsers.add_parser("pr", help="Run the reviewer/coder loop on an existing PR.")
     pr.add_argument("pr_number", type=int)
     add_common(pr)
+    pr.add_argument(
+        "--allow-unprotected-managed-ci", action="store_true",
+        help=(
+            "Per-invocation waiver for plan-first issue-created managed CI when GitHub "
+            "cannot independently enforce final-ci/exact-head. Requires --auto-merge and "
+            "--managed-ci-trusted-actor; never applies to existing-PR adoption."
+        ),
+    )
     pr.add_argument(
         "--managed-ci-adopt-existing-pr",
         action="store_true",
@@ -567,6 +591,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_review_parallel(pr)
+
+    managed_ci = subparsers.add_parser("managed-ci", help="Inspect managed-CI readiness without writes.")
+    managed_ci_subparsers = managed_ci.add_subparsers(dest="managed_ci_command", required=True)
+    preflight = managed_ci_subparsers.add_parser("preflight", help="Read-only managed-CI readiness report.")
+    preflight.add_argument("--repo", required=True, help="GitHub repository as owner/name.")
+    preflight.add_argument("--base", default=None, help="Base branch (defaults to repository default branch).")
+    preflight.add_argument("--trusted-actor", required=True, help="Expected authenticated GitHub login.")
+    preflight.add_argument("--gh-cmd", default="gh", help="GitHub CLI executable (default: gh).")
 
     task = subparsers.add_parser(
         "task",
@@ -711,6 +743,21 @@ def _resolve_task_text(args: argparse.Namespace) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "managed-ci" and args.managed_ci_command == "preflight":
+        try:
+            context = ManagedCiProbeContext(args.repo, args.gh_cmd, Path.cwd())
+            result = evaluate_managed_ci_readiness(
+                Runner(dry_run=False), context=context, base=args.base, trusted_actor=args.trusted_actor
+            )
+            print(render_managed_ci_preflight(result, repo=args.repo, base=args.base or "<default>", trusted_actor=args.trusted_actor))
+            if result.state == "strict_ready":
+                return PREFLIGHT_STRICT_READY
+            if result.state == "indeterminate":
+                return PREFLIGHT_INDETERMINATE
+            return PREFLIGHT_KNOWN_NOT_READY
+        except AgentLoopError as exc:
+            print(f"agent-loop: {exc}", file=sys.stderr)
+            return PREFLIGHT_INDETERMINATE
     runner = Runner(dry_run=args.dry_run)
     try:
         # Preserve tokens (rather than a rendered command) so timeout guidance can
@@ -733,6 +780,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError(
                     "--managed-ci-adopt-existing-pr requires --managed-ci-trusted-actor."
                 )
+        if getattr(args, "allow_unprotected_managed_ci", False):
+            if args.command not in {"issue", "pr"}:
+                raise AgentLoopError("--allow-unprotected-managed-ci is only supported with issue or pr.")
+            if not args.auto_merge:
+                raise AgentLoopError("--allow-unprotected-managed-ci requires --auto-merge.")
+            if not (args.managed_ci_trusted_actor or "").strip():
+                raise AgentLoopError("--allow-unprotected-managed-ci requires --managed-ci-trusted-actor.")
+            if getattr(args, "managed_ci_adopt_existing_pr", False):
+                raise AgentLoopError("--allow-unprotected-managed-ci cannot be used with --managed-ci-adopt-existing-pr.")
         if args.command == "issue":
             if args.implement_after_approval and not args.plan_first:
                 raise AgentLoopError("--implement-after-approval requires --plan-first.")

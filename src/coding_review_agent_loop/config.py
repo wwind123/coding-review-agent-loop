@@ -181,6 +181,13 @@ class AgentLoopConfig:
     # Explicit PR-mode opt-in for adopting an already-open PR into the v2
     # managed-CI protocol.  Kept separate from the issue-created v2 flow.
     managed_ci_adopt_existing_pr: bool = False
+    # A consciously per-invocation waiver for issue-created v2 only. It is
+    # never read from the environment or durable PR state.
+    allow_unprotected_managed_ci: bool = False
+    # Runtime-only correlation value minted by the issue-created preflight.
+    # It is intentionally not a CLI option: a later invocation must perform a
+    # new preflight rather than accepting a PR-body token it did not create.
+    managed_ci_expected_override_nonce: str | None = None
     invocation_argv: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -958,6 +965,7 @@ def config_from_args(
         ),
         managed_ci_trusted_actor=getattr(args, "managed_ci_trusted_actor", None),
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
+        allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),
         invocation_argv=invocation_argv,
         ci_queued_grace_seconds=getattr(args, "ci_queued_grace_seconds", 1200),
         mergeability_poll_attempts=getattr(args, "mergeability_poll_attempts", 3),
