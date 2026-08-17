@@ -15,7 +15,7 @@ from .config import AgentLoopConfig, reviewers
 from .decomposition import MAX_DECOMPOSITION_PHASES
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .memory import AgentMemoryContext, format_agent_memory_context
-from .managed_ci import ManagedCiCreationIntent
+from .managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
 from .salvage import AGENT_SALVAGE_MARKER_RE
 from .round_transport import is_round_transport_sidecar
 from .protocol import (
@@ -1737,11 +1737,19 @@ def build_issue_implementation_prompt(
     managed_creation_guidance = ""
     if managed_ci_creation_intent is not None:
         branch = managed_ci_creation_intent.branch
+        override = ""
+        if managed_ci_creation_intent.audit_nonce:
+            override = (
+                " This invocation is using the explicit unprotected override. Include this exact "
+                f"PR-body trailer on its own line: `{UNPROTECTED_OVERRIDE_TRAILER} nonce={managed_ci_creation_intent.audit_nonce}`. "
+                "GitHub cannot stop a manual merge, other automation, a compromised credential, "
+                "or an agent-loop defect from bypassing this voluntary gate."
+            )
         managed_creation_guidance = (
             "\nThis repository has authenticated managed-CI v2 enabled. Create the PR atomically: "
             f"use the reserved branch `{branch}`, create/verify the `agent-loop-managed` label first, "
             "then run `gh pr create --draft --label agent-loop-managed`. Do not mark it ready until "
-            "agent-loop's final exact-head qualification succeeds.\n"
+            f"agent-loop's final exact-head qualification succeeds.{override}\n"
         )
     return f"""Implement the approved plan for GitHub issue #{issue_number} in {config.repo}.
 

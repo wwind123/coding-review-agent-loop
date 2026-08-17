@@ -15,6 +15,8 @@ from coding_review_agent_loop.managed_ci import (
     MANAGED_OPT_OUT_LABEL,
     READINESS_CONTEXT,
     ManagedCiContract,
+    ManagedCiProbeContext,
+    assess_exact_head_protection,
     _dispatch_v2_qualification,
     _ensure_v2_intent,
     _v2_failed_jobs,
@@ -223,6 +225,21 @@ class V2ManagedRunner(ManagedRunner):
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, f"{self.pr_payload.get('headRefOid')}\n", "", 0)
         return super()._run_locked(args, cwd=cwd, check=check)
+
+
+def test_protection_assessment_distinguishes_private_free_plan_limit(tmp_path):
+    runner = FakeRunner(
+        pr_branch_protection_returncode=1,
+        pr_branch_protection_stderr="Upgrade to GitHub Pro or make this repository public",
+    )
+
+    assessment = assess_exact_head_protection(
+        runner,
+        context=ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path),
+        base="main",
+    )
+
+    assert assessment.state == "plan_limited"
 
 
 def metadata(*, base_branch="main"):

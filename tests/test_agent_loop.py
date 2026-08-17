@@ -1278,6 +1278,27 @@ def test_config_records_explicit_existing_pr_managed_ci_adoption(tmp_path):
     assert config.managed_ci_adopt_existing_pr is True
 
 
+def test_config_records_per_invocation_unprotected_managed_ci_override(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "issue", "658", "--repo", "OWNER/REPO", "--auto-merge",
+        "--managed-ci-trusted-actor", "agent-loop", "--allow-unprotected-managed-ci",
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.allow_unprotected_managed_ci is True
+
+
+def test_unprotected_managed_ci_override_rejects_existing_pr_adoption(capsys):
+    assert main([
+        "pr", "77", "--repo", "OWNER/REPO", "--auto-merge",
+        "--managed-ci-trusted-actor", "agent-loop", "--managed-ci-adopt-existing-pr",
+        "--allow-unprotected-managed-ci",
+    ]) == 1
+    assert "cannot be used with --managed-ci-adopt-existing-pr" in capsys.readouterr().err
+
+
 def test_config_does_not_enable_ci_watch_without_auto_merge(tmp_path):
     parser = build_parser()
     args = parser.parse_args(["pr", "77", "--repo", "OWNER/REPO"])

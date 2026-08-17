@@ -1262,6 +1262,47 @@ Failing GitHub checks always block approval and can route back to the coder. Pen
 
 ### Managed exact-head CI
 
+#### Read-only readiness preflight and unprotected override
+
+Run this before starting agents or creating a PR:
+
+```bash
+agent-loop managed-ci preflight --repo OWNER/REPO --base main --trusted-actor LOGIN
+```
+
+The command only reads repository, identity, Actions-variable, workflow, branch
+protection, and ruleset APIs. It reports visibility, the authenticated and
+configured actors, workflow/recovery completeness, and whether GitHub can
+independently enforce `final-ci/exact-head`. Its deterministic exit values are
+`0` (strict-ready), `10` (known non-ready, ordinary fallback, invalid contract,
+or override-eligible), and `11` (ambiguous API/probe failure). A private-GitHub
+Free protection API response that says to upgrade or make the repository public
+is reported as a plan limitation, not as a missing actor permission.
+
+Strict means either classic required-status protection includes
+`final-ci/exact-head` *and* enforces administrators, or an active applicable
+ruleset requires that context without bypass actors. Context-only classic rules
+with admin bypass, evaluate/disabled rulesets, and rulesets with bypass actors
+are voluntary rather than strict. Existing-PR adoption always requires strict,
+non-bypassable enforcement.
+
+For an otherwise eligible authenticated plan-first issue-created v2 invocation,
+`--allow-unprotected-managed-ci` may waive only that protection prerequisite.
+It must be written on every invocation; an old label, audit trailer, or
+`--dangerous-agent-permissions` never re-enables it. The coder records the
+override nonce in the PR body and agent-loop warns locally. This is not suitable
+for shared repositories or unattended automation: GitHub cannot prevent a
+manual merge, another automation, a compromised credential, or an agent-loop
+defect from bypassing the voluntary gate. The flag is rejected for adoption and
+does not waive identity, workflow, nonce, exact-head qualification, or
+`--match-head-commit` merge checks.
+
+Suppression-capable v2 workflows must additionally advertise
+`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` and subscribe their
+`pull_request` trigger to `unlabeled`; when a managed label is released,
+ordinary CI must emit a new check on the current head. Agent-loop refuses to
+merge a managed-labeled PR on a `no_checks` board.
+
 #### v2 authenticated opening and exact-head provenance
 
 V2 is an explicit opt-in migration that prevents the opening-event matrix race.
