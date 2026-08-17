@@ -81,6 +81,9 @@ class ManagedCiReadiness:
     protection: ProtectionAssessment
     reasons: tuple[str, ...]
     remediation: tuple[str, ...]
+    # The evaluator resolves the repository default before it probes the
+    # workflow.  Keep that value so preflight reports the branch it assessed.
+    base: str | None = None
 
 
 PREFLIGHT_STRICT_READY = 0
@@ -347,6 +350,28 @@ def _probe_json(runner: Runner, context: ManagedCiProbeContext, endpoint: str) -
     return (payload if isinstance(payload, dict) else None), result
 
 
+def _probe_json_list(
+    runner: Runner, context: ManagedCiProbeContext, endpoint: str
+) -> tuple[list[object] | None, object]:
+    """Read a GitHub list response without treating a valid array as malformed."""
+    result = _probe(runner, context, endpoint)
+    if result.returncode != 0:
+        return None, result
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return None, result
+    return (payload if isinstance(payload, list) else None), result
+
+
+def _is_http_error(result: object, *statuses: int) -> bool:
+    """`gh api` uses exit 1 for HTTP errors, so inspect its diagnostic text."""
+    combined = " ".join(
+        str(getattr(result, field, "") or "") for field in ("stdout", "stderr")
+    ).casefold()
+    return any(str(status) in combined for status in statuses)
+
+
 def _probe_raw_workflow(runner: Runner, context: ManagedCiProbeContext, base: str) -> str | None:
     result = _probe(
         runner, context,
@@ -378,23 +403,24 @@ def assess_exact_head_protection(
     required, required_result = _probe_json(
         runner, context, f"repos/{context.repo}/branches/{base}/protection/required_status_checks"
     )
-    if required is None:
-        stderr = (required_result.stderr or "").lower()
-        if "upgrade to github pro" in stderr or "make this repository public" in stderr:
-            return ProtectionAssessment("plan_limited", "classic", "GitHub plan/API does not permit branch protection")
-        if required_result.returncode == 404:
-            return ProtectionAssessment("voluntary", "classic", "required status protection is not configured")
-        return ProtectionAssessment("indeterminate", "classic", "required-status protection could not be inspected")
-
-    classic_state: Literal["voluntary", "indeterminate"] | None = None
+    classic_state: Literal["voluntary", "plan_limited", "indeterminate"] | None = None
     classic_detail = "final-ci/exact-head is not independently required"
-    if _has_final_context(required):
+    if required is None:
+        combined = " ".join((required_result.stdout or "", required_result.stderr or "")).casefold()
+        if "upgrade to github pro" in combined or "make this repository public" in combined:
+            classic_state = "plan_limited"
+            classic_detail = "GitHub plan/API does not permit branch protection"
+        elif _is_http_error(required_result, 404):
+            classic_state = "voluntary"
+            classic_detail = "required status protection is not configured"
+        else:
+            classic_state = "indeterminate"
+            classic_detail = "required-status protection could not be inspected"
+    elif _has_final_context(required):
         admins, admins_result = _probe_json(
             runner, context, f"repos/{context.repo}/branches/{base}/protection/enforce_admins"
         )
-        # Empty responses are accepted only for compatibility with older gh
-        # test doubles; GitHub's real endpoint is a JSON object with enabled.
-        if admins is not None and (not admins or admins.get("enabled") is True):
+        if admins is not None and admins.get("enabled") is True:
             return ProtectionAssessment("strict", "classic", "final-ci/exact-head is required and admins are enforced")
         if admins is not None and admins.get("enabled") is False:
             classic_state = "voluntary"
@@ -406,14 +432,13 @@ def assess_exact_head_protection(
             classic_state = "indeterminate"
             classic_detail = "admin enforcement response was malformed"
 
-    rules, rules_result = _probe_json(runner, context, f"repos/{context.repo}/rules/branches/{base}")
+    rules, rules_result = _probe_json_list(runner, context, f"repos/{context.repo}/rules/branches/{base}")
     if rules is None:
-        if rules_result.returncode in {404, 422}:
+        if _is_http_error(rules_result, 404, 422):
             return ProtectionAssessment(classic_state or "voluntary", "classic" if classic_state else "none", classic_detail)
         return ProtectionAssessment("indeterminate", "rulesets", "effective branch rules could not be inspected")
-    entries = rules.get("rules") if isinstance(rules.get("rules"), list) else []
     voluntary = False
-    for entry in entries:
+    for entry in rules:
         if not isinstance(entry, dict):
             continue
         ruleset_id = entry.get("ruleset_id") or entry.get("id")
@@ -431,6 +456,8 @@ def assess_exact_head_protection(
         return ProtectionAssessment("strict", "ruleset", "active ruleset requires final-ci/exact-head without bypass actors")
     if classic_state == "indeterminate":
         return ProtectionAssessment("indeterminate", "classic", classic_detail)
+    if classic_state == "plan_limited":
+        return ProtectionAssessment("plan_limited", "classic", classic_detail)
     return ProtectionAssessment(
         "voluntary", "rulesets" if voluntary else ("classic" if classic_state else "none"),
         "matching ruleset is bypassable/evaluate-mode" if voluntary else classic_detail,
@@ -457,7 +484,7 @@ def evaluate_managed_ci_readiness(
     actor = who.get("login") if who and isinstance(who.get("login"), str) else None
     advertised = variable.get("value") if variable and isinstance(variable.get("value"), str) else None
     protection = assess_exact_head_protection(runner, context=context, base=resolved_base)
-    if workflow is None or who is None or (variable is None and variable_result.returncode not in {404}):
+    if workflow is None or who is None or (variable is None and not _is_http_error(variable_result, 404)):
         return ManagedCiReadiness("indeterminate", visibility, actor, advertised, False, False, protection,
             ("a required read-only GitHub probe failed",), ())
     core = V2_MARKER in workflow
@@ -467,30 +494,31 @@ def evaluate_managed_ci_readiness(
     # any workflow that does opt into pull_request suppression must advertise
     # the explicit recovery marker and unlabeled activity.
     recovery = (RECOVERY_MARKER in workflow and "unlabeled" in workflow) or "pull_request" not in workflow
-    identity_ok = bool(actor and advertised and trusted_actor.strip() and actor.casefold() == trusted_actor.casefold() == advertised.casefold())
+    expected_actor = trusted_actor.strip()
+    identity_ok = bool(actor and advertised and expected_actor and actor.casefold() == expected_actor.casefold() == advertised.casefold())
     if not core:
         return ManagedCiReadiness("ordinary_fallback", visibility, actor, advertised, False, recovery, protection,
-            ("base workflow does not advertise managed-CI v2",), ("deploy the documented managed-CI v2 workflow",))
+            ("base workflow does not advertise managed-CI v2",), ("deploy the documented managed-CI v2 workflow",), resolved_base)
     if not complete or not recovery:
         missing = "complete v2 contract" if not complete else "unlabeled recovery contract"
         return ManagedCiReadiness("invalid", visibility, actor, advertised, complete, recovery, protection,
-            (f"workflow lacks the {missing}",), ("add the documented workflow markers and pull_request unlabeled trigger",))
+            (f"workflow lacks the {missing}",), ("add the documented workflow markers and pull_request unlabeled trigger",), resolved_base)
     if not identity_ok:
         return ManagedCiReadiness("ordinary_fallback", visibility, actor, advertised, complete, recovery, protection,
             ("authenticated login, trusted actor, and AGENT_LOOP_MANAGED_ACTOR do not match",),
-            (f"gh variable set AGENT_LOOP_MANAGED_ACTOR --repo {shlex.quote(context.repo)} --body {shlex.quote(trusted_actor)}",))
+            (f"gh variable set AGENT_LOOP_MANAGED_ACTOR --repo {shlex.quote(context.repo)} --body {shlex.quote(expected_actor)}",), resolved_base)
     if protection.state == "strict":
-        return ManagedCiReadiness("strict_ready", visibility, actor, advertised, complete, recovery, protection, (), ())
+        return ManagedCiReadiness("strict_ready", visibility, actor, advertised, complete, recovery, protection, (), (), resolved_base)
     if protection.state in {"voluntary", "plan_limited"}:
         return ManagedCiReadiness("override_eligible", visibility, actor, advertised, complete, recovery, protection,
-            (protection.detail,), ("configure non-bypassable final-ci/exact-head protection, or use --allow-unprotected-managed-ci for this invocation",))
+            (protection.detail,), ("configure non-bypassable final-ci/exact-head protection, or use --allow-unprotected-managed-ci for this invocation",), resolved_base)
     return ManagedCiReadiness("indeterminate", visibility, actor, advertised, complete, recovery, protection,
-        (protection.detail,), ())
+        (protection.detail,), (), resolved_base)
 
 
 def render_managed_ci_preflight(result: ManagedCiReadiness, *, repo: str, base: str, trusted_actor: str) -> str:
     lines = [
-        f"repository: {repo}", f"base: {base}", f"visibility: {result.repo_visibility or 'unknown'}",
+        f"repository: {repo}", f"base: {result.base or base}", f"visibility: {result.repo_visibility or 'unknown'}",
         f"workflow: {'v2 complete' if result.workflow_v2 else 'ordinary/absent'}",
         f"recovery: {'unlabeled capable' if result.recovery_capable else 'missing'}",
         f"actor: authenticated={result.actor or 'unknown'} trusted={trusted_actor} variable={result.advertised_actor or 'missing'}",
@@ -526,7 +554,8 @@ def preflight_managed_ci_creation(
         trusted_actor=config.managed_ci_trusted_actor,
     )
     if readiness.state == "indeterminate" and not legacy_non_suppressing:
-        raise AgentLoopError("Managed-CI readiness could not be determined; refusing to suppress CI.")
+        log(config, "Managed-CI readiness could not be determined; continuing with ordinary CI.")
+        return None
     if readiness.state == "indeterminate":
         who = _api_json(runner, config, "user", quiet=True)
         advertised = _api_json(
@@ -548,17 +577,31 @@ def preflight_managed_ci_creation(
         readiness.state == "override_eligible" and (config.allow_unprotected_managed_ci or legacy_non_suppressing)
     ):
         return None
-    workflow = source_workflow
-    if workflow is None or V2_MARKER not in workflow:
-        return None
-    if any(marker not in workflow for marker in V2_FEATURE_MARKERS):
-        raise AgentLoopError("Repository CI advertises an incomplete managed-CI v2 contract.")
     return ManagedCiCreationIntent(
         branch=f"agent-loop/managed-{issue_number}",
         trusted_actor=readiness.actor or config.managed_ci_trusted_actor,
         protection_mode=readiness.protection.state,
         audit_nonce=secrets.token_urlsafe(18) if config.allow_unprotected_managed_ci else None,
     )
+
+
+def _restore_ordinary_ci_after_v2_fallback(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, reason: str
+) -> None:
+    """Remove the issue-created suppression label before returning to ordinary CI."""
+    result = runner.run(
+        [
+            config.gh_cmd, "api", "--method", "DELETE",
+            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
+        ],
+        cwd=active_workdir(config), check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError(
+            f"Managed-CI v2 could not activate ({reason}) and `{MANAGED_LABEL}` could not be removed. "
+            "Remove the label before relying on ordinary CI."
+        )
+    log(config, f"PR #{pr_number}: removed `{MANAGED_LABEL}`; continuing with ordinary CI ({reason})")
 
 
 def _activate_v2_managed_ci(
@@ -655,11 +698,25 @@ def _activate_v2_managed_ci(
             body = pr.get("body") if isinstance(pr.get("body"), str) else ""
             marker_line = next((line.strip() for line in body.splitlines() if line.strip().startswith(UNPROTECTED_OVERRIDE_TRAILER)), "")
             if not config.allow_unprotected_managed_ci or protection.state not in {"voluntary", "plan_limited"} or not marker_line:
+                _restore_ordinary_ci_after_v2_fallback(
+                    runner, config=config, pr_number=pr_number,
+                    reason="strict protection or the explicit override is unavailable",
+                )
                 return None
             parts = marker_line.split("nonce=", 1)
             if len(parts) != 2 or not parts[1].strip():
+                _restore_ordinary_ci_after_v2_fallback(
+                    runner, config=config, pr_number=pr_number,
+                    reason="the override trailer has no nonce",
+                )
                 return None
             override_nonce = parts[1].strip().split()[0]
+            if override_nonce != config.managed_ci_expected_override_nonce:
+                _restore_ordinary_ci_after_v2_fallback(
+                    runner, config=config, pr_number=pr_number,
+                    reason="the override trailer is not correlated to this invocation",
+                )
+                return None
             audit = runner.run(
                 [
                     config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/comments",
@@ -672,11 +729,21 @@ def _activate_v2_managed_ci(
                 ], cwd=active_workdir(config), check=False,
             )
             if audit.returncode != 0:
+                _restore_ordinary_ci_after_v2_fallback(
+                    runner, config=config, pr_number=pr_number,
+                    reason="the override audit comment could not be recorded",
+                )
                 return None
             try:
                 audit_id = json.loads(audit.stdout or "{}").get("id")
             except json.JSONDecodeError:
                 audit_id = None
+            if not isinstance(audit_id, int):
+                _restore_ordinary_ci_after_v2_fallback(
+                    runner, config=config, pr_number=pr_number,
+                    reason="the override audit comment response was malformed",
+                )
+                return None
         else:
             audit_id = None
     else:

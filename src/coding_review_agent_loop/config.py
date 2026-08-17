@@ -184,6 +184,10 @@ class AgentLoopConfig:
     # A consciously per-invocation waiver for issue-created v2 only. It is
     # never read from the environment or durable PR state.
     allow_unprotected_managed_ci: bool = False
+    # Runtime-only correlation value minted by the issue-created preflight.
+    # It is intentionally not a CLI option: a later invocation must perform a
+    # new preflight rather than accepting a PR-body token it did not create.
+    managed_ci_expected_override_nonce: str | None = None
     invocation_argv: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:

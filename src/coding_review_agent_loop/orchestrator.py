@@ -4017,6 +4017,11 @@ def _implement_approved_issue(
             ),
         ),
     )
+    if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
+        implementation_config = dataclasses_replace(
+            implementation_config,
+            managed_ci_expected_override_nonce=managed_ci_creation_intent.audit_nonce,
+        )
     return run_pr_loop(
         runner,
         pr_number=pr_number,
@@ -6879,7 +6884,7 @@ def run_pr_loop(
                         label_live = managed_label_present(
                             runner, config=config, pr_number=pr_number
                         )
-                        if watch_outcome.status == "no_checks" and label_live is True:
+                        if watch_outcome.status == "no_checks" and label_live is not False:
                             raise AgentLoopError(
                                 f"PR #{pr_number} has no ordinary CI checks while `{MANAGED_LABEL}` "
                                 "is present or unreadable; remove the label and wait for real CI before merging."

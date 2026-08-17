@@ -1297,6 +1297,15 @@ defect from bypassing the voluntary gate. The flag is rejected for adoption and
 does not waive identity, workflow, nonce, exact-head qualification, or
 `--match-head-commit` merge checks.
 
+This intentionally tightens the issue-created v2 path for workflows that can
+suppress `pull_request` CI. A repository that previously ran that v2 flow
+without non-bypassable GitHub protection now uses ordinary CI unless the
+operator supplies the explicit waiver for that invocation. If activation later
+cannot prove readiness, a later waiver is omitted, or the override audit
+comment cannot be written, agent-loop removes `agent-loop-managed` and waits
+for the workflow's `unlabeled` recovery CI instead of treating a `no_checks`
+board as mergeable.
+
 Suppression-capable v2 workflows must additionally advertise
 `AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` and subscribe their
 `pull_request` trigger to `unlabeled`; when a managed label is released,
@@ -1349,6 +1358,13 @@ branch, or body alone is never trusted. Forks and ordinary PRs retain regular
 CI unless they are explicitly adopted as described below. The issue-created
 opening tuple remains unchanged: it alone requires a trusted author, reserved
 branch, and draft state.
+
+For an unprotected override, the coder carries the preflight-minted nonce in
+the creation trailer. During that same invocation agent-loop compares the
+trailer to its in-memory nonce and writes an actor-owned PR audit comment
+before accepting activation or dispatching qualification. A forged, stale, or
+mismatched trailer, or a failed audit write, releases the suppression label;
+a later invocation cannot reuse a body nonce as its authorization.
 
 #### Optional adoption of an existing PR
 

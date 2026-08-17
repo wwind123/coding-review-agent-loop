@@ -210,6 +210,10 @@ class FakeRunner(Runner):
         pr_branch_protection_payload=None,
         pr_branch_protection_returncode=0,
         pr_branch_protection_stderr="",
+        pr_enforce_admins_payload=None,
+        pr_effective_rules_payload=None,
+        pr_rulesets_payload=None,
+        repo_payload=None,
         pr_check_runs_returncode=0,
         pr_check_runs_stderr="",
         pr_status_returncode=0,
@@ -281,6 +285,14 @@ class FakeRunner(Runner):
         self.pr_branch_protection_payload = pr_branch_protection_payload or {"contexts": ["test"]}
         self.pr_branch_protection_returncode = pr_branch_protection_returncode
         self.pr_branch_protection_stderr = pr_branch_protection_stderr
+        self.pr_enforce_admins_payload = (
+            {"enabled": True} if pr_enforce_admins_payload is None else pr_enforce_admins_payload
+        )
+        self.pr_effective_rules_payload = list(pr_effective_rules_payload or [])
+        self.pr_rulesets_payload = dict(pr_rulesets_payload or {})
+        self.repo_payload = {"default_branch": repo_default_branch, "private": False}
+        if repo_payload:
+            self.repo_payload.update(repo_payload)
         self.pr_check_runs_returncode = pr_check_runs_returncode
         self.pr_check_runs_stderr = pr_check_runs_stderr
         self.pr_status_returncode = pr_status_returncode
@@ -837,6 +849,20 @@ class FakeRunner(Runner):
                 self.pr_branch_protection_stderr,
                 self.pr_branch_protection_returncode,
             )
+
+        if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/protection/enforce_admins"):
+            return CommandResult(cmd, cwd_path, json_dumps(self.pr_enforce_admins_payload), "", 0)
+
+        if cmd[:2] == ["gh", "api"] and "/rules/branches/" in cmd[2]:
+            return CommandResult(cmd, cwd_path, json_dumps(self.pr_effective_rules_payload), "", 0)
+
+        if cmd[:2] == ["gh", "api"] and "/rulesets/" in cmd[2]:
+            ruleset_id = cmd[2].rsplit("/", 1)[-1]
+            payload = self.pr_rulesets_payload.get(ruleset_id, self.pr_rulesets_payload.get(int(ruleset_id), {}))
+            return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
+
+        if cmd[:2] == ["gh", "api"] and cmd[2] == "repos/OWNER/REPO":
+            return CommandResult(cmd, cwd_path, json_dumps(self.repo_payload), "", 0)
 
         if cmd[:1] == ["sleep"]:
             return CommandResult(cmd, cwd_path, "", "", 0)

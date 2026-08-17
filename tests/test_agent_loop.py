@@ -9,6 +9,9 @@ from unittest.mock import patch
 
 import pytest
 
+import coding_review_agent_loop.cli as cli_module
+import coding_review_agent_loop.orchestrator as orchestrator_module
+
 from coding_review_agent_loop.agents.base import AgentResult, with_public_response_file_instruction
 from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER
 from coding_review_agent_loop.cli import (
@@ -31,7 +34,8 @@ from coding_review_agent_loop.config import (
     resolve_base_branch,
 )
 from coding_review_agent_loop.errors import AgentInvocationError, QuotaResetExceededError
-from coding_review_agent_loop.github import IssueComment
+from coding_review_agent_loop.github import CiWatchOutcome, IssueComment
+from coding_review_agent_loop.managed_ci import ManagedCiReadiness, ProtectionAssessment
 from coding_review_agent_loop.runner import CommandResult, ExecutableIdentity, ExecutionObservation
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
@@ -1297,6 +1301,41 @@ def test_unprotected_managed_ci_override_rejects_existing_pr_adoption(capsys):
         "--allow-unprotected-managed-ci",
     ]) == 1
     assert "cannot be used with --managed-ci-adopt-existing-pr" in capsys.readouterr().err
+
+
+def test_managed_ci_preflight_reports_the_resolved_base(monkeypatch, capsys):
+    result = ManagedCiReadiness(
+        "strict_ready", "private", "agent-loop", "agent-loop", True, True,
+        ProtectionAssessment("strict", "classic", "admins enforced"), (), (), "develop",
+    )
+    monkeypatch.setattr(cli_module, "evaluate_managed_ci_readiness", lambda *args, **kwargs: result)
+
+    assert main(["managed-ci", "preflight", "--repo", "OWNER/REPO", "--trusted-actor", "agent-loop"]) == 0
+
+    assert "base: develop" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("state", "expected"), [("override_eligible", 10), ("indeterminate", 11)])
+def test_managed_ci_preflight_uses_documented_nonready_exit_codes(monkeypatch, state, expected):
+    result = ManagedCiReadiness(
+        state, "private", "agent-loop", "agent-loop", True, True,
+        ProtectionAssessment("voluntary", "classic", "not enforced"), (), (), "main",
+    )
+    monkeypatch.setattr(cli_module, "evaluate_managed_ci_readiness", lambda *args, **kwargs: result)
+
+    assert main(["managed-ci", "preflight", "--repo", "OWNER/REPO", "--trusted-actor", "agent-loop"]) == expected
+
+
+def test_no_checks_never_merges_when_managed_label_state_is_unreadable(tmp_path):
+    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
+    config = make_config(tmp_path, auto_merge=True, watch_pending_ci=True)
+
+    with (
+        patch.object(orchestrator_module, "watch_pr_checks", return_value=CiWatchOutcome(status="no_checks")),
+        patch.object(orchestrator_module, "managed_label_present", return_value=None),
+        pytest.raises(AgentLoopError, match="present or unreadable"),
+    ):
+        run_pr_loop(runner, pr_number=77, config=config)
 
 
 def test_config_does_not_enable_ci_watch_without_auto_merge(tmp_path):

@@ -16,12 +16,14 @@ from coding_review_agent_loop.managed_ci import (
     READINESS_CONTEXT,
     ManagedCiContract,
     ManagedCiProbeContext,
+    UNPROTECTED_OVERRIDE_TRAILER,
     assess_exact_head_protection,
     _dispatch_v2_qualification,
     _ensure_v2_intent,
     _v2_failed_jobs,
     activate_managed_ci,
     dispatch_final_qualification,
+    evaluate_managed_ci_readiness,
     intermediate_managed_checks,
     preflight_managed_ci_creation,
     prepare_v2_merge,
@@ -63,6 +65,13 @@ on:
 jobs:
   aggregate:
     name: final-ci/exact-head
+"""
+
+SUPPRESSING_V2_WORKFLOW = V2_WORKFLOW + """
+# AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1
+on:
+  pull_request:
+    types: [opened, unlabeled]
 """
 
 
@@ -130,6 +139,7 @@ class V2ManagedRunner(ManagedRunner):
         actor_login="agent-loop",
         actor_id=1,
         advertised_actor=None,
+        missing_advertised_actor=False,
         issue_events=None,
         unreadable_issue_events_after_label=False,
         **kwargs,
@@ -155,6 +165,7 @@ class V2ManagedRunner(ManagedRunner):
         self.actor_login = actor_login
         self.actor_id = actor_id
         self.advertised_actor = advertised_actor or actor_login
+        self.missing_advertised_actor = missing_advertised_actor
         self.issue_events = list(issue_events or [])
         self.unreadable_issue_events_after_label = unreadable_issue_events_after_label
         self.labels_posted = False
@@ -175,6 +186,8 @@ class V2ManagedRunner(ManagedRunner):
             )
         if endpoint.endswith("/actions/variables/AGENT_LOOP_MANAGED_ACTOR"):
             cmd, cwd_path = self._record_command(args, cwd)
+            if self.missing_advertised_actor:
+                return CommandResult(cmd, cwd_path, "", "HTTP 404: Not Found", 1)
             return CommandResult(cmd, cwd_path, json.dumps({"value": self.advertised_actor}), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/contents/.github/workflows/ci.yml"):
             cmd, cwd_path = self._record_command(args, cwd)
@@ -242,6 +255,44 @@ def test_protection_assessment_distinguishes_private_free_plan_limit(tmp_path):
     assert assessment.state == "plan_limited"
 
 
+def test_protection_assessment_accepts_array_rules_and_rejects_voluntary_rulesets(tmp_path):
+    context = ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path)
+    rule = {"ruleset_id": 8}
+    required = {"contexts": []}
+    active_rule = {
+        "enforcement": "active", "bypass_actors": [],
+        "rules": [{"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": FINAL_CONTEXT}]}}],
+    }
+    strict = assess_exact_head_protection(
+        FakeRunner(pr_branch_protection_payload=required, pr_effective_rules_payload=[rule], pr_rulesets_payload={8: active_rule}),
+        context=context, base="main",
+    )
+    assert strict.state == "strict"
+
+    bypassable = dict(active_rule, bypass_actors=[{"actor_id": 1}])
+    voluntary = assess_exact_head_protection(
+        FakeRunner(pr_branch_protection_payload=required, pr_effective_rules_payload=[rule], pr_rulesets_payload={8: bypassable}),
+        context=context, base="main",
+    )
+    assert voluntary.state == "voluntary"
+
+    evaluate_mode = dict(active_rule, enforcement="evaluate")
+    voluntary = assess_exact_head_protection(
+        FakeRunner(pr_branch_protection_payload=required, pr_effective_rules_payload=[rule], pr_rulesets_payload={8: evaluate_mode}),
+        context=context, base="main",
+    )
+    assert voluntary.state == "voluntary"
+
+
+def test_protection_assessment_never_treats_empty_admin_response_as_enforced(tmp_path):
+    assessment = assess_exact_head_protection(
+        FakeRunner(pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]}, pr_enforce_admins_payload={}),
+        context=ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path), base="main",
+    )
+
+    assert assessment.state == "indeterminate"
+
+
 def metadata(*, base_branch="main"):
     return PullRequestMetadata(
         number=7,
@@ -251,6 +302,77 @@ def metadata(*, base_branch="main"):
         base_branch=base_branch,
         head_sha="abc123",
         url="https://github.com/OWNER/REPO/pull/7",
+    )
+
+
+def test_readiness_resolves_default_base_and_distinguishes_missing_actor_variable(tmp_path):
+    context = ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path)
+    ready = evaluate_managed_ci_readiness(
+        V2ManagedRunner(
+            workflow=SUPPRESSING_V2_WORKFLOW,
+            pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        ),
+        context=context, base=None, trusted_actor=" agent-loop ",
+    )
+
+    assert ready.state == "strict_ready"
+    assert ready.base == "main"
+
+    missing = evaluate_managed_ci_readiness(
+        V2ManagedRunner(workflow=SUPPRESSING_V2_WORKFLOW, missing_advertised_actor=True),
+        context=context, base="main", trusted_actor="agent-loop",
+    )
+    assert missing.state == "ordinary_fallback"
+    assert missing.advertised_actor is None
+    assert missing.remediation
+
+
+def test_suppressing_v2_preflight_falls_back_without_override_and_uses_nonce_with_override(tmp_path):
+    runner = V2ManagedRunner(workflow=SUPPRESSING_V2_WORKFLOW)
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+
+    assert preflight_managed_ci_creation(runner, config=config, issue_number=643) is None
+
+    override_config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    intent = preflight_managed_ci_creation(runner, config=override_config, issue_number=643)
+
+    assert intent is not None
+    assert intent.audit_nonce
+
+
+def test_override_activation_requires_the_preflight_nonce_and_releases_label_on_mismatch(tmp_path):
+    nonce = "nonce-from-preflight"
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"body": f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}"},
+    )
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, managed_ci_expected_override_nonce=nonce,
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.audit_nonce == nonce
+    assert contract.audit_comment_id == 17
+    assert any(UNPROTECTED_OVERRIDE_TRAILER in " ".join(command) for command, _ in runner.commands)
+
+    mismatch = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"body": f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}"},
+    )
+    rejected = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, managed_ci_expected_override_nonce="different",
+    )
+    assert activate_managed_ci(mismatch, config=rejected, pr_number=7, metadata=metadata()) is None
+    assert any(
+        command[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for command, _ in mismatch.commands
     )
 
 

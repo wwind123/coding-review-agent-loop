@@ -671,6 +671,10 @@ is the default. A personal, consciously supervised private repository that is
 otherwise ready but cannot use GitHub protection may use the deliberately
 per-invocation `--allow-unprotected-managed-ci` flag on authenticated plan-first
 issue work; it never applies to existing-PR adoption or dangerous permissions.
+This is an intentional tightening for suppression-capable v2 workflows: a
+repository that previously used issue-created v2 without non-bypassable GitHub
+protection now returns to ordinary CI unless that explicit per-run waiver is
+present.
 
 For repositories without that contract, `--auto-merge` foreground-polls the
 complete check board after approval with

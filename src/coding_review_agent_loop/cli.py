@@ -574,7 +574,14 @@ def build_parser() -> argparse.ArgumentParser:
     pr = subparsers.add_parser("pr", help="Run the reviewer/coder loop on an existing PR.")
     pr.add_argument("pr_number", type=int)
     add_common(pr)
-    pr.add_argument("--allow-unprotected-managed-ci", action="store_true")
+    pr.add_argument(
+        "--allow-unprotected-managed-ci", action="store_true",
+        help=(
+            "Per-invocation waiver for plan-first issue-created managed CI when GitHub "
+            "cannot independently enforce final-ci/exact-head. Requires --auto-merge and "
+            "--managed-ci-trusted-actor; never applies to existing-PR adoption."
+        ),
+    )
     pr.add_argument(
         "--managed-ci-adopt-existing-pr",
         action="store_true",
@@ -742,8 +749,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = evaluate_managed_ci_readiness(
                 Runner(dry_run=False), context=context, base=args.base, trusted_actor=args.trusted_actor
             )
-            # The evaluator resolved the default branch internally. Rendering a
-            # user-supplied base keeps the command deterministic without another read.
             print(render_managed_ci_preflight(result, repo=args.repo, base=args.base or "<default>", trusted_actor=args.trusted_actor))
             if result.state == "strict_ready":
                 return PREFLIGHT_STRICT_READY
