@@ -372,12 +372,22 @@ def _is_http_error(result: object, *statuses: int) -> bool:
     return any(str(status) in combined for status in statuses)
 
 
-def _probe_raw_workflow(runner: Runner, context: ManagedCiProbeContext, base: str) -> str | None:
+def _is_plan_limited_error(result: object) -> bool:
+    """Recognize GitHub's plan restriction independently of endpoint wording."""
+    combined = " ".join(
+        str(getattr(result, field, "") or "") for field in ("stdout", "stderr")
+    ).casefold()
+    return "upgrade to github pro" in combined or "make this repository public" in combined
+
+
+def _probe_raw_workflow(
+    runner: Runner, context: ManagedCiProbeContext, base: str
+) -> tuple[str | None, object]:
     result = _probe(
         runner, context,
         f"repos/{context.repo}/contents/.github/workflows/{WORKFLOW_FILE}?ref={base}", raw=True,
     )
-    return (result.stdout or "") if result.returncode == 0 else None
+    return ((result.stdout or "") if result.returncode == 0 else None), result
 
 
 def _has_final_context(payload: dict[str, object]) -> bool:
@@ -406,8 +416,7 @@ def assess_exact_head_protection(
     classic_state: Literal["voluntary", "plan_limited", "indeterminate"] | None = None
     classic_detail = "final-ci/exact-head is not independently required"
     if required is None:
-        combined = " ".join((required_result.stdout or "", required_result.stderr or "")).casefold()
-        if "upgrade to github pro" in combined or "make this repository public" in combined:
+        if _is_plan_limited_error(required_result):
             classic_state = "plan_limited"
             classic_detail = "GitHub plan/API does not permit branch protection"
         elif _is_http_error(required_result, 404):
@@ -434,6 +443,11 @@ def assess_exact_head_protection(
 
     rules, rules_result = _probe_json_list(runner, context, f"repos/{context.repo}/rules/branches/{base}")
     if rules is None:
+        # A private-Free repository can reject both protection APIs.  The
+        # ruleset probe cannot turn an already known plan restriction into an
+        # unknown result, so retain the actionable classification.
+        if classic_state == "plan_limited":
+            return ProtectionAssessment("plan_limited", "classic", classic_detail)
         if _is_http_error(rules_result, 404, 422):
             return ProtectionAssessment(classic_state or "voluntary", "classic" if classic_state else "none", classic_detail)
         return ProtectionAssessment("indeterminate", "rulesets", "effective branch rules could not be inspected")
@@ -478,13 +492,27 @@ def evaluate_managed_ci_readiness(
     if not resolved_base:
         return ManagedCiReadiness("indeterminate", visibility, None, None, False, False,
             ProtectionAssessment("indeterminate", "none", "base branch unavailable"), ("base branch is unavailable",), ())
-    workflow = _probe_raw_workflow(runner, context, resolved_base)
+    workflow, workflow_result = _probe_raw_workflow(runner, context, resolved_base)
+    if workflow is None:
+        if _is_http_error(workflow_result, 404):
+            return ManagedCiReadiness(
+                "ordinary_fallback", visibility, None, None, False, False,
+                ProtectionAssessment("voluntary", "none", "base workflow is absent"),
+                ("base workflow is absent",),
+                ("deploy the documented managed-CI v2 workflow",),
+                resolved_base,
+            )
+        return ManagedCiReadiness(
+            "indeterminate", visibility, None, None, False, False,
+            ProtectionAssessment("indeterminate", "none", "base workflow could not be read"),
+            ("a required read-only GitHub probe failed",), (), resolved_base,
+        )
     who, _ = _probe_json(runner, context, "user")
     variable, variable_result = _probe_json(runner, context, f"repos/{context.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR")
     actor = who.get("login") if who and isinstance(who.get("login"), str) else None
     advertised = variable.get("value") if variable and isinstance(variable.get("value"), str) else None
     protection = assess_exact_head_protection(runner, context=context, base=resolved_base)
-    if workflow is None or who is None or (variable is None and not _is_http_error(variable_result, 404)):
+    if who is None or (variable is None and not _is_http_error(variable_result, 404)):
         return ManagedCiReadiness("indeterminate", visibility, actor, advertised, False, False, protection,
             ("a required read-only GitHub probe failed",), ())
     core = V2_MARKER in workflow
@@ -541,7 +569,7 @@ def preflight_managed_ci_creation(
     if not config.auto_merge or config.dry_run or not config.managed_ci_trusted_actor or not config.base:
         return None
     source_context = ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config))
-    source_workflow = _probe_raw_workflow(runner, source_context, config.base)
+    source_workflow, _ = _probe_raw_workflow(runner, source_context, config.base)
     if source_workflow is None or V2_MARKER not in source_workflow:
         return None
     if any(marker not in source_workflow for marker in V2_FEATURE_MARKERS):

@@ -212,6 +212,8 @@ class FakeRunner(Runner):
         pr_branch_protection_stderr="",
         pr_enforce_admins_payload=None,
         pr_effective_rules_payload=None,
+        pr_effective_rules_returncode=0,
+        pr_effective_rules_stderr="",
         pr_rulesets_payload=None,
         repo_payload=None,
         pr_check_runs_returncode=0,
@@ -289,6 +291,8 @@ class FakeRunner(Runner):
             {"enabled": True} if pr_enforce_admins_payload is None else pr_enforce_admins_payload
         )
         self.pr_effective_rules_payload = list(pr_effective_rules_payload or [])
+        self.pr_effective_rules_returncode = pr_effective_rules_returncode
+        self.pr_effective_rules_stderr = pr_effective_rules_stderr
         self.pr_rulesets_payload = dict(pr_rulesets_payload or {})
         self.repo_payload = {"default_branch": repo_default_branch, "private": False}
         if repo_payload:
@@ -854,7 +858,15 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, json_dumps(self.pr_enforce_admins_payload), "", 0)
 
         if cmd[:2] == ["gh", "api"] and "/rules/branches/" in cmd[2]:
-            return CommandResult(cmd, cwd_path, json_dumps(self.pr_effective_rules_payload), "", 0)
+            return CommandResult(
+                cmd,
+                cwd_path,
+                json_dumps(self.pr_effective_rules_payload)
+                if self.pr_effective_rules_returncode == 0
+                else "",
+                self.pr_effective_rules_stderr,
+                self.pr_effective_rules_returncode,
+            )
 
         if cmd[:2] == ["gh", "api"] and "/rulesets/" in cmd[2]:
             ruleset_id = cmd[2].rsplit("/", 1)[-1]

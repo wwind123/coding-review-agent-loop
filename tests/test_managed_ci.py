@@ -74,6 +74,12 @@ on:
     types: [opened, unlabeled]
 """
 
+SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY = V2_WORKFLOW + """
+on:
+  pull_request:
+    types: [opened]
+"""
+
 
 class ManagedRunner(FakeRunner):
     def __init__(
@@ -140,6 +146,8 @@ class V2ManagedRunner(ManagedRunner):
         actor_id=1,
         advertised_actor=None,
         missing_advertised_actor=False,
+        workflow_returncode=0,
+        workflow_stderr="",
         issue_events=None,
         unreadable_issue_events_after_label=False,
         **kwargs,
@@ -166,6 +174,8 @@ class V2ManagedRunner(ManagedRunner):
         self.actor_id = actor_id
         self.advertised_actor = advertised_actor or actor_login
         self.missing_advertised_actor = missing_advertised_actor
+        self.workflow_returncode = workflow_returncode
+        self.workflow_stderr = workflow_stderr
         self.issue_events = list(issue_events or [])
         self.unreadable_issue_events_after_label = unreadable_issue_events_after_label
         self.labels_posted = False
@@ -191,7 +201,13 @@ class V2ManagedRunner(ManagedRunner):
             return CommandResult(cmd, cwd_path, json.dumps({"value": self.advertised_actor}), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/contents/.github/workflows/ci.yml"):
             cmd, cwd_path = self._record_command(args, cwd)
-            return CommandResult(cmd, cwd_path, self.workflow, "", 0)
+            return CommandResult(
+                cmd,
+                cwd_path,
+                self.workflow if self.workflow_returncode == 0 else "",
+                self.workflow_stderr,
+                self.workflow_returncode,
+            )
         if endpoint == "repos/OWNER/REPO/pulls/7":
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, json.dumps(self.rest_pr), "", 0)
@@ -253,6 +269,28 @@ def test_protection_assessment_distinguishes_private_free_plan_limit(tmp_path):
     )
 
     assert assessment.state == "plan_limited"
+
+
+def test_private_free_plan_limits_on_both_protection_endpoints_remain_override_eligible(tmp_path):
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        repo_payload={"private": True},
+        pr_branch_protection_returncode=1,
+        pr_branch_protection_stderr="HTTP 403: Upgrade to GitHub Pro or make this repository public",
+        pr_effective_rules_returncode=1,
+        pr_effective_rules_stderr="HTTP 403: Upgrade to GitHub Pro or make this repository public",
+    )
+
+    readiness = evaluate_managed_ci_readiness(
+        runner,
+        context=ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path),
+        base="main",
+        trusted_actor="agent-loop",
+    )
+
+    assert readiness.protection.state == "plan_limited"
+    assert readiness.state == "override_eligible"
+    assert any("/rules/branches/" in " ".join(command) for command, _ in runner.commands)
 
 
 def test_protection_assessment_accepts_array_rules_and_rejects_voluntary_rulesets(tmp_path):
@@ -325,6 +363,38 @@ def test_readiness_resolves_default_base_and_distinguishes_missing_actor_variabl
     assert missing.state == "ordinary_fallback"
     assert missing.advertised_actor is None
     assert missing.remediation
+
+
+def test_suppressing_v2_without_recovery_marker_is_invalid_and_cannot_create_managed_pr(tmp_path):
+    runner = V2ManagedRunner(workflow=SUPPRESSING_V2_WORKFLOW_WITHOUT_RECOVERY)
+    context = ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path)
+
+    readiness = evaluate_managed_ci_readiness(
+        runner, context=context, base="main", trusted_actor="agent-loop"
+    )
+
+    assert readiness.state == "invalid"
+    assert readiness.recovery_capable is False
+    assert preflight_managed_ci_creation(
+        runner,
+        config=make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop"),
+        issue_number=643,
+    ) is None
+
+
+def test_missing_workflow_is_a_deterministic_ordinary_ci_fallback(tmp_path):
+    readiness = evaluate_managed_ci_readiness(
+        V2ManagedRunner(
+            workflow_returncode=1,
+            workflow_stderr="HTTP 404: Not Found",
+        ),
+        context=ManagedCiProbeContext("OWNER/REPO", "gh", tmp_path),
+        base="main",
+        trusted_actor="agent-loop",
+    )
+
+    assert readiness.state == "ordinary_fallback"
+    assert readiness.workflow_v2 is False
 
 
 def test_suppressing_v2_preflight_falls_back_without_override_and_uses_nonce_with_override(tmp_path):
