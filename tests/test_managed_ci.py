@@ -1,5 +1,6 @@
 import ast
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1702,6 +1703,48 @@ def test_v2_activation_and_preflight_require_authenticated_actor(tmp_path):
     assert contract is not None
     assert contract.protocol_version == 2
     assert contract.trusted_actor_login == "agent-loop"
+
+
+def test_v2_preflight_accepts_exactly_one_reserved_direct_branch(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(pr_payload={"headRefOid": "abc123"})
+
+    intent = preflight_managed_ci_creation(
+        runner,
+        config=config,
+        branch="agent-loop/managed-direct-123-token",
+    )
+
+    assert intent is not None
+    assert intent.branch == "agent-loop/managed-direct-123-token"
+    with pytest.raises(AgentLoopError, match="exactly one"):
+        preflight_managed_ci_creation(runner, config=config)
+    with pytest.raises(AgentLoopError, match="exactly one"):
+        preflight_managed_ci_creation(
+            runner,
+            config=config,
+            issue_number=643,
+            branch="agent-loop/managed-direct-123-token",
+        )
+    with pytest.raises(AgentLoopError, match="reserved"):
+        preflight_managed_ci_creation(runner, config=config, branch="fix/not-reserved")
+
+
+def test_v2_preflight_accepts_reserved_direct_branch_in_manual_mode(tmp_path):
+    config = replace(
+        make_config(tmp_path, auto_merge=False, managed_ci_trusted_actor="agent-loop"),
+        managed_ci=True,
+    )
+    runner = V2ManagedRunner(pr_payload={"headRefOid": "abc123"})
+
+    intent = preflight_managed_ci_creation(
+        runner,
+        config=config,
+        branch="agent-loop/managed-direct-123-token",
+    )
+
+    assert intent is not None
+    assert intent.branch == "agent-loop/managed-direct-123-token"
 
 
 def adoption_workflow():

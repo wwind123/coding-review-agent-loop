@@ -137,6 +137,14 @@ def test_managed_ci_docs_describe_safe_issue_draft_resume_and_fallback():
     assert "remains ready" in text
 
 
+def test_managed_ci_docs_describe_precreation_managed_pr_mode():
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    assert "agent-loop managed-pr" in text
+    assert "agent-loop/managed-direct-*" in text
+    assert "never adopts an already-open PR" in text
+    assert "--allow-unprotected-managed-ci" in text
+
+
 def test_local_agent_loop_doc_has_focused_bounded_local_test_section():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert f"### {LOCAL_TEST_SCOPE_HEADING_TEXT}" in text

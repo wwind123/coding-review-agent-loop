@@ -1331,6 +1331,40 @@ def test_config_records_per_invocation_unprotected_managed_ci_override(tmp_path)
     assert config.allow_unprotected_managed_ci is True
 
 
+def test_managed_pr_parser_accepts_direct_branch_metadata():
+    args = build_parser().parse_args([
+        "managed-pr",
+        "--repo", "OWNER/REPO",
+        "--head", "fix/direct-change",
+        "--title", "Fix direct change",
+        "--body-file", "description.md",
+        "--auto-merge",
+        "--managed-ci-trusted-actor", "agent-loop",
+        "--allow-unprotected-managed-ci",
+    ])
+
+    assert args.command == "managed-pr"
+    assert args.head == "fix/direct-change"
+    assert args.title == "Fix direct change"
+    assert args.body_file == Path("description.md")
+    assert args.allow_unprotected_managed_ci is True
+
+
+def test_managed_pr_parser_accepts_manual_managed_ci():
+    args = build_parser().parse_args([
+        "managed-pr",
+        "--repo", "OWNER/REPO",
+        "--head", "fix/direct-change",
+        "--title", "Fix direct change",
+        "--managed-ci",
+        "--managed-ci-trusted-actor", "agent-loop",
+    ])
+
+    assert args.command == "managed-pr"
+    assert args.managed_ci is True
+    assert args.auto_merge is False
+
+
 def test_unprotected_managed_ci_override_rejects_existing_pr_adoption(capsys):
     assert main([
         "pr", "77", "--repo", "OWNER/REPO", "--auto-merge",

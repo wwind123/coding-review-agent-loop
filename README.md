@@ -683,6 +683,30 @@ advertise safe adoption and an operator can explicitly request it only with
 --managed-ci-adopt-existing-pr`. The managed-CI guide documents the required
 branch-protection guard, timeline provenance, and durable opt-out.
 
+Code that is already pushed to a same-repository branch, but does not yet have
+a PR, can enter managed CI without a placeholder issue:
+
+```bash
+agent-loop managed-pr \
+  --repo OWNER/REPO \
+  --head fix/prepared-change \
+  --base main \
+  --title "Fix prepared change" \
+  --body-file /path/to/pr-body.md \
+  --managed-ci \
+  --managed-ci-trusted-actor LOGIN \
+  --reviewer codex
+```
+
+`managed-pr` verifies readiness before writing, pins the source head to a
+unique reserved branch, opens and labels a managed draft, and immediately
+enters the normal review loop. It refuses a source head that already has an
+open PR; use `agent-loop pr <n>` for that PR instead. Repositories without
+enforceable exact-head protection must repeat the explicit
+`--allow-unprotected-managed-ci` waiver on this command. Use `--managed-ci`
+to leave the qualified PR ready for a manual head-guarded merge, or replace it
+with `--auto-merge` to retain automatic merging.
+
 Before enabling managed CI, run the read-only readiness report:
 
 ```bash
@@ -695,7 +719,8 @@ GitHub evidence is unavailable or ambiguous. It makes no writes. Protected mode
 is the default. A personal, consciously supervised private repository that is
 otherwise ready but cannot use GitHub protection may use the deliberately
 per-invocation `--allow-unprotected-managed-ci` flag on authenticated plan-first
-issue work; it never applies to existing-PR adoption or dangerous permissions.
+issue work or pre-creation `managed-pr` work; it never applies to existing-PR
+adoption or dangerous permissions.
 This is an intentional tightening for suppression-capable v2 workflows: a
 repository that previously used issue-created v2 without non-bypassable GitHub
 protection now returns to ordinary CI unless that explicit per-run waiver is
