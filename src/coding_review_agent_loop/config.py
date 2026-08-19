@@ -188,6 +188,10 @@ class AgentLoopConfig:
     # It is intentionally not a CLI option: a later invocation must perform a
     # new preflight rather than accepting a PR-body token it did not create.
     managed_ci_expected_override_nonce: str | None = None
+    # True only for the public `agent-loop pr` entry point. Issue-mode
+    # implementation hands off to the PR loop too, but must retain the
+    # issue-created activation semantics for that first invocation.
+    managed_ci_pr_mode: bool = False
     invocation_argv: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -966,6 +970,7 @@ def config_from_args(
         managed_ci_trusted_actor=getattr(args, "managed_ci_trusted_actor", None),
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
         allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),
+        managed_ci_pr_mode=getattr(args, "command", None) == "pr",
         invocation_argv=invocation_argv,
         ci_queued_grace_seconds=getattr(args, "ci_queued_grace_seconds", 1200),
         mergeability_poll_attempts=getattr(args, "mergeability_poll_attempts", 3),

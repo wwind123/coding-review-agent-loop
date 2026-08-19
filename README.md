@@ -676,6 +676,32 @@ repository that previously used issue-created v2 without non-bypassable GitHub
 protection now returns to ordinary CI unless that explicit per-run waiver is
 present.
 
+To resume an interrupted issue-created managed draft on an unprotected
+repository, rerun the explicit waiver in PR mode:
+
+```bash
+agent-loop pr <number> --auto-merge \
+  --managed-ci-trusted-actor <login> --allow-unprotected-managed-ci
+```
+
+This is supported resume, not retroactive adoption. The live PR must still be
+an open same-repository draft authored by the authenticated actor (matching
+its immutable ID), use the reserved `agent-loop/managed-*` ref and live
+base/head, and have an active `agent-loop-managed` label event made by that
+actor. A prior actor-owned override audit is provenance only: its editable
+body nonce is never reused or trusted. Missing, malformed, ambiguous, or
+mismatched history deliberately releases the label to ordinary CI. Successful
+resume writes a fresh audit and intent generation; prior dispatched runs,
+including rejected or failed runs, remain previous-invocation outcomes and are
+never attached to the new generation.
+
+When safe managed resume is unavailable, agent-loop waits for a new unlabeled
+recovery run on the exact current head and then requires the ordinary required
+checks. Only the draft released by that invocation may be made ready, and only
+with `--auto-merge`; unrelated drafts remain drafts. The head is revalidated
+before and after `gh pr ready`, and merge uses `--match-head-commit`. If that
+later merge fails, the PR remains ready and unmerged for a safe retry.
+
 For repositories without that contract, `--auto-merge` foreground-polls the
 complete check board after approval with
 `--ci-timeout-seconds` and

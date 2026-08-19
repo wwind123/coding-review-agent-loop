@@ -203,7 +203,7 @@ def test_pr_loop_runs_tests_and_merge_only_after_codex_approval(tmp_path):
         "api",
         "repos/OWNER/REPO/branches/main/protection/required_status_checks",
     ] in commands
-    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"] in commands
 
 def test_pr_loop_does_not_post_gemini_diagnostics_without_agent_state(tmp_path):
     diagnostic = "[ERROR] Invalid stream: The model returned an empty response or malformed tool call."
@@ -2485,7 +2485,7 @@ def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
     ]
     assert len(metadata_fetches) == 1
     assert ["pytest", "tests/test_agent_loop.py"] in commands
-    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"] in commands
 
 
 def test_pr_loop_skips_prior_approval_when_pr_head_is_unchanged(tmp_path):
@@ -5300,7 +5300,7 @@ def test_claude_review_loop_runs_tests_and_merge_only_after_approval(tmp_path):
 
     commands = [cmd for cmd, _cwd in runner.commands]
     assert ["pytest", "tests/test_agent_loop.py"] in commands
-    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"] in commands
 
 def test_claude_review_loop_does_not_run_codex_after_final_blocking_round(tmp_path):
     runner = FakeRunner(

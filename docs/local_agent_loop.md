@@ -1306,6 +1306,37 @@ comment cannot be written, agent-loop removes `agent-loop-managed` and waits
 for the workflow's `unlabeled` recovery CI instead of treating a `no_checks`
 board as mergeable.
 
+To retry an interrupted issue-created managed draft on an unprotected
+repository, use the explicit per-invocation PR-mode command:
+
+```bash
+agent-loop pr <number> --auto-merge \
+  --managed-ci-trusted-actor <login> --allow-unprotected-managed-ci
+```
+
+This is supported resume, not retroactive adoption. The live PR must still be
+open, a draft, same-repository, authored by the authenticated trusted actor
+(login and immutable ID), on the reserved `agent-loop/managed-*` ref, with the
+same live base/head and an active `agent-loop-managed` timeline event applied
+by that actor. A prior actor-owned override audit is only provenance; its
+editable body nonce never grants authority or gets reused. The audit's
+repository/base fields must match, and missing, malformed, ambiguous, or raced
+audit/timeline data fails closed to deliberate ordinary release.
+
+A successful resume records a fresh audit, nonce, and invocation intent
+generation. Earlier ledger entries and attached workflow runs remain history:
+even a queued, successful, failed, or rejected prior run is logged as the
+previous invocation's outcome and is never adopted by the new dispatch. If
+safe managed resume is unavailable, agent-loop removes the exact active
+managed label and waits for a new post-`unlabeled` workflow run on the exact
+head, then requires the ordinary current-head check board to pass. It does not
+accept pre-release green checks, `no_checks`, or a different SHA. Only the
+invocation-owned fallback draft can be made ready, only when `--auto-merge` is
+requested; unrelated or intentional drafts remain drafts. Agent-loop checks
+the exact head before and after `gh pr ready` and merges with
+`--match-head-commit`. If that merge fails after readiness, it logs that the PR
+remains ready and leaves it unmerged rather than restoring draft state.
+
 Suppression-capable v2 workflows must additionally advertise
 `AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` and subscribe their
 `pull_request` trigger to `unlabeled`; when a managed label is released,
