@@ -1,6 +1,7 @@
 import datetime
 import json
 import re
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -28,7 +29,11 @@ from coding_review_agent_loop.github import (
     get_pr_checks,
 )
 from coding_review_agent_loop.migrations import MigrationValidationResult
-from coding_review_agent_loop.managed_ci import ManagedCiContract, ManagedCiOutcome
+from coding_review_agent_loop.managed_ci import (
+    ManagedCiContract,
+    ManagedCiOutcome,
+    OrdinaryRecoveryCapability,
+)
 from coding_review_agent_loop.orchestrator import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     PostedRoundMetadata,
@@ -203,7 +208,148 @@ def test_pr_loop_runs_tests_and_merge_only_after_codex_approval(tmp_path):
         "api",
         "repos/OWNER/REPO/branches/main/protection/required_status_checks",
     ] in commands
-    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"] in commands
+
+
+def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path, auto_merge=True)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100,
+    )
+    validations = []
+    merged = []
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
+            number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
+            base_branch="main", head_sha="abc123", url=None,
+        )),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_ordinary_recovery_capability",
+        lambda *args, **kwargs: validations.append(kwargs.get("require_draft", True)) or True,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda *args, **kwargs: merged.append(kwargs["expected_head_sha"]),
+    )
+
+    orchestrator._finalize_ordinary_recovery_merge(
+        runner, config=config, pr_number=77, capability=capability,
+    )
+
+    assert validations == [True, None]
+    assert merged == ["abc123"]
+    assert ["gh", "pr", "ready", "77", "--repo", "OWNER/REPO"] in [
+        command for command, _cwd in runner.commands
+    ]
+
+
+def test_ordinary_recovery_refuses_head_changed_before_ready(monkeypatch, tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path, auto_merge=True)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100,
+    )
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: ManagedCiOutcome(status="head_changed", head_sha="new-head"),
+    )
+
+    with pytest.raises(AgentLoopError, match="head_changed"):
+        orchestrator._finalize_ordinary_recovery_merge(
+            runner, config=config, pr_number=77, capability=capability,
+        )
+
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+
+
+def test_ordinary_recovery_refuses_provenance_change_after_ready(monkeypatch, tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path, auto_merge=True)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100,
+    )
+    validations = iter([True, False])
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
+            number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
+            base_branch="main", head_sha="abc123", url=None,
+        )),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_ordinary_recovery_capability",
+        lambda *args, **kwargs: next(validations),
+    )
+
+    with pytest.raises(AgentLoopError, match="after `gh pr ready`"):
+        orchestrator._finalize_ordinary_recovery_merge(
+            runner, config=config, pr_number=77, capability=capability,
+        )
+
+    assert any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_ordinary_recovery_merge_failure_leaves_pr_ready(monkeypatch, tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path, auto_merge=True)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100,
+    )
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
+            number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
+            base_branch="main", head_sha="abc123", url=None,
+        )),
+    )
+    monkeypatch.setattr(orchestrator, "validate_ordinary_recovery_capability", lambda *args, **kwargs: True)
+
+    def fail_merge(*args, **kwargs):
+        raise AgentLoopError("merge failed")
+
+    monkeypatch.setattr(orchestrator, "merge_pr", fail_merge)
+
+    with pytest.raises(AgentLoopError, match="merge failed"):
+        orchestrator._finalize_ordinary_recovery_merge(
+            runner, config=config, pr_number=77, capability=capability,
+        )
+
+    assert any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+    assert not any("convert-to-draft" in command for command, _cwd in runner.commands)
 
 def test_pr_loop_does_not_post_gemini_diagnostics_without_agent_state(tmp_path):
     diagnostic = "[ERROR] Invalid stream: The model returned an empty response or malformed tool call."
@@ -2485,7 +2631,7 @@ def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
     ]
     assert len(metadata_fetches) == 1
     assert ["pytest", "tests/test_agent_loop.py"] in commands
-    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"] in commands
 
 
 def test_pr_loop_skips_prior_approval_when_pr_head_is_unchanged(tmp_path):
@@ -5300,7 +5446,7 @@ def test_claude_review_loop_runs_tests_and_merge_only_after_approval(tmp_path):
 
     commands = [cmd for cmd, _cwd in runner.commands]
     assert ["pytest", "tests/test_agent_loop.py"] in commands
-    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"] in commands
 
 def test_claude_review_loop_does_not_run_codex_after_final_blocking_round(tmp_path):
     runner = FakeRunner(

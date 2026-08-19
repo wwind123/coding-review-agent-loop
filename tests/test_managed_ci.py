@@ -2,6 +2,8 @@ import json
 
 import pytest
 
+import coding_review_agent_loop.managed_ci as managed_ci
+
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import (
     PullRequestCheck,
@@ -30,6 +32,9 @@ from coding_review_agent_loop.managed_ci import (
     publish_round_readiness,
     release_adopted_managed_ci,
     revalidate_adopted_managed_ci,
+    OrdinaryRecoveryCapability,
+    refresh_ordinary_recovery_capability,
+    wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
 from coding_review_agent_loop.runner import CommandResult
@@ -444,6 +449,175 @@ def test_override_activation_requires_the_preflight_nonce_and_releases_label_on_
         command[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
         for command, _ in mismatch.commands
     )
+
+
+def _resume_audit(*, head="old-head", repo="OWNER/REPO", base="main"):
+    return {
+        "id": 41,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": (
+            f"{UNPROTECTED_OVERRIDE_TRAILER} nonce=old-nonce repo={repo} "
+            f"base={base} head={head} protection=voluntary"
+        ),
+    }
+
+
+def test_pr_mode_resumes_only_from_immutable_issue_draft_facts_and_mints_fresh_audit(tmp_path):
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"draft": True},
+        issue_events=[label_event()],
+        intent_comments=[_resume_audit()],
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.activation_path == "managed"
+    assert contract.audit_nonce and contract.audit_nonce != "old-nonce"
+    assert contract.audit_comment_id == 17
+    assert contract.intent_generation
+    assert any("active_label_event_id=101" in " ".join(cmd) for cmd, _ in runner.commands)
+
+
+def test_pr_mode_strict_resume_does_not_require_or_write_unprotected_audit(tmp_path):
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        issue_events=[label_event()],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        pr_enforce_admins_payload={"enabled": True},
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.activation_path == "managed"
+    assert contract.audit_nonce is None
+    assert not any(
+        cmd[:3] == ["gh", "api", "--method"]
+        and "issues/7/comments" in " ".join(cmd)
+        and "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1" in " ".join(cmd)
+        for cmd, _cwd in runner.commands
+    )
+
+
+def test_pr_mode_treats_edited_or_missing_audit_as_ordinary_fallback(tmp_path):
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        issue_events=[label_event()],
+        intent_comments=[_resume_audit(repo="EVIL/REPO")],
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is not None
+    assert any(
+        cmd[:5] == ["gh", "api", "--method", "DELETE", f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}"]
+        for cmd, _ in runner.commands
+    )
+
+
+def test_resume_intent_generation_ignores_historical_same_head_ledger_and_run(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    historical = v2_intent_comment(run_id=100, run_attempt=1)
+    contract = v2_contract(intent_generation="fresh-generation")
+    runner = V2ManagedRunner(
+        intent_comments=[historical],
+        workflow_runs=[v2_run(run_id=100)],
+    )
+
+    _ensure_v2_intent(runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract)
+
+    assert contract.nonce != "nonce-1"
+    assert contract.attached_run_id is None
+    assert any("issues/7/comments" in " ".join(cmd) and "POST" in cmd for cmd, _ in runner.commands)
+
+
+def test_ordinary_recovery_rejects_green_checks_without_post_release_run(monkeypatch, tmp_path):
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100, prior_run_ids=frozenset({2}),
+    )
+    passing = checks(passing=(PullRequestCheck("test", "check_run", "success"),), required=("test",))
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: type("M", (), {"state": "mergeable"})())
+    monkeypatch.setattr(managed_ci, "_workflow_runs_payload", lambda *args, **kwargs: [{"id": 2, "status": "completed", "conclusion": "success"}])
+    monkeypatch.setattr(managed_ci, "get_pr_checks", lambda *args, **kwargs: passing)
+
+    outcome = wait_for_ordinary_recovery(runner=FakeRunner(), config=config, capability=capability, metadata=metadata())
+
+    assert outcome.status == "timeout"
+
+
+def test_ordinary_recovery_accepts_current_head_run_without_local_clock_filter(monkeypatch, tmp_path):
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=2_000, prior_run_ids=frozenset(),
+    )
+    passing = checks(passing=(PullRequestCheck("test", "check_run", "success"),), required=("test",))
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: type("M", (), {"state": "mergeable"})())
+    monkeypatch.setattr(
+        managed_ci,
+        "_workflow_runs_payload",
+        lambda *args, **kwargs: [{
+            "id": 3, "status": "completed", "conclusion": "success",
+            "created_at": "1970-01-01T00:00:00Z",
+        }],
+    )
+    monkeypatch.setattr(managed_ci, "get_pr_checks", lambda *args, **kwargs: passing)
+
+    outcome = wait_for_ordinary_recovery(
+        runner=FakeRunner(), config=config, capability=capability, metadata=metadata(),
+    )
+
+    assert outcome.status == "passed"
+
+
+def test_refresh_ordinary_recovery_rebinds_changed_head_and_resets_run_baseline(tmp_path):
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100, prior_run_ids=frozenset({2}),
+    )
+    runner = V2ManagedRunner(
+        rest_pr={
+            "head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "new-head", "ref": "feature"},
+            "labels": [],
+        },
+        issue_events=[label_event(), label_event(event="unlabeled")],
+    )
+
+    refreshed = refresh_ordinary_recovery_capability(
+        runner, config=make_config(tmp_path), capability=capability,
+    )
+
+    assert refreshed is not None
+    assert refreshed.expected_head_sha == "new-head"
+    assert refreshed.prior_run_ids == frozenset()
 
 
 def v2_contract(**overrides):

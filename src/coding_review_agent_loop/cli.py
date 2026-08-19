@@ -564,9 +564,10 @@ def build_parser() -> argparse.ArgumentParser:
     issue.add_argument(
         "--allow-unprotected-managed-ci", action="store_true",
         help=(
-            "Per-invocation waiver for plan-first issue-created managed CI when GitHub "
-            "cannot independently enforce final-ci/exact-head. Requires --auto-merge and "
-            "--managed-ci-trusted-actor; never applies to existing-PR adoption."
+            "Per-invocation waiver for issue-created managed CI, including a safe PR-mode "
+            "resume of its existing draft, when GitHub cannot independently enforce "
+            "final-ci/exact-head. Requires --auto-merge and --managed-ci-trusted-actor; "
+            "never applies to arbitrary PR adoption."
         ),
     )
     add_review_parallel(issue)
@@ -577,9 +578,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument(
         "--allow-unprotected-managed-ci", action="store_true",
         help=(
-            "Per-invocation waiver for plan-first issue-created managed CI when GitHub "
-            "cannot independently enforce final-ci/exact-head. Requires --auto-merge and "
-            "--managed-ci-trusted-actor; never applies to existing-PR adoption."
+            "Per-invocation waiver for issue-created managed CI resume when GitHub cannot "
+            "independently enforce final-ci/exact-head. Requires --auto-merge and "
+            "--managed-ci-trusted-actor; never authorizes arbitrary PR adoption."
         ),
     )
     pr.add_argument(

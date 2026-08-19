@@ -114,6 +114,12 @@ class ManagedCiContract:
     protection_mode: str | None = None
     audit_nonce: str | None = None
     audit_comment_id: int | None = None
+    # A resumed invocation always gets a new generation. Historical intent
+    # comments remain diagnostic history and are never adopted as this run's
+    # dispatch authorization.
+    intent_generation: str | None = None
+    activation_path: Literal["managed", "ordinary_fallback"] = "managed"
+    ordinary_recovery: "OrdinaryRecoveryCapability | None" = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +130,19 @@ class ManagedCiCreationIntent:
     trusted_actor: str
     protection_mode: str = "strict"
     audit_nonce: str | None = None
+
+
+@dataclass(frozen=True)
+class OrdinaryRecoveryCapability:
+    """Invocation-owned proof that this run deliberately released managed CI."""
+
+    pr_number: int
+    repository: str
+    base_ref: str
+    expected_head_sha: str
+    released_label_event_id: int | None
+    released_at: int
+    prior_run_ids: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -632,6 +651,156 @@ def _restore_ordinary_ci_after_v2_fallback(
     log(config, f"PR #{pr_number}: removed `{MANAGED_LABEL}`; continuing with ordinary CI ({reason})")
 
 
+def _release_for_ordinary_recovery(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    base_ref: str,
+    expected_head_sha: str,
+    active_event: tuple[int, str, int] | None,
+    reason: str,
+) -> OrdinaryRecoveryCapability | None:
+    """Release the exact active label and return a narrowly scoped capability.
+
+    The capability is deliberately unusable when timeline ownership cannot be
+    proven. We still remove the suppression label where possible so ordinary
+    current-head CI can run, but the orchestrator will not ready or merge such
+    a PR automatically.
+    """
+    prior_run_ids: set[int] = set()
+    try:
+        prior_run_ids = _workflow_run_ids(runner, config=config, head_sha=expected_head_sha)
+    except AgentLoopError:
+        log(config, f"PR #{pr_number}: could not baseline ordinary recovery runs ({reason})")
+    if active_event is not None:
+        current_event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+        if current_event != active_event:
+            raise AgentLoopError(
+                f"PR #{pr_number} managed-label ownership changed before ordinary release; "
+                "leaving the label untouched and no merge will be attempted."
+            )
+    result = runner.run(
+        [
+            config.gh_cmd, "api", "--method", "DELETE",
+            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
+        ],
+        cwd=active_workdir(config), check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError(
+            f"Managed-CI v2 could not activate ({reason}) and `{MANAGED_LABEL}` could not be removed."
+        )
+    log(config, f"PR #{pr_number}: selected ordinary unlabeled recovery ({reason})")
+    if active_event is None:
+        return None
+    return OrdinaryRecoveryCapability(
+        pr_number=pr_number,
+        repository=config.repo,
+        base_ref=base_ref,
+        expected_head_sha=expected_head_sha,
+        released_label_event_id=active_event[0],
+        released_at=int(time.time()),
+        prior_run_ids=frozenset(prior_run_ids),
+    )
+
+
+def refresh_ordinary_recovery_capability(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    capability: OrdinaryRecoveryCapability,
+) -> OrdinaryRecoveryCapability | None:
+    """Rebind ordinary recovery to the live draft head before finalization.
+
+    Review rounds may push commits after the managed label was released.  The
+    original capability must not reject that expected progress, nor may it
+    authorize a different PR or a relabeled PR.  A newly observed head is
+    newer than this invocation's release observation, so its run baseline
+    starts empty and only runs observed for that exact head are eligible.
+    """
+    pr = _api_json(
+        runner, config, f"repos/{config.repo}/pulls/{capability.pr_number}", quiet=True,
+    )
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    live_head = head.get("sha") if isinstance(head.get("sha"), str) else None
+    if not live_head or not isinstance(head_repo.get("full_name"), str):
+        return None
+    if (
+        pr.get("state") not in {None, "open", "OPEN"}
+        or pr.get("draft") is not True
+        or base.get("ref") != capability.base_ref
+        or head_repo["full_name"].casefold() != capability.repository.casefold()
+        or _active_managed_label_event(runner, config=config, pr_number=capability.pr_number) is not None
+    ):
+        return None
+    if live_head == capability.expected_head_sha:
+        return capability
+    return replace(
+        capability,
+        expected_head_sha=live_head,
+        prior_run_ids=frozenset(),
+    )
+
+
+def _parse_override_audit(body: str) -> dict[str, str] | None:
+    """Parse only the structured provenance fields of an old audit comment."""
+    first = next((line.strip() for line in body.splitlines() if line.strip().startswith(UNPROTECTED_OVERRIDE_TRAILER)), "")
+    if not first:
+        return None
+    fields: dict[str, str] = {}
+    for token in first.split()[1:]:
+        key, separator, value = token.partition("=")
+        if not separator or key not in {
+            "nonce", "repo", "base", "head", "protection", "active_label_event_id",
+            "resume_from", "provenance_head", "generation",
+        } or not value:
+            return None
+        if key in fields:
+            return None
+        fields[key] = value
+    if not {"repo", "base", "head", "protection"}.issubset(fields):
+        return None
+    return fields
+
+
+def _find_resume_audit(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, actor_login: str, actor_id: int,
+    base_ref: str,
+) -> tuple[int, dict[str, str]] | None:
+    """Find exactly one actor-owned old issue audit for resume provenance."""
+    comments = _api_list(runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100")
+    if comments is None:
+        return None
+    candidates: list[tuple[int, dict[str, str]]] = []
+    malformed = False
+    for comment in comments:
+        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        if UNPROTECTED_OVERRIDE_TRAILER not in body:
+            continue
+        parsed = _parse_override_audit(body)
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        if parsed is None or user.get("login") != actor_login or user.get("id") != actor_id:
+            malformed = True
+            continue
+        if parsed["repo"].casefold() != config.repo.casefold() or parsed["base"] != base_ref:
+            malformed = True
+            continue
+        cid = comment.get("id")
+        if not isinstance(cid, int):
+            malformed = True
+            continue
+        candidates.append((cid, parsed))
+    if malformed or not candidates:
+        return None
+    # Multiple valid audits are normal after a safe retry. The newest actor-
+    # owned record is the latest provenance, while all malformed/mismatched
+    # records still fail closed above.
+    return sorted(candidates, key=lambda item: item[0])[-1]
+
+
 def _activate_v2_managed_ci(
     runner: Runner,
     *,
@@ -710,19 +879,66 @@ def _activate_v2_managed_ci(
     )
     if not managed_tuple:
         return None
+    # A direct `pr` retry has a separate, deliberately narrower contract. It
+    # may resume only an issue-created draft whose immutable timeline facts
+    # still identify this trusted actor. The old body nonce is provenance, not
+    # authorization; this invocation mints a new nonce and intent generation.
+    active_event: tuple[int, str, int] | None = None
+    if config.managed_ci_pr_mode:
+        active_event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+        if (
+            active_event is None
+            or active_event[1].casefold() != actor_login.casefold()
+            or active_event[2] != actor_id
+        ):
+            _release_for_ordinary_recovery(
+                runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                expected_head_sha=live_sha, active_event=active_event,
+                reason="the active managed-label event is missing or not actor-owned",
+            )
+            return ManagedCiContract(
+                activation_path="ordinary_fallback",
+                ordinary_recovery=None,
+            )
+
     # Only workflows with a pull_request route can suppress an opening matrix.
     # Legacy dispatch-only v2 deployments remain compatible, while modern
     # suppression-capable workflows must retain strict protection or supply a
     # live, explicit waiver and its auditable PR trailer.
     protection = ProtectionAssessment("strict", "legacy", "dispatch-only legacy workflow")
     override_nonce: str | None = None
+    resume_audit_id: int | None = None
+    resume_provenance_head: str | None = None
     if "pull_request" in workflow_text:
         protection = assess_exact_head_protection(
             runner,
             context=ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config)),
             base=base_ref,
         )
-        if protection.state != "strict":
+        if protection.state != "strict" and config.managed_ci_pr_mode:
+            if not config.allow_unprotected_managed_ci or protection.state not in {"voluntary", "plan_limited"}:
+                recovery = _release_for_ordinary_recovery(
+                    runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                    expected_head_sha=live_sha, active_event=active_event,
+                    reason="strict protection is unavailable and the explicit waiver is absent",
+                )
+                return ManagedCiContract(
+                    activation_path="ordinary_fallback", ordinary_recovery=recovery,
+                )
+            prior_audit = _find_resume_audit(
+                runner, config=config, pr_number=pr_number,
+                actor_login=actor_login, actor_id=actor_id, base_ref=base_ref,
+            )
+            if prior_audit is None:
+                recovery = _release_for_ordinary_recovery(
+                    runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                    expected_head_sha=live_sha, active_event=active_event,
+                    reason="no unambiguous actor-owned issue-created override audit exists",
+                )
+                return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
+            resume_audit_id, prior_fields = prior_audit
+            resume_provenance_head = prior_fields.get("head")
+        elif protection.state != "strict":
             body = pr.get("body") if isinstance(pr.get("body"), str) else ""
             marker_line = next((line.strip() for line in body.splitlines() if line.strip().startswith(UNPROTECTED_OVERRIDE_TRAILER)), "")
             if not config.allow_unprotected_managed_ci or protection.state not in {"voluntary", "plan_limited"} or not marker_line:
@@ -776,9 +992,75 @@ def _activate_v2_managed_ci(
             audit_id = None
     else:
         audit_id = None
+
+    if config.managed_ci_pr_mode:
+        # Re-read both the PR and the active timeline event immediately before
+        # the audit write. A successful earlier probe cannot authorize a raced
+        # head/base/draft/label transition.
+        live_pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+        live_head = live_pr.get("head") if isinstance(live_pr.get("head"), dict) else {}
+        live_base = live_pr.get("base") if isinstance(live_pr.get("base"), dict) else {}
+        live_author = live_pr.get("user") if isinstance(live_pr.get("user"), dict) else {}
+        live_event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+        if (
+            live_pr.get("draft") is not True
+            or live_base.get("ref") != base_ref
+            or live_head.get("sha") != live_sha
+            or live_head.get("repo", {}).get("full_name", "").casefold() != config.repo.casefold()
+            or live_author.get("login") != actor_login
+            or live_author.get("id") != actor_id
+            or live_event != active_event
+        ):
+            recovery = _release_for_ordinary_recovery(
+                runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                expected_head_sha=live_sha, active_event=live_event,
+                reason="the immutable resume tuple changed before activation",
+            )
+            return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
+        if protection.state != "strict":
+            override_nonce = secrets.token_urlsafe(24)
+            resume_body = (
+                f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce} repo={config.repo} "
+                f"base={base_ref} head={live_sha} protection={protection.state} "
+                f"active_label_event_id={active_event[0]} resume_from={resume_audit_id} "
+                f"provenance_head={resume_provenance_head or 'unknown'} generation={secrets.token_urlsafe(12)}\n\n"
+                "Resume provenance only: the prior issue-created audit is not an authorization token."
+            )
+            audit = runner.run(
+                [
+                    config.gh_cmd, "api", "--method", "POST",
+                    f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={resume_body}",
+                ], cwd=active_workdir(config), check=False,
+            )
+            if audit.returncode != 0:
+                recovery = _release_for_ordinary_recovery(
+                    runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                    expected_head_sha=live_sha, active_event=active_event,
+                    reason="the fresh resume audit could not be recorded",
+                )
+                return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
+            try:
+                audit_id = json.loads(audit.stdout or "{}").get("id")
+            except json.JSONDecodeError:
+                audit_id = None
+            if not isinstance(audit_id, int):
+                recovery = _release_for_ordinary_recovery(
+                    runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                    expected_head_sha=live_sha, active_event=active_event,
+                    reason="the fresh resume audit response was malformed",
+                )
+                return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
+        else:
+            audit_id = None
     workflow_revision = _api_json(runner, config, f"repos/{config.repo}/commits/{base_ref}", quiet=True)
     revision = workflow_revision.get("sha") if isinstance(workflow_revision.get("sha"), str) else None
-    log(config, f"PR #{pr_number}: activated authenticated managed exact-head CI v2")
+    generation = secrets.token_urlsafe(16) if config.managed_ci_pr_mode else None
+    log(
+        config,
+        f"PR #{pr_number}: selected managed resume (fresh generation)"
+        if config.managed_ci_pr_mode
+        else f"PR #{pr_number}: activated authenticated managed exact-head CI v2",
+    )
     return ManagedCiContract(
         protocol_version=2,
         base_ref=base_ref,
@@ -788,6 +1070,8 @@ def _activate_v2_managed_ci(
         protection_mode=protection.state,
         audit_nonce=override_nonce,
         audit_comment_id=audit_id if isinstance(audit_id, int) else None,
+        intent_generation=generation,
+        active_label_event_id=active_event[0] if active_event is not None else None,
     )
 
 
@@ -1208,9 +1492,23 @@ def _dispatch_v2_qualification(
         raise AgentLoopError(
             "The managed-CI base workflow revision changed after activation; rerun review before dispatch."
         )
-    _ensure_v2_intent(
-        runner, config=config, pr_number=pr_number, expected_head_sha=expected_head_sha, contract=contract
-    )
+    try:
+        _ensure_v2_intent(
+            runner, config=config, pr_number=pr_number, expected_head_sha=expected_head_sha, contract=contract
+        )
+    except AgentLoopError as exc:
+        if not config.managed_ci_pr_mode:
+            raise
+        event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+        recovery = _release_for_ordinary_recovery(
+            runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
+            expected_head_sha=expected_head_sha, active_event=event,
+            reason=f"fresh intent ledger could not be reconciled ({exc})",
+        )
+        contract.activation_path = "ordinary_fallback"
+        contract.ordinary_recovery = recovery
+        log(config, f"PR #{pr_number}: managed resume ledger failed; selected ordinary recovery")
+        return
     attached = _discover_v2_run(runner, config=config, contract=contract, retries=3)
     if attached is None:
         _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
@@ -1259,6 +1557,7 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
         "expected_head_sha": expected_head_sha,
         "base_ref": contract.base_ref,
         "workflow_revision": contract.workflow_revision,
+        "generation": contract.intent_generation,
         "nonce": contract.nonce,
         "created_at": contract.created_at,
         "state": state,
@@ -1278,13 +1577,14 @@ def _ensure_v2_intent(
         [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"],
         cwd=active_workdir(config), check=False,
     )
+    if comments_result.returncode != 0:
+        raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
     comments: list[object] = []
-    if comments_result.returncode == 0:
-        try:
-            parsed = json.loads(comments_result.stdout or "[]")
-            comments = parsed if isinstance(parsed, list) else []
-        except json.JSONDecodeError as exc:
-            raise AgentLoopError("Managed-CI intent comments response was invalid JSON.") from exc
+    try:
+        parsed = json.loads(comments_result.stdout or "[]")
+        comments = parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError("Managed-CI intent comments response was invalid JSON.") from exc
     matching: list[tuple[int, dict[str, object]]] = []
     for raw in comments:
         if not isinstance(raw, dict):
@@ -1303,6 +1603,15 @@ def _ensure_v2_intent(
         if not isinstance(intent, dict):
             continue
         if intent.get("repository") != config.repo:
+            continue
+        if contract.intent_generation is not None and intent.get("generation") != contract.intent_generation:
+            prior_run = intent.get("run_id")
+            if isinstance(prior_run, int):
+                log(
+                    config,
+                    f"PR #{pr_number}: superseding prior managed-CI generation run {prior_run}; "
+                    "it will not be attached to this invocation",
+                )
             continue
         if intent.get("pr") == pr_number and intent.get("expected_head_sha") == expected_head_sha:
             cid = raw.get("id")
@@ -1702,6 +2011,91 @@ def _workflow_runs_payload(
     if not isinstance(runs, list):
         raise AgentLoopError("Managed-CI workflow-run response omitted `workflow_runs`.")
     return runs
+
+
+def wait_for_ordinary_recovery(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    capability: OrdinaryRecoveryCapability,
+    metadata: PullRequestMetadata,
+) -> ManagedCiOutcome:
+    """Wait for a post-unlabel current-head run and a complete ordinary board."""
+    expected_head = capability.expected_head_sha
+    attempts = max(1, config.ci_timeout_seconds // config.ci_poll_interval_seconds)
+    latest: PullRequestChecks | None = None
+    for attempt in range(attempts):
+        live_head = get_pr_head_sha(runner, config, capability.pr_number)
+        if live_head != expected_head:
+            return ManagedCiOutcome(status="head_changed", checks=latest, head_sha=live_head)
+        mergeability = get_pr_mergeability(runner, config=config, pr_number=capability.pr_number)
+        if mergeability.state == "conflicted":
+            return ManagedCiOutcome(
+                status="merge_conflict", checks=latest, mergeability=mergeability, head_sha=live_head,
+            )
+        runs = _workflow_runs_payload(runner, config=config, head_sha=expected_head)
+        recovery_runs = []
+        for run in runs:
+            if not isinstance(run, dict) or run.get("id") in capability.prior_run_ids:
+                continue
+            if run.get("event") not in {None, "pull_request"}:
+                continue
+            if isinstance(run.get("head_sha"), str) and run["head_sha"] != expected_head:
+                continue
+            recovery_runs.append(run)
+        latest = get_pr_checks(runner, config=config, metadata=metadata)
+        if latest.state == "failing":
+            return ManagedCiOutcome(status="failed", checks=latest, head_sha=live_head)
+        if is_wholly_infrastructure_blocked(latest):
+            return ManagedCiOutcome(
+                status="infrastructure_stall", checks=latest, head_sha=live_head,
+                stall=CiInfrastructureStall(checks=latest.infrastructure_stalls),
+            )
+        completed = [run for run in recovery_runs if run.get("status") == "completed"]
+        if completed and any(run.get("conclusion") not in {"success", "neutral", "skipped"} for run in completed):
+            return ManagedCiOutcome(status="failed", checks=latest, head_sha=live_head)
+        reliable = latest.check_query_status == "ok" and latest.branch_protection_status in {
+            "configured", "not_found", "forbidden",
+        }
+        if (
+            recovery_runs
+            and any(run.get("status") == "completed" and run.get("conclusion") in {"success", "neutral", "skipped"} for run in completed)
+            and latest.state == "passing"
+            and reliable
+            and not latest.pending
+            and not latest.missing_required
+        ):
+            log(config, f"PR #{capability.pr_number}: ordinary unlabeled recovery passed at {expected_head}")
+            return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
+        if attempt < attempts - 1:
+            runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
+    return ManagedCiOutcome(status="timeout", checks=latest, head_sha=expected_head)
+
+
+def validate_ordinary_recovery_capability(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    capability: OrdinaryRecoveryCapability,
+    require_draft: bool | None = True,
+) -> bool:
+    """Revalidate the invocation-owned fallback tuple before readiness/merge."""
+    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{capability.pr_number}", quiet=True)
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    event = _active_managed_label_event(
+        runner, config=config, pr_number=capability.pr_number,
+    )
+    return bool(
+        pr.get("state") in {None, "open"}
+        and (require_draft is None or pr.get("draft") is require_draft)
+        and base.get("ref") == capability.base_ref
+        and isinstance(head_repo.get("full_name"), str)
+        and head_repo["full_name"].casefold() == capability.repository.casefold()
+        and head.get("sha") == capability.expected_head_sha
+        and event is None
+    )
 
 
 def _wait_for_label_handoff(

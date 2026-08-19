@@ -102,6 +102,7 @@ from .evidence_reconciliation import (
 from .memory import AgentMemoryContext, prepare_agent_memory
 from .managed_ci import (
     MANAGED_LABEL,
+    OrdinaryRecoveryCapability,
     activate_managed_ci,
     dispatch_final_qualification,
     intermediate_managed_checks,
@@ -109,8 +110,11 @@ from .managed_ci import (
     preflight_managed_ci_creation,
     prepare_v2_merge,
     publish_round_readiness,
+    refresh_ordinary_recovery_capability,
     release_adopted_managed_ci,
     revalidate_adopted_managed_ci,
+    validate_ordinary_recovery_capability,
+    wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
 from .migrations import validate_pr_migration_topology
@@ -5657,6 +5661,57 @@ def _extract_structured_coder_tests_run(text: str | None) -> tuple[str, ...] | N
         return None
 
 
+def _finalize_ordinary_recovery_merge(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    capability: OrdinaryRecoveryCapability,
+) -> None:
+    """Ready and merge only the draft released by this invocation."""
+    refreshed = refresh_ordinary_recovery_capability(
+        runner, config=config, capability=capability,
+    )
+    if refreshed is None:
+        raise AgentLoopError(
+            f"PR #{pr_number} ordinary recovery provenance changed before finalization; no merge attempted."
+        )
+    capability = refreshed
+    outcome = wait_for_ordinary_recovery(
+        runner, config=config, capability=capability,
+        metadata=get_pr_review_context(runner, config=config, pr_number=pr_number).metadata,
+    )
+    if outcome.status != "passed":
+        raise AgentLoopError(
+            f"PR #{pr_number} ordinary recovery did not qualify the exact head "
+            f"({outcome.status}); the draft was left unmerged."
+        )
+    if not validate_ordinary_recovery_capability(runner, config=config, capability=capability):
+        raise AgentLoopError(
+            f"PR #{pr_number} ordinary recovery provenance changed before readiness; no merge attempted."
+        )
+    ready = runner.run(
+        [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
+        cwd=active_workdir(config), check=False,
+    )
+    if ready.returncode != 0:
+        raise AgentLoopError(f"Unable to mark recovered PR #{pr_number} ready for review.")
+    if not validate_ordinary_recovery_capability(
+        runner, config=config, capability=capability, require_draft=None,
+    ):
+        raise AgentLoopError(
+            f"PR #{pr_number} head or provenance changed after `gh pr ready`; "
+            "the PR remains ready and was not merged."
+        )
+    try:
+        merge_pr(runner, config, pr_number, expected_head_sha=capability.expected_head_sha)
+    except Exception:
+        # Do not convert a successfully readied PR back into a draft. A safe
+        # rerun can now inspect the ready exact head and retry the merge gate.
+        log(config, f"PR #{pr_number}: merge failed after ordinary recovery readiness; PR remains ready")
+        raise
+
+
 def run_pr_loop(
     runner: Runner,
     *,
@@ -5672,6 +5727,8 @@ def run_pr_loop(
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     managed_ci = None
+    ordinary_recovery: OrdinaryRecoveryCapability | None = None
+    ordinary_recovery_selected = False
     managed_ci_qualified = False
     try:
         bootstrap_cwd = github_bootstrap_cwd(config)
@@ -5717,12 +5774,23 @@ def run_pr_loop(
             _ensure_parallel_reviewer_workdirs(config, flag_name="--review-parallel", role_label="reviewer")
         log(config, f"Validating PR #{pr_number}")
         validate_open_pr(runner, config=config, pr_number=pr_number)
-        managed_ci = activate_managed_ci(
+        activation = activate_managed_ci(
             runner,
             config=config,
             pr_number=pr_number,
             metadata=initial_pr_context.metadata,
         )
+        if activation is not None and activation.activation_path == "ordinary_fallback":
+            ordinary_recovery_selected = True
+            ordinary_recovery = activation.ordinary_recovery
+            managed_ci = None
+            log(
+                config,
+                f"PR #{pr_number}: ordinary recovery selected; "
+                "the previous managed activation is not being resumed",
+            )
+        else:
+            managed_ci = activation
 
         def managed_ci_active(metadata: PullRequestMetadata) -> bool:
             """Drop adopted filtering immediately when its live handshake changes."""
@@ -6842,6 +6910,20 @@ def run_pr_loop(
                     )
                     return 0
                 if not must_fix_items and config.watch_pending_ci and not managed_ci_active(pr_metadata):
+                    if ordinary_recovery_selected:
+                        if ordinary_recovery is None:
+                            raise AgentLoopError(
+                                f"PR #{pr_number} was released to ordinary CI, but recovery provenance "
+                                "could not be correlated; no merge attempted."
+                            )
+                        _finalize_ordinary_recovery_merge(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            capability=ordinary_recovery,
+                        )
+                        print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
+                        return 0
                     if watch_deadline is None:
                         watch_deadline = time.monotonic() + config.ci_timeout_seconds
                         watch_attempts_remaining = max(
@@ -6899,7 +6981,10 @@ def run_pr_loop(
                         )
                         run_optional_tests(runner, config)
                         if config.auto_merge:
-                            merge_pr(runner, config, pr_number)
+                            merge_pr(
+                                runner, config, pr_number,
+                                expected_head_sha=pr_metadata.head_sha,
+                            )
                             print(f"PR #{pr_number} merged after CI watch completed.")
                         else:
                             print(f"PR #{pr_number} is merge-ready after CI watch completed.")
@@ -7111,6 +7196,23 @@ def run_pr_loop(
                                 head_ref=pr_metadata.head_branch,
                                 contract=managed_ci,
                             )
+                            if managed_ci.activation_path == "ordinary_fallback":
+                                ordinary_recovery_selected = True
+                                ordinary_recovery = managed_ci.ordinary_recovery
+                                managed_ci = None
+                                if ordinary_recovery is None:
+                                    raise AgentLoopError(
+                                        f"PR #{pr_number} managed resume could not be correlated to ordinary "
+                                        "recovery CI; no merge attempted."
+                                    )
+                                _finalize_ordinary_recovery_merge(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    capability=ordinary_recovery,
+                                )
+                                print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
+                                return 0
                             managed_outcome = wait_for_final_qualification(
                                 runner,
                                 config=config,
@@ -7233,6 +7335,19 @@ def run_pr_loop(
                                 if item.status in {"blocking", "same-pr"}
                             ]
                             wait_outcome = None
+                        elif ordinary_recovery_selected:
+                            if ordinary_recovery is None:
+                                raise AgentLoopError(
+                                    f"PR #{pr_number} ordinary recovery provenance is unavailable; "
+                                    "no merge attempted."
+                                )
+                            _finalize_ordinary_recovery_merge(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                capability=ordinary_recovery,
+                            )
+                            wait_outcome = None
                         else:
                             wait_outcome = wait_for_ci(
                                 runner, config, pr_number, metadata=pr_metadata
@@ -7286,7 +7401,10 @@ def run_pr_loop(
                                 "during the CI wait; no merge attempted",
                             )
                         else:
-                            merge_pr(runner, config, pr_number)
+                            merge_pr(
+                                runner, config, pr_number,
+                                expected_head_sha=pr_metadata.head_sha,
+                            )
                     if not must_fix_items:
                         print(f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}.")
                         return 0

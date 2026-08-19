@@ -1266,6 +1266,7 @@ def test_config_enables_ci_watch_with_auto_merge_without_rebuilding_antigravity_
         invocation_argv=("agent-loop", "pr", "77"),
     )
     assert config.watch_pending_ci is True
+    assert config.managed_ci_pr_mode is True
     assert config.invocation_argv[-1] == "77"
     assert config.antigravity_models == ("Gemini 3.1 Pro (High)",)
 

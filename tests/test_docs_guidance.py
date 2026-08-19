@@ -127,6 +127,16 @@ def test_managed_ci_docs_describe_explicit_existing_pr_adoption_and_opt_out():
     assert "triage/write collaborators" in text
 
 
+def test_managed_ci_docs_describe_safe_issue_draft_resume_and_fallback():
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    assert "agent-loop pr <number> --auto-merge" in text
+    assert "supported resume, not retroactive adoption" in text
+    assert "editable body nonce never grants authority" in text
+    assert "previous invocation's outcome" in text
+    assert "invocation-owned fallback draft" in text
+    assert "remains ready" in text
+
+
 def test_local_agent_loop_doc_has_focused_bounded_local_test_section():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert f"### {LOCAL_TEST_SCOPE_HEADING_TEXT}" in text
