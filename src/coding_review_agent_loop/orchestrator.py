@@ -110,6 +110,7 @@ from .managed_ci import (
     preflight_managed_ci_creation,
     prepare_v2_merge,
     publish_round_readiness,
+    refresh_ordinary_recovery_capability,
     release_adopted_managed_ci,
     revalidate_adopted_managed_ci,
     validate_ordinary_recovery_capability,
@@ -5668,6 +5669,14 @@ def _finalize_ordinary_recovery_merge(
     capability: OrdinaryRecoveryCapability,
 ) -> None:
     """Ready and merge only the draft released by this invocation."""
+    refreshed = refresh_ordinary_recovery_capability(
+        runner, config=config, capability=capability,
+    )
+    if refreshed is None:
+        raise AgentLoopError(
+            f"PR #{pr_number} ordinary recovery provenance changed before finalization; no merge attempted."
+        )
+    capability = refreshed
     outcome = wait_for_ordinary_recovery(
         runner, config=config, capability=capability,
         metadata=get_pr_review_context(runner, config=config, pr_number=pr_number).metadata,

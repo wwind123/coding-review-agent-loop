@@ -7,7 +7,6 @@ import secrets
 import shlex
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -706,6 +705,46 @@ def _release_for_ordinary_recovery(
     )
 
 
+def refresh_ordinary_recovery_capability(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    capability: OrdinaryRecoveryCapability,
+) -> OrdinaryRecoveryCapability | None:
+    """Rebind ordinary recovery to the live draft head before finalization.
+
+    Review rounds may push commits after the managed label was released.  The
+    original capability must not reject that expected progress, nor may it
+    authorize a different PR or a relabeled PR.  A newly observed head is
+    newer than this invocation's release observation, so its run baseline
+    starts empty and only runs observed for that exact head are eligible.
+    """
+    pr = _api_json(
+        runner, config, f"repos/{config.repo}/pulls/{capability.pr_number}", quiet=True,
+    )
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    live_head = head.get("sha") if isinstance(head.get("sha"), str) else None
+    if not live_head or not isinstance(head_repo.get("full_name"), str):
+        return None
+    if (
+        pr.get("state") not in {None, "open", "OPEN"}
+        or pr.get("draft") is not True
+        or base.get("ref") != capability.base_ref
+        or head_repo["full_name"].casefold() != capability.repository.casefold()
+        or _active_managed_label_event(runner, config=config, pr_number=capability.pr_number) is not None
+    ):
+        return None
+    if live_head == capability.expected_head_sha:
+        return capability
+    return replace(
+        capability,
+        expected_head_sha=live_head,
+        prior_run_ids=frozenset(),
+    )
+
+
 def _parse_override_audit(body: str) -> dict[str, str] | None:
     """Parse only the structured provenance fields of an old audit comment."""
     first = next((line.strip() for line in body.splitlines() if line.strip().startswith(UNPROTECTED_OVERRIDE_TRAILER)), "")
@@ -845,8 +884,6 @@ def _activate_v2_managed_ci(
     # still identify this trusted actor. The old body nonce is provenance, not
     # authorization; this invocation mints a new nonce and intent generation.
     active_event: tuple[int, str, int] | None = None
-    resume_audit_id: int | None = None
-    resume_provenance_head: str | None = None
     if config.managed_ci_pr_mode:
         active_event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
         if (
@@ -863,19 +900,6 @@ def _activate_v2_managed_ci(
                 activation_path="ordinary_fallback",
                 ordinary_recovery=None,
             )
-        prior_audit = _find_resume_audit(
-            runner, config=config, pr_number=pr_number,
-            actor_login=actor_login, actor_id=actor_id, base_ref=base_ref,
-        )
-        if prior_audit is None:
-            recovery = _release_for_ordinary_recovery(
-                runner, config=config, pr_number=pr_number, base_ref=base_ref,
-                expected_head_sha=live_sha, active_event=active_event,
-                reason="no unambiguous actor-owned issue-created override audit exists",
-            )
-            return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
-        resume_audit_id, prior_fields = prior_audit
-        resume_provenance_head = prior_fields.get("head")
 
     # Only workflows with a pull_request route can suppress an opening matrix.
     # Legacy dispatch-only v2 deployments remain compatible, while modern
@@ -883,6 +907,8 @@ def _activate_v2_managed_ci(
     # live, explicit waiver and its auditable PR trailer.
     protection = ProtectionAssessment("strict", "legacy", "dispatch-only legacy workflow")
     override_nonce: str | None = None
+    resume_audit_id: int | None = None
+    resume_provenance_head: str | None = None
     if "pull_request" in workflow_text:
         protection = assess_exact_head_protection(
             runner,
@@ -899,8 +925,19 @@ def _activate_v2_managed_ci(
                 return ManagedCiContract(
                     activation_path="ordinary_fallback", ordinary_recovery=recovery,
                 )
-            # The prior audit was already validated against immutable actor,
-            # repository, and base facts above. Its head remains history only.
+            prior_audit = _find_resume_audit(
+                runner, config=config, pr_number=pr_number,
+                actor_login=actor_login, actor_id=actor_id, base_ref=base_ref,
+            )
+            if prior_audit is None:
+                recovery = _release_for_ordinary_recovery(
+                    runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                    expected_head_sha=live_sha, active_event=active_event,
+                    reason="no unambiguous actor-owned issue-created override audit exists",
+                )
+                return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
+            resume_audit_id, prior_fields = prior_audit
+            resume_provenance_head = prior_fields.get("head")
         elif protection.state != "strict":
             body = pr.get("body") if isinstance(pr.get("body"), str) else ""
             marker_line = next((line.strip() for line in body.splitlines() if line.strip().startswith(UNPROTECTED_OVERRIDE_TRAILER)), "")
@@ -980,38 +1017,41 @@ def _activate_v2_managed_ci(
                 reason="the immutable resume tuple changed before activation",
             )
             return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
-        override_nonce = secrets.token_urlsafe(24)
-        resume_body = (
-            f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce} repo={config.repo} "
-            f"base={base_ref} head={live_sha} protection={protection.state} "
-            f"active_label_event_id={active_event[0]} resume_from={resume_audit_id} "
-            f"provenance_head={resume_provenance_head or 'unknown'} generation={secrets.token_urlsafe(12)}\n\n"
-            "Resume provenance only: the prior issue-created audit is not an authorization token."
-        )
-        audit = runner.run(
-            [
-                config.gh_cmd, "api", "--method", "POST",
-                f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={resume_body}",
-            ], cwd=active_workdir(config), check=False,
-        )
-        if audit.returncode != 0:
-            recovery = _release_for_ordinary_recovery(
-                runner, config=config, pr_number=pr_number, base_ref=base_ref,
-                expected_head_sha=live_sha, active_event=active_event,
-                reason="the fresh resume audit could not be recorded",
+        if protection.state != "strict":
+            override_nonce = secrets.token_urlsafe(24)
+            resume_body = (
+                f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce} repo={config.repo} "
+                f"base={base_ref} head={live_sha} protection={protection.state} "
+                f"active_label_event_id={active_event[0]} resume_from={resume_audit_id} "
+                f"provenance_head={resume_provenance_head or 'unknown'} generation={secrets.token_urlsafe(12)}\n\n"
+                "Resume provenance only: the prior issue-created audit is not an authorization token."
             )
-            return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
-        try:
-            audit_id = json.loads(audit.stdout or "{}").get("id")
-        except json.JSONDecodeError:
+            audit = runner.run(
+                [
+                    config.gh_cmd, "api", "--method", "POST",
+                    f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={resume_body}",
+                ], cwd=active_workdir(config), check=False,
+            )
+            if audit.returncode != 0:
+                recovery = _release_for_ordinary_recovery(
+                    runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                    expected_head_sha=live_sha, active_event=active_event,
+                    reason="the fresh resume audit could not be recorded",
+                )
+                return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
+            try:
+                audit_id = json.loads(audit.stdout or "{}").get("id")
+            except json.JSONDecodeError:
+                audit_id = None
+            if not isinstance(audit_id, int):
+                recovery = _release_for_ordinary_recovery(
+                    runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                    expected_head_sha=live_sha, active_event=active_event,
+                    reason="the fresh resume audit response was malformed",
+                )
+                return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
+        else:
             audit_id = None
-        if not isinstance(audit_id, int):
-            recovery = _release_for_ordinary_recovery(
-                runner, config=config, pr_number=pr_number, base_ref=base_ref,
-                expected_head_sha=live_sha, active_event=active_event,
-                reason="the fresh resume audit response was malformed",
-            )
-            return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
     workflow_revision = _api_json(runner, config, f"repos/{config.repo}/commits/{base_ref}", quiet=True)
     revision = workflow_revision.get("sha") if isinstance(workflow_revision.get("sha"), str) else None
     generation = secrets.token_urlsafe(16) if config.managed_ci_pr_mode else None
@@ -1540,12 +1580,11 @@ def _ensure_v2_intent(
     if comments_result.returncode != 0:
         raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
     comments: list[object] = []
-    if comments_result.returncode == 0:
-        try:
-            parsed = json.loads(comments_result.stdout or "[]")
-            comments = parsed if isinstance(parsed, list) else []
-        except json.JSONDecodeError as exc:
-            raise AgentLoopError("Managed-CI intent comments response was invalid JSON.") from exc
+    try:
+        parsed = json.loads(comments_result.stdout or "[]")
+        comments = parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError("Managed-CI intent comments response was invalid JSON.") from exc
     matching: list[tuple[int, dict[str, object]]] = []
     for raw in comments:
         if not isinstance(raw, dict):
@@ -2003,16 +2042,6 @@ def wait_for_ordinary_recovery(
                 continue
             if isinstance(run.get("head_sha"), str) and run["head_sha"] != expected_head:
                 continue
-            created_at = run.get("created_at")
-            if isinstance(created_at, str):
-                try:
-                    created_timestamp = datetime.fromisoformat(
-                        created_at.replace("Z", "+00:00")
-                    ).astimezone(timezone.utc).timestamp()
-                except ValueError:
-                    continue
-                if created_timestamp <= capability.released_at:
-                    continue
             recovery_runs.append(run)
         latest = get_pr_checks(runner, config=config, metadata=metadata)
         if latest.state == "failing":
