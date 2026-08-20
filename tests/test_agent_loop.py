@@ -3693,6 +3693,29 @@ def test_runner_pty_reports_tty_and_strips_ansi(tmp_path):
     assert result.returncode == 0
 
 
+def test_runner_keeps_output_when_capture_path_is_unlinked(tmp_path):
+    """An open capture descriptor survives cleanup unlinking its pathname."""
+    program = (
+        "import os, sys, time\n"
+        "path = sys.argv[1]\n"
+        "print('before-unlink', flush=True)\n"
+        "os.unlink(path)\n"
+        "print('after-unlink', flush=True)\n"
+    )
+    log_path = tmp_path / "logs" / "unlinked.log"
+    result = Runner().run_with_log(
+        [sys.executable, "-c", program, str(log_path)],
+        cwd=tmp_path,
+        log_path=log_path,
+        label="UnlinkProbe",
+        progress_interval_seconds=999,
+    )
+    assert result.returncode == 0
+    assert "before-unlink" in result.stdout
+    assert "after-unlink" in result.stdout
+    assert result.capture_diagnostics == ()
+
+
 @pytest.mark.parametrize("use_pty", [False, True])
 def test_runner_execution_observation_elapsed_begins_at_spawn(tmp_path, use_pty):
     """Pipe and PTY observations use the same post-spawn elapsed interval."""

@@ -46,6 +46,7 @@ class CommandResult:
     stderr: str
     returncode: int | None
     observation: ExecutionObservation | None = None
+    capture_diagnostics: tuple[str, ...] = ()
 
 
 # Matches ANSI/VT100 control sequences (CSI, OSC, charset selection) that a
@@ -347,7 +348,8 @@ class Runner:
             # prompts are preserved in the command header.
             header += f"\n# stdin\n{input_text}\n"
         header += "\n"
-        with log_path.open("w", encoding="utf-8") as log_file:
+        capture_diagnostics: list[str] = []
+        with log_path.open("w+", encoding="utf-8") as log_file:
             log_file.write(header)
             log_file.flush()
             # stderr=subprocess.STDOUT merges stderr into the log file.
@@ -417,17 +419,25 @@ class Runner:
                 finally:
                     self._unregister_active_process(proc)
 
-        full_output = log_path.read_text(encoding="utf-8")
+            # Read through the retained descriptor. A concurrent cleanup may
+            # unlink the pathname while the child still owns this open file.
+            try:
+                log_file.flush()
+                log_file.seek(0)
+                full_output = log_file.read()
+            except OSError as exc:
+                capture_diagnostics.append(f"capture_read_failed:{type(exc).__name__}:{exc}")
+                full_output = ""
         output = full_output[len(header):] if full_output.startswith(header) else full_output
         exited = time.monotonic()
         result = CommandResult(cmd, cwd, output, "", returncode, ExecutionObservation(
             spawn_wall_time, spawn_monotonic,
             exited, exited - spawn_monotonic, before_identity, executable_identity(cmd[0]), self._interrupted,
-        ))
+        ), tuple(capture_diagnostics))
         if check and returncode != 0:
             raise AgentLoopError(
                 f"Command failed with exit {returncode}: {' '.join(cmd)}\n"
-                f"log: {log_path}\n\nlast output:\n{tail_text(full_output)}"
+                f"log: {log_path if not capture_diagnostics else '(capture pathname unavailable)'}\n\nlast output:\n{tail_text(full_output or output)}"
             )
         return result
 

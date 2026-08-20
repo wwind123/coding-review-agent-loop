@@ -453,6 +453,7 @@ class AntigravityBackend:
             # This single-model backend reports the model it requested; the
             # caller's attempt state advances to a fallback model if needed.
             model_used=model,
+            command_result=result,
         )
 
     def run_repair(

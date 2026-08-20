@@ -332,6 +332,7 @@ def main() -> None:
         ci_poll_interval_seconds=30,
         quiet=False,
         log_dir=log_dir,
+        subprocess_log_dir=log_dir,
         progress_interval_seconds=30,
         agent_max_retries=0,
         agent_retry_backoff_seconds=(30,),

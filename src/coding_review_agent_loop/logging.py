@@ -3,9 +3,56 @@
 from __future__ import annotations
 
 import sys
+import os
+import time
+import fcntl
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+_LEASES: dict[Path, object] = {}
+_RETENTION_SECONDS = 14 * 24 * 60 * 60
+
+
+def _prepare_capture_root(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    if root not in _LEASES:
+        lease = (root / ".lease").open("a+")
+        try:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lease.close()
+        else:
+            _LEASES[root] = lease
+            _prune_capture_roots(root.parent, root)
+
+
+def _prune_capture_roots(parent: Path, current: Path) -> None:
+    """Best-effort age cleanup; live invocation leases are never removed."""
+    try:
+        candidates = list(parent.iterdir())
+    except OSError:
+        return
+    cutoff = time.time() - _RETENTION_SECONDS
+    for candidate in candidates:
+        if not candidate.is_dir() or candidate == current:
+            continue
+        try:
+            if candidate.stat().st_mtime >= cutoff:
+                continue
+            lease = (candidate / ".lease").open("a+")
+            try:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                lease.close()
+                continue
+            for item in candidate.iterdir():
+                if item.name != ".lease" and item.is_file():
+                    item.unlink(missing_ok=True)
+            lease.close()
+            candidate.rmdir()
+        except OSError:
+            continue
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
@@ -34,7 +81,9 @@ def agent_log_path(
     prefix = f"{run_id}-" if run_id else ""
     suffix = f"-{label}" if label else ""
     attempt = f"-{attempt_suffix}" if attempt_suffix else ""
-    return config.log_dir / f"{prefix}{stamp}-{agent}{suffix}{attempt}.log"
+    root = config.subprocess_log_dir or config.log_dir
+    _prepare_capture_root(root)
+    return root / f"{prefix}{stamp}-{agent}{suffix}{attempt}.log"
 
 
 def run_usage_summary_path(config: AgentLoopConfig, run_id: str) -> Path:

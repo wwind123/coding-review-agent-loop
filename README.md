@@ -914,8 +914,13 @@ The remaining legacy compatibility surface is intentional:
 - Resume reconstruction should not depend on reparsing old prose once
   `AGENT_LOOP_META` exists for the active structured-response round.
 
-Agent subprocess logs are written under `.agent-loop-logs/` in the active
-checkout, and long-running agents print heartbeat lines with the exact log
+Active subprocess captures are written to a unique directory under the local
+agent-loop cache, outside every managed checkout. Use `--subprocess-log-dir`
+to override it; an override equal to or nested inside a managed checkout is
+rejected. Capture directories are leased for the life of the invocation and
+old, unlocked directories are pruned by age. `--log-dir` remains the location
+for salvage and usage artifacts, preserving discovery of legacy
+`.agent-loop-logs/` data. Long-running agents print heartbeat lines with the exact log
 path. GitHub comments come from validated public response files under
 `/tmp/coding-review-agent-loop/responses/...` or validated fallback stdout, not
 from raw logs. If an agent looks stuck or returns diagnostics, inspect the

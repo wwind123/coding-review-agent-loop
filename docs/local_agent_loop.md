@@ -2051,6 +2051,14 @@ file is the public answer the orchestrator will validate and post. Empty
 response files, missing markers, or diagnostics-only stdout fail locally instead
 of being posted to GitHub.
 
+Active subprocess captures default to a unique directory under the agent-loop
+cache, outside managed checkouts. `--subprocess-log-dir` selects an explicit
+capture root, but paths equal to or beneath a managed checkout are rejected.
+Invocation directories hold a lifetime lease; cleanup removes only old,
+unlocked directories on a best-effort basis. `--log-dir` remains the legacy
+root for usage summaries and salvage artifacts, and old checkout-resident logs
+are not migrated or rediscovered as active captures.
+
 When a mutating coder implementation run reaches a terminal failure with a
 non-empty tracked diff, the orchestrator writes local salvage artifacts under
 `<log_dir>/salvage/<run>-<agent>-<scope>/`. That directory contains

@@ -393,7 +393,16 @@ def build_parser() -> argparse.ArgumentParser:
             "--log-dir",
             type=Path,
             default=Path(".agent-loop-logs"),
-            help="Directory for agent subprocess logs (default: .agent-loop-logs).",
+            help="Directory for salvage and usage artifacts (default: .agent-loop-logs).",
+        )
+        subparser.add_argument(
+            "--subprocess-log-dir",
+            type=Path,
+            default=None,
+            help=(
+                "External directory for active subprocess captures. The default is a unique "
+                "directory under the agent-loop cache; paths inside managed checkouts are rejected."
+            ),
         )
         subparser.add_argument(
             "--progress-interval-seconds",

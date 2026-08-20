@@ -900,6 +900,14 @@ class FakeRunner(Runner):
                 self.pr_status_returncode,
             )
 
+        if cmd[:2] == ["gh", "api"] and any(
+            "/statuses?per_page=100" in part for part in cmd[2:]
+        ):
+            payload = self.pr_status_payload
+            pages = payload.get("pages") if isinstance(payload, dict) else None
+            stdout = json_dumps(pages if isinstance(pages, list) else payload.get("statuses", []))
+            return CommandResult(cmd, cwd_path, stdout, self.pr_status_stderr, self.pr_status_returncode)
+
         if cmd[:2] == ["gh", "api"] and "/protection/required_status_checks" in cmd[2]:
             stdout = (
                 json_dumps(self.pr_branch_protection_payload)
