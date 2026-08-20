@@ -539,6 +539,29 @@ def test_pr_mode_treats_edited_or_missing_audit_as_ordinary_fallback(tmp_path):
     )
 
 
+def test_pr_mode_keeps_ordinary_recovery_capability_when_label_event_is_temporarily_unreadable(tmp_path):
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        # The PR API still proves the managed draft tuple, but the timeline
+        # has not yielded the label event yet.
+        issue_events=[],
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is not None
+    assert contract.ordinary_recovery.released_label_event_id is None
+
+
 def test_resume_intent_generation_ignores_historical_same_head_ledger_and_run(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
     historical = v2_intent_comment(run_id=100, run_attempt=1)

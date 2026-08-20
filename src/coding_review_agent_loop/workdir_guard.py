@@ -71,6 +71,18 @@ WORKDIR_FLAG_PREFIXES = ("--directory=", "--chdir=", "--cwd=", "--rootdir=")
 INTERPRETER_VALUE_FLAGS = {"--python", "--interpreter", "--with-python", "--python-executable"}
 INTERPRETER_VALUE_ENV_VARS = {"PYTHONPATH", "VIRTUAL_ENV", "NODE_PATH", "JAVA_HOME", "PATH"}
 
+# Report destinations are not execution inputs.  Keep this vocabulary
+# deliberately explicit so an arbitrary outside path cannot be hidden behind
+# a generic option.
+OUTPUT_VALUE_FLAGS = {
+    "--output",
+    "--output-dir",
+    "--output-file",
+    "--report",
+    "--report-file",
+}
+OUTPUT_VALUE_FLAG_PREFIXES = tuple(f"{flag}=" for flag in OUTPUT_VALUE_FLAGS)
+
 # ---------------------------------------------------------------------------
 # Package acquisition (URL pass exclusion).
 # ---------------------------------------------------------------------------
@@ -498,6 +510,15 @@ def _path_roles(clause: _Clause) -> list[tuple[str, str]]:
             idx += 1
             continue
 
+        for prefix in OUTPUT_VALUE_FLAG_PREFIXES:
+            if token.startswith(prefix):
+                results.append((token[len(prefix) :], "output"))
+                matched_prefix = True
+                break
+        if matched_prefix:
+            idx += 1
+            continue
+
         env_match = VAR_ASSIGNMENT_RE.match(token)
         if env_match:
             eq_idx = token.index("=")
@@ -521,6 +542,11 @@ def _path_roles(clause: _Clause) -> list[tuple[str, str]]:
             idx += 2
             continue
 
+        if token in OUTPUT_VALUE_FLAGS and idx + 1 < n:
+            results.append((tokens[idx + 1], "output"))
+            idx += 2
+            continue
+
         if _is_path_shaped(token):
             if idx in program_positions or idx == promoted_idx:
                 results.append((token, "program"))
@@ -540,6 +566,8 @@ def _check_path_role(raw_path: str, role: str, *, command: str, assigned: Path) 
     if role == "program" and _is_toolchain_executable(raw_path):
         return
     if role == "interpreter_value":
+        return
+    if role == "output":
         return
     raise AgentLoopError(
         "Coder reported tests from outside the assigned checkout: "
