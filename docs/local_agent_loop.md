@@ -2083,3 +2083,27 @@ when only some counters are available. When a backend exposes no usable usage
 data, the orchestrator records an `estimated` fallback based on prompt and
 public-response size, along with raw character and byte counts. `--dry-run`
 does not invent token usage records.
+
+# Managed-CI GitHub CLI compatibility
+
+Managed-CI uses GitHub CLI 2.45.0 or newer. Paginated array endpoints are
+decoded as one flat JSON array; concatenated object pages (such as workflow
+jobs) are decoded page by page. A malformed page or entry is unavailable and
+is never treated as an empty or absent timeline. The managed-label timeline is
+therefore unreadable-is-not-absent, and every ownership, readiness, and merge
+gate fails closed when it cannot be revalidated.
+
+Ordinary fallback is authorized only by the centralized release path. It
+records the GitHub `unlabeled.created_at` instant in UTC and separate
+pre-release and post-release exact-head run snapshots. Earlier run timestamps
+fail; equal-second timestamps require clock-free proof that the run was absent
+from the post-release snapshot and first observed during recovery; malformed
+timestamps fail. Operators should distinguish no run observed from a run that
+appeared but cannot prove post-release ordering.
+
+Reconstructed reserved drafts require the authenticated user, the configured
+CLI trusted actor, and the current `AGENT_LOOP_MANAGED_ACTOR` repository
+variable to agree. Readiness and merge remain fail-closed, with `gh pr ready`
+and `--match-head-commit` guarded by a fresh exact-head and inactive-label
+provenance check. The workflow must advertise the `pull_request: unlabeled`
+recovery trigger for this path.

@@ -1,4 +1,6 @@
+import ast
 import json
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +25,7 @@ from coding_review_agent_loop.managed_ci import (
     _dispatch_v2_qualification,
     _ensure_v2_intent,
     _v2_failed_jobs,
+    _api_list,
     activate_managed_ci,
     dispatch_final_qualification,
     evaluate_managed_ci_readiness,
@@ -1458,6 +1461,53 @@ def test_v2_failed_jobs_and_ready_merge_recovery(tmp_path):
     )
 
     assert not any(cmd[:3] == ["gh", "pr", "ready"] for cmd, _cwd in runner.commands)
+
+
+def test_paginated_array_response_is_flat_and_malformed_entries_are_unavailable(tmp_path):
+    config = make_config(tmp_path)
+    runner = V2ManagedRunner(issue_events=[label_event()])
+
+    assert _api_list(runner, config, "repos/OWNER/REPO/issues/7/events?per_page=100") == [label_event()]
+    runner.issue_events = [label_event(), ["not an event"]]
+    assert _api_list(runner, config, "repos/OWNER/REPO/issues/7/events?per_page=100") is None
+    assert all("--slurp" not in command for command, _cwd in runner.commands)
+
+
+def test_v2_failed_jobs_decodes_concatenated_cli_pages(tmp_path):
+    class PagedJobsRunner(FakeRunner):
+        def _run_locked(self, args, *, cwd, check):
+            if args and str(args[-1]).endswith("/jobs?filter=latest&per_page=100"):
+                cmd, cwd_path = self._record_command(args, cwd)
+                return CommandResult(
+                    cmd, cwd_path,
+                    '{"jobs":[{"name":"unit","conclusion":"failure"}]}'
+                    '{"jobs":[{"name":"lint","conclusion":"timed_out"}]}',
+                    "", 0,
+                )
+            return super()._run_locked(args, cwd=cwd, check=check)
+
+    details = _v2_failed_jobs(PagedJobsRunner(), config=make_config(tmp_path), run_id=100)
+    assert details == ("unit: failure", "lint: timed_out")
+
+
+def test_managed_ci_gh_invocations_obey_the_245_floor():
+    allowed_api_flags = {"--paginate", "--method", "-H", "-f"}
+    for filename in ("managed_ci.py", "orchestrator.py"):
+        path = Path(__file__).parents[1] / "src" / "coding_review_agent_loop" / filename
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in {"run", "run_with_log"} or not node.args:
+                continue
+            command = node.args[0]
+            if not isinstance(command, ast.List) or not command.elts:
+                continue
+            values = {elt.value for elt in command.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)}
+            if "api" in values:
+                assert "--slurp" not in values
+                assert values.isdisjoint({"--hostname", "--cache"})
+                assert values.intersection(allowed_api_flags | {"api"})
 
 
 def test_merge_pr_uses_expected_head_guard(tmp_path):

@@ -666,7 +666,62 @@ class FakeRunner(Runner):
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         with self._scripted_lock:
+            cmd = [str(arg) for arg in args]
+            error = self._gh_argv_error(cmd)
+            if error is not None:
+                cmd, cwd_path = self._record_command(cmd, cwd)
+                return CommandResult(cmd, cwd_path, "", error, 1)
             return self._run_locked(args, cwd=cwd, check=check)
+
+    @staticmethod
+    def _gh_argv_error(cmd):
+        """Model the pinned gh 2.45 parser so tests catch unsupported flags."""
+        if len(cmd) < 2 or cmd[0] != "gh":
+            return None
+        if cmd[1] == "api":
+            value_flags = {"--method", "-H", "-f", "-F", "--input", "--hostname", "--jq"}
+            flags = {"--paginate", "--silent", "--verbose"}
+            index = 2
+            saw_endpoint = False
+            while index < len(cmd):
+                token = cmd[index]
+                if token == "--slurp":
+                    return "unknown flag: --slurp (unsupported by gh 2.45.0)"
+                if token in value_flags:
+                    if index + 1 >= len(cmd):
+                        return f"flag {token} requires a value"
+                    index += 2
+                    continue
+                if token in flags:
+                    index += 1
+                    continue
+                if token.startswith("-"):
+                    return f"unknown flag: {token}"
+                if saw_endpoint:
+                    return "gh api accepts one endpoint"
+                saw_endpoint = True
+                index += 1
+            if not saw_endpoint:
+                return "gh api requires an endpoint"
+            return None
+        allowed = {
+            "ready": {"--repo"},
+            "view": {"--repo", "--json", "--jq", "--comments"},
+            "list": {"--repo", "--state", "--search", "--json", "--limit"},
+            "comment": {"--repo", "--body", "--body-file"},
+            "checks": {"--repo", "--required", "--watch", "--fail-fast"},
+            "create": {"--repo", "--title", "--body", "--body-file", "--label"},
+            "clone": {"--", "--depth"},
+            "repo": {"--json", "--jq", "--repo"},
+            "issue": {"--repo", "--body", "--body-file", "--title", "--search", "--json"},
+        }
+        if len(cmd) < 3 or cmd[2] not in allowed:
+            return None
+        accepted = allowed[cmd[2]]
+        for token in cmd[3:]:
+            if token.startswith("-") and token not in accepted and not token.startswith("--inputs"):
+                return f"unknown flag: {token}"
+        return None
 
     def _run_locked(self, args, *, cwd, check):
         cmd, cwd_path = self._record_command(args, cwd)
