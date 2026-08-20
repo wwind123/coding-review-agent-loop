@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import shutil
@@ -183,6 +184,14 @@ class Runner:
             f"Retry shortly or pass {override_flag} <path>."
         )
 
+    def _command_non_executable_after_preflight_error(self, command: str) -> AgentLoopError:
+        override_flag = self._override_flag_for(command)
+        return AgentLoopError(
+            f"{command} CLI remained temporarily non-executable after "
+            f"{_SPAWN_ATTEMPTS} spawn attempts and may be updating; "
+            f"retry shortly or pass {override_flag} <path>."
+        )
+
     @staticmethod
     def _is_dangling_symlink(path: str | None) -> bool:
         return bool(path and os.path.islink(path) and not os.path.exists(path))
@@ -219,6 +228,20 @@ class Runner:
                     if saw_preflight_disappearance and not dangling_symlink:
                         raise self._command_disappeared_after_preflight_error(command) from exc
                     raise self._missing_command_error(command) from exc
+                time.sleep(_SPAWN_RETRY_BACKOFF_SECONDS)
+            except OSError as exc:
+                # Claude Code can briefly leave its bare command pointing at
+                # an incomplete native install during an auto-update. Treat
+                # only ENOEXEC for a preflighted bare command as retryable;
+                # permission errors and explicit paths remain fail-closed.
+                if exc.errno != errno.ENOEXEC or os.path.isabs(command):
+                    raise
+                with self._commands_lock:
+                    preflighted = command in self._preflighted_commands
+                if not preflighted:
+                    raise
+                if attempt == _SPAWN_ATTEMPTS:
+                    raise self._command_non_executable_after_preflight_error(command) from exc
                 time.sleep(_SPAWN_RETRY_BACKOFF_SECONDS)
 
         raise AssertionError("spawn retry loop exited unexpectedly")

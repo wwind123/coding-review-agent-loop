@@ -3992,6 +3992,43 @@ def test_runner_preflighted_command_permission_error_does_not_retry(
     assert sleep_calls == []
 
 
+@pytest.mark.parametrize("use_pty", [False, True])
+def test_runner_preflighted_exec_format_error_retries(monkeypatch, tmp_path, use_pty):
+    """A bare preflighted CLI may be briefly non-executable during auto-update."""
+    import errno
+    import coding_review_agent_loop.runner as runner_module
+
+    command_name = "bare-agent"
+    runner = Runner()
+    runner.remember_agent_command(command_name, "/tmp/bare-agent", "--claude-cmd")
+    popen_calls = []
+    sleep_calls = []
+
+    def invalid_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        raise OSError(errno.ENOEXEC, "Exec format error")
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", invalid_popen)
+    monkeypatch.setattr(
+        runner_module.time,
+        "sleep",
+        lambda delay: sleep_calls.append(delay),
+    )
+
+    with pytest.raises(AgentLoopError, match="remained temporarily non-executable"):
+        runner.run_with_log(
+            [command_name, "--version"],
+            cwd=tmp_path,
+            log_path=tmp_path / "logs" / f"exec-format-retry-{use_pty}.log",
+            label="Exec format retry probe",
+            progress_interval_seconds=999,
+            use_pty=use_pty,
+        )
+
+    assert len(popen_calls) == 3
+    assert sleep_calls == [2, 2]
+
+
 def test_runner_missing_command_without_dangling_evidence_does_not_retry(
     monkeypatch,
     tmp_path,
