@@ -670,6 +670,11 @@ class FakeRunner(Runner):
             error = self._gh_argv_error(cmd)
             if error is not None:
                 cmd, cwd_path = self._record_command(cmd, cwd)
+                if check:
+                    raise AgentLoopError(
+                        f"Command failed with exit 1: {' '.join(cmd)}\n"
+                        f"stdout:\n\n\nstderr:\n{error}"
+                    )
                 return CommandResult(cmd, cwd_path, "", error, 1)
             return self._run_locked(args, cwd=cwd, check=check)
 

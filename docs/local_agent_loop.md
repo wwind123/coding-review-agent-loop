@@ -2084,22 +2084,23 @@ data, the orchestrator records an `estimated` fallback based on prompt and
 public-response size, along with raw character and byte counts. `--dry-run`
 does not invent token usage records.
 
-# Managed-CI GitHub CLI compatibility
+#### Managed-CI GitHub CLI compatibility
 
-Managed-CI uses GitHub CLI 2.45.0 or newer. Paginated array endpoints are
-decoded as one flat JSON array; concatenated object pages (such as workflow
-jobs) are decoded page by page. A malformed page or entry is unavailable and
-is never treated as an empty or absent timeline. The managed-label timeline is
-therefore unreadable-is-not-absent, and every ownership, readiness, and merge
-gate fails closed when it cannot be revalidated.
+The managed-CI API calls use the GitHub CLI 2.45-compatible pagination
+behavior. Paginated array endpoints are decoded as one flat JSON array;
+concatenated object pages (such as workflow jobs) are decoded page by page. A
+malformed page or entry is unavailable and is never treated as an empty or
+absent timeline. The managed-label timeline is therefore unreadable-is-not-
+absent, and every ownership, readiness, and merge gate fails closed when it
+cannot be revalidated.
 
-Ordinary fallback is authorized only by the centralized release path. It
-records the GitHub `unlabeled.created_at` instant in UTC and separate
-pre-release and post-release exact-head run snapshots. Earlier run timestamps
-fail; equal-second timestamps require clock-free proof that the run was absent
-from the post-release snapshot and first observed during recovery; malformed
-timestamps fail. Operators should distinguish no run observed from a run that
-appeared but cannot prove post-release ordering.
+Ordinary fallback is authorized only by the centralized release path. Before
+removing the managed label it records the IDs of existing workflow runs for
+the exact head. Recovery accepts only a newly observed `pull_request` run for
+that same head, together with a passing and complete ordinary check board.
+There is deliberately no local-clock or timestamp ordering claim: GitHub run
+IDs and the exact-head check are the available provenance, and no run observed
+is not treated as a successful recovery.
 
 Reconstructed reserved drafts require the authenticated user, the configured
 CLI trusted actor, and the current `AGENT_LOOP_MANAGED_ACTOR` repository

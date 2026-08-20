@@ -1,10 +1,12 @@
 import ast
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import coding_review_agent_loop.managed_ci as managed_ci
+import coding_review_agent_loop.orchestrator as orchestrator
 
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import (
@@ -40,6 +42,7 @@ from coding_review_agent_loop.managed_ci import (
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
+from coding_review_agent_loop.orchestrator import _finalize_ordinary_recovery_merge
 from coding_review_agent_loop.runner import CommandResult
 
 from agent_loop_helpers import FakeRunner, make_config
@@ -603,6 +606,57 @@ def test_resume_intent_generation_ignores_historical_same_head_ledger_and_run(tm
     assert contract.nonce != "nonce-1"
     assert contract.attached_run_id is None
     assert any("issues/7/comments" in " ".join(cmd) and "POST" in cmd for cmd, _ in runner.commands)
+
+
+def test_intent_history_malformed_page_fails_closed_instead_of_minting_nonce(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    contract = v2_contract(intent_generation="fresh-generation")
+    runner = V2ManagedRunner(intent_comments=[{"id": 17}, "malformed-entry"])
+
+    with pytest.raises(AgentLoopError, match="Unable to inspect managed-CI v2 intent history"):
+        _ensure_v2_intent(
+            runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract,
+        )
+
+
+def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, monkeypatch):
+    config = make_config(tmp_path, auto_merge=True)
+    runner = V2ManagedRunner(issue_events=[])
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
+    )
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: SimpleNamespace(status="passed"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
+    )
+    merged: list[tuple[int, str | None]] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda _runner, _config, number, *, expected_head_sha: merged.append((number, expected_head_sha)),
+    )
+
+    _finalize_ordinary_recovery_merge(
+        runner, config=config, pr_number=7, capability=capability,
+    )
+
+    assert any(command[:3] == ["gh", "pr", "ready"] for command, _ in runner.commands)
+    assert merged == [(7, "abc123")]
+
+
+def test_fake_runner_models_gh_parser_failure_when_check_is_true(tmp_path):
+    runner = FakeRunner()
+
+    with pytest.raises(AgentLoopError, match="unknown flag: --slurp"):
+        runner.run(["gh", "api", "--paginate", "--slurp", "repos/OWNER/REPO/issues/7/events"], cwd=tmp_path)
 
 
 def test_ordinary_recovery_rejects_green_checks_without_post_release_run(monkeypatch, tmp_path):
@@ -1491,7 +1545,10 @@ def test_v2_failed_jobs_decodes_concatenated_cli_pages(tmp_path):
 
 
 def test_managed_ci_gh_invocations_obey_the_245_floor():
-    allowed_api_flags = {"--paginate", "--method", "-H", "-f"}
+    allowed_api_flags = {
+        "--paginate", "--method", "-H", "-f", "-F", "--input", "--hostname", "--jq",
+        "--silent", "--verbose",
+    }
     for filename in ("managed_ci.py", "orchestrator.py"):
         path = Path(__file__).parents[1] / "src" / "coding_review_agent_loop" / filename
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -1505,9 +1562,8 @@ def test_managed_ci_gh_invocations_obey_the_245_floor():
                 continue
             values = {elt.value for elt in command.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)}
             if "api" in values:
-                assert "--slurp" not in values
-                assert values.isdisjoint({"--hostname", "--cache"})
-                assert values.intersection(allowed_api_flags | {"api"})
+                api_flags = {value for value in values if value.startswith("-")}
+                assert api_flags.issubset(allowed_api_flags)
 
 
 def test_merge_pr_uses_expected_head_guard(tmp_path):

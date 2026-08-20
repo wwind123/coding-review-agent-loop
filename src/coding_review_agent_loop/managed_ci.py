@@ -48,8 +48,6 @@ V2_ADOPTION_MARKER = "AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION"
 V2_ADOPTION_FEATURE_MARKERS = (V2_ADOPTION_MARKER,)
 RECOVERY_MARKER = "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1"
 UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
-GH_MIN_VERSION = (2, 45, 0)
-GH_MIN_VERSION_TEXT = "2.45.0"
 
 
 @dataclass(frozen=True)
@@ -1586,22 +1584,13 @@ def _ensure_v2_intent(
     contract.pr_number = pr_number
     contract.expected_head_sha = expected_head_sha
     contract.repository = config.repo
-    comments_result = runner.run(
-        [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"],
-        cwd=active_workdir(config), check=False,
+    comments = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
-    if comments_result.returncode != 0:
+    if comments is None:
         raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
-    comments: list[object] = []
-    try:
-        parsed = json.loads(comments_result.stdout or "[]")
-        comments = parsed if isinstance(parsed, list) else []
-    except json.JSONDecodeError as exc:
-        raise AgentLoopError("Managed-CI intent comments response was invalid JSON.") from exc
     matching: list[tuple[int, dict[str, object]]] = []
     for raw in comments:
-        if not isinstance(raw, dict):
-            continue
         body = raw.get("body")
         author = raw.get("user") if isinstance(raw.get("user"), dict) else {}
         if not isinstance(body, str) or INTENT_MARKER not in body:
