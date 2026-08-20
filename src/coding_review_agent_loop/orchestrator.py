@@ -7314,16 +7314,6 @@ def run_pr_loop(
                                     "review so a new ledger is created/used."
                                 )
                                 post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
-                                post_pr_comment(
-                                    runner,
-                                    config=config,
-                                    pr_number=pr_number,
-                                    body=(
-                                        f"PR #{pr_number} qualification stopped at terminal workflow state "
-                                        f"`{conclusion}` without `{FINAL_CONTEXT}` publication; rerun after a "
-                                        "legitimate higher-attempt rerun or fresh same-nonce dispatch."
-                                    ),
-                                )
                                 log(
                                     config,
                                     f"Round {round_number}: managed CI reached terminal state without "
