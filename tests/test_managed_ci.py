@@ -1273,7 +1273,7 @@ def test_v2_later_legitimate_rerun_attempt_is_accepted_after_terminal_stop(tmp_p
     runner = V2ManagedRunner(
         workflow_runs=[
             v2_run(run_id=100, attempt=2, status="completed", conclusion="success"),
-            v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
+            v2_run(run_id=100, attempt=1, status="completed", conclusion="timed_out"),
         ],
         intent_comments=[v2_intent_comment(
             run_id=100, run_attempt=1, state="terminal-no-status",
@@ -1300,6 +1300,28 @@ def test_v2_later_legitimate_rerun_attempt_is_accepted_after_terminal_stop(tmp_p
     assert outcome.status == "passed"
     assert (contract.attached_run_id, contract.run_attempt) == (100, 2)
     assert contract.terminal_run_attempt == 1
+
+
+def test_v2_waiter_excludes_prior_non_cancelled_terminal_attempt(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(run_id=100, attempt=1, status="completed", conclusion="timed_out")],
+        pr_status_payload={"statuses": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract(
+        terminal_run_id=100,
+        terminal_run_attempt=1,
+        terminal_attempts=((100, 1),),
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "timeout"
+    assert contract.attached_run_id is None
+    assert not any('"state":"attached"' in " ".join(command) for command, _cwd in runner.commands)
 
 
 def test_v2_refresh_keeps_known_attempt_when_payload_omits_run_attempt(tmp_path):
