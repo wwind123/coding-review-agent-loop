@@ -1090,9 +1090,14 @@ The orchestrator validates coder-reported test commands before posting normal
 coder progress. For `Tests:` reports and structured `tests_run` entries, it is
 role-aware rather than pattern-only: an explicit working directory (`cd
 <path>`, `-C <path>`, `--directory[=]<path>`, `--chdir[=]`, `--cwd[=]`,
-`--rootdir[=]`) is always validated, and so is any ordinary target, checkout,
-or artifact path (a positional test path, a redirect target, an `--rootdir`
-value, and so on). An absolute interpreter, runner, or package-manager
+`--rootdir[=]<path>`) is always validated, and so is any ordinary target,
+checkout, or artifact path (a positional test path, a redirect target, an
+`--rootdir` value, and so on). The values of the explicitly recognized report
+flags `--output`, `--output-dir`, `--output-file`, `--report`, and
+`--report-file` are the narrow exception: they are treated as report
+destinations and may name paths outside the checkout. This exemption is
+flag-gated only; a shell redirect to an outside path such as `pytest tests/ >
+/tmp/out.log` is still rejected. An absolute interpreter, runner, or package-manager
 executable in *program position* -- for example `/usr/bin/python3`, a venv's
 `.venv/bin/pytest`, or a wrapper like `sudo`/`env` in front of one -- is not
 treated as a test location, and neither is the value of a narrow set of
@@ -1106,8 +1111,8 @@ are likewise consumed only for their defined options such as `timeout -k`/`-s`,
 `xargs -n`/`-P`/`-I`. These exemptions
 are gated on command position or on a specific interpreter-valued construct,
 not on path components: wrapper operands, option values, workdirs,
-test/script targets, outputs, remote targets, malformed commands, and
-arbitrary `/tmp` paths receive no blanket exemption, so a toolchain-shaped path
+test/script targets, unrecognized outputs, remote targets, malformed commands,
+and arbitrary `/tmp` paths receive no blanket exemption, so a toolchain-shaped path
 used as an ordinary argument (`pytest /outside/bin/tests/test_foo.py`) still
 fails containment. Package acquisition (`pip install ...`, including the
 `python -m pip install ...` form) is exempted from the separate live-target

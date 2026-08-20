@@ -216,6 +216,24 @@ def test_rejects_timeout_wrapped_outside_paths(tmp_path, command):
 
 
 @pytest.mark.parametrize("command", [
+    "python scripts/qualify_localization.py --output-dir /tmp/localization-report",
+    "python scripts/qualify_localization.py --output=/tmp/localization-report",
+    "python scripts/qualify_localization.py --report-file /tmp/localization-report.json",
+])
+def test_accepts_explicit_report_outputs_outside_checkout(tmp_path, command):
+    validate_test_commands_within_workdir((command,), assigned_workdir=_assigned(tmp_path))
+
+
+@pytest.mark.parametrize("command", [
+    "python /outside/checkout/scripts/qualify.py --output-dir /tmp/report",
+    "python tests/test_foo.py --rootdir /outside/checkout",
+])
+def test_report_output_exemption_does_not_allow_outside_execution_or_workdir(tmp_path, command):
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir((command,), assigned_workdir=_assigned(tmp_path))
+
+
+@pytest.mark.parametrize("command", [
     "timeout curl https://live.example",
     "timeout badduration curl https://live.example",
     "timeout -k",

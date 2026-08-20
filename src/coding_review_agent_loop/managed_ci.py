@@ -663,10 +663,16 @@ def _release_for_ordinary_recovery(
 ) -> OrdinaryRecoveryCapability | None:
     """Release the exact active label and return a narrowly scoped capability.
 
-    The capability is deliberately unusable when timeline ownership cannot be
-    proven. We still remove the suppression label where possible so ordinary
-    current-head CI can run, but the orchestrator will not ready or merge such
-    a PR automatically.
+    The capability is created only after the caller has already authenticated
+    the managed draft tuple (same-repository branch, trusted author, draft,
+    label, base, and exact head) and the caller is handling a temporarily
+    missing timeline event. GitHub can return an incomplete event history
+    immediately after a label transition, so that specific race may still use
+    the authenticated tuple as provenance. A readable event owned by another
+    identity remains fail-closed: the label can be removed to restore ordinary
+    CI, but the caller must not receive a capability to ready or merge. The
+    later exact-head ordinary-CI gate remains mandatory before readiness or
+    merge.
     """
     prior_run_ids: set[int] = set()
     try:
@@ -692,14 +698,12 @@ def _release_for_ordinary_recovery(
             f"Managed-CI v2 could not activate ({reason}) and `{MANAGED_LABEL}` could not be removed."
         )
     log(config, f"PR #{pr_number}: selected ordinary unlabeled recovery ({reason})")
-    if active_event is None:
-        return None
     return OrdinaryRecoveryCapability(
         pr_number=pr_number,
         repository=config.repo,
         base_ref=base_ref,
         expected_head_sha=expected_head_sha,
-        released_label_event_id=active_event[0],
+        released_label_event_id=active_event[0] if active_event is not None else None,
         released_at=int(time.time()),
         prior_run_ids=frozenset(prior_run_ids),
     )
@@ -886,15 +890,21 @@ def _activate_v2_managed_ci(
     active_event: tuple[int, str, int] | None = None
     if config.managed_ci_pr_mode:
         active_event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
-        if (
-            active_event is None
-            or active_event[1].casefold() != actor_login.casefold()
-            or active_event[2] != actor_id
-        ):
+        if active_event is None:
+            recovery = _release_for_ordinary_recovery(
+                runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                expected_head_sha=live_sha, active_event=active_event,
+                reason="the active managed-label event is temporarily unreadable",
+            )
+            return ManagedCiContract(
+                activation_path="ordinary_fallback",
+                ordinary_recovery=recovery,
+            )
+        if active_event[1].casefold() != actor_login.casefold() or active_event[2] != actor_id:
             _release_for_ordinary_recovery(
                 runner, config=config, pr_number=pr_number, base_ref=base_ref,
                 expected_head_sha=live_sha, active_event=active_event,
-                reason="the active managed-label event is missing or not actor-owned",
+                reason="the active managed-label event is not actor-owned",
             )
             return ManagedCiContract(
                 activation_path="ordinary_fallback",
