@@ -1088,7 +1088,7 @@ def _activate_v2_managed_ci(
 def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[dict[str, object]] | None:
     """Fetch a paginated GitHub list, returning None for an uninspectable response."""
     result = runner.run(
-        [config.gh_cmd, "api", "--paginate", "--slurp", endpoint], cwd=active_workdir(config), check=False
+        [config.gh_cmd, "api", "--paginate", endpoint], cwd=active_workdir(config), check=False
     )
     if result.returncode != 0:
         return None
@@ -1098,11 +1098,12 @@ def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[di
         return None
     if not isinstance(payload, list):
         return None
-    # `gh api --paginate --slurp` returns one array per page.  Accept a plain
-    # list too so single-page API implementations remain compatible.
-    if all(isinstance(item, list) for item in payload):
-        return [entry for page in payload for entry in page if isinstance(entry, dict)]
-    return [item for item in payload if isinstance(item, dict)]
+    # GitHub CLI 2.45 emits one flat array for paginated array endpoints.
+    # Never silently discard malformed entries: doing so could turn an
+    # incomplete timeline into an apparently complete ownership record.
+    if not all(isinstance(item, dict) for item in payload):
+        return None
+    return payload
 
 
 def _active_managed_label_event(
@@ -1583,22 +1584,13 @@ def _ensure_v2_intent(
     contract.pr_number = pr_number
     contract.expected_head_sha = expected_head_sha
     contract.repository = config.repo
-    comments_result = runner.run(
-        [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"],
-        cwd=active_workdir(config), check=False,
+    comments = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
-    if comments_result.returncode != 0:
+    if comments is None:
         raise AgentLoopError("Unable to inspect managed-CI v2 intent history.")
-    comments: list[object] = []
-    try:
-        parsed = json.loads(comments_result.stdout or "[]")
-        comments = parsed if isinstance(parsed, list) else []
-    except json.JSONDecodeError as exc:
-        raise AgentLoopError("Managed-CI intent comments response was invalid JSON.") from exc
     matching: list[tuple[int, dict[str, object]]] = []
     for raw in comments:
-        if not isinstance(raw, dict):
-            continue
         body = raw.get("body")
         author = raw.get("user") if isinstance(raw.get("user"), dict) else {}
         if not isinstance(body, str) or INTENT_MARKER not in body:
@@ -1933,11 +1925,31 @@ def _v2_failed_jobs(runner: Runner, *, config: AgentLoopConfig, run_id: int | No
     )
     if result.returncode != 0:
         return (f"Managed CI run {run_id} failed; job details were unavailable.",)
+    raw = result.stdout or ""
+    # Without --slurp, gh 2.45 concatenates object pages. Decode every object
+    # instead of accepting only the first page (or treating the stream as bad).
+    decoder = json.JSONDecoder()
+    pages: list[dict[str, object]] = []
+    offset = 0
     try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
+        while offset < len(raw):
+            while offset < len(raw) and raw[offset].isspace():
+                offset += 1
+            if offset == len(raw):
+                break
+            page, end = decoder.raw_decode(raw, offset)
+            if not isinstance(page, dict):
+                raise ValueError("jobs page is not an object")
+            pages.append(page)
+            offset = end
+    except (json.JSONDecodeError, ValueError):
         return (f"Managed CI run {run_id} failed; job details were unavailable.",)
-    jobs = payload.get("jobs") if isinstance(payload, dict) else None
+    jobs: list[object] = []
+    for payload in pages:
+        page_jobs = payload.get("jobs")
+        if not isinstance(page_jobs, list):
+            return (f"Managed CI run {run_id} failed; job details were unavailable.",)
+        jobs.extend(page_jobs)
     terminal = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
     details = []
     for job in jobs if isinstance(jobs, list) else []:

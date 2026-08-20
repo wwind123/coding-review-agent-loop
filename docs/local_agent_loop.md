@@ -1497,6 +1497,31 @@ selected independently of `--watch-pending-ci`; neither that flag nor
 `--no-watch-pending-ci` replaces exact-head qualification with an ordinary
 full-board or named-check wait.
 
+#### Managed-CI GitHub CLI compatibility
+
+The managed-CI API calls use the GitHub CLI 2.45-compatible pagination
+behavior. Paginated array endpoints are decoded as one flat JSON array;
+concatenated object pages (such as workflow jobs) are decoded page by page. A
+malformed page or entry is unavailable and is never treated as an empty or
+absent timeline. The managed-label timeline is therefore unreadable-is-not-absent,
+and every ownership, readiness, and merge gate fails closed when it cannot be
+revalidated.
+
+Ordinary fallback is authorized only by the centralized release path. Before
+removing the managed label it records the IDs of existing workflow runs for
+the exact head. Recovery accepts only a newly observed `pull_request` run for
+that same head, together with a passing and complete ordinary check board.
+There is deliberately no local-clock or timestamp ordering claim: GitHub run
+IDs and the exact-head check are the available provenance, and no run observed
+is not treated as a successful recovery.
+
+Reconstructed reserved drafts require the authenticated user, the configured
+CLI trusted actor, and the current `AGENT_LOOP_MANAGED_ACTOR` repository
+variable to agree. Readiness and merge remain fail-closed, with `gh pr ready`
+and `--match-head-commit` guarded by a fresh exact-head and inactive-label
+provenance check. The workflow must advertise the `pull_request: unlabeled`
+recovery trigger for this path.
+
 ### Watch pending CI
 
 For repositories not using managed exact-head CI, `--watch-pending-ci` is
