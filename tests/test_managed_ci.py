@@ -42,7 +42,10 @@ from coding_review_agent_loop.managed_ci import (
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
-from coding_review_agent_loop.orchestrator import _finalize_ordinary_recovery_merge
+from coding_review_agent_loop.orchestrator import (
+    _finalize_ordinary_recovery_merge,
+    _stop_on_terminal_without_status,
+)
 from coding_review_agent_loop.runner import CommandResult
 
 from agent_loop_helpers import FakeRunner, make_config
@@ -761,7 +764,11 @@ def v2_run(
     }
 
 
-def v2_intent_comment(*, nonce="nonce-1", run_id=None, run_attempt=None):
+def v2_intent_comment(
+    *, nonce="nonce-1", run_id=None, run_attempt=None, state=None,
+    terminal_run_id=None, terminal_run_attempt=None,
+    terminal_attempts=None,
+):
     payload = {
         "repository": "OWNER/REPO",
         "pr": 7,
@@ -771,6 +778,17 @@ def v2_intent_comment(*, nonce="nonce-1", run_id=None, run_attempt=None):
         "run_id": run_id,
         "run_attempt": run_attempt,
     }
+    if state is not None:
+        payload["state"] = state
+    if terminal_run_id is not None:
+        payload["terminal_run_id"] = terminal_run_id
+    if terminal_run_attempt is not None:
+        payload["terminal_run_attempt"] = terminal_run_attempt
+    if terminal_attempts is not None:
+        payload["terminal_attempts"] = [
+            {"run_id": run_id, "run_attempt": attempt}
+            for run_id, attempt in terminal_attempts
+        ]
     return {
         "id": 17,
         "user": {"login": "agent-loop", "id": 1},
@@ -1098,6 +1116,263 @@ def test_v2_qualification_accepts_only_attached_run_status(tmp_path):
     )
 
     assert outcome.status == "passed"
+
+
+def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_path, monkeypatch):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=2, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(status="completed", conclusion="cancelled")],
+        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_status_payload={"statuses": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract(
+        attached_run_id=100, run_attempt=1, intent_comment_id=17,
+        pr_number=7, expected_head_sha="abc123",
+    )
+    monkeypatch.setattr(
+        managed_ci, "_v2_correlated_status", lambda *args, **kwargs: None
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "terminal_without_status"
+    assert (outcome.run_id, outcome.run_attempt) == (100, 1)
+    assert outcome.workflow_conclusion == "cancelled"
+    assert contract.intent_state == "terminal-no-status"
+    assert any(
+        '"state":"terminal-no-status"' in " ".join(command)
+        for command, _cwd in runner.commands
+        if "/issues/comments/17" in " ".join(command)
+    )
+    assert not any(
+        "/statuses/abc123" in " ".join(command) and "POST" in command
+        for command, _cwd in runner.commands
+    )
+
+
+def test_orchestrator_terminal_without_status_posts_resumable_diagnostic(tmp_path, capsys):
+    config = make_config(tmp_path, auto_merge=True)
+    runner = V2ManagedRunner()
+    outcome = managed_ci.ManagedCiOutcome(
+        status="terminal_without_status",
+        run_id=100,
+        run_attempt=1,
+        workflow_conclusion="cancelled",
+    )
+
+    assert _stop_on_terminal_without_status(
+        runner, config=config, pr_number=7, round_number=2, outcome=outcome
+    ) == 0
+    assert len(runner.comments) == 1
+    assert "terminal workflow state `cancelled`" in runner.comments[0]
+    assert "No terminal status was synthesized" in runner.comments[0]
+    assert "higher attempt" in runner.comments[0]
+    assert "terminal workflow state `cancelled`" in capsys.readouterr().out
+
+
+def test_v2_cancelled_run_during_candidate_jobs_stops_without_publishing_status(tmp_path, monkeypatch):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=2, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(status="completed", conclusion="cancelled")],
+        jobs=[{"name": "candidate", "conclusion": "cancelled"}],
+        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_status_payload={"statuses": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract(
+        attached_run_id=100, run_attempt=1, intent_comment_id=17,
+        pr_number=7, expected_head_sha="abc123",
+    )
+    monkeypatch.setattr(managed_ci, "_v2_correlated_status", lambda *args, **kwargs: None)
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "terminal_without_status"
+    assert outcome.workflow_conclusion == "cancelled"
+    assert (contract.terminal_run_id, contract.terminal_run_attempt) == (100, 1)
+
+
+def test_v2_terminal_exclusion_does_not_attach_stale_cancelled_run(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(
+        workflow_runs=[
+            v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
+            v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
+        ],
+        intent_comments=[v2_intent_comment(
+            run_id=100, run_attempt=1, state="terminal-no-status",
+            terminal_run_id=100, terminal_run_attempt=1,
+        )],
+    )
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
+    assert contract.intent_state == "attached"
+    assert not any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
+
+
+def test_v2_terminal_ledger_clears_old_attachment_before_fresh_dispatch(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled")],
+        intent_comments=[v2_intent_comment(
+            run_id=100, run_attempt=1, state="terminal-no-status",
+            terminal_run_id=100, terminal_run_attempt=1,
+        )],
+    )
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert contract.attached_run_id is None
+    assert contract.run_attempt is None
+    assert any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
+
+
+def test_v2_terminal_ledger_excludes_all_prior_cancelled_attempts(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(
+        workflow_runs=[
+            v2_run(run_id=100, attempt=2, status="completed", conclusion="cancelled"),
+            v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
+            v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
+        ],
+        intent_comments=[v2_intent_comment(
+            run_id=100, run_attempt=2, state="terminal-no-status",
+            terminal_run_id=100, terminal_run_attempt=2,
+            terminal_attempts=((100, 1), (100, 2)),
+        )],
+    )
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
+    assert not any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
+
+
+def test_v2_later_legitimate_rerun_attempt_is_accepted_after_terminal_stop(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    runner = V2ManagedRunner(
+        workflow_runs=[
+            v2_run(run_id=100, attempt=2, status="completed", conclusion="success"),
+            v2_run(run_id=100, attempt=1, status="completed", conclusion="timed_out"),
+        ],
+        intent_comments=[v2_intent_comment(
+            run_id=100, run_attempt=1, state="terminal-no-status",
+            terminal_run_id=100, terminal_run_attempt=1,
+        )],
+        pr_status_payload={"statuses": [{
+            "context": FINAL_CONTEXT,
+            "state": "success",
+            "description": "nonce=nonce-1;run_id=100;attempt=2",
+            "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
+            "creator": {"login": "github-actions[bot]", "id": 41898282},
+        }]},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "passed"
+    assert (contract.attached_run_id, contract.run_attempt) == (100, 2)
+    assert contract.terminal_run_attempt == 1
+
+
+def test_v2_waiter_excludes_prior_non_cancelled_terminal_attempt(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(run_id=100, attempt=1, status="completed", conclusion="timed_out")],
+        pr_status_payload={"statuses": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract(
+        terminal_run_id=100,
+        terminal_run_attempt=1,
+        terminal_attempts=((100, 1),),
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "timeout"
+    assert contract.attached_run_id is None
+    assert not any('"state":"attached"' in " ".join(command) for command, _cwd in runner.commands)
+
+
+def test_v2_refresh_keeps_known_attempt_when_payload_omits_run_attempt(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    run = v2_run(run_id=100, attempt=1)
+    del run["run_attempt"]
+    runner = V2ManagedRunner(
+        workflow_runs=[run],
+        pr_status_payload={"statuses": [{
+            "context": FINAL_CONTEXT,
+            "state": "success",
+            "description": "nonce=nonce-1;run_id=100;attempt=1",
+            "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
+            "creator": {"login": "github-actions[bot]", "id": 41898282},
+        }]},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract(attached_run_id=100, run_attempt=1)
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "passed"
+    assert contract.run_attempt == 1
+
+
+def test_v2_completed_run_failure_race_accepts_late_correlated_status(tmp_path, monkeypatch):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=2, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(status="completed", conclusion="failure")],
+        jobs=[{"name": "unit", "conclusion": "failure"}],
+        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+    )
+    contract = v2_contract(attached_run_id=100, run_attempt=1)
+    failure = PullRequestCheck(
+        name=FINAL_CONTEXT, kind="status_context", status="failure",
+        run_id="100", description="nonce=nonce-1;run_id=100;attempt=1",
+    )
+    responses = iter([None, failure])
+    monkeypatch.setattr(
+        managed_ci, "_v2_correlated_status", lambda *args, **kwargs: next(responses)
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "failed"
 
 
 def test_v2_qualification_rejects_numeric_prefix_tokens_and_run_url(tmp_path):

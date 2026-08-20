@@ -101,7 +101,9 @@ from .evidence_reconciliation import (
 )
 from .memory import AgentMemoryContext, prepare_agent_memory
 from .managed_ci import (
+    FINAL_CONTEXT,
     MANAGED_LABEL,
+    ManagedCiOutcome,
     OrdinaryRecoveryCapability,
     activate_managed_ci,
     dispatch_final_qualification,
@@ -5712,6 +5714,45 @@ def _finalize_ordinary_recovery_merge(
         raise
 
 
+def _stop_on_terminal_without_status(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    outcome: ManagedCiOutcome,
+) -> int:
+    conclusion = outcome.workflow_conclusion or "unknown"
+    attempt_text = (
+        f"run `{outcome.run_id}` attempt `{outcome.run_attempt}`"
+        if outcome.run_id is not None
+        else "the correlated managed-CI attempt"
+    )
+    body = (
+        f"PR #{pr_number} managed exact-head CI stopped because {attempt_text} "
+        f"reached terminal workflow state `{conclusion}` without publishing a "
+        f"correlated `{FINAL_CONTEXT}` status. No terminal status was synthesized "
+        "and no merge was attempted.\n\n"
+        "The round is resumable: for the unchanged head, rerun the command after "
+        "a legitimate GitHub rerun creates a higher attempt, or rerun it to dispatch "
+        "a fresh eligible same-nonce run. If the head was corrected, restart exact-head "
+        "review so a new ledger is created/used."
+    )
+    post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
+    log(
+        config,
+        f"Round {round_number}: managed CI reached terminal state without "
+        "publishing the correlated exact-head status; no merge attempted",
+    )
+    print(
+        f"PR #{pr_number} managed exact-head CI reached terminal workflow state "
+        f"`{conclusion}` without publishing its correlated status. No merge was "
+        "attempted; rerun after a legitimate GitHub rerun or fresh same-nonce "
+        "dispatch (or restart review if the head changed)."
+    )
+    return 0
+
+
 def run_pr_loop(
     runner: Runner,
     *,
@@ -7295,6 +7336,14 @@ def run_pr_loop(
                                     "runners recover."
                                 )
                                 return 0
+                            elif managed_outcome.status == "terminal_without_status":
+                                return _stop_on_terminal_without_status(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    round_number=round_number,
+                                    outcome=managed_outcome,
+                                )
                             elif managed_outcome.status == "failed":
                                 details = (
                                     list(managed_outcome.failure_details)

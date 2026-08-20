@@ -48,6 +48,10 @@ V2_ADOPTION_MARKER = "AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION"
 V2_ADOPTION_FEATURE_MARKERS = (V2_ADOPTION_MARKER,)
 RECOVERY_MARKER = "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1"
 UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
+_TERMINAL_CI_STATUSES = frozenset({
+    "success", "failure", "error", "cancelled", "timed_out",
+    "action_required", "startup_failure", "stale",
+})
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,10 @@ class ManagedCiContract:
     # comments remain diagnostic history and are never adopted as this run's
     # dispatch authorization.
     intent_generation: str | None = None
+    intent_state: str | None = None
+    terminal_run_id: int | None = None
+    terminal_run_attempt: int | None = None
+    terminal_attempts: tuple[tuple[int, int | None], ...] = ()
     activation_path: Literal["managed", "ordinary_fallback"] = "managed"
     ordinary_recovery: "OrdinaryRecoveryCapability | None" = None
 
@@ -154,12 +162,25 @@ class ManagedCiOutcome:
         "head_changed",
         "merge_conflict",
         "infrastructure_stall",
+        "terminal_without_status",
     ]
     checks: PullRequestChecks | None = None
     mergeability: PullRequestMergeability | None = None
     head_sha: str | None = None
     stall: CiInfrastructureStall | None = None
     failure_details: tuple[str, ...] = ()
+    run_id: int | None = None
+    run_attempt: int | None = None
+    workflow_status: str | None = None
+    workflow_conclusion: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagedCiRunSnapshot:
+    run_id: int
+    run_attempt: int | None
+    status: str | None
+    conclusion: str | None
 
 
 def activate_managed_ci(
@@ -1574,6 +1595,12 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
         "state": state,
         "run_id": contract.attached_run_id,
         "run_attempt": contract.run_attempt,
+        "terminal_run_id": contract.terminal_run_id,
+        "terminal_run_attempt": contract.terminal_run_attempt,
+        "terminal_attempts": [
+            {"run_id": run_id, "run_attempt": run_attempt}
+            for run_id, run_attempt in contract.terminal_attempts
+        ],
     }
     return f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->"
 
@@ -1631,6 +1658,38 @@ def _ensure_v2_intent(
         contract.created_at = intent.get("created_at") if isinstance(intent.get("created_at"), int) else None
         contract.attached_run_id = intent.get("run_id") if isinstance(intent.get("run_id"), int) else None
         contract.run_attempt = intent.get("run_attempt") if isinstance(intent.get("run_attempt"), int) else None
+        contract.intent_state = intent.get("state") if isinstance(intent.get("state"), str) else None
+        terminal_run_id = intent.get("terminal_run_id")
+        terminal_run_attempt = intent.get("terminal_run_attempt")
+        encoded_attempts = intent.get("terminal_attempts")
+        terminal_attempts: list[tuple[int, int | None]] = []
+        if isinstance(encoded_attempts, list):
+            for encoded in encoded_attempts:
+                if not isinstance(encoded, dict) or not isinstance(encoded.get("run_id"), int):
+                    continue
+                encoded_attempt = encoded.get("run_attempt")
+                terminal_attempts.append(
+                    (encoded["run_id"], encoded_attempt if isinstance(encoded_attempt, int) else None)
+                )
+        if isinstance(terminal_run_id, int) and isinstance(terminal_run_attempt, int):
+            contract.terminal_run_id = terminal_run_id
+            contract.terminal_run_attempt = terminal_run_attempt
+        if contract.intent_state == "terminal-no-status" and not terminal_attempts:
+            if contract.attached_run_id is not None:
+                contract.terminal_run_id = contract.attached_run_id
+                contract.terminal_run_attempt = contract.run_attempt
+        legacy_key = (contract.terminal_run_id, contract.terminal_run_attempt)
+        if legacy_key[0] is not None and legacy_key not in terminal_attempts:
+            terminal_attempts.append((legacy_key[0], legacy_key[1]))
+        contract.terminal_attempts = tuple(terminal_attempts)
+        if (
+            contract.intent_state == "terminal-no-status"
+            and (contract.attached_run_id, contract.run_attempt) in contract.terminal_attempts
+        ):
+            # The attached attempt is the one that already stopped. Leave
+            # discovery responsible for finding a rerun or fresh dispatch.
+            contract.attached_run_id = None
+            contract.run_attempt = None
         return
     contract.nonce = secrets.token_urlsafe(24)
     contract.created_at = int(time.time())
@@ -1648,6 +1707,7 @@ def _ensure_v2_intent(
     if not isinstance(payload.get("id"), int):
         raise AgentLoopError("Managed-CI intent comment was created without an ID.")
     contract.intent_comment_id = payload["id"]
+    contract.intent_state = "prepared"
 
 
 def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract, state: str) -> None:
@@ -1667,9 +1727,13 @@ def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedC
     )
     if updated.returncode != 0:
         raise AgentLoopError("Unable to persist managed-CI v2 intent state.")
+    contract.intent_state = state
 
 
-def _discover_v2_run(runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract, retries: int) -> tuple[int, int | None] | None:
+def _discover_v2_snapshot(
+    runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract,
+    retries: int, include_terminal: bool = False,
+) -> ManagedCiRunSnapshot | None:
     if not contract.nonce:
         return None
     run_name = _v2_run_name(contract)
@@ -1688,21 +1752,47 @@ def _discover_v2_run(runner: Runner, *, config: AgentLoopConfig, contract: Manag
                 for run in runs
                 if isinstance(run, dict) and _is_v2_intent_run(run, contract=contract, run_name=run_name)
             ]
-            survivors = [run for run in candidates if run.get("status") != "completed" or run.get("conclusion") != "cancelled"]
+            survivors = [
+                run for run in candidates
+                if include_terminal or run.get("status") != "completed"
+                or run.get("conclusion") != "cancelled"
+            ]
+            excluded_attempts = set(contract.terminal_attempts)
+            if contract.terminal_run_id is not None:
+                excluded_attempts.add((contract.terminal_run_id, contract.terminal_run_attempt))
+            if excluded_attempts:
+                survivors = [
+                    run for run in survivors
+                    if (run.get("id"), run.get("run_attempt")) not in excluded_attempts
+                ]
             if survivors:
                 newest = sorted(survivors, key=lambda run: (str(run.get("created_at") or ""), int(run.get("id") or 0)))[-1]
                 rid = newest.get("id")
                 if isinstance(rid, int):
                     attempt_no = newest.get("run_attempt")
-                    return rid, attempt_no if isinstance(attempt_no, int) else None
+                    return ManagedCiRunSnapshot(
+                        rid,
+                        attempt_no if isinstance(attempt_no, int) else None,
+                        newest.get("status") if isinstance(newest.get("status"), str) else None,
+                        newest.get("conclusion") if isinstance(newest.get("conclusion"), str) else None,
+                    )
         if attempt < retries - 1:
             runner.run(["sleep", str(min(config.ci_poll_interval_seconds, 2))], cwd=active_workdir(config))
     return None
 
 
-def _refresh_v2_attached_run_attempt(
+def _discover_v2_run(
+    runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract, retries: int,
+) -> tuple[int, int | None] | None:
+    snapshot = _discover_v2_snapshot(
+        runner, config=config, contract=contract, retries=retries, include_terminal=False
+    )
+    return (snapshot.run_id, snapshot.run_attempt) if snapshot is not None else None
+
+
+def _refresh_v2_attached_run(
     runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract
-) -> int | None:
+) -> ManagedCiRunSnapshot | None:
     """Read the current attempt for the already-attached workflow run.
 
     GitHub increments ``run_attempt`` when a run is re-run.  The run ID remains
@@ -1732,7 +1822,12 @@ def _refresh_v2_attached_run_attempt(
     if not _is_v2_intent_run(run, contract=contract, run_name=run_name):
         return None
     attempt = run.get("run_attempt")
-    return attempt if isinstance(attempt, int) else None
+    return ManagedCiRunSnapshot(
+        contract.attached_run_id,
+        attempt if isinstance(attempt, int) else contract.run_attempt,
+        run.get("status") if isinstance(run.get("status"), str) else None,
+        run.get("conclusion") if isinstance(run.get("conclusion"), str) else None,
+    )
 
 
 def _v2_run_name(contract: ManagedCiContract) -> str:
@@ -1782,6 +1877,8 @@ def wait_for_final_qualification(
         raise AgentLoopError(f"PR #{pr_number} has no approved head SHA.")
     attempts = max(1, config.ci_timeout_seconds // config.ci_poll_interval_seconds)
     latest: PullRequestChecks | None = None
+    terminal_confirmation: tuple[int, int | None] | None = None
+    terminal_confirmation_seen = False
     for attempt in range(attempts):
         live_head = get_pr_head_sha(runner, config, pr_number)
         if live_head != expected_head:
@@ -1795,18 +1892,24 @@ def wait_for_final_qualification(
                 head_sha=live_head,
             )
         latest = get_pr_checks(runner, config=config, metadata=metadata)
+        run_snapshot: ManagedCiRunSnapshot | None = None
         if contract is not None and contract.protocol_version == 2:
             if contract.attached_run_id is None:
-                attached = _discover_v2_run(runner, config=config, contract=contract, retries=1)
-                if attached is not None:
-                    contract.attached_run_id, contract.run_attempt = attached
+                run_snapshot = _discover_v2_snapshot(
+                    runner, config=config, contract=contract, retries=1, include_terminal=True
+                )
+                if run_snapshot is not None:
+                    contract.attached_run_id, contract.run_attempt = run_snapshot.run_id, run_snapshot.run_attempt
                     _patch_intent(runner, config=config, contract=contract, state="attached")
             else:
-                current_attempt = _refresh_v2_attached_run_attempt(
+                run_snapshot = _refresh_v2_attached_run(
                     runner, config=config, contract=contract
                 )
-                if current_attempt is not None and current_attempt != contract.run_attempt:
-                    contract.run_attempt = current_attempt
+                if run_snapshot is not None and (
+                    run_snapshot.run_attempt is not None
+                    and run_snapshot.run_attempt != contract.run_attempt
+                ):
+                    contract.run_attempt = run_snapshot.run_attempt
                     _patch_intent(runner, config=config, contract=contract, state="attached")
             final = _v2_correlated_status(
                 runner, config=config, expected_head=expected_head, contract=contract
@@ -1819,15 +1922,42 @@ def wait_for_final_qualification(
             if contract is not None and contract.protocol_version == 2:
                 _patch_intent(runner, config=config, contract=contract, state="completed")
             return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
-        if status in {
-            "failure",
-            "error",
-            "cancelled",
-            "timed_out",
-            "action_required",
-            "startup_failure",
-            "stale",
-        }:
+        correlated_terminal = final is not None and final.status.lower() in _TERMINAL_CI_STATUSES
+        if (
+            contract is not None and contract.protocol_version == 2
+            and run_snapshot is not None
+            and (run_snapshot.status or "").lower() == "completed"
+            and not correlated_terminal
+        ):
+            key = (run_snapshot.run_id, run_snapshot.run_attempt)
+            if key != terminal_confirmation:
+                terminal_confirmation = key
+                terminal_confirmation_seen = False
+                # A publisher may race the workflow's completed transition. Re-read
+                # immediately before starting the bounded confirmation window.
+                final = _v2_correlated_status(
+                    runner, config=config, expected_head=expected_head, contract=contract
+                )
+                if final is not None and final.status.lower() in _TERMINAL_CI_STATUSES:
+                    status = final.status.lower()
+                    if status == "success":
+                        _patch_intent(runner, config=config, contract=contract, state="completed")
+                        return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
+                else:
+                    terminal_confirmation_seen = True
+            elif terminal_confirmation_seen:
+                contract.terminal_run_id = run_snapshot.run_id
+                contract.terminal_run_attempt = run_snapshot.run_attempt
+                terminal_key = (run_snapshot.run_id, run_snapshot.run_attempt)
+                if terminal_key not in contract.terminal_attempts:
+                    contract.terminal_attempts += (terminal_key,)
+                _patch_intent(runner, config=config, contract=contract, state="terminal-no-status")
+                return ManagedCiOutcome(
+                    status="terminal_without_status", checks=latest, head_sha=live_head,
+                    run_id=run_snapshot.run_id, run_attempt=run_snapshot.run_attempt,
+                    workflow_status=run_snapshot.status, workflow_conclusion=run_snapshot.conclusion,
+                )
+        if status in _TERMINAL_CI_STATUSES - {"success"}:
             details = ()
             if contract is not None and contract.protocol_version == 2:
                 _patch_intent(runner, config=config, contract=contract, state="completed")
