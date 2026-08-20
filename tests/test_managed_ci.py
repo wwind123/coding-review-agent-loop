@@ -27,6 +27,7 @@ from coding_review_agent_loop.managed_ci import (
     _dispatch_v2_qualification,
     _ensure_v2_intent,
     _v2_failed_jobs,
+    _v2_correlated_status,
     _api_list,
     activate_managed_ci,
     dispatch_final_qualification,
@@ -1116,6 +1117,47 @@ def test_v2_qualification_accepts_only_attached_run_status(tmp_path):
     )
 
     assert outcome.status == "passed"
+
+
+def test_v2_correlated_status_uses_history_and_ignores_later_unrelated_status(tmp_path):
+    config = make_config(tmp_path, auto_merge=True)
+    creator = {"login": "github-actions[bot]", "id": 41898282}
+    common = {
+        "context": FINAL_CONTEXT,
+        "target_url": "https://ghe.example/actions/runs/100/",
+        "creator": creator,
+    }
+    runner = FakeRunner(pr_status_payload={
+        "pages": [
+            [{**common, "state": "pending", "description": "nonce=nonce-1;run_id=100;attempt=1", "created_at": "2026-08-20T10:00:00Z"}],
+            [{**common, "state": "success", "description": "nonce=nonce-1;run_id=100;attempt=1", "created_at": "2026-08-20T10:01:00Z"}],
+            [{**common, "state": "failure", "description": "nonce=nonce-1;run_id=999;attempt=1", "created_at": "2026-08-20T10:02:00Z"}],
+        ]
+    })
+    contract = v2_contract(attached_run_id=100, run_attempt=1)
+
+    result = _v2_correlated_status(runner, config=config, expected_head="abc123", contract=contract)
+
+    assert result is not None
+    assert result.status == "success"
+    assert result.run_id == "100"
+
+
+def test_v2_correlated_status_omits_unknown_attempt_token(tmp_path):
+    config = make_config(tmp_path, auto_merge=True)
+    runner = FakeRunner(pr_status_payload={"statuses": [{
+        "context": FINAL_CONTEXT,
+        "state": "success",
+        "description": "nonce=nonce-1;run_id=100",
+        "target_url": "https://github.com/OWNER/REPO/actions/runs/100",
+        "creator": {"login": "github-actions[bot]", "id": 41898282},
+    }]})
+    result = _v2_correlated_status(
+        runner, config=config, expected_head="abc123",
+        contract=v2_contract(attached_run_id=100, run_attempt=None),
+    )
+    assert result is not None
+    assert result.status == "success"
 
 
 def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_path, monkeypatch):

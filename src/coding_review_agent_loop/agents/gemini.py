@@ -279,6 +279,7 @@ class GeminiBackend:
             usage=usage,
             raw_usage=raw_usage,
             model_used=config.gemini_model or None,
+            command_result=result,
         )
 
 

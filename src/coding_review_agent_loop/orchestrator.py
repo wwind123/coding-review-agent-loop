@@ -2336,8 +2336,10 @@ def _run_validated_agent(
         if result.returncode != 0 and artifact_unavailable is None:
             last_error = f"agent command exited with {result.returncode}"
             classification_text = _agent_failure_classification_text(result, phase="command")
+            if result.command_result is not None and result.command_result.capture_diagnostics:
+                classification_text += "\nsubprocess capture unavailable; retryable tooling failure"
             last_classification_text = classification_text
-            should_retry = _is_transient_agent_output(classification_text)
+            should_retry = bool(result.command_result and result.command_result.capture_diagnostics) or _is_transient_agent_output(classification_text)
             last_failure_category = _failure_category(classification_text)
             capacity = classify_antigravity_capacity(
                 classification_text,
@@ -2410,6 +2412,9 @@ def _run_validated_agent(
                     public_response=True,
                     repair_expected_kind=repair_expected_kind,
                 )
+                if result.command_result is not None and result.command_result.capture_diagnostics:
+                    last_failure_category = "transient"
+                    public_text_is_transient = True
                 if (
                     completion_recovery is not None
                     and not completion_recovery_attempted

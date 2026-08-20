@@ -118,6 +118,22 @@ def test_ensure_log_dir_ignored_does_not_overwrite_existing_file(tmp_path):
     assert gitignore.read_text(encoding="utf-8") == "custom\n"
 
 
+def test_logging_module_imports_without_fcntl(monkeypatch):
+    """The shared logging module must remain importable on Windows."""
+    import importlib
+
+    import coding_review_agent_loop.logging as logging_module
+
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    try:
+        reloaded = importlib.reload(logging_module)
+        assert reloaded.fcntl is None
+        assert reloaded.datetime_stamp()
+    finally:
+        monkeypatch.delitem(sys.modules, "fcntl", raising=False)
+        importlib.reload(logging_module)
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -3691,6 +3707,89 @@ def test_runner_pty_reports_tty_and_strips_ansi(tmp_path):
     assert "GREEN" in result.stdout
     assert "\x1b[" not in result.stdout  # ANSI stripped from captured output
     assert result.returncode == 0
+
+
+def test_runner_keeps_output_when_capture_path_is_unlinked(tmp_path):
+    """An open capture descriptor survives cleanup unlinking its pathname."""
+    program = (
+        "import os, sys, time\n"
+        "path = sys.argv[1]\n"
+        "print('before-unlink', flush=True)\n"
+        "os.unlink(path)\n"
+        "print('after-unlink', flush=True)\n"
+    )
+    log_path = tmp_path / "logs" / "unlinked.log"
+    result = Runner().run_with_log(
+        [sys.executable, "-c", program, str(log_path)],
+        cwd=tmp_path,
+        log_path=log_path,
+        label="UnlinkProbe",
+        progress_interval_seconds=999,
+    )
+    assert result.returncode == 0
+    assert "before-unlink" in result.stdout
+    assert "after-unlink" in result.stdout
+    assert result.capture_diagnostics == ()
+
+
+def test_runner_classifies_invalid_capture_encoding_without_crashing(tmp_path):
+    program = "import sys; sys.stdout.buffer.write(b'\\xff'); sys.stdout.flush()"
+    result = Runner().run_with_log(
+        [sys.executable, "-c", program],
+        cwd=tmp_path,
+        log_path=tmp_path / "logs" / "invalid-utf8.log",
+        label="InvalidEncodingProbe",
+        progress_interval_seconds=999,
+    )
+    assert result.returncode == 0
+    assert result.capture_diagnostics[0].startswith("capture_read_failed:UnicodeDecodeError:")
+
+
+@pytest.mark.parametrize(
+    ("text", "returncode"),
+    [("", 1), ("not a structured response", 0)],
+)
+def test_orchestrator_retries_capture_diagnostics_as_tooling_failure(
+    tmp_path, text, returncode
+):
+    """Capture-read diagnostics remain retryable for failed or invalid responses."""
+    from unittest.mock import patch
+
+    config = make_config(tmp_path, coder="codex", reviewer="codex", agent_max_retries=1)
+    command_result = CommandResult(
+        ["codex"],
+        tmp_path,
+        "",
+        "",
+        returncode,
+        capture_diagnostics=("capture_read_failed:OSError: injected",),
+    )
+    result = AgentResult(
+        text=text,
+        raw_output=text,
+        returncode=returncode,
+        command_result=command_result,
+    )
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.run_agent_result", return_value=result
+    ) as run_mock:
+        with pytest.raises(AgentInvocationError) as exc_info:
+            _run_validated_agent(
+                FakeRunner(),
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="test",
+                validate=lambda value: _validate_review_response(
+                    value, reviewer="OpenAI Codex", unresolved_items=()
+                ),
+            )
+
+    assert run_mock.call_count == 2
+    assert exc_info.value.failure_category == (
+        "deterministic" if returncode != 0 else "transient"
+    )
 
 
 @pytest.mark.parametrize("use_pty", [False, True])

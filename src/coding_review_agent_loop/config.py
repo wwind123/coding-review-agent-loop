@@ -8,6 +8,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from .agents.base import AgentName
 from .agents.registry import default_agent_args
 from .errors import AgentLoopError
 from .github import PullRequestMetadata, detect_repo, get_repo_default_branch
-from .logging import log
+from .logging import datetime_stamp, log
 from .runner import Runner
 from .workdirs import active_workdir, agent_workdir
 
@@ -122,6 +123,9 @@ class AgentLoopConfig:
     repair_backend: str = "antigravity"
     repair_models: tuple[str, ...] = DEFAULT_REPAIR_MODELS
     repair_timeout_seconds: int = 120
+    # Active subprocess capture is kept outside mutable agent checkouts.  The
+    # legacy log_dir remains the home for salvage and usage artifacts.
+    subprocess_log_dir: Path | None = None
     # Optional analyzer agent for discuss mode (#467). None keeps plain
     # direct deliberation unchanged. May coincide with a reviewer.
     discuss_analyzer: AgentName | None = None
@@ -441,6 +445,14 @@ def default_cache_root() -> Path:
     return Path.home() / ".cache" / "coding-review-agent-loop"
 
 
+def default_subprocess_log_dir(repo: str) -> Path:
+    """Return a unique, checkout-independent capture directory."""
+    return (
+        default_cache_root() / "subprocess-logs" / repo_cache_slug(repo)
+        / f"{datetime_stamp()}-{uuid.uuid4().hex}"
+    )
+
+
 def default_agent_memory_dir(repo: str) -> Path:
     return default_cache_root() / "repos" / repo_cache_slug(repo) / "memory"
 
@@ -454,6 +466,24 @@ def ensure_workdir(path: Path, option_name: str) -> None:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise AgentLoopError(f"Could not create {option_name} at {path}: {exc}") from exc
+
+
+def _resolve_subprocess_log_dir(
+    args: argparse.Namespace, *, repo: str, primary_dir: Path, managed_roots: tuple[Path, ...]
+) -> Path:
+    value = getattr(args, "subprocess_log_dir", None)
+    raw = Path(value) if value is not None else default_subprocess_log_dir(repo)
+    path = (primary_dir / raw if value is not None and not raw.is_absolute() else raw).expanduser().resolve()
+    if any(path == root or root in path.parents for root in managed_roots):
+        raise AgentLoopError(
+            "--subprocess-log-dir must not be equal to or nested beneath a managed checkout: "
+            f"{path}"
+        )
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AgentLoopError(f"Could not create --subprocess-log-dir at {path}: {exc}") from exc
+    return path
 
 
 _TOOL_ARTIFACT_NAMES = frozenset({
@@ -977,6 +1007,7 @@ def config_from_args(
         mergeability_poll_interval_seconds=getattr(args, "mergeability_poll_interval_seconds", 5),
         quiet=args.quiet,
         log_dir=(primary_dir / args.log_dir if not args.log_dir.is_absolute() else args.log_dir),
+        subprocess_log_dir=_resolve_subprocess_log_dir(args, repo=repo, primary_dir=primary_dir, managed_roots=(claude_dir, codex_dir, gemini_dir, antigravity_dir)),
         progress_interval_seconds=args.progress_interval_seconds,
         agent_max_retries=args.agent_max_retries,
         agent_retry_backoff_seconds=tuple(args.agent_retry_backoff_seconds),

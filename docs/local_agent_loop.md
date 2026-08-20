@@ -1378,7 +1378,8 @@ exact tokens (in any order):
 nonce=<managed_nonce>;run_id=<github.run_id>;attempt=<github.run_attempt>
 ```
 
-Its `target_url` must end in `/actions/runs/<github.run_id>`. Agent-loop
+Its `target_url` path must end in `/actions/runs/<github.run_id>` (the host may
+be github.com or a GitHub Enterprise Server hostname). Agent-loop
 matches each token and the final URL path segment exactly; a matching prefix,
 another run, or an earlier rerun attempt is not accepted. The publisher should
 run under `github-actions[bot]` (or the configured trusted actor when posting
@@ -2050,6 +2051,15 @@ diagnostics, and whether the subprocess is still making progress; the response
 file is the public answer the orchestrator will validate and post. Empty
 response files, missing markers, or diagnostics-only stdout fail locally instead
 of being posted to GitHub.
+
+Active subprocess captures default to a unique directory under the agent-loop
+cache, outside managed checkouts. `--subprocess-log-dir` selects an explicit
+capture root; relative values are resolved from the primary agent directory,
+and paths equal to or beneath a managed checkout are rejected.
+Invocation directories hold a lifetime lease; cleanup removes only old,
+unlocked directories on a best-effort basis. `--log-dir` remains the legacy
+root for usage summaries and salvage artifacts, and old checkout-resident logs
+are not migrated or rediscovered as active captures.
 
 When a mutating coder implementation run reaches a terminal failure with a
 non-empty tracked diff, the orchestrator writes local salvage artifacts under

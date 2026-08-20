@@ -323,6 +323,7 @@ class CodexBackend:
                 usage=usage,
                 raw_usage=raw_usage,
                 model_used=model_used,
+                command_result=result,
             )
         finally:
             try:
