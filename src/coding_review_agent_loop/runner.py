@@ -425,7 +425,7 @@ class Runner:
                 log_file.flush()
                 log_file.seek(0)
                 full_output = log_file.read()
-            except OSError as exc:
+            except (OSError, UnicodeError) as exc:
                 capture_diagnostics.append(f"capture_read_failed:{type(exc).__name__}:{exc}")
                 full_output = ""
         output = full_output[len(header):] if full_output.startswith(header) else full_output

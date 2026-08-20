@@ -1989,8 +1989,6 @@ def _v2_correlated_status(
     """
     if contract.attached_run_id is None or not contract.nonce:
         return None
-    if not isinstance(contract.run_attempt, int):
-        return None
     result = runner.run(
         [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/commits/{expected_head}/statuses?per_page=100"],
         cwd=active_workdir(config), check=False,
@@ -2001,8 +1999,13 @@ def _v2_correlated_status(
         pages = _decode_paginated_json(result.stdout)
     except (json.JSONDecodeError, TypeError):
         return None
-    statuses = [item for page in pages for item in page] if all(isinstance(page, list) for page in pages) else []
-    required = {f"nonce={contract.nonce}", f"run_id={contract.attached_run_id}", f"attempt={contract.run_attempt}"}
+    statuses = [item for page in pages for item in page]
+    required = {f"nonce={contract.nonce}", f"run_id={contract.attached_run_id}"}
+    if isinstance(contract.run_attempt, int):
+        required.add(f"attempt={contract.run_attempt}")
+    excluded = _v2_terminal_attempt_excluded(
+        contract.attached_run_id, contract.run_attempt, contract.terminal_attempts
+    )
     matches: list[tuple[int, str | None, dict[str, object]]] = []
     for position, raw in enumerate(statuses):
         if not isinstance(raw, dict) or raw.get("context") != FINAL_CONTEXT:
@@ -2022,13 +2025,12 @@ def _v2_correlated_status(
         target_path = urlparse(target).path.rstrip("/")
         target_segments = target_path.split("/")
         if (
-            target != f"https://github.com/{config.repo}/actions/runs/{contract.attached_run_id}"
-            or len(target_segments) < 3
+            len(target_segments) < 3
             or target_segments[-3:-1] != ["actions", "runs"]
             or target_segments[-1] != str(contract.attached_run_id)
         ):
             continue
-        if _v2_terminal_attempt_excluded(contract.attached_run_id, contract.run_attempt, contract.terminal_attempts):
+        if excluded:
             continue
         created_value = raw.get("created_at")
         created = created_value if isinstance(created_value, str) else None
@@ -2050,17 +2052,17 @@ def _v2_correlated_status(
     login = creator.get("login") if isinstance(creator.get("login"), str) else None
     creator_id = creator.get("id") if isinstance(creator.get("id"), int) else None
     return PullRequestCheck(
-            name=FINAL_CONTEXT,
-            kind="status_context",
-            status=str(raw.get("state") or "pending"),
-            url=target or None,
-            run_id=str(contract.attached_run_id),
-            created_at=raw.get("created_at") if isinstance(raw.get("created_at"), str) else None,
-            completed_at=raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None,
-            creator_login=login,
-            creator_id=creator_id,
-            description=description,
-        )
+        name=FINAL_CONTEXT,
+        kind="status_context",
+        status=str(raw.get("state") or "pending"),
+        url=target or None,
+        run_id=str(contract.attached_run_id),
+        created_at=raw.get("created_at") if isinstance(raw.get("created_at"), str) else None,
+        completed_at=raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None,
+        creator_login=login,
+        creator_id=creator_id,
+        description=description,
+    )
 
 
 def _decode_paginated_json(text: str) -> list[list[object]]:

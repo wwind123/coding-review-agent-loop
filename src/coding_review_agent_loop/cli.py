@@ -401,7 +401,8 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help=(
                 "External directory for active subprocess captures. The default is a unique "
-                "directory under the agent-loop cache; paths inside managed checkouts are rejected."
+                "directory under the agent-loop cache; relative overrides are resolved from the "
+                "primary agent directory, and paths inside managed checkouts are rejected."
             ),
         )
         subparser.add_argument(

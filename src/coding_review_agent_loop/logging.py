@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import os
 import time
 import fcntl
 from datetime import datetime
@@ -12,10 +11,17 @@ from typing import TYPE_CHECKING
 
 _LEASES: dict[Path, object] = {}
 _RETENTION_SECONDS = 14 * 24 * 60 * 60
+_MAX_LEASES = 32
+_CAPTURE_MARKER = ".agent-loop-capture"
+
+
+def datetime_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
 
 def _prepare_capture_root(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
+    (root / _CAPTURE_MARKER).touch(exist_ok=True)
     if root not in _LEASES:
         lease = (root / ".lease").open("a+")
         try:
@@ -24,7 +30,14 @@ def _prepare_capture_root(root: Path) -> None:
             lease.close()
         else:
             _LEASES[root] = lease
-            _prune_capture_roots(root.parent, root)
+            while len(_LEASES) > _MAX_LEASES:
+                old_root, old_lease = next(iter(_LEASES.items()))
+                if old_root == root:
+                    break
+                _LEASES.pop(old_root)
+                old_lease.close()
+            if root.parent.parent.name == "subprocess-logs":
+                _prune_capture_roots(root.parent, root)
 
 
 def _prune_capture_roots(parent: Path, current: Path) -> None:
@@ -37,6 +50,8 @@ def _prune_capture_roots(parent: Path, current: Path) -> None:
     for candidate in candidates:
         if not candidate.is_dir() or candidate == current:
             continue
+        if not (candidate / _CAPTURE_MARKER).is_file():
+            continue
         try:
             if candidate.stat().st_mtime >= cutoff:
                 continue
@@ -47,7 +62,7 @@ def _prune_capture_roots(parent: Path, current: Path) -> None:
                 lease.close()
                 continue
             for item in candidate.iterdir():
-                if item.name != ".lease" and item.is_file():
+                if item.is_file():
                     item.unlink(missing_ok=True)
             lease.close()
             candidate.rmdir()
@@ -66,7 +81,7 @@ def log(config: AgentLoopConfig, message: str) -> None:
 
 
 def new_run_id() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return datetime_stamp()
 
 
 def agent_log_path(
@@ -77,7 +92,7 @@ def agent_log_path(
     label: str | None = None,
     attempt_suffix: str | None = None,
 ) -> Path:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    stamp = datetime_stamp()
     prefix = f"{run_id}-" if run_id else ""
     suffix = f"-{label}" if label else ""
     attempt = f"-{attempt_suffix}" if attempt_suffix else ""

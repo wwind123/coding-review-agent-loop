@@ -916,9 +916,10 @@ The remaining legacy compatibility surface is intentional:
 
 Active subprocess captures are written to a unique directory under the local
 agent-loop cache, outside every managed checkout. Use `--subprocess-log-dir`
-to override it; an override equal to or nested inside a managed checkout is
+to override it; relative overrides are resolved from the primary agent
+directory, and an override equal to or nested inside a managed checkout is
 rejected. Capture directories are leased for the life of the invocation and
-old, unlocked directories are pruned by age. `--log-dir` remains the location
+old, unlocked tool-owned directories are pruned by age. `--log-dir` remains the location
 for salvage and usage artifacts, preserving discovery of legacy
 `.agent-loop-logs/` data. Long-running agents print heartbeat lines with the exact log
 path. GitHub comments come from validated public response files under

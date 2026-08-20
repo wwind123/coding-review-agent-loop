@@ -3716,6 +3716,19 @@ def test_runner_keeps_output_when_capture_path_is_unlinked(tmp_path):
     assert result.capture_diagnostics == ()
 
 
+def test_runner_classifies_invalid_capture_encoding_without_crashing(tmp_path):
+    program = "import sys; sys.stdout.buffer.write(b'\\xff'); sys.stdout.flush()"
+    result = Runner().run_with_log(
+        [sys.executable, "-c", program],
+        cwd=tmp_path,
+        log_path=tmp_path / "logs" / "invalid-utf8.log",
+        label="InvalidEncodingProbe",
+        progress_interval_seconds=999,
+    )
+    assert result.returncode == 0
+    assert result.capture_diagnostics[0].startswith("capture_read_failed:UnicodeDecodeError:")
+
+
 @pytest.mark.parametrize("use_pty", [False, True])
 def test_runner_execution_observation_elapsed_begins_at_spawn(tmp_path, use_pty):
     """Pipe and PTY observations use the same post-spawn elapsed interval."""

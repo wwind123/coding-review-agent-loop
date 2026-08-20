@@ -16,7 +16,7 @@ from .agents.base import AgentName
 from .agents.registry import default_agent_args
 from .errors import AgentLoopError
 from .github import PullRequestMetadata, detect_repo, get_repo_default_branch
-from .logging import log
+from .logging import datetime_stamp, log
 from .runner import Runner
 from .workdirs import active_workdir, agent_workdir
 
@@ -453,11 +453,6 @@ def default_subprocess_log_dir(repo: str) -> Path:
     )
 
 
-def datetime_stamp() -> str:
-    import datetime
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-
-
 def default_agent_memory_dir(repo: str) -> Path:
     return default_cache_root() / "repos" / repo_cache_slug(repo) / "memory"
 
@@ -473,9 +468,12 @@ def ensure_workdir(path: Path, option_name: str) -> None:
         raise AgentLoopError(f"Could not create {option_name} at {path}: {exc}") from exc
 
 
-def _resolve_subprocess_log_dir(args: argparse.Namespace, *, repo: str, managed_roots: tuple[Path, ...]) -> Path:
+def _resolve_subprocess_log_dir(
+    args: argparse.Namespace, *, repo: str, primary_dir: Path, managed_roots: tuple[Path, ...]
+) -> Path:
     value = getattr(args, "subprocess_log_dir", None)
-    path = (Path(value) if value is not None else default_subprocess_log_dir(repo)).expanduser().resolve()
+    raw = Path(value) if value is not None else default_subprocess_log_dir(repo)
+    path = (primary_dir / raw if value is not None and not raw.is_absolute() else raw).expanduser().resolve()
     if any(path == root or root in path.parents for root in managed_roots):
         raise AgentLoopError(
             "--subprocess-log-dir must not be equal to or nested beneath a managed checkout: "
@@ -1009,7 +1007,7 @@ def config_from_args(
         mergeability_poll_interval_seconds=getattr(args, "mergeability_poll_interval_seconds", 5),
         quiet=args.quiet,
         log_dir=(primary_dir / args.log_dir if not args.log_dir.is_absolute() else args.log_dir),
-        subprocess_log_dir=_resolve_subprocess_log_dir(args, repo=repo, managed_roots=(claude_dir, codex_dir, gemini_dir, antigravity_dir)),
+        subprocess_log_dir=_resolve_subprocess_log_dir(args, repo=repo, primary_dir=primary_dir, managed_roots=(claude_dir, codex_dir, gemini_dir, antigravity_dir)),
         progress_interval_seconds=args.progress_interval_seconds,
         agent_max_retries=args.agent_max_retries,
         agent_retry_backoff_seconds=tuple(args.agent_retry_backoff_seconds),
