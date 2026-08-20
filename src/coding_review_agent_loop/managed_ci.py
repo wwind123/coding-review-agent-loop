@@ -125,6 +125,7 @@ class ManagedCiContract:
     intent_state: str | None = None
     terminal_run_id: int | None = None
     terminal_run_attempt: int | None = None
+    terminal_attempts: tuple[tuple[int, int | None], ...] = ()
     activation_path: Literal["managed", "ordinary_fallback"] = "managed"
     ordinary_recovery: "OrdinaryRecoveryCapability | None" = None
 
@@ -1596,6 +1597,10 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
         "run_attempt": contract.run_attempt,
         "terminal_run_id": contract.terminal_run_id,
         "terminal_run_attempt": contract.terminal_run_attempt,
+        "terminal_attempts": [
+            {"run_id": run_id, "run_attempt": run_attempt}
+            for run_id, run_attempt in contract.terminal_attempts
+        ],
     }
     return f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->"
 
@@ -1656,15 +1661,35 @@ def _ensure_v2_intent(
         contract.intent_state = intent.get("state") if isinstance(intent.get("state"), str) else None
         terminal_run_id = intent.get("terminal_run_id")
         terminal_run_attempt = intent.get("terminal_run_attempt")
-        if contract.intent_state == "terminal-no-status":
-            contract.terminal_run_id = (
-                terminal_run_id if isinstance(terminal_run_id, int) else contract.attached_run_id
-            )
-            contract.terminal_run_attempt = (
-                terminal_run_attempt
-                if isinstance(terminal_run_attempt, int)
-                else contract.run_attempt
-            )
+        encoded_attempts = intent.get("terminal_attempts")
+        terminal_attempts: list[tuple[int, int | None]] = []
+        if isinstance(encoded_attempts, list):
+            for encoded in encoded_attempts:
+                if not isinstance(encoded, dict) or not isinstance(encoded.get("run_id"), int):
+                    continue
+                encoded_attempt = encoded.get("run_attempt")
+                terminal_attempts.append(
+                    (encoded["run_id"], encoded_attempt if isinstance(encoded_attempt, int) else None)
+                )
+        if isinstance(terminal_run_id, int) and isinstance(terminal_run_attempt, int):
+            contract.terminal_run_id = terminal_run_id
+            contract.terminal_run_attempt = terminal_run_attempt
+        if contract.intent_state == "terminal-no-status" and not terminal_attempts:
+            if contract.attached_run_id is not None:
+                contract.terminal_run_id = contract.attached_run_id
+                contract.terminal_run_attempt = contract.run_attempt
+        legacy_key = (contract.terminal_run_id, contract.terminal_run_attempt)
+        if legacy_key[0] is not None and legacy_key not in terminal_attempts:
+            terminal_attempts.append((legacy_key[0], legacy_key[1]))
+        contract.terminal_attempts = tuple(terminal_attempts)
+        if (
+            contract.intent_state == "terminal-no-status"
+            and (contract.attached_run_id, contract.run_attempt) in contract.terminal_attempts
+        ):
+            # The attached attempt is the one that already stopped. Leave
+            # discovery responsible for finding a rerun or fresh dispatch.
+            contract.attached_run_id = None
+            contract.run_attempt = None
         return
     contract.nonce = secrets.token_urlsafe(24)
     contract.created_at = int(time.time())
@@ -1727,18 +1752,18 @@ def _discover_v2_snapshot(
                 for run in runs
                 if isinstance(run, dict) and _is_v2_intent_run(run, contract=contract, run_name=run_name)
             ]
-            excluded = None
-            if contract.terminal_run_id is not None:
-                excluded = (contract.terminal_run_id, contract.terminal_run_attempt)
             survivors = [
                 run for run in candidates
                 if include_terminal or run.get("status") != "completed"
                 or run.get("conclusion") != "cancelled"
             ]
-            if excluded is not None:
+            excluded_attempts = set(contract.terminal_attempts)
+            if contract.terminal_run_id is not None:
+                excluded_attempts.add((contract.terminal_run_id, contract.terminal_run_attempt))
+            if excluded_attempts:
                 survivors = [
                     run for run in survivors
-                    if (run.get("id"), run.get("run_attempt")) != excluded
+                    if (run.get("id"), run.get("run_attempt")) not in excluded_attempts
                 ]
             if survivors:
                 newest = sorted(survivors, key=lambda run: (str(run.get("created_at") or ""), int(run.get("id") or 0)))[-1]
@@ -1923,6 +1948,9 @@ def wait_for_final_qualification(
             elif terminal_confirmation_seen:
                 contract.terminal_run_id = run_snapshot.run_id
                 contract.terminal_run_attempt = run_snapshot.run_attempt
+                terminal_key = (run_snapshot.run_id, run_snapshot.run_attempt)
+                if terminal_key not in contract.terminal_attempts:
+                    contract.terminal_attempts += (terminal_key,)
                 _patch_intent(runner, config=config, contract=contract, state="terminal-no-status")
                 return ManagedCiOutcome(
                     status="terminal_without_status", checks=latest, head_sha=live_head,

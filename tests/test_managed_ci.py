@@ -42,7 +42,10 @@ from coding_review_agent_loop.managed_ci import (
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
-from coding_review_agent_loop.orchestrator import _finalize_ordinary_recovery_merge
+from coding_review_agent_loop.orchestrator import (
+    _finalize_ordinary_recovery_merge,
+    _stop_on_terminal_without_status,
+)
 from coding_review_agent_loop.runner import CommandResult
 
 from agent_loop_helpers import FakeRunner, make_config
@@ -764,6 +767,7 @@ def v2_run(
 def v2_intent_comment(
     *, nonce="nonce-1", run_id=None, run_attempt=None, state=None,
     terminal_run_id=None, terminal_run_attempt=None,
+    terminal_attempts=None,
 ):
     payload = {
         "repository": "OWNER/REPO",
@@ -780,6 +784,11 @@ def v2_intent_comment(
         payload["terminal_run_id"] = terminal_run_id
     if terminal_run_attempt is not None:
         payload["terminal_run_attempt"] = terminal_run_attempt
+    if terminal_attempts is not None:
+        payload["terminal_attempts"] = [
+            {"run_id": run_id, "run_attempt": attempt}
+            for run_id, attempt in terminal_attempts
+        ]
     return {
         "id": 17,
         "user": {"login": "agent-loop", "id": 1},
@@ -1146,6 +1155,26 @@ def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_
     )
 
 
+def test_orchestrator_terminal_without_status_posts_resumable_diagnostic(tmp_path, capsys):
+    config = make_config(tmp_path, auto_merge=True)
+    runner = V2ManagedRunner()
+    outcome = managed_ci.ManagedCiOutcome(
+        status="terminal_without_status",
+        run_id=100,
+        run_attempt=1,
+        workflow_conclusion="cancelled",
+    )
+
+    assert _stop_on_terminal_without_status(
+        runner, config=config, pr_number=7, round_number=2, outcome=outcome
+    ) == 0
+    assert len(runner.comments) == 1
+    assert "terminal workflow state `cancelled`" in runner.comments[0]
+    assert "No terminal status was synthesized" in runner.comments[0]
+    assert "higher attempt" in runner.comments[0]
+    assert "terminal workflow state `cancelled`" in capsys.readouterr().out
+
+
 def test_v2_cancelled_run_during_candidate_jobs_stops_without_publishing_status(tmp_path, monkeypatch):
     config = make_config(
         tmp_path, auto_merge=True, ci_timeout_seconds=2, ci_poll_interval_seconds=1
@@ -1192,6 +1221,50 @@ def test_v2_terminal_exclusion_does_not_attach_stale_cancelled_run(tmp_path):
 
     assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
     assert contract.intent_state == "attached"
+    assert not any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
+
+
+def test_v2_terminal_ledger_clears_old_attachment_before_fresh_dispatch(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled")],
+        intent_comments=[v2_intent_comment(
+            run_id=100, run_attempt=1, state="terminal-no-status",
+            terminal_run_id=100, terminal_run_attempt=1,
+        )],
+    )
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert contract.attached_run_id is None
+    assert contract.run_attempt is None
+    assert any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
+
+
+def test_v2_terminal_ledger_excludes_all_prior_cancelled_attempts(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(
+        workflow_runs=[
+            v2_run(run_id=100, attempt=2, status="completed", conclusion="cancelled"),
+            v2_run(run_id=100, attempt=1, status="completed", conclusion="cancelled"),
+            v2_run(run_id=101, attempt=1, status="in_progress", conclusion=None),
+        ],
+        intent_comments=[v2_intent_comment(
+            run_id=100, run_attempt=2, state="terminal-no-status",
+            terminal_run_id=100, terminal_run_attempt=2,
+            terminal_attempts=((100, 1), (100, 2)),
+        )],
+    )
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
     assert not any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
 
 
