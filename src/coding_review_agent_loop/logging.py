@@ -14,6 +14,9 @@ _RETENTION_SECONDS = 14 * 24 * 60 * 60
 _MAX_LEASES = 32
 _CAPTURE_MARKER = ".agent-loop-capture"
 
+if TYPE_CHECKING:
+    from .config import AgentLoopConfig
+
 
 def datetime_stamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -68,9 +71,6 @@ def _prune_capture_roots(parent: Path, current: Path) -> None:
             candidate.rmdir()
         except OSError:
             continue
-
-if TYPE_CHECKING:
-    from .config import AgentLoopConfig
 
 
 def log(config: AgentLoopConfig, message: str) -> None:

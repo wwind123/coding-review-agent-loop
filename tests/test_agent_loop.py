@@ -3729,6 +3729,53 @@ def test_runner_classifies_invalid_capture_encoding_without_crashing(tmp_path):
     assert result.capture_diagnostics[0].startswith("capture_read_failed:UnicodeDecodeError:")
 
 
+@pytest.mark.parametrize(
+    ("text", "returncode"),
+    [("", 1), ("not a structured response", 0)],
+)
+def test_orchestrator_retries_capture_diagnostics_as_tooling_failure(
+    tmp_path, text, returncode
+):
+    """Capture-read diagnostics remain retryable for failed or invalid responses."""
+    from unittest.mock import patch
+
+    config = make_config(tmp_path, coder="codex", reviewer="codex", agent_max_retries=1)
+    command_result = CommandResult(
+        ["codex"],
+        tmp_path,
+        "",
+        "",
+        returncode,
+        capture_diagnostics=("capture_read_failed:OSError: injected",),
+    )
+    result = AgentResult(
+        text=text,
+        raw_output=text,
+        returncode=returncode,
+        command_result=command_result,
+    )
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.run_agent_result", return_value=result
+    ) as run_mock:
+        with pytest.raises(AgentInvocationError) as exc_info:
+            _run_validated_agent(
+                FakeRunner(),
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="test",
+                validate=lambda value: _validate_review_response(
+                    value, reviewer="OpenAI Codex", unresolved_items=()
+                ),
+            )
+
+    assert run_mock.call_count == 2
+    assert exc_info.value.failure_category == (
+        "deterministic" if returncode != 0 else "transient"
+    )
+
+
 @pytest.mark.parametrize("use_pty", [False, True])
 def test_runner_execution_observation_elapsed_begins_at_spawn(tmp_path, use_pty):
     """Pipe and PTY observations use the same post-spawn elapsed interval."""
