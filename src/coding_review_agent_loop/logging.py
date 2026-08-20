@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import sys
 import time
-import fcntl
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None  # type: ignore[assignment]
 
 _LEASES: dict[Path, object] = {}
 _RETENTION_SECONDS = 14 * 24 * 60 * 60
@@ -25,6 +29,10 @@ def datetime_stamp() -> str:
 def _prepare_capture_root(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / _CAPTURE_MARKER).touch(exist_ok=True)
+    # Windows has no fcntl module.  Capture directories are still usable there;
+    # only the optional cross-process lease and age pruning are unavailable.
+    if fcntl is None:
+        return
     if root not in _LEASES:
         lease = (root / ".lease").open("a+")
         try:
@@ -45,6 +53,8 @@ def _prepare_capture_root(root: Path) -> None:
 
 def _prune_capture_roots(parent: Path, current: Path) -> None:
     """Best-effort age cleanup; live invocation leases are never removed."""
+    if fcntl is None:
+        return
     try:
         candidates = list(parent.iterdir())
     except OSError:

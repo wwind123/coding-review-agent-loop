@@ -118,6 +118,22 @@ def test_ensure_log_dir_ignored_does_not_overwrite_existing_file(tmp_path):
     assert gitignore.read_text(encoding="utf-8") == "custom\n"
 
 
+def test_logging_module_imports_without_fcntl(monkeypatch):
+    """The shared logging module must remain importable on Windows."""
+    import importlib
+
+    import coding_review_agent_loop.logging as logging_module
+
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    try:
+        reloaded = importlib.reload(logging_module)
+        assert reloaded.fcntl is None
+        assert reloaded.datetime_stamp()
+    finally:
+        monkeypatch.delitem(sys.modules, "fcntl", raising=False)
+        importlib.reload(logging_module)
+
+
 @pytest.mark.parametrize(
     "text",
     [
