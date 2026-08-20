@@ -1100,6 +1100,69 @@ def test_v2_qualification_accepts_only_attached_run_status(tmp_path):
     assert outcome.status == "passed"
 
 
+def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_path, monkeypatch):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=2, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(status="completed", conclusion="cancelled")],
+        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_status_payload={"statuses": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract(
+        attached_run_id=100, run_attempt=1, intent_comment_id=17,
+        pr_number=7, expected_head_sha="abc123",
+    )
+    monkeypatch.setattr(
+        managed_ci, "_v2_correlated_status", lambda *args, **kwargs: None
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "terminal_without_status"
+    assert (outcome.run_id, outcome.run_attempt) == (100, 1)
+    assert outcome.workflow_conclusion == "cancelled"
+    assert contract.intent_state == "terminal-no-status"
+    assert any(
+        '"state":"terminal-no-status"' in " ".join(command)
+        for command, _cwd in runner.commands
+        if "/issues/comments/17" in " ".join(command)
+    )
+    assert not any(
+        "/statuses/abc123" in " ".join(command) and "POST" in command
+        for command, _cwd in runner.commands
+    )
+
+
+def test_v2_completed_run_failure_race_accepts_late_correlated_status(tmp_path, monkeypatch):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=2, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(status="completed", conclusion="failure")],
+        jobs=[{"name": "unit", "conclusion": "failure"}],
+        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+    )
+    contract = v2_contract(attached_run_id=100, run_attempt=1)
+    failure = PullRequestCheck(
+        name=FINAL_CONTEXT, kind="status_context", status="failure",
+        run_id="100", description="nonce=nonce-1;run_id=100;attempt=1",
+    )
+    responses = iter([None, failure])
+    monkeypatch.setattr(
+        managed_ci, "_v2_correlated_status", lambda *args, **kwargs: next(responses)
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "failed"
+
+
 def test_v2_qualification_rejects_numeric_prefix_tokens_and_run_url(tmp_path):
     config = make_config(
         tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1

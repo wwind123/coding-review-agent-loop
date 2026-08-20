@@ -1488,14 +1488,25 @@ pre-review `--test-command` passes, agent-loop also publishes the non-required
 without running that command.
 
 After every required reviewer approves one live head, agent-loop dispatches the
-repository's `CI` workflow with the PR number and that exact expected SHA. It
-polls `final-ci/exact-head`, routes a real failure back to the coder, and
-restarts review if the head moves. A passing aggregate is merged with
-`--match-head-commit`, so a different head cannot inherit the approval or CI
-result. The managed label remains in place through merge. The managed route is
-selected independently of `--watch-pending-ci`; neither that flag nor
-`--no-watch-pending-ci` replaces exact-head qualification with an ordinary
-full-board or named-check wait.
+repository's `CI` workflow with the PR number and that exact expected SHA. In
+v2 it polls the exact-head status and the validated nonce/run/attempt together.
+A correlated terminal status is authoritative; a completed workflow without
+that publisher status is confirmed by an immediate re-read and one bounded
+subsequent poll, then stops resumably without synthesizing a status. This
+applies to every workflow conclusion, including cancellation, timeout,
+action-required, success, neutral, skipped, failure, and unknown values—workflow
+success alone never qualifies the head. A real correlated failure routes back
+to the coder, and a moved head restarts review. A passing aggregate is merged
+with `--match-head-commit`, so a different head cannot inherit the approval or
+CI result. The terminal-without-status stop records
+`state=terminal-no-status` and the exact run attempt in the intent ledger; a
+later higher-attempt rerun is accepted, while an unchanged head can also
+dispatch a fresh same-nonce run. If an adopted PR stops this way, its
+invocation-owned managed label is released and the next invocation
+re-adopts/reapplies managed mode. A corrected head requires a fresh exact-head
+review. The managed route is selected independently of `--watch-pending-ci`;
+neither that flag nor `--no-watch-pending-ci` replaces exact-head
+qualification with an ordinary full-board or named-check wait.
 
 #### Managed-CI GitHub CLI compatibility
 
