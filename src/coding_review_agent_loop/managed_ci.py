@@ -665,9 +665,12 @@ def _release_for_ordinary_recovery(
 
     The capability is created only after the caller has already authenticated
     the managed draft tuple (same-repository branch, trusted author, draft,
-    label, base, and exact head). The timeline event is useful provenance, but
-    it is not the sole proof of this invocation's ownership: GitHub can return
-    an incomplete event history immediately after a label transition. The
+    label, base, and exact head) and the caller is handling a temporarily
+    missing timeline event. GitHub can return an incomplete event history
+    immediately after a label transition, so that specific race may still use
+    the authenticated tuple as provenance. A readable event owned by another
+    identity remains fail-closed: the label can be removed to restore ordinary
+    CI, but the caller must not receive a capability to ready or merge. The
     later exact-head ordinary-CI gate remains mandatory before readiness or
     merge.
     """
@@ -887,19 +890,25 @@ def _activate_v2_managed_ci(
     active_event: tuple[int, str, int] | None = None
     if config.managed_ci_pr_mode:
         active_event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
-        if (
-            active_event is None
-            or active_event[1].casefold() != actor_login.casefold()
-            or active_event[2] != actor_id
-        ):
+        if active_event is None:
             recovery = _release_for_ordinary_recovery(
                 runner, config=config, pr_number=pr_number, base_ref=base_ref,
                 expected_head_sha=live_sha, active_event=active_event,
-                reason="the active managed-label event is missing or not actor-owned",
+                reason="the active managed-label event is temporarily unreadable",
             )
             return ManagedCiContract(
                 activation_path="ordinary_fallback",
                 ordinary_recovery=recovery,
+            )
+        if active_event[1].casefold() != actor_login.casefold() or active_event[2] != actor_id:
+            _release_for_ordinary_recovery(
+                runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                expected_head_sha=live_sha, active_event=active_event,
+                reason="the active managed-label event is not actor-owned",
+            )
+            return ManagedCiContract(
+                activation_path="ordinary_fallback",
+                ordinary_recovery=None,
             )
 
     # Only workflows with a pull_request route can suppress an opening matrix.

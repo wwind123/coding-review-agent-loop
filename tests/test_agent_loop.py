@@ -3958,7 +3958,7 @@ def test_runner_preflighted_command_permission_error_does_not_retry(
     tmp_path,
     use_pty,
 ):
-    """Only FileNotFoundError can use the preflighted-command retry."""
+    """Only FileNotFoundError and preflighted bare-command ENOEXEC can retry."""
     import coding_review_agent_loop.runner as runner_module
 
     command_name = "bare-agent"
@@ -4027,6 +4027,45 @@ def test_runner_preflighted_exec_format_error_retries(monkeypatch, tmp_path, use
 
     assert len(popen_calls) == 3
     assert sleep_calls == [2, 2]
+
+
+@pytest.mark.parametrize("command", ["bare-agent", "/tmp/bare-agent"])
+def test_runner_unpreflighted_or_absolute_exec_format_error_does_not_retry(
+    monkeypatch,
+    tmp_path,
+    command,
+):
+    """ENOEXEC is fail-closed for unpreflighted and absolute commands."""
+    import errno
+    import coding_review_agent_loop.runner as runner_module
+
+    runner = Runner()
+    popen_calls = []
+    sleep_calls = []
+
+    def invalid_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        raise OSError(errno.ENOEXEC, "Exec format error")
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", invalid_popen)
+    monkeypatch.setattr(
+        runner_module.time,
+        "sleep",
+        lambda delay: sleep_calls.append(delay),
+    )
+
+    with pytest.raises(OSError) as exc_info:
+        runner.run_with_log(
+            [command, "--version"],
+            cwd=tmp_path,
+            log_path=tmp_path / "logs" / "exec-format-no-retry.log",
+            label="Exec format no-retry probe",
+            progress_interval_seconds=999,
+        )
+
+    assert exc_info.value.errno == errno.ENOEXEC
+    assert len(popen_calls) == 1
+    assert sleep_calls == []
 
 
 def test_runner_missing_command_without_dangling_evidence_does_not_retry(
