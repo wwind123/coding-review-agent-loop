@@ -1113,8 +1113,10 @@ def _issue_human_requirements_prompt_context(
 
 def _issue_pr_reference_guidance(issue_number: int) -> str:
     return (
-        f"In the pull request body, include `Fixes #{issue_number}` or another direct "
-        f"reference to issue #{issue_number} so GitHub links the PR back to the issue.\n"
+        f"In the pull request body, include a GitHub closing phrase targeting issue "
+        f"#{issue_number}: use `Fixes #{issue_number}`, `Closes #{issue_number}`, or "
+        f"`Resolves #{issue_number}`. A bare `#{issue_number}`, `Refs` reference, contextual "
+        "issue URL, title, or branch name is not sufficient implementation evidence.\n"
     )
 
 
@@ -1129,8 +1131,9 @@ def _staged_issue_pr_reference_guidance(issue_number: int, *, staged_parent_issu
     return (
         f"This PR implements one stage (#{issue_number}) split out of parent issue "
         f"#{staged_parent_issue}; other stages may remain unfiled or unimplemented. In the pull "
-        f"request body, include `Closes #{issue_number}` (or another direct reference to "
-        f"#{issue_number}) plus `Refs #{staged_parent_issue}`. Do NOT use a closing keyword "
+        f"request body, include a GitHub closing phrase targeting only the child issue "
+        f"(for example `Closes #{issue_number}`), plus the explicit non-closing reference "
+        f"`Refs #{staged_parent_issue}`. Do NOT use a closing keyword "
         f"(Fixes/Closes/Resolves) against #{staged_parent_issue} — that would auto-close the "
         "parent while other stages remain outstanding.\n"
     )
@@ -1157,6 +1160,7 @@ def build_issue_prompt(
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
     salvage_summary: str | None = None,
+    staged_parent_issue: int | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config)
@@ -1165,6 +1169,11 @@ def build_issue_prompt(
         requirement_scope="implementation requirements",
         full_omission_fallback="Fetch the issue discussion directly before implementing.",
     )
+    pr_reference_guidance = (
+        _staged_issue_pr_reference_guidance(issue_number, staged_parent_issue=staged_parent_issue)
+        if staged_parent_issue is not None
+        else _issue_pr_reference_guidance(issue_number)
+    )
     return f"""Fix GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout as your workspace. Create a branch, implement the fix,
@@ -1172,7 +1181,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
-{_issue_pr_reference_guidance(issue_number)}
+{pr_reference_guidance}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
     requirement_label="implementation requirements",

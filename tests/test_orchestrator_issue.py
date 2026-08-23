@@ -8,12 +8,16 @@ import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.decomposition import approved_plan_hash, format_one_shot_impl_handoff_comment
 from coding_review_agent_loop.errors import QuotaResetExceededError
-from coding_review_agent_loop.github import get_issue_context
-from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+from coding_review_agent_loop.github import IssueComment, IssueContext, get_issue_context
+from coding_review_agent_loop.issue_pr_handoff import (
+    format_issue_pr_handoff_comment,
+    resolve_canonical_pr_for_issue,
+)
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _decode_round_metadata,
+    _infer_staged_parent_issue,
     _plan_subject,
     _strip_round_metadata,
 )
@@ -264,6 +268,57 @@ def test_get_issue_context_parses_signed_issue_body_and_comments(tmp_path):
     assert issue_context.human_requirements[0].body == "Use the stable API path."
     assert issue_context.human_requirements[1].body == "Add a regression test."
     assert issue_context.comments[0].body == "Unsigned discussion remains normal context."
+
+
+def test_infer_staged_parent_requires_generated_marker_or_body_header():
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Child issue",
+        body="Ordinary issue text.",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(
+            IssueComment(
+                author="bot",
+                created_at=None,
+                body="Quoted AGENT_SPLIT_CHILD: parent=12 in review prose.",
+            ),
+            IssueComment(
+                author="bot",
+                created_at=None,
+                body="Child phase issue for parent #13: quoted comment text.",
+            ),
+        ),
+    )
+
+    assert _infer_staged_parent_issue(issue_context) is None
+
+    marked_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Child issue",
+        body="<!-- AGENT_SPLIT_CHILD: parent=12 key=" + "a" * 64 + " -->",
+        url=issue_context.url,
+        comments=(),
+    )
+    assert _infer_staged_parent_issue(marked_context) == 12
+
+    decomposed_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Child issue",
+        body="Child phase issue for parent #13: https://github.com/OWNER/REPO/issues/13\n\nDetails.",
+        url=issue_context.url,
+        comments=(
+            IssueComment(
+                author="bot",
+                created_at=None,
+                body="Child phase issue for parent #14: quoted comment text.",
+            ),
+        ),
+    )
+    assert _infer_staged_parent_issue(decomposed_context) == 13
+
 
 def test_issue_loop_can_use_codex_as_coder_and_claude_as_reviewer(tmp_path):
     runner = FakeRunner(
@@ -2038,7 +2093,7 @@ def test_issue_loop_plan_first_can_implement_after_approval(tmp_path):
     claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     assert len(claude_calls) == 2
     assert "Approved implementation plan" in claude_calls[1][-1]
-    assert "include `Fixes #56` or another direct reference to issue #56" in claude_calls[1][-1]
+    assert "include a GitHub closing phrase targeting issue #56" in claude_calls[1][-1]
     first_claude_index = command_index(runner.commands, ["claude", "--print"])
     fetch_index = command_index(runner.commands, ["git", "fetch", "origin"])
     switch_index = command_index(runner.commands, ["git", "switch", "main"])
@@ -2224,7 +2279,7 @@ def test_issue_loop_plan_first_one_shot_rerun_with_closed_pr_stops(tmp_path, cap
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
 
-def test_issue_loop_plan_first_one_shot_rerun_hash_mismatch_reimplements(tmp_path):
+def test_issue_loop_plan_first_one_shot_rerun_hash_mismatch_stops_safely(tmp_path):
     plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     old_plan = "Plan:\n- Old approach that was replaced.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     old_handoff = format_one_shot_impl_handoff_comment(
@@ -2277,11 +2332,11 @@ def test_issue_loop_plan_first_one_shot_rerun_hash_mismatch_reimplements(tmp_pat
     )
     config = make_config(tmp_path)
 
-    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
+    with pytest.raises(AgentLoopError, match=r"older plan hash") as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
 
-    claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
-    assert len(claude_calls) == 1
-    assert "Approved implementation plan" in claude_calls[0][-1]
+    assert "agent-loop pr 99" in str(excinfo.value)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 def test_issue_loop_plan_first_one_shot_rerun_pr_missing_issue_reference(tmp_path):
     plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -2332,14 +2387,11 @@ def test_issue_loop_plan_first_one_shot_rerun_pr_missing_issue_reference(tmp_pat
             "url": "https://github.com/OWNER/REPO/pull/77",
             "body": "No issue reference here.",
         },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
     config = make_config(tmp_path)
 
-    with pytest.raises(AgentLoopError, match="does not reference issue #56") as excinfo:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
-
-    assert "Edit the PR description on GitHub" in str(excinfo.value)
-    assert "rerun the orchestrator as `agent-loop pr 77` to continue the review" in str(excinfo.value)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 def test_issue_loop_plan_first_one_shot_resumes_existing_pr_after_crash_before_handoff_comment(tmp_path):
@@ -2396,7 +2448,7 @@ def test_issue_loop_plan_first_one_shot_resumes_existing_pr_after_crash_before_h
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     handoff_comments = [c for c in runner.comments if "<!-- AGENT_ISSUE_PR_HANDOFF:" in c]
     assert len(handoff_comments) == 1
-    assert "Flow: issue-implementation" in handoff_comments[0]
+    assert "Flow: approved-plan-implementation" in handoff_comments[0]
     assert "PR #77" in handoff_comments[0]
 
 def test_issue_loop_plan_first_one_shot_resume_existing_pr_logs_clear_message(tmp_path, capsys):
@@ -2547,6 +2599,71 @@ def test_issue_loop_direct_mode_legacy_search_resumes_and_backfills_canonical_re
     assert "PR #77" in handoff_comments[0]
 
 
+def test_issue_loop_direct_mode_incidental_open_pr_invokes_coder(tmp_path):
+    """An incidental issue mention must not be treated as crash recovery."""
+    runner = FakeRunner(
+        open_prs_payload=[
+            {
+                "number": 492,
+                "body": "Not on auto-merge; #56's loop is running and this PR is unrelated.",
+            }
+        ],
+        claude_outputs=[
+            "Implemented issue.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(tmp_path)
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    assert any(cmd[:2] == ["claude", "--print"] for cmd, _cwd in runner.commands)
+    handoff_comments = [c for c in runner.comments if "<!-- AGENT_ISSUE_PR_HANDOFF:" in c]
+    assert len(handoff_comments) == 1
+    assert "PR #77" in handoff_comments[0]
+    assert "PR #492" not in handoff_comments[0]
+
+
+def test_removed_canonical_handoff_does_not_recreate_from_incidental_pr(tmp_path):
+    canonical_comment = {
+        "author": {"login": "bot"},
+        "createdAt": "2026-05-23T00:00:00Z",
+        "body": format_issue_pr_handoff_comment(
+            issue_number=56,
+            pr_number=77,
+            pr_url="https://github.com/OWNER/REPO/pull/77",
+            pr_head_sha="abc123",
+            flow="issue-implementation",
+            plan_hash=None,
+        ),
+    }
+    runner = FakeRunner(
+        issue_comments=[canonical_comment],
+        open_prs_payload=[
+            {"number": 492, "body": "#56's loop is running; this is only a sequencing note."}
+        ],
+    )
+    config = make_config(tmp_path)
+
+    first_context = get_issue_context(runner, config=config, issue_number=56)
+    first = resolve_canonical_pr_for_issue(
+        runner, config=config, issue_number=56, issue_context=first_context
+    )
+    assert first is not None
+    assert first.source == "canonical"
+    assert first.pr_number == 77
+
+    runner.issue_comments.clear()
+    second_context = get_issue_context(runner, config=config, issue_number=56)
+    assert (
+        resolve_canonical_pr_for_issue(
+            runner, config=config, issue_number=56, issue_context=second_context
+        )
+        is None
+    )
+
+
 def test_issue_loop_direct_mode_stale_canonical_record_raises(tmp_path):
     """A canonical record pointing at a closed/merged PR must fail safely
     with an actionable message before any coder invocation, never falling
@@ -2597,9 +2714,8 @@ def test_issue_loop_direct_mode_ambiguous_open_prs_raises(tmp_path):
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 
-def test_issue_loop_direct_mode_canonical_record_mismatched_pr_body_raises(tmp_path):
-    """A canonical record whose PR no longer references the issue in its body
-    must fail safely via the existing mismatch error (#589)."""
+def test_issue_loop_direct_mode_canonical_record_resumes_refs_only_pr(tmp_path):
+    """Canonical provenance remains valid when an older PR has only Refs text."""
     canonical_comment = {
         "author": {"login": "bot"},
         "createdAt": "2026-05-23T00:00:00Z",
@@ -2618,13 +2734,13 @@ def test_issue_loop_direct_mode_canonical_record_mismatched_pr_body_raises(tmp_p
             "number": 77,
             "state": "OPEN",
             "url": "https://github.com/OWNER/REPO/pull/77",
-            "body": "No reference here.",
+            "body": "Refs #56",
         },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
     config = make_config(tmp_path)
 
-    with pytest.raises(AgentLoopError, match="does not reference issue #56"):
-        run_issue_loop(runner, issue_number=56, config=config)
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 

@@ -381,6 +381,15 @@ iteration pass:
 agent-loop pr 456 --repo OWNER/REPO
 ```
 
+Issue-mode recovery resumes validated `AGENT_ISSUE_PR_HANDOFF` metadata across
+direct and plan-first runs. Without that marker, it adopts at most one open PR
+whose body contains a same-repository GitHub closing phrase (`Fixes`, `Closes`,
+or `Resolves`) for the issue; bare references, `Refs`, contextual URLs, and
+discussion prose are not implementation evidence. Multiple candidates stop
+with cleanup guidance. Use `agent-loop pr <number>` when the PR is known, and
+see [Issue-to-PR association and recovery](docs/local_agent_loop.md#issue-to-pr-association-and-recovery)
+for plan-hash checks and operator recovery.
+
 Evaluate a GitHub issue without writing any code using discuss mode. Reviewers
 first evaluate independently, then debate if their outcomes disagree:
 

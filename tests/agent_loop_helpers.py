@@ -345,7 +345,7 @@ class FakeRunner(Runner):
         self.search_issues_payload = search_issues_payload
         self.search_issues_calls = []
         # Results returned by `gh pr list --state open` calls, used to fake
-        # `find_open_pr_referencing_issue` (#495). A list of dicts with
+        # `find_open_pr_closing_issue` (#495). A list of dicts with
         # number/body keys; defaults to no open PRs found.
         self.open_prs_payload = open_prs_payload if open_prs_payload is not None else []
         self.open_prs_calls = 0
