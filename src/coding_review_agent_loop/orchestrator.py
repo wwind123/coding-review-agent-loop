@@ -79,6 +79,7 @@ from .issue_pr_handoff import (
 )
 from .split_materialization import (
     DISCUSS_SPLIT_MARKER_RE,
+    SPLIT_CHILD_MARKER_RE,
     SPLIT_STAGE_HANDOFF_MARKER_RE,
     UNFILED_SPLIT_WARNING_MARKER_RE,
     MaterializedSplitChild,
@@ -3777,19 +3778,20 @@ def _round_ledger_may_be_incomplete(
 def _infer_staged_parent_issue(issue_context: IssueContext) -> int | None:
     """Read only generated child-issue markers for direct staged safety checks."""
     candidates: set[int] = set()
-    bodies = [issue_context.body or ""]
+    issue_body = issue_context.body or ""
+    bodies = [issue_body]
     bodies.extend(comment.body or "" for comment in issue_context.comments)
     for body in bodies:
-        for match in re.finditer(
-            r"AGENT_SPLIT_CHILD:\s*parent=(?P<parent>\d+)", body, re.IGNORECASE
-        ):
+        for match in SPLIT_CHILD_MARKER_RE.finditer(body):
             candidates.add(int(match.group("parent")))
-        for match in re.finditer(
-            r"^Child phase issue for parent #(?P<parent>\d+)\b",
-            body,
-            re.IGNORECASE | re.MULTILINE,
-        ):
-            candidates.add(int(match.group("parent")))
+    first_line = issue_body.splitlines()[0].strip() if issue_body.splitlines() else ""
+    decomposition_match = re.fullmatch(
+        r"Child phase issue for parent #(?P<parent>\d+)\b.*",
+        first_line,
+        re.IGNORECASE,
+    )
+    if decomposition_match:
+        candidates.add(int(decomposition_match.group("parent")))
     if len(candidates) > 1:
         joined = ", ".join(f"#{number}" for number in sorted(candidates))
         raise AgentLoopError(
@@ -4008,13 +4010,6 @@ def _implement_approved_issue(
         issue_number=issue_number,
         staged_parent_issue=staged_parent_issue,
     )
-    if staged_parent_issue is not None:
-        validate_pr_body_does_not_close_issue(
-            runner,
-            config=implementation_config,
-            pr_number=pr_number,
-            issue_number=staged_parent_issue,
-        )
     initial_pr_context = get_pr_review_context(runner, config=implementation_config, pr_number=pr_number)
     initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_context.metadata)
     post_issue_pr_handoff_comment(
@@ -5571,13 +5566,6 @@ def run_issue_loop(
             issue_number=issue_number,
             staged_parent_issue=staged_parent_issue,
         )
-        if staged_parent_issue is not None:
-            validate_pr_body_does_not_close_issue(
-                runner,
-                config=config,
-                pr_number=pr_number,
-                issue_number=staged_parent_issue,
-            )
         initial_pr_metadata = get_pr_review_context(runner, config=config, pr_number=pr_number).metadata
         initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_metadata)
         post_issue_pr_handoff_comment(

@@ -8,12 +8,16 @@ import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.decomposition import approved_plan_hash, format_one_shot_impl_handoff_comment
 from coding_review_agent_loop.errors import QuotaResetExceededError
-from coding_review_agent_loop.github import get_issue_context
-from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+from coding_review_agent_loop.github import IssueComment, IssueContext, get_issue_context
+from coding_review_agent_loop.issue_pr_handoff import (
+    format_issue_pr_handoff_comment,
+    resolve_canonical_pr_for_issue,
+)
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
     _attach_round_metadata,
     _decode_round_metadata,
+    _infer_staged_parent_issue,
     _plan_subject,
     _strip_round_metadata,
 )
@@ -264,6 +268,57 @@ def test_get_issue_context_parses_signed_issue_body_and_comments(tmp_path):
     assert issue_context.human_requirements[0].body == "Use the stable API path."
     assert issue_context.human_requirements[1].body == "Add a regression test."
     assert issue_context.comments[0].body == "Unsigned discussion remains normal context."
+
+
+def test_infer_staged_parent_requires_generated_marker_or_body_header():
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Child issue",
+        body="Ordinary issue text.",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(
+            IssueComment(
+                author="bot",
+                created_at=None,
+                body="Quoted AGENT_SPLIT_CHILD: parent=12 in review prose.",
+            ),
+            IssueComment(
+                author="bot",
+                created_at=None,
+                body="Child phase issue for parent #13: quoted comment text.",
+            ),
+        ),
+    )
+
+    assert _infer_staged_parent_issue(issue_context) is None
+
+    marked_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Child issue",
+        body="<!-- AGENT_SPLIT_CHILD: parent=12 key=" + "a" * 64 + " -->",
+        url=issue_context.url,
+        comments=(),
+    )
+    assert _infer_staged_parent_issue(marked_context) == 12
+
+    decomposed_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Child issue",
+        body="Child phase issue for parent #13: https://github.com/OWNER/REPO/issues/13\n\nDetails.",
+        url=issue_context.url,
+        comments=(
+            IssueComment(
+                author="bot",
+                created_at=None,
+                body="Child phase issue for parent #14: quoted comment text.",
+            ),
+        ),
+    )
+    assert _infer_staged_parent_issue(decomposed_context) == 13
+
 
 def test_issue_loop_can_use_codex_as_coder_and_claude_as_reviewer(tmp_path):
     runner = FakeRunner(
@@ -2542,6 +2597,71 @@ def test_issue_loop_direct_mode_legacy_search_resumes_and_backfills_canonical_re
     assert len(handoff_comments) == 1
     assert "Flow: issue-implementation" in handoff_comments[0]
     assert "PR #77" in handoff_comments[0]
+
+
+def test_issue_loop_direct_mode_incidental_open_pr_invokes_coder(tmp_path):
+    """An incidental issue mention must not be treated as crash recovery."""
+    runner = FakeRunner(
+        open_prs_payload=[
+            {
+                "number": 492,
+                "body": "Not on auto-merge; #56's loop is running and this PR is unrelated.",
+            }
+        ],
+        claude_outputs=[
+            "Implemented issue.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(tmp_path)
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    assert any(cmd[:2] == ["claude", "--print"] for cmd, _cwd in runner.commands)
+    handoff_comments = [c for c in runner.comments if "<!-- AGENT_ISSUE_PR_HANDOFF:" in c]
+    assert len(handoff_comments) == 1
+    assert "PR #77" in handoff_comments[0]
+    assert "PR #492" not in handoff_comments[0]
+
+
+def test_removed_canonical_handoff_does_not_recreate_from_incidental_pr(tmp_path):
+    canonical_comment = {
+        "author": {"login": "bot"},
+        "createdAt": "2026-05-23T00:00:00Z",
+        "body": format_issue_pr_handoff_comment(
+            issue_number=56,
+            pr_number=77,
+            pr_url="https://github.com/OWNER/REPO/pull/77",
+            pr_head_sha="abc123",
+            flow="issue-implementation",
+            plan_hash=None,
+        ),
+    }
+    runner = FakeRunner(
+        issue_comments=[canonical_comment],
+        open_prs_payload=[
+            {"number": 492, "body": "#56's loop is running; this is only a sequencing note."}
+        ],
+    )
+    config = make_config(tmp_path)
+
+    first_context = get_issue_context(runner, config=config, issue_number=56)
+    first = resolve_canonical_pr_for_issue(
+        runner, config=config, issue_number=56, issue_context=first_context
+    )
+    assert first is not None
+    assert first.source == "canonical"
+    assert first.pr_number == 77
+
+    runner.issue_comments.clear()
+    second_context = get_issue_context(runner, config=config, issue_number=56)
+    assert (
+        resolve_canonical_pr_for_issue(
+            runner, config=config, issue_number=56, issue_context=second_context
+        )
+        is None
+    )
 
 
 def test_issue_loop_direct_mode_stale_canonical_record_raises(tmp_path):

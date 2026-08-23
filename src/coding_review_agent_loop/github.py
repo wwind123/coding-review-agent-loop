@@ -116,7 +116,7 @@ _GITHUB_ISSUE_URL_RE = re.compile(
 # name is not implementation provenance.
 _CLOSING_ISSUE_REFERENCE_RE = re.compile(
     r"\b(?P<keyword>close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\b"
-    r"\s*:?[ \t]*(?:"
+    r"[ \t]*:?[ \t]*(?:"
     r"(?P<unqualified>#[1-9]\d*)|"
     r"(?P<qualified>[^\s/#]+/[^\s/#]+#[1-9]\d*(?![\w/-]))|"
     r"(?P<url>https?://github\.com/[^/\s#]+/[^/\s#]+/issues/[1-9]\d*(?![\w/-]))"
@@ -128,7 +128,7 @@ _CLOSING_ISSUE_REFERENCE_RE = re.compile(
 # but are never returned as strong recovery evidence.  This narrow form is
 # used only when a caller explicitly says it is validating a staged parent.
 _NON_CLOSING_ISSUE_REFERENCE_RE = re.compile(
-    r"\b(?P<keyword>refs?|references?)\b\s*:?[ \t]*(?:"
+    r"\b(?P<keyword>refs?|references?)\b[ \t]*:?[ \t]*(?:"
     r"(?P<unqualified>#[1-9]\d*)|"
     r"(?P<qualified>[^\s/#]+/[^\s/#]+#[1-9]\d*(?![\w/-]))|"
     r"(?P<url>https?://github\.com/[^/\s#]+/[^/\s#]+/issues/[1-9]\d*(?![\w/-]))"
@@ -397,43 +397,14 @@ def validate_pr_references_issue(
     config: AgentLoopConfig,
     pr_number: int,
     issue_number: int,
-    allow_non_closing: bool = False,
     staged_parent_issue: int | None = None,
 ) -> None:
     if config.dry_run:
         return
-    result = runner.run(
-        [
-            config.gh_cmd,
-            "pr",
-            "view",
-            str(pr_number),
-            "--repo",
-            config.repo,
-            "--json",
-            "body,url",
-        ],
-        cwd=active_workdir(config),
-    )
-    data = json.loads(result.stdout or "{}")
-    body = _optional_str(data.get("body")) or ""
+    body = _get_pr_body(runner, config=config, pr_number=pr_number)
     strong_evidence = parse_strong_issue_reference_evidence(
         body, repo=config.repo, issue_number=issue_number
     )
-    if allow_non_closing:
-        if strong_evidence:
-            raise AgentLoopError(
-                f"PR #{pr_number} uses closing evidence for staged parent issue #{issue_number}; "
-                f"use an explicit non-closing `Refs #{issue_number}` reference instead."
-            )
-        if parse_non_closing_issue_reference_evidence(
-            body, repo=config.repo, issue_number=issue_number
-        ):
-            return
-        raise AgentLoopError(
-            f"PR #{pr_number} must contain an explicit non-closing `Refs #{issue_number}` "
-            "reference for the staged-parent role."
-        )
     if strong_evidence:
         if staged_parent_issue is not None:
             _validate_staged_parent_reference(
@@ -578,28 +549,17 @@ def find_open_pr_closing_issue(
             )
             return f"#{match.pr_number} ({evidence_text})"
 
-        joined = ", ".join(
-            format_match(match) for match in sorted(matches, key=lambda item: item.pr_number)
-        )
+        sorted_matches = sorted(matches, key=lambda item: item.pr_number)
+        numbers = ", ".join(f"#{match.pr_number}" for match in sorted_matches)
+        joined = ", ".join(format_match(match) for match in sorted_matches)
         raise AgentLoopError(
-            f"Multiple open PRs ({', '.join(f'#{match.pr_number}' for match in sorted(matches, key=lambda item: item.pr_number))}) "
+            f"Multiple open PRs ({numbers}) "
             f"with strong closing evidence for issue #{issue_number}: {joined}; "
             "cannot automatically determine which to resume. Remove the accidental closing "
             "reference or close the unrelated PR(s), then rerun `agent-loop pr <number>` directly "
             "to continue review on the correct one."
         )
     return matches[0]
-
-
-def find_open_pr_referencing_issue(
-    runner: Runner, *, config: AgentLoopConfig, issue_number: int
-) -> OpenPrClosingMatch | None:
-    """Compatibility alias for the former discovery API.
-
-    The alias intentionally has the new strong contract.  New callers should
-    use :func:`find_open_pr_closing_issue` to make that contract explicit.
-    """
-    return find_open_pr_closing_issue(runner, config=config, issue_number=issue_number)
 
 
 def _parse_pr_metadata(
