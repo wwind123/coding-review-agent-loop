@@ -37,6 +37,7 @@ from .decomposition import (
     create_decomposition_child_issues,
     find_existing_decomposition,
     find_existing_one_shot_impl_handoff,
+    find_latest_one_shot_impl_handoff,
     find_existing_phase_implementation_handoff,
     parse_plan_decomposition,
     post_decomposition_parent_summary,
@@ -3773,6 +3774,31 @@ def _round_ledger_may_be_incomplete(
     return same_subject_incomplete or cross_subject_incomplete
 
 
+def _infer_staged_parent_issue(issue_context: IssueContext) -> int | None:
+    """Read only generated child-issue markers for direct staged safety checks."""
+    candidates: set[int] = set()
+    bodies = [issue_context.body or ""]
+    bodies.extend(comment.body or "" for comment in issue_context.comments)
+    for body in bodies:
+        for match in re.finditer(
+            r"AGENT_SPLIT_CHILD:\s*parent=(?P<parent>\d+)", body, re.IGNORECASE
+        ):
+            candidates.add(int(match.group("parent")))
+        for match in re.finditer(
+            r"^Child phase issue for parent #(?P<parent>\d+)\b",
+            body,
+            re.IGNORECASE | re.MULTILINE,
+        ):
+            candidates.add(int(match.group("parent")))
+    if len(candidates) > 1:
+        joined = ", ".join(f"#{number}" for number in sorted(candidates))
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} contains conflicting generated staged-parent "
+            f"markers ({joined}); resolve the child issue metadata before running issue mode."
+        )
+    return next(iter(candidates), None)
+
+
 def _approved_implementation_config(config: AgentLoopConfig) -> tuple[AgentLoopConfig, bool]:
     """Return the config and session-reuse policy for approved plan implementation."""
     implementation_coder = config.implementation_coder or config.coder
@@ -3832,16 +3858,23 @@ def _implement_approved_issue(
     )
     if resolved_pr is not None:
         existing_pr_number = resolved_pr.pr_number
+        if (
+            resolved_pr.source == "canonical"
+            and resolved_pr.metadata is not None
+            and resolved_pr.metadata.flow == "approved-plan-implementation"
+            and resolved_pr.metadata.plan_hash != plan_hash
+        ):
+            raise AgentLoopError(
+                f"Canonical approved-plan handoff for issue #{issue_number} points to PR "
+                f"#{existing_pr_number} with plan hash {resolved_pr.metadata.plan_hash}, "
+                f"but the current approved plan has hash {plan_hash}. Review the recorded PR "
+                f"with `agent-loop pr {existing_pr_number}` or remove the stale handoff marker."
+            )
         log(
             config,
             f"Existing implementation PR #{existing_pr_number} found for issue #{issue_number} "
-            f"/ approved plan {plan_hash}; resuming PR review instead of invoking {coder_name}.",
-        )
-        validate_pr_references_issue(
-            runner,
-            config=implementation_config,
-            pr_number=existing_pr_number,
-            issue_number=issue_number,
+            f"/ approved plan {plan_hash}; resuming PR review instead of invoking {coder_name} "
+            f"(source={resolved_pr.source}, evidence={resolved_pr.evidence_summary}).",
         )
         if staged_parent_issue is not None:
             validate_pr_body_does_not_close_issue(
@@ -3851,11 +3884,11 @@ def _implement_approved_issue(
                 issue_number=staged_parent_issue,
             )
         resumed_pr_context = None
-        if resolved_pr.source == "legacy" or one_shot_parent_issue is not None:
+        if resolved_pr.source == "legacy-closing-reference" or one_shot_parent_issue is not None:
             resumed_pr_context = get_pr_review_context(
                 runner, config=implementation_config, pr_number=existing_pr_number
             )
-        if resolved_pr.source == "legacy":
+        if resolved_pr.source == "legacy-closing-reference":
             pr_url, pr_head_sha = require_pr_metadata_for_handoff(resumed_pr_context.metadata)
             post_issue_pr_handoff_comment(
                 runner,
@@ -3973,6 +4006,7 @@ def _implement_approved_issue(
         config=implementation_config,
         pr_number=pr_number,
         issue_number=issue_number,
+        staged_parent_issue=staged_parent_issue,
     )
     if staged_parent_issue is not None:
         validate_pr_body_does_not_close_issue(
@@ -5085,16 +5119,24 @@ def _run_plan_first_loop(
                     runner, config=config, issue_number=target_issue_number, issue_context=target_issue_context
                 )
                 if resolved_pr is not None:
+                    if (
+                        resolved_pr.source == "canonical"
+                        and resolved_pr.metadata is not None
+                        and resolved_pr.metadata.flow == "approved-plan-implementation"
+                        and resolved_pr.metadata.plan_hash != plan_hash
+                    ):
+                        raise AgentLoopError(
+                            f"Canonical approved-plan handoff for issue #{target_issue_number} "
+                            f"points to PR #{resolved_pr.pr_number} with plan hash "
+                            f"{resolved_pr.metadata.plan_hash}, but the current approved plan "
+                            f"has hash {plan_hash}. Review it with `agent-loop pr "
+                            f"{resolved_pr.pr_number}` or remove the stale handoff marker."
+                        )
                     log(
                         config,
                         f"Issue #{target_issue_number}: resuming PR #{resolved_pr.pr_number} review for "
-                        "already-handed-off plan",
-                    )
-                    validate_pr_references_issue(
-                        runner,
-                        config=config,
-                        pr_number=resolved_pr.pr_number,
-                        issue_number=target_issue_number,
+                        f"already-handed-off plan (source={resolved_pr.source}, "
+                        f"evidence={resolved_pr.evidence_summary})",
                     )
                     if staged_parent_issue is not None:
                         validate_pr_body_does_not_close_issue(
@@ -5103,7 +5145,7 @@ def _run_plan_first_loop(
                             pr_number=resolved_pr.pr_number,
                             issue_number=staged_parent_issue,
                         )
-                    if resolved_pr.source == "legacy":
+                    if resolved_pr.source == "legacy-closing-reference":
                         resumed_pr_context = get_pr_review_context(
                             runner, config=config, pr_number=resolved_pr.pr_number
                         )
@@ -5132,6 +5174,34 @@ def _run_plan_first_loop(
                     plan_hash=plan_hash,
                     mode="implement-one-shot",
                 )
+                any_one_shot_handoff = find_latest_one_shot_impl_handoff(
+                    target_issue_context.comments,
+                    parent_issue=target_issue_number,
+                    mode="implement-one-shot",
+                )
+                if (
+                    existing_handoff is None
+                    and any_one_shot_handoff is not None
+                    and any_one_shot_handoff.plan_hash != plan_hash
+                ):
+                    try:
+                        older_state = get_pr_state(
+                            runner, config=config, pr_number=any_one_shot_handoff.pr_number
+                        )
+                    except AgentLoopError as exc:
+                        raise AgentLoopError(
+                            f"Older one-shot handoff for PR #{any_one_shot_handoff.pr_number} "
+                            f"cannot be validated ({exc}). Review it directly with `agent-loop pr "
+                            f"{any_one_shot_handoff.pr_number}` or remove the stale handoff."
+                        ) from exc
+                    if older_state == "OPEN":
+                        raise AgentLoopError(
+                            f"Open one-shot handoff for PR #{any_one_shot_handoff.pr_number} has "
+                            f"older plan hash {any_one_shot_handoff.plan_hash}, but the current "
+                            f"approved plan has hash {plan_hash}. Review the recorded PR with "
+                            f"`agent-loop pr {any_one_shot_handoff.pr_number}` or remove the "
+                            "stale handoff before creating another implementation PR."
+                        )
                 if existing_handoff is not None:
                     try:
                         pr_state = get_pr_state(
@@ -5150,12 +5220,6 @@ def _run_plan_first_loop(
                             config,
                             f"Issue #{target_issue_number}: resuming PR #{existing_handoff.pr_number} "
                             "review for already-handed-off plan",
-                        )
-                        validate_pr_references_issue(
-                            runner,
-                            config=config,
-                            pr_number=existing_handoff.pr_number,
-                            issue_number=target_issue_number,
                         )
                         if staged_parent_issue is not None:
                             validate_pr_body_does_not_close_issue(
@@ -5328,6 +5392,18 @@ def run_issue_loop(
         log(config, f"Validating issue #{issue_number}")
         validate_open_issue(runner, config=config, issue_number=issue_number)
         issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
+        staged_parent_issue = _infer_staged_parent_issue(issue_context)
+
+        recovered_plan_hash: str | None = None
+        if plan_first:
+            # This is a comment-only reconstruction.  It must happen before
+            # memory preparation or any agent invocation so an existing
+            # approved-plan handoff can be checked without re-planning.
+            recovered_plan_state = _resume_plan_round(
+                issue_context.comments, configured_reviewers=reviewers(config)
+            )
+            if recovered_plan_state is not None:
+                recovered_plan_hash = approved_plan_hash(recovered_plan_state[0])
 
         # Resolve the canonical AGENT_ISSUE_PR_HANDOFF record (or, failing
         # that, the legacy exactly-one-open-PR search) before invoking a
@@ -5338,15 +5414,52 @@ def run_issue_loop(
             runner, config=config, issue_number=issue_number, issue_context=issue_context
         )
         if resolved_pr is not None:
+            resolved_metadata = resolved_pr.metadata
+            if plan_first and resolved_pr.source == "canonical" and resolved_metadata is not None:
+                if (
+                    resolved_metadata.flow == "approved-plan-implementation"
+                    and recovered_plan_hash is not None
+                    and resolved_metadata.plan_hash != recovered_plan_hash
+                ):
+                    raise AgentLoopError(
+                        f"Canonical approved-plan handoff for issue #{issue_number} points to "
+                        f"PR #{resolved_pr.pr_number} with plan hash {resolved_metadata.plan_hash}, "
+                        f"but the reconstructable approved plan has hash {recovered_plan_hash}. "
+                        f"Review the recorded PR with `agent-loop pr {resolved_pr.pr_number}` or "
+                        "remove the stale handoff marker before rerunning issue mode."
+                    )
+                if resolved_metadata.flow == "approved-plan-implementation" and recovered_plan_hash is None:
+                    log(
+                        config,
+                        f"WARNING: issue #{issue_number} is resuming canonical approved-plan PR "
+                        f"#{resolved_pr.pr_number} using recorded plan hash {resolved_metadata.plan_hash}; "
+                        "no reconstructable prior plan round was found.",
+                    )
+            if plan_first and resolved_pr.source == "legacy-closing-reference" and recovered_plan_hash is None:
+                raise AgentLoopError(
+                    f"Found unique legacy PR #{resolved_pr.pr_number} with strong closing evidence "
+                    f"for issue #{issue_number}, but no approved plan round is reconstructable. "
+                    "Issue-mode plan-first recovery cannot invent plan provenance; review the PR "
+                    f"directly with `agent-loop pr {resolved_pr.pr_number}` or rerun direct issue mode."
+                )
             log(
                 config,
                 f"Issue #{issue_number}: resuming PR #{resolved_pr.pr_number} review instead of "
                 f"invoking {agent_display_name(config.coder)}.",
             )
-            validate_pr_references_issue(
-                runner, config=config, pr_number=resolved_pr.pr_number, issue_number=issue_number
+            log(
+                config,
+                f"Issue #{issue_number}: PR #{resolved_pr.pr_number} association source="
+                f"{resolved_pr.source}, evidence={resolved_pr.evidence_summary}",
             )
-            if resolved_pr.source == "legacy":
+            if staged_parent_issue is not None:
+                validate_pr_body_does_not_close_issue(
+                    runner,
+                    config=config,
+                    pr_number=resolved_pr.pr_number,
+                    issue_number=staged_parent_issue,
+                )
+            if resolved_pr.source == "legacy-closing-reference":
                 pr_context = get_pr_review_context(runner, config=config, pr_number=resolved_pr.pr_number)
                 pr_url, pr_head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
                 post_issue_pr_handoff_comment(
@@ -5356,8 +5469,12 @@ def run_issue_loop(
                     pr_number=resolved_pr.pr_number,
                     pr_url=pr_url,
                     pr_head_sha=pr_head_sha,
-                    flow="issue-implementation",
-                    plan_hash=None,
+                    flow=(
+                        "approved-plan-implementation"
+                        if plan_first and recovered_plan_hash is not None
+                        else "issue-implementation"
+                    ),
+                    plan_hash=recovered_plan_hash if plan_first else None,
                 )
             return run_pr_loop(
                 runner,
@@ -5398,6 +5515,7 @@ def run_issue_loop(
                 memory,
                 issue_context=issue_context,
                 salvage_summary=salvage_summary,
+                staged_parent_issue=staged_parent_issue,
             ),
             marker_description="positive <!-- AGENT_PR: <number> -->, PR URL, blocking, or clarification",
             validate=_require_issue_implementation_result,
@@ -5451,7 +5569,15 @@ def run_issue_loop(
             config=config,
             pr_number=pr_number,
             issue_number=issue_number,
+            staged_parent_issue=staged_parent_issue,
         )
+        if staged_parent_issue is not None:
+            validate_pr_body_does_not_close_issue(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                issue_number=staged_parent_issue,
+            )
         initial_pr_metadata = get_pr_review_context(runner, config=config, pr_number=pr_number).metadata
         initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_metadata)
         post_issue_pr_handoff_comment(

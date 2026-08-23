@@ -1005,6 +1005,45 @@ and `validate_pr_body_does_not_close_issue` rejects a PR body that uses
 unfiled or unimplemented, with an actionable error to edit the PR body and
 rerun `agent-loop pr <n>`.
 
+### Issue-to-PR association and recovery
+
+Issue mode first trusts a validated `AGENT_ISSUE_PR_HANDOFF` marker. Its schema,
+issue, case-insensitive repository/PR URL, PR number, and current open state are
+checked against GitHub; the recorded head SHA is historical handoff evidence
+and may change after review commits. Canonical records resume across direct and
+plan-first invocations, including `implement-by-phase` child PRs, regardless of
+the producer flow stored in the marker.
+
+Without canonical metadata, crash-window recovery scans all open PR pages and
+accepts only one same-repository closing reference such as `Fixes #123`,
+`Closes owner/repo#123`, or `Resolves https://github.com/owner/repo/issues/123`.
+Bare `#123`, `Refs #123`, contextual URLs, discussion prose, titles, branch
+names, and cross-repository references are not candidates. Pagination covers
+the full open-PR list. Multiple strong candidates stop with their PR numbers
+and matched closing evidence, plus cleanup and `agent-loop pr <number>`
+guidance.
+
+New direct and approved-plan PRs must contain a closing phrase for their issue
+before a handoff marker is posted. A staged child closes the child, includes
+non-closing `Refs #<parent>`, and never closes the parent. Existing canonical or
+plan-handoff PRs retain their validated provenance and do not need a closing
+phrase added retroactively; staged-parent no-close safety still applies.
+
+Plan-first reruns reconstruct persisted plan state from comments before memory
+preparation or agent calls. A matching approved-plan hash resumes without
+planning; a definite mismatch stops with the PR and both hashes and directs the
+operator to `agent-loop pr <number>` or handoff cleanup. If no plan round can be
+reconstructed, a valid canonical record resumes with a warning and its recorded
+hash. A metadata-free legacy candidate is stopped rather than assigned invented
+plan provenance, while direct mode can backfill a strong legacy candidate.
+
+Logs identify canonical marker versus legacy closing-reference evidence. To
+recover from a false handoff, edit or delete the latest canonical marker and,
+only if present, remove the unrelated PR's accidental closing phrase or close
+that PR. Removing a marker alone is sufficient when the PR has only an
+incidental mention or contextual URL: that text cannot recreate the handoff.
+`agent-loop pr <number>` remains the explicit operator path for a known PR.
+
 If `--repo` is omitted, the tool runs `gh repo view` from the current working
 directory, or from `--codex-dir` when that flag is provided, and uses the
 detected `OWNER/REPO`. Pass `--repo` explicitly when running outside the target

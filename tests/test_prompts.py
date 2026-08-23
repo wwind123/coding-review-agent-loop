@@ -1165,7 +1165,7 @@ def test_issue_loop_includes_issue_comments_in_coder_and_review_prompts(tmp_path
         )
         assert "Earlier comment refines the request." in prompt
         assert "Later comment should come second." in prompt
-    assert "include `Fixes #56` or another direct reference to issue #56" in claude_prompt
+    assert "include a GitHub closing phrase targeting issue #56" in claude_prompt
 
 def test_format_issue_context_truncates_oversized_newest_comment():
     issue_context = IssueContext(

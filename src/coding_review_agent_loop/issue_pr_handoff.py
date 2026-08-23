@@ -23,11 +23,12 @@ from .config import AgentLoopConfig
 from .errors import AgentLoopError
 from .github import (
     IssueContext,
+    OpenPrClosingMatch,
     PullRequestMetadata,
-    find_open_pr_referencing_issue,
+    find_open_pr_closing_issue,
     get_pr_state,
+    get_pr_review_context,
     post_issue_comment,
-    validate_pr_references_issue,
 )
 from .runner import Runner
 
@@ -54,7 +55,27 @@ class IssuePrHandoffMetadata:
 @dataclass(frozen=True)
 class ResolvedIssuePr:
     pr_number: int
-    source: Literal["canonical", "legacy"]
+    source: Literal["canonical", "legacy-closing-reference"]
+    evidence: IssuePrHandoffMetadata | OpenPrClosingMatch
+
+    @property
+    def metadata(self) -> IssuePrHandoffMetadata | None:
+        return self.evidence if isinstance(self.evidence, IssuePrHandoffMetadata) else None
+
+    @property
+    def evidence_summary(self) -> str:
+        if self.metadata is not None:
+            return (
+                "canonical marker "
+                f"(flow={self.metadata.flow}, plan_hash={self.metadata.plan_hash or 'none'}, "
+                f"pr_url={self.metadata.pr_url})"
+            )
+        match = self.evidence
+        return "legacy-closing-reference " + "; ".join(
+            f"keyword={item.keyword}, target={item.target_repo}#{item.issue_number}, "
+            f"form={item.reference_form}, text={item.matched_text!r}"
+            for item in match.evidence
+        )
 
 
 def _encode_json_payload(payload: dict[str, object]) -> str:
@@ -155,11 +176,13 @@ def _decode_issue_pr_handoff_metadata(encoded: str) -> IssuePrHandoffMetadata:
 
 def _validate_issue_pr_handoff_url(url: str, *, repo: str, pr_number: int) -> None:
     parsed = urlparse(url)
-    expected_path = f"/{repo}/pull/{pr_number}"
+    expected_path = f"/{repo}/pull/{pr_number}".casefold()
     if (
         parsed.scheme != "https"
-        or parsed.netloc != "github.com"
-        or parsed.path.rstrip("/") != expected_path
+        or parsed.netloc.casefold() != "github.com"
+        or parsed.path.rstrip("/").casefold() != expected_path
+        or parsed.query
+        or parsed.fragment
     ):
         raise AgentLoopError(
             f"Invalid AGENT_ISSUE_PR_HANDOFF payload: `pr_url` {url!r} does not match "
@@ -194,9 +217,10 @@ def resolve_canonical_pr_for_issue(
     """Resolve the PR a rerun of `agent-loop issue <issue_number>` should resume.
 
     Consults the canonical `AGENT_ISSUE_PR_HANDOFF` record first; if none
-    exists, falls back to the legacy exactly-one-open-PR GitHub search so
-    issues predating this marker still recover. Returns `None` when neither
-    source finds a PR, meaning normal coder invocation should proceed.
+    exists, falls back to strong closing-reference recovery for issues
+    predating this marker. A canonical marker is authoritative: malformed,
+    stale, or mismatched remote state raises instead of falling through to a
+    potentially unrelated PR.
     """
     if config.dry_run:
         return None
@@ -205,6 +229,25 @@ def resolve_canonical_pr_for_issue(
     )
     if canonical is not None:
         try:
+            pr_context = get_pr_review_context(
+                runner, config=config, pr_number=canonical.pr_number
+            )
+            actual = pr_context.metadata
+            if actual.number != canonical.pr_number:
+                raise AgentLoopError(
+                    f"GitHub returned PR #{actual.number} for canonical PR "
+                    f"#{canonical.pr_number}."
+                )
+            if not actual.url:
+                raise AgentLoopError("GitHub returned no PR URL.")
+            _validate_issue_pr_handoff_url(
+                actual.url, repo=config.repo, pr_number=canonical.pr_number
+            )
+            if actual.url.casefold() != canonical.pr_url.casefold():
+                raise AgentLoopError(
+                    f"recorded URL {canonical.pr_url!r} does not match GitHub URL "
+                    f"{actual.url!r}"
+                )
             state = get_pr_state(runner, config=config, pr_number=canonical.pr_number)
         except AgentLoopError as exc:
             raise AgentLoopError(
@@ -220,16 +263,19 @@ def resolve_canonical_pr_for_issue(
                 f"`agent-loop pr {canonical.pr_number}` directly if that PR should still be "
                 "reviewed, or close/select the correct duplicate before rerunning the issue."
             )
-        validate_pr_references_issue(
-            runner, config=config, pr_number=canonical.pr_number, issue_number=issue_number
+        return ResolvedIssuePr(
+            pr_number=canonical.pr_number, source="canonical", evidence=canonical
         )
-        return ResolvedIssuePr(pr_number=canonical.pr_number, source="canonical")
-    legacy_pr_number = find_open_pr_referencing_issue(
+    legacy_match = find_open_pr_closing_issue(
         runner, config=config, issue_number=issue_number
     )
-    if legacy_pr_number is None:
+    if legacy_match is None:
         return None
-    return ResolvedIssuePr(pr_number=legacy_pr_number, source="legacy")
+    return ResolvedIssuePr(
+        pr_number=legacy_match.pr_number,
+        source="legacy-closing-reference",
+        evidence=legacy_match,
+    )
 
 
 def require_pr_metadata_for_handoff(metadata: PullRequestMetadata) -> tuple[str, str]:

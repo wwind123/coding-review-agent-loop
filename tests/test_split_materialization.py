@@ -3,7 +3,9 @@ import pytest
 from coding_review_agent_loop.cli import AgentLoopError
 from coding_review_agent_loop.github import (
     IssueComment,
-    find_open_pr_referencing_issue,
+    find_open_pr_closing_issue,
+    parse_issue_reference_evidence,
+    parse_strong_issue_reference_evidence,
     parse_linked_issue_numbers,
     validate_pr_body_does_not_close_issue,
 )
@@ -491,19 +493,19 @@ def test_validate_pr_body_does_not_close_issue_skips_in_dry_run(tmp_path):
     validate_pr_body_does_not_close_issue(runner, config=config, pr_number=77, issue_number=56)
 
 
-def test_find_open_pr_referencing_issue_returns_none_when_no_match(tmp_path):
+def test_find_open_pr_closing_issue_returns_none_when_no_match(tmp_path):
     runner = FakeRunner(open_prs_payload=[{"number": 12, "body": "Unrelated change."}])
     config = make_config(tmp_path)
-    assert find_open_pr_referencing_issue(runner, config=config, issue_number=56) is None
+    assert find_open_pr_closing_issue(runner, config=config, issue_number=56) is None
 
 
-def test_find_open_pr_referencing_issue_returns_none_when_no_open_prs(tmp_path):
+def test_find_open_pr_closing_issue_returns_none_when_no_open_prs(tmp_path):
     runner = FakeRunner(open_prs_payload=[])
     config = make_config(tmp_path)
-    assert find_open_pr_referencing_issue(runner, config=config, issue_number=56) is None
+    assert find_open_pr_closing_issue(runner, config=config, issue_number=56) is None
 
 
-def test_find_open_pr_referencing_issue_matches_direct_reference(tmp_path):
+def test_find_open_pr_closing_issue_matches_direct_reference(tmp_path):
     runner = FakeRunner(
         open_prs_payload=[
             {"number": 12, "body": "Unrelated change."},
@@ -511,20 +513,20 @@ def test_find_open_pr_referencing_issue_matches_direct_reference(tmp_path):
         ]
     )
     config = make_config(tmp_path)
-    assert find_open_pr_referencing_issue(runner, config=config, issue_number=476) == 492
+    assert find_open_pr_closing_issue(runner, config=config, issue_number=476) == 492
 
 
-def test_find_open_pr_referencing_issue_matches_issue_url_reference(tmp_path):
+def test_find_open_pr_closing_issue_ignores_contextual_issue_url(tmp_path):
     runner = FakeRunner(
         open_prs_payload=[
             {"number": 492, "body": "See https://github.com/OWNER/REPO/issues/476 for context."},
         ]
     )
     config = make_config(tmp_path)
-    assert find_open_pr_referencing_issue(runner, config=config, issue_number=476) == 492
+    assert find_open_pr_closing_issue(runner, config=config, issue_number=476) is None
 
 
-def test_find_open_pr_referencing_issue_raises_on_ambiguous_matches(tmp_path):
+def test_find_open_pr_closing_issue_raises_on_ambiguous_matches(tmp_path):
     runner = FakeRunner(
         open_prs_payload=[
             {"number": 492, "body": "Fixes #476"},
@@ -533,11 +535,73 @@ def test_find_open_pr_referencing_issue_raises_on_ambiguous_matches(tmp_path):
     )
     config = make_config(tmp_path)
     with pytest.raises(AgentLoopError, match=r"Multiple open PRs \(#492, #494\)"):
-        find_open_pr_referencing_issue(runner, config=config, issue_number=476)
+        find_open_pr_closing_issue(runner, config=config, issue_number=476)
 
 
-def test_find_open_pr_referencing_issue_skips_in_dry_run(tmp_path):
+def test_find_open_pr_closing_issue_skips_in_dry_run(tmp_path):
     runner = FakeRunner(open_prs_payload=[{"number": 492, "body": "Fixes #476"}])
     config = make_config(tmp_path, dry_run=True)
-    assert find_open_pr_referencing_issue(runner, config=config, issue_number=476) is None
+    assert find_open_pr_closing_issue(runner, config=config, issue_number=476) is None
     assert runner.open_prs_calls == 0
+
+
+@pytest.mark.parametrize(
+    "body, form",
+    [
+        ("Fixes #870", "unqualified"),
+        ("Closes OWNER/REPO#870", "qualified"),
+        ("Resolves https://github.com/owner/repo/issues/870", "url"),
+    ],
+)
+def test_strong_issue_reference_parser_returns_structured_closing_evidence(body, form):
+    evidence = parse_strong_issue_reference_evidence(
+        body, repo="OWNER/REPO", issue_number=870
+    )
+    assert len(evidence) == 1
+    assert evidence[0].keyword.casefold() in {"fixes", "closes", "resolves"}
+    assert evidence[0].target_repo.casefold() == "owner/repo"
+    assert evidence[0].reference_form == form
+    assert evidence[0].matched_text == body
+    assert evidence[0].closing is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "#870's loop is running",
+        "Bare #870",
+        "Refs #870",
+        "See https://github.com/OWNER/REPO/issues/870 for context.",
+        "Fixes other/repo#870",
+        "Fixes https://github.com/other/repo/issues/870",
+    ],
+)
+def test_weak_or_cross_repository_issue_text_is_not_strong_evidence(body):
+    assert parse_strong_issue_reference_evidence(
+        body, repo="OWNER/REPO", issue_number=870
+    ) == ()
+
+
+def test_reference_parser_classifies_refs_without_promoting_it_to_strong_evidence():
+    evidence = parse_issue_reference_evidence("Refs OWNER/REPO#870", repo="OWNER/REPO")
+    assert len(evidence) == 1
+    assert evidence[0].closing is False
+    assert evidence[0].keyword.casefold() == "refs"
+
+
+def test_find_open_pr_closing_issue_returns_evidence_after_first_page(tmp_path):
+    runner = FakeRunner(
+        open_prs_payload=[
+            *({"number": number, "body": "Unrelated."} for number in range(1, 102)),
+            {"number": 492, "body": "Fixes #476"},
+        ]
+    )
+    config = make_config(tmp_path)
+
+    found = find_open_pr_closing_issue(runner, config=config, issue_number=476)
+
+    assert found is not None
+    assert found.pr_number == 492
+    assert found.evidence[0].matched_text == "Fixes #476"
+    pr_list = next(cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "list"])
+    assert pr_list[pr_list.index("--limit") + 1] == "100000"

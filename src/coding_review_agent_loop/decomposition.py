@@ -673,6 +673,27 @@ def find_existing_one_shot_impl_handoff(
     return found
 
 
+def find_latest_one_shot_impl_handoff(
+    comments: Sequence[object], *, parent_issue: int, mode: str
+) -> OneShotImplementationHandoffMetadata | None:
+    """Return the latest valid one-shot handoff regardless of plan hash.
+
+    Plan-first recovery uses this to distinguish an open handoff for an older
+    plan from an absent handoff; silently ignoring the former would create a
+    duplicate implementation PR.
+    """
+    found: OneShotImplementationHandoffMetadata | None = None
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in ONE_SHOT_IMPL_HANDOFF_MARKER_RE.finditer(body):
+            metadata = _decode_one_shot_impl_handoff_metadata(match.group("payload"))
+            if metadata.parent_issue == parent_issue and metadata.mode == mode:
+                found = metadata
+    return found
+
+
 def format_one_shot_impl_handoff_comment(
     *,
     parent_issue: int,
