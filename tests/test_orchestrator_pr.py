@@ -1229,6 +1229,31 @@ def test_managed_manual_issue_created_label_loss_cancels_qualification(tmp_path,
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
+def test_managed_manual_adopted_provenance_loss_cancels_qualification(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_adopt_existing_pr=True,
+        managed_ci_trusted_actor="agent-loop",
+        max_rounds=1,
+    )
+    contract = ManagedCiContract(
+        protocol_version=2,
+        base_ref="main",
+        adopted_existing_pr=True,
+    )
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *args, **kwargs: False)
+
+    with pytest.raises(AgentLoopError, match="adoption provenance changed"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
 def test_managed_ci_head_change_restarts_review_without_coder(tmp_path, monkeypatch):
     runner = FakeRunner(
         codex_outputs=[

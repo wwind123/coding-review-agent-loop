@@ -5996,6 +5996,11 @@ def run_pr_loop(
                     return False
                 return True
             if managed_ci.adopted_existing_pr:
+                if config.managed_ci:
+                    raise AgentLoopError(
+                        f"PR #{pr_number} managed-CI adoption provenance changed; "
+                        "managed qualification is cancelled and the head is not qualified."
+                    )
                 if not release_adopted_managed_ci(
                     runner, config=config, pr_number=pr_number, contract=managed_ci
                 ):
