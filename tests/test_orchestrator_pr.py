@@ -1173,6 +1173,62 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
     assert merges == [{"expected_head_sha": "abc123-coder-1"}]
 
 
+def test_managed_manual_success_publishes_result_without_merge_even_with_pending_intermediate_ci(
+    tmp_path, monkeypatch, capsys
+):
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+        pr_check_runs_payload={
+            "check_runs": [
+                {"name": "test", "status": "completed", "conclusion": "success"},
+                {"name": "lint", "status": "in_progress"},
+            ]
+        },
+        pr_status_payload={"state": "pending", "statuses": []},
+    )
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    contract = ManagedCiContract(protocol_version=2, protection_mode="strict")
+    published = []
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "publish_manual_v2_qualification",
+        lambda *args, **kwargs: published.append(kwargs["expected_head_sha"]) or "abc123",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda *args, **kwargs: pytest.fail("manual managed-CI success must not merge"),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert published == ["abc123"]
+    assert "approved and qualified; manual merge required" in capsys.readouterr().out
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_managed_manual_issue_created_label_loss_cancels_qualification(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+    )
+    config = make_config(tmp_path, managed_ci=True, max_rounds=1)
+    contract = ManagedCiContract(protocol_version=2, issue_created_pr=True)
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
+
+    with pytest.raises(AgentLoopError, match="lost its authenticated"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
 def test_managed_ci_head_change_restarts_review_without_coder(tmp_path, monkeypatch):
     runner = FakeRunner(
         codex_outputs=[

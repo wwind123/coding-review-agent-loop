@@ -5809,11 +5809,8 @@ def _finalize_ordinary_recovery_merge(
     config: AgentLoopConfig,
     pr_number: int,
     capability: OrdinaryRecoveryCapability,
-    merge: bool | None = None,
 ) -> None:
-    """Qualify and ready only the draft released by this invocation."""
-    if merge is None:
-        merge = config.auto_merge
+    """Qualify, ready, and merge only the draft released by this invocation."""
     refreshed = refresh_ordinary_recovery_capability(
         runner, config=config, capability=capability,
     )
@@ -5848,14 +5845,6 @@ def _finalize_ordinary_recovery_merge(
             f"PR #{pr_number} head or provenance changed after `gh pr ready`; "
             "the PR remains ready and was not merged."
         )
-    if not merge:
-        print(
-            f"PR #{pr_number} approved and qualified; manual merge required. "
-            f"Qualified head: {capability.expected_head_sha}. "
-            f"Run `gh pr merge {pr_number} --repo {config.repo} --merge "
-            f"--match-head-commit {capability.expected_head_sha}` after confirming the live head."
-        )
-        return
     try:
         merge_pr(runner, config, pr_number, expected_head_sha=capability.expected_head_sha)
     except Exception:
@@ -7125,10 +7114,8 @@ def run_pr_loop(
                         config=config,
                         pr_number=pr_number,
                         capability=ordinary_recovery,
-                        merge=config.auto_merge,
                     )
-                    if config.auto_merge:
-                        print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
+                    print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
                     return 0
                 if not must_fix_items and config.watch_pending_ci and not managed_ci_active(pr_metadata):
                     if watch_deadline is None:
@@ -7311,7 +7298,7 @@ def run_pr_loop(
                 if not must_fix_items:
                     if pr_checks.state in {"pending", "unavailable"}:
                         details = _pr_check_details(pr_checks)
-                        if not config.auto_merge and not managed_ci_active(pr_metadata):
+                        if not config.effective_managed_ci and not managed_ci_active(pr_metadata):
                             # Pending/unavailable checks are an external wait, not
                             # actionable coder feedback: stop cleanly instead of
                             # erroring or spending another coder/reviewer round.
@@ -7348,8 +7335,10 @@ def run_pr_loop(
                                 f"{_pending_ci_stop_guidance(pr_checks.state)}"
                             )
                             return 0
-                        # --auto-merge: post the informational comment, then fall
-                        # through to wait for CI before merging, as today.
+                        # Managed qualification and --auto-merge: post the
+                        # informational comment, then fall through to wait for
+                        # the final gate before merging or publishing a manual
+                        # result.
                         post_pr_comment(
                             runner,
                             config=config,
@@ -7896,6 +7885,7 @@ def run_pr_loop(
             f"Reached max rounds ({config.max_rounds}) for PR #{pr_number}; human review required."
         )
     finally:
+        cleanup_failure: AgentLoopError | None = None
         if (
             managed_ci is not None
             and not managed_ci_qualified
@@ -7910,12 +7900,21 @@ def run_pr_loop(
             ):
                 message = f"PR #{pr_number}: unable to release invocation-owned managed-CI label"
                 if config.managed_ci:
-                    raise AgentLoopError(
+                    cleanup_failure = AgentLoopError(
                         message + "; the PR remains suppressed and requires manual label removal."
                     )
                 log(config, message)
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)
+        if cleanup_failure is not None:
+            active_exception = sys.exc_info()[1]
+            if active_exception is not None:
+                # Preserve the original failure while making cleanup failure
+                # visible in its traceback. Usage accounting above must run
+                # even when label cleanup also fails.
+                active_exception.add_note(str(cleanup_failure))
+            else:
+                raise cleanup_failure
 
 
 DISCUSS_CONSENSUS_MARKER_RE = re.compile(

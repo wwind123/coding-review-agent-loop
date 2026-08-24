@@ -20,7 +20,8 @@ supports hands-off automation and externally scheduled resume after quota reset 
 `--test-command` gate and, with
 `--auto-merge`, CI-wait + merge, or explicit `--managed-ci` exact-head qualification
 with a printed head-guarded manual merge command (all are configuration-dependent;
-without them the CLI runs no gate and won't poll/merge). The skill never auto-merges (merge stays a human
+without `--test-command`, `--auto-merge`, or `--managed-ci`, the CLI runs no gate
+and does not poll or merge). The skill never auto-merges (merge stays a human
 decision), cannot continue or schedule its own restart after the host session exhausts
 quota, and may still encounter Claude Code tool-approval prompts. Keeping the skill also
 reduces reliance on

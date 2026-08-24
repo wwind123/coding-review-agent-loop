@@ -1351,13 +1351,16 @@ for the workflow's `unlabeled` recovery CI instead of treating a `no_checks`
 board as mergeable.
 
 To retry an interrupted issue-created managed draft on an unprotected
-repository, use the explicit per-invocation PR-mode command:
+repository and preserve automatic merging, use the explicit per-invocation
+PR-mode command:
 
 ```bash
-agent-loop pr <number> --managed-ci \
+agent-loop pr <number> --auto-merge \
   --managed-ci-trusted-actor <login> --allow-unprotected-managed-ci
 ```
 
+For a manual-merge resume, replace `--auto-merge` with `--managed-ci`; that
+mode publishes a fresh SHA-bound qualification and never calls the merge API.
 This is supported resume, not retroactive adoption. The live PR must still be
 open, a draft, same-repository, authored by the authenticated trusted actor
 (login and immutable ID), on the reserved `agent-loop/managed-*` ref, with the
@@ -1375,8 +1378,10 @@ safe managed resume is unavailable, agent-loop removes the exact active
 managed label and waits for a new post-`unlabeled` workflow run on the exact
 head, then requires the ordinary current-head check board to pass. It does not
 accept pre-release green checks, `no_checks`, or a different SHA. Only the
-invocation-owned fallback draft can be made ready, only when managed
-qualification is explicitly requested; unrelated or intentional drafts remain drafts. Agent-loop checks
+invocation-owned fallback draft can be made ready, and only an auto-merge
+invocation can take this deliberate ordinary-recovery path; explicit managed
+manual mode fails closed instead. Unrelated or intentional drafts remain
+drafts. Agent-loop checks
 the exact head before and after `gh pr ready` and merges with
 `--match-head-commit`. If that merge fails after readiness, it logs that the PR
 remains ready and leaves it unmerged rather than restoring draft state.

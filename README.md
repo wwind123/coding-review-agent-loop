@@ -655,8 +655,10 @@ matches both the authenticated GitHub CLI user and the repository Actions
 variable `AGENT_LOOP_MANAGED_ACTOR`; without that explicit trust configuration,
 the normal CI path remains in effect. Agent-loop may
 publish local round readiness after a configured pre-review test succeeds,
-dispatches final CI for the reviewers' exact approved SHA, and merges only that
-qualified SHA with `--match-head-commit`. `--watch-pending-ci` and
+dispatches final CI for the reviewers' exact approved SHA. With `--auto-merge`,
+it merges only that qualified SHA with `--match-head-commit`; with explicit
+`--managed-ci`, it publishes the qualified SHA and leaves merging to the human.
+`--watch-pending-ci` and
 `--no-watch-pending-ci` do not alter this managed flow. See
 [Managed exact-head CI](docs/local_agent_loop.md#managed-exact-head-ci) for the
 repository contract and failure behavior.
@@ -700,14 +702,17 @@ protection now returns to ordinary CI unless that explicit per-run waiver is
 present.
 
 To resume an interrupted issue-created managed draft on an unprotected
-repository, rerun the explicit waiver in PR mode:
+repository while retaining the historical automatic merge, rerun the explicit
+waiver in PR mode:
 
 ```bash
-agent-loop pr <number> --managed-ci \
+agent-loop pr <number> --auto-merge \
   --managed-ci-trusted-actor <login> --allow-unprotected-managed-ci
 ```
 
-This is supported resume, not retroactive adoption. The live PR must still be
+For a manual-merge resume, use the same command with `--managed-ci` instead of
+`--auto-merge`; it publishes a fresh SHA-bound qualification and does not
+merge. This is supported resume, not retroactive adoption. The live PR must still be
 an open same-repository draft authored by the authenticated actor (matching
 its immutable ID), use the reserved `agent-loop/managed-*` ref and live
 base/head, and have an active `agent-loop-managed` label event made by that

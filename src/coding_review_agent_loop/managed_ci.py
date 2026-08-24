@@ -218,6 +218,11 @@ def activate_managed_ci(
         check=False,
     )
     if result.returncode != 0:
+        if config.managed_ci:
+            raise AgentLoopError(
+                "--managed-ci could not read the base workflow; managed exact-head qualification "
+                "is unavailable and no ordinary fallback was selected."
+            )
         return None
     workflow = result.stdout or ""
     present = tuple(marker for marker in _CONTRACT_MARKERS if marker in workflow)
@@ -1431,7 +1436,7 @@ def _activate_v2_existing_pr_adoption(
         invocation_applied_label=applied,
         intent_generation=(
             secrets.token_urlsafe(16)
-            if (config.managed_ci or config.managed_ci_pr_mode)
+            if config.managed_ci
             else None
         ),
     )
