@@ -18,8 +18,9 @@ mechanical Python code, while skill mode also spends host-session context and ou
 interpreting and executing the orchestration workflow. Actual quota use varies. The CLI also
 supports hands-off automation and externally scheduled resume after quota reset — optionally a
 `--test-command` gate and, with
-`--auto-merge`, CI-wait + merge (both are configuration-dependent; without them the CLI
-runs no gate and won't poll/merge). The skill never auto-merges (merge stays a human
+`--auto-merge`, CI-wait + merge, or explicit `--managed-ci` exact-head qualification
+with a printed head-guarded manual merge command (all are configuration-dependent;
+without them the CLI runs no gate and won't poll/merge). The skill never auto-merges (merge stays a human
 decision), cannot continue or schedule its own restart after the host session exhausts
 quota, and may still encounter Claude Code tool-approval prompts. Keeping the skill also
 reduces reliance on

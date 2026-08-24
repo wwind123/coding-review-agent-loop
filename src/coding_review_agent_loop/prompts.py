@@ -1161,6 +1161,7 @@ def build_issue_prompt(
     issue_context: IssueContext | None = None,
     salvage_summary: str | None = None,
     staged_parent_issue: int | None = None,
+    managed_ci_creation_intent: ManagedCiCreationIntent | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config)
@@ -1174,6 +1175,24 @@ def build_issue_prompt(
         if staged_parent_issue is not None
         else _issue_pr_reference_guidance(issue_number)
     )
+    managed_creation_guidance = ""
+    if managed_ci_creation_intent is not None:
+        branch = managed_ci_creation_intent.branch
+        override = ""
+        if managed_ci_creation_intent.audit_nonce:
+            override = (
+                " Include this exact PR-body trailer on its own line: "
+                f"`{UNPROTECTED_OVERRIDE_TRAILER} nonce={managed_ci_creation_intent.audit_nonce}`. "
+                "This is a voluntary gate: GitHub cannot force a later human merge to use "
+                "the qualified SHA."
+            )
+        managed_creation_guidance = (
+            "\nThis invocation has explicit authenticated managed-CI enabled. Create the PR "
+            f"on the reserved branch `{branch}` as a draft, ensure the `agent-loop-managed` "
+            "label exists, and create it with `gh pr create --draft --label "
+            f"agent-loop-managed`. Do not mark it ready; agent-loop will dispatch exact-head "
+            f"qualification after review.{override}\n"
+        )
     return f"""Fix GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout as your workspace. Create a branch, implement the fix,
@@ -1182,6 +1201,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {pr_reference_guidance}
+{managed_creation_guidance}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
     requirement_label="implementation requirements",

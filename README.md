@@ -646,7 +646,7 @@ still-computing (`UNKNOWN`) GitHub mergeability result is re-checked before
 being treated as unresolved. See
 [Merge conflicts](docs/local_agent_loop.md#merge-conflicts) for details.
 
-With `--auto-merge`, repositories that advertise the managed exact-head CI
+With `--auto-merge`, or with explicit `--managed-ci`, repositories that advertise the managed exact-head CI
 contract use a dedicated flow. The v2 rollout atomically opens a trusted draft
 with `agent-loop-managed`, dispatches qualification from the base workflow,
 and accepts only nonce/run/attempt-correlated statuses; v1 keeps its post-open
@@ -660,6 +660,20 @@ qualified SHA with `--match-head-commit`. `--watch-pending-ci` and
 `--no-watch-pending-ci` do not alter this managed flow. See
 [Managed exact-head CI](docs/local_agent_loop.md#managed-exact-head-ci) for the
 repository contract and failure behavior.
+
+To qualify a protected exact head while retaining a human merge decision, use:
+
+```bash
+agent-loop issue <number> --managed-ci --managed-ci-trusted-actor <login>
+```
+
+The successful terminal result names the qualified SHA and prints a guarded
+`gh pr merge --match-head-commit <sha>` command; the merge API is not called.
+For an existing issue-created PR left ready and unlabeled after a successful
+manual run, rerun `agent-loop pr <number> --managed-ci
+--managed-ci-trusted-actor <login>`. Re-entry first makes that PR a draft, so
+the previous manual-merge command is suspended until a fresh review and
+qualification succeeds. A changed head always needs a new cycle.
 
 Already-open PRs remain ordinary CI by default. A repository can separately
 advertise safe adoption and an operator can explicitly request it only with
@@ -689,7 +703,7 @@ To resume an interrupted issue-created managed draft on an unprotected
 repository, rerun the explicit waiver in PR mode:
 
 ```bash
-agent-loop pr <number> --auto-merge \
+agent-loop pr <number> --managed-ci \
   --managed-ci-trusted-actor <login> --allow-unprotected-managed-ci
 ```
 

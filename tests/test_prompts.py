@@ -2,6 +2,7 @@ import pytest
 
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
+from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
 from coding_review_agent_loop.prompts import build_task_clarification_prompt, format_pr_checks
 from coding_review_agent_loop.protocol import (
     validate_structured_coder_followup,
@@ -2877,3 +2878,17 @@ def test_build_discuss_final_analysis_prompt_excludes_prior_context(tmp_path):
     assert "Accept concession checks." in prompt
     assert "Your previous agenda" not in prompt
     assert "Complete debate transcript so far" not in prompt
+
+
+def test_build_issue_prompt_carries_explicit_managed_creation_contract(tmp_path):
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="agent-loop",
+        protection_mode="strict",
+    )
+
+    prompt = build_issue_prompt(56, make_config(tmp_path, managed_ci=True), managed_ci_creation_intent=intent)
+
+    assert "agent-loop/managed-56" in prompt
+    assert "gh pr create --draft --label agent-loop-managed" in prompt
+    assert "Do not mark it ready" in prompt

@@ -355,8 +355,9 @@ def build_parser() -> argparse.ArgumentParser:
             dest="watch_pending_ci",
             default=None,
             help=(
-                "With --auto-merge, foreground-poll the full GitHub check board after approval "
-                "and resume the coder if CI fails (enabled by default with --auto-merge)."
+                "For ordinary CI, foreground-poll the full GitHub check board after approval "
+                "and resume the coder if CI fails (enabled by default with --auto-merge). "
+                "Managed exact-head qualification remains its own gate."
             ),
         )
         subparser.add_argument(
@@ -572,11 +573,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common(issue)
     issue.add_argument(
+        "--managed-ci",
+        action="store_true",
+        help=(
+            "Explicitly activate managed exact-head CI and qualify the approved head. "
+            "Without --auto-merge, leave a successfully qualified PR ready for manual "
+            "head-guarded merging. Requires --managed-ci-trusted-actor."
+        ),
+    )
+    issue.add_argument(
         "--allow-unprotected-managed-ci", action="store_true",
         help=(
             "Per-invocation waiver for issue-created managed CI, including a safe PR-mode "
             "resume of its existing draft, when GitHub cannot independently enforce "
-            "final-ci/exact-head. Requires --auto-merge and --managed-ci-trusted-actor; "
+            "final-ci/exact-head. Requires an effective managed-CI request and "
+            "--managed-ci-trusted-actor; "
             "never applies to arbitrary PR adoption."
         ),
     )
@@ -586,10 +597,20 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("pr_number", type=int)
     add_common(pr)
     pr.add_argument(
+        "--managed-ci",
+        action="store_true",
+        help=(
+            "Explicitly activate managed exact-head CI without implying a merge. "
+            "A successful run leaves the live qualified head ready for manual "
+            "head-guarded merging. Requires --managed-ci-trusted-actor."
+        ),
+    )
+    pr.add_argument(
         "--allow-unprotected-managed-ci", action="store_true",
         help=(
             "Per-invocation waiver for issue-created managed CI resume when GitHub cannot "
-            "independently enforce final-ci/exact-head. Requires --auto-merge and "
+            "independently enforce final-ci/exact-head. Requires an effective managed-CI "
+            "request and "
             "--managed-ci-trusted-actor; never authorizes arbitrary PR adoption."
         ),
     )
@@ -598,7 +619,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Explicitly adopt an eligible already-open PR into the separately advertised "
-            "v2 managed-CI protocol. Requires --auto-merge and --managed-ci-trusted-actor."
+            "v2 managed-CI protocol. Requires an effective managed-CI request and "
+            "--managed-ci-trusted-actor."
         ),
     )
     add_review_parallel(pr)
@@ -774,6 +796,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Preserve tokens (rather than a rendered command) so timeout guidance can
         # be safely shell-quoted locally. Programmatic callers have no sys.argv.
         invocation = tuple([sys.argv[0], *sys.argv[1:]]) if argv is None else tuple(["agent-loop", *argv])
+        explicit_managed_ci = bool(getattr(args, "managed_ci", False))
+        if explicit_managed_ci:
+            if args.command not in {"issue", "pr"}:
+                raise AgentLoopError("--managed-ci is only supported with issue or pr.")
+            if not (args.managed_ci_trusted_actor or "").strip():
+                raise AgentLoopError("--managed-ci requires --managed-ci-trusted-actor.")
         config = config_from_args(args, runner, invocation_argv=invocation)
         implementation_override_requested = (
             args.implementation_coder is not None
@@ -785,8 +813,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if getattr(args, "managed_ci_adopt_existing_pr", False):
             if args.command != "pr":
                 raise AgentLoopError("--managed-ci-adopt-existing-pr is only supported with `agent-loop pr <n>`.")
-            if not args.auto_merge:
-                raise AgentLoopError("--managed-ci-adopt-existing-pr requires --auto-merge.")
+            if not (args.auto_merge or getattr(args, "managed_ci", False)):
+                raise AgentLoopError("--managed-ci-adopt-existing-pr requires --managed-ci or --auto-merge.")
             if not (args.managed_ci_trusted_actor or "").strip():
                 raise AgentLoopError(
                     "--managed-ci-adopt-existing-pr requires --managed-ci-trusted-actor."
@@ -794,8 +822,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if getattr(args, "allow_unprotected_managed_ci", False):
             if args.command not in {"issue", "pr"}:
                 raise AgentLoopError("--allow-unprotected-managed-ci is only supported with issue or pr.")
-            if not args.auto_merge:
-                raise AgentLoopError("--allow-unprotected-managed-ci requires --auto-merge.")
+            if not (args.auto_merge or getattr(args, "managed_ci", False)):
+                raise AgentLoopError("--allow-unprotected-managed-ci requires --managed-ci or --auto-merge.")
             if not (args.managed_ci_trusted_actor or "").strip():
                 raise AgentLoopError("--allow-unprotected-managed-ci requires --managed-ci-trusted-actor.")
             if getattr(args, "managed_ci_adopt_existing_pr", False):

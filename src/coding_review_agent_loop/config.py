@@ -179,6 +179,10 @@ class AgentLoopConfig:
     # invocations enable this automatically with --auto-merge; direct config
     # constructions remain conservative unless they set it explicitly.
     watch_pending_ci: bool = False
+    # Explicit request to activate managed exact-head CI without requesting a
+    # merge. `auto_merge` remains an implicit managed-CI eligibility signal so
+    # existing invocations retain their behavior.
+    managed_ci: bool = False
     # Optional v2 managed-CI identity. A repository must independently opt in
     # with its Actions variable before this can suppress any automatic matrix.
     managed_ci_trusted_actor: str | None = None
@@ -197,6 +201,11 @@ class AgentLoopConfig:
     # issue-created activation semantics for that first invocation.
     managed_ci_pr_mode: bool = False
     invocation_argv: tuple[str, ...] = ()
+
+    @property
+    def effective_managed_ci(self) -> bool:
+        """Whether this invocation requested the managed-CI protocol."""
+        return self.managed_ci or self.auto_merge
 
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
@@ -998,6 +1007,7 @@ def config_from_args(
             else bool(args.watch_pending_ci)
         ),
         managed_ci_trusted_actor=getattr(args, "managed_ci_trusted_actor", None),
+        managed_ci=getattr(args, "managed_ci", False),
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
         allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),
         managed_ci_pr_mode=getattr(args, "command", None) == "pr",

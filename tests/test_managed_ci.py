@@ -40,6 +40,7 @@ from coding_review_agent_loop.managed_ci import (
     revalidate_adopted_managed_ci,
     OrdinaryRecoveryCapability,
     refresh_ordinary_recovery_capability,
+    _release_for_ordinary_recovery,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
@@ -1702,6 +1703,40 @@ def test_v2_preflight_fails_closed_for_incomplete_markers(tmp_path):
 
     with pytest.raises(AgentLoopError, match="incomplete managed-CI v2 contract"):
         preflight_managed_ci_creation(runner, config=config, issue_number=643)
+
+
+def test_explicit_managed_mode_rejects_legacy_v1_contract(tmp_path):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    with pytest.raises(AgentLoopError, match="legacy v1"):
+        activate_managed_ci(
+            ManagedRunner(workflow=WORKFLOW), config=config, pr_number=7, metadata=metadata()
+        )
+
+
+def test_explicit_activation_release_is_terminal_and_unqualified(tmp_path):
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+    )
+    runner = V2ManagedRunner(issue_events=[])
+
+    with pytest.raises(AgentLoopError, match="did NOT qualify"):
+        _release_for_ordinary_recovery(
+            runner,
+            config=config,
+            pr_number=7,
+            base_ref="main",
+            expected_head_sha="abc123",
+            active_event=None,
+            reason="timeline unavailable",
+        )
+    assert any(
+        command[:5] == [
+            "gh", "api", "--method", "DELETE",
+            f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+        ]
+        for command, _cwd in runner.commands
+    )
 
 
 def test_v2_intent_resumes_matching_comment_and_rejects_competing_nonce(tmp_path):
