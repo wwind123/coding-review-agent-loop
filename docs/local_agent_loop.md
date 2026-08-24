@@ -1302,7 +1302,7 @@ changes before reviewer rounds, so reviewers are less likely to spend rounds
 on code that already fails the configured local test command. Use
 `--no-pre-review-tests` to keep `--test-command` as a post-approval gate only.
 
-Failing GitHub checks always block approval and can route back to the coder. Pending or unavailable GitHub checks are treated as an external wait state rather than actionable coder feedback: if every reviewer approves the code and only GitHub checks are pending/unavailable, the loop posts a comment and stops with a clear message instead of erroring or starting another coder/reviewer round. If those checks later pass, manual merge is fine and rerunning is optional unless you want agent-loop to re-check or automate the final step. With `--auto-merge`, the loop instead keeps watching until checks resolve before merging.
+Failing GitHub checks always block approval and can route back to the coder. Pending or unavailable GitHub checks are treated as an external wait state rather than actionable coder feedback: if every reviewer approves the code and only GitHub checks are pending/unavailable, the loop posts a comment and stops with a clear message instead of erroring or starting another coder/reviewer round. If those checks later pass, manual merge is fine and rerunning is optional unless you want agent-loop to re-check or automate the final step. With `--auto-merge`, the loop instead keeps watching until checks resolve before merging. With active `--managed-ci`, the informational comment is retained but the loop falls through to dispatch the final exact-head workflow; ordinary pending/unavailable checks are not qualification.
 
 ### Managed exact-head CI
 
@@ -1351,13 +1351,16 @@ for the workflow's `unlabeled` recovery CI instead of treating a `no_checks`
 board as mergeable.
 
 To retry an interrupted issue-created managed draft on an unprotected
-repository, use the explicit per-invocation PR-mode command:
+repository and preserve automatic merging, use the explicit per-invocation
+PR-mode command:
 
 ```bash
 agent-loop pr <number> --auto-merge \
   --managed-ci-trusted-actor <login> --allow-unprotected-managed-ci
 ```
 
+For a manual-merge resume, replace `--auto-merge` with `--managed-ci`; that
+mode publishes a fresh SHA-bound qualification and never calls the merge API.
 This is supported resume, not retroactive adoption. The live PR must still be
 open, a draft, same-repository, authored by the authenticated trusted actor
 (login and immutable ID), on the reserved `agent-loop/managed-*` ref, with the
@@ -1375,8 +1378,10 @@ safe managed resume is unavailable, agent-loop removes the exact active
 managed label and waits for a new post-`unlabeled` workflow run on the exact
 head, then requires the ordinary current-head check board to pass. It does not
 accept pre-release green checks, `no_checks`, or a different SHA. Only the
-invocation-owned fallback draft can be made ready, only when `--auto-merge` is
-requested; unrelated or intentional drafts remain drafts. Agent-loop checks
+invocation-owned fallback draft can be made ready, and only an auto-merge
+invocation can take this deliberate ordinary-recovery path; explicit managed
+manual mode fails closed instead. Unrelated or intentional drafts remain
+drafts. Agent-loop checks
 the exact head before and after `gh pr ready` and merges with
 `--match-head-commit`. If that merge fails after readiness, it logs that the PR
 remains ready and leaves it unmerged rather than restoring draft state.
@@ -1501,10 +1506,25 @@ accepts neither green nor red same-context statuses unless publisher, nonce,
 attached run, and latest attempt all correlate. A failure is reported from the
 validated run's failing jobs, not base-ref PR checks.
 
-After correlated success, agent-loop applies `agent-loop-exact-head-qualified`,
-marks the PR ready, rechecks its head, and merges with `--match-head-commit`.
-Interrupted labeled drafts remain non-mergeable; rerun the issue loop to resume
-the intent, or remove the managed label to deliberately release ordinary CI.
+After correlated success, auto-merge applies the short-lived
+`agent-loop-exact-head-qualified` label, marks the PR ready, rechecks its head,
+and merges with `--match-head-commit`. Explicit `--managed-ci` never applies
+that bare label and never calls the merge API: it releases the managed label,
+marks an issue-created draft ready, writes a SHA-bearing
+`AGENT_LOOP_MANAGED_CI_QUALIFIED_V2` audit comment, and prints:
+
+```bash
+gh pr merge <number> --repo OWNER/REPO --merge --match-head-commit <qualified-sha>
+```
+
+The PR stays open for a human. A later head change invalidates the result. A
+rerun of a successful issue-created manual result first makes the PR draft
+again, suspending the earlier manual command; if reconstruction fails, rerun
+managed qualification or restore readiness manually and use the old guarded
+command only after confirming that exact SHA is still live. For an explicitly
+unprotected run, the audit and terminal warning state that GitHub cannot force
+the human to use the qualified SHA after agent-loop exits. Explicit mode
+requires complete v2; it rejects v1 instead of silently claiming qualification.
 
 A v2 issue-created PR has zero billed routing jobs at opening, zero hosted
 minutes per intermediate revision, one final matrix, and one rounded
@@ -1579,8 +1599,10 @@ For repositories not using managed exact-head CI, `--watch-pending-ci` is
 enabled by default whenever `--auto-merge` is set;
 pass `--no-watch-pending-ci` to fall back to the legacy single
 `--ci-check-name` waiter described above. It can also be passed explicitly
-without `--auto-merge`, in which case it watches checks after approval and
-reports merge-ready without merging.
+without `--auto-merge`, in which case it watches ordinary checks after approval
+and reports merge-ready without merging. It does not activate suppression or
+replace managed exact-head qualification; when `--managed-ci` is active it is
+inert for that managed route.
 
 When active, it foreground-polls the full PR check/status/required-check board
 using the existing timeout and poll interval controls. It does not call

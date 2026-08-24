@@ -1154,6 +1154,27 @@ selectively, and validate any reused changes yourself.
 """
 
 
+def _managed_ci_creation_guidance(
+    intent: ManagedCiCreationIntent | None,
+) -> str:
+    if intent is None:
+        return ""
+    override = ""
+    if intent.audit_nonce:
+        override = (
+            " This invocation uses the explicit unprotected override. Include this exact "
+            f"PR-body trailer on its own line: `{UNPROTECTED_OVERRIDE_TRAILER} nonce={intent.audit_nonce}`. "
+            "This is a voluntary gate: GitHub cannot force a later human merge, other automation, "
+            "a compromised credential, or an agent-loop defect to use the qualified SHA."
+        )
+    return (
+        "\nThis invocation has authenticated managed-CI v2 enabled. Create the PR atomically: "
+        f"use the reserved branch `{intent.branch}`, create or verify the `agent-loop-managed` "
+        "label, then run `gh pr create --draft --label agent-loop-managed`. Do not mark it ready; "
+        f"agent-loop will dispatch exact-head qualification after review.{override}\n"
+    )
+
+
 def build_issue_prompt(
     issue_number: int,
     config: AgentLoopConfig,
@@ -1161,6 +1182,7 @@ def build_issue_prompt(
     issue_context: IssueContext | None = None,
     salvage_summary: str | None = None,
     staged_parent_issue: int | None = None,
+    managed_ci_creation_intent: ManagedCiCreationIntent | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config)
@@ -1174,6 +1196,7 @@ def build_issue_prompt(
         if staged_parent_issue is not None
         else _issue_pr_reference_guidance(issue_number)
     )
+    managed_creation_guidance = _managed_ci_creation_guidance(managed_ci_creation_intent)
     return f"""Fix GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout as your workspace. Create a branch, implement the fix,
@@ -1182,6 +1205,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {pr_reference_guidance}
+{managed_creation_guidance}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
     requirement_label="implementation requirements",
@@ -1743,23 +1767,7 @@ def build_issue_implementation_prompt(
         if staged_parent_issue is not None
         else _issue_pr_reference_guidance(issue_number)
     )
-    managed_creation_guidance = ""
-    if managed_ci_creation_intent is not None:
-        branch = managed_ci_creation_intent.branch
-        override = ""
-        if managed_ci_creation_intent.audit_nonce:
-            override = (
-                " This invocation is using the explicit unprotected override. Include this exact "
-                f"PR-body trailer on its own line: `{UNPROTECTED_OVERRIDE_TRAILER} nonce={managed_ci_creation_intent.audit_nonce}`. "
-                "GitHub cannot stop a manual merge, other automation, a compromised credential, "
-                "or an agent-loop defect from bypassing this voluntary gate."
-            )
-        managed_creation_guidance = (
-            "\nThis repository has authenticated managed-CI v2 enabled. Create the PR atomically: "
-            f"use the reserved branch `{branch}`, create/verify the `agent-loop-managed` label first, "
-            "then run `gh pr create --draft --label agent-loop-managed`. Do not mark it ready until "
-            f"agent-loop's final exact-head qualification succeeds.{override}\n"
-        )
+    managed_creation_guidance = _managed_ci_creation_guidance(managed_ci_creation_intent)
     return f"""Implement the approved plan for GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout as your workspace. Create a branch, implement the

@@ -112,6 +112,7 @@ from .managed_ci import (
     intermediate_managed_checks,
     managed_label_present,
     preflight_managed_ci_creation,
+    publish_manual_v2_qualification,
     prepare_v2_merge,
     publish_round_readiness,
     refresh_ordinary_recovery_capability,
@@ -5492,6 +5493,20 @@ def run_issue_loop(
             )
 
         sync_coder_base_before_implementation(config, runner)
+        managed_ci_creation_intent = None
+        if config.managed_ci:
+            # Direct issue mode is intentionally the only new creation path.
+            # A plain `issue --auto-merge` invocation keeps its historical
+            # ordinary opening behavior unless it uses plan-first.
+            managed_ci_creation_intent = preflight_managed_ci_creation(
+                runner, config=config, issue_number=issue_number
+            )
+            if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
+                print(
+                    "WARNING: --allow-unprotected-managed-ci is active for this invocation. GitHub cannot "
+                    "prevent a manual merge, other automation, a compromised credential, or an agent-loop "
+                    "defect from bypassing the voluntary final-ci/exact-head gate."
+                )
         assigned_head_before = _read_assigned_workdir_head(runner, config)
         salvage_summary = latest_salvage_context(
             config.log_dir,
@@ -5511,6 +5526,7 @@ def run_issue_loop(
                 issue_context=issue_context,
                 salvage_summary=salvage_summary,
                 staged_parent_issue=staged_parent_issue,
+                managed_ci_creation_intent=managed_ci_creation_intent,
             ),
             marker_description="positive <!-- AGENT_PR: <number> -->, PR URL, blocking, or clarification",
             validate=_require_issue_implementation_result,
@@ -5597,6 +5613,11 @@ def run_issue_loop(
                 ),
             ),
         )
+        if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
+            config = dataclasses_replace(
+                config,
+                managed_ci_expected_override_nonce=managed_ci_creation_intent.audit_nonce,
+            )
         return run_pr_loop(
             runner,
             pr_number=pr_number,
@@ -5789,7 +5810,7 @@ def _finalize_ordinary_recovery_merge(
     pr_number: int,
     capability: OrdinaryRecoveryCapability,
 ) -> None:
-    """Ready and merge only the draft released by this invocation."""
+    """Qualify, ready, and merge only the draft released by this invocation."""
     refreshed = refresh_ordinary_recovery_capability(
         runner, config=config, capability=capability,
     )
@@ -5960,8 +5981,26 @@ def run_pr_loop(
             if revalidate_adopted_managed_ci(
                 runner, config=config, pr_number=pr_number, metadata=metadata, contract=managed_ci
             ):
+                if managed_ci.issue_created_pr:
+                    label_state = managed_label_present(
+                        runner, config=config, pr_number=pr_number,
+                    )
+                    if label_state is True:
+                        return True
+                    if config.managed_ci:
+                        raise AgentLoopError(
+                            f"PR #{pr_number} lost its authenticated `{MANAGED_LABEL}` suppression label; "
+                            "managed qualification is cancelled and the head is not qualified."
+                        )
+                    managed_ci = None
+                    return False
                 return True
             if managed_ci.adopted_existing_pr:
+                if config.managed_ci:
+                    raise AgentLoopError(
+                        f"PR #{pr_number} managed-CI adoption provenance changed; "
+                        "managed qualification is cancelled and the head is not qualified."
+                    )
                 if not release_adopted_managed_ci(
                     runner, config=config, pr_number=pr_number, contract=managed_ci
                 ):
@@ -7069,21 +7108,21 @@ def run_pr_loop(
                         "Actions runners recover."
                     )
                     return 0
-                if not must_fix_items and config.watch_pending_ci and not managed_ci_active(pr_metadata):
-                    if ordinary_recovery_selected:
-                        if ordinary_recovery is None:
-                            raise AgentLoopError(
-                                f"PR #{pr_number} was released to ordinary CI, but recovery provenance "
-                                "could not be correlated; no merge attempted."
-                            )
-                        _finalize_ordinary_recovery_merge(
-                            runner,
-                            config=config,
-                            pr_number=pr_number,
-                            capability=ordinary_recovery,
+                if not must_fix_items and ordinary_recovery_selected and not managed_ci_active(pr_metadata):
+                    if ordinary_recovery is None:
+                        raise AgentLoopError(
+                            f"PR #{pr_number} was released to ordinary CI, but recovery provenance "
+                            "could not be correlated; no merge attempted."
                         )
-                        print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
-                        return 0
+                    _finalize_ordinary_recovery_merge(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        capability=ordinary_recovery,
+                    )
+                    print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
+                    return 0
+                if not must_fix_items and config.watch_pending_ci and not managed_ci_active(pr_metadata):
                     if watch_deadline is None:
                         watch_deadline = time.monotonic() + config.ci_timeout_seconds
                         watch_attempts_remaining = max(
@@ -7264,7 +7303,7 @@ def run_pr_loop(
                 if not must_fix_items:
                     if pr_checks.state in {"pending", "unavailable"}:
                         details = _pr_check_details(pr_checks)
-                        if not config.auto_merge:
+                        if not config.effective_managed_ci and not managed_ci_active(pr_metadata):
                             # Pending/unavailable checks are an external wait, not
                             # actionable coder feedback: stop cleanly instead of
                             # erroring or spending another coder/reviewer round.
@@ -7301,8 +7340,10 @@ def run_pr_loop(
                                 f"{_pending_ci_stop_guidance(pr_checks.state)}"
                             )
                             return 0
-                        # --auto-merge: post the informational comment, then fall
-                        # through to wait for CI before merging, as today.
+                        # Managed qualification and --auto-merge: post the
+                        # informational comment, then fall through to wait for
+                        # the final gate before merging or publishing a manual
+                        # result.
                         post_pr_comment(
                             runner,
                             config=config,
@@ -7344,7 +7385,7 @@ def run_pr_loop(
                         followups=future_followups,
                     )
                     run_optional_tests(runner, config)
-                    if config.auto_merge:
+                    if config.auto_merge or managed_ci_active(pr_metadata):
                         if managed_ci_active(pr_metadata):
                             assert pr_metadata.head_sha is not None
                             assert pr_metadata.head_branch is not None
@@ -7381,24 +7422,49 @@ def run_pr_loop(
                                 contract=managed_ci,
                             )
                             if managed_outcome.status == "passed":
-                                managed_ci_qualified = True
-                                prepare_v2_merge(
-                                    runner,
-                                    config=config,
-                                    pr_number=pr_number,
-                                    expected_head_sha=pr_metadata.head_sha,
-                                    contract=managed_ci,
-                                )
-                                merge_pr(
-                                    runner,
-                                    config,
-                                    pr_number,
-                                    expected_head_sha=pr_metadata.head_sha,
-                                )
-                                print(
-                                    f"PR #{pr_number} approved by "
-                                    f"{format_agent_list(configured_reviewers)}."
-                                )
+                                if config.auto_merge:
+                                    managed_ci_qualified = True
+                                    prepare_v2_merge(
+                                        runner,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        expected_head_sha=pr_metadata.head_sha,
+                                        contract=managed_ci,
+                                    )
+                                    merge_pr(
+                                        runner,
+                                        config,
+                                        pr_number,
+                                        expected_head_sha=pr_metadata.head_sha,
+                                    )
+                                    print(
+                                        f"PR #{pr_number} approved by "
+                                        f"{format_agent_list(configured_reviewers)}."
+                                    )
+                                else:
+                                    qualified_head = publish_manual_v2_qualification(
+                                        runner,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        expected_head_sha=pr_metadata.head_sha,
+                                        contract=managed_ci,
+                                        reviewers=tuple(str(reviewer) for reviewer in configured_reviewers),
+                                    )
+                                    managed_ci_qualified = True
+                                    merge_command = (
+                                        f"gh pr merge {pr_number} --repo {shlex.quote(config.repo)} --merge "
+                                        f"--match-head-commit {shlex.quote(qualified_head)}"
+                                    )
+                                    risk = (
+                                        " GitHub cannot force a human or other automation to use that SHA."
+                                        if managed_ci.protection_mode != "strict"
+                                        else ""
+                                    )
+                                    print(
+                                        f"PR #{pr_number} approved and qualified; manual merge required. "
+                                        f"Qualified head: {qualified_head}. Run `{merge_command}` after "
+                                        f"confirming the live head.{risk}"
+                                    )
                                 return 0
                             if managed_outcome.status == "head_changed":
                                 log(
@@ -7824,17 +7890,36 @@ def run_pr_loop(
             f"Reached max rounds ({config.max_rounds}) for PR #{pr_number}; human review required."
         )
     finally:
+        cleanup_failure: AgentLoopError | None = None
         if (
             managed_ci is not None
-            and managed_ci.adopted_existing_pr
             and not managed_ci_qualified
-            and not release_adopted_managed_ci(
-                runner, config=config, pr_number=pr_number, contract=managed_ci
-            )
         ):
-            log(config, f"PR #{pr_number}: unable to release invocation-owned managed-CI label")
+            should_release = managed_ci.adopted_existing_pr or config.managed_ci
+            if should_release and not release_adopted_managed_ci(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                contract=managed_ci,
+                force=config.managed_ci,
+            ):
+                message = f"PR #{pr_number}: unable to release invocation-owned managed-CI label"
+                if config.managed_ci:
+                    cleanup_failure = AgentLoopError(
+                        message + "; the PR remains suppressed and requires manual label removal."
+                    )
+                log(config, message)
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)
+        if cleanup_failure is not None:
+            active_exception = sys.exc_info()[1]
+            if active_exception is not None:
+                # Preserve the original failure while making cleanup failure
+                # visible in its traceback. Usage accounting above must run
+                # even when label cleanup also fails.
+                active_exception.add_note(str(cleanup_failure))
+            else:
+                raise cleanup_failure
 
 
 DISCUSS_CONSENSUS_MARKER_RE = re.compile(

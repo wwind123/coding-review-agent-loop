@@ -1287,6 +1287,26 @@ def test_config_enables_ci_watch_with_auto_merge_without_rebuilding_antigravity_
     assert config.antigravity_models == ("Gemini 3.1 Pro (High)",)
 
 
+def test_config_records_explicit_managed_ci_without_implying_auto_merge(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr", "77", "--repo", "OWNER/REPO", "--managed-ci",
+        "--managed-ci-trusted-actor", "agent-loop",
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.managed_ci is True
+    assert config.auto_merge is False
+    assert config.effective_managed_ci is True
+    assert config.watch_pending_ci is False
+
+
+def test_explicit_managed_ci_requires_trusted_actor_before_agent_preflight(capsys):
+    assert main(["pr", "77", "--repo", "OWNER/REPO", "--managed-ci"]) == 1
+    assert "--managed-ci requires --managed-ci-trusted-actor" in capsys.readouterr().err
+
+
 def test_config_records_explicit_existing_pr_managed_ci_adoption(tmp_path):
     parser = build_parser()
     args = parser.parse_args([

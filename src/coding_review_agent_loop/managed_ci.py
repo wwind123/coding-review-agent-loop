@@ -35,6 +35,7 @@ from .workdirs import active_workdir
 MANAGED_LABEL = "agent-loop-managed"
 MANAGED_OPT_OUT_LABEL = "agent-loop-managed-opt-out"
 QUALIFIED_LABEL = "agent-loop-exact-head-qualified"
+QUALIFICATION_MARKER = "AGENT_LOOP_MANAGED_CI_QUALIFIED_V2"
 FINAL_CONTEXT = "final-ci/exact-head"
 READINESS_CONTEXT = "agent-loop/round-readiness"
 WORKFLOW_FILE = "ci.yml"
@@ -113,6 +114,7 @@ class ManagedCiContract:
     repository: str | None = None
     created_at: int | None = None
     adopted_existing_pr: bool = False
+    issue_created_pr: bool = False
     guard_head_sha: str | None = None
     active_label_event_id: int | None = None
     invocation_applied_label: bool = False
@@ -191,13 +193,13 @@ def activate_managed_ci(
     pr_number: int,
     metadata: PullRequestMetadata,
 ) -> ManagedCiContract | None:
-    """Activate a repository-advertised managed-CI contract for auto-merge runs.
+    """Activate a repository-advertised managed-CI contract.
 
     Repositories without any contract markers retain legacy behavior. A partial
     contract fails closed because applying its suppression label could otherwise
     disable hosted tests without a usable final qualification path.
     """
-    if not config.auto_merge or config.dry_run:
+    if not config.effective_managed_ci or config.dry_run:
         return None
 
     workflow_ref = metadata.base_branch or config.base
@@ -216,10 +218,20 @@ def activate_managed_ci(
         check=False,
     )
     if result.returncode != 0:
+        if config.managed_ci:
+            raise AgentLoopError(
+                "--managed-ci could not read the base workflow; managed exact-head qualification "
+                "is unavailable and no ordinary fallback was selected."
+            )
         return None
     workflow = result.stdout or ""
     present = tuple(marker for marker in _CONTRACT_MARKERS if marker in workflow)
     if not present:
+        if config.managed_ci:
+            raise AgentLoopError(
+                "--managed-ci requested managed exact-head qualification, but the base workflow "
+                "does not advertise a complete v2 managed-CI contract."
+            )
         return None
     missing = tuple(marker for marker in _CONTRACT_MARKERS if marker not in workflow)
     if missing:
@@ -246,15 +258,31 @@ def activate_managed_ci(
             metadata=metadata,
         )
         if contract is not None or not config.managed_ci_adopt_existing_pr:
+            if contract is None and config.managed_ci:
+                raise AgentLoopError(
+                    f"PR #{pr_number} does not match the authenticated issue-created managed-CI "
+                    "tuple; use --managed-ci-adopt-existing-pr for an eligible existing PR."
+                )
             return contract
         # A complete ordinary v2 workflow is not an adoption contract.  This
         # path is intentionally quiet/fallback-compatible when the optional
         # marker has not been deployed.
-        return _activate_v2_existing_pr_adoption(
+        adopted = _activate_v2_existing_pr_adoption(
             runner,
             config=config,
             pr_number=pr_number,
             metadata=metadata,
+        )
+        if adopted is None and config.managed_ci:
+            raise AgentLoopError(
+                f"--managed-ci-adopt-existing-pr could not safely adopt PR #{pr_number}; "
+                "no suppression or qualification was claimed."
+            )
+        return adopted
+
+    if config.managed_ci:
+        raise AgentLoopError(
+            "--managed-ci is unsupported for the legacy v1 managed-CI contract; deploy the complete v2 workflow."
         )
 
     pr_result = runner.run(
@@ -607,11 +635,16 @@ def preflight_managed_ci_creation(
     This happens before the coder is prompted, avoiding the opened-event race:
     the PR is born as a draft with its managed label, or it is ordinary CI.
     """
-    if not config.auto_merge or config.dry_run or not config.managed_ci_trusted_actor or not config.base:
+    if not config.effective_managed_ci or config.dry_run or not config.managed_ci_trusted_actor or not config.base:
         return None
     source_context = ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config))
     source_workflow, _ = _probe_raw_workflow(runner, source_context, config.base)
     if source_workflow is None or V2_MARKER not in source_workflow:
+        if config.managed_ci:
+            raise AgentLoopError(
+                "--managed-ci requires a complete v2 workflow on the resolved base branch; "
+                "v1 or ordinary CI cannot qualify a managed head."
+            )
         return None
     if any(marker not in source_workflow for marker in V2_FEATURE_MARKERS):
         raise AgentLoopError("Repository CI advertises an incomplete managed-CI v2 contract.")
@@ -623,6 +656,11 @@ def preflight_managed_ci_creation(
         trusted_actor=config.managed_ci_trusted_actor,
     )
     if readiness.state == "indeterminate" and not legacy_non_suppressing:
+        if config.managed_ci:
+            raise AgentLoopError(
+                "--managed-ci could not determine the repository's exact-head protection; "
+                "no PR was created."
+            )
         log(config, "Managed-CI readiness could not be determined; continuing with ordinary CI.")
         return None
     if readiness.state == "indeterminate":
@@ -635,16 +673,30 @@ def preflight_managed_ci_creation(
             actor.casefold() != config.managed_ci_trusted_actor.casefold()
             or actor.casefold() != advertised.casefold()
         ):
+            if config.managed_ci:
+                raise AgentLoopError(
+                    "--managed-ci authentication does not match the configured trusted actor; no PR was created."
+                )
             return None
         readiness = ManagedCiReadiness(
             "override_eligible", None, actor, advertised, True, True,
             ProtectionAssessment("voluntary", "legacy", "legacy non-suppressing workflow"), (), (),
         )
     if readiness.state == "override_eligible" and not (config.allow_unprotected_managed_ci or legacy_non_suppressing):
+        if config.managed_ci:
+            raise AgentLoopError(
+                "--managed-ci requires protected final-ci/exact-head or "
+                "--allow-unprotected-managed-ci; no PR was created."
+            )
         return None
     if readiness.state != "strict_ready" and not (
         readiness.state == "override_eligible" and (config.allow_unprotected_managed_ci or legacy_non_suppressing)
     ):
+        if config.managed_ci:
+            raise AgentLoopError(
+                "--managed-ci repository readiness is not sufficient for suppression and exact-head qualification; "
+                "no PR was created."
+            )
         return None
     return ManagedCiCreationIntent(
         branch=f"agent-loop/managed-{issue_number}",
@@ -671,6 +723,12 @@ def _restore_ordinary_ci_after_v2_fallback(
             "Remove the label before relying on ordinary CI."
         )
     log(config, f"PR #{pr_number}: removed `{MANAGED_LABEL}`; continuing with ordinary CI ({reason})")
+    if config.managed_ci:
+        raise AgentLoopError(
+            f"--managed-ci requested qualification, but activation failed ({reason}). "
+            f"PR #{pr_number} is now draft and unlabeled; this run did NOT qualify its head. "
+            "Rerun the same managed-CI command to start a fresh cycle."
+        )
 
 
 def _release_for_ordinary_recovery(
@@ -720,6 +778,13 @@ def _release_for_ordinary_recovery(
             f"Managed-CI v2 could not activate ({reason}) and `{MANAGED_LABEL}` could not be removed."
         )
     log(config, f"PR #{pr_number}: selected ordinary unlabeled recovery ({reason})")
+    if config.managed_ci:
+        raise AgentLoopError(
+            f"--managed-ci requested qualification, but activation failed ({reason}). "
+            f"PR #{pr_number} is now draft and unlabeled; this run did NOT qualify its head. "
+            "The previously advertised manual-merge state is suspended. Rerun the same "
+            "managed-CI command to qualify a fresh live head."
+        )
     return OrdinaryRecoveryCapability(
         pr_number=pr_number,
         repository=config.repo,
@@ -893,24 +958,90 @@ def _activate_v2_managed_ci(
     author_id = author.get("id") if isinstance(author.get("id"), int) else None
     # Reserved branches are generated by the typed creation prompt. A mere
     # lookalike branch cannot pass without all the other authenticated fields.
-    managed_tuple = (
+    immutable_tuple = (
         head_repo_name is not None and head_repo_name.casefold() == config.repo.casefold()
         and author_login is not None and author_login.casefold() == actor_login.casefold()
         and author_id == actor_id
         and isinstance(head_ref, str) and head_ref.startswith("agent-loop/managed-")
-        and MANAGED_LABEL in labels
-        and pr.get("draft") is True
         and base.get("ref") == base_ref
         and live_sha is not None and live_sha == metadata.head_sha
+        and pr.get("state") not in {"closed", "CLOSED"}
     )
-    if not managed_tuple:
+    if not immutable_tuple:
         return None
+
+    # A successful explicit manual run leaves an issue-created PR ready and
+    # unlabeled. Re-entry deliberately suspends that prior manual-merge
+    # affordance before reconstructing suppression, so every invocation gets a
+    # fresh exact-head qualification ledger.
+    if pr.get("draft") is not True:
+        if not (config.managed_ci and config.managed_ci_pr_mode and MANAGED_LABEL not in labels):
+            return None
+        undo = runner.run(
+            [config.gh_cmd, "pr", "ready", "--undo", str(pr_number), "--repo", config.repo],
+            cwd=active_workdir(config), check=False,
+        )
+        refreshed = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+        if undo.returncode != 0 and refreshed.get("draft") is not True:
+            raise AgentLoopError(
+                f"--managed-ci re-entry could not make PR #{pr_number} a draft; its prior "
+                "qualified/manual-merge state remains suspended until the PR is safely reconstructed."
+            )
+        pr = refreshed
+        head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+        base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+        author = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+        head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+        labels = {
+            item.get("name") for item in (pr.get("labels") or [])
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        live_sha = head.get("sha") if isinstance(head.get("sha"), str) else None
+        if (
+            pr.get("draft") is not True
+            or pr.get("state") in {"closed", "CLOSED"}
+            or base.get("ref") != base_ref
+            or live_sha != metadata.head_sha
+            or head.get("ref") != head_ref
+            or head_repo.get("full_name", "").casefold() != config.repo.casefold()
+            or author.get("login") != actor_login
+            or author.get("id") != actor_id
+        ):
+            # There is no trusted active label to remove in the unlabeled
+            # re-entry case. Report the draft/unlabeled state without claiming
+            # qualification; the next invocation can retry reconstruction.
+            raise AgentLoopError(
+                f"--managed-ci re-entry reconstruction for PR #{pr_number} failed after "
+                "the ready-to-draft transition; the head is NOT qualified by this run. "
+                "The PR must be draft and unlabeled before rerunning managed qualification."
+            )
+    if MANAGED_LABEL not in labels:
+        # Implicit auto-merge keeps the historical existing-PR behavior: only
+        # an already authenticated issue-created managed draft is resumable.
+        if not config.managed_ci:
+            return None
+        if not _ensure_managed_label(runner, config=config):
+            raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
+        applied_label = runner.run(
+            [
+                config.gh_cmd, "api", "--method", "POST",
+                f"repos/{config.repo}/issues/{pr_number}/labels",
+                "-f", f"labels[]={MANAGED_LABEL}",
+            ], cwd=active_workdir(config), check=False,
+        )
+        if applied_label.returncode != 0:
+            raise AgentLoopError(f"Unable to apply `{MANAGED_LABEL}` to PR #{pr_number}.")
+        label_applied = True
+        labels.add(MANAGED_LABEL)
+    else:
+        label_applied = False
+
     # A direct `pr` retry has a separate, deliberately narrower contract. It
     # may resume only an issue-created draft whose immutable timeline facts
     # still identify this trusted actor. The old body nonce is provenance, not
     # authorization; this invocation mints a new nonce and intent generation.
     active_event: tuple[int, str, int] | None = None
-    if config.managed_ci_pr_mode:
+    if config.managed_ci_pr_mode or config.managed_ci:
         active_event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
         if active_event is None:
             recovery = _release_for_ordinary_recovery(
@@ -1086,7 +1217,7 @@ def _activate_v2_managed_ci(
             audit_id = None
     workflow_revision = _api_json(runner, config, f"repos/{config.repo}/commits/{base_ref}", quiet=True)
     revision = workflow_revision.get("sha") if isinstance(workflow_revision.get("sha"), str) else None
-    generation = secrets.token_urlsafe(16) if config.managed_ci_pr_mode else None
+    generation = secrets.token_urlsafe(16) if (config.managed_ci_pr_mode or config.managed_ci) else None
     log(
         config,
         f"PR #{pr_number}: selected managed resume (fresh generation)"
@@ -1104,6 +1235,8 @@ def _activate_v2_managed_ci(
         audit_comment_id=audit_id if isinstance(audit_id, int) else None,
         intent_generation=generation,
         active_label_event_id=active_event[0] if active_event is not None else None,
+        issue_created_pr=True,
+        invocation_applied_label=label_applied,
     )
 
 
@@ -1301,6 +1434,11 @@ def _activate_v2_existing_pr_adoption(
         trusted_actor_id=actor_id, workflow_revision=revision if isinstance(revision, str) else None,
         adopted_existing_pr=True, guard_head_sha=live_sha, active_label_event_id=existing[0],
         invocation_applied_label=applied,
+        intent_generation=(
+            secrets.token_urlsafe(16)
+            if config.managed_ci
+            else None
+        ),
     )
 
 
@@ -1340,7 +1478,8 @@ def revalidate_adopted_managed_ci(
 
 
 def release_adopted_managed_ci(
-    runner: Runner, *, config: AgentLoopConfig, pr_number: int, contract: ManagedCiContract
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, contract: ManagedCiContract,
+    force: bool = False,
 ) -> bool:
     """Remove an invocation-owned adoption label without removing a later label.
 
@@ -1348,7 +1487,9 @@ def release_adopted_managed_ci(
     our claimed suppression.  It is then removed unconditionally; when an
     event ID was recorded, retain the normal fresh event-ID ownership check.
     """
-    if not contract.adopted_existing_pr or not contract.invocation_applied_label:
+    if not (contract.adopted_existing_pr or contract.issue_created_pr) or (
+        not contract.invocation_applied_label and not force
+    ):
         return True
     if contract.active_label_event_id is not None:
         event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
@@ -1359,6 +1500,147 @@ def release_adopted_managed_ci(
         cwd=active_workdir(config), check=False,
     )
     return result.returncode == 0
+
+
+def _release_managed_label_for_manual_qualification(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    contract: ManagedCiContract,
+) -> None:
+    """Release only the authenticated active suppression before manual exit."""
+    event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+    if (
+        event is None
+        or contract.active_label_event_id is None
+        or event[0] != contract.active_label_event_id
+        or event[1].casefold() != (contract.trusted_actor_login or "").casefold()
+        or event[2] != contract.trusted_actor_id
+    ):
+        raise AgentLoopError(
+            f"PR #{pr_number} managed-label provenance changed before manual qualification; "
+            "the head is not qualified and no manual merge command is safe."
+        )
+    result = runner.run(
+        [
+            config.gh_cmd, "api", "--method", "DELETE",
+            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
+        ], cwd=active_workdir(config), check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError(
+            f"PR #{pr_number} qualified CI passed, but `{MANAGED_LABEL}` could not be removed; "
+            "the PR remains suppressed and must not be manually merged until the label is removed."
+        )
+
+
+def publish_manual_v2_qualification(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    expected_head_sha: str,
+    contract: ManagedCiContract,
+    reviewers: tuple[str, ...],
+) -> str:
+    """Publish a SHA-bound manual result, release suppression, and ready the PR."""
+    if contract.protocol_version != 2:
+        raise AgentLoopError("Explicit managed-CI manual qualification requires protocol v2.")
+    if get_pr_head_sha(runner, config, pr_number) != expected_head_sha:
+        raise AgentLoopError(
+            f"PR #{pr_number} head changed before manual qualification publication; no merge is safe."
+        )
+
+    # The bare qualified label is intentionally not used for a manual result.
+    # Remove a historical copy if one exists so it cannot outlive its SHA.
+    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    labels = {
+        item.get("name") for item in (pr.get("labels") or [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    if QUALIFIED_LABEL in labels:
+        removed = runner.run(
+            [
+                config.gh_cmd, "api", "--method", "DELETE",
+                f"repos/{config.repo}/issues/{pr_number}/labels/{QUALIFIED_LABEL}",
+            ], cwd=active_workdir(config), check=False,
+        )
+        if removed.returncode != 0:
+            raise AgentLoopError(f"Unable to clear stale `{QUALIFIED_LABEL}` from PR #{pr_number}.")
+
+    _release_managed_label_for_manual_qualification(
+        runner, config=config, pr_number=pr_number, contract=contract,
+    )
+    after_release = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    after_head = after_release.get("head") if isinstance(after_release.get("head"), dict) else {}
+    after_labels = {
+        item.get("name") for item in (after_release.get("labels") or [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    if (
+        after_head.get("sha") != expected_head_sha
+        or MANAGED_LABEL in after_labels
+        or (contract.adopted_existing_pr and after_release.get("draft") is True)
+    ):
+        raise AgentLoopError(
+            f"PR #{pr_number} changed while releasing managed CI; its exact head is not safely published."
+        )
+
+    if not contract.adopted_existing_pr:
+        ready = runner.run(
+            [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
+            cwd=active_workdir(config), check=False,
+        )
+        if ready.returncode != 0:
+            raise AgentLoopError(f"Unable to mark qualified PR #{pr_number} ready for manual review.")
+        after_ready = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+        ready_head = after_ready.get("head") if isinstance(after_ready.get("head"), dict) else {}
+        ready_labels = {
+            item.get("name") for item in (after_ready.get("labels") or [])
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        if ready_head.get("sha") != expected_head_sha or after_ready.get("draft") is True or MANAGED_LABEL in ready_labels:
+            raise AgentLoopError(
+                f"PR #{pr_number} changed while being made ready; the approved head is not safely published."
+            )
+
+    run_text = str(contract.attached_run_id) if contract.attached_run_id is not None else "unknown"
+    attempt_text = str(contract.run_attempt) if contract.run_attempt is not None else "unknown"
+    reviewer_text = ",".join(reviewers) or "unknown"
+    body = (
+        f"<!-- {QUALIFICATION_MARKER} repo={config.repo} pr={pr_number} base={contract.base_ref or config.base} "
+        f"protocol=2 qualified_head={expected_head_sha} reviewers={reviewer_text} "
+        f"protection={contract.protection_mode or 'unknown'} nonce={contract.nonce or 'unknown'} "
+        f"run_id={run_text} attempt={attempt_text} generation={contract.intent_generation or 'unknown'} -->\n\n"
+        f"Managed exact-head CI qualified `{expected_head_sha}` for manual merge. "
+        "The managed suppression label was released and this SHA is the only advertised merge target."
+    )
+    if contract.protection_mode != "strict":
+        body += (
+            " GitHub cannot force a human or other automation to use this SHA or the guarded command "
+            "after agent-loop exits."
+        )
+    posted = runner.run(
+        [
+            config.gh_cmd, "api", "--method", "POST",
+            f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={body}",
+        ], cwd=active_workdir(config), check=False,
+    )
+    if posted.returncode != 0:
+        raise AgentLoopError(f"Unable to publish the SHA-bound qualification audit for PR #{pr_number}.")
+    try:
+        audit_id = json.loads(posted.stdout or "{}").get("id")
+    except json.JSONDecodeError:
+        audit_id = None
+    if not isinstance(audit_id, int):
+        raise AgentLoopError(f"Qualification audit for PR #{pr_number} returned no comment ID.")
+    contract.audit_comment_id = audit_id
+    if get_pr_head_sha(runner, config, pr_number) != expected_head_sha:
+        raise AgentLoopError(
+            f"PR #{pr_number} head changed after qualification publication; rerun review and exact-head CI."
+        )
+    return expected_head_sha
 
 
 def _api_json(runner: Runner, config: AgentLoopConfig, endpoint: str, *, quiet: bool = False) -> dict[str, object]:

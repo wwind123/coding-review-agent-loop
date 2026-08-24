@@ -19,6 +19,7 @@ from coding_review_agent_loop.managed_ci import (
     FINAL_CONTEXT,
     MANAGED_LABEL,
     MANAGED_OPT_OUT_LABEL,
+    QUALIFICATION_MARKER,
     READINESS_CONTEXT,
     ManagedCiContract,
     ManagedCiProbeContext,
@@ -35,11 +36,13 @@ from coding_review_agent_loop.managed_ci import (
     intermediate_managed_checks,
     preflight_managed_ci_creation,
     prepare_v2_merge,
+    publish_manual_v2_qualification,
     publish_round_readiness,
     release_adopted_managed_ci,
     revalidate_adopted_managed_ci,
     OrdinaryRecoveryCapability,
     refresh_ordinary_recovery_capability,
+    _release_for_ordinary_recovery,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
@@ -271,6 +274,24 @@ class V2ManagedRunner(ManagedRunner):
         return super()._run_locked(args, cwd=cwd, check=check)
 
 
+class ManualQualificationRunner(V2ManagedRunner):
+    """Model GitHub's draft/ready transition for manual qualification tests."""
+
+    @staticmethod
+    def _gh_argv_error(cmd):
+        if cmd[:3] == ["gh", "pr", "ready"] and "--undo" in cmd:
+            return None
+        return FakeRunner._gh_argv_error(cmd)
+
+    def _run_locked(self, args, *, cwd, check):
+        cmd = list(args)
+        if cmd[:3] == ["gh", "pr", "ready"]:
+            cmd, cwd_path = self._record_command(args, cwd)
+            self.rest_pr["draft"] = "--undo" in cmd
+            return CommandResult(cmd, cwd_path, "", "", 0)
+        return super()._run_locked(args, cwd=cwd, check=check)
+
+
 def test_protection_assessment_distinguishes_private_free_plan_limit(tmp_path):
     runner = FakeRunner(
         pr_branch_protection_returncode=1,
@@ -495,6 +516,46 @@ def test_pr_mode_resumes_only_from_immutable_issue_draft_facts_and_mints_fresh_a
     assert contract.audit_comment_id == 17
     assert contract.intent_generation
     assert any("active_label_event_id=101" in " ".join(cmd) for cmd, _ in runner.commands)
+
+
+def test_explicit_manual_reentry_reconstructs_ready_pr_as_draft_before_labeling(tmp_path):
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    runner = ManualQualificationRunner(
+        rest_pr={"draft": False, "labels": []},
+        issue_events=[],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is not None
+    assert contract.issue_created_pr is True
+    assert contract.intent_generation
+    commands = [command for command, _cwd in runner.commands]
+    undo_index = next(index for index, command in enumerate(commands) if "--undo" in command)
+    label_index = next(
+        index for index, command in enumerate(commands)
+        if command[:5] == ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"]
+    )
+    assert undo_index < label_index
+
+
+def test_explicit_manual_reentry_fails_closed_when_ready_to_draft_transition_does_not_stick(tmp_path):
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    runner = V2ManagedRunner(rest_pr={"draft": False, "labels": []})
+
+    with pytest.raises(AgentLoopError, match="re-entry could not make"):
+        activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
 
 
 def test_pr_mode_strict_resume_does_not_require_or_write_unprotected_audit(tmp_path):
@@ -739,6 +800,126 @@ def v2_contract(**overrides):
     }
     fields.update(overrides)
     return ManagedCiContract(**fields)
+
+
+def test_publish_manual_v2_qualification_releases_label_readies_and_audits_sha(tmp_path):
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+    )
+    runner = ManualQualificationRunner(issue_events=[label_event()])
+    contract = v2_contract(
+        issue_created_pr=True,
+        active_label_event_id=101,
+        invocation_applied_label=True,
+        protection_mode="strict",
+        attached_run_id=100,
+        run_attempt=2,
+        intent_generation="generation-1",
+    )
+
+    qualified = publish_manual_v2_qualification(
+        runner,
+        config=config,
+        pr_number=7,
+        expected_head_sha="abc123",
+        contract=contract,
+        reviewers=("Codex", "Claude"),
+    )
+
+    assert qualified == "abc123"
+    commands = [command for command, _cwd in runner.commands]
+    release_index = next(
+        index for index, command in enumerate(commands)
+        if command[:5] == [
+            "gh", "api", "--method", "DELETE",
+            f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+        ]
+    )
+    ready_index = next(index for index, command in enumerate(commands) if command[:4] == ["gh", "pr", "ready", "7"])
+    assert release_index < ready_index
+    assert not any(
+        command[:5] == [
+            "gh", "api", "--method", "POST",
+            "repos/OWNER/REPO/issues/7/labels",
+        ] and QUALIFICATION_MARKER not in " ".join(command)
+        for command in commands
+    )
+    audit_commands = [command for command in commands if QUALIFICATION_MARKER in " ".join(command)]
+    assert len(audit_commands) == 1
+    assert "qualified_head=abc123" in " ".join(" ".join(command) for command in audit_commands)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command in commands)
+
+
+def test_publish_manual_v2_qualification_publishes_unprotected_residual_risk(tmp_path):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    runner = ManualQualificationRunner(
+        rest_pr={"draft": False}, issue_events=[label_event()],
+    )
+    contract = v2_contract(
+        adopted_existing_pr=True,
+        active_label_event_id=101,
+        protection_mode="voluntary",
+    )
+
+    publish_manual_v2_qualification(
+        runner,
+        config=config,
+        pr_number=7,
+        expected_head_sha="abc123",
+        contract=contract,
+        reviewers=("Codex",),
+    )
+
+    audit = next(" ".join(command) for command, _cwd in runner.commands if QUALIFICATION_MARKER in " ".join(command))
+    assert "GitHub cannot force a human or other automation" in audit
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+
+
+def test_publish_manual_v2_qualification_rejects_head_change_before_release(tmp_path, monkeypatch):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    runner = ManualQualificationRunner(issue_events=[label_event()])
+    contract = v2_contract(
+        issue_created_pr=True, active_label_event_id=101, invocation_applied_label=True,
+        protection_mode="strict",
+    )
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+
+    with pytest.raises(AgentLoopError, match="head changed before"):
+        publish_manual_v2_qualification(
+            runner,
+            config=config,
+            pr_number=7,
+            expected_head_sha="abc123",
+            contract=contract,
+            reviewers=("Codex",),
+        )
+
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+    assert not any(command[:4] == ["gh", "api", "--method", "DELETE"] for command, _cwd in runner.commands)
+
+
+def test_publish_manual_v2_qualification_rejects_head_change_after_audit(tmp_path, monkeypatch):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    runner = ManualQualificationRunner(issue_events=[label_event()])
+    contract = v2_contract(
+        issue_created_pr=True, active_label_event_id=101, invocation_applied_label=True,
+        protection_mode="strict",
+    )
+    heads = iter(("abc123", "new-head"))
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: next(heads))
+
+    with pytest.raises(AgentLoopError, match="after qualification publication"):
+        publish_manual_v2_qualification(
+            runner,
+            config=config,
+            pr_number=7,
+            expected_head_sha="abc123",
+            contract=contract,
+            reviewers=("Codex",),
+        )
+
+    assert any(QUALIFICATION_MARKER in " ".join(command) for command, _cwd in runner.commands)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
 def v2_run(
@@ -1592,6 +1773,7 @@ def test_existing_pr_adoption_reuses_trusted_label_and_revalidates(tmp_path):
     assert contract is not None
     assert contract.adopted_existing_pr is True
     assert contract.invocation_applied_label is False
+    assert contract.intent_generation is None
     assert revalidate_adopted_managed_ci(
         runner, config=config, pr_number=7, metadata=metadata(), contract=contract
     )
@@ -1702,6 +1884,40 @@ def test_v2_preflight_fails_closed_for_incomplete_markers(tmp_path):
 
     with pytest.raises(AgentLoopError, match="incomplete managed-CI v2 contract"):
         preflight_managed_ci_creation(runner, config=config, issue_number=643)
+
+
+def test_explicit_managed_mode_rejects_legacy_v1_contract(tmp_path):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    with pytest.raises(AgentLoopError, match="legacy v1"):
+        activate_managed_ci(
+            ManagedRunner(workflow=WORKFLOW), config=config, pr_number=7, metadata=metadata()
+        )
+
+
+def test_explicit_activation_release_is_terminal_and_unqualified(tmp_path):
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+    )
+    runner = V2ManagedRunner(issue_events=[])
+
+    with pytest.raises(AgentLoopError, match="did NOT qualify"):
+        _release_for_ordinary_recovery(
+            runner,
+            config=config,
+            pr_number=7,
+            base_ref="main",
+            expected_head_sha="abc123",
+            active_event=None,
+            reason="timeline unavailable",
+        )
+    assert any(
+        command[:5] == [
+            "gh", "api", "--method", "DELETE",
+            f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+        ]
+        for command, _cwd in runner.commands
+    )
 
 
 def test_v2_intent_resumes_matching_comment_and_rejects_competing_nonce(tmp_path):
