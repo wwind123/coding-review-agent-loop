@@ -390,6 +390,47 @@ with cleanup guidance. Use `agent-loop pr <number>` when the PR is known, and
 see [Issue-to-PR association and recovery](docs/local_agent_loop.md#issue-to-pr-association-and-recovery)
 for plan-hash checks and operator recovery.
 
+### Expected closing issues
+
+When one implementation PR is intended to complete more than its primary issue,
+declare the complete closing set explicitly with the repeatable
+`--expected-closing-issue POSITIVE_ID` option:
+
+```bash
+agent-loop issue 847 --repo OWNER/REPO --expected-closing-issue 848
+agent-loop pr 900 --repo OWNER/REPO \
+  --expected-closing-issue 847 --expected-closing-issue 848
+agent-loop managed-pr --repo OWNER/REPO --head fix/multi-issue --base main \
+  --title "Complete related issues" --body-file /tmp/pr-body.md \
+  --expected-closing-issue 847 --expected-closing-issue 848
+```
+
+In issue mode the primary issue is always included, and approved-plan
+`additional_closing_issue_ids` declarations are unioned with the CLI additions.
+For direct `pr` and `managed-pr`, the CLI declaration is the complete contract.
+Without authoritative metadata, direct `pr` mode does not infer a contract from
+issue mentions, `Refs`, or related links. A staged child must close the child,
+reference an unfinished parent with `Refs`, and must not include the parent in
+the expected set. Split/decomposed parent workflows reject parent-scoped
+multi-issue declarations; invoke the child with a child-scoped contract.
+
+The expected set is stored in canonical issue handoff and PR metadata and is
+reused after interruption. A PR is checked after creation and before reviewer,
+qualification, or merge handoff. Each expected issue needs its own GitHub
+closing keyword/reference pair (`Closes`, `Fixes`, or `Resolves`, including
+same-repository qualified references and canonical issue URLs); `Closes #847,
+#848` is not treated as two closures. If the body is incomplete, edit the
+existing PR description and resume with `agent-loop pr <number>`—the loop will
+not create another PR. To deliberately widen a recovered contract, repeat the
+full desired set and add `--supersede-expected-closing-contract` on `issue` or
+`pr`; narrowing, replacement, or a missing declaration requires canonical
+metadata repair before resume.
+
+Protocol comments are canonical machine metadata. A bare mention of
+`AGENT_ISSUE_PR_HANDOFF` or `AGENT_PR_EXPECTED_CLOSING_ISSUES` in normal prose
+is allowed, but a well-formed forged marker is rejected before any comment,
+handoff, sidecar, or PR-body write.
+
 Evaluate a GitHub issue without writing any code using discuss mode. Reviewers
 first evaluate independently, then debate if their outcomes disagree:
 

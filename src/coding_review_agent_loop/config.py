@@ -15,6 +15,7 @@ from pathlib import Path
 from .agents.base import AgentName
 from .agents.registry import default_agent_args
 from .errors import AgentLoopError
+from .expected_closure import normalize_issue_ids
 from .github import PullRequestMetadata, detect_repo, get_repo_default_branch
 from .logging import datetime_stamp, log
 from .runner import Runner
@@ -201,6 +202,14 @@ class AgentLoopConfig:
     # issue-created activation semantics for that first invocation.
     managed_ci_pr_mode: bool = False
     invocation_argv: tuple[str, ...] = ()
+    # Optional authoritative issue-closing declaration. ``None`` means that
+    # this invocation made no declaration; an empty tuple is explicit and is
+    # intentionally preserved for reconciliation.
+    expected_closing_issue_ids: tuple[int, ...] | None = None
+    supersede_expected_closing_contract: bool = False
+    # Internal handoff bit: issue mode has already resolved CLI/plan additions
+    # into the complete immutable contract before entering the PR loop.
+    expected_closing_contract_resolved: bool = False
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -267,6 +276,11 @@ class AgentLoopConfig:
             raise AgentLoopError("--discuss-debater-timeout must be greater than zero seconds.")
         if self.salvage_comment_patch_max_bytes <= 0:
             raise AgentLoopError("--salvage-comment-patch-max-bytes must be greater than zero.")
+        normalized_expected = normalize_issue_ids(
+            self.expected_closing_issue_ids,
+            field_name="expected_closing_issue_ids",
+        )
+        object.__setattr__(self, "expected_closing_issue_ids", normalized_expected)
 
 
 def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
@@ -1012,6 +1026,13 @@ def config_from_args(
         allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),
         managed_ci_pr_mode=getattr(args, "command", None) == "pr",
         invocation_argv=invocation_argv,
+        expected_closing_issue_ids=normalize_issue_ids(
+            getattr(args, "expected_closing_issue", None),
+            field_name="--expected-closing-issue",
+        ),
+        supersede_expected_closing_contract=getattr(
+            args, "supersede_expected_closing_contract", False
+        ),
         ci_queued_grace_seconds=getattr(args, "ci_queued_grace_seconds", 1200),
         mergeability_poll_attempts=getattr(args, "mergeability_poll_attempts", 3),
         mergeability_poll_interval_seconds=getattr(args, "mergeability_poll_interval_seconds", 5),

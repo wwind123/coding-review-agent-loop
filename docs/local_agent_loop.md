@@ -1044,6 +1044,51 @@ that PR. Removing a marker alone is sufficient when the PR has only an
 incidental mention or contextual URL: that text cannot recreate the handoff.
 `agent-loop pr <number>` remains the explicit operator path for a known PR.
 
+### Expected closing issue contracts
+
+Use the repeatable `--expected-closing-issue POSITIVE_ID` option when a single
+PR intentionally completes multiple issues. Issue mode starts with the actual
+implementation issue and unions CLI additions with the approved plan's
+`additional_closing_issue_ids`; the plan field is optional, and an explicit
+empty list is different from omission. Direct `pr` and `managed-pr` use the
+explicit CLI IDs as the complete contract. Direct `pr` without a declaration or
+recovered contract remains contract-unknown and does not infer expected issues
+from linked-issue prose, `Refs`, or related URLs.
+
+The normalized set is persisted in the schema-version-1 issue handoff and in a
+canonical PR-side `AGENT_PR_EXPECTED_CLOSING_ISSUES` record. Recovery requires
+the issue and PR records to agree, while a validated one-sided write or
+supersession crash window can be completed idempotently. Omission on a rerun
+reuses the recovered set. A changed explicit declaration must match exactly;
+`--supersede-expected-closing-contract` is available only on `issue` and `pr`,
+requires a full declaration, and permits only a proper superset. The new record
+stores its contract hash and supersession hash, so narrowing or replacement is
+not silently accepted.
+
+After PR creation, and again after every body-edit round and immediately before
+reviewer dispatch, qualification, or merge, the loop fetches the current body
+and checks every expected ID. Each ID needs its own case-insensitive GitHub
+closing keyword (`Close(s|d)`, `Fix(es|ed)`, or `Resolve(s|d)`) paired with a
+same-repository `#N`, `OWNER/REPO#N`, or canonical issue URL. A keyword does not
+carry over to later bare targets, so `Closes #847, #848` satisfies only #847.
+`Refs`, cross-repository references, incidental links, comments, and code
+examples are not affirmative closure evidence. Blockquotes and nested list
+items remain active Markdown evidence because GitHub linkifies them.
+
+Staged and materialized topology is single-PR scoped: a child contract may
+include the child and child-scoped additions, but excludes the unfinished
+parent. The body must close the child and use non-closing `Refs #<parent>`; any
+parent closing keyword is rejected. Parent-scoped additions are rejected before
+child creation, stage handoff, or coder invocation, and the operator must rerun
+the actual child with its contract.
+
+If validation reports missing IDs, edit the existing PR description so every
+listed issue has its own closing keyword/reference pair, then resume with
+`agent-loop pr <number>`. No second PR is created. The reserved marker names
+may appear in ordinary coder or reviewer prose, but only an exactly well-formed
+canonical marker is trusted; such a forged marker aborts before the first
+durable write.
+
 If `--repo` is omitted, the tool runs `gh repo view` from the current working
 directory, or from `--codex-dir` when that flag is provided, and uses the
 detected `OWNER/REPO`. Pass `--repo` explicitly when running outside the target

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from .decomposition import _decode_json_payload, _encode_json_payload
 from .errors import AgentLoopError
+from .expected_closure import normalize_issue_ids
 from .agents.registry import agent_display_name, agent_signature
 from .protocol import (
     ANY_HEADING_RE,
@@ -42,6 +43,11 @@ if TYPE_CHECKING:
     from .config import AgentLoopConfig
 
 ITEM_SUMMARY_LIMIT = 100
+PLAN_EXPECTED_CLOSING_MARKER = "AGENT_PLAN_EXPECTED_CLOSING_ISSUES"
+PLAN_EXPECTED_CLOSING_MARKER_RE = re.compile(
+    rf"<!--\s*{PLAN_EXPECTED_CLOSING_MARKER}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.IGNORECASE,
+)
 # Reverse map display-name -> agent. agent_display_name is config-independent, so
 # this is safe to build at import; the signature itself is resolved per-call via
 # agent_signature(agent, config) so it can reflect the configured model (#332).
@@ -238,6 +244,42 @@ def render_canonical_plan_steps(plan_steps: Sequence[str]) -> str:
     return "\n".join(f"{index}. {step}" for index, step in enumerate(plan_steps, start=1))
 
 
+def render_expected_closing_issue_declaration(
+    issue_ids: Sequence[int] | None,
+) -> str | None:
+    """Render an authoritative plan declaration, retaining omitted vs empty."""
+    if issue_ids is None:
+        return None
+    normalized = normalize_issue_ids(issue_ids, field_name="additional_closing_issue_ids")
+    assert normalized is not None
+    payload = {"issue_ids": list(normalized)}
+    encoded = _encode_json_payload(payload)
+    visible = ", ".join(f"#{item}" for item in normalized) or "none"
+    return "\n".join(
+        [
+            "### Additional issues completed by this implementation PR",
+            f"Only these additional same-repository issues are part of this single-PR closing contract: {visible}.",
+            "Incidental mentions, `Refs` links, related issues, staged parents, unselected stages, deferred work, and plan actions are not declarations.",
+            f"<!-- {PLAN_EXPECTED_CLOSING_MARKER}: {encoded} -->",
+        ]
+    )
+
+
+def decode_expected_closing_issue_declaration(encoded: str) -> tuple[int, ...]:
+    payload = _decode_json_payload(encoded, marker_name=PLAN_EXPECTED_CLOSING_MARKER)
+    if _encode_json_payload(payload) != encoded:
+        raise AgentLoopError(
+            f"Invalid {PLAN_EXPECTED_CLOSING_MARKER} payload: non-canonical encoding."
+        )
+    if set(payload) != {"issue_ids"}:
+        raise AgentLoopError(f"Invalid {PLAN_EXPECTED_CLOSING_MARKER} payload.")
+    normalized = normalize_issue_ids(
+        payload["issue_ids"], field_name=f"{PLAN_EXPECTED_CLOSING_MARKER}.issue_ids"
+    )
+    assert normalized is not None
+    return normalized
+
+
 def render_human_requirement_dispositions(
     dispositions: Sequence[HumanRequirementDisposition],
     *,
@@ -369,6 +411,11 @@ def render_canonical_plan_revision(
             ]
         )
     )
+    expected_section = render_expected_closing_issue_declaration(
+        parsed_revision.additional_closing_issue_ids
+    )
+    if expected_section:
+        sections.append(expected_section)
     human_section = render_human_requirement_dispositions(parsed_revision.human_requirement_dispositions)
     if human_section:
         sections.append(human_section)
@@ -670,6 +717,11 @@ def _render_public_plan_state_comment(
         parsed_plan.summary.strip(),
         "\n".join(["### Plan steps", render_canonical_plan_steps(parsed_plan.plan_steps)]),
     ]
+    expected_section = render_expected_closing_issue_declaration(
+        parsed_plan.additional_closing_issue_ids
+    )
+    if expected_section:
+        sections.append(expected_section)
     human_section = render_human_requirement_dispositions(parsed_plan.human_requirement_dispositions)
     if human_section:
         sections.append(human_section)

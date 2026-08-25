@@ -1243,11 +1243,17 @@ For a plan (rather than a clarification), respond with exactly one structured JS
   "state": "blocking",
   "summary": "<non-empty concise implementation summary>",
   "plan_steps": ["<non-empty step>"],
+  "additional_closing_issue_ids": [],
   "human_requirement_dispositions": []
 }}
 
 `plan_steps` must be a non-empty list of non-empty strings and should cover the
 intended approach, key files or areas to change, edge cases, and test strategy.
+`additional_closing_issue_ids` is optional. When present, it must be a unique
+array of positive integer issue IDs completed by this one approved implementation
+PR. Do not include ordinary mentions, `Refs` links, related issues, external
+dependencies, staged parents, unselected stages, deferred work, or plan actions.
+Absence means no declaration; an explicit empty array means no additional issue.
 When signed requirements are surfaced, the disposition array must contain every
 generated `Requirement N` exactly once; when none are surfaced, it must be empty.
 Use the optional typed `child_stages`, `external_dependencies`, `deferred_work`,
@@ -1649,13 +1655,19 @@ Use this mandatory structured JSON response format:
     "Update `src/coding_review_agent_loop/protocol.py` to hard-fail invalid structured plan payloads after JSON-prefix detection.",
     "Normalize structured plan rendering and metadata-backed resume behavior in `src/coding_review_agent_loop/orchestrator.py`.",
     "Extend prompts and targeted tests for structured planning flows."
-  ]
+  ],
+  "additional_closing_issue_ids": []
 }}
 <!-- AGENT_PLAN_STATE: blocking -->
 -- {coder_signature}
 
 The orchestrator will normalize structured plan revisions into canonical
 markdown for stored plan state, reviewer prompts, subject hashing, and resume.
+Preserve `additional_closing_issue_ids` when revising the plan. It covers only
+additional issues completed by this single implementation PR; do not infer it
+from issue mentions or PR prose, and do not add a staged parent, unselected
+stage, deferred work, or plan action. Omit it only when no declaration exists;
+use `[]` for an intentional explicit empty declaration.
 Your response must start with exactly one top-level JSON object, with no prose
 or code fences before it. If signed human requirements are present, put
 `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` and a `### Human requirements` section
