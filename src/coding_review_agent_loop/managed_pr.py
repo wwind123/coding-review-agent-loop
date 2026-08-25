@@ -15,6 +15,7 @@ from .logging import log
 from .managed_ci import (
     MANAGED_LABEL,
     UNPROTECTED_OVERRIDE_TRAILER,
+    ensure_managed_label,
     preflight_managed_ci_creation,
 )
 from .runner import CommandResult, Runner
@@ -231,6 +232,8 @@ def create_managed_pr(
         pr_number = created.get("number") if isinstance(created, dict) else None
         if not isinstance(pr_number, int) or pr_number <= 0:
             raise AgentLoopError("GitHub created a managed draft without returning a valid PR number.")
+        if not ensure_managed_label(runner, config=config):
+            raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
         _api(
             runner,
             config=config,
@@ -297,6 +300,10 @@ def create_managed_pr(
     correlated_config = replace(
         config,
         managed_ci_expected_override_nonce=intent.audit_nonce,
+        # Replaying managed-pr would hit the duplicate-PR guard for the draft
+        # just created above. Leave no original argv so a CI-watch timeout
+        # renders run_pr_loop's deterministic `agent-loop pr <n>` recovery.
+        invocation_argv=(),
     )
     log(
         config,

@@ -18,12 +18,14 @@ class ManagedPrRunner(Runner):
         self,
         *,
         label_failure: bool = False,
+        label_exists: bool = True,
         cleanup_failure: bool = False,
         existing_pulls=None,
         post_create_pulls=None,
     ):
         super().__init__()
         self.label_failure = label_failure
+        self.label_exists = label_exists
         self.cleanup_failure = cleanup_failure
         self.existing_pulls = existing_pulls or []
         self.post_create_pulls = post_create_pulls
@@ -34,6 +36,9 @@ class ManagedPrRunner(Runner):
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         cmd = [str(item) for item in args]
         self.calls.append((cmd, input_text))
+        if "--method" not in cmd:
+            assert cmd[-1] == "repos/OWNER/REPO/labels/agent-loop-managed"
+            return CommandResult(cmd, Path(cwd), "{}", "", 0 if self.label_exists else 1)
         method = cmd[cmd.index("--method") + 1]
         endpoint = cmd[cmd.index("--method") + 2]
         payload: object = {}
@@ -80,7 +85,12 @@ def _intent(*args, branch, **kwargs):
 
 def test_create_managed_pr_opens_labeled_draft_and_correlates_override(tmp_path):
     runner = ManagedPrRunner()
-    config = _config(tmp_path)
+    config = replace(
+        _config(tmp_path),
+        invocation_argv=(
+            "agent-loop", "managed-pr", "--head", "fix/direct-change", "--title", "Fix direct change",
+        ),
+    )
 
     with patch("coding_review_agent_loop.managed_pr.preflight_managed_ci_creation", _intent):
         handoff = create_managed_pr(
@@ -93,6 +103,7 @@ def test_create_managed_pr_opens_labeled_draft_and_correlates_override(tmp_path)
 
     assert handoff.pr_number == 77
     assert handoff.config.managed_ci_expected_override_nonce == "fresh-nonce"
+    assert handoff.config.invocation_argv == ()
     create_call = next(
         (cmd, body) for cmd, body in runner.calls
         if "--method" in cmd and cmd[cmd.index("--method") + 1] == "POST" and cmd[-3].endswith("/pulls")
@@ -108,6 +119,38 @@ def test_create_managed_pr_opens_labeled_draft_and_correlates_override(tmp_path)
     )
     assert label_payload == {"labels": ["agent-loop-managed"]}
     assert runner.branch_reads == 2
+
+
+def test_create_managed_pr_creates_documented_label_before_applying_it(tmp_path):
+    runner = ManagedPrRunner(label_exists=False)
+
+    with patch("coding_review_agent_loop.managed_pr.preflight_managed_ci_creation", _intent):
+        create_managed_pr(
+            runner,
+            config=_config(tmp_path),
+            source_branch="fix/missing-label",
+            title="Create label",
+            body="",
+        )
+
+    label_create_index = next(
+        index
+        for index, (cmd, _body) in enumerate(runner.calls)
+        if cmd[:4] == ["gh", "api", "--method", "POST"]
+        and cmd[4] == "repos/OWNER/REPO/labels"
+    )
+    label_apply_index = next(
+        index
+        for index, (cmd, _body) in enumerate(runner.calls)
+        if cmd[:4] == ["gh", "api", "--method", "POST"]
+        and cmd[4] == "repos/OWNER/REPO/issues/77/labels"
+    )
+    create_cmd, _ = runner.calls[label_create_index]
+    assert create_cmd[-6:] == [
+        "-f", "name=agent-loop-managed", "-f", "color=1f6feb", "-f",
+        "description=Suppress intermediate CI; agent-loop dispatches exact-head final CI",
+    ]
+    assert label_create_index < label_apply_index
 
 
 def test_create_managed_pr_refuses_existing_open_pr_before_writes(tmp_path):
@@ -145,6 +188,7 @@ def test_create_managed_pr_closes_partial_draft_when_labeling_fails(tmp_path):
     methods_and_endpoints = [
         (cmd[cmd.index("--method") + 1], cmd[cmd.index("--method") + 2])
         for cmd, _ in runner.calls
+        if "--method" in cmd
     ]
     assert ("PATCH", "repos/OWNER/REPO/pulls/77") in methods_and_endpoints
     assert any(method == "DELETE" and "/git/refs/" in endpoint for method, endpoint in methods_and_endpoints)
@@ -171,7 +215,8 @@ def test_create_managed_pr_closes_partial_draft_on_concurrent_duplicate(tmp_path
         )
 
     assert any(
-        cmd[cmd.index("--method") + 1] == "PATCH"
+        "--method" in cmd
+        and cmd[cmd.index("--method") + 1] == "PATCH"
         and cmd[cmd.index("--method") + 2].endswith("/pulls/77")
         for cmd, _ in runner.calls
     )

@@ -325,31 +325,8 @@ def activate_managed_ci(
         for label in pr_data.get("labels") or []
         if isinstance(label, dict) and isinstance(label.get("name"), str)
     }
-    label_result = runner.run(
-        [config.gh_cmd, "api", f"repos/{config.repo}/labels/{MANAGED_LABEL}"],
-        cwd=active_workdir(config),
-        check=False,
-    )
-    if label_result.returncode != 0:
-        create_result = runner.run(
-            [
-                config.gh_cmd,
-                "api",
-                "--method",
-                "POST",
-                f"repos/{config.repo}/labels",
-                "-f",
-                f"name={MANAGED_LABEL}",
-                "-f",
-                "color=1f6feb",
-                "-f",
-                "description=Suppress intermediate CI; agent-loop dispatches exact-head final CI",
-            ],
-            cwd=active_workdir(config),
-            check=False,
-        )
-        if create_result.returncode != 0:
-            raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
+    if not ensure_managed_label(runner, config=config):
+        raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
     if MANAGED_LABEL not in labels:
         prior_workflow_run_ids = _workflow_run_ids(
             runner,
@@ -1029,7 +1006,7 @@ def _activate_v2_managed_ci(
         # an already authenticated issue-created managed draft is resumable.
         if not config.managed_ci:
             return None
-        if not _ensure_managed_label(runner, config=config):
+        if not ensure_managed_label(runner, config=config):
             raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
         applied_label = runner.run(
             [
@@ -1320,7 +1297,7 @@ def _publish_adoption_guard(
     return result.returncode == 0
 
 
-def _ensure_managed_label(runner: Runner, *, config: AgentLoopConfig) -> bool:
+def ensure_managed_label(runner: Runner, *, config: AgentLoopConfig) -> bool:
     """Create the repository label only when GitHub reports it absent."""
     existing = runner.run(
         [config.gh_cmd, "api", f"repos/{config.repo}/labels/{MANAGED_LABEL}"],
@@ -1417,7 +1394,7 @@ def _activate_v2_existing_pr_adoption(
     existing = _active_managed_label_event(runner, config=config, pr_number=pr_number)
     applied = False
     if MANAGED_LABEL not in labels:
-        if not _ensure_managed_label(runner, config=config):
+        if not ensure_managed_label(runner, config=config):
             return None
         created = runner.run(
             [config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/labels",
