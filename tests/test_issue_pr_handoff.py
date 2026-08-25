@@ -45,6 +45,28 @@ def test_round_trips_approved_plan_flow_with_plan_hash():
     assert _decode_issue_pr_handoff_metadata(encoded) == metadata
 
 
+def test_round_trips_complete_expected_closing_set_and_supersession_lineage():
+    metadata = _metadata(
+        expected_closing_issue_ids=(56, 57),
+        supersedes_hash="a" * 64,
+    )
+
+    encoded = _encode_issue_pr_handoff_metadata(metadata)
+
+    assert _decode_issue_pr_handoff_metadata(encoded) == metadata
+    rendered = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="issue-implementation",
+        plan_hash=None,
+        expected_closing_issue_ids=(56, 57),
+        supersedes_hash="a" * 64,
+    )
+    assert "Expected closing issues: #56, #57." in rendered
+
+
 def test_find_latest_issue_pr_handoff_returns_newest_when_multiple_markers_present():
     older = format_issue_pr_handoff_comment(
         issue_number=56,

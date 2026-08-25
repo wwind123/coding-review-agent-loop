@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import os
@@ -22,6 +23,12 @@ from .ci_health import (
     is_wholly_infrastructure_blocked,
 )
 from .errors import AgentLoopError
+from .pr_contract import (
+    PR_EXPECTED_CLOSING_MARKER,
+    PR_EXPECTED_CLOSING_MARKER_RE,
+    decode_pr_contract,
+    encode_pr_contract,
+)
 from .logging import log
 from .round_transport import MAX_GITHUB_BODY_CHARS, prepare_round_comment
 from .protocol import parse_signed_human_requirement_body
@@ -136,6 +143,55 @@ _NON_CLOSING_ISSUE_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_AGENT_ISSUE_PR_HANDOFF_MARKER_RE = re.compile(
+    r"<!--\s*AGENT_ISSUE_PR_HANDOFF:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.IGNORECASE,
+)
+
+
+def affirmative_markdown_view(body: str | None) -> str:
+    """Return active Markdown text that can count as affirmative issue evidence.
+
+    GitHub does not interpret code samples, inline code, or HTML comments as
+    closing instructions. List items are classified before indentation so a
+    nested list item remains active evidence, and blockquotes remain active
+    because GitHub linkifies their references.
+    """
+    if not body:
+        return ""
+    text = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    output: list[str] = []
+    fenced = False
+    fence_char = ""
+    fence_length = 0
+    list_line_re = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
+    for line in text.splitlines():
+        stripped = line.lstrip(" \t")
+        fence = re.match(r"(`{3,}|~{3,})", stripped)
+        if fence:
+            token = fence.group(1)
+            if not fenced:
+                fenced = True
+                fence_char = token[0]
+                fence_length = len(token)
+            elif (
+                token[0] == fence_char
+                and len(token) >= fence_length
+                and not stripped[len(token) :].strip()
+            ):
+                fenced = False
+            continue
+        if fenced:
+            continue
+        is_list_item = bool(list_line_re.match(line))
+        if (line.startswith("    ") or line.startswith("\t")) and not is_list_item:
+            continue
+        # Inline code spans are non-rendered code, even when they are inside a
+        # list item or blockquote. Preserve surrounding prose and references.
+        line = re.sub(r"(`+)(.+?)\1", "", line)
+        output.append(line)
+    return "\n".join(output)
+
 
 @dataclass(frozen=True)
 class IssueReferenceEvidence:
@@ -207,6 +263,7 @@ def parse_issue_reference_evidence(
     *,
     repo: str,
     include_non_closing: bool = True,
+    affirmative: bool = True,
 ) -> tuple[IssueReferenceEvidence, ...]:
     """Parse closing and, optionally, explicit ``Refs`` issue evidence.
 
@@ -216,12 +273,13 @@ def parse_issue_reference_evidence(
     """
     if not body:
         return ()
+    searchable_body = affirmative_markdown_view(body) if affirmative else body
     matches: list[tuple[int, IssueReferenceEvidence]] = [
         (
             match.start(),
             _issue_reference_evidence_from_match(match, closing=True, default_repo=repo),
         )
-        for match in _CLOSING_ISSUE_REFERENCE_RE.finditer(body)
+        for match in _CLOSING_ISSUE_REFERENCE_RE.finditer(searchable_body)
     ]
     if include_non_closing:
         matches.extend(
@@ -229,7 +287,7 @@ def parse_issue_reference_evidence(
                 match.start(),
                 _issue_reference_evidence_from_match(match, closing=False, default_repo=repo),
             )
-            for match in _NON_CLOSING_ISSUE_REFERENCE_RE.finditer(body)
+            for match in _NON_CLOSING_ISSUE_REFERENCE_RE.finditer(searchable_body)
         )
     return tuple(evidence for _position, evidence in sorted(matches, key=lambda item: item[0]))
 
@@ -242,6 +300,22 @@ def parse_strong_issue_reference_evidence(
     return tuple(
         evidence
         for evidence in parse_issue_reference_evidence(body, repo=repo, include_non_closing=False)
+        if evidence.closing
+        and evidence.target_repo.casefold() == normalized_repo
+        and evidence.issue_number == issue_number
+    )
+
+
+def parse_raw_strong_issue_reference_evidence(
+    body: str | None, *, repo: str, issue_number: int
+) -> tuple[IssueReferenceEvidence, ...]:
+    """Return raw-body closing evidence for fail-closed safety prohibitions."""
+    normalized_repo = repo.casefold()
+    return tuple(
+        evidence
+        for evidence in parse_issue_reference_evidence(
+            body, repo=repo, include_non_closing=False, affirmative=False
+        )
         if evidence.closing
         and evidence.target_repo.casefold() == normalized_repo
         and evidence.issue_number == issue_number
@@ -398,10 +472,11 @@ def validate_pr_references_issue(
     pr_number: int,
     issue_number: int,
     staged_parent_issue: int | None = None,
+    body: str | None = None,
 ) -> None:
     if config.dry_run:
         return
-    body = _get_pr_body(runner, config=config, pr_number=pr_number)
+    body = _get_pr_body(runner, config=config, pr_number=pr_number) if body is None else body
     strong_evidence = parse_strong_issue_reference_evidence(
         body, repo=config.repo, issue_number=issue_number
     )
@@ -418,6 +493,50 @@ def validate_pr_references_issue(
         f"`agent-loop pr {pr_number}` to continue the review. Bare `#{issue_number}`, `Refs`, "
         "issue URLs used as context, and branch names are not implementation evidence."
     )
+
+
+def missing_expected_closing_issue_ids(
+    body: str | None,
+    *,
+    repo: str,
+    expected_issue_ids: Sequence[int],
+) -> tuple[int, ...]:
+    """Return expected IDs without their own affirmative closing pair."""
+    observed = {
+        evidence.issue_number
+        for evidence in parse_issue_reference_evidence(
+            body, repo=repo, include_non_closing=False, affirmative=True
+        )
+        if evidence.closing and evidence.target_repo.casefold() == repo.casefold()
+    }
+    return tuple(sorted(set(expected_issue_ids) - observed))
+
+
+def validate_pr_expected_closing_issues(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    expected_issue_ids: Sequence[int],
+    body: str | None = None,
+) -> tuple[int, ...]:
+    """Validate a known contract against one freshly fetched PR body."""
+    if config.dry_run:
+        return ()
+    current_body = _get_pr_body(runner, config=config, pr_number=pr_number) if body is None else body
+    missing = missing_expected_closing_issue_ids(
+        current_body, repo=config.repo, expected_issue_ids=expected_issue_ids
+    )
+    if missing:
+        rendered = ", ".join(f"#{issue}" for issue in missing)
+        expected = ", ".join(f"#{issue}" for issue in sorted(set(expected_issue_ids))) or "(none)"
+        raise AgentLoopError(
+            f"PR #{pr_number} is missing affirmative closing references for expected issue(s): {rendered}. "
+            f"The immutable expected set is {{{expected}}}. Edit the existing PR description so every "
+            "listed issue has its own `Closes`, `Fixes`, or `Resolves` keyword/reference pair, then "
+            f"resume with `agent-loop pr {pr_number}`; do not create another PR."
+        )
+    return missing
 
 
 def _get_pr_body(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> str:
@@ -443,7 +562,7 @@ def _get_pr_body(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> 
 def _validate_staged_parent_reference(
     body: str, *, config: AgentLoopConfig, pr_number: int, parent_issue: int
 ) -> None:
-    if parse_strong_issue_reference_evidence(
+    if parse_raw_strong_issue_reference_evidence(
         body, repo=config.repo, issue_number=parent_issue
     ):
         raise AgentLoopError(
@@ -476,7 +595,7 @@ def validate_pr_body_does_not_close_issue(
     `validate_pr_references_issue`.
     """
     body = _get_pr_body(runner, config=config, pr_number=pr_number)
-    if not parse_strong_issue_reference_evidence(
+    if not parse_raw_strong_issue_reference_evidence(
         body, repo=config.repo, issue_number=issue_number
     ):
         return
@@ -1217,6 +1336,7 @@ def post_pr_comment(
     pr_number: int,
     body: str,
 ) -> None:
+    reject_forged_protocol_markers(body)
     bodies = prepare_round_comment(body)
     if len(bodies) > 1:
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to PR #{pr_number}")
@@ -1232,12 +1352,143 @@ def post_issue_comment(
     issue_number: int,
     body: str,
 ) -> None:
+    reject_forged_protocol_markers(body)
     bodies = prepare_round_comment(body)
     if len(bodies) > 1:
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to issue #{issue_number}")
     log(config, f"Posting agent output to issue #{issue_number}")
     for prepared in bodies:
         _post_comment_body(runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared)
+
+
+def reject_forged_protocol_markers(body: str) -> None:
+    """Reject only well-formed reserved metadata markers in untrusted prose."""
+    if _AGENT_ISSUE_PR_HANDOFF_MARKER_RE.search(body) or PR_EXPECTED_CLOSING_MARKER_RE.search(body):
+        raise AgentLoopError(
+            "Ordinary agent-authored comments may not contain a well-formed reserved "
+            "handoff or expected-closing protocol marker. Remove the marker from the "
+            "prose; a bare marker name is allowed."
+        )
+
+
+def _post_trusted_protocol_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    command: list[str],
+    body: str,
+) -> None:
+    """Post canonical protocol output after validating its marker encoding."""
+    _post_comment_body(runner, config=config, command=command, body=body)
+
+
+def _validate_canonical_json_marker_payload(
+    body: str,
+    *,
+    marker_re: re.Pattern[str],
+    marker_name: str,
+) -> None:
+    matches = tuple(marker_re.finditer(body))
+    if not matches:
+        raise AgentLoopError(
+            f"Trusted {marker_name} posting requires its canonical protocol marker."
+        )
+    for match in matches:
+        encoded = match.group("payload")
+        try:
+            value = json.loads(
+                base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8")
+            )
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise AgentLoopError(f"Trusted {marker_name} payload is not valid JSON.") from exc
+        canonical = base64.urlsafe_b64encode(
+            json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).decode("ascii")
+        if canonical != encoded:
+            raise AgentLoopError(f"Trusted {marker_name} payload is not canonically encoded.")
+
+
+def post_trusted_pr_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    body: str,
+) -> None:
+    matches = tuple(PR_EXPECTED_CLOSING_MARKER_RE.finditer(body))
+    if not matches:
+        raise AgentLoopError(
+            f"Trusted PR protocol posting requires {PR_EXPECTED_CLOSING_MARKER}."
+        )
+    for match in matches:
+        encoded = match.group("payload")
+        contract = decode_pr_contract(encoded)
+        if encode_pr_contract(contract) != encoded:
+            raise AgentLoopError(
+                f"Trusted {PR_EXPECTED_CLOSING_MARKER} payload is not canonically encoded."
+            )
+    _post_trusted_protocol_comment(
+        runner, config=config, command=["pr", "comment", str(pr_number)], body=body
+    )
+
+
+def post_trusted_pr_contract_record(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    body: str,
+) -> None:
+    """Create a canonical PR contract record before issue-origin handoff."""
+    matches = tuple(PR_EXPECTED_CLOSING_MARKER_RE.finditer(body))
+    if not matches:
+        raise AgentLoopError(
+            f"Trusted PR protocol posting requires {PR_EXPECTED_CLOSING_MARKER}."
+        )
+    for match in matches:
+        encoded = match.group("payload")
+        contract = decode_pr_contract(encoded)
+        if encode_pr_contract(contract) != encoded:
+            raise AgentLoopError(
+                f"Trusted {PR_EXPECTED_CLOSING_MARKER} payload is not canonically encoded."
+            )
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "api",
+            f"repos/{config.repo}/issues/{pr_number}/comments",
+            "--method",
+            "POST",
+            "--input",
+            "-",
+        ],
+        cwd=active_workdir(config),
+        input_text=json.dumps({"body": body}),
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise AgentLoopError(
+            f"Unable to persist the expected-closing PR contract for PR #{pr_number}."
+            + (f" {detail}" if detail else "")
+        )
+
+
+def post_trusted_issue_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    body: str,
+) -> None:
+    _validate_canonical_json_marker_payload(
+        body,
+        marker_re=_AGENT_ISSUE_PR_HANDOFF_MARKER_RE,
+        marker_name="AGENT_ISSUE_PR_HANDOFF",
+    )
+    _post_trusted_protocol_comment(
+        runner, config=config, command=["issue", "comment", str(issue_number)], body=body
+    )
 
 
 def _post_comment_body(runner: Runner, *, config: AgentLoopConfig, command: list[str], body: str) -> None:

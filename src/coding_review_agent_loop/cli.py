@@ -525,6 +525,21 @@ def build_parser() -> argparse.ArgumentParser:
     issue = subparsers.add_parser("issue", help="Ask the coder to fix an issue, then review it.")
     issue.add_argument("issue_number", type=int)
     issue.add_argument(
+        "--expected-closing-issue",
+        action="append",
+        type=int,
+        metavar="POSITIVE_ID",
+        help=(
+            "Additional issue ID that this single implementation PR is authoritative to close. "
+            "Repeatable; values are sorted and deduplicated."
+        ),
+    )
+    issue.add_argument(
+        "--supersede-expected-closing-contract",
+        action="store_true",
+        help="Explicitly widen a recovered expected-closing contract with a proper superset.",
+    )
+    issue.add_argument(
         "--plan-first",
         action="store_true",
         help=(
@@ -597,6 +612,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     pr = subparsers.add_parser("pr", help="Run the reviewer/coder loop on an existing PR.")
     pr.add_argument("pr_number", type=int)
+    pr.add_argument(
+        "--expected-closing-issue",
+        action="append",
+        type=int,
+        metavar="POSITIVE_ID",
+        help="Complete expected-closing issue set for this existing PR; repeatable.",
+    )
+    pr.add_argument(
+        "--supersede-expected-closing-contract",
+        action="store_true",
+        help="Explicitly widen a recovered expected-closing contract with a proper superset.",
+    )
     add_common(pr)
     pr.add_argument(
         "--managed-ci",
@@ -642,6 +669,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Read the pull-request body from this file (use '-' for stdin; default: empty).",
+    )
+    managed_pr.add_argument(
+        "--expected-closing-issue",
+        action="append",
+        type=int,
+        metavar="POSITIVE_ID",
+        help="Complete expected-closing issue set for this managed PR; repeatable.",
     )
     add_common(managed_pr)
     managed_pr.add_argument(
@@ -848,6 +882,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if args.command != "issue" and implementation_override_requested:
             raise AgentLoopError("--implementation-coder options are only supported with issue --plan-first.")
+        if getattr(args, "supersede_expected_closing_contract", False):
+            if args.command not in {"issue", "pr"}:
+                raise AgentLoopError(
+                    "--supersede-expected-closing-contract is only supported with `agent-loop issue` or `agent-loop pr`."
+                )
+            if getattr(args, "expected_closing_issue", None) is None:
+                raise AgentLoopError(
+                    "--supersede-expected-closing-contract requires an explicit full "
+                    "--expected-closing-issue declaration."
+                )
         if getattr(args, "managed_ci_adopt_existing_pr", False):
             if args.command != "pr":
                 raise AgentLoopError("--managed-ci-adopt-existing-pr is only supported with `agent-loop pr <n>`.")

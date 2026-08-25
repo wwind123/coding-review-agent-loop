@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 from .config import AgentLoopConfig
 from .errors import AgentLoopError
+from .expected_closure import contract_hash, normalize_issue_ids
 from .github import (
     IssueContext,
     OpenPrClosingMatch,
@@ -29,7 +30,9 @@ from .github import (
     get_pr_state,
     get_pr_review_context,
     post_issue_comment,
+    post_trusted_issue_comment,
 )
+from .pr_contract import PrExpectedClosingContract, find_latest_pr_contract
 from .runner import Runner
 
 SCHEMA_VERSION = 1
@@ -50,6 +53,35 @@ class IssuePrHandoffMetadata:
     pr_head_sha: str
     flow: str
     plan_hash: str | None
+    expected_closing_issue_ids: tuple[int, ...] = ()
+    contract_hash: str | None = None
+    supersedes_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        # Handoff records are issue-origin records, so the primary issue is
+        # always part of their contract. Preserve compatibility with callers
+        # that construct the pre-contract dataclass without the new fields.
+        if (
+            not self.expected_closing_issue_ids
+            and isinstance(self.issue_number, int)
+            and not isinstance(self.issue_number, bool)
+            and self.issue_number > 0
+        ):
+            object.__setattr__(self, "expected_closing_issue_ids", (self.issue_number,))
+        if not self.expected_closing_issue_ids:
+            return
+        normalized = normalize_issue_ids(
+            self.expected_closing_issue_ids,
+            field_name="expected_closing_issue_ids",
+        )
+        assert normalized is not None
+        if self.issue_number not in normalized:
+            raise AgentLoopError(
+                f"Issue handoff contract must retain primary issue #{self.issue_number}."
+            )
+        object.__setattr__(self, "expected_closing_issue_ids", normalized)
+        if self.contract_hash is None:
+            object.__setattr__(self, "contract_hash", contract_hash(normalized))
 
 
 @dataclass(frozen=True)
@@ -86,7 +118,7 @@ def _encode_json_payload(payload: dict[str, object]) -> str:
 def _decode_json_payload(encoded: str) -> dict[str, object]:
     try:
         payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
-    except (ValueError, json.JSONDecodeError) as exc:
+    except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
         raise AgentLoopError("Invalid AGENT_ISSUE_PR_HANDOFF payload.") from exc
     if not isinstance(payload, dict):
         raise AgentLoopError("Invalid AGENT_ISSUE_PR_HANDOFF payload.")
@@ -103,6 +135,9 @@ def _encode_issue_pr_handoff_metadata(metadata: IssuePrHandoffMetadata) -> str:
             "pr_head_sha": metadata.pr_head_sha,
             "flow": metadata.flow,
             "plan_hash": metadata.plan_hash,
+            "expected_closing_issue_ids": list(metadata.expected_closing_issue_ids),
+            "contract_hash": metadata.contract_hash,
+            "supersedes_hash": metadata.supersedes_hash,
         }
     )
 
@@ -163,6 +198,37 @@ def _decode_issue_pr_handoff_metadata(encoded: str) -> IssuePrHandoffMetadata:
             "Invalid AGENT_ISSUE_PR_HANDOFF payload: `plan_hash` must be absent for "
             "issue-implementation flow."
         )
+    raw_expected = payload.get("expected_closing_issue_ids")
+    if raw_expected is None:
+        expected_ids = (issue_number,)
+    else:
+        expected_ids = normalize_issue_ids(
+            raw_expected, field_name="AGENT_ISSUE_PR_HANDOFF.expected_closing_issue_ids"
+        )
+        assert expected_ids is not None
+        if issue_number not in expected_ids:
+            raise AgentLoopError(
+                "Invalid AGENT_ISSUE_PR_HANDOFF payload: expected closing IDs must retain "
+                f"the primary issue #{issue_number}."
+            )
+    raw_contract_hash = payload.get("contract_hash")
+    expected_contract_hash = contract_hash(expected_ids)
+    if raw_contract_hash is None:
+        handoff_contract_hash = expected_contract_hash
+    elif isinstance(raw_contract_hash, str) and raw_contract_hash == expected_contract_hash:
+        handoff_contract_hash = raw_contract_hash
+    else:
+        raise AgentLoopError(
+            "Invalid AGENT_ISSUE_PR_HANDOFF payload: `contract_hash` does not match "
+            "expected_closing_issue_ids."
+        )
+    supersedes_hash = payload.get("supersedes_hash")
+    if supersedes_hash is not None and (
+        not isinstance(supersedes_hash, str) or not supersedes_hash.strip()
+    ):
+        raise AgentLoopError(
+            "Invalid AGENT_ISSUE_PR_HANDOFF payload: `supersedes_hash` is invalid."
+        )
     return IssuePrHandoffMetadata(
         schema_version=schema_version,
         issue_number=issue_number,
@@ -171,6 +237,9 @@ def _decode_issue_pr_handoff_metadata(encoded: str) -> IssuePrHandoffMetadata:
         pr_head_sha=pr_head_sha,
         flow=str(flow),
         plan_hash=plan_hash if isinstance(plan_hash, str) else None,
+        expected_closing_issue_ids=expected_ids,
+        contract_hash=handoff_contract_hash,
+        supersedes_hash=supersedes_hash if isinstance(supersedes_hash, str) else None,
     )
 
 
@@ -199,10 +268,38 @@ def find_latest_issue_pr_handoff(
         if not isinstance(body, str):
             continue
         for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(body):
-            metadata = _decode_issue_pr_handoff_metadata(match.group("payload"))
+            encoded = match.group("payload")
+            metadata = _decode_issue_pr_handoff_metadata(encoded)
+            canonical_encoded = _encode_issue_pr_handoff_metadata(metadata)
+            if canonical_encoded != encoded:
+                legacy_keys = {
+                    "schema_version",
+                    "issue_number",
+                    "pr_number",
+                    "pr_url",
+                    "pr_head_sha",
+                    "flow",
+                    "plan_hash",
+                }
+                payload = _decode_json_payload(encoded)
+                if set(payload) != legacy_keys:
+                    raise AgentLoopError(
+                        "AGENT_ISSUE_PR_HANDOFF record is not canonically encoded."
+                    )
             if metadata.issue_number != issue_number:
                 continue
             _validate_issue_pr_handoff_url(metadata.pr_url, repo=repo, pr_number=metadata.pr_number)
+            if found is not None and found.pr_number == metadata.pr_number and found != metadata:
+                if (
+                    metadata.supersedes_hash == found.contract_hash
+                    and set(found.expected_closing_issue_ids) < set(metadata.expected_closing_issue_ids)
+                ):
+                    found = metadata
+                    continue
+                raise AgentLoopError(
+                    "Divergent AGENT_ISSUE_PR_HANDOFF records were found for "
+                    f"issue #{issue_number}."
+                )
             found = metadata
     return found
 
@@ -247,6 +344,29 @@ def resolve_canonical_pr_for_issue(
                 raise AgentLoopError(
                     f"recorded URL {canonical.pr_url!r} does not match GitHub URL "
                     f"{actual.url!r}"
+                )
+            pr_contract = find_latest_pr_contract(
+                pr_context.comments,
+                repository=config.repo,
+                pr_number=canonical.pr_number,
+            )
+            if pr_contract is not None and tuple(pr_contract.expected_closing_issue_ids) != tuple(
+                canonical.expected_closing_issue_ids
+            ):
+                raise AgentLoopError(
+                    "issue-side and PR-side expected closing contracts diverge: "
+                    f"issue side {canonical.expected_closing_issue_ids!r}, PR side "
+                    f"{pr_contract.expected_closing_issue_ids!r}."
+                )
+            if pr_contract is not None and (
+                pr_contract.primary_issue_number != canonical.issue_number
+                or pr_contract.origin_flow != canonical.flow
+                or pr_contract.contract_hash != canonical.contract_hash
+                or pr_contract.supersedes_hash != canonical.supersedes_hash
+            ):
+                raise AgentLoopError(
+                    "issue-side and PR-side expected closing contract metadata diverge: "
+                    "primary issue, origin flow, hash, or supersession lineage differs."
                 )
             state = get_pr_state(runner, config=config, pr_number=canonical.pr_number)
         except AgentLoopError as exc:
@@ -303,7 +423,18 @@ def format_issue_pr_handoff_comment(
     pr_head_sha: str,
     flow: str,
     plan_hash: str | None,
+    expected_closing_issue_ids: Sequence[int] | None = None,
+    supersedes_hash: str | None = None,
 ) -> str:
+    expected_ids = normalize_issue_ids(
+        expected_closing_issue_ids or (issue_number,),
+        field_name="expected_closing_issue_ids",
+    )
+    assert expected_ids is not None
+    if issue_number not in expected_ids:
+        raise AgentLoopError(
+            f"Issue handoff contract must retain primary issue #{issue_number}."
+        )
     metadata = IssuePrHandoffMetadata(
         schema_version=SCHEMA_VERSION,
         issue_number=issue_number,
@@ -312,7 +443,13 @@ def format_issue_pr_handoff_comment(
         pr_head_sha=pr_head_sha,
         flow=flow,
         plan_hash=plan_hash,
+        expected_closing_issue_ids=expected_ids,
+        contract_hash=contract_hash(expected_ids),
+        supersedes_hash=supersedes_hash,
     )
+    encoded_metadata = _encode_issue_pr_handoff_metadata(metadata)
+    if _encode_issue_pr_handoff_metadata(_decode_issue_pr_handoff_metadata(encoded_metadata)) != encoded_metadata:
+        raise AgentLoopError("Issue-to-PR handoff failed canonical rendering validation.")
     lines = [
         f"Issue #{issue_number} implementation handed off to PR #{pr_number}.",
         "",
@@ -322,13 +459,18 @@ def format_issue_pr_handoff_comment(
     ]
     if plan_hash:
         lines.append(f"Plan hash: {plan_hash}")
+    lines.append(
+        "Expected closing issues: "
+        + (", ".join(f"#{item}" for item in expected_ids) or "(none)")
+        + "."
+    )
     lines.extend(
         [
             "",
             "Reruns of `agent-loop issue` for this issue will resume review of this PR instead of "
             "invoking a coder again.",
             "",
-            f"<!-- AGENT_ISSUE_PR_HANDOFF: {_encode_issue_pr_handoff_metadata(metadata)} -->",
+            f"<!-- AGENT_ISSUE_PR_HANDOFF: {encoded_metadata} -->",
             "-- coding-review-agent-loop",
         ]
     )
@@ -345,8 +487,10 @@ def post_issue_pr_handoff_comment(
     pr_head_sha: str,
     flow: str,
     plan_hash: str | None,
+    expected_closing_issue_ids: Sequence[int] | None = None,
+    supersedes_hash: str | None = None,
 ) -> None:
-    post_issue_comment(
+    post_trusted_issue_comment(
         runner,
         config=config,
         issue_number=issue_number,
@@ -357,5 +501,7 @@ def post_issue_pr_handoff_comment(
             pr_head_sha=pr_head_sha,
             flow=flow,
             plan_hash=plan_hash,
+            expected_closing_issue_ids=expected_closing_issue_ids,
+            supersedes_hash=supersedes_hash,
         ),
     )

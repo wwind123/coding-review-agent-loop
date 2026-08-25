@@ -50,6 +50,12 @@ from .errors import (
     QuotaResetExceededError,
     UnknownPriorItemDispositionError,
 )
+from .expected_closure import (
+    ExpectedClosingContract,
+    reject_parent_from_contract,
+    resolve_direct_contract,
+    resolve_issue_contract,
+)
 from .github import (
     CiWatchOutcome,
     IssueContext,
@@ -65,17 +71,30 @@ from .github import (
     merge_pr,
     post_issue_comment,
     post_pr_comment,
+    post_trusted_pr_contract_record,
+    post_trusted_pr_comment,
+    reject_forged_protocol_markers,
     validate_open_issue,
     validate_open_pr,
     validate_pr_body_does_not_close_issue,
+    validate_pr_expected_closing_issues,
     validate_pr_references_issue,
     wait_for_ci,
     watch_pr_checks,
 )
 from .issue_pr_handoff import (
+    find_latest_issue_pr_handoff,
     post_issue_pr_handoff_comment,
     require_pr_metadata_for_handoff,
     resolve_canonical_pr_for_issue,
+)
+from .pr_contract import (
+    PR_EXPECTED_CLOSING_MARKER_RE,
+    PrExpectedClosingContract,
+    find_latest_pr_contract,
+    format_pr_contract_comment,
+    make_pr_contract,
+    render_pr_contract_marker,
 )
 from .split_materialization import (
     DISCUSS_SPLIT_MARKER_RE,
@@ -274,6 +293,8 @@ from .comment_rendering import (
     render_agent_unavailable_comment,
     render_canonical_plan_revision,
     render_canonical_plan_steps,
+    PLAN_EXPECTED_CLOSING_MARKER_RE,
+    decode_expected_closing_issue_declaration,
     _render_discuss_agenda_lines,
 )
 from .followups import (
@@ -348,6 +369,14 @@ from .unresolved_items import (
     _validate_review_response,
     _validate_structured_coder_followup_items,
 )
+
+
+def _embed_pr_contract_marker(body: str, contract: PrExpectedClosingContract) -> str:
+    marker = render_pr_contract_marker(contract)
+    if "\n-- " in body:
+        prefix, signature = body.rsplit("\n-- ", 1)
+        return f"{prefix}\n{marker}\n-- {signature}"
+    return f"{body.rstrip()}\n{marker}"
 
 
 # TRANSIENT_AGENT_OUTPUT_RE / NON_RETRYABLE_AGENT_OUTPUT_RE / is_transient_agent_output
@@ -3483,6 +3512,23 @@ def _extract_current_deferred_stages(current_plan: str) -> tuple[DeferredStage, 
     return tuple(stages)
 
 
+def _extract_current_expected_closing_issue_ids(
+    current_plan: str,
+) -> tuple[int, ...] | None:
+    """Recover the optional plan declaration from JSON or canonical Markdown."""
+    for validator in (validate_structured_plan_state, validate_structured_plan_revision):
+        try:
+            structured = validator(current_plan)
+        except AgentLoopError:
+            structured = None
+        if structured is not None:
+            return structured.additional_closing_issue_ids
+    marker = PLAN_EXPECTED_CLOSING_MARKER_RE.search(current_plan)
+    if marker is None:
+        return None
+    return decode_expected_closing_issue_declaration(marker.group("payload"))
+
+
 def _extract_current_child_stages(current_plan: str) -> tuple[ChildStage, ...]:
     """Return only explicitly typed child stages; legacy entries are record-only."""
     try:
@@ -3849,6 +3895,7 @@ def _implement_approved_issue(
     coder_name = agent_display_name(implementation_config.coder)
     implementation_session_id = coder_session_id if reuse_planning_session else None
     plan_hash = approved_plan_hash(approved_plan)
+    plan_additions = _extract_current_expected_closing_issue_ids(approved_plan)
 
     # A prior implementation attempt may have created a PR and then aborted
     # before recording any handoff marker/comment (e.g. the #493 test-report
@@ -3858,6 +3905,24 @@ def _implement_approved_issue(
     # (#495, #589).
     resolved_pr = resolve_canonical_pr_for_issue(
         runner, config=config, issue_number=issue_number, issue_context=issue_context
+    )
+    recovered_contract_ids = (
+        resolved_pr.metadata.expected_closing_issue_ids
+        if resolved_pr is not None and resolved_pr.metadata is not None
+        else (issue_number,) if resolved_pr is not None else None
+    )
+    closing_contract = resolve_issue_contract(
+        primary_issue=issue_number,
+        cli_additions=config.expected_closing_issue_ids,
+        plan_additions=plan_additions,
+        recovered=recovered_contract_ids,
+        supersede=config.supersede_expected_closing_contract,
+    )
+    reject_parent_from_contract(closing_contract, parent_issue=staged_parent_issue)
+    implementation_config = dataclasses_replace(
+        implementation_config,
+        expected_closing_issue_ids=closing_contract.issue_ids,
+        expected_closing_contract_resolved=True,
     )
     if resolved_pr is not None:
         existing_pr_number = resolved_pr.pr_number
@@ -3893,6 +3958,27 @@ def _implement_approved_issue(
             )
         if resolved_pr.source == "legacy-closing-reference":
             pr_url, pr_head_sha = require_pr_metadata_for_handoff(resumed_pr_context.metadata)
+            validate_pr_expected_closing_issues(
+                runner,
+                config=implementation_config,
+                pr_number=existing_pr_number,
+                expected_issue_ids=closing_contract.issue_ids,
+                body=resumed_pr_context.metadata.body,
+            )
+            pr_contract = make_pr_contract(
+                repository=implementation_config.repo,
+                pr_number=existing_pr_number,
+                origin_flow="approved-plan-implementation",
+                primary_issue_number=issue_number,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+                supersedes_hash=closing_contract.supersedes_hash,
+            )
+            post_trusted_pr_comment(
+                runner,
+                config=implementation_config,
+                pr_number=existing_pr_number,
+                body=format_pr_contract_comment(pr_contract),
+            )
             post_issue_pr_handoff_comment(
                 runner,
                 config=implementation_config,
@@ -3902,6 +3988,8 @@ def _implement_approved_issue(
                 pr_head_sha=pr_head_sha,
                 flow="approved-plan-implementation",
                 plan_hash=plan_hash,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+                supersedes_hash=closing_contract.supersedes_hash,
             )
         if one_shot_parent_issue is not None:
             post_one_shot_impl_handoff_comment(
@@ -4004,15 +4092,38 @@ def _implement_approved_issue(
     )
     log(config, f"{coder_name} reported PR #{pr_number}; validating it is open")
     validate_open_pr(runner, config=implementation_config, pr_number=pr_number)
+    initial_pr_context = get_pr_review_context(runner, config=implementation_config, pr_number=pr_number)
+    reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
     validate_pr_references_issue(
         runner,
         config=implementation_config,
         pr_number=pr_number,
         issue_number=issue_number,
         staged_parent_issue=staged_parent_issue,
+        body=initial_pr_context.metadata.body,
     )
-    initial_pr_context = get_pr_review_context(runner, config=implementation_config, pr_number=pr_number)
+    validate_pr_expected_closing_issues(
+        runner,
+        config=implementation_config,
+        pr_number=pr_number,
+        expected_issue_ids=closing_contract.issue_ids,
+        body=initial_pr_context.metadata.body,
+    )
     initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_context.metadata)
+    pr_contract = make_pr_contract(
+        repository=implementation_config.repo,
+        pr_number=pr_number,
+        origin_flow="approved-plan-implementation",
+        primary_issue_number=issue_number,
+        expected_closing_issue_ids=closing_contract.issue_ids,
+        supersedes_hash=closing_contract.supersedes_hash,
+    )
+    post_trusted_pr_contract_record(
+        runner,
+        config=implementation_config,
+        pr_number=pr_number,
+        body=format_pr_contract_comment(pr_contract),
+    )
     post_issue_pr_handoff_comment(
         runner,
         config=implementation_config,
@@ -4022,6 +4133,8 @@ def _implement_approved_issue(
         pr_head_sha=initial_pr_head_sha,
         flow="approved-plan-implementation",
         plan_hash=plan_hash,
+        expected_closing_issue_ids=closing_contract.issue_ids,
+        supersedes_hash=closing_contract.supersedes_hash,
     )
     if one_shot_parent_issue is not None:
         post_one_shot_impl_handoff_comment(
@@ -4034,29 +4147,30 @@ def _implement_approved_issue(
             pr_number=pr_number,
             pr_head_sha=initial_pr_context.metadata.head_sha,
         )
-    post_pr_comment(
+    initial_coder_body = _attach_round_metadata(
+        normalize_freeform_signature(
+            coder_output,
+            agent=implementation_config.coder,
+            config=implementation_config,
+            model_used=coder_response.model_used,
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="coder",
+            agent=coder_name,
+            round_number=1,
+            subject=str(initial_pr_context.metadata.head_sha or "unknown"),
+            prior_items=(),
+            model_used=coder_response.model_used,
+            acquisition_outcome=coder_response.acquisition_outcome,
+            acquisition_returncode=coder_response.acquisition_returncode,
+        ),
+    )
+    post_trusted_pr_comment(
         runner,
         config=implementation_config,
         pr_number=pr_number,
-        body=_attach_round_metadata(
-            normalize_freeform_signature(
-                coder_output,
-                agent=implementation_config.coder,
-                config=implementation_config,
-                model_used=coder_response.model_used,
-            ),
-            PostedRoundMetadata(
-                flow="pr",
-                role="coder",
-                agent=coder_name,
-                round_number=1,
-                subject=str(initial_pr_context.metadata.head_sha or "unknown"),
-                prior_items=(),
-                model_used=coder_response.model_used,
-                acquisition_outcome=coder_response.acquisition_outcome,
-                acquisition_returncode=coder_response.acquisition_returncode,
-            ),
-        ),
+        body=_embed_pr_contract_marker(initial_coder_body, pr_contract),
     )
     if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
         implementation_config = dataclasses_replace(
@@ -4926,6 +5040,19 @@ def _run_plan_first_loop(
             mode = config.plan_execution_mode
             if implement_after_approval:
                 mode = "implement-one-shot"
+            plan_additions = _extract_current_expected_closing_issue_ids(current_plan)
+            split_topology = bool(
+                mode in {"decompose-only", "implement-by-phase"}
+                or config.materialize_split_issues
+                or _extract_current_child_stages(current_plan)
+                or _extract_current_deferred_stages(current_plan)
+            )
+            if split_topology and (config.expected_closing_issue_ids is not None or plan_additions is not None):
+                raise AgentLoopError(
+                    "Additional expected closing issue IDs are single-PR-only and cannot be "
+                    "carried through split/decomposition materialization. Invoke the actual "
+                    "child issue with a child-scoped --expected-closing-issue declaration."
+                )
             _publish_plan_approved_followups(
                 runner,
                 config=config,
@@ -5391,6 +5518,7 @@ def run_issue_loop(
         staged_parent_issue = _infer_staged_parent_issue(issue_context)
 
         recovered_plan_hash: str | None = None
+        recovered_plan_additions: tuple[int, ...] | None = None
         if plan_first:
             # This is a comment-only reconstruction.  It must happen before
             # memory preparation or any agent invocation so an existing
@@ -5400,6 +5528,9 @@ def run_issue_loop(
             )
             if recovered_plan_state is not None:
                 recovered_plan_hash = approved_plan_hash(recovered_plan_state[0])
+                recovered_plan_additions = _extract_current_expected_closing_issue_ids(
+                    recovered_plan_state[0]
+                )
 
         # Resolve the canonical AGENT_ISSUE_PR_HANDOFF record (or, failing
         # that, the legacy exactly-one-open-PR search) before invoking a
@@ -5410,6 +5541,23 @@ def run_issue_loop(
             runner, config=config, issue_number=issue_number, issue_context=issue_context
         )
         if resolved_pr is not None:
+            closing_contract = resolve_issue_contract(
+                primary_issue=issue_number,
+                cli_additions=config.expected_closing_issue_ids,
+                plan_additions=recovered_plan_additions,
+                recovered=(
+                    resolved_pr.metadata.expected_closing_issue_ids
+                    if resolved_pr.metadata is not None
+                    else (issue_number,)
+                ),
+                supersede=config.supersede_expected_closing_contract,
+            )
+            reject_parent_from_contract(closing_contract, parent_issue=staged_parent_issue)
+            config = dataclasses_replace(
+                config,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+                expected_closing_contract_resolved=True,
+            )
             resolved_metadata = resolved_pr.metadata
             if plan_first and resolved_pr.source == "canonical" and resolved_metadata is not None:
                 if (
@@ -5457,7 +5605,32 @@ def run_issue_loop(
                 )
             if resolved_pr.source == "legacy-closing-reference":
                 pr_context = get_pr_review_context(runner, config=config, pr_number=resolved_pr.pr_number)
+                validate_pr_expected_closing_issues(
+                    runner,
+                    config=config,
+                    pr_number=resolved_pr.pr_number,
+                    expected_issue_ids=closing_contract.issue_ids,
+                    body=pr_context.metadata.body,
+                )
                 pr_url, pr_head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
+                pr_contract = make_pr_contract(
+                    repository=config.repo,
+                    pr_number=resolved_pr.pr_number,
+                    origin_flow=(
+                        "approved-plan-implementation"
+                        if plan_first and recovered_plan_hash is not None
+                        else "issue-implementation"
+                    ),
+                    primary_issue_number=issue_number,
+                    expected_closing_issue_ids=closing_contract.issue_ids,
+                    supersedes_hash=closing_contract.supersedes_hash,
+                )
+                post_trusted_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=resolved_pr.pr_number,
+                    body=format_pr_contract_comment(pr_contract),
+                )
                 post_issue_pr_handoff_comment(
                     runner,
                     config=config,
@@ -5471,6 +5644,8 @@ def run_issue_loop(
                         else "issue-implementation"
                     ),
                     plan_hash=recovered_plan_hash if plan_first else None,
+                    expected_closing_issue_ids=closing_contract.issue_ids,
+                    supersedes_hash=closing_contract.supersedes_hash,
                 )
             return run_pr_loop(
                 runner,
@@ -5491,6 +5666,20 @@ def run_issue_loop(
                 implement_after_approval=implement_after_approval,
                 usage_context=usage_context,
             )
+
+        closing_contract = resolve_issue_contract(
+            primary_issue=issue_number,
+            cli_additions=config.expected_closing_issue_ids,
+            plan_additions=None,
+            recovered=None,
+            supersede=config.supersede_expected_closing_contract,
+        )
+        reject_parent_from_contract(closing_contract, parent_issue=staged_parent_issue)
+        config = dataclasses_replace(
+            config,
+            expected_closing_issue_ids=closing_contract.issue_ids,
+            expected_closing_contract_resolved=True,
+        )
 
         sync_coder_base_before_implementation(config, runner)
         managed_ci_creation_intent = None
@@ -5575,15 +5764,38 @@ def run_issue_loop(
         )
         log(config, f"{agent_display_name(config.coder)} reported PR #{pr_number}; validating it is open")
         validate_open_pr(runner, config=config, pr_number=pr_number)
+        initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+        reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        initial_pr_metadata = initial_pr_context.metadata
         validate_pr_references_issue(
             runner,
             config=config,
             pr_number=pr_number,
             issue_number=issue_number,
             staged_parent_issue=staged_parent_issue,
+            body=initial_pr_metadata.body,
         )
-        initial_pr_metadata = get_pr_review_context(runner, config=config, pr_number=pr_number).metadata
+        validate_pr_expected_closing_issues(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            expected_issue_ids=closing_contract.issue_ids,
+            body=initial_pr_metadata.body,
+        )
         initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_metadata)
+        pr_contract = make_pr_contract(
+            repository=config.repo,
+            pr_number=pr_number,
+            origin_flow="issue-implementation",
+            primary_issue_number=issue_number,
+            expected_closing_issue_ids=closing_contract.issue_ids,
+        )
+        post_trusted_pr_contract_record(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            body=format_pr_contract_comment(pr_contract),
+        )
         post_issue_pr_handoff_comment(
             runner,
             config=config,
@@ -5593,25 +5805,32 @@ def run_issue_loop(
             pr_head_sha=initial_pr_head_sha,
             flow="issue-implementation",
             plan_hash=None,
+            expected_closing_issue_ids=closing_contract.issue_ids,
         )
-        post_pr_comment(
+        initial_coder_body = _attach_round_metadata(
+            normalize_freeform_signature(
+                coder_output,
+                agent=config.coder,
+                config=config,
+                model_used=coder_response.model_used,
+            ),
+            PostedRoundMetadata(
+                flow="pr",
+                role="coder",
+                agent=agent_display_name(config.coder),
+                round_number=1,
+                subject=str(initial_pr_metadata.head_sha or "unknown"),
+                prior_items=(),
+                model_used=coder_response.model_used,
+                acquisition_outcome=coder_response.acquisition_outcome,
+                acquisition_returncode=coder_response.acquisition_returncode,
+            ),
+        )
+        post_trusted_pr_comment(
             runner,
             config=config,
             pr_number=pr_number,
-            body=_attach_round_metadata(
-                normalize_freeform_signature(coder_output, agent=config.coder, config=config, model_used=coder_response.model_used),
-                PostedRoundMetadata(
-                    flow="pr",
-                    role="coder",
-                    agent=agent_display_name(config.coder),
-                    round_number=1,
-                    subject=str(initial_pr_metadata.head_sha or "unknown"),
-                    prior_items=(),
-                    model_used=coder_response.model_used,
-                    acquisition_outcome=coder_response.acquisition_outcome,
-                    acquisition_returncode=coder_response.acquisition_returncode,
-                ),
-            ),
+            body=_embed_pr_contract_marker(initial_coder_body, pr_contract),
         )
         if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
             config = dataclasses_replace(
@@ -5919,6 +6138,128 @@ def run_pr_loop(
             pr_number=pr_number,
             cwd=bootstrap_cwd,
         )
+        reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        recorded_pr_contract = find_latest_pr_contract(
+            initial_pr_context.comments,
+            repository=config.repo,
+            pr_number=pr_number,
+        )
+        if config.expected_closing_contract_resolved:
+            assert config.expected_closing_issue_ids is not None
+            closing_contract = make_pr_contract(
+                repository=config.repo,
+                pr_number=pr_number,
+                origin_flow=(
+                    recorded_pr_contract.origin_flow
+                    if recorded_pr_contract is not None
+                    else (
+                        config.pr_origin_flow
+                        if issue_context is None
+                        else "issue-implementation"
+                    )
+                ),
+                primary_issue_number=(
+                    recorded_pr_contract.primary_issue_number
+                    if recorded_pr_contract is not None
+                    else None if issue_context is None else issue_context.number
+                ),
+                expected_closing_issue_ids=config.expected_closing_issue_ids,
+                supersedes_hash=(
+                    recorded_pr_contract.supersedes_hash
+                    if recorded_pr_contract is not None
+                    else None
+                ),
+            )
+            if recorded_pr_contract is not None and tuple(
+                recorded_pr_contract.expected_closing_issue_ids
+            ) != tuple(closing_contract.expected_closing_issue_ids):
+                closing_contract = resolve_direct_contract(
+                    explicit=closing_contract.expected_closing_issue_ids,
+                    recovered=recorded_pr_contract.expected_closing_issue_ids,
+                    supersede=config.supersede_expected_closing_contract,
+                )
+                assert closing_contract is not None
+                closing_contract = make_pr_contract(
+                    repository=config.repo,
+                    pr_number=pr_number,
+                    origin_flow=recorded_pr_contract.origin_flow,
+                    primary_issue_number=recorded_pr_contract.primary_issue_number,
+                    expected_closing_issue_ids=closing_contract.issue_ids,
+                    supersedes_hash=closing_contract.supersedes_hash,
+                )
+        else:
+            resolved_contract = resolve_direct_contract(
+                explicit=config.expected_closing_issue_ids,
+                recovered=(
+                    recorded_pr_contract.expected_closing_issue_ids
+                    if recorded_pr_contract is not None
+                    else None
+                ),
+                supersede=config.supersede_expected_closing_contract,
+            )
+            closing_contract = (
+                None
+                if resolved_contract is None
+                else make_pr_contract(
+                    repository=config.repo,
+                    pr_number=pr_number,
+                    origin_flow=(
+                        recorded_pr_contract.origin_flow
+                        if recorded_pr_contract is not None
+                        else (
+                            config.pr_origin_flow
+                            if issue_context is None
+                            else "issue-implementation"
+                        )
+                    ),
+                    primary_issue_number=(
+                        recorded_pr_contract.primary_issue_number
+                        if recorded_pr_contract is not None
+                        else None if issue_context is None else issue_context.number
+                    ),
+                    expected_closing_issue_ids=resolved_contract.issue_ids,
+                    supersedes_hash=(
+                        recorded_pr_contract.supersedes_hash
+                        if recorded_pr_contract is not None
+                        and tuple(resolved_contract.issue_ids)
+                        == tuple(recorded_pr_contract.expected_closing_issue_ids)
+                        else resolved_contract.supersedes_hash
+                    ),
+                )
+            )
+        if issue_context is not None and recorded_pr_contract is None and config.expected_closing_contract_resolved:
+            # A pre-contract canonical handoff is a legacy recovery record. Do
+            # not retroactively turn its old Refs-only body into a new durable
+            # contract; only newly persisted PR-side records activate the gate.
+            log(
+                config,
+                f"PR #{pr_number}: no PR-side expected-closing record found; retaining legacy "
+                "handoff recovery without inferring a contract from prose",
+            )
+            closing_contract = None
+        contract_needs_persisting = (
+            closing_contract is not None
+            and (recorded_pr_contract is None or recorded_pr_contract != closing_contract)
+        )
+        issue_handoff_to_update = None
+        if issue_context is not None and recorded_pr_contract is not None:
+            issue_handoff_to_update = find_latest_issue_pr_handoff(
+                issue_context.comments,
+                issue_number=issue_context.number,
+                repo=config.repo,
+            )
+            if (
+                contract_needs_persisting
+                and recorded_pr_contract.origin_flow
+                in {"issue-implementation", "approved-plan-implementation"}
+                and issue_handoff_to_update is not None
+                and tuple(issue_handoff_to_update.expected_closing_issue_ids)
+                != tuple(recorded_pr_contract.expected_closing_issue_ids)
+            ):
+                raise AgentLoopError(
+                    "Issue-side and PR-side expected closing contracts disagree before "
+                    "supersession; no durable metadata changed."
+                )
         if issue_context is None:
             linked_issue_numbers = parse_linked_issue_numbers(
                 initial_pr_context.metadata.body,
@@ -5943,6 +6284,29 @@ def run_pr_loop(
                 )
             else:
                 log(config, f"PR #{pr_number} has no linked issue context to include in review prompts")
+        if (
+            closing_contract is not None
+            and contract_needs_persisting
+            and recorded_pr_contract is not None
+            and recorded_pr_contract.origin_flow
+            in {"issue-implementation", "approved-plan-implementation"}
+            and issue_context is not None
+            and issue_handoff_to_update is None
+        ):
+            issue_handoff_to_update = find_latest_issue_pr_handoff(
+                issue_context.comments,
+                issue_number=issue_context.number,
+                repo=config.repo,
+            )
+            if (
+                issue_handoff_to_update is not None
+                and tuple(issue_handoff_to_update.expected_closing_issue_ids)
+                != tuple(recorded_pr_contract.expected_closing_issue_ids)
+            ):
+                raise AgentLoopError(
+                    "Issue-side and PR-side expected closing contracts disagree before "
+                    "supersession; no durable metadata changed."
+                )
         config = resolve_base_branch(
             config,
             runner,
@@ -5955,6 +6319,47 @@ def run_pr_loop(
             _ensure_parallel_reviewer_workdirs(config, flag_name="--review-parallel", role_label="reviewer")
         log(config, f"Validating PR #{pr_number}")
         validate_open_pr(runner, config=config, pr_number=pr_number)
+        if closing_contract is not None:
+            validate_pr_expected_closing_issues(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                expected_issue_ids=closing_contract.expected_closing_issue_ids,
+                body=initial_pr_context.metadata.body,
+            )
+            if contract_needs_persisting:
+                post_trusted_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=format_pr_contract_comment(closing_contract),
+                )
+            if (
+                contract_needs_persisting
+                and recorded_pr_contract is not None
+                and recorded_pr_contract.origin_flow
+                in {"issue-implementation", "approved-plan-implementation"}
+                and issue_context is not None
+                and issue_handoff_to_update is not None
+            ):
+                if issue_context.number != recorded_pr_contract.primary_issue_number:
+                    raise AgentLoopError(
+                        "The linked issue context does not match the issue-origin PR contract; "
+                        "resume with the authoritative issue or PR metadata."
+                    )
+                pr_url, pr_head_sha = require_pr_metadata_for_handoff(initial_pr_context.metadata)
+                post_issue_pr_handoff_comment(
+                    runner,
+                    config=config,
+                    issue_number=issue_context.number,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    pr_head_sha=pr_head_sha,
+                    flow=recorded_pr_contract.origin_flow,
+                    plan_hash=issue_handoff_to_update.plan_hash,
+                    expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
+                    supersedes_hash=closing_contract.supersedes_hash,
+                )
         activation = activate_managed_ci(
             runner,
             config=config,
@@ -6074,6 +6479,14 @@ def run_pr_loop(
             initial_pr_context = pr_context
             pr_metadata = pr_context.metadata
             pr_comments = pr_context.comments
+            if closing_contract is not None:
+                validate_pr_expected_closing_issues(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    expected_issue_ids=closing_contract.expected_closing_issue_ids,
+                    body=pr_metadata.body,
+                )
             if managed_ci_active(pr_metadata) and pre_review_tests_passed and pr_metadata.head_sha:
                 publish_round_readiness(
                     runner,

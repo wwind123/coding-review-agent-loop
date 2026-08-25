@@ -12,6 +12,7 @@ from urllib.parse import quote
 from .config import AgentLoopConfig
 from .errors import AgentLoopError
 from .logging import log
+from .github import reject_forged_protocol_markers
 from .managed_ci import (
     MANAGED_LABEL,
     UNPROTECTED_OVERRIDE_TRAILER,
@@ -139,6 +140,7 @@ def create_managed_pr(
         raise AgentLoopError("--head must name a same-repository branch, without `refs/` or an owner prefix.")
     if not title:
         raise AgentLoopError("--title cannot be empty.")
+    reject_forged_protocol_markers(body)
     if SOURCE_MARKER in body or UNPROTECTED_OVERRIDE_TRAILER in body:
         raise AgentLoopError("The supplied PR body contains a reserved managed-PR protocol marker.")
     if not config.base:
@@ -300,6 +302,7 @@ def create_managed_pr(
     correlated_config = replace(
         config,
         managed_ci_expected_override_nonce=intent.audit_nonce,
+        pr_origin_flow="managed-pr",
         # Replaying managed-pr would hit the duplicate-PR guard for the draft
         # just created above. Leave no original argv so a CI-watch timeout
         # renders run_pr_loop's deterministic `agent-loop pr <n>` recovery.

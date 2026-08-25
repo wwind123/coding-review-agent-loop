@@ -283,6 +283,9 @@ class StructuredPlanRevision:
     summary: str
     prior_plan_item_dispositions: tuple[ReviewItemDisposition, ...]
     plan_steps: tuple[str, ...]
+    # None means the plan made no declaration. An empty tuple is an explicit
+    # declaration that the single PR completes no additional issues.
+    additional_closing_issue_ids: tuple[int, ...] | None = None
     deferred_stages: tuple[DeferredStage, ...] = ()
     typed_stages: TypedPlanStages = TypedPlanStages()
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
@@ -295,6 +298,9 @@ class StructuredPlanState:
     state: str
     summary: str
     plan_steps: tuple[str, ...]
+    # Presence is preserved so an explicit empty declaration cannot be confused
+    # with an omitted declaration during contract reconciliation.
+    additional_closing_issue_ids: tuple[int, ...] | None = None
     deferred_stages: tuple[DeferredStage, ...] = ()
     typed_stages: TypedPlanStages = TypedPlanStages()
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
@@ -943,6 +949,29 @@ def _expect_optional_string_list(
         item_context=item_context,
         min_length=min_length,
     )
+
+
+def _expect_optional_issue_id_list(
+    payload: dict[str, object],
+    field_name: str,
+    *,
+    context: str,
+) -> tuple[int, ...] | None:
+    if field_name not in payload:
+        return None
+    value = payload[field_name]
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    ids: set[int] = set()
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise AgentLoopError(
+                f"{context} item at index {index} must be a unique positive integer (not a bool)."
+            )
+        if item in ids:
+            raise AgentLoopError(f"{context} contains duplicate issue ID #{item}.")
+        ids.add(item)
+    return tuple(sorted(ids))
 
 
 def _expect_deferred_stage_list(
@@ -1933,6 +1962,7 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
             "plan_steps",
         },
         optional={
+            "additional_closing_issue_ids",
             "deferred_stages",
             "child_stages",
             "external_dependencies",
@@ -1958,6 +1988,11 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
         item_context="plan_revision.plan_steps",
         min_length=1,
     )
+    additional_closing_issue_ids = _expect_optional_issue_id_list(
+        payload,
+        "additional_closing_issue_ids",
+        context="plan_revision.additional_closing_issue_ids",
+    )
     deferred_stages = _expect_deferred_stage_list(
         payload, "deferred_stages", context="plan_revision.deferred_stages"
     )
@@ -1972,6 +2007,7 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
         summary=summary,
         prior_plan_item_dispositions=dispositions,
         plan_steps=plan_steps,
+        additional_closing_issue_ids=additional_closing_issue_ids,
         deferred_stages=deferred_stages,
         typed_stages=_expect_typed_plan_stages(payload, context="plan_revision"),
         human_requirement_dispositions=human_requirement_dispositions,
@@ -1991,6 +2027,7 @@ def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
         context="plan_state",
         required={"schema_version", "kind", "state", "summary", "plan_steps"},
         optional={
+            "additional_closing_issue_ids",
             "deferred_stages",
             "child_stages",
             "external_dependencies",
@@ -2012,6 +2049,11 @@ def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
             context="plan_state.plan_steps",
             item_context="plan_state.plan_steps",
             min_length=1,
+        ),
+        additional_closing_issue_ids=_expect_optional_issue_id_list(
+            payload,
+            "additional_closing_issue_ids",
+            context="plan_state.additional_closing_issue_ids",
         ),
         deferred_stages=_expect_deferred_stage_list(
             payload, "deferred_stages", context="plan_state.deferred_stages"

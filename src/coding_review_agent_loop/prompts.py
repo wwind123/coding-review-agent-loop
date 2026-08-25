@@ -1111,16 +1111,42 @@ def _issue_human_requirements_prompt_context(
     )
 
 
-def _issue_pr_reference_guidance(issue_number: int) -> str:
+def _expected_closing_issue_ids(
+    issue_number: int, expected_closing_issue_ids: Sequence[int] | None
+) -> tuple[int, ...]:
+    ids = tuple(sorted(set(expected_closing_issue_ids or (issue_number,))))
+    return ids or (issue_number,)
+
+
+def _issue_pr_reference_guidance(
+    issue_number: int, *, expected_closing_issue_ids: Sequence[int] | None = None
+) -> str:
+    expected_ids = _expected_closing_issue_ids(issue_number, expected_closing_issue_ids)
+    if len(expected_ids) == 1:
+        issue_id = expected_ids[0]
+        return (
+            f"In the pull request body, include a GitHub closing phrase targeting issue "
+            f"#{issue_id}: use `Fixes #{issue_id}`, `Closes #{issue_id}`, or "
+            f"`Resolves #{issue_id}`. A bare `#{issue_id}`, `Refs` reference, contextual "
+            "issue URL, title, or branch name is not sufficient implementation evidence.\n"
+        )
+    else:
+        issue_text = "every expected issue"
+        examples = ", ".join(f"`Closes #{issue_id}`" for issue_id in expected_ids)
     return (
-        f"In the pull request body, include a GitHub closing phrase targeting issue "
-        f"#{issue_number}: use `Fixes #{issue_number}`, `Closes #{issue_number}`, or "
-        f"`Resolves #{issue_number}`. A bare `#{issue_number}`, `Refs` reference, contextual "
+        f"In the pull request body, include a separate GitHub closing phrase/reference pair "
+        f"for {issue_text}: use {examples}. A single keyword/reference pair must not be "
+        "shared across multiple issues. A bare issue reference, `Refs` reference, contextual "
         "issue URL, title, or branch name is not sufficient implementation evidence.\n"
     )
 
 
-def _staged_issue_pr_reference_guidance(issue_number: int, *, staged_parent_issue: int) -> str:
+def _staged_issue_pr_reference_guidance(
+    issue_number: int,
+    *,
+    staged_parent_issue: int,
+    expected_closing_issue_ids: Sequence[int] | None = None,
+) -> str:
     """PR-reference guidance for a staged implementation (#476).
 
     Used when `issue_number` is one split/deferred stage of `staged_parent_issue`
@@ -1128,11 +1154,13 @@ def _staged_issue_pr_reference_guidance(issue_number: int, *, staged_parent_issu
     stage issue, and must NOT use a closing keyword against the parent, or the
     parent would auto-close while the other stages are still outstanding.
     """
+    expected_ids = _expected_closing_issue_ids(issue_number, expected_closing_issue_ids)
+    closing_pairs = ", ".join(f"`Closes #{issue_id}`" for issue_id in expected_ids)
     return (
         f"This PR implements one stage (#{issue_number}) split out of parent issue "
         f"#{staged_parent_issue}; other stages may remain unfiled or unimplemented. In the pull "
-        f"request body, include a GitHub closing phrase targeting only the child issue "
-        f"(for example `Closes #{issue_number}`), plus the explicit non-closing reference "
+        f"request body, include a separate GitHub closing phrase/reference pair for every "
+        f"expected child/additional issue ({closing_pairs}), plus the explicit non-closing reference "
         f"`Refs #{staged_parent_issue}`. Do NOT use a closing keyword "
         f"(Fixes/Closes/Resolves) against #{staged_parent_issue} — that would auto-close the "
         "parent while other stages remain outstanding.\n"
@@ -1192,9 +1220,16 @@ def build_issue_prompt(
         full_omission_fallback="Fetch the issue discussion directly before implementing.",
     )
     pr_reference_guidance = (
-        _staged_issue_pr_reference_guidance(issue_number, staged_parent_issue=staged_parent_issue)
+        _staged_issue_pr_reference_guidance(
+            issue_number,
+            staged_parent_issue=staged_parent_issue,
+            expected_closing_issue_ids=config.expected_closing_issue_ids,
+        )
         if staged_parent_issue is not None
-        else _issue_pr_reference_guidance(issue_number)
+        else _issue_pr_reference_guidance(
+            issue_number,
+            expected_closing_issue_ids=config.expected_closing_issue_ids,
+        )
     )
     managed_creation_guidance = _managed_ci_creation_guidance(managed_ci_creation_intent)
     return f"""Fix GitHub issue #{issue_number} in {config.repo}.
@@ -1243,11 +1278,17 @@ For a plan (rather than a clarification), respond with exactly one structured JS
   "state": "blocking",
   "summary": "<non-empty concise implementation summary>",
   "plan_steps": ["<non-empty step>"],
+  "additional_closing_issue_ids": [],
   "human_requirement_dispositions": []
 }}
 
 `plan_steps` must be a non-empty list of non-empty strings and should cover the
 intended approach, key files or areas to change, edge cases, and test strategy.
+`additional_closing_issue_ids` is optional. When present, it must be a unique
+array of positive integer issue IDs completed by this one approved implementation
+PR. Do not include ordinary mentions, `Refs` links, related issues, external
+dependencies, staged parents, unselected stages, deferred work, or plan actions.
+Absence means no declaration; an explicit empty array means no additional issue.
 When signed requirements are surfaced, the disposition array must contain every
 generated `Requirement N` exactly once; when none are surfaced, it must be empty.
 Use the optional typed `child_stages`, `external_dependencies`, `deferred_work`,
@@ -1649,13 +1690,19 @@ Use this mandatory structured JSON response format:
     "Update `src/coding_review_agent_loop/protocol.py` to hard-fail invalid structured plan payloads after JSON-prefix detection.",
     "Normalize structured plan rendering and metadata-backed resume behavior in `src/coding_review_agent_loop/orchestrator.py`.",
     "Extend prompts and targeted tests for structured planning flows."
-  ]
+  ],
+  "additional_closing_issue_ids": []
 }}
 <!-- AGENT_PLAN_STATE: blocking -->
 -- {coder_signature}
 
 The orchestrator will normalize structured plan revisions into canonical
 markdown for stored plan state, reviewer prompts, subject hashing, and resume.
+Preserve `additional_closing_issue_ids` when revising the plan. It covers only
+additional issues completed by this single implementation PR; do not infer it
+from issue mentions or PR prose, and do not add a staged parent, unselected
+stage, deferred work, or plan action. Omit it only when no declaration exists;
+use `[]` for an intentional explicit empty declaration.
 Your response must start with exactly one top-level JSON object, with no prose
 or code fences before it. If signed human requirements are present, put
 `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` and a `### Human requirements` section
@@ -1763,9 +1810,16 @@ def build_issue_implementation_prompt(
         full_omission_fallback="Fetch the issue discussion directly before implementing.",
     )
     pr_reference_guidance = (
-        _staged_issue_pr_reference_guidance(issue_number, staged_parent_issue=staged_parent_issue)
+        _staged_issue_pr_reference_guidance(
+            issue_number,
+            staged_parent_issue=staged_parent_issue,
+            expected_closing_issue_ids=config.expected_closing_issue_ids,
+        )
         if staged_parent_issue is not None
-        else _issue_pr_reference_guidance(issue_number)
+        else _issue_pr_reference_guidance(
+            issue_number,
+            expected_closing_issue_ids=config.expected_closing_issue_ids,
+        )
     )
     managed_creation_guidance = _managed_ci_creation_guidance(managed_ci_creation_intent)
     return f"""Implement the approved plan for GitHub issue #{issue_number} in {config.repo}.
