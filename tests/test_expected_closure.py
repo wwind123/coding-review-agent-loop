@@ -13,6 +13,7 @@ from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.expected_closure import (
     contract_hash,
     make_contract,
+    normalize_issue_ids,
     reject_parent_from_contract,
     reconcile_contracts,
     resolve_direct_contract,
@@ -88,6 +89,11 @@ def test_recovered_contract_is_reused_or_requires_monotonic_supersession():
 def test_direct_pr_without_metadata_does_not_infer_contract_from_prose():
     assert resolve_direct_contract(explicit=None, recovered=None) is None
     assert resolve_direct_contract(explicit=[]) is not None
+
+
+def test_normalize_issue_ids_rejects_non_iterable_values_as_agent_loop_errors():
+    with pytest.raises(AgentLoopError, match="expected_closing_issue_ids must be an iterable"):
+        normalize_issue_ids(847)
 
 
 @pytest.mark.parametrize(

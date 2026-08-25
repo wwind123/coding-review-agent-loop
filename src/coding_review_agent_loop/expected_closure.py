@@ -18,8 +18,12 @@ def normalize_issue_ids(
     """Normalize an optional issue-id declaration without treating bool as int."""
     if value is None:
         return None
+    try:
+        iterator = iter(value)
+    except TypeError as exc:
+        raise AgentLoopError(f"{field_name} must be an iterable of issue IDs.") from exc
     result: set[int] = set()
-    for index, raw in enumerate(value):
+    for index, raw in enumerate(iterator):
         if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
             raise AgentLoopError(
                 f"{field_name} item at index {index} must be a positive integer (not a bool)."
