@@ -103,6 +103,7 @@ def test_create_managed_pr_opens_labeled_draft_and_correlates_override(tmp_path)
 
     assert handoff.pr_number == 77
     assert handoff.config.managed_ci_expected_override_nonce == "fresh-nonce"
+    assert handoff.config.pr_origin_flow == "managed-pr"
     assert handoff.config.invocation_argv == ()
     create_call = next(
         (cmd, body) for cmd, body in runner.calls

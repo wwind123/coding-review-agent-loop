@@ -210,6 +210,9 @@ class AgentLoopConfig:
     # Internal handoff bit: issue mode has already resolved CLI/plan additions
     # into the complete immutable contract before entering the PR loop.
     expected_closing_contract_resolved: bool = False
+    # Origin for a contract created by the public direct/managed PR entry point.
+    # Issue-origin handoffs select their own flow when a linked issue exists.
+    pr_origin_flow: str = "direct-pr"
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -281,6 +284,8 @@ class AgentLoopConfig:
             field_name="expected_closing_issue_ids",
         )
         object.__setattr__(self, "expected_closing_issue_ids", normalized_expected)
+        if self.pr_origin_flow not in {"direct-pr", "managed-pr"}:
+            raise AgentLoopError("pr_origin_flow must be 'direct-pr' or 'managed-pr'.")
 
 
 def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:

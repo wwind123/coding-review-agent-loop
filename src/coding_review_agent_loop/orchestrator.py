@@ -90,6 +90,7 @@ from .issue_pr_handoff import (
 )
 from .pr_contract import (
     PR_EXPECTED_CLOSING_MARKER_RE,
+    PrExpectedClosingContract,
     find_latest_pr_contract,
     format_pr_contract_comment,
     make_pr_contract,
@@ -342,14 +343,6 @@ from .round_state import (
     _serialize_unresolved_item,
     _strip_round_metadata,
 )
-
-
-def _embed_pr_contract_marker(body: str, contract) -> str:
-    marker = render_pr_contract_marker(contract)
-    if "\n-- " in body:
-        prefix, signature = body.rsplit("\n-- ", 1)
-        return f"{prefix}\n{marker}\n-- {signature}"
-    return f"{body.rstrip()}\n{marker}"
 from .round_transport import is_round_transport_sidecar
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
@@ -376,6 +369,14 @@ from .unresolved_items import (
     _validate_review_response,
     _validate_structured_coder_followup_items,
 )
+
+
+def _embed_pr_contract_marker(body: str, contract: PrExpectedClosingContract) -> str:
+    marker = render_pr_contract_marker(contract)
+    if "\n-- " in body:
+        prefix, signature = body.rsplit("\n-- ", 1)
+        return f"{prefix}\n{marker}\n-- {signature}"
+    return f"{body.rstrip()}\n{marker}"
 
 
 # TRANSIENT_AGENT_OUTPUT_RE / NON_RETRYABLE_AGENT_OUTPUT_RE / is_transient_agent_output
@@ -5622,6 +5623,7 @@ def run_issue_loop(
                     ),
                     primary_issue_number=issue_number,
                     expected_closing_issue_ids=closing_contract.issue_ids,
+                    supersedes_hash=closing_contract.supersedes_hash,
                 )
                 post_trusted_pr_comment(
                     runner,
@@ -5643,6 +5645,7 @@ def run_issue_loop(
                     ),
                     plan_hash=recovered_plan_hash if plan_first else None,
                     expected_closing_issue_ids=closing_contract.issue_ids,
+                    supersedes_hash=closing_contract.supersedes_hash,
                 )
             return run_pr_loop(
                 runner,
@@ -6149,7 +6152,11 @@ def run_pr_loop(
                 origin_flow=(
                     recorded_pr_contract.origin_flow
                     if recorded_pr_contract is not None
-                    else ("direct-pr" if issue_context is None else "issue-implementation")
+                    else (
+                        config.pr_origin_flow
+                        if issue_context is None
+                        else "issue-implementation"
+                    )
                 ),
                 primary_issue_number=(
                     recorded_pr_contract.primary_issue_number
@@ -6199,7 +6206,11 @@ def run_pr_loop(
                     origin_flow=(
                         recorded_pr_contract.origin_flow
                         if recorded_pr_contract is not None
-                        else ("direct-pr" if issue_context is None else "issue-implementation")
+                        else (
+                            config.pr_origin_flow
+                            if issue_context is None
+                            else "issue-implementation"
+                        )
                     ),
                     primary_issue_number=(
                         recorded_pr_contract.primary_issue_number
@@ -6207,7 +6218,13 @@ def run_pr_loop(
                         else None if issue_context is None else issue_context.number
                     ),
                     expected_closing_issue_ids=resolved_contract.issue_ids,
-                    supersedes_hash=resolved_contract.supersedes_hash,
+                    supersedes_hash=(
+                        recorded_pr_contract.supersedes_hash
+                        if recorded_pr_contract is not None
+                        and tuple(resolved_contract.issue_ids)
+                        == tuple(recorded_pr_contract.expected_closing_issue_ids)
+                        else resolved_contract.supersedes_hash
+                    ),
                 )
             )
         if issue_context is not None and recorded_pr_contract is None and config.expected_closing_contract_resolved:
@@ -6281,6 +6298,15 @@ def run_pr_loop(
                 issue_number=issue_context.number,
                 repo=config.repo,
             )
+            if (
+                issue_handoff_to_update is not None
+                and tuple(issue_handoff_to_update.expected_closing_issue_ids)
+                != tuple(recorded_pr_contract.expected_closing_issue_ids)
+            ):
+                raise AgentLoopError(
+                    "Issue-side and PR-side expected closing contracts disagree before "
+                    "supersession; no durable metadata changed."
+                )
         config = resolve_base_branch(
             config,
             runner,

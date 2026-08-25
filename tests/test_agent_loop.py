@@ -109,6 +109,164 @@ def test_pre_review_tests_can_be_disabled(tmp_path):
     assert commands.count(["pytest", "tests/test_agent_loop.py"]) == 1
 
 
+def test_issue_mode_passes_complete_expected_closing_set_to_coder(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[
+            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #56\nFixes #847"},
+    )
+    config = make_config(tmp_path, expected_closing_issue_ids=(847,))
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "separate GitHub closing phrase/reference pair" in coder_prompt
+    assert "Closes #847" in coder_prompt
+
+
+def test_approved_plan_additional_closing_issue_reaches_implementation_flow(tmp_path):
+    plan_output = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "plan_state",
+                "state": "blocking",
+                "summary": "Implement the change.",
+                "plan_steps": ["Implement the change."],
+                "additional_closing_issue_ids": [847],
+                "human_requirement_dispositions": [],
+            }
+        )
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            plan_output,
+            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
+        ],
+        codex_outputs=[
+            structured_plan_review(summary="Plan approved."),
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        pr_payload={"body": "Fixes #56\nFixes #847"},
+    )
+    config = make_config(tmp_path, plan_execution_mode="implement-one-shot")
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=config,
+        plan_first=True,
+        implement_after_approval=True,
+    ) == 0
+
+    implementation_prompt = next(
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] and "Implement the approved plan" in cmd[-1]
+    )
+    assert "Closes #847" in implementation_prompt
+
+
+def test_staged_child_closes_child_and_refs_parent(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[
+            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
+        ],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_payload={
+            "body": "<!-- AGENT_SPLIT_CHILD: parent=12 key=" + "a" * 64 + " -->",
+        },
+        pr_payload={"body": "Fixes #56\nRefs #12"},
+    )
+    config = make_config(tmp_path)
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Closes #56" in coder_prompt
+    assert "Refs #12" in coder_prompt
+    assert "Do NOT use a closing keyword" in coder_prompt
+
+
+def test_direct_pr_without_metadata_remains_contract_unknown(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert not any(
+        "AGENT_PR_EXPECTED_CLOSING_ISSUES" in comment
+        for comment in runner.pr_payload["comments"]
+    )
+
+
+def test_direct_pr_explicit_metadata_uses_managed_origin_and_all_ids(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={"body": "Closes #847\nCloses #848"},
+    )
+    config = make_config(
+        tmp_path,
+        expected_closing_issue_ids=(847, 848),
+        pr_origin_flow="managed-pr",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    contract_comments = [
+        comment
+        for comment in runner.pr_payload["comments"]
+        if "AGENT_PR_EXPECTED_CLOSING_ISSUES" in comment["body"]
+    ]
+    assert len(contract_comments) == 1
+    assert "Origin flow: managed-pr" in contract_comments[0]["body"]
+
+
+def test_direct_pr_supersession_lineage_survives_plain_reruns(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        pr_payload={"body": "Closes #847\nCloses #848"},
+    )
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=make_config(tmp_path, expected_closing_issue_ids=(847,)),
+    ) == 0
+    assert sum(
+        "AGENT_PR_EXPECTED_CLOSING_ISSUES" in comment["body"]
+        for comment in runner.pr_payload["comments"]
+    ) == 1
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=make_config(
+            tmp_path,
+            expected_closing_issue_ids=(847, 848),
+            supersede_expected_closing_contract=True,
+        ),
+    ) == 0
+    assert sum(
+        "AGENT_PR_EXPECTED_CLOSING_ISSUES" in comment["body"]
+        for comment in runner.pr_payload["comments"]
+    ) == 2
+
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+    assert sum(
+        "AGENT_PR_EXPECTED_CLOSING_ISSUES" in comment["body"]
+        for comment in runner.pr_payload["comments"]
+    ) == 2
+
+
 def test_ensure_log_dir_ignored_does_not_overwrite_existing_file(tmp_path):
     log_dir = tmp_path / "logs"
     log_dir.mkdir()

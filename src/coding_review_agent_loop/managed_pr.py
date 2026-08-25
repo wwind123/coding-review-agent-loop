@@ -302,6 +302,7 @@ def create_managed_pr(
     correlated_config = replace(
         config,
         managed_ci_expected_override_nonce=intent.audit_nonce,
+        pr_origin_flow="managed-pr",
         # Replaying managed-pr would hit the duplicate-PR guard for the draft
         # just created above. Leave no original argv so a CI-watch timeout
         # renders run_pr_loop's deterministic `agent-loop pr <n>` recovery.

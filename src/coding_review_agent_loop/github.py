@@ -163,6 +163,7 @@ def affirmative_markdown_view(body: str | None) -> str:
     output: list[str] = []
     fenced = False
     fence_char = ""
+    fence_length = 0
     list_line_re = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
     for line in text.splitlines():
         stripped = line.lstrip(" \t")
@@ -172,7 +173,12 @@ def affirmative_markdown_view(body: str | None) -> str:
             if not fenced:
                 fenced = True
                 fence_char = token[0]
-            elif token[0] == fence_char:
+                fence_length = len(token)
+            elif (
+                token[0] == fence_char
+                and len(token) >= fence_length
+                and not stripped[len(token) :].strip()
+            ):
                 fenced = False
             continue
         if fenced:

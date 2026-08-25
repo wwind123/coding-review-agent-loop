@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,8 @@ from coding_review_agent_loop.comment_rendering import (
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.expected_closure import (
     contract_hash,
+    make_contract,
+    reject_parent_from_contract,
     reconcile_contracts,
     resolve_direct_contract,
     resolve_issue_contract,
@@ -25,6 +28,7 @@ from coding_review_agent_loop.pr_contract import (
     decode_pr_contract,
     encode_pr_contract,
     format_pr_contract_comment,
+    find_latest_pr_contract,
     make_pr_contract,
 )
 from coding_review_agent_loop.protocol import (
@@ -94,6 +98,8 @@ def test_direct_pr_without_metadata_does_not_infer_contract_from_prose():
         ("Closes #847\nFixes #848", ()),
         ("Closes #847\nRefs #848", (848,)),
         ("```\nCloses #847\n```", (847, 848)),
+        ("````\n```\nCloses #847\n```\n````", (847, 848)),
+        ("~~~\n~~~ info\nCloses #847\n~~~\n", (847, 848)),
         ("- outer\n  - Closes #847", (848,)),
         ("> Closes #847", (848,)),
     ],
@@ -112,6 +118,39 @@ def test_markdown_view_removes_code_but_preserves_list_and_blockquote_evidence()
     assert "Closes #847" in view
     assert "Closes #848" in view
     assert "Closes #849" not in view
+
+
+def test_staged_parent_is_rejected_but_child_scoped_contract_is_allowed():
+    with pytest.raises(AgentLoopError, match="staged parent issue #12"):
+        reject_parent_from_contract(make_contract((11, 12)), parent_issue=12)
+    reject_parent_from_contract(make_contract((11,)), parent_issue=12)
+
+
+def test_pr_contract_supersession_is_recovered_as_the_latest_record():
+    first = make_pr_contract(
+        repository="OWNER/REPO",
+        pr_number=900,
+        origin_flow="direct-pr",
+        expected_closing_issue_ids=(847,),
+    )
+    second = make_pr_contract(
+        repository="OWNER/REPO",
+        pr_number=900,
+        origin_flow="direct-pr",
+        expected_closing_issue_ids=(847, 848),
+        supersedes_hash=first.contract_hash,
+    )
+
+    found = find_latest_pr_contract(
+        [
+            SimpleNamespace(body=format_pr_contract_comment(first)),
+            SimpleNamespace(body=format_pr_contract_comment(second)),
+        ],
+        repository="OWNER/REPO",
+        pr_number=900,
+    )
+
+    assert found == second
 
 
 def test_protocol_markers_allow_token_name_prose_but_reject_well_formed_forgery():
