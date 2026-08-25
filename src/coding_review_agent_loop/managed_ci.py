@@ -325,31 +325,8 @@ def activate_managed_ci(
         for label in pr_data.get("labels") or []
         if isinstance(label, dict) and isinstance(label.get("name"), str)
     }
-    label_result = runner.run(
-        [config.gh_cmd, "api", f"repos/{config.repo}/labels/{MANAGED_LABEL}"],
-        cwd=active_workdir(config),
-        check=False,
-    )
-    if label_result.returncode != 0:
-        create_result = runner.run(
-            [
-                config.gh_cmd,
-                "api",
-                "--method",
-                "POST",
-                f"repos/{config.repo}/labels",
-                "-f",
-                f"name={MANAGED_LABEL}",
-                "-f",
-                "color=1f6feb",
-                "-f",
-                "description=Suppress intermediate CI; agent-loop dispatches exact-head final CI",
-            ],
-            cwd=active_workdir(config),
-            check=False,
-        )
-        if create_result.returncode != 0:
-            raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
+    if not ensure_managed_label(runner, config=config):
+        raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
     if MANAGED_LABEL not in labels:
         prior_workflow_run_ids = _workflow_run_ids(
             runner,
@@ -628,13 +605,22 @@ def render_managed_ci_preflight(result: ManagedCiReadiness, *, repo: str, base: 
 
 
 def preflight_managed_ci_creation(
-    runner: Runner, *, config: AgentLoopConfig, issue_number: int
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int | None = None,
+    branch: str | None = None,
 ) -> ManagedCiCreationIntent | None:
     """Return an atomic creation intent only for an authenticated v2 rollout.
 
     This happens before the coder is prompted, avoiding the opened-event race:
-    the PR is born as a draft with its managed label, or it is ordinary CI.
+    the PR is born as a recognizable reserved draft and is labeled before the
+    orchestrator continues, or it is ordinary CI.
     """
+    if (issue_number is None) == (branch is None):
+        raise AgentLoopError("Managed-CI creation preflight requires exactly one issue number or branch.")
+    if branch is not None and not branch.startswith("agent-loop/managed-"):
+        raise AgentLoopError("Managed-CI creation branches must use the reserved `agent-loop/managed-` prefix.")
     if not config.effective_managed_ci or config.dry_run or not config.managed_ci_trusted_actor or not config.base:
         return None
     source_context = ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config))
@@ -699,7 +685,7 @@ def preflight_managed_ci_creation(
             )
         return None
     return ManagedCiCreationIntent(
-        branch=f"agent-loop/managed-{issue_number}",
+        branch=branch or f"agent-loop/managed-{issue_number}",
         trusted_actor=readiness.actor or config.managed_ci_trusted_actor,
         protection_mode=readiness.protection.state,
         audit_nonce=secrets.token_urlsafe(18) if config.allow_unprotected_managed_ci else None,
@@ -1020,7 +1006,7 @@ def _activate_v2_managed_ci(
         # an already authenticated issue-created managed draft is resumable.
         if not config.managed_ci:
             return None
-        if not _ensure_managed_label(runner, config=config):
+        if not ensure_managed_label(runner, config=config):
             raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
         applied_label = runner.run(
             [
@@ -1311,7 +1297,7 @@ def _publish_adoption_guard(
     return result.returncode == 0
 
 
-def _ensure_managed_label(runner: Runner, *, config: AgentLoopConfig) -> bool:
+def ensure_managed_label(runner: Runner, *, config: AgentLoopConfig) -> bool:
     """Create the repository label only when GitHub reports it absent."""
     existing = runner.run(
         [config.gh_cmd, "api", f"repos/{config.repo}/labels/{MANAGED_LABEL}"],
@@ -1408,7 +1394,7 @@ def _activate_v2_existing_pr_adoption(
     existing = _active_managed_label_event(runner, config=config, pr_number=pr_number)
     applied = False
     if MANAGED_LABEL not in labels:
-        if not _ensure_managed_label(runner, config=config):
+        if not ensure_managed_label(runner, config=config):
             return None
         created = runner.run(
             [config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/labels",

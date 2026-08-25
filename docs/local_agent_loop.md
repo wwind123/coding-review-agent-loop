@@ -1330,8 +1330,9 @@ with admin bypass, evaluate/disabled rulesets, and rulesets with bypass actors
 are voluntary rather than strict. Existing-PR adoption always requires strict,
 non-bypassable enforcement.
 
-For an otherwise eligible authenticated plan-first issue-created v2 invocation,
-`--allow-unprotected-managed-ci` may waive only that protection prerequisite.
+For an otherwise eligible authenticated plan-first issue-created or
+pre-creation `managed-pr` v2 invocation, `--allow-unprotected-managed-ci` may
+waive only that protection prerequisite.
 It must be written on every invocation; an old label, audit trailer, or
 `--dangerous-agent-permissions` never re-enables it. The coder records the
 override nonce in the PR body and agent-loop warns locally. This is not suitable
@@ -1432,13 +1433,14 @@ through that account).
 For auto-merge issue work, a v2 preflight gives the coder an atomic creation
 intent: create or verify `agent-loop-managed`, use the reserved
 `agent-loop/managed-<issue>` branch, then run `gh pr create --draft --label
-agent-loop-managed`. The workflow can suppress opened/reopened/synchronize
+agent-loop-managed`. The workflow can suppress later reopened/synchronize
 matrices only for the complete tuple: same-repository head, trusted REST
-author, reserved branch, draft, and label. A contributor-editable label,
-branch, or body alone is never trusted. Forks and ordinary PRs retain regular
-CI unless they are explicitly adopted as described below. The issue-created
-opening tuple remains unchanged: it alone requires a trusted author, reserved
-branch, and draft state.
+author, reserved branch, draft, and label. The opening event is necessarily
+evaluated before GitHub's separate label write and therefore uses the same
+tuple without the label; agent-loop must apply the label before continuing.
+A contributor-editable label, branch, or body alone is never trusted. Forks
+and ordinary PRs retain regular CI unless they are explicitly adopted as
+described below.
 
 For an unprotected override, the coder carries the preflight-minted nonce in
 the creation trailer. During that same invocation agent-loop compares the
@@ -1446,6 +1448,45 @@ trailer to its in-memory nonce and writes an actor-owned PR audit comment
 before accepting activation or dispatching qualification. A forged, stale, or
 mismatched trailer, or a failed audit write, releases the suppression label;
 a later invocation cannot reuse a body nonce as its authorization.
+
+#### Creating a managed PR from an existing branch
+
+When code is already pushed to the repository but no PR exists, use the
+pre-creation mode instead of creating an ordinary PR and adopting it later:
+
+```bash
+agent-loop managed-pr \
+  --repo OWNER/REPO \
+  --head fix/prepared-change \
+  --base main \
+  --title "Fix prepared change" \
+  --body-file /path/to/pr-body.md \
+  --managed-ci \
+  --managed-ci-trusted-actor LOGIN \
+  --reviewer claude \
+  --reviewer agy \
+  --review-parallel
+```
+
+The command resolves the exact SHA of `--head`, rejects a source SHA that
+already has an open PR, and runs managed-CI readiness before creating anything.
+It then creates a unique `agent-loop/managed-direct-*` alias at that SHA, opens
+a draft, applies `agent-loop-managed`, and enters the ordinary PR review loop.
+Use `--managed-ci` to leave a successfully qualified PR ready for the printed
+head-guarded manual merge, or replace it with `--auto-merge` to merge the
+qualified head automatically.
+If the source moves during handoff or draft labeling fails, the partial draft
+is closed and the reserved alias is removed. The original source branch is
+never changed or deleted.
+
+`--body-file -` reads the PR body from stdin; omitting `--body-file` creates an
+otherwise empty body with only the hidden source audit marker. On a repository
+whose preflight reports `override_eligible`, add
+`--allow-unprotected-managed-ci` to this invocation. Its nonce is embedded in
+the newly created body and correlated in memory exactly like issue-created v2.
+The waiver is safe only under the same single-operator constraints documented
+above. `managed-pr` never adopts an already-open PR and does not weaken the
+strict-only `--managed-ci-adopt-existing-pr` path.
 
 #### Optional adoption of an existing PR
 

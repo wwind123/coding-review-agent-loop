@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,6 +37,7 @@ from coding_review_agent_loop.config import (
 from coding_review_agent_loop.errors import AgentInvocationError, QuotaResetExceededError
 from coding_review_agent_loop.github import CiWatchOutcome, IssueComment
 from coding_review_agent_loop.managed_ci import ManagedCiReadiness, ProtectionAssessment
+from coding_review_agent_loop.managed_pr import ManagedPrHandoff
 from coding_review_agent_loop.runner import CommandResult, ExecutableIdentity, ExecutionObservation
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
@@ -1329,6 +1331,101 @@ def test_config_records_per_invocation_unprotected_managed_ci_override(tmp_path)
     config = config_from_args(args, FakeRunner())
 
     assert config.allow_unprotected_managed_ci is True
+
+
+def test_managed_pr_parser_accepts_direct_branch_metadata():
+    args = build_parser().parse_args([
+        "managed-pr",
+        "--repo", "OWNER/REPO",
+        "--head", "fix/direct-change",
+        "--title", "Fix direct change",
+        "--body-file", "description.md",
+        "--auto-merge",
+        "--managed-ci-trusted-actor", "agent-loop",
+        "--allow-unprotected-managed-ci",
+    ])
+
+    assert args.command == "managed-pr"
+    assert args.head == "fix/direct-change"
+    assert args.title == "Fix direct change"
+    assert args.body_file == Path("description.md")
+    assert args.allow_unprotected_managed_ci is True
+
+
+def test_managed_pr_parser_accepts_manual_managed_ci():
+    args = build_parser().parse_args([
+        "managed-pr",
+        "--repo", "OWNER/REPO",
+        "--head", "fix/direct-change",
+        "--title", "Fix direct change",
+        "--managed-ci",
+        "--managed-ci-trusted-actor", "agent-loop",
+    ])
+
+    assert args.command == "managed-pr"
+    assert args.managed_ci is True
+    assert args.auto_merge is False
+
+
+def test_managed_pr_requires_managed_ci_or_auto_merge(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: make_config(tmp_path))
+
+    assert main([
+        "managed-pr", "--repo", "OWNER/REPO", "--head", "fix/direct-change", "--title", "Direct change",
+    ]) == 1
+
+    assert "managed-pr requires --managed-ci or --auto-merge" in capsys.readouterr().err
+
+
+def test_managed_pr_requires_trusted_actor(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: make_config(tmp_path))
+
+    assert main([
+        "managed-pr", "--repo", "OWNER/REPO", "--head", "fix/direct-change", "--title", "Direct change",
+        "--auto-merge",
+    ]) == 1
+
+    assert "managed-pr requires --managed-ci-trusted-actor" in capsys.readouterr().err
+
+
+def test_managed_pr_refuses_dry_run(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: make_config(tmp_path))
+
+    assert main([
+        "managed-pr", "--repo", "OWNER/REPO", "--head", "fix/direct-change", "--title", "Direct change",
+        "--managed-ci", "--managed-ci-trusted-actor", "agent-loop", "--dry-run",
+    ]) == 1
+
+    assert "managed-pr does not support --dry-run" in capsys.readouterr().err
+
+
+def test_managed_pr_hands_created_draft_to_pr_loop(tmp_path, monkeypatch):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    handoff_config = replace(config, invocation_argv=())
+    handoff = ManagedPrHandoff(77, handoff_config, "a" * 40, "agent-loop/managed-direct-token")
+    captured = {}
+    monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: config)
+    monkeypatch.setattr(cli_module, "resolve_base_branch", lambda config, runner: config)
+    monkeypatch.setattr(cli_module, "ensure_agent_workdirs", lambda config, runner: None)
+
+    def create(runner, *, config, source_branch, title, body):
+        captured["create"] = (config, source_branch, title, body)
+        return handoff
+
+    def run(runner, *, pr_number, config, workdirs_ready=False):
+        captured["run"] = (pr_number, config, workdirs_ready)
+        return 23
+
+    monkeypatch.setattr(cli_module, "create_managed_pr", create)
+    monkeypatch.setattr(cli_module, "run_pr_loop", run)
+
+    assert main([
+        "managed-pr", "--repo", "OWNER/REPO", "--head", "fix/direct-change", "--title", "Direct change",
+        "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
+    ]) == 23
+
+    assert captured["create"][1:] == ("fix/direct-change", "Direct change", "")
+    assert captured["run"] == (77, handoff_config, True)
 
 
 def test_unprotected_managed_ci_override_rejects_existing_pr_adoption(capsys):

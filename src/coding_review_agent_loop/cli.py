@@ -23,6 +23,7 @@ from .config import (
     ensure_agent_workdirs,
     ensure_distinct_workdirs,
     ensure_workdir,
+    resolve_base_branch,
     reviewers,
 )
 from .errors import AgentLoopError, QuotaResetExceededError
@@ -34,6 +35,7 @@ from .managed_ci import (
     evaluate_managed_ci_readiness,
     render_managed_ci_preflight,
 )
+from .managed_pr import create_managed_pr
 from .github import (
     detect_repo,
     get_check_status,
@@ -625,6 +627,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_review_parallel(pr)
 
+    managed_pr = subparsers.add_parser(
+        "managed-pr",
+        help="Create a managed-CI draft from an existing branch, then review it.",
+    )
+    managed_pr.add_argument(
+        "--head",
+        required=True,
+        help="Existing same-repository source branch whose exact head will be used.",
+    )
+    managed_pr.add_argument("--title", required=True, help="Pull-request title.")
+    managed_pr.add_argument(
+        "--body-file",
+        type=Path,
+        default=None,
+        help="Read the pull-request body from this file (use '-' for stdin; default: empty).",
+    )
+    add_common(managed_pr)
+    managed_pr.add_argument(
+        "--managed-ci",
+        action="store_true",
+        help=(
+            "Explicitly activate managed exact-head CI without implying a merge. "
+            "A successful run leaves the live qualified head ready for manual "
+            "head-guarded merging. Requires --managed-ci-trusted-actor."
+        ),
+    )
+    managed_pr.add_argument(
+        "--allow-unprotected-managed-ci",
+        action="store_true",
+        help=(
+            "Per-invocation waiver when GitHub cannot independently enforce final-ci/exact-head. "
+            "Requires --managed-ci or --auto-merge and --managed-ci-trusted-actor."
+        ),
+    )
+    add_review_parallel(managed_pr)
+
     managed_ci = subparsers.add_parser("managed-ci", help="Inspect managed-CI readiness without writes.")
     managed_ci_subparsers = managed_ci.add_subparsers(dest="managed_ci_command", required=True)
     preflight = managed_ci_subparsers.add_parser("preflight", help="Read-only managed-CI readiness report.")
@@ -798,8 +836,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         invocation = tuple([sys.argv[0], *sys.argv[1:]]) if argv is None else tuple(["agent-loop", *argv])
         explicit_managed_ci = bool(getattr(args, "managed_ci", False))
         if explicit_managed_ci:
-            if args.command not in {"issue", "pr"}:
-                raise AgentLoopError("--managed-ci is only supported with issue or pr.")
+            if args.command not in {"issue", "pr", "managed-pr"}:
+                raise AgentLoopError("--managed-ci is only supported with issue, pr, or managed-pr.")
             if not (args.managed_ci_trusted_actor or "").strip():
                 raise AgentLoopError("--managed-ci requires --managed-ci-trusted-actor.")
         config = config_from_args(args, runner, invocation_argv=invocation)
@@ -820,8 +858,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--managed-ci-adopt-existing-pr requires --managed-ci-trusted-actor."
                 )
         if getattr(args, "allow_unprotected_managed_ci", False):
-            if args.command not in {"issue", "pr"}:
-                raise AgentLoopError("--allow-unprotected-managed-ci is only supported with issue or pr.")
+            if args.command not in {"issue", "pr", "managed-pr"}:
+                raise AgentLoopError("--allow-unprotected-managed-ci is only supported with issue, pr, or managed-pr.")
             if not (args.auto_merge or getattr(args, "managed_ci", False)):
                 raise AgentLoopError("--allow-unprotected-managed-ci requires --managed-ci or --auto-merge.")
             if not (args.managed_ci_trusted_actor or "").strip():
@@ -860,6 +898,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.command == "pr":
             return run_pr_loop(runner, pr_number=args.pr_number, config=config)
+        if args.command == "managed-pr":
+            if not (args.auto_merge or args.managed_ci):
+                raise AgentLoopError("managed-pr requires --managed-ci or --auto-merge.")
+            if not (args.managed_ci_trusted_actor or "").strip():
+                raise AgentLoopError("managed-pr requires --managed-ci-trusted-actor.")
+            if args.dry_run:
+                raise AgentLoopError("managed-pr does not support --dry-run because it must verify live GitHub state.")
+            if args.body_file is None:
+                body = ""
+            elif str(args.body_file) == "-":
+                body = sys.stdin.read()
+            else:
+                body = args.body_file.read_text(encoding="utf-8")
+            config = resolve_base_branch(config, runner)
+            ensure_agent_workdirs(config, runner)
+            handoff = create_managed_pr(
+                runner,
+                config=config,
+                source_branch=args.head,
+                title=args.title,
+                body=body,
+            )
+            return run_pr_loop(
+                runner,
+                pr_number=handoff.pr_number,
+                config=handoff.config,
+                workdirs_ready=True,
+            )
         if args.command == "task":
             task_text = _resolve_task_text(args)
             return run_task_loop(
