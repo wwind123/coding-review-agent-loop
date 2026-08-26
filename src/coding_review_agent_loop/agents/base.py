@@ -46,6 +46,9 @@ class AgentResult:
     # antigravity fallback chain (#333) sets this to the model that answered.
     model_used: str | None = None
     command_result: CommandResult | None = None
+    # Provider-neutral evidence that the configured executable was replaced or
+    # disappeared during this invocation. Claude uses the historical field name;
+    # Codex sets it for the same bounded recovery signal.
     self_update_reason: str | None = None
 
 

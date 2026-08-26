@@ -2060,6 +2060,32 @@ narrow and intended for stream/tool-call failures, empty responses, network
 timeouts/resets, and provider 5xx errors. Auth, credit, quota, dirty workdir,
 and normal missing-marker responses are not retried.
 
+Claude and Codex have a separate, evidence-gated post-spawn executable
+replacement path. The runner samples the resolved command entry, symlink target,
+and executable identity for the successful spawn attempt and again after exit.
+A replay is considered only when direct identity-change or disappearance evidence
+falls within the invocation window. Codex has no elapsed-time cap, but it may be
+replayed only when its failed `--json` stream parsed as empty or as exactly one
+setup-only `thread.started` dictionary. Any other dictionary event—including
+item, tool, command, error, or `turn.completed` activity—means work may have
+started and prevents a fresh replay. A public response file or last-message
+artifact suppresses replacement classification even when metadata changes after
+completion; a malformed present artifact remains on ordinary validation.
+
+The Codex stability wait is independent and bounded to six seconds. Once stable,
+the loop performs at most one fresh `codex exec` replay with the full configured
+timeout (or no timeout when unconfigured), without consuming ordinary retry
+budget. Ordinary Codex invocation and discuss-round log names are unchanged; only
+the dedicated replay uses `executable-replacement-attempt2`. An unstable or
+exhausted path retains a specific Codex executable-replacement diagnostic. Bare
+commands compare PATH entry, symlink, and target identities; an absolute override
+requires direct evidence that its exact entry or target changed or disappeared.
+Claude's existing 30-second eligibility cap, updater diagnostics, deadline-
+bounded stability wait, remaining-time replay, and `self-update-attempt2` suffix
+remain unchanged. If a genuine long quota reset occurs after replacement
+context was recorded, quota remains primary and exit code 3 is preserved with
+the earlier replacement detail appended.
+
 Unsupported model/provider-auth compatibility errors are reported separately
 with failure category `unsupported_model`. These diagnostics name the agent and
 requested model when available and suggest choosing a compatible model or

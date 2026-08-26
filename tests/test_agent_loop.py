@@ -3951,6 +3951,194 @@ def test_claude_self_update_stability_failure_sets_final_category(tmp_path):
     assert "wait for the Claude Code self-update to finish" in str(error.value)
 
 
+def _observed_codex_result(tmp_path, *, text="", raw_output="", returncode=1, changed=True):
+    before = ExecutableIdentity(
+        "/tmp/codex", "/tmp/codex-target", (1, 1, 100_000_000_000), (1, 2, 100_000_000_000)
+    )
+    after = (
+        ExecutableIdentity(
+            "/tmp/codex", "/tmp/codex-new-target", (1, 3, 101_000_000_000), (1, 4, 101_000_000_000)
+        )
+        if changed
+        else before
+    )
+    observation = ExecutionObservation(100, 100, 101, 1, before, after, False)
+    command_result = CommandResult(
+        ["codex", "exec", "--json"], tmp_path, raw_output, "", returncode, observation
+    )
+    return AgentResult(
+        text=text,
+        raw_output=raw_output,
+        returncode=returncode,
+        command_result=command_result,
+        self_update_reason=("Codex executable changed during invocation" if changed else None),
+    )
+
+
+def test_codex_executable_replacement_replay_uses_fresh_full_timeout(tmp_path):
+    valid = structured_pr_review(
+        state="approved", summary="Recovered.", reviewer="OpenAI Codex"
+    )
+    results = iter(
+        [
+            _observed_codex_result(tmp_path, raw_output="overloaded_error"),
+            AgentResult(text=valid, raw_output=valid, returncode=0),
+        ]
+    )
+    runner = FakeRunner()
+    stability_calls = []
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: (
+        stability_calls.append((command, deadline)) or True
+    )
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="codex",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="OpenAI Codex", unresolved_items=()
+            ),
+            timeout_seconds=60,
+        )
+
+    assert response.marker_value.state == "approved"
+    assert stability_calls == [(config.codex_cmd, None)]
+    assert run_mock.call_count == 2
+    assert run_mock.call_args_list[0].kwargs["timeout_seconds"] == 60
+    assert run_mock.call_args_list[1].kwargs["timeout_seconds"] == 60
+    assert "attempt_suffix" not in run_mock.call_args_list[0].kwargs
+    assert run_mock.call_args_list[1].kwargs["attempt_suffix"] == "executable-replacement-attempt2"
+
+
+def test_codex_replacement_replay_does_not_consume_ordinary_retry(tmp_path):
+    valid = structured_pr_review(
+        state="approved", summary="Recovered after retry.", reviewer="OpenAI Codex"
+    )
+    results = iter(
+        [
+            _observed_codex_result(tmp_path),
+            _observed_codex_result(
+                tmp_path, raw_output="overloaded_error", changed=False
+            ),
+            AgentResult(text=valid, raw_output=valid, returncode=0),
+        ]
+    )
+    runner = FakeRunner()
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: True
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="codex",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="test",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="OpenAI Codex", unresolved_items=()
+            ),
+        )
+
+    assert response.marker_value.state == "approved"
+    assert run_mock.call_count == 3
+    assert run_mock.call_args_list[1].kwargs["attempt_suffix"] == "executable-replacement-attempt2"
+    assert "attempt_suffix" not in run_mock.call_args_list[2].kwargs
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["sleep"]]) == 1
+
+
+def test_codex_replacement_exhaustion_keeps_specific_terminal_category(tmp_path):
+    results = iter(
+        [
+            _observed_codex_result(tmp_path),
+            _observed_codex_result(tmp_path, raw_output="ordinary failure", changed=False),
+        ]
+    )
+    runner = FakeRunner()
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: True
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=results):
+        with pytest.raises(AgentInvocationError) as error:
+            _run_validated_agent(
+                runner,
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="test",
+                validate=lambda text: _validate_review_response(
+                    text, reviewer="OpenAI Codex", unresolved_items=()
+                ),
+            )
+
+    assert error.value.failure_category == "executable-replacement"
+    assert "Codex executable replacement" in str(error.value)
+    assert "wait for the Codex executable replacement" in str(error.value)
+
+
+def test_codex_unstable_replacement_retains_ordinary_retry(tmp_path):
+    valid = structured_pr_review(
+        state="approved", summary="Recovered by ordinary retry.", reviewer="OpenAI Codex"
+    )
+    results = iter(
+        [
+            _observed_codex_result(tmp_path, raw_output="overloaded_error"),
+            AgentResult(text=valid, raw_output=valid, returncode=0),
+        ]
+    )
+    runner = FakeRunner()
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: False
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
+
+    # The first failed replacement observation remains subject to normal
+    # retry accounting; this test uses a scripted valid ordinary retry.
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="codex",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="test",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="OpenAI Codex", unresolved_items=()
+            ),
+        )
+
+    assert response.marker_value.state == "approved"
+    assert run_mock.call_count == 2
+    assert "attempt_suffix" not in run_mock.call_args_list[1].kwargs
+
+
+def test_codex_replacement_context_does_not_change_long_quota_exit_priority(tmp_path):
+    result = _observed_codex_result(
+        tmp_path,
+        raw_output="HTTP 429: rate limit exceeded. Retry-After: 3600",
+    )
+    runner = FakeRunner()
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: False
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
+
+    with patch.object(orchestrator_module, "run_agent_result", return_value=result):
+        with pytest.raises(QuotaResetExceededError) as error:
+            _run_validated_agent(
+                runner,
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="test",
+                validate=lambda text: _validate_review_response(
+                    text, reviewer="OpenAI Codex", unresolved_items=()
+                ),
+            )
+
+    assert QuotaResetExceededError.EXIT_CODE == 3
+    assert "quota exhausted" in str(error.value).lower()
+    assert "Codex executable replacement" in str(error.value)
+
+
 # ---------------------------------------------------------------------------
 # Antigravity (agy) backend + Gemini retirement guidance (#215)
 # ---------------------------------------------------------------------------
@@ -4264,9 +4452,10 @@ def test_runner_retries_preflighted_command_disappearance_and_recovers(
     assert result.returncode == 0
     assert "recovered after preflight" in result.stdout
     assert len(popen_calls) == 3
-    # Spawn retry keeps its existing three lookups; the completed invocation
-    # additionally records isolated pre/post executable observations.
-    assert which_calls == [command_name] * 5
+    # Each candidate spawn is resolved immediately before its attempt so the
+    # returned observation belongs to the successful attempt; the post-exit
+    # sample adds one final lookup.
+    assert which_calls == [command_name] * 7
     assert runner._resolved_commands[command_name] == str(command)
     assert sleep_calls[:2] == [2, 2]
     assert all(delay == 1 for delay in sleep_calls[2:])
@@ -4322,7 +4511,7 @@ def test_runner_preflighted_command_disappearance_retry_is_bounded(
         )
 
     assert len(popen_calls) == 3
-    assert which_calls == [command_name] * 4
+    assert which_calls == [command_name] * 7
     assert sleep_calls == [2, 2]
 
 
@@ -4478,7 +4667,7 @@ def test_runner_missing_command_without_dangling_evidence_does_not_retry(
         )
 
     assert len(popen_calls) == 1
-    assert which_calls == ["missing-agent", "missing-agent"]
+    assert which_calls == ["missing-agent"] * 3
     assert sleep_calls == []
 
 
@@ -4847,6 +5036,51 @@ def test_runner_records_attempt_local_executable_observation(tmp_path, use_pty):
     assert result.observation.before.path
     assert result.observation.after.path
     assert result.observation.elapsed_seconds >= 0
+
+
+@pytest.mark.parametrize("use_pty", [False, True])
+def test_runner_observation_before_is_from_successful_spawn_attempt(
+    monkeypatch, tmp_path, use_pty
+):
+    """A failed spawn's identity is discarded before a later retry succeeds."""
+    import coding_review_agent_loop.runner as runner_module
+
+    command_name = "observed-agent"
+    command = tmp_path / command_name
+    command.symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+    runner = Runner()
+    runner.remember_agent_command(command_name, str(command), "--codex-cmd")
+    first = ExecutableIdentity("/failed", "/failed", (1, 1, 1), (1, 1, 1))
+    successful = ExecutableIdentity("/successful", "/successful", (1, 2, 2), (1, 2, 2))
+    after = ExecutableIdentity("/after", "/after", (1, 3, 3), (1, 3, 3))
+    identities = iter([first, successful, after])
+    original_popen = runner_module.subprocess.Popen
+    popen_calls = []
+
+    def flaky_popen(*args, **kwargs):
+        popen_calls.append(args[0])
+        if len(popen_calls) == 1:
+            raise FileNotFoundError(command_name)
+        return original_popen(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "executable_identity", lambda _command: next(identities))
+    monkeypatch.setattr(runner_module.subprocess, "Popen", flaky_popen)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _delay: None)
+
+    result = runner.run_with_log(
+        [command_name, "-c", "print('observed')"],
+        cwd=tmp_path,
+        log_path=tmp_path / "logs" / f"successful-observation-{use_pty}.log",
+        label="Successful observation",
+        progress_interval_seconds=999,
+        use_pty=use_pty,
+    )
+
+    assert len(popen_calls) == 2
+    assert result.observation is not None
+    assert result.observation.before == successful
+    assert result.observation.after == after
 
 
 # ---------------------------------------------------------------------------

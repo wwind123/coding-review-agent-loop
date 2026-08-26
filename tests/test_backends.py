@@ -16,6 +16,7 @@ from coding_review_agent_loop.agents.claude import (
 from coding_review_agent_loop.runner import CommandResult, ExecutableIdentity, ExecutionObservation
 from coding_review_agent_loop.agents.codex import (
     BACKEND as CODEX_BACKEND,
+    classify_executable_replacement_interruption,
     _extract_codex_usage,
     _normalize_codex_usage,
 )
@@ -96,6 +97,173 @@ def test_claude_self_update_classification_requires_bounded_evidence():
     assert classify_self_update_interruption(
         diagnostic, command="claude", response_file_text=None, session_id=None
     ) == "Claude Code updater diagnostic"
+
+
+def _codex_result(
+    *,
+    stdout="",
+    returncode=1,
+    before=None,
+    after=None,
+    interrupted=False,
+    capture_diagnostics=(),
+    elapsed_seconds=1,
+):
+    before = before or ExecutableIdentity(
+        "/tmp/codex", "/tmp/codex-target", (1, 1, 100_000_000_000), (1, 2, 100_000_000_000)
+    )
+    after = after or ExecutableIdentity(
+        "/tmp/codex", "/tmp/codex-target", (1, 3, 101_000_000_000), (1, 4, 101_000_000_000)
+    )
+    observation = ExecutionObservation(
+        100,
+        100,
+        100 + elapsed_seconds,
+        elapsed_seconds,
+        before,
+        after,
+        interrupted,
+    )
+    return CommandResult(
+        ["codex", "exec", "--json"],
+        Path.cwd(),
+        stdout,
+        "",
+        returncode,
+        observation,
+        capture_diagnostics,
+    )
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_codex_executable_replacement_classifies_outputless_exit(returncode):
+    result = _codex_result(returncode=returncode)
+
+    assert classify_executable_replacement_interruption(
+        result,
+        command="codex",
+        response_file_text=None,
+        last_message_artifact=None,
+    ) == "Codex executable changed during invocation"
+
+
+def test_codex_executable_replacement_has_no_elapsed_cap():
+    result = _codex_result(elapsed_seconds=31)
+
+    assert classify_executable_replacement_interruption(
+        result,
+        command="codex",
+        response_file_text=None,
+        last_message_artifact=None,
+    ) == "Codex executable changed during invocation"
+
+
+def test_codex_executable_replacement_accepts_one_setup_event_only():
+    result = _codex_result(
+        stdout=json.dumps({"type": "thread.started", "thread_id": "thread"})
+    )
+
+    assert classify_executable_replacement_interruption(
+        result,
+        command="codex",
+        response_file_text=None,
+        last_message_artifact=None,
+    ) == "Codex executable changed during invocation"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        json.dumps({"type": "item.started"}),
+        json.dumps({"type": "turn.completed"}),
+        "\n".join([json.dumps({"type": "thread.started"}), json.dumps({"type": "item.started"})]),
+    ],
+)
+def test_codex_executable_replacement_rejects_work_progress_events(stdout):
+    result = _codex_result(stdout=stdout)
+
+    assert classify_executable_replacement_interruption(
+        result,
+        command="codex",
+        response_file_text=None,
+        last_message_artifact=None,
+    ) is None
+
+
+def test_codex_executable_replacement_bare_command_observes_path_entry_change():
+    before = ExecutableIdentity(
+        "/one/codex", "/one/target", (1, 1, 100_000_000_000), (1, 2, 100_000_000_000)
+    )
+    after = ExecutableIdentity(
+        "/two/codex", "/two/target", (1, 3, 101_000_000_000), (1, 4, 101_000_000_000)
+    )
+    result = _codex_result(before=before, after=after)
+
+    assert classify_executable_replacement_interruption(
+        result,
+        command="codex",
+        response_file_text=None,
+        last_message_artifact=None,
+    ) == "Codex executable changed during invocation"
+
+
+def test_codex_executable_replacement_absolute_override_requires_exact_identity_change():
+    command = "/configured/codex"
+    unchanged = ExecutableIdentity(
+        command, command, (1, 1, 100_000_000_000), (1, 2, 100_000_000_000)
+    )
+    result = _codex_result(before=unchanged, after=unchanged)
+    assert classify_executable_replacement_interruption(
+        result,
+        command=command,
+        response_file_text=None,
+        last_message_artifact=None,
+    ) is None
+
+    replaced = ExecutableIdentity(
+        command, "/configured/new-target", (1, 3, 101_000_000_000), (1, 4, 101_000_000_000)
+    )
+    result = _codex_result(before=unchanged, after=replaced)
+    assert classify_executable_replacement_interruption(
+        result,
+        command=command,
+        response_file_text=None,
+        last_message_artifact=None,
+    ) == "Codex executable changed during invocation"
+
+
+@pytest.mark.parametrize(
+    ("response_file_text", "last_message_artifact"),
+    [("valid public response", None), (None, "malformed but present")],
+)
+def test_codex_artifacts_suppress_replacement_classification(
+    response_file_text, last_message_artifact
+):
+    result = _codex_result()
+    assert classify_executable_replacement_interruption(
+        result,
+        command="codex",
+        response_file_text=response_file_text,
+        last_message_artifact=last_message_artifact,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("interrupted", "capture_diagnostics"),
+    [(True, ()), (False, ("capture_read_failed:OSError: injected",))],
+)
+def test_codex_replacement_excludes_interruptions_and_capture_loss(
+    interrupted, capture_diagnostics
+):
+    result = _codex_result(
+        interrupted=interrupted, capture_diagnostics=capture_diagnostics
+    )
+    assert classify_executable_replacement_interruption(
+        result,
+        command="codex",
+        response_file_text=None,
+        last_message_artifact=None,
+    ) is None
 
 
 def test_parse_claude_output_falls_back_on_non_string_result():
