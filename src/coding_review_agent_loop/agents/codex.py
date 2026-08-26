@@ -18,7 +18,7 @@ from .base import (
     with_public_response_file_instruction,
 )
 from ..logging import agent_log_path, log
-from ..runner import Runner
+from ..runner import CommandResult, Runner, executable_identity_changed
 from ..usage import UsageMetadata, coerce_int, first_present
 
 if TYPE_CHECKING:
@@ -219,6 +219,62 @@ def _read_codex_message_file(output_path: Path) -> str | None:
     return text or None
 
 
+def _codex_stream_is_setup_only(raw: str) -> bool:
+    """Allow replay only when --json produced no work-progress events."""
+    events: list[object] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            events.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            # Updater diagnostics and other plain-text startup output are not
+            # Codex work events. They remain eligible only if no JSON event was
+            # parsed at all.
+            continue
+    if not events:
+        return True
+    return (
+        len(events) == 1
+        and isinstance(events[0], dict)
+        and events[0].get("type") == "thread.started"
+    )
+
+
+def classify_executable_replacement_interruption(
+    result: CommandResult,
+    *,
+    command: str,
+    response_file_text: str | None,
+    last_message_artifact: str | None,
+) -> str | None:
+    """Return direct Codex executable-replacement evidence, if safely replayable."""
+    observation = result.observation
+    if not isinstance(result.returncode, int) or observation is None:
+        return None
+    has_public_response = bool(response_file_text and response_file_text.strip())
+    has_last_message = bool(last_message_artifact and last_message_artifact.strip())
+    if result.returncode == 0 and has_last_message:
+        return None
+    if has_public_response or has_last_message:
+        return None
+    if observation.interrupted or result.capture_diagnostics:
+        return None
+    identity_changed = executable_identity_changed(
+        observation.before,
+        observation.after,
+        command=command,
+        spawn_wall_time=observation.spawn_wall_time,
+        exit_wall_time=observation.spawn_wall_time + observation.elapsed_seconds,
+    )
+    if not _codex_stream_is_setup_only(result.stdout):
+        return None
+    if identity_changed:
+        return "Codex executable changed during invocation"
+    return None
+
+
 class CodexBackend:
     name: AgentName = "codex"
     display_name = "Codex"
@@ -307,7 +363,8 @@ class CodexBackend:
                 timeout_seconds=timeout_seconds,
             )
             response_file_text = read_public_response_file(response_path)
-            message_text = _read_codex_message_file(Path(output_path)) or result.stdout
+            last_message_artifact = _read_codex_message_file(Path(output_path))
+            message_text = last_message_artifact or result.stdout
             usage, raw_usage = _extract_codex_usage(result.stdout)
             model_used = _codex_model_label(config) or _detect_codex_model(result.stdout)
             log(config, f"Codex finished; log: {log_path}")
@@ -324,6 +381,12 @@ class CodexBackend:
                 raw_usage=raw_usage,
                 model_used=model_used,
                 command_result=result,
+                self_update_reason=classify_executable_replacement_interruption(
+                    result,
+                    command=config.codex_cmd,
+                    response_file_text=response_file_text,
+                    last_message_artifact=last_message_artifact,
+                ),
             )
         finally:
             try:

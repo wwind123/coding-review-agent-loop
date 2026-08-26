@@ -87,6 +87,54 @@ def executable_identity(command: str) -> ExecutableIdentity:
     return ExecutableIdentity(path, target, entry, resolved)
 
 
+def executable_identity_changed(
+    before: ExecutableIdentity,
+    after: ExecutableIdentity,
+    *,
+    command: str | None = None,
+    spawn_wall_time: float,
+    exit_wall_time: float,
+) -> bool:
+    """Return whether executable replacement is evidenced during an invocation.
+
+    Identity changes outside the invocation window are not enough: a command can
+    legitimately be updated between turns.  Missing post-exit identity is direct
+    disappearance evidence and remains eligible, while mtime-bearing changes are
+    bounded to the same small window used by the Claude recovery path.
+    """
+    if command is not None and os.path.isabs(command):
+        # An absolute override has no PATH entry to compare. Its exact target
+        # and entry metadata must change or disappear directly.
+        before_values = (before.target, before.entry_identity, before.target_identity)
+        after_values = (after.target, after.entry_identity, after.target_identity)
+    else:
+        # Bare commands include the resolved PATH entry itself, plus symlink and
+        # target identities, so PATH retargeting is observable.
+        before_values = (
+            before.path,
+            before.target,
+            before.entry_identity,
+            before.target_identity,
+        )
+        after_values = (
+            after.path,
+            after.target,
+            after.entry_identity,
+            after.target_identity,
+        )
+    changed = before_values != after_values
+    if not changed:
+        return False
+    mtimes = [
+        identity[2] / 1_000_000_000
+        for identity in (after.entry_identity, after.target_identity)
+        if identity
+    ]
+    return not mtimes or any(
+        spawn_wall_time - 5 <= mtime <= exit_wall_time + 2 for mtime in mtimes
+    )
+
+
 def ensure_log_dir_ignored(log_dir: Path) -> None:
     gitignore = log_dir / ".gitignore"
     if not gitignore.exists():
@@ -201,7 +249,7 @@ class Runner:
         self,
         cmd: list[str],
         spawn_attempt: Callable[[], _SpawnResult],
-    ) -> _SpawnResult:
+    ) -> tuple[_SpawnResult, float, float, ExecutableIdentity]:
         command = cmd[0]
         resolved = shutil.which(command)
         if resolved is not None:
@@ -210,8 +258,14 @@ class Runner:
 
         saw_preflight_disappearance = False
         for attempt in range(1, _SPAWN_ATTEMPTS + 1):
+            # Capture the identity for the attempt that actually succeeds.  In
+            # particular, do not resolve an absolute path or replace cmd[0]: a
+            # bare command must continue to resolve through PATH at exec time.
+            spawn_wall_time = time.time()
+            spawn_monotonic = time.monotonic()
+            before_identity = executable_identity(command)
             try:
-                return spawn_attempt()
+                return spawn_attempt(), spawn_wall_time, spawn_monotonic, before_identity
             except FileNotFoundError as exc:
                 if os.path.isabs(command):
                     raise self._missing_command_error(command) from exc
@@ -378,13 +432,10 @@ class Runner:
                         env={**os.environ, **env} if env is not None else None,
                     )
 
-                proc = self._spawn_with_retry(
+                proc, spawn_wall_time, spawn_monotonic, before_identity = self._spawn_with_retry(
                     cmd,
                     spawn,
                 )
-                spawn_wall_time = time.time()
-                spawn_monotonic = time.monotonic()
-                before_identity = executable_identity(cmd[0])
                 self._register_active_process(proc)
                 try:
                     while True:
@@ -430,10 +481,23 @@ class Runner:
                 full_output = ""
         output = full_output[len(header):] if full_output.startswith(header) else full_output
         exited = time.monotonic()
-        result = CommandResult(cmd, cwd, output, "", returncode, ExecutionObservation(
-            spawn_wall_time, spawn_monotonic,
-            exited, exited - spawn_monotonic, before_identity, executable_identity(cmd[0]), self._interrupted,
-        ), tuple(capture_diagnostics))
+        result = CommandResult(
+            cmd,
+            cwd,
+            output,
+            "",
+            returncode,
+            ExecutionObservation(
+                spawn_wall_time,
+                spawn_monotonic,
+                exited,
+                exited - spawn_monotonic,
+                before_identity,
+                executable_identity(cmd[0]),
+                self._interrupted,
+            ),
+            tuple(capture_diagnostics),
+        )
         if check and returncode != 0:
             raise AgentLoopError(
                 f"Command failed with exit {returncode}: {' '.join(cmd)}\n"
@@ -500,10 +564,10 @@ class Runner:
                     allocated_fds = None
                     raise
 
-            proc = self._spawn_with_retry(cmd, spawn_pty)
-            spawn_wall_time = time.time()
-            spawn_monotonic = time.monotonic()
-            before_identity = executable_identity(cmd[0])
+            proc, spawn_wall_time, spawn_monotonic, before_identity = self._spawn_with_retry(
+                cmd,
+                spawn_pty,
+            )
             assert allocated_fds is not None
             master_fd, slave_fd = allocated_fds
             os.close(slave_fd)
@@ -558,10 +622,22 @@ class Runner:
         raw = b"".join(chunks).decode("utf-8", errors="replace")
         output = strip_ansi(raw)
         exited = time.monotonic()
-        result = CommandResult(cmd, cwd, output, "", returncode, ExecutionObservation(
-            spawn_wall_time, spawn_monotonic, exited, exited - spawn_monotonic,
-            before_identity, executable_identity(cmd[0]), self._interrupted,
-        ))
+        result = CommandResult(
+            cmd,
+            cwd,
+            output,
+            "",
+            returncode,
+            ExecutionObservation(
+                spawn_wall_time,
+                spawn_monotonic,
+                exited,
+                exited - spawn_monotonic,
+                before_identity,
+                executable_identity(cmd[0]),
+                self._interrupted,
+            ),
+        )
         if check and returncode != 0:
             raise AgentLoopError(
                 f"Command failed with exit {returncode}: {' '.join(cmd)}\n"

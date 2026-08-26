@@ -1025,6 +1025,30 @@ early with rerun guidance, while narrower transient failures retry according to
 are also visible in the log as schema-validation failure, repair attempt, and
 recovered-or-invalid repair messages.
 
+Claude and Codex also have evidence-gated recovery for an executable that is
+replaced after spawn. The runner records the resolved PATH entry, symlink target,
+and executable identity immediately around each invocation and only considers a
+replacement when that identity changed or disappeared during the invocation.
+Codex replay is deliberately conservative: an outputless failed `codex exec
+--json` may contain no parsed events or only one `thread.started` setup event;
+any item, tool, command, error, or `turn.completed` event prevents a fresh
+replay. A usable public response or Codex last-message artifact always wins,
+even if executable metadata changes after completion, and a malformed artifact
+continues through normal validation. Absolute command overrides require direct
+identity evidence; ordinary unchanged-identity Codex failures are not treated
+as replacement interruptions.
+
+After Codex identity evidence, the loop waits for executable stability for at
+most six seconds independently of the interrupted turn's timeout, then makes
+one fresh replay with the full configured timeout. This replay does not consume
+the ordinary retry allowance. Ordinary Codex logs keep their existing names;
+only the dedicated replay is suffixed `executable-replacement-attempt2`.
+Claude retains its invocation deadline and replays only with the remaining
+budget, using `self-update-attempt2`. If stability or replay/retry exhaustion
+leaves a failure, the error retains a specific executable-replacement/self-update
+diagnostic. A genuine long quota reset remains the primary exit-code-3 result,
+with any earlier replacement context appended.
+
 For trusted local automation that must run without approval prompts:
 
 ```bash

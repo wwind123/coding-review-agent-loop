@@ -17,7 +17,7 @@ from .base import (
     with_public_response_file_instruction,
 )
 from ..logging import agent_log_path, log
-from ..runner import CommandResult, ExecutableIdentity, Runner
+from ..runner import CommandResult, Runner, executable_identity_changed
 from ..usage import UsageMetadata, coerce_int, first_present
 
 if TYPE_CHECKING:
@@ -101,16 +101,6 @@ _UPDATER_DIAGNOSTIC_RE = re.compile(
 )
 
 
-def _identity_changed(before: ExecutableIdentity, after: ExecutableIdentity, *, spawn_wall: float, exit_wall: float) -> bool:
-    changed = (before.path, before.target, before.entry_identity, before.target_identity) != (
-        after.path, after.target, after.entry_identity, after.target_identity
-    )
-    if not changed:
-        return False
-    mtimes = [identity[2] / 1_000_000_000 for identity in (after.entry_identity, after.target_identity) if identity]
-    return not mtimes or any(spawn_wall - 5 <= mtime <= exit_wall + 2 for mtime in mtimes)
-
-
 def _has_updater_diagnostic(output: str) -> bool:
     lines = [line.strip() for line in output.splitlines() if line.strip()][-8:]
     return bool(_UPDATER_DIAGNOSTIC_RE.search("\n".join(lines)[-2048:]))
@@ -143,7 +133,12 @@ def classify_self_update_interruption(
     # race through an identity change while it was running.
     if os.path.isabs(command):
         return None
-    if _identity_changed(observation.before, observation.after, spawn_wall=observation.spawn_wall_time, exit_wall=observation.spawn_wall_time + observation.elapsed_seconds):
+    if executable_identity_changed(
+        observation.before,
+        observation.after,
+        spawn_wall_time=observation.spawn_wall_time,
+        exit_wall_time=observation.spawn_wall_time + observation.elapsed_seconds,
+    ):
         return "Claude executable changed during invocation"
     return None
 

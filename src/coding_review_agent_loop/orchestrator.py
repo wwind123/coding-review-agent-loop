@@ -1312,6 +1312,29 @@ def _unsupported_model_suggestion(diagnostic: _UnsupportedModelDiagnostic | None
     )
 
 
+def _executable_replacement_failure_detail(
+    *,
+    provider: AgentName | None,
+    reason: str | None,
+    stability_error: str | None,
+) -> str:
+    """Render sticky replacement evidence without losing the terminal cause."""
+    if provider is None:
+        return ""
+    if stability_error:
+        return stability_error
+    if provider == "claude":
+        label = "Claude self-update"
+    elif provider == "codex":
+        label = "Codex executable replacement"
+    else:
+        label = "agent executable replacement"
+    detail = f"likely {label} interruption"
+    if reason:
+        detail += f" ({reason})"
+    return f"{detail}; dedicated replay and ordinary retries were exhausted."
+
+
 def _failure_suggestion(
     category: str | None,
     reason: str,
@@ -1330,7 +1353,11 @@ def _failure_suggestion(
             "or switch that agent/model before re-running."
         )
     if category == "self-update-interruption":
-        return "Suggestion: wait for the Claude Code self-update to finish, then re-run."
+        if agent_name.lower() == "claude":
+            return "Suggestion: wait for the Claude Code self-update to finish, then re-run."
+        return "Suggestion: wait for the agent executable replacement to finish, then re-run."
+    if category == "executable-replacement":
+        return "Suggestion: wait for the Codex executable replacement to finish, then re-run."
     if category == "transient":
         if _QUOTA_RATE_LIMIT_RE.search(combined):
             return (
@@ -1419,7 +1446,12 @@ def _format_invalid_agent_response_error(
     elif category == "timeout":
         category_hint = " Failure category: timeout (the agent exceeded the configured time limit)."
     elif category == "self-update-interruption":
-        category_hint = " Failure category: self-update-interruption (Claude Code updated during startup)."
+        if agent_name.lower() == "claude":
+            category_hint = " Failure category: self-update-interruption (Claude Code updated during startup)."
+        else:
+            category_hint = " Failure category: self-update-interruption (the agent executable changed during invocation)."
+    elif category == "executable-replacement":
+        category_hint = " Failure category: executable-replacement (Codex changed during invocation)."
     elif category == "agent-unavailable":
         category_hint = " Failure category: agent-unavailable (the agent explicitly could not continue)."
     if not classification_text:
@@ -2198,7 +2230,7 @@ def _run_validated_agent(
     max_attempts = (
         len(config.antigravity_models) + config.agent_max_retries
         if antigravity_attempts is not None
-        else config.agent_max_retries + 2 if agent == "claude" else config.agent_max_retries + 1
+        else config.agent_max_retries + 2 if agent in {"claude", "codex"} else config.agent_max_retries + 1
     )
     last_error = f"{agent_name} produced no output."
     last_result: AgentResult | None = None
@@ -2213,8 +2245,10 @@ def _run_validated_agent(
     completion_recovery_attempted = False
     # Keep the detection guard separate from the replay marker: a failed
     # stability check must not make the next ordinary retry look like a replay.
-    updater_replay_considered = False
-    updater_replay_pending = False
+    executable_replacement_considered = False
+    executable_replacement_replay_pending = False
+    executable_replacement_provider: AgentName | None = None
+    executable_replacement_reason: str | None = None
     ordinary_retries_used = 0
     self_update_deadline: float | None = None
     self_update_stability_error: str | None = None
@@ -2227,13 +2261,15 @@ def _run_validated_agent(
             else config
         )
         invocation_kwargs: dict[str, object] = {}
-        is_self_update_replay = updater_replay_pending
+        is_executable_replacement_replay = executable_replacement_replay_pending
         if agent == "claude":
             invocation_kwargs["attempt_suffix"] = (
                 "self-update-attempt2"
-                if is_self_update_replay
+                if is_executable_replacement_replay
                 else f"attempt{ordinary_retries_used + 1}"
             )
+        elif agent == "codex" and is_executable_replacement_replay:
+            invocation_kwargs["attempt_suffix"] = "executable-replacement-attempt2"
         result = run_agent_result(
             runner,
             agent=agent,
@@ -2248,8 +2284,8 @@ def _run_validated_agent(
         )
         # The bounded deadline belongs only to the interrupted invocation and
         # its dedicated replay. A later ordinary retry has its normal budget.
-        if is_self_update_replay:
-            updater_replay_pending = False
+        if is_executable_replacement_replay:
+            executable_replacement_replay_pending = False
             next_timeout_seconds = timeout_seconds
         last_result = result
         if result.log_path is not None:
@@ -2312,46 +2348,81 @@ def _run_validated_agent(
                 # envelope, even when the command itself failed.
                 text = artifact
 
-        # A Claude process can be replaced by its self-updater after it spawned.
-        # This is exclusive with ordinary transient classification and gets one
-        # full replay only after the bare executable is stable.
+        # Claude or Codex can be replaced after spawning. This is exclusive with
+        # ordinary transient classification and gets one full replay only after
+        # the configured executable is stable.
         if (
-            agent == "claude"
+            agent in {"claude", "codex"}
             and result.self_update_reason is not None
-            and not updater_replay_considered
+            and not executable_replacement_considered
             and result.command_result is not None
         ):
-            updater_replay_considered = True
+            executable_replacement_considered = True
+            executable_replacement_provider = agent
+            executable_replacement_reason = result.self_update_reason
             observation = result.command_result.observation
-            self_update_deadline = (
-                observation.spawn_monotonic + timeout_seconds
-                if timeout_seconds is not None and observation is not None
-                else None
-            )
-            stable = runner.wait_for_executable_stability(
-                config.claude_cmd, deadline=self_update_deadline
-            )
-            remaining = (
-                self_update_deadline - time.monotonic()
-                if self_update_deadline is not None else None
-            )
-            if not stable or (remaining is not None and remaining <= 0):
+            if agent == "claude":
+                self_update_deadline = (
+                    observation.spawn_monotonic + timeout_seconds
+                    if timeout_seconds is not None and observation is not None
+                    else None
+                )
+                stable = runner.wait_for_executable_stability(
+                    config.claude_cmd, deadline=self_update_deadline
+                )
+                remaining = (
+                    self_update_deadline - time.monotonic()
+                    if self_update_deadline is not None else None
+                )
+                replay_timeout = remaining
+                deadline_exhausted = remaining is not None and remaining <= 0
+            else:
+                # Codex replacement recovery has its own bounded six-second
+                # stability observation. The replay is a fresh invocation and
+                # receives the full configured timeout, if any.
+                stable = runner.wait_for_executable_stability(
+                    config.codex_cmd, deadline=None
+                )
+                replay_timeout = timeout_seconds
+                deadline_exhausted = False
+            if not stable or deadline_exhausted:
+                provider_label = (
+                    "Claude self-update"
+                    if agent == "claude"
+                    else "Codex executable replacement"
+                )
+                deadline_label = (
+                    "within the invocation deadline"
+                    if agent == "claude"
+                    else "within the bounded stability window"
+                )
                 self_update_stability_error = (
-                    f"likely Claude self-update interruption ({result.self_update_reason}); "
-                    "executable did not stabilize within the invocation deadline"
+                    f"likely {provider_label} interruption ({result.self_update_reason}); "
+                    f"executable did not stabilize {deadline_label}"
                 )
                 if usage_record is not None:
-                    usage_record.outcome = "self_update_interruption"
+                    usage_record.outcome = (
+                        "self_update_interruption"
+                        if agent == "claude"
+                        else "executable_replacement_interruption"
+                    )
                     usage_record.log_path = str(result.log_path) if result.log_path else None
-                # Preserve any ordinary transient retry allowance: a failed
-                # stability observation does not make provider errors final.
+                # Preserve the ordinary retry allowance: a failed stability
+                # observation does not make provider errors final.
             else:
-                updater_replay_pending = True
+                executable_replacement_replay_pending = True
                 if usage_record is not None:
-                    usage_record.outcome = "self_update_interruption"
+                    usage_record.outcome = (
+                        "self_update_interruption"
+                        if agent == "claude"
+                        else "executable_replacement_interruption"
+                    )
                     usage_record.log_path = str(result.log_path) if result.log_path else None
-                next_timeout_seconds = remaining
-                log(config, f"{agent_name}: {result.self_update_reason}; replaying once after executable stability")
+                next_timeout_seconds = replay_timeout
+                log(
+                    config,
+                    f"{agent_name}: {result.self_update_reason}; replaying once after executable stability",
+                )
                 continue
         should_retry = False
         provider_capacity = False
@@ -2875,6 +2946,17 @@ def _run_validated_agent(
                         f"{agent_name} quota exhausted. Reset in {duration_str} (at {at_str}). "
                         "Rerun when quota resets, or switch to a different API key / model."
                     )
+                    replacement_detail = _executable_replacement_failure_detail(
+                        provider=executable_replacement_provider,
+                        reason=executable_replacement_reason,
+                        stability_error=self_update_stability_error,
+                    )
+                    diagnostic_classification_text = classification_text
+                    if replacement_detail:
+                        message += f" {replacement_detail}"
+                        diagnostic_classification_text = (
+                            f"{classification_text}\n{replacement_detail}"
+                        ).strip()
                     diagnostics = _failed_run_diagnostics(
                         runner=runner,
                         config=config,
@@ -2883,7 +2965,7 @@ def _run_validated_agent(
                         operation_description=operation_description,
                         failure_category=last_failure_category,
                         failure_reason=message,
-                        classification_text=classification_text,
+                        classification_text=diagnostic_classification_text,
                         marker_description=marker_description,
                         result=last_result,
                     )
@@ -2928,9 +3010,21 @@ def _run_validated_agent(
                 continue
         break
 
-    if self_update_stability_error is not None:
-        last_error = f"{self_update_stability_error}; final failure: {last_error}"
-        last_failure_category = "self-update-interruption"
+    if executable_replacement_provider is not None:
+        replacement_detail = _executable_replacement_failure_detail(
+            provider=executable_replacement_provider,
+            reason=executable_replacement_reason,
+            stability_error=self_update_stability_error,
+        )
+        last_error = f"{replacement_detail}; final failure: {last_error}"
+        last_classification_text = (
+            f"{last_classification_text}\n{replacement_detail}"
+        ).strip()
+        last_failure_category = (
+            "self-update-interruption"
+            if executable_replacement_provider == "claude"
+            else "executable-replacement"
+        )
     diagnostics = _failed_run_diagnostics(
         runner=runner,
         config=config,
