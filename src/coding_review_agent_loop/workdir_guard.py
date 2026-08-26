@@ -741,6 +741,8 @@ def _malformed_wrapper_recovery_targets(
     tokens: Sequence[str],
     start: int,
     n: int,
+    *,
+    wrapper_positions: set[int] | None = None,
 ) -> list[str]:
     """Recover a command-shaped head without making later URLs commands.
 
@@ -750,15 +752,17 @@ def _malformed_wrapper_recovery_targets(
     clause-wide so incidental words such as ``no proxy`` cannot hide a URL.
     """
     phrase_end = _execution_phrase_end(tokens, start, n)
-    traversal = _wrapper_traversal(tokens[start:phrase_end])
-    wrapper_positions = (
-        traversal.program_positions if traversal.recognized_prefix else set()
-    )
+    if wrapper_positions is None:
+        traversal = _wrapper_traversal(tokens[start:phrase_end])
+        wrapper_positions = {
+            start + position for position in traversal.program_positions
+        }
     head_idx = next(
         (
             idx
             for idx in range(start, phrase_end)
-            if idx - start not in wrapper_positions
+            if idx not in wrapper_positions
+            and _program_basename(tokens[idx]) not in WRAPPER_PROGRAMS
             and not _is_url_token(tokens[idx])
             and _is_command_shaped(tokens[idx])
         ),
@@ -781,7 +785,12 @@ def _head_opened_span_targets(clause: _Clause) -> list[str]:
             return _walk_span(tokens, head_idx, n)
         return []
     if traversal.recognized_prefix:
-        return _malformed_wrapper_recovery_targets(tokens, 0, n)
+        return _malformed_wrapper_recovery_targets(
+            tokens,
+            0,
+            n,
+            wrapper_positions=traversal.program_positions,
+        )
     return []
 
 
@@ -837,7 +846,16 @@ def _verb_based_targets(clause: _Clause) -> list[str]:
             targets.extend(attached)
             continue
         if traversal.recognized_prefix and traversal.effective_head_index is None:
-            targets.extend(_malformed_wrapper_recovery_targets(tokens, start, n))
+            targets.extend(
+                _malformed_wrapper_recovery_targets(
+                    tokens,
+                    j,
+                    n,
+                    wrapper_positions={
+                        j + position for position in traversal.program_positions
+                    },
+                )
+            )
     return targets
 
 
