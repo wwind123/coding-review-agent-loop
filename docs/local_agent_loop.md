@@ -1239,9 +1239,19 @@ not on path components: wrapper operands, option values, workdirs,
 test/script targets, unrecognized outputs, remote targets, malformed commands,
 and arbitrary `/tmp` paths receive no blanket exemption, so a toolchain-shaped path
 used as an ordinary argument (`pytest /outside/bin/tests/test_foo.py`) still
-fails containment. Package acquisition (`pip install ...`, including the
-`python -m pip install ...` form) is exempted from the separate live-target
-check described below, but never from path containment.
+fails containment. In narrative execution phrases, the parser may skip one
+optional determiner, leading `VAR=VALUE` assignments, and basename-normalized
+wrapper paths before resolving the effective head; a direct HTTP(S) URL at that
+head is treated as the target. If a recognized wrapper prefix is malformed,
+recovery may promote a later command-shaped token only when it occurs before
+the governing boundary, and never promotes an otherwise unattached URL.
+Wrapper traversal stops only at the next execution verb. Malformed recovery in
+both verb-adjacent and verbless narrative clauses, as well as prose
+prepositional attachment, stops at governing negation or the next execution
+verb. After a command head is successfully resolved or recovered, its target
+span runs through the end of the clause. Package acquisition (`pip install ...`,
+including the `python -m pip install ...` form) is exempted from the separate
+live-target check described below, but never from path containment.
 A URL is rejected as a live remote target when it appears in command syntax
 (a structured entry, or backtick-quoted command text in a `Tests:` report) or
 is reported as the target of an affirmative execution phrase in prose (`ran

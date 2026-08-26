@@ -268,6 +268,53 @@ def test_timeout_wrapped_urls_in_response_are_command_classified(tmp_path):
             validate_response_tests_within_workdir(f"Tests: `{command}`", assigned_workdir=assigned)
 
 
+NARRATIVE_WRAPPED_LIVE_TARGETS = [
+    "Tests: ran timeout -k 5 180s curl https://live.example",
+    "Tests: ran sudo -u none curl https://live.example",
+    "Tests: ran nohup --verbose curl https://live.example",
+    "Tests: ran nice -n 5 curl https://live.example",
+    "Tests: ran time -p curl https://live.example",
+    "Tests: ran stdbuf -o L curl https://live.example",
+    "Tests: ran command -p curl https://live.example",
+    "Tests: ran env -u NO curl https://live.example",
+    "Tests: ran xargs -n 1 curl https://live.example",
+    "Tests: ran timeout --foreground 180s curl https://live.example",
+    "Tests: ran sudo -E nohup nice -10 time -p stdbuf -p command -p env -i xargs -r curl https://live.example",
+    "Tests: ran timeout 180s sudo -u none env -u NO curl https://live.example",
+    "Tests: ran /usr/bin/timeout 180s curl https://live.example",
+    "Tests: ran the curl https://live.example",
+    "Tests: ran the timeout 180s curl https://live.example",
+    "Tests: ran https://live.example",
+    "Tests: ran the https://live.example",
+    "Tests: ran FOO=1 https://live.example",
+]
+
+
+@pytest.mark.parametrize("text", NARRATIVE_WRAPPED_LIVE_TARGETS)
+def test_rejects_non_backticked_wrapped_live_targets(tmp_path, text):
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        validate_response_tests_within_workdir(text, assigned_workdir=_assigned(tmp_path))
+
+
+@pytest.mark.parametrize("text", [
+    "Tests: ran timeout curl https://live.example",
+    "Tests: timeout curl https://live.example",
+    "Tests: ran timeout badduration curl https://live.example",
+    "Tests: ran /usr/bin/timeout badduration curl https://live.example",
+    "Tests: /usr/bin/timeout badduration curl https://live.example",
+    "Tests: ran the /usr/bin/timeout badduration curl https://live.example",
+    "Tests: ran timeout badduration /usr/bin/timeout 180s curl https://live.example",
+    "Tests: timeout badduration /usr/bin/timeout 180s curl https://live.example",
+    "Tests: ran timeout --kill-after curl https://live.example",
+    "Tests: ran sudo -u curl https://live.example",
+    "Tests: ran env -u curl https://live.example",
+    "Tests: ran xargs -n curl https://live.example",
+])
+def test_malformed_wrapper_recovery_rejects_only_when_a_head_is_recoverable(tmp_path, text):
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        validate_response_tests_within_workdir(text, assigned_workdir=_assigned(tmp_path))
+
+
 @pytest.mark.parametrize("text", [
     "Tests: time constraints meant we relied on the report at https://ci.example/123",
     "Tests: env variables are documented at https://ci.example/123",
@@ -457,6 +504,9 @@ REJECTED_NARRATIVE_URLS = [
     "Tests: `pytest tests/unit` passed; also ran curl https://live.example/health",
     "Tests: ran curl https://live.example/health to verify.",
     "Tests: did not run unit tests but ran curl https://live.example",
+    "Tests: ran curl with no proxy https://live.example",
+    "Tests: ran curl skipped nothing https://live.example",
+    "Tests: ran timeout 180s curl with no proxy https://live.example",
     # The attached URL sits behind an earlier, non-URL prepositional object;
     # only scanning the first preposition would read this as benign prose.
     "Tests: ran the suite against the production environment at https://live.example",
@@ -524,10 +574,18 @@ ACCEPTED_NARRATIVE_TEXTS = [
     "Tests: pytest tests/test_foo.py -q - did not run the https://dev.aispar.app e2e suite.",
     "Tests: pytest tests/test_foo.py -q passed. Deployment notes live at https://dev.aispar.app/docs.",
     "Tests: ran pytest tests/test_foo.py -q, release notes at https://dev.aispar.app/notes.",
+    "Tests: ran timeout regression checks and attached https://docs.example/run",
+    "Tests: ran timeout notes and no curl https://live.example",
+    "Tests: ran timeout regression checks and ran release notes about https://docs.example/run.",
+    "Tests: Timeout tuning notes live in https://pkg.go.dev/net/http",
+    "Tests: ran timeout tuning notes and published https://pkg.go.dev/net/http",
     # Negation still wins over the full-phrase preposition scan, both when the
     # verb itself is negated and when the negation precedes the preposition.
     "Tests: Did not run the suite against the production environment at https://live.example.",
     "Tests: ran the unit suite against the local stub and never against https://live.example.",
+    "Tests: Timeout tuning did not make https://ci.example/123 flaky",
+    "Tests: Timeout budgets were not enough to go https://ci.example/123",
+    "Tests: Timeout tuning means no curl runs against https://ci.example/123",
 ]
 
 
