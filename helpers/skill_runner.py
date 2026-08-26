@@ -3847,7 +3847,10 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
     if dry_run:
         from coding_review_agent_loop.github import IssueContext
 
-        preview_issue_number = first_phase.issue_number or 0
+        # A dry-run fake GitHub response may not assign a child number. Keep
+        # the prompt scope valid by previewing against the parent issue rather
+        # than manufacturing the invalid issue zero.
+        preview_issue_number = first_phase.issue_number or issue
         preview_context = IssueContext(
             number=preview_issue_number,
             repo=repo,

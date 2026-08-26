@@ -283,3 +283,29 @@ def test_create_managed_pr_rejects_reserved_body_markers(tmp_path, marker):
         )
 
     assert runner.calls == []
+
+
+def test_create_managed_pr_accepts_non_reserved_issue_provenance_body_text(tmp_path):
+    runner = ManagedPrRunner()
+
+    # The trailer is commit metadata, not a durable body record. If a provider
+    # copies it into a body, managed-pr must still apply its normal body checks.
+    body = (
+        "Fixes #680\n\n"
+        "Agent-Issue-Provenance: v1 repo=owner/repo issue=680 flow=direct"
+    )
+    with patch("coding_review_agent_loop.managed_pr.preflight_managed_ci_creation", _intent):
+        create_managed_pr(
+            runner,
+            config=_config(tmp_path),
+            source_branch="fix/body-provenance",
+            title="Non-reserved provenance",
+            body=body,
+        )
+
+    assert any(
+        "--method" in cmd
+        and cmd[cmd.index("--method") + 1] == "POST"
+        and cmd[cmd.index("--method") + 2].endswith("/pulls")
+        for cmd, _body in runner.calls
+    )

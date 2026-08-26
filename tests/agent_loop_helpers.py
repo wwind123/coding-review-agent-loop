@@ -248,6 +248,9 @@ class FakeRunner(Runner):
         search_issues_payload=None,
         open_prs_payload=None,
         mergeability_payloads=None,
+        pr_commit_pages=None,
+        pr_commit_metadata_payloads=None,
+        pr_commit_query_failures=None,
     ):
         super().__init__(dry_run=False)
         self.claude_outputs = list(claude_outputs or [])
@@ -361,6 +364,12 @@ class FakeRunner(Runner):
             list(mergeability_payloads) if mergeability_payloads is not None else None
         )
         self.mergeability_calls = 0
+        self.pr_commit_pages = list(
+            pr_commit_pages if pr_commit_pages is not None else pr_commit_metadata_payloads or []
+        )
+        self.pr_commit_query_failures = list(pr_commit_query_failures or [])
+        self.pr_commit_calls = 0
+        self._provenance_issue_number = self.issue_payload.get("number", 56)
         self._agent_pr_counter = 0
         self._agent_command_seen = False
         # Parallel discuss debaters (#475) call run_with_log from worker
@@ -823,6 +832,18 @@ class FakeRunner(Runner):
 
         if cmd[:3] == ["gh", "pr", "list"]:
             self.open_prs_calls += 1
+            for item in self.open_prs_payload:
+                if not isinstance(item, dict):
+                    continue
+                body = str(item.get("body") or "")
+                issue_match = re.search(
+                    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9]\d*)",
+                    body,
+                    re.I,
+                )
+                if issue_match:
+                    self._provenance_issue_number = int(issue_match.group(1))
+                    break
             return CommandResult(cmd, cwd_path, json_dumps(self.open_prs_payload), "", 0)
 
         if (
@@ -875,6 +896,59 @@ class FakeRunner(Runner):
 
         if cmd[:2] == ["gh", "api"] and "/issues/" in cmd[2]:
             return CommandResult(cmd, cwd_path, json_dumps(self.issue_payload), "", 0)
+
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            self.pr_commit_calls += 1
+            if self.pr_commit_query_failures:
+                failure = self.pr_commit_query_failures.pop(0)
+                return CommandResult(cmd, cwd_path, "", str(failure), 1)
+            if self.pr_commit_pages:
+                payload = self.pr_commit_pages.pop(0)
+            else:
+                head_sha = self.pr_payload.get("headRefOid") or "abc123"
+                issue_number = self._provenance_issue_number
+                payload = {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "headRefOid": head_sha,
+                                "commits": {
+                                    "totalCount": 1,
+                                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                    "nodes": [
+                                        {
+                                            "commit": {
+                                                "oid": "commit-1",
+                                                "message": (
+                                                    "Implement issue.\n\n"
+                                                    "Agent-Issue-Provenance: v1 "
+                                                    f"repo=owner/repo issue={issue_number} flow=direct"
+                                                ),
+                                            }
+                                        }
+                                    ],
+                                },
+                            }
+                        }
+                    }
+                }
+            if isinstance(payload, list):
+                head_sha = self.pr_payload.get("headRefOid") or "abc123"
+                payload = {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "headRefOid": head_sha,
+                                "commits": {
+                                    "totalCount": len(payload),
+                                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                    "nodes": payload,
+                                },
+                            }
+                        }
+                    }
+                }
+            return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
 
         if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/check-runs"):
             if "--jq" in cmd:

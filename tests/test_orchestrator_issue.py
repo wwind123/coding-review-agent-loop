@@ -13,8 +13,10 @@ from coding_review_agent_loop.issue_pr_handoff import (
     format_issue_pr_handoff_comment,
     resolve_canonical_pr_for_issue,
 )
+from coding_review_agent_loop.issue_pr_provenance import IssuePrProvenanceScope
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
+    _advisory_issue_pr_provenance,
     _attach_round_metadata,
     _decode_round_metadata,
     _infer_staged_parent_issue,
@@ -49,6 +51,38 @@ from agent_loop_helpers import (
     structured_plan_state,
     structured_pr_review,
 )
+
+
+def _provenance_pages(message: str):
+    page = {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "headRefOid": "abc123",
+                    "commits": {
+                        "totalCount": 1,
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [{"commit": {"oid": "commit-1", "message": message}}],
+                    },
+                }
+            }
+        }
+    }
+    return [page, page]
+
+
+def test_advisory_issue_provenance_skips_commit_scan_in_dry_run(tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path, dry_run=True)
+
+    _advisory_issue_pr_provenance(
+        runner,
+        config=config,
+        pr_number=77,
+        expected_scope=IssuePrProvenanceScope("OWNER/REPO", 56, "direct"),
+    )
+
+    assert runner.pr_commit_calls == 0
 
 
 class FakeRunner(_FakeRunner):
@@ -2437,6 +2471,10 @@ def test_issue_loop_plan_first_one_shot_resumes_existing_pr_after_crash_before_h
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
+        pr_commit_pages=_provenance_pages(
+            "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=approved "
+            f"plan={approved_plan_hash(plan)}"
+        ),
     )
     config = make_config(tmp_path)
 
@@ -2489,6 +2527,10 @@ def test_issue_loop_plan_first_one_shot_resume_existing_pr_logs_clear_message(tm
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         open_prs_payload=[{"number": 492, "body": "Fixes #56"}],
+        pr_commit_pages=_provenance_pages(
+            "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=approved "
+            f"plan={approved_plan_hash(plan)}"
+        ),
     )
     config = make_config(tmp_path, quiet=False)
 

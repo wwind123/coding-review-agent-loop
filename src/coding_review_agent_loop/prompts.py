@@ -12,8 +12,9 @@ from typing import Sequence
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .config import AgentLoopConfig, reviewers
-from .decomposition import MAX_DECOMPOSITION_PHASES
+from .decomposition import MAX_DECOMPOSITION_PHASES, approved_plan_hash
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
+from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provenance
 from .memory import AgentMemoryContext, format_agent_memory_context
 from .managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
 from .salvage import AGENT_SALVAGE_MARKER_RE
@@ -187,6 +188,21 @@ def _coder_documentation_guidance() -> str:
     return (
         "If your implementation adds or changes a user-facing subcommand, flag, "
         "or mode, update README.md and any relevant docs/ files as part of this PR.\n"
+    )
+
+
+def _issue_pr_provenance_guidance(scope: IssuePrProvenanceScope) -> str:
+    trailer = format_issue_pr_provenance(scope)
+    return (
+        "Commit provenance is an unauthenticated convention used only to reduce accidental "
+        "adoption of an unrelated open PR; it is not an authentication boundary. Before creating "
+        "the PR, ensure at least one implementation commit carries this complete Git trailer line "
+        f"exactly: `{trailer}`. Keep this trailer out of the PR body and all comments. Use an "
+        "explicit PR body when creating the PR; if `gh pr create --fill` copied the trailer into "
+        "the body, remove that copy before opening or update the body explicitly while preserving "
+        "all required closing references. Do not rewrite or force-push solely to add the trailer "
+        "after a canonical handoff exists."
+        "\n"
     )
 
 
@@ -1235,6 +1251,9 @@ def build_issue_prompt(
             expected_closing_issue_ids=config.expected_closing_issue_ids,
         )
     )
+    provenance_guidance = _issue_pr_provenance_guidance(
+        IssuePrProvenanceScope(repository=config.repo, issue_number=issue_number, flow="direct")
+    )
     managed_creation_guidance = _managed_ci_creation_guidance(managed_ci_creation_intent)
     return f"""Fix GitHub issue #{issue_number} in {config.repo}.
 
@@ -1244,6 +1263,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {pr_reference_guidance}
+{provenance_guidance}
 {managed_creation_guidance}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
@@ -1825,6 +1845,14 @@ def build_issue_implementation_prompt(
             expected_closing_issue_ids=config.expected_closing_issue_ids,
         )
     )
+    provenance_guidance = _issue_pr_provenance_guidance(
+        IssuePrProvenanceScope(
+            repository=config.repo,
+            issue_number=issue_number,
+            flow="approved",
+            approved_plan_hash=approved_plan_hash(approved_plan),
+        )
+    )
     managed_creation_guidance = _managed_ci_creation_guidance(managed_ci_creation_intent)
     return f"""Implement the approved plan for GitHub issue #{issue_number} in {config.repo}.
 
@@ -1835,6 +1863,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {pr_reference_guidance}
+{provenance_guidance}
 {managed_creation_guidance}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,

@@ -402,7 +402,10 @@ or `Resolves`) for the issue; bare references, `Refs`, contextual URLs, and
 discussion prose are not implementation evidence. Multiple candidates stop
 with cleanup guidance. Use `agent-loop pr <number>` when the PR is known, and
 see [Issue-to-PR association and recovery](docs/local_agent_loop.md#issue-to-pr-association-and-recovery)
-for plan-hash checks and operator recovery.
+for plan-hash checks and operator recovery. Metadata-free closing-reference
+recovery now requires an exact unauthenticated commit-trailer scope, so
+pre-trailer PRs and `agent-loop managed-pr --head` PRs without that trailer
+must be resumed directly with `agent-loop pr <number>` rather than adopted.
 
 ### Expected closing issues
 

@@ -1052,7 +1052,12 @@ Bare `#123`, `Refs #123`, contextual URLs, discussion prose, titles, branch
 names, and cross-repository references are not candidates. Pagination covers
 the full open-PR list. Multiple strong candidates stop with their PR numbers
 and matched closing evidence, plus cleanup and `agent-loop pr <number>`
-guidance.
+guidance. A sole candidate must also carry one or more identical, complete
+`Agent-Issue-Provenance` Git commit trailers for the exact repository, issue,
+flow, and (for plan-first recovery) approved-plan hash. Missing, malformed,
+conflicting, stale, or unstable commit history fails closed. This trailer is
+an unauthenticated convention that reduces accidental adoption, not an
+authentication boundary, because contributors can copy it.
 
 New direct and approved-plan PRs must contain a closing phrase for their issue
 before a handoff marker is posted. A staged child closes the child, includes
@@ -1066,7 +1071,12 @@ planning; a definite mismatch stops with the PR and both hashes and directs the
 operator to `agent-loop pr <number>` or handoff cleanup. If no plan round can be
 reconstructed, a valid canonical record resumes with a warning and its recorded
 hash. A metadata-free legacy candidate is stopped rather than assigned invented
-plan provenance, while direct mode can backfill a strong legacy candidate.
+plan provenance, while direct mode can backfill only a matching trailer-backed
+candidate. Metadata-free recovery is retired: pre-trailer PRs and
+`agent-loop managed-pr --head` PRs without a trailer require direct resume with
+`agent-loop pr <number>`. Squash or rebase removal of the trailer matters only
+before a canonical handoff exists; newly created PRs receive an advisory
+warning and still complete their authoritative handoff.
 
 Logs identify canonical marker versus legacy closing-reference evidence. To
 recover from a false handoff, edit or delete the latest canonical marker and,

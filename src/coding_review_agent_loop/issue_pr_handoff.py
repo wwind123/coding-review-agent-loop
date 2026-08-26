@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 from .config import AgentLoopConfig
 from .errors import AgentLoopError
 from .expected_closure import contract_hash, normalize_issue_ids
+from .issue_pr_provenance import IssuePrProvenanceScope
 from .github import (
     IssueContext,
     OpenPrClosingMatch,
@@ -43,6 +44,9 @@ AGENT_ISSUE_PR_HANDOFF_RE = re.compile(
     r"<!--\s*AGENT_ISSUE_PR_HANDOFF:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
     re.I,
 )
+
+
+_UNSET_FALLBACK_SCOPE = object()
 
 
 @dataclass(frozen=True)
@@ -311,6 +315,7 @@ def resolve_canonical_pr_for_issue(
     config: AgentLoopConfig,
     issue_number: int,
     issue_context: IssueContext,
+    expected_fallback_scope: IssuePrProvenanceScope | None | object = _UNSET_FALLBACK_SCOPE,
 ) -> ResolvedIssuePr | None:
     """Resolve the PR a rerun of `agent-loop issue <issue_number>` should resume.
 
@@ -387,8 +392,15 @@ def resolve_canonical_pr_for_issue(
         return ResolvedIssuePr(
             pr_number=canonical.pr_number, source="canonical", evidence=canonical
         )
+    if expected_fallback_scope is _UNSET_FALLBACK_SCOPE:
+        expected_fallback_scope = IssuePrProvenanceScope(
+            repository=config.repo, issue_number=issue_number, flow="direct"
+        )
     legacy_match = find_open_pr_closing_issue(
-        runner, config=config, issue_number=issue_number
+        runner,
+        config=config,
+        issue_number=issue_number,
+        expected_scope=expected_fallback_scope,
     )
     if legacy_match is None:
         return None
