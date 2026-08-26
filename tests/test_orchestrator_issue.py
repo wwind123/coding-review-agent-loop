@@ -13,8 +13,10 @@ from coding_review_agent_loop.issue_pr_handoff import (
     format_issue_pr_handoff_comment,
     resolve_canonical_pr_for_issue,
 )
+from coding_review_agent_loop.issue_pr_provenance import IssuePrProvenanceScope
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
+    _advisory_issue_pr_provenance,
     _attach_round_metadata,
     _decode_round_metadata,
     _infer_staged_parent_issue,
@@ -67,6 +69,20 @@ def _provenance_pages(message: str):
         }
     }
     return [page, page]
+
+
+def test_advisory_issue_provenance_skips_commit_scan_in_dry_run(tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path, dry_run=True)
+
+    _advisory_issue_pr_provenance(
+        runner,
+        config=config,
+        pr_number=77,
+        expected_scope=IssuePrProvenanceScope("OWNER/REPO", 56, "direct"),
+    )
+
+    assert runner.pr_commit_calls == 0
 
 
 class FakeRunner(_FakeRunner):

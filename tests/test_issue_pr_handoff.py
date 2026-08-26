@@ -45,10 +45,18 @@ def _metadata(**overrides) -> IssuePrHandoffMetadata:
     return IssuePrHandoffMetadata(**defaults)
 
 
-def _commit_page(messages, *, head="abc123", total=None, has_next=False, cursor=None):
+def _commit_page(
+    messages,
+    *,
+    head="abc123",
+    total=None,
+    has_next=False,
+    cursor=None,
+    oid_start=1,
+):
     nodes = [
         {"commit": {"oid": f"commit-{index}", "message": message}}
-        for index, message in enumerate(messages, start=1)
+        for index, message in enumerate(messages, start=oid_start)
     ]
     return {
         "data": {
@@ -66,7 +74,7 @@ def _commit_page(messages, *, head="abc123", total=None, has_next=False, cursor=
     }
 
 
-def _provenance_pages(message, *, issue=56, flow="direct", plan=None):
+def _provenance_pages(*, issue=56, flow="direct", plan=None):
     scope = IssuePrProvenanceScope("OWNER/REPO", issue, flow, plan)
     page = _commit_page([f"Change\n\n{format_issue_pr_provenance(scope)}"])
     return [page, page]
@@ -355,7 +363,7 @@ def test_provenance_parser_collapses_identical_claims_across_commits():
 def test_legacy_recovery_requires_complete_matching_commit_provenance(tmp_path):
     runner = FakeRunner(
         open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
-        pr_commit_pages=_provenance_pages("ignored"),
+        pr_commit_pages=_provenance_pages(),
     )
     config = make_config(tmp_path)
 
@@ -366,29 +374,37 @@ def test_legacy_recovery_requires_complete_matching_commit_provenance(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "pages",
+    ("pages", "provenance_reason"),
     [
-        [_commit_page([]), _commit_page([])],
-        [
-            _commit_page(
-                ["Change\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct\n"
-                 "Agent-Issue-Provenance: malformed"]
-            ),
-            _commit_page(["ignored"]),
-        ],
-        [
-            _commit_page(
-                [
-                    "Change\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct",
-                    "Other\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=57 flow=direct",
-                ],
-                total=2,
-            ),
-            _commit_page(["ignored"], total=2),
-        ],
+        ([_commit_page([]), _commit_page([])], "is missing"),
+        (
+            [
+                _commit_page(
+                    ["Change\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct\n"
+                     "Agent-Issue-Provenance: malformed"]
+                ),
+                _commit_page(["ignored"]),
+            ],
+            "is malformed",
+        ),
+        (
+            [
+                _commit_page(
+                    [
+                        "Change\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct",
+                        "Other\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=57 flow=direct",
+                    ],
+                    total=2,
+                ),
+                _commit_page(["ignored"], total=2),
+            ],
+            "contains conflicting claims",
+        ),
     ],
 )
-def test_invalid_single_candidate_recovery_includes_both_safe_remedies(tmp_path, pages):
+def test_invalid_single_candidate_recovery_includes_both_safe_remedies(
+    tmp_path, pages, provenance_reason
+):
     runner = FakeRunner(
         open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
         pr_commit_pages=pages,
@@ -399,9 +415,178 @@ def test_invalid_single_candidate_recovery_includes_both_safe_remedies(tmp_path,
         find_open_pr_closing_issue(runner, config=config, issue_number=56)
 
     message = str(exc_info.value)
+    assert provenance_reason in message
+    assert "unavailable" not in message
     assert "Remove the closing reference" in message
     assert "close the unrelated PR" in message
     assert "agent-loop pr 77" in message
+
+
+@pytest.mark.parametrize(
+    ("claimed_scope", "expected_scope"),
+    [
+        (
+            IssuePrProvenanceScope("OTHER/REPO", 56, "direct"),
+            IssuePrProvenanceScope("OWNER/REPO", 56, "direct"),
+        ),
+        (
+            IssuePrProvenanceScope("OWNER/REPO", 57, "direct"),
+            IssuePrProvenanceScope("OWNER/REPO", 56, "direct"),
+        ),
+        (
+            IssuePrProvenanceScope("OWNER/REPO", 56, "direct"),
+            IssuePrProvenanceScope("OWNER/REPO", 56, "approved", "current-plan"),
+        ),
+        (
+            IssuePrProvenanceScope("OWNER/REPO", 56, "approved", "current-plan"),
+            IssuePrProvenanceScope("OWNER/REPO", 56, "direct"),
+        ),
+        (
+            IssuePrProvenanceScope("OWNER/REPO", 56, "approved", "old-plan"),
+            IssuePrProvenanceScope("OWNER/REPO", 56, "approved", "current-plan"),
+        ),
+    ],
+    ids=["repository", "issue", "direct-to-approved", "approved-to-direct", "plan-hash"],
+)
+def test_single_candidate_recovery_rejects_one_well_formed_wrong_scope(
+    tmp_path, claimed_scope, expected_scope
+):
+    page = _commit_page([format_issue_pr_provenance(claimed_scope)])
+    runner = FakeRunner(
+        open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
+        pr_commit_pages=[page, page],
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="does not match the expected scope") as exc_info:
+        find_open_pr_closing_issue(
+            runner,
+            config=config,
+            issue_number=56,
+            expected_scope=expected_scope,
+        )
+
+    message = str(exc_info.value)
+    assert "unavailable" not in message
+    assert "Remove the closing reference" in message
+    assert "close the unrelated PR" in message
+    assert "agent-loop pr 77" in message
+
+
+def test_single_candidate_recovery_without_reconstructable_scope_gives_safe_remedies(tmp_path):
+    runner = FakeRunner(open_prs_payload=[{"number": 77, "body": "Fixes #56"}])
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="reconstructable approved-plan scope\\. Remove") as exc_info:
+        find_open_pr_closing_issue(
+            runner,
+            config=config,
+            issue_number=56,
+            expected_scope=None,
+        )
+
+    message = str(exc_info.value)
+    assert "close the unrelated PR" in message
+    assert "agent-loop pr 77" in message
+    assert runner.pr_commit_calls == 0
+
+
+def test_single_candidate_recovery_distinguishes_commit_query_unavailability(tmp_path):
+    runner = FakeRunner(
+        open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
+        pr_commit_query_failures=["connection reset"],
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="commit provenance is unavailable.*query failed") as exc_info:
+        find_open_pr_closing_issue(runner, config=config, issue_number=56)
+
+    message = str(exc_info.value)
+    assert "Remove the closing reference" in message
+    assert "close the unrelated PR" in message
+    assert "agent-loop pr 77" in message
+
+
+@pytest.mark.parametrize(
+    "changed_page",
+    [
+        _commit_page(["second"], head="def456", total=2, oid_start=2),
+        _commit_page(["second"], total=3, oid_start=2),
+    ],
+    ids=["head", "total"],
+)
+def test_commit_connection_rejects_history_change_during_pagination(tmp_path, changed_page):
+    first_page = _commit_page(["first"], total=2, has_next=True, cursor="cursor-1")
+    runner = FakeRunner(pr_commit_pages=[first_page, changed_page])
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="history changed during provenance scan"):
+        read_pull_request_commit_metadata(runner, config=config, pr_number=77)
+
+
+@pytest.mark.parametrize(
+    "final_page",
+    [
+        _commit_page(["first"], head="def456"),
+        _commit_page(["first"], total=2),
+    ],
+    ids=["head", "total"],
+)
+def test_commit_connection_rejects_history_change_after_pagination(tmp_path, final_page):
+    first_page = _commit_page(["first"])
+    runner = FakeRunner(pr_commit_pages=[first_page, final_page])
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="history changed during provenance scan"):
+        read_pull_request_commit_metadata(runner, config=config, pr_number=77)
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        [
+            _commit_page(["first"], total=2, has_next=True, cursor="cursor-1"),
+            _commit_page(["second"], total=2, has_next=True, cursor="cursor-1", oid_start=2),
+        ],
+        [
+            _commit_page(["first"], total=4, has_next=True, cursor="cursor-1"),
+            _commit_page(["second"], total=4, has_next=True, cursor="cursor-2", oid_start=2),
+            _commit_page(["third"], total=4, has_next=True, cursor="cursor-1", oid_start=3),
+        ],
+    ],
+    ids=["non-advancing", "repeated"],
+)
+def test_commit_connection_rejects_non_advancing_or_repeated_cursors(tmp_path, pages):
+    runner = FakeRunner(pr_commit_pages=pages)
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="pagination.*did not advance"):
+        read_pull_request_commit_metadata(runner, config=config, pr_number=77)
+
+
+def test_commit_connection_sends_string_graphql_variables_with_raw_fields(tmp_path):
+    first_page = _commit_page(["first"], total=2, has_next=True, cursor="cursor-1")
+    second_page = _commit_page(["second"], total=2, oid_start=2)
+    final_page = _commit_page([], total=2)
+    runner = FakeRunner(pr_commit_pages=[first_page, second_page, final_page])
+    config = make_config(tmp_path, repo="2048/null")
+
+    read_pull_request_commit_metadata(runner, config=config, pr_number=77)
+
+    graphql_commands = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "api", "graphql"]]
+    first_command = graphql_commands[0]
+    owner_index = first_command.index("owner=2048")
+    number_index = first_command.index("number=77")
+    assert first_command[owner_index - 1 : number_index + 1] == [
+        "-f",
+        "owner=2048",
+        "-f",
+        "name=null",
+        "-F",
+        "number=77",
+    ]
+    after_index = graphql_commands[1].index("after=cursor-1")
+    assert graphql_commands[1][after_index - 1 : after_index + 1] == ["-f", "after=cursor-1"]
 
 
 def test_commit_connection_rejects_count_truncation(tmp_path):

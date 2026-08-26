@@ -285,15 +285,15 @@ def _query_pr_commit_connection(
         "graphql",
         "-f",
         f"query={_PR_COMMIT_CONNECTION_QUERY}",
-        "-F",
+        "-f",
         f"owner={owner}",
-        "-F",
+        "-f",
         f"name={name}",
         "-F",
         f"number={pr_number}",
     ]
     if after is not None:
-        args.extend(("-F", f"after={after}"))
+        args.extend(("-f", f"after={after}"))
     result = runner.run(args, cwd=active_workdir(config), check=False)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
@@ -429,12 +429,24 @@ def validate_pull_request_provenance(
     pr_number: int,
     expected_scope: IssuePrProvenanceScope,
 ) -> IssuePrProvenanceScope:
-    commits = read_pull_request_commit_metadata(runner, config=config, pr_number=pr_number)
     try:
-        claims = parse_issue_pr_provenance_messages(commit.message for commit in commits)
-        return compare_issue_pr_provenance(claims, expected=expected_scope)
+        commits = read_pull_request_commit_metadata(runner, config=config, pr_number=pr_number)
     except AgentLoopError as exc:
         raise AgentLoopError(f"PR #{pr_number} commit provenance is unavailable: {exc}") from exc
+    try:
+        claims = parse_issue_pr_provenance_messages(commit.message for commit in commits)
+    except AgentLoopError as exc:
+        raise AgentLoopError(f"PR #{pr_number} commit provenance is malformed: {exc}") from exc
+    try:
+        return compare_issue_pr_provenance(claims, expected=expected_scope)
+    except AgentLoopError as exc:
+        if not claims:
+            reason = "is missing"
+        elif len(set(claims)) != 1:
+            reason = "contains conflicting claims"
+        else:
+            reason = "does not match the expected scope"
+        raise AgentLoopError(f"PR #{pr_number} commit provenance {reason}: {exc}") from exc
 
 
 def _issue_reference_evidence_from_match(
@@ -906,7 +918,7 @@ def find_open_pr_closing_issue(
     if expected_scope is None:
         raise _candidate_provenance_error(
             match.pr_number,
-            "the issue-mode plan has no reconstructable approved-plan scope",
+            "the issue-mode plan has no reconstructable approved-plan scope.",
         )
     try:
         validate_pull_request_provenance(

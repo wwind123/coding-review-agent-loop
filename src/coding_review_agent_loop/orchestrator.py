@@ -3894,6 +3894,8 @@ def _advisory_issue_pr_provenance(
     expected_scope: IssuePrProvenanceScope,
 ) -> None:
     """Warn on missing provenance without blocking a newly created PR handoff."""
+    if config.dry_run:
+        return
     try:
         validate_pull_request_provenance(
             runner,
