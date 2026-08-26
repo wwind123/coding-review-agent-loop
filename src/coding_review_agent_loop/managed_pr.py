@@ -12,7 +12,6 @@ from urllib.parse import quote
 from .config import AgentLoopConfig
 from .errors import AgentLoopError
 from .logging import log
-from .github import reject_forged_protocol_markers
 from .managed_ci import (
     MANAGED_LABEL,
     UNPROTECTED_OVERRIDE_TRAILER,
@@ -21,6 +20,7 @@ from .managed_ci import (
 )
 from .runner import CommandResult, Runner
 from .workdirs import active_workdir
+from .protocol_markers import PR_BODY_SURFACE, TrustedBody, scan_reserved_markers
 
 
 SOURCE_MARKER = "AGENT_MANAGED_PR_SOURCE_V1"
@@ -32,6 +32,7 @@ class ManagedPrHandoff:
     config: AgentLoopConfig
     source_sha: str
     managed_branch: str
+    source_branch: str | None = None
 
 
 def _api(
@@ -68,7 +69,7 @@ def _json_payload(result: CommandResult, *, operation: str) -> object:
         raise AgentLoopError(f"GitHub returned invalid JSON while {operation}.") from exc
 
 
-def _source_marker(*, source_branch: str, source_sha: str) -> str:
+def _source_marker(*, source_branch: str, source_sha: str) -> TrustedBody:
     encoded = base64.urlsafe_b64encode(
         json.dumps(
             {"source_branch": source_branch, "source_sha": source_sha},
@@ -76,7 +77,10 @@ def _source_marker(*, source_branch: str, source_sha: str) -> str:
             sort_keys=True,
         ).encode("utf-8")
     ).decode("ascii")
-    return f"<!-- {SOURCE_MARKER} {encoded} -->"
+    return TrustedBody.canonical(
+        f"<!-- {SOURCE_MARKER} {encoded} -->",
+        expected_tokens=(SOURCE_MARKER,),
+    )
 
 
 def _compose_body(
@@ -85,12 +89,80 @@ def _compose_body(
     source_branch: str,
     source_sha: str,
     override_nonce: str | None,
-) -> str:
-    sections = [body.rstrip()] if body.strip() else []
+) -> TrustedBody:
+    sections: list[TrustedBody | str] = []
+    if body.strip():
+        sections.append(TrustedBody.current_untrusted_visible(body.rstrip()))
+    if sections:
+        sections.append("\n\n")
     sections.append(_source_marker(source_branch=source_branch, source_sha=source_sha))
     if override_nonce:
-        sections.append(f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce}")
-    return "\n\n".join(sections) + "\n"
+        sections.extend(
+            [
+                "\n\n",
+                TrustedBody.marker(
+                    UNPROTECTED_OVERRIDE_TRAILER,
+                    f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce}",
+                ),
+            ]
+        )
+    return TrustedBody.join(*sections).append("\n")
+
+
+def validate_managed_pr_body(
+    body: str,
+    *,
+    source_branch: str,
+    source_sha: str,
+    managed_branch: str,
+    override_nonce: str | None,
+    fetched_head_sha: str | None,
+    fetched_head_branch: str | None,
+    fetched_base_branch: str | None,
+    expected_base_branch: str | None,
+) -> None:
+    """Validate the one managed-PR body that this invocation created."""
+    expected_tokens = {SOURCE_MARKER}
+    if override_nonce is not None:
+        expected_tokens.add(UNPROTECTED_OVERRIDE_TRAILER)
+    carrier = TrustedBody.canonical(
+        body,
+        surface=PR_BODY_SURFACE,
+        expected_tokens=expected_tokens,
+    )
+    carrier.validate_for_surface(PR_BODY_SURFACE)
+    occurrences = scan_reserved_markers(str(carrier))
+    source_occurrence = next(
+        item for item in occurrences if item.definition.token == SOURCE_MARKER
+    )
+    source_match = source_occurrence.definition.pattern.search(source_occurrence.text)
+    if source_match is None:
+        raise AgentLoopError("Managed PR source record is malformed.")
+    encoded = source_match.group("payload")
+    try:
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentLoopError("Managed PR source record could not be decoded.") from exc
+    if not isinstance(payload, dict) or set(payload) != {"source_branch", "source_sha"}:
+        raise AgentLoopError("Managed PR source record has an invalid schema.")
+    if payload.get("source_branch") != source_branch or payload.get("source_sha") != source_sha:
+        raise AgentLoopError("Managed PR source record does not match this creation handoff.")
+    if fetched_head_sha != source_sha:
+        raise AgentLoopError("Managed PR head SHA does not match its creation handoff.")
+    if fetched_head_branch != managed_branch:
+        raise AgentLoopError("Managed PR head branch does not match its creation handoff.")
+    if expected_base_branch is not None and fetched_base_branch != expected_base_branch:
+        raise AgentLoopError("Managed PR base branch does not match its creation handoff.")
+    if override_nonce is not None:
+        override_occurrence = next(
+            item for item in occurrences if item.definition.token == UNPROTECTED_OVERRIDE_TRAILER
+        )
+        if override_occurrence.text.strip().split() != [
+            UNPROTECTED_OVERRIDE_TRAILER,
+            f"nonce={override_nonce}",
+        ]:
+            raise AgentLoopError("Managed PR override record does not match this creation handoff.")
 
 
 def _close_partial_handoff(
@@ -140,9 +212,12 @@ def create_managed_pr(
         raise AgentLoopError("--head must name a same-repository branch, without `refs/` or an owner prefix.")
     if not title:
         raise AgentLoopError("--title cannot be empty.")
-    reject_forged_protocol_markers(body)
-    if SOURCE_MARKER in body or UNPROTECTED_OVERRIDE_TRAILER in body:
-        raise AgentLoopError("The supplied PR body contains a reserved managed-PR protocol marker.")
+    try:
+        TrustedBody.current_untrusted_visible(body)
+    except AgentLoopError as exc:
+        raise AgentLoopError(
+            "The supplied PR body contains a reserved managed-PR protocol marker."
+        ) from exc
     if not config.base:
         raise AgentLoopError("Managed PR creation requires a resolved base branch.")
     if source_branch == config.base:
@@ -217,6 +292,7 @@ def create_managed_pr(
             source_sha=source_sha,
             override_nonce=intent.audit_nonce,
         )
+        rendered_body.validate_for_surface(PR_BODY_SURFACE)
         create_result = _api(
             runner,
             config=config,
@@ -312,4 +388,4 @@ def create_managed_pr(
         config,
         f"Created managed draft PR #{pr_number} from {source_branch}@{source_sha[:12]} via {managed_branch}",
     )
-    return ManagedPrHandoff(pr_number, correlated_config, source_sha, managed_branch)
+    return ManagedPrHandoff(pr_number, correlated_config, source_sha, managed_branch, source_branch)

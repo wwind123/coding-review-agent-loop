@@ -34,6 +34,7 @@ from .github import (
 )
 from .pr_contract import PrExpectedClosingContract, find_latest_pr_contract
 from .runner import Runner
+from .protocol_markers import TrustedBody
 
 SCHEMA_VERSION = 1
 _VALID_FLOWS = {"issue-implementation", "approved-plan-implementation"}
@@ -494,14 +495,17 @@ def post_issue_pr_handoff_comment(
         runner,
         config=config,
         issue_number=issue_number,
-        body=format_issue_pr_handoff_comment(
-            issue_number=issue_number,
-            pr_number=pr_number,
-            pr_url=pr_url,
-            pr_head_sha=pr_head_sha,
-            flow=flow,
-            plan_hash=plan_hash,
-            expected_closing_issue_ids=expected_closing_issue_ids,
-            supersedes_hash=supersedes_hash,
+        body=TrustedBody.canonical(
+            format_issue_pr_handoff_comment(
+                issue_number=issue_number,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                pr_head_sha=pr_head_sha,
+                flow=flow,
+                plan_hash=plan_hash,
+                expected_closing_issue_ids=expected_closing_issue_ids,
+                supersedes_hash=supersedes_hash,
+            ),
+            expected_tokens=("AGENT_ISSUE_PR_HANDOFF",),
         ),
     )

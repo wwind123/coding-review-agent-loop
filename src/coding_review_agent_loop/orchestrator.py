@@ -141,6 +141,7 @@ from .managed_ci import (
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
+from .managed_pr import validate_managed_pr_body
 from .migrations import validate_pr_migration_topology
 from .prompts import (
     CompactPlanTailContext,
@@ -344,6 +345,7 @@ from .round_state import (
     _strip_round_metadata,
 )
 from .round_transport import is_round_transport_sidecar
+from .protocol_markers import TrustedBody, scan_reserved_markers
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
     CODER_DISPUTE_NOTE_PREFIX,
@@ -371,12 +373,16 @@ from .unresolved_items import (
 )
 
 
-def _embed_pr_contract_marker(body: str, contract: PrExpectedClosingContract) -> str:
+def _embed_pr_contract_marker(body: str | TrustedBody, contract: PrExpectedClosingContract) -> TrustedBody:
     marker = render_pr_contract_marker(contract)
-    if "\n-- " in body:
-        prefix, signature = body.rsplit("\n-- ", 1)
-        return f"{prefix}\n{marker}\n-- {signature}"
-    return f"{body.rstrip()}\n{marker}"
+    body_text = str(body)
+    if "\n-- " in body_text:
+        prefix, signature = body_text.rsplit("\n-- ", 1)
+        rendered = f"{prefix}\n{marker}\n-- {signature}"
+    else:
+        rendered = f"{body_text.rstrip()}\n{marker}"
+    expected = tuple(item.definition.token for item in scan_reserved_markers(rendered))
+    return TrustedBody.canonical(rendered, expected_tokens=expected)
 
 
 # TRANSIENT_AGENT_OUTPUT_RE / NON_RETRYABLE_AGENT_OUTPUT_RE / is_transient_agent_output
@@ -2212,6 +2218,15 @@ def _run_validated_agent(
     operation_description: str | None = None,
     completion_recovery: CompletionRecoveryPolicy | None = None,
 ) -> ValidatedAgentResponse:
+    # Agent responses are current untrusted visible text.  Keep this guard in
+    # the validation seam so every artifact recovery and repair path receives
+    # the same provenance check before it can be accepted.
+    response_validator = validate
+
+    def validate(text: str) -> object:
+        TrustedBody.current_untrusted_visible(text)
+        return response_validator(text)
+
     agent_name = agent_display_name(agent)
     operation_description = operation_description or _operation_description_from_context(
         salvage_context=salvage_context,
@@ -2253,6 +2268,7 @@ def _run_validated_agent(
     self_update_deadline: float | None = None
     self_update_stability_error: str | None = None
     next_timeout_seconds = timeout_seconds
+    marker_safety_repair_attempted = False
 
     for attempt in range(1, max_attempts + 1):
         attempt_config = (
@@ -2504,6 +2520,7 @@ def _run_validated_agent(
                 )
             except AgentLoopError as exc:
                 last_error = str(exc)
+                marker_safety_failure = "Current untrusted GitHub text contains reserved protocol marker(s):" in str(exc)
                 classification_text = _agent_failure_classification_text(result, phase="validation")
                 last_classification_text = classification_text
                 public_text_is_transient = _is_transient_public_response(
@@ -2835,6 +2852,7 @@ def _run_validated_agent(
                     use_repair
                     and not public_text_is_transient
                     and not response_failure_is_unsupported
+                    and (not marker_safety_failure or not marker_safety_repair_attempted)
                     and not (
                         isinstance(exc, UnknownPriorItemDispositionError)
                         and ledger_incomplete
@@ -2874,6 +2892,8 @@ def _run_validated_agent(
                     elif repair_allowed_prior_item_ids is not None:
                         repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
                     original_validation_error = str(exc)
+                    if marker_safety_failure:
+                        marker_safety_repair_attempted = True
                     repaired, repaired_marker, repair_attempts = _run_structured_repair(
                         normalized if normalized is not None else text,
                         runner=runner,
@@ -4071,7 +4091,10 @@ def _implement_approved_issue(
                 runner,
                 config=implementation_config,
                 pr_number=existing_pr_number,
-                body=format_pr_contract_comment(pr_contract),
+                body=TrustedBody.canonical(
+                    format_pr_contract_comment(pr_contract),
+                    expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+                ),
             )
             post_issue_pr_handoff_comment(
                 runner,
@@ -4216,7 +4239,10 @@ def _implement_approved_issue(
         runner,
         config=implementation_config,
         pr_number=pr_number,
-        body=format_pr_contract_comment(pr_contract),
+        body=TrustedBody.canonical(
+            format_pr_contract_comment(pr_contract),
+            expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+        ),
     )
     post_issue_pr_handoff_comment(
         runner,
@@ -5723,7 +5749,10 @@ def run_issue_loop(
                     runner,
                     config=config,
                     pr_number=resolved_pr.pr_number,
-                    body=format_pr_contract_comment(pr_contract),
+                    body=TrustedBody.canonical(
+                        format_pr_contract_comment(pr_contract),
+                        expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+                    ),
                 )
                 post_issue_pr_handoff_comment(
                     runner,
@@ -5888,7 +5917,10 @@ def run_issue_loop(
             runner,
             config=config,
             pr_number=pr_number,
-            body=format_pr_contract_comment(pr_contract),
+            body=TrustedBody.canonical(
+                format_pr_contract_comment(pr_contract),
+                expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+            ),
         )
         post_issue_pr_handoff_comment(
             runner,
@@ -6217,6 +6249,7 @@ def run_pr_loop(
     workdirs_ready: bool = False,
     usage_context: RunUsageContext | None = None,
     pre_review_test_pending: bool = False,
+    managed_pr_origin: tuple[str, str, str, str | None] | None = None,
 ) -> int:
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
@@ -6232,7 +6265,21 @@ def run_pr_loop(
             pr_number=pr_number,
             cwd=bootstrap_cwd,
         )
-        reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        if managed_pr_origin is None:
+            reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        else:
+            source_branch, source_sha, managed_branch, override_nonce = managed_pr_origin
+            validate_managed_pr_body(
+                initial_pr_context.metadata.body or "",
+                source_branch=source_branch,
+                source_sha=source_sha,
+                managed_branch=managed_branch,
+                override_nonce=override_nonce,
+                fetched_head_sha=initial_pr_context.metadata.head_sha,
+                fetched_head_branch=initial_pr_context.metadata.head_branch,
+                fetched_base_branch=initial_pr_context.metadata.base_branch,
+                expected_base_branch=config.base,
+            )
         recorded_pr_contract = find_latest_pr_contract(
             initial_pr_context.comments,
             repository=config.repo,
@@ -6426,7 +6473,10 @@ def run_pr_loop(
                     runner,
                     config=config,
                     pr_number=pr_number,
-                    body=format_pr_contract_comment(closing_contract),
+                    body=TrustedBody.canonical(
+                        format_pr_contract_comment(closing_contract),
+                        expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+                    ),
                 )
             if (
                 contract_needs_persisting

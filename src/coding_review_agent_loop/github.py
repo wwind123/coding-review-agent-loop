@@ -32,6 +32,13 @@ from .pr_contract import (
 from .logging import log
 from .round_transport import MAX_GITHUB_BODY_CHARS, prepare_round_comment
 from .protocol import parse_signed_human_requirement_body
+from .protocol_markers import (
+    ISSUE_BODY_SURFACE,
+    ISSUE_COMMENT_SURFACE,
+    PR_COMMENT_SURFACE,
+    TrustedBody,
+    scan_reserved_markers,
+)
 from .runner import Runner
 from .workdirs import active_workdir
 
@@ -1334,10 +1341,10 @@ def post_pr_comment(
     *,
     config: AgentLoopConfig,
     pr_number: int,
-    body: str,
+    body: str | TrustedBody,
 ) -> None:
-    reject_forged_protocol_markers(body)
-    bodies = prepare_round_comment(body)
+    carrier = body if isinstance(body, TrustedBody) else TrustedBody.current_untrusted_visible(body)
+    bodies = prepare_round_comment(carrier)
     if len(bodies) > 1:
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to PR #{pr_number}")
     log(config, f"Posting agent output to PR #{pr_number}")
@@ -1350,10 +1357,10 @@ def post_issue_comment(
     *,
     config: AgentLoopConfig,
     issue_number: int,
-    body: str,
+    body: str | TrustedBody,
 ) -> None:
-    reject_forged_protocol_markers(body)
-    bodies = prepare_round_comment(body)
+    carrier = body if isinstance(body, TrustedBody) else TrustedBody.current_untrusted_visible(body)
+    bodies = prepare_round_comment(carrier)
     if len(bodies) > 1:
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to issue #{issue_number}")
     log(config, f"Posting agent output to issue #{issue_number}")
@@ -1362,13 +1369,8 @@ def post_issue_comment(
 
 
 def reject_forged_protocol_markers(body: str) -> None:
-    """Reject only well-formed reserved metadata markers in untrusted prose."""
-    if _AGENT_ISSUE_PR_HANDOFF_MARKER_RE.search(body) or PR_EXPECTED_CLOSING_MARKER_RE.search(body):
-        raise AgentLoopError(
-            "Ordinary agent-authored comments may not contain a well-formed reserved "
-            "handoff or expected-closing protocol marker. Remove the marker from the "
-            "prose; a bare marker name is allowed."
-        )
+    """Reject reserved records before any temp-file, runner, or remote mutation."""
+    TrustedBody.current_untrusted_visible(body)
 
 
 def _post_trusted_protocol_comment(
@@ -1413,23 +1415,16 @@ def post_trusted_pr_comment(
     *,
     config: AgentLoopConfig,
     pr_number: int,
-    body: str,
+    body: TrustedBody,
 ) -> None:
-    matches = tuple(PR_EXPECTED_CLOSING_MARKER_RE.finditer(body))
-    if not matches:
-        raise AgentLoopError(
-            f"Trusted PR protocol posting requires {PR_EXPECTED_CLOSING_MARKER}."
+    if not isinstance(body, TrustedBody):
+        raise AgentLoopError("Trusted PR comment posting requires a TrustedBody.")
+    bodies = prepare_round_comment(body)
+    for prepared in bodies:
+        prepared.validate_for_surface(PR_COMMENT_SURFACE)
+        _post_trusted_protocol_comment(
+            runner, config=config, command=["pr", "comment", str(pr_number)], body=prepared
         )
-    for match in matches:
-        encoded = match.group("payload")
-        contract = decode_pr_contract(encoded)
-        if encode_pr_contract(contract) != encoded:
-            raise AgentLoopError(
-                f"Trusted {PR_EXPECTED_CLOSING_MARKER} payload is not canonically encoded."
-            )
-    _post_trusted_protocol_comment(
-        runner, config=config, command=["pr", "comment", str(pr_number)], body=body
-    )
 
 
 def post_trusted_pr_contract_record(
@@ -1437,21 +1432,12 @@ def post_trusted_pr_contract_record(
     *,
     config: AgentLoopConfig,
     pr_number: int,
-    body: str,
+    body: TrustedBody,
 ) -> None:
     """Create a canonical PR contract record before issue-origin handoff."""
-    matches = tuple(PR_EXPECTED_CLOSING_MARKER_RE.finditer(body))
-    if not matches:
-        raise AgentLoopError(
-            f"Trusted PR protocol posting requires {PR_EXPECTED_CLOSING_MARKER}."
-        )
-    for match in matches:
-        encoded = match.group("payload")
-        contract = decode_pr_contract(encoded)
-        if encode_pr_contract(contract) != encoded:
-            raise AgentLoopError(
-                f"Trusted {PR_EXPECTED_CLOSING_MARKER} payload is not canonically encoded."
-            )
+    if not isinstance(body, TrustedBody):
+        raise AgentLoopError("Trusted PR contract posting requires a TrustedBody.")
+    body.validate_for_surface(PR_COMMENT_SURFACE)
     result = runner.run(
         [
             config.gh_cmd,
@@ -1463,7 +1449,7 @@ def post_trusted_pr_contract_record(
             "-",
         ],
         cwd=active_workdir(config),
-        input_text=json.dumps({"body": body}),
+        input_text=json.dumps({"body": str(body)}),
         check=False,
     )
     if result.returncode != 0:
@@ -1479,16 +1465,16 @@ def post_trusted_issue_comment(
     *,
     config: AgentLoopConfig,
     issue_number: int,
-    body: str,
+    body: TrustedBody,
 ) -> None:
-    _validate_canonical_json_marker_payload(
-        body,
-        marker_re=_AGENT_ISSUE_PR_HANDOFF_MARKER_RE,
-        marker_name="AGENT_ISSUE_PR_HANDOFF",
-    )
-    _post_trusted_protocol_comment(
-        runner, config=config, command=["issue", "comment", str(issue_number)], body=body
-    )
+    if not isinstance(body, TrustedBody):
+        raise AgentLoopError("Trusted issue comment posting requires a TrustedBody.")
+    bodies = prepare_round_comment(body)
+    for prepared in bodies:
+        prepared.validate_for_surface(ISSUE_COMMENT_SURFACE)
+        _post_trusted_protocol_comment(
+            runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared
+        )
 
 
 def _post_comment_body(runner: Runner, *, config: AgentLoopConfig, command: list[str], body: str) -> None:
@@ -1514,9 +1500,14 @@ def create_issue(
     *,
     config: AgentLoopConfig,
     title: str,
-    body: str,
+    body: str | TrustedBody,
 ) -> str | None:
-    if len(body) > MAX_GITHUB_BODY_CHARS:
+    if isinstance(body, TrustedBody):
+        body.validate_for_surface(ISSUE_BODY_SURFACE)
+        rendered_body = str(body)
+    else:
+        rendered_body = str(TrustedBody.current_untrusted_visible(body))
+    if len(rendered_body) > MAX_GITHUB_BODY_CHARS:
         raise AgentLoopError(f"GitHub issue body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response.")
     log(config, f"Creating GitHub issue: {title}")
     if config.dry_run:
@@ -1530,7 +1521,7 @@ def create_issue(
                 "--title",
                 title,
                 "--body",
-                body,
+                rendered_body,
             ],
             cwd=active_workdir(config),
         )
@@ -1540,7 +1531,7 @@ def create_issue(
         return issue_url
 
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
-        handle.write(body)
+        handle.write(rendered_body)
         path = handle.name
     try:
         result = runner.run(

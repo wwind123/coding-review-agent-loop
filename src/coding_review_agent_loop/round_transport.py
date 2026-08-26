@@ -10,6 +10,7 @@ import zlib
 from collections.abc import Mapping, Sequence
 
 from .errors import AgentLoopError
+from .protocol_markers import TrustedBody, scan_reserved_markers
 
 MAX_GITHUB_BODY_CHARS = 60_000
 ROUND_RESUME_MARKER_RE = re.compile(
@@ -84,31 +85,47 @@ def is_round_transport_sidecar(body: str) -> bool:
     return bool(ROUND_TRANSPORT_SIDECAR_RE.search(body))
 
 
-def _sidecar(payload: Mapping[str, object]) -> str:
+def _sidecar(payload: Mapping[str, object]) -> TrustedBody:
     encoded = _b64(
         json.dumps(dict(payload), separators=(",", ":"), sort_keys=True).encode()
     )
-    return f"<!-- AGENT_LOOP_SIDECAR: {encoded} -->"
+    return TrustedBody.canonical(
+        f"<!-- AGENT_LOOP_SIDECAR: {encoded} -->",
+        expected_tokens=("AGENT_LOOP_SIDECAR",),
+    )
 
 
-def prepare_round_comment(body: str) -> tuple[str, ...]:
+def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
     """Return sidecars followed by an anchor; non-round bodies are strictly bounded."""
-    matches = list(ROUND_RESUME_MARKER_RE.finditer(body))
-    if len(body) > MAX_GITHUB_BODY_CHARS and not matches:
+    if isinstance(body, TrustedBody):
+        carrier = body
+    else:
+        occurrences = scan_reserved_markers(body)
+        carrier = (
+            TrustedBody.current_untrusted_visible(body)
+            if not occurrences
+            else TrustedBody.canonical(
+                body,
+                expected_tokens=tuple(item.definition.token for item in occurrences),
+            )
+        )
+    body_text = str(carrier)
+    matches = list(ROUND_RESUME_MARKER_RE.finditer(body_text))
+    if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches:
         raise AgentLoopError(
             f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response."
         )
     if not matches:
-        return (body,)
+        return (carrier,)
 
     # Resume reads the last marker when a legacy comment contains more than one.
     match = matches[-1]
     payload = decode_mapping(match.group("payload"))
     sidecars: list[str] = []
-    anchor_id = hashlib.sha256(body.encode()).hexdigest()[:24]
+    anchor_id = hashlib.sha256(body_text.encode()).hexdigest()[:24]
 
     def render_anchor(mapping: Mapping[str, object]) -> str:
-        return body[: match.start("payload")] + encode_mapping(mapping) + body[match.end("payload") :]
+        return body_text[: match.start("payload")] + encode_mapping(mapping) + body_text[match.end("payload") :]
 
     for field in _SPILL_FIELDS:
         current_anchor = render_anchor(payload)
@@ -163,7 +180,8 @@ def prepare_round_comment(body: str) -> tuple[str, ...]:
         )
     if any(len(item) > MAX_GITHUB_BODY_CHARS for item in sidecars):
         raise AgentLoopError("Round metadata sidecar exceeds GitHub body budget.")
-    return (*sidecars, anchor)
+    expected = tuple(item.definition.token for item in scan_reserved_markers(anchor))
+    return (*sidecars, TrustedBody.canonical(anchor, expected_tokens=expected))
 
 
 def hydrate_mapping(

@@ -217,6 +217,20 @@ guaranteed billing outcome.
 
 ## Develop This Tool
 
+### Durable protocol marker boundary
+
+Durable GitHub records are defined in the centralized
+`src/coding_review_agent_loop/protocol_markers.py` registry. Current
+agent-authored prose is untrusted and marker-free; only canonical producers
+can compose a `TrustedBody` segment for the GitHub surface that permits it.
+Historical ledger prose is a separate input class: reserved spans are replaced
+with stable descriptive labels before summaries are truncated or interpolated.
+Codec-contained salvage and round-state payloads remain opaque at their encoded
+occurrence and are checked when they are later projected into visible prose.
+Ordinary issue/PR writers and managed-PR/CI REST paths fail closed before any
+temp-file creation or remote mutation when provenance, grammar, surface, or
+canonical encoding checks fail.
+
 Use this if you are changing `coding-review-agent-loop` itself:
 
 ```bash

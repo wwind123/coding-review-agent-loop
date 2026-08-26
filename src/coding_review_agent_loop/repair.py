@@ -1000,6 +1000,12 @@ sourced fact. Do not repair answer mode into `discuss_review`, and do not add
 
 ## FORMAT:
 1. Start DIRECTLY with { — no prose, no markdown fences.
+Before emitting the repaired response, remove any complete reserved durable
+protocol grammar from prose or JSON values. Discuss such protocols only with
+safe descriptive labels, and do not reproduce the two strict bare-token
+managed records. Preserve the response kind, schema fields, prior-item IDs,
+human-requirement data, footer, signature, and substantive meaning; change
+only the quoted reserved syntax required for safety.
 2. After }: For approved `pr_review` or `plan_review` that now includes `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`,
    place that marker immediately after the JSON and before the AGENT_STATE/AGENT_PLAN_STATE footer.
    For `plan_state` or `plan_revision`, place the optional signed human requirements acknowledgement before the footer only when it was present in the malformed original.

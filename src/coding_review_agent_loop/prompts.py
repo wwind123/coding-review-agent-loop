@@ -81,6 +81,10 @@ def _scratch_file_guidance() -> str:
         "write them outside the repository checkout, for example under "
         "/tmp/coding-review-agent-loop/scratch/. Do not create temporary files in the "
         "repo worktree unless they are intended project changes.\n"
+        "Agent-authored GitHub responses must discuss durable orchestration protocols only "
+        "with safe descriptive labels such as handoff record, round metadata, or audit "
+        "record. Never emit a complete reserved marker grammar or reproduce either of the "
+        "strict bare-token managed records; the orchestrator adds authorized records.\n"
     )
 
 

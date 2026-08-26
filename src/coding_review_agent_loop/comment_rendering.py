@@ -37,6 +37,7 @@ from .protocol import (
     review_freeform_summary_text,
 )
 from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID
+from .protocol_markers import sanitize_historical_text
 
 if TYPE_CHECKING:
     from .agents.base import AgentName
@@ -83,6 +84,10 @@ def _review_freeform_summary_text(text: str) -> str:
 
 
 def _normalize_item_summary(text: str, *, limit: int = ITEM_SUMMARY_LIMIT) -> str:
+    # Prior-item text is historical ledger data, not a fresh agent output.  It
+    # must be neutralized before truncation so a marker cannot survive in a
+    # later public rendering or be recreated at the truncation boundary.
+    text = sanitize_historical_text(text)
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:

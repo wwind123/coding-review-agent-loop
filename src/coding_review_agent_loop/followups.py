@@ -12,6 +12,7 @@ from .github import create_issue, post_issue_comment, post_pr_comment
 from .logging import log
 from .protocol import ApprovedFollowup, UnresolvedReviewItem
 from .runner import Runner
+from .protocol_markers import TrustedBody, sanitize_historical_text
 
 MAX_APPROVED_FOLLOWUP_ISSUES = 3
 APPROVED_FOLLOWUP_MARKER_RE = re.compile(
@@ -719,7 +720,12 @@ def _publish_approved_followups(
             head_sha=head_sha,
             mode=mode,
         )
-        post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
+        post_pr_comment(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            body=TrustedBody.canonical(body, expected_tokens=("AGENT_APPROVED_FOLLOWUPS",)),
+        )
         return True
 
     if config.approved_followups in ("issue", "fix-and-issue"):
@@ -749,7 +755,12 @@ def _publish_approved_followups(
                 head_sha=head_sha,
                 mode=mode,
             )
-            post_pr_comment(runner, config=config, pr_number=pr_number, body=body)
+            post_pr_comment(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                body=TrustedBody.canonical(body, expected_tokens=("AGENT_APPROVED_FOLLOWUPS",)),
+            )
             return True
     return False
 
@@ -886,9 +897,12 @@ def _publish_plan_approved_followups(
                 reconciliation=reconciliation,
             )
 
+    # The approved plan is a re-rendered historical GitHub artifact.  Its
+    # encoded plan metadata may contain durable records, but those records are
+    # not newly authorized by this follow-up comment.
     body = _format_plan_approval_summary_with_followups(
         issue_number,
-        approved_plan,
+        sanitize_historical_text(approved_plan),
         reconciliation=reconciliation,
         issue_urls=issue_urls,
         filing_enabled=filing_enabled,
@@ -899,5 +913,10 @@ def _publish_plan_approved_followups(
         plan_hash=plan_hash,
         mode=mode,
     )
-    post_issue_comment(runner, config=config, issue_number=issue_number, body=body)
+    post_issue_comment(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        body=TrustedBody.canonical(body, expected_tokens=("AGENT_PLAN_APPROVED_FOLLOWUPS",)),
+    )
     return True

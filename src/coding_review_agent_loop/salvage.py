@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from .agents.base import AgentName, AgentResult
 from .errors import AgentLoopError
 from .github import IssueComment, post_issue_comment
+from .protocol_markers import TrustedBody
 from .logging import log
 from .runner import ensure_log_dir_ignored
 from .round_transport import MAX_GITHUB_BODY_CHARS
@@ -628,7 +629,12 @@ def post_salvage_comment(
             patch_max_bytes=config.salvage_comment_patch_max_bytes,
         )
         body = _render_clamped_salvage_comment(payload)
-        post_issue_comment(runner, config=config, issue_number=context.issue_number, body=body)
+        post_issue_comment(
+            runner,
+            config=config,
+            issue_number=context.issue_number,
+            body=TrustedBody.canonical(body, expected_tokens=("AGENT_SALVAGE",)),
+        )
     except (AgentLoopError, OSError, UnicodeDecodeError) as exc:
         log(config, f"salvage comment posting failed ({exc}); preserving original agent failure")
         return False
