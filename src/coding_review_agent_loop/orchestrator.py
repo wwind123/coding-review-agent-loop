@@ -251,6 +251,7 @@ from .transient import (
 from .usage import RunUsageContext, UsageMetadata, estimate_usage
 from .workdirs import active_workdir
 from .workdir_guard import (
+    read_workdir_head,
     validate_assigned_head_advanced,
     validate_checkout_inspected_evidence,
     validate_response_tests_within_workdir,
@@ -2269,6 +2270,9 @@ def _run_validated_agent(
     ordinary_retries_used = 0
     self_update_deadline: float | None = None
     self_update_stability_error: str | None = None
+    # Refusals are diagnostic-only context. Keep only the latest one, without
+    # treating it as accepted executable-replacement evidence.
+    latest_replay_refusal_detail: str | None = None
     next_timeout_seconds = timeout_seconds
     marker_safety_repair_attempted = False
 
@@ -2366,12 +2370,36 @@ def _run_validated_agent(
                 # envelope, even when the command itself failed.
                 text = artifact
 
-        # Claude or Codex can be replaced after spawning. This is exclusive with
+        if result.self_update_replay_refusal_kind is not None:
+            refusal_detail = result.self_update_replay_refusal_detail or (
+                f"{agent_name} replay refused ({result.self_update_replay_refusal_kind})"
+            )
+            latest_replay_refusal_detail = refusal_detail
+            refusal_outcome = (
+                "self_update_replay_refused_changed_workdir"
+                if result.self_update_replay_refusal_kind in {"changed-head", "changed-status"}
+                else "self_update_replay_refused_unavailable_workdir"
+            )
+            if usage_record is not None:
+                usage_record.outcome = refusal_outcome
+                usage_record.log_path = str(result.log_path) if result.log_path else None
+            log(
+                config,
+                f"{agent_name} attempt replay refusal: {refusal_detail}; "
+                "continuing with provider-derived retry classification",
+            )
+
+        # Claude or Codex can be replaced after spawning. Codex remains driven
+        # by its JSONL setup-versus-progress evidence; Claude's non-streaming
+        # JSON output additionally uses the workdir snapshot gate below.
+        # This is exclusive with
         # ordinary transient classification and gets one full replay only after
-        # the configured executable is stable.
+        # the configured executable is stable. A Claude workdir refusal above
+        # deliberately does not enter this branch.
         if (
             agent in {"claude", "codex"}
             and result.self_update_reason is not None
+            and result.self_update_replay_refusal_kind is None
             and not executable_replacement_considered
             and result.command_result is not None
         ):
@@ -2979,6 +3007,11 @@ def _run_validated_agent(
                         diagnostic_classification_text = (
                             f"{classification_text}\n{replacement_detail}"
                         ).strip()
+                    if latest_replay_refusal_detail:
+                        message += f" {latest_replay_refusal_detail}"
+                        diagnostic_classification_text = (
+                            f"{diagnostic_classification_text}\n{latest_replay_refusal_detail}"
+                        ).strip()
                     diagnostics = _failed_run_diagnostics(
                         runner=runner,
                         config=config,
@@ -3038,15 +3071,27 @@ def _run_validated_agent(
             reason=executable_replacement_reason,
             stability_error=self_update_stability_error,
         )
-        last_error = f"{replacement_detail}; final failure: {last_error}"
+        context_details = [replacement_detail]
+        if latest_replay_refusal_detail:
+            context_details.append(latest_replay_refusal_detail)
+        last_error = f"{'; '.join(context_details)}; final failure: {last_error}"
         last_classification_text = (
-            f"{last_classification_text}\n{replacement_detail}"
+            f"{replacement_detail}\n"
+            f"{latest_replay_refusal_detail + chr(10) if latest_replay_refusal_detail else ''}"
+            f"{last_classification_text}"
         ).strip()
         last_failure_category = (
             "self-update-interruption"
             if executable_replacement_provider == "claude"
             else "executable-replacement"
         )
+    elif latest_replay_refusal_detail:
+        # Refusal context is added only after all retry decisions. In
+        # particular, the provider-derived category remains untouched.
+        last_error = f"{latest_replay_refusal_detail}; final failure: {last_error}"
+        last_classification_text = (
+            f"{latest_replay_refusal_detail}\n{last_classification_text}"
+        ).strip()
     diagnostics = _failed_run_diagnostics(
         runner=runner,
         config=config,
@@ -3876,14 +3921,12 @@ def _handle_plan_first_split_scope(
 
 
 def _read_assigned_workdir_head(runner: Runner, config: AgentLoopConfig) -> str | None:
-    result = runner.run(
-        ("git", "rev-parse", "HEAD"),
-        cwd=active_workdir(config),
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
+    # The PR handoff guard intentionally keeps strict exception behavior: a
+    # runner/tooling exception must not be silently converted into evidence
+    # that the coder advanced the assigned checkout. Ordinary Git failures
+    # and blank HEAD output remain an unavailable (None) observation.
+    probe = read_workdir_head(runner, active_workdir(config))
+    return probe.value if probe.available else None
 
 
 def _advisory_issue_pr_provenance(

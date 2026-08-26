@@ -1,5 +1,137 @@
 from agent_loop_helpers import *  # noqa: F403
 
+from coding_review_agent_loop.workdir_guard import (
+    capture_workdir_snapshot,
+    read_workdir_head,
+)
+from coding_review_agent_loop.orchestrator import _read_assigned_workdir_head
+
+
+def test_workdir_snapshot_runs_exact_read_only_git_probes_and_accepts_clean_status(tmp_path):
+    runner = FakeRunner(
+        git_probe_results=[
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "", "returncode": 0},
+        ]
+    )
+
+    snapshot = capture_workdir_snapshot(runner, tmp_path)
+
+    assert snapshot.available
+    assert snapshot.head.value == "abc123"
+    assert snapshot.status.value == ""
+    assert runner.git_probe_calls == [
+        ("git", "rev-parse", "HEAD"),
+        ("git", "status", "--porcelain"),
+    ]
+
+
+def test_workdir_snapshot_preserves_identical_dirty_status_and_detects_changes(tmp_path):
+    before_runner = FakeRunner(
+        git_probe_results=[
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": " M src/app.py\n", "returncode": 0},
+        ]
+    )
+    after_runner = FakeRunner(
+        git_probe_results=[
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": " M src/app.py\n", "returncode": 0},
+        ]
+    )
+
+    before = capture_workdir_snapshot(before_runner, tmp_path)
+    after = capture_workdir_snapshot(after_runner, tmp_path)
+
+    assert before.status.value == after.status.value == " M src/app.py\n"
+    assert before == after
+
+    changed = capture_workdir_snapshot(
+        FakeRunner(
+            git_probe_results=[
+                {"stdout": "def456\n", "returncode": 0},
+                {"stdout": " M src/app.py\n", "returncode": 0},
+            ]
+        ),
+        tmp_path,
+    )
+    assert changed.head.value != before.head.value
+
+
+@pytest.mark.parametrize(
+    ("results", "expected_head_kind", "expected_status_kind"),
+    [
+        (
+            [{"stdout": "fatal: not a git repository\n", "returncode": 128},
+             {"stdout": "", "returncode": 128}],
+            "command-failed",
+            "command-failed",
+        ),
+        (
+            [{"stdout": "", "returncode": 0}, {"stdout": "", "returncode": 0}],
+            "blank",
+            "available",
+        ),
+        (
+            [{"stdout": "", "returncode": 128}, {"stdout": "", "returncode": 128}],
+            "command-failed",
+            "command-failed",
+        ),
+    ],
+)
+def test_workdir_snapshot_distinguishes_failed_blank_and_unborn_git_results(
+    tmp_path, results, expected_head_kind, expected_status_kind
+):
+    snapshot = capture_workdir_snapshot(
+        FakeRunner(git_probe_results=results),
+        tmp_path,
+        tolerate_exceptions=True,
+    )
+
+    assert snapshot.head.kind == expected_head_kind
+    assert snapshot.status.kind == expected_status_kind
+
+
+def test_workdir_snapshot_tolerates_agent_loop_error_and_oserror_per_probe(tmp_path):
+    runner = FakeRunner(
+        git_probe_exceptions=[AgentLoopError("runner interrupted"), OSError("git missing")]
+    )
+
+    snapshot = capture_workdir_snapshot(runner, tmp_path, tolerate_exceptions=True)
+
+    assert snapshot.head.kind == "exception"
+    assert snapshot.head.exception_type == "AgentLoopError"
+    assert snapshot.status.kind == "exception"
+    assert snapshot.status.exception_type == "OSError"
+
+
+def test_head_only_probe_does_not_invoke_status_and_strict_mode_reraises(tmp_path):
+    runner = FakeRunner(git_probe_exceptions=[OSError("git unavailable")])
+
+    with pytest.raises(OSError, match="git unavailable"):
+        read_workdir_head(runner, tmp_path)
+
+    assert runner.git_probe_calls == [("git", "rev-parse", "HEAD")]
+
+
+@pytest.mark.parametrize(
+    "scripted", [{"stdout": "", "returncode": 1}, {"stdout": "\n", "returncode": 0}]
+)
+def test_orchestrator_strict_head_probe_maps_only_nonzero_or_blank_to_none(tmp_path, scripted):
+    runner = FakeRunner(git_probe_results=[scripted])
+    config = make_config(tmp_path)
+
+    assert _read_assigned_workdir_head(runner, config) is None
+    assert runner.git_probe_calls == [("git", "rev-parse", "HEAD")]
+
+
+def test_orchestrator_strict_head_probe_reraises_exception(tmp_path):
+    runner = FakeRunner(git_probe_exceptions=[AgentLoopError("interrupted runner")])
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="interrupted runner"):
+        _read_assigned_workdir_head(runner, config)
+
 
 def test_workdir_guard_rejects_outside_home_path(tmp_path):
     assigned = tmp_path / "claude" / "repo"

@@ -48,8 +48,12 @@ class AgentResult:
     command_result: CommandResult | None = None
     # Provider-neutral evidence that the configured executable was replaced or
     # disappeared during this invocation. Claude uses the historical field name;
-    # Codex sets it for the same bounded recovery signal.
+    # Codex sets it for the same bounded recovery signal. Replay refusal is
+    # separate: a candidate can be positively identified while the checkout
+    # snapshot makes replay unsafe.
     self_update_reason: str | None = None
+    self_update_replay_refusal_kind: str | None = None
+    self_update_replay_refusal_detail: str | None = None
 
 
 class AgentBackend(Protocol):
