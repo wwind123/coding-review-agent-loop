@@ -255,8 +255,6 @@ def classify_executable_replacement_interruption(
         return None
     has_public_response = bool(response_file_text and response_file_text.strip())
     has_last_message = bool(last_message_artifact and last_message_artifact.strip())
-    if result.returncode == 0 and has_last_message:
-        return None
     if has_public_response or has_last_message:
         return None
     if observation.interrupted or result.capture_diagnostics:
