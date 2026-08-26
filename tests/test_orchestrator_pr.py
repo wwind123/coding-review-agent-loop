@@ -146,6 +146,57 @@ def test_plain_pr_recovery_accepts_loop_created_managed_pr_body(tmp_path):
     assert runner.comments == ["**Review verdict:** Approved\n\nLGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"]
 
 
+def test_plain_pr_recovery_accepts_managed_pr_head_after_creation_sha_advanced(tmp_path):
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(
+            {"source_branch": "feature/review-context", "source_sha": "abc123"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).decode()
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={
+            "body": f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {encoded} -->",
+            "headRefName": "agent-loop/managed-direct-token",
+            "headRefOid": "abc123-coder-1",
+        },
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+    assert runner.comments == ["**Review verdict:** Approved\n\nLGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"]
+
+
+def test_in_process_managed_pr_handoff_still_requires_creation_sha(tmp_path):
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(
+            {"source_branch": "feature/review-context", "source_sha": "abc123"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).decode()
+    runner = FakeRunner(
+        pr_payload={
+            "body": f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {encoded} -->",
+            "headRefName": "agent-loop/managed-direct-token",
+            "headRefOid": "abc123-coder-1",
+        },
+    )
+
+    with pytest.raises(AgentLoopError, match="Managed PR head SHA does not match"):
+        run_pr_loop(
+            runner,
+            pr_number=77,
+            config=make_config(tmp_path),
+            managed_pr_origin=(
+                "feature/review-context",
+                "abc123",
+                "agent-loop/managed-direct-token",
+                None,
+            ),
+        )
+
+
 def test_approved_followup_public_renderings_sanitize_historical_marker_mentions():
     followup = ApprovedFollowup(
         reviewer="Claude",

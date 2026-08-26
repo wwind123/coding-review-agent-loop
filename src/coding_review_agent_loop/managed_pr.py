@@ -196,8 +196,15 @@ def validate_managed_pr_body(
     fetched_head_branch: str | None,
     fetched_base_branch: str | None,
     expected_base_branch: str | None,
+    require_creation_head_sha: bool = True,
 ) -> None:
-    """Validate the one managed-PR body that this invocation created."""
+    """Validate a managed-PR body and its current branch/base identity.
+
+    A managed PR created in the current invocation must still point at the
+    source commit used to create its handoff.  A recovered managed PR may have
+    advanced through coder rounds, so its current head is only required to be
+    on the authenticated managed branch.
+    """
     expected_tokens = {SOURCE_MARKER}
     if override_nonce is not None:
         expected_tokens.add(UNPROTECTED_OVERRIDE_TRAILER)
@@ -211,7 +218,7 @@ def validate_managed_pr_body(
     source_branch_value, source_sha_value = _managed_pr_source_fields(carrier)
     if source_branch_value != source_branch or source_sha_value != source_sha:
         raise AgentLoopError("Managed PR source record does not match this creation handoff.")
-    if fetched_head_sha != source_sha:
+    if require_creation_head_sha and fetched_head_sha != source_sha:
         raise AgentLoopError("Managed PR head SHA does not match its creation handoff.")
     if fetched_head_branch != managed_branch:
         raise AgentLoopError("Managed PR head branch does not match its creation handoff.")

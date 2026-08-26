@@ -6257,6 +6257,7 @@ def run_pr_loop(
     ordinary_recovery: OrdinaryRecoveryCapability | None = None
     ordinary_recovery_selected = False
     managed_ci_qualified = False
+    managed_pr_recovered = False
     try:
         bootstrap_cwd = github_bootstrap_cwd(config)
         initial_pr_context = get_pr_review_context(
@@ -6266,12 +6267,15 @@ def run_pr_loop(
             cwd=bootstrap_cwd,
         )
         if managed_pr_origin is None:
-            managed_pr_origin = recover_managed_pr_origin(
+            recovered_origin = recover_managed_pr_origin(
                 initial_pr_context.metadata.body or "",
                 fetched_head_branch=initial_pr_context.metadata.head_branch,
             )
-            if managed_pr_origin is None:
+            if recovered_origin is None:
                 reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+            else:
+                managed_pr_origin = recovered_origin
+                managed_pr_recovered = True
         if managed_pr_origin is not None:
             source_branch, source_sha, managed_branch, override_nonce = managed_pr_origin
             validate_managed_pr_body(
@@ -6284,6 +6288,7 @@ def run_pr_loop(
                 fetched_head_branch=initial_pr_context.metadata.head_branch,
                 fetched_base_branch=initial_pr_context.metadata.base_branch,
                 expected_base_branch=config.base,
+                require_creation_head_sha=not managed_pr_recovered,
             )
         recorded_pr_contract = find_latest_pr_contract(
             initial_pr_context.comments,
