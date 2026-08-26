@@ -79,6 +79,7 @@ from .github import (
     validate_pr_body_does_not_close_issue,
     validate_pr_expected_closing_issues,
     validate_pr_references_issue,
+    validate_pull_request_provenance,
     wait_for_ci,
     watch_pr_checks,
 )
@@ -88,6 +89,7 @@ from .issue_pr_handoff import (
     require_pr_metadata_for_handoff,
     resolve_canonical_pr_for_issue,
 )
+from .issue_pr_provenance import IssuePrProvenanceScope
 from .pr_contract import (
     PR_EXPECTED_CLOSING_MARKER_RE,
     PrExpectedClosingContract,
@@ -3884,6 +3886,33 @@ def _read_assigned_workdir_head(runner: Runner, config: AgentLoopConfig) -> str 
     return result.stdout.strip() or None
 
 
+def _advisory_issue_pr_provenance(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    expected_scope: IssuePrProvenanceScope,
+) -> None:
+    """Warn on missing provenance without blocking a newly created PR handoff."""
+    try:
+        validate_pull_request_provenance(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            expected_scope=expected_scope,
+        )
+    except AgentLoopError as exc:
+        log(
+            config,
+            f"WARNING: PR #{pr_number} did not prove expected issue commit provenance "
+            f"(repository={expected_scope.repository}, issue=#{expected_scope.issue_number}, "
+            f"flow={expected_scope.flow}, plan={expected_scope.approved_plan_hash or 'none'}): {exc}. "
+            "Do not rewrite or force-push solely to satisfy this warning. If execution is "
+            "interrupted before handoff, resume the PR directly with "
+            f"`agent-loop pr {pr_number}`.",
+        )
+
+
 def _validate_response_tests_with_post_pr_context(
     text: str,
     *,
@@ -4018,7 +4047,16 @@ def _implement_approved_issue(
     # legacy exactly-one-open-PR GitHub search when no record exists yet
     # (#495, #589).
     resolved_pr = resolve_canonical_pr_for_issue(
-        runner, config=config, issue_number=issue_number, issue_context=issue_context
+        runner,
+        config=config,
+        issue_number=issue_number,
+        issue_context=issue_context,
+        expected_fallback_scope=IssuePrProvenanceScope(
+            repository=config.repo,
+            issue_number=issue_number,
+            flow="approved",
+            approved_plan_hash=plan_hash,
+        ),
     )
     recovered_contract_ids = (
         resolved_pr.metadata.expected_closing_issue_ids
@@ -4225,6 +4263,17 @@ def _implement_approved_issue(
         pr_number=pr_number,
         expected_issue_ids=closing_contract.issue_ids,
         body=initial_pr_context.metadata.body,
+    )
+    _advisory_issue_pr_provenance(
+        runner,
+        config=implementation_config,
+        pr_number=pr_number,
+        expected_scope=IssuePrProvenanceScope(
+            repository=implementation_config.repo,
+            issue_number=issue_number,
+            flow="approved",
+            approved_plan_hash=plan_hash,
+        ),
     )
     initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_context.metadata)
     pr_contract = make_pr_contract(
@@ -5359,7 +5408,16 @@ def _run_plan_first_loop(
                 # it (#589). It is scoped to the selected target issue, since
                 # a split-stage plan implements a child, not the parent.
                 resolved_pr = resolve_canonical_pr_for_issue(
-                    runner, config=config, issue_number=target_issue_number, issue_context=target_issue_context
+                    runner,
+                    config=config,
+                    issue_number=target_issue_number,
+                    issue_context=target_issue_context,
+                    expected_fallback_scope=IssuePrProvenanceScope(
+                        repository=config.repo,
+                        issue_number=target_issue_number,
+                        flow="approved",
+                        approved_plan_hash=plan_hash,
+                    ),
                 )
                 if resolved_pr is not None:
                     if (
@@ -5658,7 +5716,20 @@ def run_issue_loop(
         # interrupted PR review resumes that PR instead of creating a
         # duplicate (#589).
         resolved_pr = resolve_canonical_pr_for_issue(
-            runner, config=config, issue_number=issue_number, issue_context=issue_context
+            runner,
+            config=config,
+            issue_number=issue_number,
+            issue_context=issue_context,
+            expected_fallback_scope=(
+                None
+                if plan_first and recovered_plan_hash is None
+                else IssuePrProvenanceScope(
+                    repository=config.repo,
+                    issue_number=issue_number,
+                    flow="approved" if plan_first else "direct",
+                    approved_plan_hash=recovered_plan_hash if plan_first else None,
+                )
+            ),
         )
         if resolved_pr is not None:
             closing_contract = resolve_issue_contract(
@@ -5904,6 +5975,16 @@ def run_issue_loop(
             pr_number=pr_number,
             expected_issue_ids=closing_contract.issue_ids,
             body=initial_pr_metadata.body,
+        )
+        _advisory_issue_pr_provenance(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            expected_scope=IssuePrProvenanceScope(
+                repository=config.repo,
+                issue_number=issue_number,
+                flow="direct",
+            ),
         )
         initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_metadata)
         pr_contract = make_pr_contract(

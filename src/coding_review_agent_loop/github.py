@@ -30,6 +30,11 @@ from .pr_contract import (
     encode_pr_contract,
 )
 from .logging import log
+from .issue_pr_provenance import (
+    IssuePrProvenanceScope,
+    compare_issue_pr_provenance,
+    parse_issue_pr_provenance_messages,
+)
 from .round_transport import MAX_GITHUB_BODY_CHARS, prepare_round_comment
 from .protocol import parse_signed_human_requirement_body
 from .protocol_markers import (
@@ -231,6 +236,205 @@ class OpenPrClosingMatch(int):
     @property
     def pr_number(self) -> int:
         return int(self)
+
+
+@dataclass(frozen=True)
+class PullRequestCommitMetadata:
+    """One commit in the provider-reported PR base-to-head connection."""
+
+    oid: str
+    message: str
+
+
+def _graphql_repository_parts(repository: str) -> tuple[str, str]:
+    parts = repository.split("/", 1)
+    if len(parts) != 2 or not all(parts):
+        raise AgentLoopError(f"Repository {repository!r} is not an owner/repository identity.")
+    return parts[0], parts[1]
+
+
+_PR_COMMIT_CONNECTION_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      commits(first: 100, after: $after) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          commit { oid message }
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+
+def _query_pr_commit_connection(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    after: str | None,
+) -> object:
+    owner, name = _graphql_repository_parts(config.repo)
+    args = [
+        config.gh_cmd,
+        "api",
+        "graphql",
+        "-f",
+        f"query={_PR_COMMIT_CONNECTION_QUERY}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+        "-F",
+        f"number={pr_number}",
+    ]
+    if after is not None:
+        args.extend(("-F", f"after={after}"))
+    result = runner.run(args, cwd=active_workdir(config), check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise AgentLoopError(
+            f"GitHub PR commit provenance query failed for PR #{pr_number}"
+            + (f": {detail}" if detail else ".")
+        )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(
+            f"GitHub returned malformed PR commit provenance JSON for PR #{pr_number}."
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("errors"):
+        raise AgentLoopError(f"GitHub returned an error for PR #{pr_number} commit provenance.")
+    return payload
+
+
+def _parse_pr_commit_connection_page(
+    payload: object,
+    *,
+    pr_number: int,
+) -> tuple[str, int, tuple[PullRequestCommitMetadata, ...], bool, str | None]:
+    if not isinstance(payload, dict):
+        raise AgentLoopError(f"GitHub returned a malformed commit page for PR #{pr_number}.")
+    data = payload.get("data")
+    repository = data.get("repository") if isinstance(data, dict) else None
+    pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
+    connection = pull_request.get("commits") if isinstance(pull_request, dict) else None
+    head_oid = pull_request.get("headRefOid") if isinstance(pull_request, dict) else None
+    if not isinstance(head_oid, str) or not head_oid:
+        raise AgentLoopError(f"GitHub returned no current head OID for PR #{pr_number}.")
+    if not isinstance(connection, dict):
+        raise AgentLoopError(f"GitHub returned no complete commit connection for PR #{pr_number}.")
+    total = connection.get("totalCount")
+    page_info = connection.get("pageInfo")
+    nodes = connection.get("nodes")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise AgentLoopError(f"GitHub returned an invalid commit total for PR #{pr_number}.")
+    if not isinstance(page_info, dict):
+        raise AgentLoopError(f"GitHub returned malformed commit pagination for PR #{pr_number}.")
+    has_next = page_info.get("hasNextPage")
+    end_cursor = page_info.get("endCursor")
+    if not isinstance(has_next, bool) or (has_next and (not isinstance(end_cursor, str) or not end_cursor)):
+        raise AgentLoopError(f"GitHub returned malformed commit pagination for PR #{pr_number}.")
+    if end_cursor is not None and not isinstance(end_cursor, str):
+        raise AgentLoopError(f"GitHub returned malformed commit pagination for PR #{pr_number}.")
+    if not isinstance(nodes, list):
+        raise AgentLoopError(f"GitHub returned malformed commit nodes for PR #{pr_number}.")
+    commits: list[PullRequestCommitMetadata] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise AgentLoopError(f"GitHub returned an incomplete commit node for PR #{pr_number}.")
+        commit_node = node.get("commit") if isinstance(node.get("commit"), dict) else node
+        oid = commit_node.get("oid") if isinstance(commit_node, dict) else None
+        message = commit_node.get("message") if isinstance(commit_node, dict) else None
+        if not isinstance(oid, str) or not oid or not isinstance(message, str):
+            raise AgentLoopError(f"GitHub returned an incomplete commit node for PR #{pr_number}.")
+        commits.append(PullRequestCommitMetadata(oid=oid, message=message))
+    return head_oid, total, tuple(commits), has_next, end_cursor
+
+
+def read_pull_request_commit_metadata(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+) -> tuple[PullRequestCommitMetadata, ...]:
+    """Read the complete stable commit history for one PR.
+
+    The connection is paginated independently of the provider's default page
+    cap.  Both the head OID and provider-reported total are sampled again
+    after traversal so a concurrent push or truncated response is unavailable
+    for recovery rather than being mistaken for a clean provenance miss.
+    """
+    if config.dry_run:
+        return ()
+    first_payload = _query_pr_commit_connection(
+        runner, config=config, pr_number=pr_number, after=None
+    )
+    before_head, expected_total, first_commits, has_next, cursor = _parse_pr_commit_connection_page(
+        first_payload, pr_number=pr_number
+    )
+    commits = list(first_commits)
+    seen_oids = {commit.oid for commit in commits}
+    seen_cursors: set[str] = set()
+    while has_next:
+        assert cursor is not None
+        if cursor in seen_cursors:
+            raise AgentLoopError(f"GitHub commit pagination for PR #{pr_number} did not advance.")
+        seen_cursors.add(cursor)
+        payload = _query_pr_commit_connection(
+            runner, config=config, pr_number=pr_number, after=cursor
+        )
+        head, total, page_commits, has_next, next_cursor = _parse_pr_commit_connection_page(
+            payload, pr_number=pr_number
+        )
+        if head != before_head or total != expected_total:
+            raise AgentLoopError(f"PR #{pr_number} commit history changed during provenance scan.")
+        if not page_commits and has_next:
+            raise AgentLoopError(f"GitHub commit pagination for PR #{pr_number} returned an empty advancing page.")
+        for commit in page_commits:
+            if commit.oid in seen_oids:
+                raise AgentLoopError(f"GitHub commit pagination for PR #{pr_number} repeated a commit.")
+            seen_oids.add(commit.oid)
+            commits.append(commit)
+        if has_next and next_cursor == cursor:
+            raise AgentLoopError(f"GitHub commit pagination for PR #{pr_number} did not advance.")
+        cursor = next_cursor
+    if len(commits) != expected_total:
+        raise AgentLoopError(
+            f"GitHub PR #{pr_number} commit provenance was truncated: provider reported "
+            f"{expected_total} commits but returned {len(commits)}."
+        )
+    final_payload = _query_pr_commit_connection(
+        runner, config=config, pr_number=pr_number, after=None
+    )
+    final_head, final_total, _ignored, _ignored_next, _ignored_cursor = _parse_pr_commit_connection_page(
+        final_payload, pr_number=pr_number
+    )
+    if final_head != before_head or final_total != expected_total:
+        raise AgentLoopError(f"PR #{pr_number} commit history changed during provenance scan.")
+    return tuple(commits)
+
+
+get_pull_request_commit_metadata = read_pull_request_commit_metadata
+
+
+def validate_pull_request_provenance(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    expected_scope: IssuePrProvenanceScope,
+) -> IssuePrProvenanceScope:
+    commits = read_pull_request_commit_metadata(runner, config=config, pr_number=pr_number)
+    try:
+        claims = parse_issue_pr_provenance_messages(commit.message for commit in commits)
+        return compare_issue_pr_provenance(claims, expected=expected_scope)
+    except AgentLoopError as exc:
+        raise AgentLoopError(f"PR #{pr_number} commit provenance is unavailable: {exc}") from exc
 
 
 def _issue_reference_evidence_from_match(
@@ -613,8 +817,15 @@ def validate_pr_body_does_not_close_issue(
     )
 
 
+_UNSET_PROVENANCE_SCOPE = object()
+
+
 def find_open_pr_closing_issue(
-    runner: Runner, *, config: AgentLoopConfig, issue_number: int
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    expected_scope: IssuePrProvenanceScope | None | object = _UNSET_PROVENANCE_SCOPE,
 ) -> OpenPrClosingMatch | None:
     """Find the unique open PR with strong closing evidence for an issue.
 
@@ -624,6 +835,13 @@ def find_open_pr_closing_issue(
     """
     if config.dry_run:
         return None
+    if expected_scope is _UNSET_PROVENANCE_SCOPE:
+        # Preserve the direct helper's historical default while resolver call
+        # sites pass an explicit scope (including ``None`` when a plan cannot
+        # be reconstructed).
+        expected_scope = IssuePrProvenanceScope(
+            repository=config.repo, issue_number=issue_number, flow="direct"
+        )
     result = runner.run(
         [
             config.gh_cmd,
@@ -684,7 +902,31 @@ def find_open_pr_closing_issue(
             "reference or close the unrelated PR(s), then rerun `agent-loop pr <number>` directly "
             "to continue review on the correct one."
         )
-    return matches[0]
+    match = matches[0]
+    if expected_scope is None:
+        raise _candidate_provenance_error(
+            match.pr_number,
+            "the issue-mode plan has no reconstructable approved-plan scope",
+        )
+    try:
+        validate_pull_request_provenance(
+            runner,
+            config=config,
+            pr_number=match.pr_number,
+            expected_scope=expected_scope,
+        )
+    except AgentLoopError as exc:
+        raise _candidate_provenance_error(match.pr_number, str(exc)) from exc
+    return match
+
+
+def _candidate_provenance_error(pr_number: int, reason: str) -> AgentLoopError:
+    return AgentLoopError(
+        f"Open PR #{pr_number} is the sole closing-reference candidate, but it cannot be "
+        f"safely adopted: {reason} Remove the closing reference from this unrelated PR or "
+        f"close the unrelated PR; if PR #{pr_number} is the intended implementation, resume "
+        f"it directly with `agent-loop pr {pr_number}`."
+    )
 
 
 def _parse_pr_metadata(

@@ -285,6 +285,20 @@ def test_issue_prompts_include_salvage_guardrail_block(tmp_path):
         assert "partial.patch" in prompt
 
 
+def test_issue_implementation_prompts_inject_exact_scoped_trailer_guidance(tmp_path):
+    config = make_config(tmp_path)
+    direct_prompt = build_issue_prompt(680, config)
+    approved_prompt = build_issue_implementation_prompt(680, "Approved plan text.", config)
+
+    assert "Agent-Issue-Provenance: v1 repo=owner/repo issue=680 flow=direct" in direct_prompt
+    assert "Agent-Issue-Provenance: v1 repo=owner/repo issue=680 flow=approved plan=" in approved_prompt
+    for prompt in (direct_prompt, approved_prompt):
+        assert "at least one implementation commit carries" in prompt
+        assert "Keep this trailer out of the PR body and all comments" in prompt
+        assert "gh pr create --fill" in prompt
+        assert "preserving all required closing references" in prompt
+
+
 def test_issue_prompts_render_remote_salvage_summary_shape(tmp_path):
     from coding_review_agent_loop.salvage import RemoteSalvageRecord, render_remote_salvage_summary
 

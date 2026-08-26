@@ -3,7 +3,18 @@ import base64
 import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.github import IssueComment, PullRequestMetadata
+from coding_review_agent_loop.github import (
+    IssueComment,
+    PullRequestMetadata,
+    find_open_pr_closing_issue,
+    read_pull_request_commit_metadata,
+)
+from coding_review_agent_loop.issue_pr_provenance import (
+    IssuePrProvenanceScope,
+    compare_issue_pr_provenance,
+    format_issue_pr_provenance,
+    parse_issue_pr_provenance_messages,
+)
 from coding_review_agent_loop.issue_pr_handoff import (
     _decode_issue_pr_handoff_metadata,
     _encode_issue_pr_handoff_metadata,
@@ -13,6 +24,7 @@ from coding_review_agent_loop.issue_pr_handoff import (
     format_issue_pr_handoff_comment,
     require_pr_metadata_for_handoff,
 )
+from agent_loop_helpers import FakeRunner, make_config
 
 
 def _comment(body: str) -> IssueComment:
@@ -31,6 +43,33 @@ def _metadata(**overrides) -> IssuePrHandoffMetadata:
     )
     defaults.update(overrides)
     return IssuePrHandoffMetadata(**defaults)
+
+
+def _commit_page(messages, *, head="abc123", total=None, has_next=False, cursor=None):
+    nodes = [
+        {"commit": {"oid": f"commit-{index}", "message": message}}
+        for index, message in enumerate(messages, start=1)
+    ]
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "headRefOid": head,
+                    "commits": {
+                        "totalCount": len(nodes) if total is None else total,
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                        "nodes": nodes,
+                    },
+                }
+            }
+        }
+    }
+
+
+def _provenance_pages(message, *, issue=56, flow="direct", plan=None):
+    scope = IssuePrProvenanceScope("OWNER/REPO", issue, flow, plan)
+    page = _commit_page([f"Change\n\n{format_issue_pr_provenance(scope)}"])
+    return [page, page]
 
 
 def test_round_trips_metadata_through_marker():
@@ -299,3 +338,77 @@ def test_require_pr_metadata_for_handoff_returns_tuple_when_present():
         "https://github.com/OWNER/REPO/pull/77",
         "abc123",
     )
+
+
+def test_provenance_parser_collapses_identical_claims_across_commits():
+    scope = IssuePrProvenanceScope("OWNER/REPO", 56, "direct")
+    messages = [
+        f"first\n\n{format_issue_pr_provenance(scope)}",
+        f"second\n\n{format_issue_pr_provenance(scope)}",
+    ]
+
+    claims = parse_issue_pr_provenance_messages(messages)
+
+    assert compare_issue_pr_provenance(claims, expected=scope) == scope
+
+
+def test_legacy_recovery_requires_complete_matching_commit_provenance(tmp_path):
+    runner = FakeRunner(
+        open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
+        pr_commit_pages=_provenance_pages("ignored"),
+    )
+    config = make_config(tmp_path)
+
+    found = find_open_pr_closing_issue(runner, config=config, issue_number=56)
+
+    assert found is not None
+    assert found.pr_number == 77
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        [_commit_page([]), _commit_page([])],
+        [
+            _commit_page(
+                ["Change\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct\n"
+                 "Agent-Issue-Provenance: malformed"]
+            ),
+            _commit_page(["ignored"]),
+        ],
+        [
+            _commit_page(
+                [
+                    "Change\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct",
+                    "Other\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=57 flow=direct",
+                ],
+                total=2,
+            ),
+            _commit_page(["ignored"], total=2),
+        ],
+    ],
+)
+def test_invalid_single_candidate_recovery_includes_both_safe_remedies(tmp_path, pages):
+    runner = FakeRunner(
+        open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
+        pr_commit_pages=pages,
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError) as exc_info:
+        find_open_pr_closing_issue(runner, config=config, issue_number=56)
+
+    message = str(exc_info.value)
+    assert "Remove the closing reference" in message
+    assert "close the unrelated PR" in message
+    assert "agent-loop pr 77" in message
+
+
+def test_commit_connection_rejects_count_truncation(tmp_path):
+    scope = IssuePrProvenanceScope("OWNER/REPO", 56, "direct")
+    page = _commit_page([format_issue_pr_provenance(scope)], total=2)
+    runner = FakeRunner(pr_commit_pages=[page, page])
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="truncated"):
+        read_pull_request_commit_metadata(runner, config=config, pr_number=77)

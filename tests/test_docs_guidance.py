@@ -92,6 +92,16 @@ def test_local_agent_loop_doc_has_ci_infrastructure_stall_section():
     assert "runner_unavailable" in text
 
 
+def test_issue_recovery_docs_describe_commit_provenance_retirement():
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    readme_text = README.read_text(encoding="utf-8")
+    assert "Agent-Issue-Provenance" in text
+    assert "Metadata-free recovery is retired" in text
+    assert "unauthenticated convention" in text
+    assert "Squash or rebase removal" in text
+    assert "managed-pr --head" in readme_text
+
+
 def test_readme_links_to_ci_infrastructure_stall_section():
     doc_text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert f"### {CI_STALL_HEADING_TEXT}" in doc_text, "heading moved; update CI_STALL_HEADING_TEXT"
