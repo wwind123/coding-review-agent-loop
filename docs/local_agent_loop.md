@@ -2133,9 +2133,39 @@ commands compare PATH entry, symlink, and target identities; an absolute overrid
 requires direct evidence that its exact entry or target changed or disappeared.
 Claude's existing 30-second eligibility cap, updater diagnostics, deadline-
 bounded stability wait, remaining-time replay, and `self-update-attempt2` suffix
-remain unchanged. If a genuine long quota reset occurs after replacement
-context was recorded, quota remains primary and exit code 3 is preserved with
-the earlier replacement detail appended.
+remain unchanged, with one additional read-only workdir gate. Immediately before
+each Claude invocation the backend runs exactly `git rev-parse HEAD` and `git
+status --porcelain` in the assigned checkout. A zero exit with nonblank stripped
+HEAD is available; a zero exit with blank HEAD is unavailable. Status is available
+on zero exit even when stdout is empty, because empty porcelain output is the
+valid clean-worktree state. Non-empty porcelain output is preserved exactly, so
+unchanged dirty snapshots are replayable just like unchanged clean snapshots.
+
+The after snapshot is lazy and is taken only after the existing failure, elapsed,
+artifact, session, and parseable-JSON progress exclusions leave positive updater
+or managed-command identity evidence. Claude replay is accepted only when both
+snapshots are available and identical. Changed HEAD, changed status, and before
+or after probe unavailability fail closed for replay. Claude tolerates an
+`AgentLoopError` or `OSError` from these probes by recording structured
+unavailability; the separate PR HEAD-advance guard uses strict exception
+behavior, while ordinary nonzero or blank HEAD results still map to an
+unavailable observation.
+
+Replay refusal details are attempt-specific diagnostics only. They are recorded
+with the failed call's log path, do not set accepted executable-replacement
+evidence, do not trigger stability waiting or the dedicated replay, and do not
+change provider-derived retry eligibility, reviewer availability, or failure
+category. Terminal annotations are added once, with accepted replacement context
+before the latest refusal context and the underlying failure last. This remains
+a read-only guard: local HEAD and porcelain status cannot observe byte-identical
+external effects such as pushes, pull-request creation, or comments, so it
+reduces replay risk without eliminating it.
+
+Codex remains unchanged because its JSONL stream already supplies setup-versus-
+progress evidence and retains its separate fresh-timeout replacement replay. If
+a genuine long quota reset occurs after replacement context was recorded, quota
+remains primary and exit code 3 is preserved with the earlier replacement detail
+appended.
 
 Unsupported model/provider-auth compatibility errors are reported separately
 with failure category `unsupported_model`. These diagnostics name the agent and

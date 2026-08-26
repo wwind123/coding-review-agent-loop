@@ -94,7 +94,8 @@ class UsageCallRecord:
     outcome: Literal[
         "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
         "unavailable_model", "accepted_nonzero_exit", "accepted_timeout", "self_update_interruption",
-        "executable_replacement_interruption",
+        "executable_replacement_interruption", "self_update_replay_refused_changed_workdir",
+        "self_update_replay_refused_unavailable_workdir",
     ] | None = None
     log_path: str | None = None
     fallback_planned: bool | None = None
@@ -204,7 +205,8 @@ class RunUsageContext:
         outcome: Literal[
             "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
             "unavailable_model", "accepted_nonzero_exit", "accepted_timeout", "self_update_interruption",
-            "executable_replacement_interruption",
+            "executable_replacement_interruption", "self_update_replay_refused_changed_workdir",
+            "self_update_replay_refused_unavailable_workdir",
         ] | None = None,
         log_path: str | None = None,
         fallback_planned: bool | None = None,

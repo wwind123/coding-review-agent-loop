@@ -86,7 +86,7 @@ def test_claude_self_update_classification_requires_bounded_evidence():
     failed = CommandResult(["claude"], Path.cwd(), "", "", 1, observation)
     assert classify_self_update_interruption(
         failed, command="claude", response_file_text=None, session_id=None
-    ) == "Claude executable changed during invocation"
+    ).reason == "Claude executable changed during invocation"
     ordinary = CommandResult(["claude"], Path.cwd(), "ordinary failure", "", 1,
                              ExecutionObservation(2, 10, 11, 1, identity, identity, False))
     assert classify_self_update_interruption(
@@ -96,7 +96,97 @@ def test_claude_self_update_classification_requires_bounded_evidence():
                                ExecutionObservation(2, 10, 11, 1, identity, identity, False))
     assert classify_self_update_interruption(
         diagnostic, command="claude", response_file_text=None, session_id=None
-    ) == "Claude Code updater diagnostic"
+    ).reason == "Claude Code updater diagnostic"
+
+
+def test_claude_self_update_workdir_gate_reports_changed_status_without_replacing_evidence():
+    from coding_review_agent_loop.workdir_guard import capture_workdir_snapshot
+
+    identity = ExecutableIdentity("/bin/claude", "/bin/claude", (1, 1, 1), (1, 1, 1))
+    observation = ExecutionObservation(2, 10, 11, 1, identity, identity, False)
+    result = CommandResult(
+        ["claude"], Path.cwd(), "Loading...\nInstalling Claude Code v2.1.226", "", 1, observation
+    )
+    before_runner = FakeRunner(
+        git_probe_results=[
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "", "returncode": 0},
+        ]
+    )
+    after_runner = FakeRunner(
+        git_probe_results=[
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": " M changed.py\n", "returncode": 0},
+        ]
+    )
+    before = capture_workdir_snapshot(before_runner, Path.cwd())
+    after = capture_workdir_snapshot(after_runner, Path.cwd())
+
+    evidence = classify_self_update_interruption(
+        result,
+        command="claude",
+        response_file_text=None,
+        session_id=None,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+
+    assert evidence is not None
+    assert evidence.reason == "Claude Code updater diagnostic"
+    assert evidence.replay_refusal_kind == "changed-status"
+    assert "dirty workdir" in evidence.replay_refusal_detail
+
+
+def test_claude_backend_probes_before_every_call_but_after_only_for_candidates(tmp_path):
+    from coding_review_agent_loop.agents.claude import ClaudeBackend
+
+    identity = ExecutableIdentity("claude", "claude", (1, 1, 1), (1, 1, 1))
+    observation = ExecutionObservation(2, 10, 11, 1, identity, identity, False)
+
+    class ObservedRunner(FakeRunner):
+        def run_with_log(self, *args, **kwargs):
+            result = super().run_with_log(*args, **kwargs)
+            return CommandResult(
+                result.args,
+                result.cwd,
+                result.stdout,
+                result.stderr,
+                result.returncode,
+                observation,
+            )
+
+    candidate_runner = ObservedRunner(
+        claude_outputs=[("fatal: auto-update in progress", 1)],
+        git_probe_results=[
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "", "returncode": 0},
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": " M changed.py\n", "returncode": 0},
+        ],
+    )
+    candidate = ClaudeBackend().run(candidate_runner, make_config(tmp_path), "Review")
+    assert candidate.self_update_reason == "Claude Code updater diagnostic"
+    assert candidate.self_update_replay_refusal_kind == "changed-status"
+    assert candidate_runner.git_probe_calls == [
+        ("git", "rev-parse", "HEAD"),
+        ("git", "status", "--porcelain"),
+        ("git", "rev-parse", "HEAD"),
+        ("git", "status", "--porcelain"),
+    ]
+
+    ordinary_runner = ObservedRunner(
+        claude_outputs=[("ordinary failure", 1)],
+        git_probe_results=[
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "", "returncode": 0},
+        ],
+    )
+    ordinary = ClaudeBackend().run(ordinary_runner, make_config(tmp_path), "Review")
+    assert ordinary.self_update_reason is None
+    assert ordinary_runner.git_probe_calls == [
+        ("git", "rev-parse", "HEAD"),
+        ("git", "status", "--porcelain"),
+    ]
 
 
 def _codex_result(

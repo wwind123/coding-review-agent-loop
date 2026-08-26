@@ -656,6 +656,22 @@ checkouts must point at the requested repository. Use explicit persistent
 directories for large repositories, long-lived agent worktrees, or setups that
 should survive `/tmp` cleanup or reboot.
 
+Claude's bounded self-update replay guard is read-only. It captures `git rev-parse
+HEAD` and `git status --porcelain` immediately before each Claude invocation; an
+empty porcelain result is the valid clean-worktree state, and non-empty output is
+compared exactly. A replay is accepted only when both available snapshots are
+identical. If either snapshot is unavailable, the guard fails closed for replay
+and records a diagnostic; that diagnostic does not change the provider-derived
+failure category or reviewer availability semantics. The separate PR handoff
+HEAD-advance guard remains strict about runner exceptions, while ordinary Git
+failure or blank HEAD output is treated as an unavailable observation.
+
+Codex is unchanged here because its JSONL stream supplies setup-versus-progress
+evidence and retains its separate fresh-timeout replacement replay. Local HEAD
+and porcelain status cannot observe byte-identical external effects such as a
+push, pull-request creation, or comment, so the snapshot guard reduces replay
+risk without eliminating it.
+
 Agent memory is enabled by default. Before invoking agents, the loop creates or
 refreshes advisory repo memory in a durable, repo-scoped user cache directory
 such as `~/.cache/coding-review-agent-loop/repos/OWNER-REPO/memory` on Linux:

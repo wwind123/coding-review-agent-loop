@@ -28,6 +28,123 @@ INTERPRETER_BASENAME_RE = re.compile(r"^(python|pypy)\d*(\.\d+)?$")
 # Origin of a reported test-command string.
 Origin = Literal["structured", "response"]
 
+# These probes are deliberately kept in the workdir guard module so the
+# Claude recovery path and the coder-reported-PR HEAD guard share the same
+# read-only Git command contract without sharing exception policy.
+GitProbeKind = Literal["available", "command-failed", "blank", "exception"]
+
+
+@dataclass(frozen=True)
+class GitProbeResult:
+    """The result of one bounded, read-only Git probe."""
+
+    command: tuple[str, ...]
+    kind: GitProbeKind
+    value: str | None = None
+    returncode: int | None = None
+    exception_type: str | None = None
+    detail: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.kind == "available"
+
+
+@dataclass(frozen=True)
+class WorkdirSnapshot:
+    """HEAD and porcelain status captured from one assigned checkout."""
+
+    head: GitProbeResult
+    status: GitProbeResult
+
+    @property
+    def available(self) -> bool:
+        return self.head.available and self.status.available
+
+
+def _git_probe(
+    runner: object,
+    *,
+    workdir: Path,
+    args: tuple[str, ...],
+    tolerate_exceptions: bool,
+) -> GitProbeResult:
+    command = ("git", *args)
+    try:
+        result = runner.run(command, cwd=workdir, check=False)  # type: ignore[attr-defined]
+    except (AgentLoopError, OSError) as exc:
+        if not tolerate_exceptions:
+            raise
+        return GitProbeResult(
+            command=command,
+            kind="exception",
+            exception_type=type(exc).__name__,
+            detail=str(exc),
+        )
+    if result.returncode != 0:
+        return GitProbeResult(
+            command=command,
+            kind="command-failed",
+            returncode=result.returncode,
+            detail=result.stderr or None,
+        )
+    if args == ("rev-parse", "HEAD"):
+        value = result.stdout.strip()
+        if not value:
+            return GitProbeResult(command=command, kind="blank", returncode=result.returncode)
+        return GitProbeResult(
+            command=command,
+            kind="available",
+            value=value,
+            returncode=result.returncode,
+        )
+    # `git status --porcelain` uses an empty stdout as the authoritative clean
+    # worktree state. Preserve all non-empty bytes so dirty-status comparisons
+    # remain exact and do not normalize away meaningful changes.
+    return GitProbeResult(
+        command=command,
+        kind="available",
+        value=result.stdout,
+        returncode=result.returncode,
+    )
+
+
+def read_workdir_head(
+    runner: object,
+    workdir: Path,
+    *,
+    tolerate_exceptions: bool = False,
+) -> GitProbeResult:
+    """Read only ``git rev-parse HEAD`` from ``workdir``."""
+    return _git_probe(
+        runner,
+        workdir=workdir,
+        args=("rev-parse", "HEAD"),
+        tolerate_exceptions=tolerate_exceptions,
+    )
+
+
+def capture_workdir_snapshot(
+    runner: object,
+    workdir: Path,
+    *,
+    tolerate_exceptions: bool = False,
+) -> WorkdirSnapshot:
+    """Capture HEAD and ``git status --porcelain`` without mutating the checkout."""
+    return WorkdirSnapshot(
+        head=read_workdir_head(
+            runner,
+            workdir,
+            tolerate_exceptions=tolerate_exceptions,
+        ),
+        status=_git_probe(
+            runner,
+            workdir=workdir,
+            args=("status", "--porcelain"),
+            tolerate_exceptions=tolerate_exceptions,
+        ),
+    )
+
 # ---------------------------------------------------------------------------
 # Toolchain / runner recognition (path pass, program-role tokens only).
 # ---------------------------------------------------------------------------

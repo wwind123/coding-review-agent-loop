@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,7 @@ from .base import (
 from ..logging import agent_log_path, log
 from ..runner import CommandResult, Runner, executable_identity_changed
 from ..usage import UsageMetadata, coerce_int, first_present
+from ..workdir_guard import WorkdirSnapshot, capture_workdir_snapshot
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
@@ -106,14 +108,78 @@ def _has_updater_diagnostic(output: str) -> bool:
     return bool(_UPDATER_DIAGNOSTIC_RE.search("\n".join(lines)[-2048:]))
 
 
+@dataclass(frozen=True)
+class SelfUpdateInterruptionEvidence:
+    """Positive updater evidence and, independently, a replay refusal."""
+
+    reason: str
+    replay_refusal_kind: str | None = None
+    replay_refusal_detail: str | None = None
+
+def _workdir_probe_label(snapshot: WorkdirSnapshot) -> str:
+    def describe(probe) -> str:
+        if probe.kind == "available":
+            return repr(probe.value)
+        if probe.kind == "exception":
+            return f"{probe.exception_type}: {probe.detail}"
+        if probe.kind == "command-failed":
+            return f"returncode={probe.returncode!r}"
+        return "blank"
+
+    return f"HEAD={describe(snapshot.head)}, status={describe(snapshot.status)}"
+
+
+def _gate_self_update_replay(
+    reason: str,
+    *,
+    before_snapshot: WorkdirSnapshot | None,
+    after_snapshot: WorkdirSnapshot | None,
+) -> SelfUpdateInterruptionEvidence:
+    """Accept a candidate only when both read-only snapshots are identical."""
+    # Calls without snapshots retain the historical evidence-only helper
+    # contract. ClaudeBackend always supplies both snapshots after candidate
+    # detection, so replay policy itself remains fail-closed there.
+    if before_snapshot is None and after_snapshot is None:
+        return SelfUpdateInterruptionEvidence(reason)
+    if before_snapshot is None or not before_snapshot.available:
+        detail = (
+            "Claude self-update replay refused: before workdir snapshot "
+            f"unavailable ({_workdir_probe_label(before_snapshot) if before_snapshot else 'missing'})."
+        )
+        return SelfUpdateInterruptionEvidence(reason, "before-unavailable", detail)
+    if after_snapshot is None or not after_snapshot.available:
+        detail = (
+            "Claude self-update replay refused: after workdir snapshot "
+            f"unavailable ({_workdir_probe_label(after_snapshot) if after_snapshot else 'missing'})."
+        )
+        return SelfUpdateInterruptionEvidence(reason, "after-unavailable", detail)
+    if before_snapshot.head.value != after_snapshot.head.value:
+        detail = (
+            "Claude self-update replay refused: assigned checkout HEAD changed "
+            f"during invocation (before={before_snapshot.head.value!r}, "
+            f"after={after_snapshot.head.value!r})."
+        )
+        return SelfUpdateInterruptionEvidence(reason, "changed-head", detail)
+    if before_snapshot.status.value != after_snapshot.status.value:
+        detail = (
+            "Claude self-update replay refused: dirty workdir status changed "
+            f"during invocation (before={before_snapshot.status.value!r}, "
+            f"after={after_snapshot.status.value!r})."
+        )
+        return SelfUpdateInterruptionEvidence(reason, "changed-status", detail)
+    return SelfUpdateInterruptionEvidence(reason)
+
+
 def classify_self_update_interruption(
     result: CommandResult,
     *,
     command: str,
     response_file_text: str | None,
     session_id: str | None,
-) -> str | None:
-    """Return bounded Claude-updater evidence, never a generic failure classification."""
+    before_snapshot: WorkdirSnapshot | None = None,
+    after_snapshot: WorkdirSnapshot | None = None,
+) -> SelfUpdateInterruptionEvidence | None:
+    """Return bounded Claude-updater evidence, then apply the workdir gate."""
     observation = result.observation
     if not isinstance(result.returncode, int) or result.returncode == 0 or observation is None:
         return None
@@ -127,7 +193,12 @@ def classify_self_update_interruption(
         except json.JSONDecodeError:
             pass
     if _has_updater_diagnostic(result.stdout):
-        return "Claude Code updater diagnostic"
+        reason = "Claude Code updater diagnostic"
+        return _gate_self_update_replay(
+            reason,
+            before_snapshot=before_snapshot,
+            after_snapshot=after_snapshot,
+        )
     # A user-supplied absolute override is only eligible with an explicit
     # updater diagnostic.  A managed bare command may additionally prove the
     # race through an identity change while it was running.
@@ -136,10 +207,16 @@ def classify_self_update_interruption(
     if executable_identity_changed(
         observation.before,
         observation.after,
+        command=command,
         spawn_wall_time=observation.spawn_wall_time,
         exit_wall_time=observation.spawn_wall_time + observation.elapsed_seconds,
     ):
-        return "Claude executable changed during invocation"
+        reason = "Claude executable changed during invocation"
+        return _gate_self_update_replay(
+            reason,
+            before_snapshot=before_snapshot,
+            after_snapshot=after_snapshot,
+        )
     return None
 
 
@@ -184,6 +261,14 @@ class ClaudeBackend:
             args.append(prompt_with_response_instruction)
         log_path = agent_log_path(config, "claude", run_id=run_id, label=label, attempt_suffix=attempt_suffix)
         log(config, f"Starting Claude in {config.claude_dir}; log: {log_path}; response: {response_path}")
+        # This is deliberately before every Claude invocation, including an
+        # ordinary retry and the dedicated replay. Snapshot failures are
+        # diagnostic evidence for the replay gate, not backend failures.
+        before_snapshot = capture_workdir_snapshot(
+            runner,
+            config.claude_dir,
+            tolerate_exceptions=True,
+        )
         result = runner.run_with_log(
             args,
             cwd=config.claude_dir,
@@ -198,6 +283,29 @@ class ClaudeBackend:
         log(config, f"Claude finished; log: {log_path}")
         message_text, new_session_id, usage, raw_usage, model_detected = _parse_claude_output(result.stdout)
         response_file_text = read_public_response_file(response_path)
+        candidate = classify_self_update_interruption(
+            result,
+            command=config.claude_cmd,
+            response_file_text=response_file_text,
+            session_id=new_session_id,
+        )
+        after_snapshot = None
+        if candidate is not None and candidate.replay_refusal_kind is None:
+            # The after probe is lazy: failures without positive replacement
+            # evidence never inspect status and cannot emit refusal metadata.
+            after_snapshot = capture_workdir_snapshot(
+                runner,
+                config.claude_dir,
+                tolerate_exceptions=True,
+            )
+            candidate = classify_self_update_interruption(
+                result,
+                command=config.claude_cmd,
+                response_file_text=response_file_text,
+                session_id=new_session_id,
+                before_snapshot=before_snapshot,
+                after_snapshot=after_snapshot,
+            )
         return AgentResult(
             text=response_file_text or message_text,
             raw_output=result.stdout,
@@ -214,8 +322,12 @@ class ClaudeBackend:
             # at signature time when detection is unavailable (e.g. non-JSON output).
             model_used=model_detected,
             command_result=result,
-            self_update_reason=classify_self_update_interruption(
-                result, command=config.claude_cmd, response_file_text=response_file_text, session_id=new_session_id,
+            self_update_reason=candidate.reason if candidate else None,
+            self_update_replay_refusal_kind=(
+                candidate.replay_refusal_kind if candidate else None
+            ),
+            self_update_replay_refusal_detail=(
+                candidate.replay_refusal_detail if candidate else None
             ),
         )
 

@@ -241,6 +241,8 @@ class FakeRunner(Runner):
         post_agent_git_diff_check=None,
         post_agent_git_diff_check_returncode=None,
         post_agent_git_diff_check_stderr=None,
+        git_probe_results=None,
+        git_probe_exceptions=None,
         issue_urls=None,
         public_response_outputs=None,
         advance_git_head_on_pr=True,
@@ -337,6 +339,9 @@ class FakeRunner(Runner):
         self.post_agent_git_diff_check = post_agent_git_diff_check
         self.post_agent_git_diff_check_returncode = post_agent_git_diff_check_returncode
         self.post_agent_git_diff_check_stderr = post_agent_git_diff_check_stderr
+        self.git_probe_results = list(git_probe_results or [])
+        self.git_probe_exceptions = list(git_probe_exceptions or [])
+        self.git_probe_calls = []
         self.issue_urls = list(issue_urls) if issue_urls is not None else None
         self.public_response_outputs = list(public_response_outputs or [])
         self.advance_git_head_on_pr = advance_git_head_on_pr
@@ -1031,6 +1036,23 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, "false\n", "", 1)
 
         if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+            self.git_probe_calls.append(tuple(cmd))
+            if self.git_probe_exceptions:
+                raise self.git_probe_exceptions.pop(0)
+            if self.git_probe_results:
+                scripted = self.git_probe_results.pop(0)
+                if isinstance(scripted, CommandResult):
+                    return CommandResult(
+                        cmd, cwd_path, scripted.stdout, scripted.stderr, scripted.returncode
+                    )
+                if isinstance(scripted, dict):
+                    return CommandResult(
+                        cmd,
+                        cwd_path,
+                        scripted.get("stdout", ""),
+                        scripted.get("stderr", ""),
+                        scripted.get("returncode", 0),
+                    )
             return CommandResult(cmd, cwd_path, f"{self.git_head}\n", "", 0)
 
         if cmd[:3] == ["git", "checkout", "--detach"]:
@@ -1066,6 +1088,23 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, f"{self.git_remote}\n", "", 0)
 
         if cmd[:3] == ["git", "status", "--porcelain"]:
+            self.git_probe_calls.append(tuple(cmd))
+            if self.git_probe_exceptions:
+                raise self.git_probe_exceptions.pop(0)
+            if self.git_probe_results:
+                scripted = self.git_probe_results.pop(0)
+                if isinstance(scripted, CommandResult):
+                    return CommandResult(
+                        cmd, cwd_path, scripted.stdout, scripted.stderr, scripted.returncode
+                    )
+                if isinstance(scripted, dict):
+                    return CommandResult(
+                        cmd,
+                        cwd_path,
+                        scripted.get("stdout", ""),
+                        scripted.get("stderr", ""),
+                        scripted.get("returncode", 0),
+                    )
             return CommandResult(cmd, cwd_path, self._current_git_status(), "", 0)
 
         if cmd[:3] == ["git", "status", "--short"]:

@@ -39,6 +39,7 @@ from coding_review_agent_loop.github import CiWatchOutcome, IssueComment
 from coding_review_agent_loop.managed_ci import ManagedCiReadiness, ProtectionAssessment
 from coding_review_agent_loop.managed_pr import ManagedPrHandoff
 from coding_review_agent_loop.runner import CommandResult, ExecutableIdentity, ExecutionObservation
+from coding_review_agent_loop.usage import RunUsageContext
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
     ValidatedAgentResponse,
@@ -3951,6 +3952,104 @@ def test_claude_self_update_stability_failure_sets_final_category(tmp_path):
     assert "wait for the Claude Code self-update to finish" in str(error.value)
 
 
+def _refused_claude_result(tmp_path, *, raw_output="fatal: auto-update in progress", kind="changed-status"):
+    identity = ExecutableIdentity("claude", "claude", (1, 1, 1), (1, 1, 1))
+    observation = ExecutionObservation(1, 1, 2, 1, identity, identity, False)
+    command_result = CommandResult(
+        ["claude", "--print"], tmp_path, raw_output, "", 1, observation
+    )
+    return AgentResult(
+        text="",
+        raw_output=raw_output,
+        returncode=1,
+        log_path=tmp_path / "claude-attempt1.log",
+        command_result=command_result,
+        self_update_reason="Claude Code updater diagnostic",
+        self_update_replay_refusal_kind=kind,
+        self_update_replay_refusal_detail=(
+            "Claude self-update replay refused: dirty workdir status changed during invocation"
+            if kind == "changed-status"
+            else "Claude self-update replay refused: after workdir snapshot unavailable"
+        ),
+    )
+
+
+def test_claude_replay_refusal_is_diagnostic_only_and_does_not_wait_or_override_category(tmp_path):
+    result = _refused_claude_result(tmp_path)
+    runner = FakeRunner()
+    config = make_config(tmp_path, reviewer="claude", agent_max_retries=0)
+    usage = RunUsageContext(run_id="run-refusal", summary_path=tmp_path / "usage.json")
+
+    with patch.object(orchestrator_module, "run_agent_result", return_value=result):
+        with pytest.raises(AgentInvocationError) as error:
+            _run_validated_agent(
+                runner,
+                agent="claude",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=lambda text: _validate_review_response(
+                    text, reviewer="Anthropic Claude", unresolved_items=()
+                ),
+                usage_context=usage,
+            )
+
+    assert error.value.failure_category == "deterministic"
+    assert "dirty workdir" in str(error.value)
+    assert not any(command[:1] == ["sleep"] for command, _cwd in runner.commands)
+    assert usage.records[0].outcome == "self_update_replay_refused_changed_workdir"
+    assert usage.records[0].log_path == str(result.log_path)
+
+
+def test_transient_claude_replay_refusal_keeps_provider_retry_and_category(tmp_path):
+    refused = _refused_claude_result(tmp_path, raw_output="overloaded_error")
+    valid = AgentResult(
+        text=structured_pr_review(
+            state="approved", summary="Recovered after refusal.", reviewer="Anthropic Claude"
+        ),
+        returncode=0,
+    )
+    runner = FakeRunner()
+    config = make_config(tmp_path, reviewer="claude", agent_max_retries=1)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=[refused, valid]):
+        response = _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="Anthropic Claude", unresolved_items=()
+            ),
+        )
+
+    assert response.marker_value.state == "approved"
+    assert any(command[:1] == ["sleep"] for command, _cwd in runner.commands)
+
+
+def test_transient_claude_replay_refusal_only_retains_transient_category(tmp_path):
+    refused = _refused_claude_result(tmp_path, raw_output="overloaded_error")
+    runner = FakeRunner()
+    config = make_config(tmp_path, reviewer="claude", agent_max_retries=0)
+
+    with patch.object(orchestrator_module, "run_agent_result", return_value=refused):
+        with pytest.raises(AgentInvocationError) as error:
+            _run_validated_agent(
+                runner,
+                agent="claude",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                validate=lambda text: _validate_review_response(
+                    text, reviewer="Anthropic Claude", unresolved_items=()
+                ),
+            )
+
+    assert error.value.failure_category == "transient"
+    assert "dirty workdir" in str(error.value)
+
+
 def _observed_codex_result(tmp_path, *, text="", raw_output="", returncode=1, changed=True):
     before = ExecutableIdentity(
         "/tmp/codex", "/tmp/codex-target", (1, 1, 100_000_000_000), (1, 2, 100_000_000_000)
@@ -4789,7 +4888,7 @@ def test_claude_backend_passes_model_when_declared(tmp_path):
     runner = FakeRunner(claude_outputs=[("STATE: approved\n\nok", 0)])
     config = make_config(tmp_path, claude_model="opus")
     ClaudeBackend().run(runner, config, "Review", run_id="r")
-    cmd = runner.commands[-1][0]
+    cmd = next(cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
     assert cmd[cmd.index("--model") + 1] == "opus"
 
 
