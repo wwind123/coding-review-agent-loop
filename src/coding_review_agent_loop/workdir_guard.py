@@ -713,30 +713,66 @@ def _is_negated_occurrence(tokens: Sequence[str], idx: int) -> bool:
     return False
 
 
-def _head_opened_span_targets(clause: _Clause) -> list[str]:
-    tokens = clause.tokens
-    n = len(tokens)
-    head_idx = _effective_head_index(tokens)
-    if head_idx is None or head_idx >= n:
-        return []
-    return _walk_span(tokens, head_idx, n)
-
-
-def _execution_phrase_end(tokens: Sequence[str], start: int, n: int) -> int:
+def _execution_phrase_end(
+    tokens: Sequence[str],
+    start: int,
+    n: int,
+    *,
+    stop_at_negation: bool = True,
+) -> int:
     """End (exclusive) of the phrase attached to an execution verb.
 
-    The phrase stops at a negation word or at the next execution verb, so a
-    later negated or separately-reported clause never lends its URL to this
+    The phrase normally stops at a negation word or at the next execution verb,
+    so a later negated or separately-reported clause never lends its URL to this
     verb (and vice versa: the next verb gets its own phrase, subject to its
-    own negation check).
+    own negation check). Wrapper traversal passes ``stop_at_negation=False``
+    because a wrapper option operand can itself be a negation word.
     """
     j = start
     while j < n:
         word = _word(tokens[j])
-        if _is_negation_word(word) or word in EXECUTION_VERBS:
+        if word in EXECUTION_VERBS or (stop_at_negation and _is_negation_word(word)):
             break
         j += 1
     return j
+
+
+def _malformed_wrapper_recovery_targets(
+    tokens: Sequence[str],
+    start: int,
+    n: int,
+) -> list[str]:
+    """Recover a command-shaped head without making later URLs commands.
+
+    A malformed wrapper prefix is still useful evidence that a nearby command
+    head was intended, but only before the same negation-aware boundary used by
+    prose attachment. Once a head is recovered, its command span remains
+    clause-wide so incidental words such as ``no proxy`` cannot hide a URL.
+    """
+    phrase_end = _execution_phrase_end(tokens, start, n)
+    head_idx = next(
+        (idx for idx in range(start, phrase_end) if _is_command_shaped(tokens[idx])),
+        None,
+    )
+    if head_idx is None:
+        return []
+    return _walk_span(tokens, head_idx, n)
+
+
+def _head_opened_span_targets(clause: _Clause) -> list[str]:
+    tokens = clause.tokens
+    n = len(tokens)
+    traversal = _wrapper_traversal(tokens)
+    head_idx = traversal.effective_head_index
+    if head_idx is not None and head_idx < n:
+        if _is_url_token(tokens[head_idx]):
+            return [tokens[head_idx]]
+        if _is_command_shaped(tokens[head_idx]):
+            return _walk_span(tokens, head_idx, n)
+        return []
+    if traversal.recognized_prefix:
+        return _malformed_wrapper_recovery_targets(tokens, 0, n)
+    return []
 
 
 def _prepositional_url_targets(tokens: Sequence[str], start: int, end: int) -> list[str]:
@@ -771,21 +807,27 @@ def _verb_based_targets(clause: _Clause) -> list[str]:
         if _is_negated_occurrence(tokens, idx):
             continue
 
-        j = idx + 1
+        start = idx + 1
+        j = start
         if j < n and _word(tokens[j]) in DETERMINERS:
             j += 1
-        if j < n and _is_url_token(tokens[j]):
-            targets.append(tokens[j])
-            continue
 
-        phrase_end = _execution_phrase_end(tokens, idx + 1, n)
-        attached = _prepositional_url_targets(tokens, idx + 1, phrase_end)
+        wrapper_end = _execution_phrase_end(tokens, j, n, stop_at_negation=False)
+        traversal = _wrapper_traversal(tokens[j:wrapper_end])
+        if traversal.effective_head_index is not None:
+            head_idx = j + traversal.effective_head_index
+            if _is_url_token(tokens[head_idx]):
+                targets.append(tokens[head_idx])
+            elif _is_command_shaped(tokens[head_idx]):
+                targets.extend(_walk_span(tokens, head_idx, n))
+
+        phrase_end = _execution_phrase_end(tokens, start, n)
+        attached = _prepositional_url_targets(tokens, start, phrase_end)
         if attached:
             targets.extend(attached)
             continue
-
-        if idx + 1 < n and _is_command_shaped(tokens[idx + 1]):
-            targets.extend(_walk_span(tokens, idx + 1, n))
+        if traversal.recognized_prefix and traversal.effective_head_index is None:
+            targets.extend(_malformed_wrapper_recovery_targets(tokens, start, n))
     return targets
 
 
