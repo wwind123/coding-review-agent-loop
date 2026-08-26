@@ -108,31 +108,13 @@ def _has_updater_diagnostic(output: str) -> bool:
     return bool(_UPDATER_DIAGNOSTIC_RE.search("\n".join(lines)[-2048:]))
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class SelfUpdateInterruptionEvidence:
     """Positive updater evidence and, independently, a replay refusal."""
 
     reason: str
     replay_refusal_kind: str | None = None
     replay_refusal_detail: str | None = None
-
-    def __eq__(self, other: object) -> bool:
-        # Keep the historical helper's string comparison useful to callers
-        # while exposing structured metadata to the backend and orchestrator.
-        if isinstance(other, str):
-            return self.reason == other
-        if isinstance(other, SelfUpdateInterruptionEvidence):
-            return (
-                self.reason,
-                self.replay_refusal_kind,
-                self.replay_refusal_detail,
-            ) == (
-                other.reason,
-                other.replay_refusal_kind,
-                other.replay_refusal_detail,
-            )
-        return NotImplemented
-
 
 def _workdir_probe_label(snapshot: WorkdirSnapshot) -> str:
     def describe(probe) -> str:

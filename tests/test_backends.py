@@ -86,7 +86,7 @@ def test_claude_self_update_classification_requires_bounded_evidence():
     failed = CommandResult(["claude"], Path.cwd(), "", "", 1, observation)
     assert classify_self_update_interruption(
         failed, command="claude", response_file_text=None, session_id=None
-    ) == "Claude executable changed during invocation"
+    ).reason == "Claude executable changed during invocation"
     ordinary = CommandResult(["claude"], Path.cwd(), "ordinary failure", "", 1,
                              ExecutionObservation(2, 10, 11, 1, identity, identity, False))
     assert classify_self_update_interruption(
@@ -96,7 +96,7 @@ def test_claude_self_update_classification_requires_bounded_evidence():
                                ExecutionObservation(2, 10, 11, 1, identity, identity, False))
     assert classify_self_update_interruption(
         diagnostic, command="claude", response_file_text=None, session_id=None
-    ) == "Claude Code updater diagnostic"
+    ).reason == "Claude Code updater diagnostic"
 
 
 def test_claude_self_update_workdir_gate_reports_changed_status_without_replacing_evidence():

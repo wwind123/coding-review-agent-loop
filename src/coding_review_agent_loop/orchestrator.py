@@ -3075,10 +3075,11 @@ def _run_validated_agent(
         if latest_replay_refusal_detail:
             context_details.append(latest_replay_refusal_detail)
         last_error = f"{'; '.join(context_details)}; final failure: {last_error}"
-        last_classification_text = (
-            f"{replacement_detail}\n"
-            f"{latest_replay_refusal_detail + chr(10) if latest_replay_refusal_detail else ''}"
-            f"{last_classification_text}"
+        classification_parts = [last_classification_text, replacement_detail]
+        if latest_replay_refusal_detail:
+            classification_parts.append(latest_replay_refusal_detail)
+        last_classification_text = "\n".join(
+            part for part in classification_parts if part
         ).strip()
         last_failure_category = (
             "self-update-interruption"
@@ -3089,8 +3090,8 @@ def _run_validated_agent(
         # Refusal context is added only after all retry decisions. In
         # particular, the provider-derived category remains untouched.
         last_error = f"{latest_replay_refusal_detail}; final failure: {last_error}"
-        last_classification_text = (
-            f"{latest_replay_refusal_detail}\n{last_classification_text}"
+        last_classification_text = "\n".join(
+            part for part in (last_classification_text, latest_replay_refusal_detail) if part
         ).strip()
     diagnostics = _failed_run_diagnostics(
         runner=runner,
