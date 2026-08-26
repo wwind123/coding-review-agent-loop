@@ -300,6 +300,8 @@ def test_rejects_non_backticked_wrapped_live_targets(tmp_path, text):
     "Tests: ran timeout curl https://live.example",
     "Tests: timeout curl https://live.example",
     "Tests: ran timeout badduration curl https://live.example",
+    "Tests: ran /usr/bin/timeout badduration curl https://live.example",
+    "Tests: /usr/bin/timeout badduration curl https://live.example",
     "Tests: ran timeout --kill-after curl https://live.example",
     "Tests: ran sudo -u curl https://live.example",
     "Tests: ran env -u curl https://live.example",
@@ -572,6 +574,8 @@ ACCEPTED_NARRATIVE_TEXTS = [
     "Tests: ran timeout regression checks and attached https://docs.example/run",
     "Tests: ran timeout notes and no curl https://live.example",
     "Tests: ran timeout regression checks and ran release notes about https://docs.example/run.",
+    "Tests: Timeout tuning notes live in https://pkg.go.dev/net/http",
+    "Tests: ran timeout tuning notes and published https://pkg.go.dev/net/http",
     # Negation still wins over the full-phrase preposition scan, both when the
     # verb itself is negated and when the negation precedes the preposition.
     "Tests: Did not run the suite against the production environment at https://live.example.",

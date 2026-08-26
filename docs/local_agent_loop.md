@@ -1249,9 +1249,9 @@ Wrapper traversal stops only at the next execution verb. Malformed recovery in
 both verb-adjacent and verbless narrative clauses, as well as prose
 prepositional attachment, stops at governing negation or the next execution
 verb. After a command head is successfully resolved or recovered, its target
-span runs through the end of the clause. Package acquisition (`pip install ...`, including the
-`python -m pip install ...` form) is exempted from the separate live-target
-check described below, but never from path containment.
+span runs through the end of the clause. Package acquisition (`pip install ...`,
+including the `python -m pip install ...` form) is exempted from the separate
+live-target check described below, but never from path containment.
 A URL is rejected as a live remote target when it appears in command syntax
 (a structured entry, or backtick-quoted command text in a `Tests:` report) or
 is reported as the target of an affirmative execution phrase in prose (`ran

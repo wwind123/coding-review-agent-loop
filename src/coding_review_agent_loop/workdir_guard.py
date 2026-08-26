@@ -750,8 +750,18 @@ def _malformed_wrapper_recovery_targets(
     clause-wide so incidental words such as ``no proxy`` cannot hide a URL.
     """
     phrase_end = _execution_phrase_end(tokens, start, n)
+    traversal = _wrapper_traversal(tokens[start:phrase_end])
+    wrapper_positions = (
+        traversal.program_positions if traversal.recognized_prefix else set()
+    )
     head_idx = next(
-        (idx for idx in range(start, phrase_end) if _is_command_shaped(tokens[idx])),
+        (
+            idx
+            for idx in range(start, phrase_end)
+            if idx - start not in wrapper_positions
+            and not _is_url_token(tokens[idx])
+            and _is_command_shaped(tokens[idx])
+        ),
         None,
     )
     if head_idx is None:
