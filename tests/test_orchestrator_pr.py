@@ -1,3 +1,4 @@
+import base64
 import datetime
 import json
 import re
@@ -14,7 +15,16 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_pr_review_comment,
 )
 from coding_review_agent_loop.errors import QuotaResetExceededError
-from coding_review_agent_loop.followups import MAX_APPROVED_FOLLOWUP_ISSUES, reconcile_approved_followups
+from coding_review_agent_loop.followups import (
+    MAX_APPROVED_FOLLOWUP_ISSUES,
+    PlanApprovedFollowupSource,
+    _followup_issue_body,
+    _format_approved_followup_summary,
+    _format_plan_approval_summary_with_followups,
+    _plan_followup_issue_body,
+    reconcile_approved_followups,
+    reconcile_plan_approved_followups,
+)
 from coding_review_agent_loop.github import (
     CiWaitOutcome,
     CiWatchOutcome,
@@ -114,6 +124,65 @@ def test_direct_pr_resolves_single_linked_issue_context_for_reviewer(tmp_path):
     assert "Keep compatibility." in prompt
     assert "Later clarification." in prompt
     assert "Human requirements" in prompt
+
+
+def test_plain_pr_recovery_accepts_loop_created_managed_pr_body(tmp_path):
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(
+            {"source_branch": "feature/review-context", "source_sha": "abc123"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).decode()
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_payload={
+            "body": f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {encoded} -->",
+            "headRefName": "agent-loop/managed-direct-token",
+        },
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+    assert runner.comments == ["**Review verdict:** Approved\n\nLGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"]
+
+
+def test_approved_followup_public_renderings_sanitize_historical_marker_mentions():
+    followup = ApprovedFollowup(
+        reviewer="Claude",
+        text="Document AGENT_APPROVED_FOLLOWUPS handling.",
+    )
+    reconciliation = reconcile_approved_followups([followup])
+
+    summary = _format_approved_followup_summary(77, reconciliation)
+    issue_body = _followup_issue_body(77, reconciliation.selected_groups[0])
+
+    assert "AGENT_APPROVED_FOLLOWUPS" not in summary
+    assert "AGENT_APPROVED_FOLLOWUPS" not in issue_body
+
+    source = PlanApprovedFollowupSource(
+        item_id="item-1",
+        reviewer="Claude",
+        source_round=1,
+        text="Document AGENT_PLAN_APPROVED_FOLLOWUPS handling.",
+        notes=("AGENT_SPLIT_UNFILED_WARNING was also discussed.",),
+    )
+    plan_reconciliation = reconcile_plan_approved_followups([source])
+    plan_body = _plan_followup_issue_body(
+        issue_number=56,
+        plan_hash="abc123",
+        plan_subject="Plan AGENT_MANAGED_PR_SOURCE_V1 handling.",
+        followup=plan_reconciliation.selected_groups[0],
+    )
+    plan_summary = _format_plan_approval_summary_with_followups(
+        56,
+        "Plan AGENT_MANAGED_PR_SOURCE_V1 handling.",
+        reconciliation=plan_reconciliation,
+    )
+
+    for rendered in (plan_body, plan_summary):
+        assert "AGENT_PLAN_APPROVED_FOLLOWUPS" not in rendered
+        assert "AGENT_SPLIT_UNFILED_WARNING" not in rendered
+        assert "AGENT_MANAGED_PR_SOURCE_V1" not in rendered
 
 
 def test_direct_pr_keeps_linked_issue_context_for_coder_followup(tmp_path):

@@ -2,10 +2,12 @@ import base64
 import json
 import zlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.github import post_issue_comment, post_pr_comment
 from coding_review_agent_loop.protocol_markers import (
     ISSUE_BODY_SURFACE,
     ISSUE_COMMENT_SURFACE,
@@ -89,6 +91,49 @@ def test_historical_sanitization_preserves_surrounding_ledger_fields():
     assert safe.startswith("item-13 / reviewer / round 4:")
     assert safe.endswith("— future")
     assert "AGENT_ISSUE_PR_HANDOFF" not in safe
+
+
+def test_historical_sanitization_neutralizes_fallback_mention_next_to_record():
+    sidecar = next(marker for token, marker, _surface in MARKERS if token == "AGENT_LOOP_SIDECAR")
+    text = (
+        f"Reviewer flagged that {sidecar} and AGENT_APPROVED_FOLLOWUPS "
+        "share a writer."
+    )
+
+    safe = sanitize_historical_text(text)
+
+    assert "Reviewer flagged that" in safe
+    assert "share a writer." in safe
+    assert "AGENT_APPROVED_FOLLOWUPS" not in safe
+    assert not scan_reserved_markers(safe)
+
+
+def test_ordinary_pr_comment_writer_enforces_pr_comment_surface():
+    marker = next(
+        marker for token, marker, _surface in MARKERS if token == "AGENT_ISSUE_PR_HANDOFF"
+    )
+
+    with pytest.raises(AgentLoopError, match="not allowed on the pr_comment surface"):
+        post_pr_comment(
+            None,
+            config=SimpleNamespace(quiet=True),
+            pr_number=1,
+            body=TrustedBody.canonical(marker, expected_tokens=("AGENT_ISSUE_PR_HANDOFF",)),
+        )
+
+
+def test_ordinary_issue_comment_writer_enforces_issue_comment_surface():
+    marker = next(
+        marker for token, marker, _surface in MARKERS if token == "AGENT_APPROVED_FOLLOWUPS"
+    )
+
+    with pytest.raises(AgentLoopError, match="not allowed on the issue_comment surface"):
+        post_issue_comment(
+            None,
+            config=SimpleNamespace(quiet=True),
+            issue_number=1,
+            body=TrustedBody.canonical(marker, expected_tokens=("AGENT_APPROVED_FOLLOWUPS",)),
+        )
 
 
 def test_source_inventory_has_no_unregistered_protocol_literals():

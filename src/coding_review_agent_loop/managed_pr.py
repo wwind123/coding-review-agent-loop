@@ -96,7 +96,7 @@ def _compose_body(
     if sections:
         sections.append("\n\n")
     sections.append(_source_marker(source_branch=source_branch, source_sha=source_sha))
-    if override_nonce:
+    if override_nonce is not None:
         sections.extend(
             [
                 "\n\n",
@@ -107,6 +107,82 @@ def _compose_body(
             ]
         )
     return TrustedBody.join(*sections).append("\n")
+
+
+def _managed_pr_source_fields(carrier: TrustedBody) -> tuple[str, str]:
+    source_occurrence = next(
+        item
+        for item in scan_reserved_markers(str(carrier))
+        if item.definition.token == SOURCE_MARKER
+    )
+    source_match = source_occurrence.definition.pattern.search(source_occurrence.text)
+    if source_match is None:
+        raise AgentLoopError("Managed PR source record is malformed.")
+    encoded = source_match.group("payload")
+    try:
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentLoopError("Managed PR source record could not be decoded.") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"source_branch", "source_sha"}
+        or not isinstance(payload.get("source_branch"), str)
+        or not payload["source_branch"]
+        or not isinstance(payload.get("source_sha"), str)
+        or not payload["source_sha"]
+    ):
+        raise AgentLoopError("Managed PR source record has an invalid schema.")
+    return payload["source_branch"], payload["source_sha"]
+
+
+def _managed_pr_override_nonce(carrier: TrustedBody) -> str | None:
+    override_occurrences = [
+        item
+        for item in scan_reserved_markers(str(carrier))
+        if item.definition.token == UNPROTECTED_OVERRIDE_TRAILER
+    ]
+    if not override_occurrences:
+        return None
+    parts = override_occurrences[0].text.strip().split()
+    if len(parts) != 2 or not parts[1].startswith("nonce=") or not parts[1][len("nonce=") :]:
+        raise AgentLoopError("Managed PR override record has an invalid schema.")
+    return parts[1][len("nonce=") :]
+
+
+def recover_managed_pr_origin(
+    body: str,
+    *,
+    fetched_head_branch: str | None,
+) -> tuple[str, str, str, str | None] | None:
+    """Recover the managed-PR validation tuple for a plain PR resumption.
+
+    The body marker is only a candidate.  The caller must still pass the
+    resulting tuple through ``validate_managed_pr_body`` with the fetched PR
+    metadata before any review work begins.
+    """
+    occurrences = scan_reserved_markers(body)
+    if not any(item.definition.token == SOURCE_MARKER for item in occurrences):
+        return None
+    if not fetched_head_branch or not fetched_head_branch.startswith("agent-loop/managed-"):
+        return None
+    expected_tokens = {SOURCE_MARKER}
+    if any(
+        item.definition.token == UNPROTECTED_OVERRIDE_TRAILER for item in occurrences
+    ):
+        expected_tokens.add(UNPROTECTED_OVERRIDE_TRAILER)
+    carrier = TrustedBody.canonical(
+        body,
+        surface=PR_BODY_SURFACE,
+        expected_tokens=expected_tokens,
+    )
+    source_branch, source_sha = _managed_pr_source_fields(carrier)
+    return (
+        source_branch,
+        source_sha,
+        fetched_head_branch,
+        _managed_pr_override_nonce(carrier),
+    )
 
 
 def validate_managed_pr_body(
@@ -132,21 +208,8 @@ def validate_managed_pr_body(
     )
     carrier.validate_for_surface(PR_BODY_SURFACE)
     occurrences = scan_reserved_markers(str(carrier))
-    source_occurrence = next(
-        item for item in occurrences if item.definition.token == SOURCE_MARKER
-    )
-    source_match = source_occurrence.definition.pattern.search(source_occurrence.text)
-    if source_match is None:
-        raise AgentLoopError("Managed PR source record is malformed.")
-    encoded = source_match.group("payload")
-    try:
-        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-        payload = json.loads(decoded.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AgentLoopError("Managed PR source record could not be decoded.") from exc
-    if not isinstance(payload, dict) or set(payload) != {"source_branch", "source_sha"}:
-        raise AgentLoopError("Managed PR source record has an invalid schema.")
-    if payload.get("source_branch") != source_branch or payload.get("source_sha") != source_sha:
+    source_branch_value, source_sha_value = _managed_pr_source_fields(carrier)
+    if source_branch_value != source_branch or source_sha_value != source_sha:
         raise AgentLoopError("Managed PR source record does not match this creation handoff.")
     if fetched_head_sha != source_sha:
         raise AgentLoopError("Managed PR head SHA does not match its creation handoff.")

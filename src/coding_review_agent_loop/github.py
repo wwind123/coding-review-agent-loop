@@ -37,7 +37,6 @@ from .protocol_markers import (
     ISSUE_COMMENT_SURFACE,
     PR_COMMENT_SURFACE,
     TrustedBody,
-    scan_reserved_markers,
 )
 from .runner import Runner
 from .workdirs import active_workdir
@@ -1349,6 +1348,7 @@ def post_pr_comment(
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to PR #{pr_number}")
     log(config, f"Posting agent output to PR #{pr_number}")
     for prepared in bodies:
+        prepared.validate_for_surface(PR_COMMENT_SURFACE)
         _post_comment_body(runner, config=config, command=["pr", "comment", str(pr_number)], body=prepared)
 
 
@@ -1365,6 +1365,7 @@ def post_issue_comment(
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to issue #{issue_number}")
     log(config, f"Posting agent output to issue #{issue_number}")
     for prepared in bodies:
+        prepared.validate_for_surface(ISSUE_COMMENT_SURFACE)
         _post_comment_body(runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared)
 
 

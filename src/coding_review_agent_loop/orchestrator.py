@@ -141,7 +141,7 @@ from .managed_ci import (
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
-from .managed_pr import validate_managed_pr_body
+from .managed_pr import recover_managed_pr_origin, validate_managed_pr_body
 from .migrations import validate_pr_migration_topology
 from .prompts import (
     CompactPlanTailContext,
@@ -6266,8 +6266,13 @@ def run_pr_loop(
             cwd=bootstrap_cwd,
         )
         if managed_pr_origin is None:
-            reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
-        else:
+            managed_pr_origin = recover_managed_pr_origin(
+                initial_pr_context.metadata.body or "",
+                fetched_head_branch=initial_pr_context.metadata.head_branch,
+            )
+            if managed_pr_origin is None:
+                reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        if managed_pr_origin is not None:
             source_branch, source_sha, managed_branch, override_nonce = managed_pr_origin
             validate_managed_pr_body(
                 initial_pr_context.metadata.body or "",

@@ -345,9 +345,34 @@ def _all_occurrences(text: str) -> tuple[MarkerOccurrence, ...]:
     # records, but a complete regular match always wins over its containing
     # line/token fallback.
     for occurrence in sorted(fallback, key=lambda item: (item.start, -(item.end - item.start), item.definition.token)):
-        if any(occurrence.start < old.end and old.start < occurrence.end for old in selected):
+        overlaps = [
+            old
+            for old in selected
+            if occurrence.start < old.end and old.start < occurrence.end
+        ]
+        if not overlaps:
+            selected.append(occurrence)
             continue
-        selected.append(occurrence)
+        if occurrence.definition.strictness != "name-bearing-line":
+            continue
+        # A name-bearing-line fallback normally replaces the whole line so a
+        # malformed record cannot survive. If a valid record already occupies
+        # part of that line, retain the strict fallback for each token mention
+        # outside the valid span instead of leaking the mention after the
+        # valid record is sanitized.
+        for match in re.finditer(re.escape(occurrence.definition.token), occurrence.text, re.I):
+            token_occurrence = MarkerOccurrence(
+                occurrence.definition,
+                occurrence.start + match.start(),
+                occurrence.start + match.end(),
+                match.group(0),
+            )
+            if any(
+                token_occurrence.start < old.end and old.start < token_occurrence.end
+                for old in selected
+            ):
+                continue
+            selected.append(token_occurrence)
     return tuple(sorted(selected, key=lambda item: item.start))
 
 

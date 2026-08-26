@@ -244,6 +244,14 @@ def _followup_update_notes(text: str) -> tuple[str, ...]:
     return tuple(f"Update from {part.strip()}" for part in parts[1:] if part.strip())
 
 
+def _safe_followup_main_text(text: str) -> str:
+    return sanitize_historical_text(_followup_main_text(text))
+
+
+def _safe_followup_update_notes(text: str) -> tuple[str, ...]:
+    return tuple(sanitize_historical_text(note) for note in _followup_update_notes(text))
+
+
 def _approved_followup_from_unresolved_item(item: UnresolvedReviewItem) -> ApprovedFollowup:
     text = item.text
     for note in item.notes:
@@ -347,10 +355,12 @@ def _format_approved_followup_summary(
         "",
     ]
     for followup in reconciliation.selected_groups:
-        reviewers = ", ".join(followup.reviewers)
-        lines.append(f"- {_followup_main_text(followup.text)} ({reviewers})")
+        reviewers = ", ".join(
+            sanitize_historical_text(reviewer) for reviewer in followup.reviewers
+        )
+        lines.append(f"- {_safe_followup_main_text(followup.text)} ({reviewers})")
         for item in followup.items:
-            for note in _followup_update_notes(item.text):
+            for note in _safe_followup_update_notes(item.text):
                 lines.append(f"  - {note}")
     lines.extend(
         [
@@ -466,7 +476,7 @@ def _has_plan_approved_followups_marker(
 
 
 def _followup_issue_title(followup: ApprovedFollowup) -> str:
-    text = " ".join(_followup_main_text(followup.text).split())
+    text = " ".join(_safe_followup_main_text(followup.text).split())
     title = f"Follow up future review note: {text}"
     return title[:120]
 
@@ -500,7 +510,7 @@ def _followup_issue_body(pr_number: int, followup: GroupedApprovedFollowup) -> s
         f"Future follow-up from approved review on PR #{pr_number}.",
         "",
     ]
-    reviewers = followup.reviewers
+    reviewers = tuple(sanitize_historical_text(reviewer) for reviewer in followup.reviewers)
     if len(reviewers) == 1:
         lines.append(f"Reviewer: {reviewers[0]}")
     else:
@@ -510,11 +520,14 @@ def _followup_issue_body(pr_number: int, followup: GroupedApprovedFollowup) -> s
         [
             "",
             "Follow-up:",
-            f"- {_followup_main_text(followup.text)}",
+            f"- {_safe_followup_main_text(followup.text)}",
         ]
     )
     lines.extend(["", "Original reviewer notes:"])
-    lines.extend(f"- {item.reviewer}: {item.text}" for item in followup.items)
+    lines.extend(
+        f"- {sanitize_historical_text(item.reviewer)}: {sanitize_historical_text(item.text)}"
+        for item in followup.items
+    )
     lines.extend(
         [
             "",
@@ -525,7 +538,7 @@ def _followup_issue_body(pr_number: int, followup: GroupedApprovedFollowup) -> s
 
 
 def _plan_followup_issue_title(followup: PlanGroupedApprovedFollowup) -> str:
-    text = " ".join(_followup_main_text(followup.text).split())
+    text = " ".join(_safe_followup_main_text(followup.text).split())
     title = f"Follow up future plan-review note: {text}"
     return title[:120]
 
@@ -533,10 +546,10 @@ def _plan_followup_issue_title(followup: PlanGroupedApprovedFollowup) -> str:
 def _plan_source_label(source: PlanApprovedFollowupSource) -> str:
     parts: list[str] = []
     if source.item_id:
-        parts.append(source.item_id)
+        parts.append(sanitize_historical_text(source.item_id))
     if source.source_round is not None:
         parts.append(f"round {source.source_round}")
-    parts.append(source.reviewer)
+    parts.append(sanitize_historical_text(source.reviewer))
     return ", ".join(parts)
 
 
@@ -547,15 +560,19 @@ def _plan_followup_issue_body(
     plan_subject: str,
     followup: PlanGroupedApprovedFollowup,
 ) -> str:
-    reviewers = followup.reviewers
+    reviewers = tuple(sanitize_historical_text(reviewer) for reviewer in followup.reviewers)
     rounds = sorted({source.source_round for source in followup.sources if source.source_round is not None})
-    item_ids = [source.item_id for source in followup.sources if source.item_id]
+    item_ids = [
+        sanitize_historical_text(source.item_id)
+        for source in followup.sources
+        if source.item_id
+    ]
     lines = [
         f"Future follow-up from approved planning for issue #{issue_number}.",
         "",
         "Source context:",
         f"- Parent issue: #{issue_number}",
-        f"- Approved plan subject: {plan_subject}",
+        f"- Approved plan subject: {sanitize_historical_text(plan_subject)}",
         f"- Approved plan hash: {plan_hash}",
     ]
     if rounds:
@@ -570,15 +587,17 @@ def _plan_followup_issue_body(
         [
             "",
             "Canonical follow-up:",
-            f"- {_followup_main_text(followup.text)}",
+            f"- {_safe_followup_main_text(followup.text)}",
             "",
             "Original reviewer notes:",
         ]
     )
     for source in followup.sources:
-        lines.append(f"- {_plan_source_label(source)}: {source.text}")
+        lines.append(
+            f"- {_plan_source_label(source)}: {sanitize_historical_text(source.text)}"
+        )
         for note in source.notes:
-            lines.append(f"  - Update from {note}")
+            lines.append(f"  - Update from {sanitize_historical_text(note)}")
     lines.extend(
         [
             "",
@@ -768,8 +787,10 @@ def _publish_approved_followups(
 def _format_same_pr_followups(followups: Sequence[ApprovedFollowup]) -> str:
     lines: list[str] = []
     for followup in followups:
-        lines.append(f"{followup.reviewer} same-PR follow-up:")
-        lines.append(f"- {followup.text}")
+        lines.append(
+            f"{sanitize_historical_text(followup.reviewer)} same-PR follow-up:"
+        )
+        lines.append(f"- {sanitize_historical_text(followup.text)}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -789,7 +810,7 @@ def _format_plan_approval_summary_with_followups(
         "",
         "Approved plan:",
         "",
-        approved_plan,
+        sanitize_historical_text(approved_plan),
     ]
     if reconciliation is not None and reconciliation.selected_groups:
         if filing_enabled:
@@ -819,11 +840,15 @@ def _format_plan_approval_summary_with_followups(
                 ]
             )
             for followup in reconciliation.selected_groups:
-                reviewers = ", ".join(followup.reviewers)
-                lines.append(f"- {_followup_main_text(followup.text)} ({reviewers})")
+                reviewers = ", ".join(
+                    sanitize_historical_text(reviewer) for reviewer in followup.reviewers
+                )
+                lines.append(f"- {_safe_followup_main_text(followup.text)} ({reviewers})")
                 for source in followup.sources:
                     for note in source.notes:
-                        lines.append(f"  - Update from {note}")
+                        lines.append(
+                            f"  - Update from {sanitize_historical_text(note)}"
+                        )
             lines.extend(
                 [
                     "",
