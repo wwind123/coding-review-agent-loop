@@ -964,12 +964,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 title=args.title,
                 body=body,
             )
-            return run_pr_loop(
-                runner,
-                pr_number=handoff.pr_number,
-                config=handoff.config,
-                workdirs_ready=True,
-            )
+            run_kwargs = {
+                "pr_number": handoff.pr_number,
+                "config": handoff.config,
+                "workdirs_ready": True,
+            }
+            if handoff.source_branch is not None:
+                run_kwargs["managed_pr_origin"] = (
+                    handoff.source_branch,
+                    handoff.source_sha,
+                    handoff.managed_branch,
+                    handoff.config.managed_ci_expected_override_nonce,
+                )
+            return run_pr_loop(runner, **run_kwargs)
         if args.command == "task":
             task_text = _resolve_task_text(args)
             return run_task_loop(

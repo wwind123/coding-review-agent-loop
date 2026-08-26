@@ -13,6 +13,7 @@ from .config import AgentLoopConfig
 from .errors import AgentLoopError
 from .github import create_issue, post_issue_comment
 from .runner import Runner
+from .protocol_markers import TrustedBody
 
 MAX_DECOMPOSITION_PHASES = 8
 AUTOMATION_CLASSES = {"agent-pr", "human-action", "manual-close"}
@@ -587,12 +588,15 @@ def post_phase_implementation_handoff_comment(
         runner,
         config=config,
         issue_number=parent_issue,
-        body=format_phase_implementation_handoff_comment(
-            parent_issue=parent_issue,
-            mode=mode,
-            plan_hash=plan_hash,
-            phase_index=phase_index,
-            created=created,
+        body=TrustedBody.canonical(
+            format_phase_implementation_handoff_comment(
+                parent_issue=parent_issue,
+                mode=mode,
+                plan_hash=plan_hash,
+                phase_index=phase_index,
+                created=created,
+            ),
+            expected_tokens=("AGENT_PLAN_PHASE_IMPLEMENTATION",),
         ),
     )
 
@@ -610,11 +614,14 @@ def post_decomposition_parent_summary(
         runner,
         config=config,
         issue_number=parent_issue,
-        body=format_decomposition_parent_summary(
-            parent_issue=parent_issue,
-            mode=mode,
-            plan_hash=plan_hash,
-            created=created,
+        body=TrustedBody.canonical(
+            format_decomposition_parent_summary(
+                parent_issue=parent_issue,
+                mode=mode,
+                plan_hash=plan_hash,
+                created=created,
+            ),
+            expected_tokens=("AGENT_PLAN_DECOMPOSITION",),
         ),
     )
 
@@ -741,12 +748,15 @@ def post_one_shot_impl_handoff_comment(
         runner,
         config=config,
         issue_number=parent_issue,
-        body=format_one_shot_impl_handoff_comment(
-            parent_issue=parent_issue,
-            mode=mode,
-            plan_hash=plan_hash,
-            plan_subject=plan_subject,
-            pr_number=pr_number,
-            pr_head_sha=pr_head_sha,
+        body=TrustedBody.canonical(
+            format_one_shot_impl_handoff_comment(
+                parent_issue=parent_issue,
+                mode=mode,
+                plan_hash=plan_hash,
+                plan_subject=plan_subject,
+                pr_number=pr_number,
+                pr_head_sha=pr_head_sha,
+            ),
+            expected_tokens=("AGENT_PLAN_ONE_SHOT_IMPL",),
         ),
     )

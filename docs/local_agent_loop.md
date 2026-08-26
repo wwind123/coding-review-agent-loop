@@ -271,6 +271,37 @@ unresolvable fails safely with an actionable message rather than falling back
 to a fresh implementation; fix or select the correct PR and rerun
 `agent-loop pr <number>` directly.
 
+### Durable marker trust boundary
+
+All durable protocol records are registered in
+`src/coding_review_agent_loop/protocol_markers.py`. The registry owns each
+record's outer grammar, canonical codec, safe historical label, strictness, and
+allowed GitHub surfaces. Current untrusted responses are rejected if they
+contain a registered occurrence; trusted producers compose immutable
+`TrustedBody` segments, and writers verify a one-to-one match between every
+visible occurrence and its authorized canonical segment before posting.
+
+The loop distinguishes current prose from orchestrator-re-rendered history.
+When a prior ledger item is projected into a later public comment, only
+reserved spans are replaced with stable descriptive labels before the item is
+normalized or truncated. Item IDs, reviewer, round, source status,
+disposition, and disposition notes remain separate fields. The same
+transformation is used during initial rendering and resume reconstruction.
+
+Encoded or compressed payload values such as salvage patches and round-state
+copies are opaque at their outer occurrence: codec, size, integrity,
+decompression, secret/binary, and hydration checks still apply. If such a
+value is later projected into visible current prose it goes through current
+marker validation; if it becomes historical ledger prose it goes through the
+deterministic sanitizer.
+
+Surface policy is fail-closed. Issue comments carry issue-flow records, PR
+comments carry PR contracts and managed-CI audits, child issue bodies carry
+only the split-child record, and managed PR bodies carry only the managed
+origin record plus the invocation-correlated override trailer. Missing,
+duplicate, malformed, non-canonical, wrong-surface, stale, or uncorrelated
+records are never inferred from finished-body text or payload equality.
+
 Issues that predate this marker (or crashed before it could be posted) fall
 back to the legacy check: searching GitHub directly for an already-open PR
 that already references the target issue, independent of any handoff marker.

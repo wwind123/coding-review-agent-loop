@@ -20,6 +20,7 @@ from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .logging import log
 from .protocol import ChildStage, DeferredStage, ISSUE_REFERENCE_RE, TRACKER_ACTION_TITLE_RE
 from .runner import Runner
+from .protocol_markers import TrustedBody
 
 MAX_SPLIT_CHILDREN = 8
 DISCUSS_SPLIT_MARKER_RE = re.compile(
@@ -437,11 +438,14 @@ def materialize_split_proposals(
             runner,
             config=config,
             title=_child_issue_title(parent_issue, proposal),
-            body=_format_child_issue_body(
-                parent_issue=parent_issue,
-                proposal=proposal,
-                rationale=rationale,
-                siblings_so_far=resolved_so_far,
+            body=TrustedBody.canonical(
+                _format_child_issue_body(
+                    parent_issue=parent_issue,
+                    proposal=proposal,
+                    rationale=rationale,
+                    siblings_so_far=resolved_so_far,
+                ),
+                expected_tokens=("AGENT_SPLIT_CHILD",),
             ),
         )
         child = MaterializedSplitChild(
@@ -482,7 +486,10 @@ def materialize_split_proposals(
         runner,
         config=config,
         issue_number=parent_issue,
-        body=format_split_materialization_summary(parent_issue=parent_issue, metadata=metadata),
+        body=TrustedBody.canonical(
+            format_split_materialization_summary(parent_issue=parent_issue, metadata=metadata),
+            expected_tokens=("AGENT_DISCUSS_SPLIT",),
+        ),
     )
     return metadata
 
@@ -613,8 +620,11 @@ def post_split_stage_handoff_comment(
         runner,
         config=config,
         issue_number=parent_issue,
-        body=format_split_stage_handoff_comment(
-            parent_issue=parent_issue, plan_hash=plan_hash, child=child
+        body=TrustedBody.canonical(
+            format_split_stage_handoff_comment(
+                parent_issue=parent_issue, plan_hash=plan_hash, child=child
+            ),
+            expected_tokens=("AGENT_SPLIT_STAGE_HANDOFF",),
         ),
     )
 
@@ -675,4 +685,9 @@ def post_unfiled_split_warning(
             "-- coding-review-agent-loop",
         ]
     )
-    post_issue_comment(runner, config=config, issue_number=issue_number, body=body)
+    post_issue_comment(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        body=TrustedBody.canonical(body, expected_tokens=("AGENT_SPLIT_UNFILED_WARNING",)),
+    )

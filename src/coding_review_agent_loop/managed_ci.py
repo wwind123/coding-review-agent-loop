@@ -30,6 +30,7 @@ from .github import (
 from .logging import log
 from .runner import Runner
 from .workdirs import active_workdir
+from .protocol_markers import PR_COMMENT_SURFACE, TrustedBody
 
 
 MANAGED_LABEL = "agent-loop-managed"
@@ -1110,15 +1111,20 @@ def _activate_v2_managed_ci(
                     reason="the override trailer is not correlated to this invocation",
                 )
                 return None
+            audit_body = TrustedBody.canonical(
+                (
+                    f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce} repo={config.repo} "
+                    f"base={base_ref} head={live_sha} protection={protection.state}\n\n"
+                    "Voluntary gate: GitHub cannot prevent manual merges, other automation, "
+                    "compromised credentials, or an agent-loop defect from bypassing it."
+                ),
+                expected_tokens=(UNPROTECTED_OVERRIDE_TRAILER,),
+            )
+            audit_body.validate_for_surface(PR_COMMENT_SURFACE)
             audit = runner.run(
                 [
                     config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/comments",
-                    "-f", "body=" + (
-                        f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce} repo={config.repo} "
-                        f"base={base_ref} head={live_sha} protection={protection.state}\n\n"
-                        "Voluntary gate: GitHub cannot prevent manual merges, other automation, "
-                        "compromised credentials, or an agent-loop defect from bypassing it."
-                    ),
+                    "-f", "body=" + str(audit_body),
                 ], cwd=active_workdir(config), check=False,
             )
             if audit.returncode != 0:
@@ -1175,10 +1181,15 @@ def _activate_v2_managed_ci(
                 f"provenance_head={resume_provenance_head or 'unknown'} generation={secrets.token_urlsafe(12)}\n\n"
                 "Resume provenance only: the prior issue-created audit is not an authorization token."
             )
+            trusted_resume_body = TrustedBody.canonical(
+                resume_body,
+                expected_tokens=(UNPROTECTED_OVERRIDE_TRAILER,),
+            )
+            trusted_resume_body.validate_for_surface(PR_COMMENT_SURFACE)
             audit = runner.run(
                 [
                     config.gh_cmd, "api", "--method", "POST",
-                    f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={resume_body}",
+                    f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={trusted_resume_body}",
                 ], cwd=active_workdir(config), check=False,
             )
             if audit.returncode != 0:
@@ -1607,10 +1618,12 @@ def publish_manual_v2_qualification(
             " GitHub cannot force a human or other automation to use this SHA or the guarded command "
             "after agent-loop exits."
         )
+    trusted_body = TrustedBody.canonical(body, expected_tokens=(QUALIFICATION_MARKER,))
+    trusted_body.validate_for_surface(PR_COMMENT_SURFACE)
     posted = runner.run(
         [
             config.gh_cmd, "api", "--method", "POST",
-            f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={body}",
+            f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={trusted_body}",
         ], cwd=active_workdir(config), check=False,
     )
     if posted.returncode != 0:
@@ -1850,7 +1863,7 @@ def _dispatch_v2_qualification(
         log(config, f"PR #{pr_number}: dispatch accepted; waiting for run visibility")
 
 
-def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_sha: str, state: str) -> str:
+def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_sha: str, state: str) -> TrustedBody:
     payload = {
         "version": 2,
         "repository": contract.repository,
@@ -1871,7 +1884,10 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
             for run_id, run_attempt in contract.terminal_attempts
         ],
     }
-    return f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->"
+    return TrustedBody.canonical(
+        f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->",
+        expected_tokens=(INTENT_MARKER,),
+    )
 
 
 def _ensure_v2_intent(
@@ -1963,6 +1979,7 @@ def _ensure_v2_intent(
     contract.nonce = secrets.token_urlsafe(24)
     contract.created_at = int(time.time())
     body = _intent_body(contract, pr_number=pr_number, expected_head_sha=expected_head_sha, state="prepared")
+    body.validate_for_surface(PR_COMMENT_SURFACE)
     created = runner.run(
         [config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/comments", "-f", f"body={body}"],
         cwd=active_workdir(config), check=False,
@@ -1988,6 +2005,7 @@ def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedC
         expected_head_sha=contract.expected_head_sha or "",
         state=state,
     )
+    body.validate_for_surface(PR_COMMENT_SURFACE)
     # The immutable identifying fields are already in the original marker;
     # state updates add only live provenance and are still actor-owned.
     updated = runner.run(

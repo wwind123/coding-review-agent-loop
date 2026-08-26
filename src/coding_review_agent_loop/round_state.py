@@ -13,6 +13,7 @@ from .agents.base import AgentName
 from .agents.registry import agent_display_name
 from .errors import AgentLoopError
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, encode_mapping, hydrate_mapping
+from .protocol_markers import TrustedBody, scan_reserved_markers
 from .workdir_guard import validate_checkout_inspected_evidence
 from .protocol import (
     HTML_COMMENT_RE,
@@ -294,10 +295,15 @@ def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
     prefix = "\n".join(lines[:metadata_start]).rstrip("\n")
     suffix = "\n".join(lines[metadata_start:]).lstrip("\n")
     if not prefix:
-        return "\n".join(part for part in (marker, suffix) if part)
-    if not suffix:
-        return "\n".join((prefix, marker))
-    return "\n".join((prefix, marker, suffix))
+        rendered = "\n".join(part for part in (marker, suffix) if part)
+    elif not suffix:
+        rendered = "\n".join((prefix, marker))
+    else:
+        rendered = "\n".join((prefix, marker, suffix))
+    expected = tuple(item.definition.token for item in scan_reserved_markers(rendered))
+    if "AGENT_LOOP_META" not in expected:
+        expected = (*expected, "AGENT_LOOP_META")
+    return TrustedBody.canonical(rendered, expected_tokens=expected)
 
 
 def _strip_round_metadata(body: str) -> str:

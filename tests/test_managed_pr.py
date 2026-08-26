@@ -7,7 +7,11 @@ import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
-from coding_review_agent_loop.managed_pr import SOURCE_MARKER, create_managed_pr
+from coding_review_agent_loop.managed_pr import (
+    SOURCE_MARKER,
+    _compose_body,
+    create_managed_pr,
+)
 from coding_review_agent_loop.runner import CommandResult, Runner
 
 from agent_loop_helpers import make_config
@@ -120,6 +124,16 @@ def test_create_managed_pr_opens_labeled_draft_and_correlates_override(tmp_path)
     )
     assert label_payload == {"labels": ["agent-loop-managed"]}
     assert runner.branch_reads == 2
+
+
+def test_empty_override_nonce_is_rejected_at_body_composition(tmp_path):
+    with pytest.raises(AgentLoopError, match="Invalid AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"):
+        _compose_body(
+            "",
+            source_branch="fix/empty-nonce",
+            source_sha="a" * 40,
+            override_nonce="",
+        )
 
 
 def test_create_managed_pr_creates_documented_label_before_applying_it(tmp_path):
