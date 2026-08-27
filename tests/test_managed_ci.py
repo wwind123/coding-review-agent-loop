@@ -38,6 +38,7 @@ from coding_review_agent_loop.managed_ci import (
     intermediate_managed_checks,
     preflight_managed_ci_creation,
     parse_managed_ci_override_record,
+    render_managed_ci_resume_command,
     recover_issue_created_handoff,
     revalidate_issue_created_handoff,
     prepare_v2_merge,
@@ -512,6 +513,35 @@ def test_override_record_parser_enforces_surface_schema_agreement(body, surface,
             parse_managed_ci_override_record(body, surface=surface, schema=schema, required=True)
 
 
+def test_ordinary_resume_command_preserves_merge_and_watch_mode_without_managed_ci(tmp_path):
+    command = render_managed_ci_resume_command(
+        make_config(
+            tmp_path,
+            auto_merge=True,
+            watch_pending_ci=True,
+            managed_ci=True,
+            managed_ci_trusted_actor="agent-loop",
+            allow_unprotected_managed_ci=True,
+        ),
+        pr_number=42,
+        managed_ci=False,
+    )
+
+    assert command == (
+        "agent-loop pr 42 --repo OWNER/REPO --base main --auto-merge --watch-pending-ci"
+    )
+
+
+def test_resume_command_preserves_explicit_ordinary_watch_opt_out(tmp_path):
+    command = render_managed_ci_resume_command(
+        make_config(tmp_path, auto_merge=True, watch_pending_ci=False),
+        pr_number=42,
+        managed_ci=False,
+    )
+
+    assert command.endswith("--auto-merge --no-watch-pending-ci")
+
+
 def test_issue_created_handoff_authenticates_override_before_any_remote_write(tmp_path):
     body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
     runner = V2ManagedRunner(
@@ -532,7 +562,6 @@ def test_issue_created_handoff_authenticates_override_before_any_remote_write(tm
         trusted_actor="agent-loop",
         protection_mode="voluntary",
         audit_nonce="fresh",
-        recovery_capable=True,
     )
 
     handoff = authenticate_issue_created_handoff(
@@ -2058,10 +2087,11 @@ def test_explicit_activation_release_is_terminal_and_unqualified(tmp_path):
             config=config,
             pr_number=7,
             base_ref="main",
-            expected_head_sha="abc123",
-            active_event=None,
-            reason="timeline unavailable",
-        )
+                expected_head_sha="abc123",
+                active_event=None,
+                reason="timeline unavailable",
+                recovery_capable=True,
+            )
     assert any(
         command[:5] == [
             "gh", "api", "--method", "DELETE",

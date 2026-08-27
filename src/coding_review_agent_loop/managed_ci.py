@@ -139,7 +139,6 @@ class ManagedCiContract:
     terminal_attempts: tuple[tuple[int, int | None], ...] = ()
     activation_path: Literal["managed", "ordinary_fallback"] = "managed"
     ordinary_recovery: "OrdinaryRecoveryCapability | None" = None
-    recovery_capable: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,7 +149,6 @@ class ManagedCiCreationIntent:
     trusted_actor: str
     protection_mode: str = "strict"
     audit_nonce: str | None = None
-    recovery_capable: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,7 +181,6 @@ class AuthenticatedIssueCreatedHandoff:
     trusted_actor_id: int
     protection_mode: str
     override_nonce: str | None
-    recovery_capable: bool
     active_label_event_id: int | None = None
 
 
@@ -277,7 +274,6 @@ class OrdinaryRecoveryCapability:
     released_label_event_id: int | None
     released_at: int
     prior_run_ids: frozenset[int] = frozenset()
-    recovery_capable: bool = True
 
 
 @dataclass(frozen=True)
@@ -814,7 +810,6 @@ def preflight_managed_ci_creation(
         trusted_actor=readiness.actor or config.managed_ci_trusted_actor,
         protection_mode=readiness.protection.state,
         audit_nonce=secrets.token_urlsafe(18) if config.allow_unprotected_managed_ci else None,
-        recovery_capable=readiness.recovery_capable,
     )
 
 
@@ -828,7 +823,6 @@ def _issue_created_tuple(
     expected_branch: str,
     expected_nonce: str | None,
     protection_mode: str,
-    recovery_capable: bool,
 ) -> AuthenticatedIssueCreatedHandoff:
     """Read and verify the immutable tuple before any handoff publication.
 
@@ -915,7 +909,6 @@ def _issue_created_tuple(
         trusted_actor_id=actor_id,
         protection_mode=protection_mode,
         override_nonce=record.nonce if record is not None else None,
-        recovery_capable=recovery_capable,
     )
 
 
@@ -938,7 +931,6 @@ def authenticate_issue_created_handoff(
         expected_branch=intent.branch,
         expected_nonce=intent.audit_nonce,
         protection_mode=intent.protection_mode,
-        recovery_capable=intent.recovery_capable,
     )
 
 
@@ -961,7 +953,6 @@ def revalidate_issue_created_handoff(
         expected_branch=handoff.branch,
         expected_nonce=handoff.override_nonce,
         protection_mode=handoff.protection_mode,
-        recovery_capable=handoff.recovery_capable,
     )
     if handoff.active_label_event_id is not None:
         event = _active_managed_label_event(runner, config=config, pr_number=handoff.pr_number)
@@ -1013,7 +1004,6 @@ def recover_issue_created_handoff(
         expected_branch=branch,
         expected_nonce=record.nonce,
         protection_mode="voluntary",
-        recovery_capable=True,
     )
     event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
     if (
@@ -1041,17 +1031,26 @@ def recover_issue_created_handoff(
 
 
 def render_managed_ci_resume_command(
-    config: AgentLoopConfig, *, pr_number: int
+    config: AgentLoopConfig, *, pr_number: int, managed_ci: bool
 ) -> str:
     """Render the deterministic, shell-quoted public recovery contract."""
     command = ["agent-loop", "pr", str(pr_number), "--repo", config.repo]
     if config.base:
         command.extend(("--base", config.base))
-    command.append("--managed-ci")
-    if config.managed_ci_trusted_actor:
-        command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
-    if config.allow_unprotected_managed_ci:
-        command.append("--allow-unprotected-managed-ci")
+    if config.auto_merge:
+        command.append("--auto-merge")
+    if config.watch_pending_ci:
+        command.append("--watch-pending-ci")
+    elif config.auto_merge:
+        # CLI invocations enable this by default with --auto-merge, so an
+        # explicit opt-out is required to faithfully reproduce this stop.
+        command.append("--no-watch-pending-ci")
+    if managed_ci:
+        command.append("--managed-ci")
+        if config.managed_ci_trusted_actor:
+            command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
+        if config.allow_unprotected_managed_ci:
+            command.append("--allow-unprotected-managed-ci")
     return " ".join(shlex.quote(part) for part in command)
 
 
@@ -1089,7 +1088,7 @@ def _release_for_ordinary_recovery(
     expected_head_sha: str,
     active_event: tuple[int, str, int] | None,
     reason: str,
-    recovery_capable: bool = True,
+    recovery_capable: bool,
 ) -> OrdinaryRecoveryCapability | None:
     """Release the exact active label and return a narrowly scoped capability.
 
@@ -1150,7 +1149,6 @@ def _release_for_ordinary_recovery(
         released_label_event_id=active_event[0] if active_event is not None else None,
         released_at=int(time.time()),
         prior_run_ids=frozenset(prior_run_ids),
-        recovery_capable=True,
     )
 
 
@@ -1609,7 +1607,6 @@ def _activate_v2_managed_ci(
         active_label_event_id=active_event[0] if active_event is not None else None,
         issue_created_pr=True,
         invocation_applied_label=label_applied,
-        recovery_capable=ordinary_recovery_capable,
     )
 
 

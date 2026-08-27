@@ -211,7 +211,6 @@ def validate_managed_pr_body(
         expected_tokens=expected_tokens,
     )
     carrier.validate_for_surface(PR_BODY_SURFACE)
-    occurrences = scan_reserved_markers(str(carrier))
     source_branch_value, source_sha_value = _managed_pr_source_fields(carrier)
     if source_branch_value != source_branch or source_sha_value != source_sha:
         raise AgentLoopError("Managed PR source record does not match this creation handoff.")

@@ -6362,7 +6362,9 @@ def _finalize_ordinary_recovery_merge(
     )
     if outcome.status != "passed":
         if outcome.status == "not_started":
-            command = render_managed_ci_resume_command(config, pr_number=pr_number)
+            command = render_managed_ci_resume_command(
+                config, pr_number=pr_number, managed_ci=False,
+            )
             log(
                 config,
                 f"PR #{pr_number}: ordinary recovery CI did not start within the bounded startup window; "
@@ -6765,7 +6767,9 @@ def run_pr_loop(
                 "the previous managed activation is not being resumed",
             )
             if ordinary_recovery is None:
-                command = render_managed_ci_resume_command(config, pr_number=pr_number)
+                command = render_managed_ci_resume_command(
+                    config, pr_number=pr_number, managed_ci=False,
+                )
                 print(
                     f"PR #{pr_number} remains draft and unmerged because managed recovery provenance or "
                     f"an unlabeled CI route is unavailable. Resume with `{command}`."
@@ -7992,7 +7996,9 @@ def run_pr_loop(
                             print(f"PR #{pr_number} is merge-ready after CI watch completed.")
                         return 0
                     if watch_outcome.status == "not_started":
-                        command = render_managed_ci_resume_command(config, pr_number=pr_number)
+                        command = render_managed_ci_resume_command(
+                            config, pr_number=pr_number, managed_ci=False,
+                        )
                         log(
                             config,
                             f"Round {round_number}: PR #{pr_number} has no materialized CI board within "
@@ -8016,7 +8022,9 @@ def run_pr_loop(
                                 f"PR #{pr_number} has no ordinary CI checks while `{MANAGED_LABEL}` "
                                 "is present or unreadable; remove the label and wait for real CI before merging."
                             )
-                        command = render_managed_ci_resume_command(config, pr_number=pr_number)
+                        command = render_managed_ci_resume_command(
+                            config, pr_number=pr_number, managed_ci=False,
+                        )
                         print(
                             f"PR #{pr_number} has an empty CI board. No merge was attempted; "
                             f"resume with `{command}`."
@@ -8413,13 +8421,15 @@ def run_pr_loop(
                                     f"PR #{pr_number} ordinary recovery provenance is unavailable; "
                                     "no merge attempted."
                                 )
-                            _finalize_ordinary_recovery_merge(
+                            merged = _finalize_ordinary_recovery_merge(
                                 runner,
                                 config=config,
                                 pr_number=pr_number,
                                 capability=ordinary_recovery,
                             )
-                            wait_outcome = None
+                            if merged:
+                                print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
+                            return 0
                         else:
                             wait_outcome = wait_for_ci(
                                 runner, config, pr_number, metadata=pr_metadata
