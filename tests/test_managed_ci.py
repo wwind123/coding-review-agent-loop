@@ -532,6 +532,26 @@ def test_ordinary_resume_command_preserves_merge_and_watch_mode_without_managed_
     )
 
 
+def test_managed_resume_command_retains_managed_ci_configuration(tmp_path):
+    command = render_managed_ci_resume_command(
+        make_config(
+            tmp_path,
+            auto_merge=True,
+            watch_pending_ci=True,
+            managed_ci=True,
+            managed_ci_trusted_actor="agent-loop",
+            allow_unprotected_managed_ci=True,
+        ),
+        pr_number=42,
+        managed_ci=True,
+    )
+
+    assert command == (
+        "agent-loop pr 42 --repo OWNER/REPO --base main --auto-merge --watch-pending-ci "
+        "--managed-ci --managed-ci-trusted-actor agent-loop --allow-unprotected-managed-ci"
+    )
+
+
 def test_resume_command_preserves_explicit_ordinary_watch_opt_out(tmp_path):
     command = render_managed_ci_resume_command(
         make_config(tmp_path, auto_merge=True, watch_pending_ci=False),
@@ -653,6 +673,7 @@ def test_pr_mode_resumes_only_from_immutable_issue_draft_facts_and_mints_fresh_a
     assert contract.audit_nonce and contract.audit_nonce != "old-nonce"
     assert contract.audit_comment_id == 17
     assert contract.intent_generation
+    assert contract.ordinary_recovery_capable is True
     assert any("active_label_event_id=101" in " ".join(cmd) for cmd, _ in runner.commands)
 
 
@@ -2087,11 +2108,11 @@ def test_explicit_activation_release_is_terminal_and_unqualified(tmp_path):
             config=config,
             pr_number=7,
             base_ref="main",
-                expected_head_sha="abc123",
-                active_event=None,
-                reason="timeline unavailable",
-                recovery_capable=True,
-            )
+            expected_head_sha="abc123",
+            active_event=None,
+            reason="timeline unavailable",
+            recovery_capable=True,
+        )
     assert any(
         command[:5] == [
             "gh", "api", "--method", "DELETE",
@@ -2133,6 +2154,36 @@ def test_v2_dispatch_discovers_existing_run_before_dispatching(tmp_path):
 
     assert contract.attached_run_id == 100
     assert not any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
+
+
+def test_v2_dispatch_ledger_failure_uses_authenticated_ordinary_recovery_capability(tmp_path, monkeypatch):
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    runner = V2ManagedRunner(issue_events=[label_event()])
+    contract = v2_contract(ordinary_recovery_capable=True)
+
+    def fail_intent(*args, **kwargs):
+        raise AgentLoopError("intent ledger unavailable")
+
+    monkeypatch.setattr(managed_ci, "_ensure_v2_intent", fail_intent)
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is not None
+    assert any(
+        command[:5] == [
+            "gh", "api", "--method", "DELETE",
+            f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+        ]
+        for command, _cwd in runner.commands
+    )
 
 
 def test_v2_dispatch_discovers_run_with_display_title_and_qualified_path(tmp_path):

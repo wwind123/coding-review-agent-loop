@@ -139,6 +139,10 @@ class ManagedCiContract:
     terminal_attempts: tuple[tuple[int, int | None], ...] = ()
     activation_path: Literal["managed", "ordinary_fallback"] = "managed"
     ordinary_recovery: "OrdinaryRecoveryCapability | None" = None
+    # Derived from the exact base workflow at activation. Retain it for a
+    # delayed dispatch-time fallback so a suppressed draft is released only
+    # when that same workflow advertises an unlabeled CI route.
+    ordinary_recovery_capable: bool = False
 
 
 @dataclass(frozen=True)
@@ -1607,6 +1611,7 @@ def _activate_v2_managed_ci(
         active_label_event_id=active_event[0] if active_event is not None else None,
         issue_created_pr=True,
         invocation_applied_label=label_applied,
+        ordinary_recovery_capable=ordinary_recovery_capable,
     )
 
 
@@ -2191,6 +2196,7 @@ def _dispatch_v2_qualification(
             runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
             expected_head_sha=expected_head_sha, active_event=event,
             reason=f"fresh intent ledger could not be reconciled ({exc})",
+            recovery_capable=contract.ordinary_recovery_capable,
         )
         contract.activation_path = "ordinary_fallback"
         contract.ordinary_recovery = recovery

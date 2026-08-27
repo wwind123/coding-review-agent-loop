@@ -6768,7 +6768,7 @@ def run_pr_loop(
             )
             if ordinary_recovery is None:
                 command = render_managed_ci_resume_command(
-                    config, pr_number=pr_number, managed_ci=False,
+                    config, pr_number=pr_number, managed_ci=True,
                 )
                 print(
                     f"PR #{pr_number} remains draft and unmerged because managed recovery provenance or "
