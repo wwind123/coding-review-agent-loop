@@ -63,6 +63,27 @@ def test_watch_success_and_head_change_are_terminal(tmp_path):
         assert watch_pr_checks(runner, make_config(tmp_path, watch_pending_ci=True), 7, metadata=_metadata()).status == "head_changed"
 
 
+def test_watch_empty_rollup_stops_as_not_started_never_as_success(tmp_path):
+    runner = _Runner()
+    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
+         patch("coding_review_agent_loop.github.get_pr_mergeability", return_value=_mergeability()), \
+         patch("coding_review_agent_loop.github.get_pr_checks", return_value=_checks("no_checks")):
+        outcome = watch_pr_checks(
+            runner,
+            make_config(
+                tmp_path,
+                watch_pending_ci=True,
+                ci_timeout_seconds=60,
+                ci_poll_interval_seconds=30,
+                ci_startup_timeout_seconds=30,
+            ),
+            7,
+            metadata=_metadata(),
+        )
+    assert outcome.status == "not_started"
+    assert runner.commands == []
+
+
 def test_watch_timeout_retries_transient_snapshots_and_dry_run_does_not_poll(tmp_path):
     runner = _Runner()
     with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \

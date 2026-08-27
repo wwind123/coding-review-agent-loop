@@ -213,6 +213,9 @@ class AgentLoopConfig:
     # Origin for a contract created by the public direct/managed PR entry point.
     # Issue-origin handoffs select their own flow when a linked issue exists.
     pr_origin_flow: str = "direct-pr"
+    # Separate bounded startup observation for CI that has not materialized a
+    # run/check yet.  Empty boards are never evidence that CI succeeded.
+    ci_startup_timeout_seconds: int = 120
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -933,6 +936,8 @@ def config_from_args(
         raise AgentLoopError("--ci-timeout-seconds must be greater than zero.")
     if args.ci_poll_interval_seconds <= 0:
         raise AgentLoopError("--ci-poll-interval-seconds must be greater than zero.")
+    if getattr(args, "ci_startup_timeout_seconds", 120) <= 0:
+        raise AgentLoopError("--ci-startup-timeout-seconds must be greater than zero.")
     if getattr(args, "ci_queued_grace_seconds", 1200) <= 0:
         raise AgentLoopError("--ci-queued-grace-seconds must be greater than zero.")
     if getattr(args, "mergeability_poll_attempts", 3) <= 0:
@@ -1020,6 +1025,7 @@ def config_from_args(
         ci_check_name=args.ci_check_name,
         ci_timeout_seconds=args.ci_timeout_seconds,
         ci_poll_interval_seconds=args.ci_poll_interval_seconds,
+        ci_startup_timeout_seconds=getattr(args, "ci_startup_timeout_seconds", 120),
         watch_pending_ci=(
             bool(getattr(args, "auto_merge", False))
             if getattr(args, "watch_pending_ci", None) is None

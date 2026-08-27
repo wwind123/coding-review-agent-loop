@@ -1471,17 +1471,21 @@ A successful resume records a fresh audit, nonce, and invocation intent
 generation. Earlier ledger entries and attached workflow runs remain history:
 even a queued, successful, failed, or rejected prior run is logged as the
 previous invocation's outcome and is never adopted by the new dispatch. If
-safe managed resume is unavailable, agent-loop removes the exact active
-managed label and waits for a new post-`unlabeled` workflow run on the exact
-head, then requires the ordinary current-head check board to pass. It does not
-accept pre-release green checks, `no_checks`, or a different SHA. Only the
-invocation-owned fallback draft can be made ready, and only an auto-merge
-invocation can take this deliberate ordinary-recovery path; explicit managed
-manual mode fails closed instead. Unrelated or intentional drafts remain
-drafts. Agent-loop checks
-the exact head before and after `gh pr ready` and merges with
-`--match-head-commit`. If that merge fails after readiness, it logs that the PR
-remains ready and leaves it unmerged rather than restoring draft state.
+safe managed resume is unavailable, agent-loop selects ordinary recovery only
+when the base workflow proves an unlabeled pull-request route. It baselines
+current-head run IDs before label release, retains the draft, and observes
+startup for at most `--ci-startup-timeout-seconds` (default 120). A missing,
+queued-only, or jobless run is never success: the draft remains unmerged and
+the local terminal prints a deterministic shell-quoted PR resume command. A
+new post-`unlabeled` run must complete successfully and the exact head must
+have a non-empty complete passing board. It does not accept pre-release green
+checks, an empty rollup, or a different SHA. Only the invocation-owned fallback draft
+can be made ready, and only an auto-merge invocation can take this
+deliberate ordinary-recovery path; explicit managed manual mode fails closed
+instead. Unrelated or intentional drafts remain drafts. Agent-loop checks the
+exact head before and after `gh pr ready`, then performs one final live-head
+read before merging with `--match-head-commit`; if that guarded merge fails,
+the PR remains ready and unmerged for a safe retry.
 
 Suppression-capable v2 workflows must additionally advertise
 `AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` and subscribe their
@@ -1539,11 +1543,16 @@ and ordinary PRs retain regular CI unless they are explicitly adopted as
 described below.
 
 For an unprotected override, the coder carries the preflight-minted nonce in
-the creation trailer. During that same invocation agent-loop compares the
-trailer to its in-memory nonce and writes an actor-owned PR audit comment
-before accepting activation or dispatching qualification. A forged, stale, or
-mismatched trailer, or a failed audit write, releases the suppression label;
-a later invocation cannot reuse a body nonce as its authorization.
+one canonical body record containing only that nonce; it must not add another
+reserved body record. During the same issue-created handoff, agent-loop checks
+the draft's repository/base/head/branch/label/author tuple and one issue
+closing reference, re-reads it to catch races, then compares the body record
+to its in-memory nonce before any handoff publication. The richer actor-owned
+audit comment has separate provenance fields and its own schema. A forged,
+stale, duplicate, malformed, unrelated, or mismatched record fails before any
+handoff write. A direct PR resume treats historical records as provenance only
+and mints fresh authorization; it never accepts an old nonce for dispatch,
+readiness, or merge authority.
 
 #### Creating a managed PR from an existing branch
 
