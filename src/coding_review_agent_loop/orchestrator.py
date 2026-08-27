@@ -62,6 +62,7 @@ from .github import (
     PullRequestChecks,
     PullRequestMergeability,
     PullRequestReviewContext,
+    get_pr_head_sha,
     get_issue_context,
     get_pr_mergeability,
     parse_linked_issue_numbers,
@@ -124,11 +125,13 @@ from .evidence_reconciliation import (
 )
 from .memory import AgentMemoryContext, prepare_agent_memory
 from .managed_ci import (
+    AuthenticatedIssueCreatedHandoff,
     FINAL_CONTEXT,
     MANAGED_LABEL,
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
     activate_managed_ci,
+    authenticate_issue_created_handoff,
     dispatch_final_qualification,
     intermediate_managed_checks,
     managed_label_present,
@@ -139,6 +142,9 @@ from .managed_ci import (
     refresh_ordinary_recovery_capability,
     release_adopted_managed_ci,
     revalidate_adopted_managed_ci,
+    revalidate_issue_created_handoff,
+    recover_issue_created_handoff,
+    render_managed_ci_resume_command,
     validate_ordinary_recovery_capability,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
@@ -498,6 +504,39 @@ _ABSOLUTE_RESET_TIME_RE = re.compile(
     r"\((?P<timezone>[A-Za-z0-9_./+-]+)\)",
     re.I,
 )
+
+
+@dataclass(frozen=True)
+class ExactHeadCiProof:
+    """Non-empty current-head CI evidence required by automated merge paths."""
+
+    head_sha: str
+    source: str
+
+
+def _merge_with_exact_head_proof(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    proof: ExactHeadCiProof,
+) -> None:
+    """Make the live-head read the final remote operation before merging."""
+    # Fetch a fresh, minimal head as the final normal remote read. If GitHub
+    # serves an inconsistent GraphQL projection while it is converging, fetch
+    # the full live PR tuple and require that authoritative view to agree with
+    # the proof too; neither cached review metadata nor an old check board is
+    # accepted.
+    live_head = get_pr_head_sha(runner, config, pr_number)
+    if live_head != proof.head_sha:
+        live_head = get_pr_review_context(
+            runner, config=config, pr_number=pr_number
+        ).metadata.head_sha
+    if live_head != proof.head_sha:
+        raise AgentLoopError(
+            f"PR #{pr_number} head changed after {proof.source} CI proof; no merge attempted."
+        )
+    merge_pr(runner, config, pr_number, expected_head_sha=proof.head_sha)
 
 
 @dataclass(frozen=True)
@@ -4294,7 +4333,25 @@ def _implement_approved_issue(
     log(config, f"{coder_name} reported PR #{pr_number}; validating it is open")
     validate_open_pr(runner, config=implementation_config, pr_number=pr_number)
     initial_pr_context = get_pr_review_context(runner, config=implementation_config, pr_number=pr_number)
-    reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+    managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None
+    if managed_ci_creation_intent is not None:
+        managed_ci_handoff = authenticate_issue_created_handoff(
+            runner,
+            config=implementation_config,
+            intent=managed_ci_creation_intent,
+            issue_number=issue_number,
+            pr_number=pr_number,
+            metadata=initial_pr_context.metadata,
+        )
+        if managed_ci_handoff.override_nonce is not None:
+            # Install the expected nonce before any PR/issue publication.  It
+            # remains runtime-only and is revalidated at run_pr_loop entry.
+            implementation_config = dataclasses_replace(
+                implementation_config,
+                managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
+            )
+    else:
+        reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
     validate_pr_references_issue(
         runner,
         config=implementation_config,
@@ -4387,11 +4444,6 @@ def _implement_approved_issue(
         pr_number=pr_number,
         body=_embed_pr_contract_marker(initial_coder_body, pr_contract),
     )
-    if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
-        implementation_config = dataclasses_replace(
-            implementation_config,
-            managed_ci_expected_override_nonce=managed_ci_creation_intent.audit_nonce,
-        )
     return run_pr_loop(
         runner,
         pr_number=pr_number,
@@ -4401,6 +4453,7 @@ def _implement_approved_issue(
         workdirs_ready=True,
         usage_context=usage_context,
         pre_review_test_pending=True,
+        managed_ci_handoff=managed_ci_handoff,
     )
 
 
@@ -6005,7 +6058,23 @@ def run_issue_loop(
         log(config, f"{agent_display_name(config.coder)} reported PR #{pr_number}; validating it is open")
         validate_open_pr(runner, config=config, pr_number=pr_number)
         initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
-        reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None
+        if managed_ci_creation_intent is not None:
+            managed_ci_handoff = authenticate_issue_created_handoff(
+                runner,
+                config=config,
+                intent=managed_ci_creation_intent,
+                issue_number=issue_number,
+                pr_number=pr_number,
+                metadata=initial_pr_context.metadata,
+            )
+            if managed_ci_handoff.override_nonce is not None:
+                config = dataclasses_replace(
+                    config,
+                    managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
+                )
+        else:
+            reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
         initial_pr_metadata = initial_pr_context.metadata
         validate_pr_references_issue(
             runner,
@@ -6085,11 +6154,6 @@ def run_issue_loop(
             pr_number=pr_number,
             body=_embed_pr_contract_marker(initial_coder_body, pr_contract),
         )
-        if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
-            config = dataclasses_replace(
-                config,
-                managed_ci_expected_override_nonce=managed_ci_creation_intent.audit_nonce,
-            )
         return run_pr_loop(
             runner,
             pr_number=pr_number,
@@ -6099,6 +6163,7 @@ def run_issue_loop(
             workdirs_ready=True,
             usage_context=usage_context,
             pre_review_test_pending=True,
+            managed_ci_handoff=managed_ci_handoff,
         )
     finally:
         if owned_usage_context:
@@ -6281,7 +6346,7 @@ def _finalize_ordinary_recovery_merge(
     config: AgentLoopConfig,
     pr_number: int,
     capability: OrdinaryRecoveryCapability,
-) -> None:
+) -> bool:
     """Qualify, ready, and merge only the draft released by this invocation."""
     refreshed = refresh_ordinary_recovery_capability(
         runner, config=config, capability=capability,
@@ -6296,6 +6361,20 @@ def _finalize_ordinary_recovery_merge(
         metadata=get_pr_review_context(runner, config=config, pr_number=pr_number).metadata,
     )
     if outcome.status != "passed":
+        if outcome.status == "not_started":
+            command = render_managed_ci_resume_command(
+                config, pr_number=pr_number, managed_ci=False,
+            )
+            log(
+                config,
+                f"PR #{pr_number}: ordinary recovery CI did not start within the bounded startup window; "
+                "leaving the PR draft and unmerged",
+            )
+            print(
+                f"PR #{pr_number} remains draft and unmerged because ordinary recovery CI did not "
+                f"materialize for the current head. Resume with `{command}`."
+            )
+            return False
         raise AgentLoopError(
             f"PR #{pr_number} ordinary recovery did not qualify the exact head "
             f"({outcome.status}); the draft was left unmerged."
@@ -6318,12 +6397,21 @@ def _finalize_ordinary_recovery_merge(
             "the PR remains ready and was not merged."
         )
     try:
-        merge_pr(runner, config, pr_number, expected_head_sha=capability.expected_head_sha)
+        _merge_with_exact_head_proof(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            proof=ExactHeadCiProof(
+                head_sha=capability.expected_head_sha,
+                source="ordinary recovery",
+            ),
+        )
     except Exception:
         # Do not convert a successfully readied PR back into a draft. A safe
         # rerun can now inspect the ready exact head and retry the merge gate.
         log(config, f"PR #{pr_number}: merge failed after ordinary recovery readiness; PR remains ready")
         raise
+    return True
 
 
 def _stop_on_terminal_without_status(
@@ -6377,6 +6465,7 @@ def run_pr_loop(
     usage_context: RunUsageContext | None = None,
     pre_review_test_pending: bool = False,
     managed_pr_origin: tuple[str, str, str, str | None] | None = None,
+    managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None,
 ) -> int:
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
@@ -6393,16 +6482,37 @@ def run_pr_loop(
             pr_number=pr_number,
             cwd=bootstrap_cwd,
         )
+        if managed_ci_handoff is not None:
+            managed_ci_handoff = revalidate_issue_created_handoff(
+                runner,
+                config=config,
+                handoff=managed_ci_handoff,
+                metadata=initial_pr_context.metadata,
+            )
         if managed_pr_origin is None:
             recovered_origin = recover_managed_pr_origin(
                 initial_pr_context.metadata.body or "",
                 fetched_head_branch=initial_pr_context.metadata.head_branch,
             )
-            if recovered_origin is None:
-                reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
-            else:
+            if recovered_origin is not None:
                 managed_pr_origin = recovered_origin
                 managed_pr_recovered = True
+            elif managed_ci_handoff is None:
+                managed_ci_handoff = recover_issue_created_handoff(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    metadata=initial_pr_context.metadata,
+                )
+                if managed_ci_handoff is None:
+                    reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+                else:
+                    managed_ci_handoff = revalidate_issue_created_handoff(
+                        runner,
+                        config=config,
+                        handoff=managed_ci_handoff,
+                        metadata=initial_pr_context.metadata,
+                    )
         if managed_pr_origin is not None:
             source_branch, source_sha, managed_branch, override_nonce = managed_pr_origin
             validate_managed_pr_body(
@@ -6656,6 +6766,15 @@ def run_pr_loop(
                 f"PR #{pr_number}: ordinary recovery selected; "
                 "the previous managed activation is not being resumed",
             )
+            if ordinary_recovery is None:
+                command = render_managed_ci_resume_command(
+                    config, pr_number=pr_number, managed_ci=True,
+                )
+                print(
+                    f"PR #{pr_number} remains draft and unmerged because managed recovery provenance or "
+                    f"an unlabeled CI route is unavailable. Resume with `{command}`."
+                )
+                return 0
         else:
             managed_ci = activation
 
@@ -7808,13 +7927,14 @@ def run_pr_loop(
                             f"PR #{pr_number} was released to ordinary CI, but recovery provenance "
                             "could not be correlated; no merge attempted."
                         )
-                    _finalize_ordinary_recovery_merge(
+                    merged = _finalize_ordinary_recovery_merge(
                         runner,
                         config=config,
                         pr_number=pr_number,
                         capability=ordinary_recovery,
                     )
-                    print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
+                    if merged:
+                        print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
                     return 0
                 if not must_fix_items and config.watch_pending_ci and not managed_ci_active(pr_metadata):
                     if watch_deadline is None:
@@ -7851,19 +7971,7 @@ def run_pr_loop(
                     if watch_outcome.status == "dry_run":
                         print(f"PR #{pr_number} approval found; dry-run preview did not perform live CI watching.")
                         return 0
-                    if watch_outcome.status in {"passed", "no_checks"}:
-                        # A later invocation may omit the explicit override
-                        # while the opening label still suppresses pull_request
-                        # CI.  `no_checks` must never become a merge permit in
-                        # that state.
-                        label_live = managed_label_present(
-                            runner, config=config, pr_number=pr_number
-                        )
-                        if watch_outcome.status == "no_checks" and label_live is not False:
-                            raise AgentLoopError(
-                                f"PR #{pr_number} has no ordinary CI checks while `{MANAGED_LABEL}` "
-                                "is present or unreadable; remove the label and wait for real CI before merging."
-                            )
+                    if watch_outcome.status == "passed":
                         _publish_approved_followups(
                             runner,
                             config=config,
@@ -7874,13 +7982,53 @@ def run_pr_loop(
                         )
                         run_optional_tests(runner, config)
                         if config.auto_merge:
-                            merge_pr(
-                                runner, config, pr_number,
-                                expected_head_sha=pr_metadata.head_sha,
+                            _merge_with_exact_head_proof(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                proof=ExactHeadCiProof(
+                                    head_sha=pr_metadata.head_sha or "",
+                                    source="full-board",
+                                ),
                             )
                             print(f"PR #{pr_number} merged after CI watch completed.")
                         else:
                             print(f"PR #{pr_number} is merge-ready after CI watch completed.")
+                        return 0
+                    if watch_outcome.status == "not_started":
+                        command = render_managed_ci_resume_command(
+                            config, pr_number=pr_number, managed_ci=False,
+                        )
+                        log(
+                            config,
+                            f"Round {round_number}: PR #{pr_number} has no materialized CI board within "
+                            "the startup window; no merge attempted",
+                        )
+                        print(
+                            f"PR #{pr_number} has no materialized current-head CI board. No merge was "
+                            f"attempted; resume with `{command}`."
+                        )
+                        return 0
+                    # Compatibility fail-safe for an older watcher/provider
+                    # that still emits the retired outcome. It is never a
+                    # merge permit; unreadable managed suppression remains a
+                    # hard error rather than silently becoming ordinary CI.
+                    if watch_outcome.status == "no_checks":
+                        label_live = managed_label_present(
+                            runner, config=config, pr_number=pr_number
+                        )
+                        if label_live is not False:
+                            raise AgentLoopError(
+                                f"PR #{pr_number} has no ordinary CI checks while `{MANAGED_LABEL}` "
+                                "is present or unreadable; remove the label and wait for real CI before merging."
+                            )
+                        command = render_managed_ci_resume_command(
+                            config, pr_number=pr_number, managed_ci=False,
+                        )
+                        print(
+                            f"PR #{pr_number} has an empty CI board. No merge was attempted; "
+                            f"resume with `{command}`."
+                        )
                         return 0
                     if watch_outcome.status == "infrastructure_stall":
                         _publish_approved_followups(
@@ -8100,13 +8248,14 @@ def run_pr_loop(
                                         f"PR #{pr_number} managed resume could not be correlated to ordinary "
                                         "recovery CI; no merge attempted."
                                     )
-                                _finalize_ordinary_recovery_merge(
+                                merged = _finalize_ordinary_recovery_merge(
                                     runner,
                                     config=config,
                                     pr_number=pr_number,
                                     capability=ordinary_recovery,
                                 )
-                                print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
+                                if merged:
+                                    print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
                                 return 0
                             managed_outcome = wait_for_final_qualification(
                                 runner,
@@ -8125,11 +8274,14 @@ def run_pr_loop(
                                         expected_head_sha=pr_metadata.head_sha,
                                         contract=managed_ci,
                                     )
-                                    merge_pr(
+                                    _merge_with_exact_head_proof(
                                         runner,
-                                        config,
-                                        pr_number,
-                                        expected_head_sha=pr_metadata.head_sha,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        proof=ExactHeadCiProof(
+                                            head_sha=pr_metadata.head_sha or "",
+                                            source="managed exact-head",
+                                        ),
                                     )
                                     print(
                                         f"PR #{pr_number} approved by "
@@ -8269,13 +8421,15 @@ def run_pr_loop(
                                     f"PR #{pr_number} ordinary recovery provenance is unavailable; "
                                     "no merge attempted."
                                 )
-                            _finalize_ordinary_recovery_merge(
+                            merged = _finalize_ordinary_recovery_merge(
                                 runner,
                                 config=config,
                                 pr_number=pr_number,
                                 capability=ordinary_recovery,
                             )
-                            wait_outcome = None
+                            if merged:
+                                print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
+                            return 0
                         else:
                             wait_outcome = wait_for_ci(
                                 runner, config, pr_number, metadata=pr_metadata
@@ -8329,9 +8483,14 @@ def run_pr_loop(
                                 "during the CI wait; no merge attempted",
                             )
                         else:
-                            merge_pr(
-                                runner, config, pr_number,
-                                expected_head_sha=pr_metadata.head_sha,
+                            _merge_with_exact_head_proof(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                proof=ExactHeadCiProof(
+                                    head_sha=pr_metadata.head_sha or "",
+                                    source="configured CI",
+                                ),
                             )
                     if not must_fix_items:
                         print(f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}.")

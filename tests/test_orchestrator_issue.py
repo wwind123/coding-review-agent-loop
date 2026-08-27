@@ -9,6 +9,14 @@ from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.decomposition import approved_plan_hash, format_one_shot_impl_handoff_comment
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.github import IssueComment, IssueContext, get_issue_context
+from coding_review_agent_loop.managed_ci import (
+    AuthenticatedIssueCreatedHandoff,
+    ManagedCiContract,
+    ManagedCiCreationIntent,
+    ManagedCiOutcome,
+    UNPROTECTED_OVERRIDE_TRAILER,
+    parse_managed_ci_override_record,
+)
 from coding_review_agent_loop.issue_pr_handoff import (
     format_issue_pr_handoff_comment,
     resolve_canonical_pr_for_issue,
@@ -27,6 +35,7 @@ from coding_review_agent_loop.prompts import (
     COMPACT_PLANNING_VOLATILE_TAIL_MARKER,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
 )
+from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     ParsedPlanReview,
@@ -71,6 +80,21 @@ def _provenance_pages(message: str):
     return [page, page]
 
 
+def _managed_issue_handoff(*, nonce: str) -> AuthenticatedIssueCreatedHandoff:
+    return AuthenticatedIssueCreatedHandoff(
+        pr_number=77,
+        issue_number=56,
+        repository="OWNER/REPO",
+        base_ref="main",
+        head_sha="abc123",
+        branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop",
+        trusted_actor_id=1,
+        protection_mode="voluntary",
+        override_nonce=nonce,
+    )
+
+
 def test_advisory_issue_provenance_skips_commit_scan_in_dry_run(tmp_path):
     runner = FakeRunner()
     config = make_config(tmp_path, dry_run=True)
@@ -83,6 +107,176 @@ def test_advisory_issue_provenance_skips_commit_scan_in_dry_run(tmp_path):
     )
 
     assert runner.pr_commit_calls == 0
+
+
+def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tmp_path, monkeypatch):
+    nonce = "direct-managed-nonce"
+    body = f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}"
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce=nonce,
+    )
+    handoff = _managed_issue_handoff(nonce=nonce)
+    runner = FakeRunner(
+        claude_outputs=[
+            "Implemented the issue.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved managed draft.")],
+        pr_payload={
+            "body": body,
+            "headRefName": "agent-loop/managed-56",
+            "headRefOid": "abc123",
+        },
+    )
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        pre_review_tests=True,
+        test_command=("verify-managed-head",),
+    )
+    authentication_calls = []
+    readiness_heads = []
+    dispatches = []
+    prepared_heads = []
+    merged_heads = []
+
+    def authenticate(*_args, **kwargs):
+        record = parse_managed_ci_override_record(
+            kwargs["metadata"].body or "",
+            surface=PR_BODY_SURFACE,
+            schema="body",
+            required=True,
+            expected_nonce=nonce,
+        )
+        assert record is not None
+        assert kwargs["intent"] == intent
+        # Handoff authentication must precede every durable PR/issue write.
+        assert runner.comments == []
+        authentication_calls.append(kwargs)
+        return handoff
+
+    def revalidate(*_args, **kwargs):
+        assert kwargs["config"].managed_ci_expected_override_nonce == nonce
+        assert kwargs["handoff"] == handoff
+        return handoff
+
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_args, **_kwargs: intent)
+    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+    monkeypatch.setattr(orchestrator_module, "revalidate_issue_created_handoff", revalidate)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "activate_managed_ci",
+        lambda *_args, **_kwargs: ManagedCiContract(protocol_version=2, issue_created_pr=True),
+    )
+    monkeypatch.setattr(orchestrator_module, "revalidate_adopted_managed_ci", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(orchestrator_module, "managed_label_present", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "publish_round_readiness",
+        lambda *_args, **kwargs: readiness_heads.append(kwargs["head_sha"]),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "dispatch_final_qualification",
+        lambda *_args, **kwargs: dispatches.append(kwargs),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "wait_for_final_qualification",
+        lambda *_args, **_kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "prepare_v2_merge",
+        lambda *_args, **kwargs: prepared_heads.append(kwargs["expected_head_sha"]),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "merge_pr",
+        lambda *_args, **kwargs: merged_heads.append(kwargs["expected_head_sha"]),
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    assert len(authentication_calls) == 1
+    assert ["verify-managed-head"] in [command for command, _cwd in runner.commands]
+    assert readiness_heads == ["abc123"]
+    assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["abc123"]
+    assert prepared_heads == ["abc123"]
+    assert merged_heads == ["abc123"]
+
+
+def test_plan_first_issue_managed_draft_nonce_is_authenticated_before_pr_review(tmp_path, monkeypatch):
+    nonce = "plan-managed-nonce"
+    body = f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}"
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce=nonce,
+    )
+    handoff = _managed_issue_handoff(nonce=nonce)
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_plan_state(summary="Implement the managed draft."),
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[structured_plan_review(state="approved", summary="Plan approved.")],
+        pr_payload={
+            "body": body,
+            "headRefName": "agent-loop/managed-56",
+            "headRefOid": "abc123",
+        },
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    reviewed = []
+
+    def authenticate(*_args, **kwargs):
+        record = parse_managed_ci_override_record(
+            kwargs["metadata"].body or "",
+            surface=PR_BODY_SURFACE,
+            schema="body",
+            required=True,
+            expected_nonce=nonce,
+        )
+        assert record is not None
+        assert kwargs["intent"] == intent
+        return handoff
+
+    def review_entry(*_args, **kwargs):
+        assert kwargs["config"].managed_ci_expected_override_nonce == nonce
+        assert kwargs["managed_ci_handoff"] == handoff
+        reviewed.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_args, **_kwargs: intent)
+    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+    monkeypatch.setattr(orchestrator_module, "run_pr_loop", review_entry)
+
+    assert (
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=config,
+            plan_first=True,
+            implement_after_approval=True,
+        )
+        == 0
+    )
+
+    assert len(reviewed) == 1
 
 
 class FakeRunner(_FakeRunner):

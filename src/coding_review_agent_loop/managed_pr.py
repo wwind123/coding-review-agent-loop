@@ -16,6 +16,7 @@ from .managed_ci import (
     MANAGED_LABEL,
     UNPROTECTED_OVERRIDE_TRAILER,
     ensure_managed_label,
+    parse_managed_ci_override_record,
     preflight_managed_ci_creation,
 )
 from .runner import CommandResult, Runner
@@ -137,17 +138,13 @@ def _managed_pr_source_fields(carrier: TrustedBody) -> tuple[str, str]:
 
 
 def _managed_pr_override_nonce(carrier: TrustedBody) -> str | None:
-    override_occurrences = [
-        item
-        for item in scan_reserved_markers(str(carrier))
-        if item.definition.token == UNPROTECTED_OVERRIDE_TRAILER
-    ]
-    if not override_occurrences:
-        return None
-    parts = override_occurrences[0].text.strip().split()
-    if len(parts) != 2 or not parts[1].startswith("nonce=") or not parts[1][len("nonce=") :]:
-        raise AgentLoopError("Managed PR override record has an invalid schema.")
-    return parts[1][len("nonce=") :]
+    record = parse_managed_ci_override_record(
+        str(carrier),
+        surface=PR_BODY_SURFACE,
+        schema="body",
+        additional_allowed_tokens=frozenset({SOURCE_MARKER}),
+    )
+    return None if record is None else record.nonce
 
 
 def recover_managed_pr_origin(
@@ -214,7 +211,6 @@ def validate_managed_pr_body(
         expected_tokens=expected_tokens,
     )
     carrier.validate_for_surface(PR_BODY_SURFACE)
-    occurrences = scan_reserved_markers(str(carrier))
     source_branch_value, source_sha_value = _managed_pr_source_fields(carrier)
     if source_branch_value != source_branch or source_sha_value != source_sha:
         raise AgentLoopError("Managed PR source record does not match this creation handoff.")
@@ -225,14 +221,14 @@ def validate_managed_pr_body(
     if expected_base_branch is not None and fetched_base_branch != expected_base_branch:
         raise AgentLoopError("Managed PR base branch does not match its creation handoff.")
     if override_nonce is not None:
-        override_occurrence = next(
-            item for item in occurrences if item.definition.token == UNPROTECTED_OVERRIDE_TRAILER
+        parse_managed_ci_override_record(
+            str(carrier),
+            surface=PR_BODY_SURFACE,
+            schema="body",
+            required=True,
+            expected_nonce=override_nonce,
+            additional_allowed_tokens=frozenset({SOURCE_MARKER}),
         )
-        if override_occurrence.text.strip().split() != [
-            UNPROTECTED_OVERRIDE_TRAILER,
-            f"nonce={override_nonce}",
-        ]:
-            raise AgentLoopError("Managed PR override record does not match this creation handoff.")
 
 
 def _close_partial_handoff(

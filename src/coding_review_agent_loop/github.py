@@ -1952,7 +1952,7 @@ class CiWatchOutcome:
 
     status: Literal[
         "passed",
-        "no_checks",
+        "not_started",
         "failed",
         "timeout",
         "infrastructure_stall",
@@ -1990,6 +1990,12 @@ def watch_pr_checks(
         1, config.ci_timeout_seconds // config.ci_poll_interval_seconds
     )
     latest: PullRequestChecks | None = None
+    empty_attempts = 0
+    startup_attempt_limit = max(
+        1,
+        (config.ci_startup_timeout_seconds + config.ci_poll_interval_seconds - 1)
+        // config.ci_poll_interval_seconds,
+    )
     for attempt in range(limit):
         # A flaky head probe is diagnostic only.  The full-board and
         # mergeability probes already degrade transient API failures safely.
@@ -2033,10 +2039,17 @@ def watch_pr_checks(
                 attempts_used=attempt + 1,
             )
         if snapshot.state == "no_checks" and reliable and not snapshot.missing_required:
-            return CiWatchOutcome(
-                status="no_checks", pr_checks=snapshot, head_sha=current_head,
-                attempts_used=attempt + 1,
-            )
+            empty_attempts += 1
+            # GitHub can expose an empty rollup while a pull_request workflow
+            # is queued but no job/check has materialized.  It is a startup
+            # state, not a passing board and never a merge permit.
+            if empty_attempts >= startup_attempt_limit:
+                return CiWatchOutcome(
+                    status="not_started", pr_checks=snapshot, head_sha=current_head,
+                    attempts_used=attempt + 1,
+                )
+        else:
+            empty_attempts = 0
         if time.monotonic() >= deadline or attempt == limit - 1:
             return CiWatchOutcome(
                 status="timeout", pr_checks=latest, head_sha=current_head,

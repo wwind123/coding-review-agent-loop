@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import shlex
 import time
@@ -26,11 +27,17 @@ from .github import (
     get_pr_checks,
     get_pr_head_sha,
     get_pr_mergeability,
+    parse_strong_issue_reference_evidence,
 )
 from .logging import log
 from .runner import Runner
 from .workdirs import active_workdir
-from .protocol_markers import PR_COMMENT_SURFACE, TrustedBody
+from .protocol_markers import (
+    PR_BODY_SURFACE,
+    PR_COMMENT_SURFACE,
+    TrustedBody,
+    scan_reserved_markers,
+)
 
 
 MANAGED_LABEL = "agent-loop-managed"
@@ -132,6 +139,10 @@ class ManagedCiContract:
     terminal_attempts: tuple[tuple[int, int | None], ...] = ()
     activation_path: Literal["managed", "ordinary_fallback"] = "managed"
     ordinary_recovery: "OrdinaryRecoveryCapability | None" = None
+    # Derived from the exact base workflow at activation. Retain it for a
+    # delayed dispatch-time fallback so a suppressed draft is released only
+    # when that same workflow advertises an unlabeled CI route.
+    ordinary_recovery_capable: bool = False
 
 
 @dataclass(frozen=True)
@@ -142,6 +153,118 @@ class ManagedCiCreationIntent:
     trusted_actor: str
     protection_mode: str = "strict"
     audit_nonce: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagedCiOverrideRecord:
+    """Canonical override record parsed from one trusted PR surface.
+
+    The same marker has deliberately different schemas on a PR body and on
+    an actor-authored audit comment.  Keeping that distinction here prevents
+    one consumer from accepting a permissive form that another rejects.
+    """
+
+    nonce: str
+    fields: tuple[tuple[str, str], ...]
+
+    def field_map(self) -> dict[str, str]:
+        return dict(self.fields)
+
+
+@dataclass(frozen=True)
+class AuthenticatedIssueCreatedHandoff:
+    """Read-only proof for the issue-created draft -> PR-loop transition."""
+
+    pr_number: int
+    issue_number: int
+    repository: str
+    base_ref: str
+    head_sha: str
+    branch: str
+    trusted_actor_login: str
+    trusted_actor_id: int
+    protection_mode: str
+    override_nonce: str | None
+    active_label_event_id: int | None = None
+
+
+def parse_managed_ci_override_record(
+    body: str,
+    *,
+    surface: str,
+    schema: Literal["body", "audit"],
+    required: bool = False,
+    expected_nonce: str | None = None,
+    additional_allowed_tokens: frozenset[str] = frozenset(),
+) -> ManagedCiOverrideRecord | None:
+    """Parse one canonical managed-CI override record and reject every variant.
+
+    ``TrustedBody`` supplies the registry/surface/canonical-wire checks.  This
+    helper owns the inner field schema so body records cannot quietly acquire
+    audit provenance fields and audit comments cannot omit their provenance.
+    """
+    occurrences = scan_reserved_markers(body)
+    override = [
+        occurrence for occurrence in occurrences
+        if occurrence.definition.token == UNPROTECTED_OVERRIDE_TRAILER
+    ]
+    allowed = set(additional_allowed_tokens)
+    allowed.add(UNPROTECTED_OVERRIDE_TRAILER)
+    unexpected = [
+        occurrence.definition.token for occurrence in occurrences
+        if occurrence.definition.token not in allowed
+    ]
+    if unexpected:
+        raise AgentLoopError(
+            "Managed-CI override carrier contains unrelated reserved protocol record(s): "
+            + ", ".join(sorted(set(unexpected)))
+        )
+    if not override:
+        if required:
+            raise AgentLoopError("Managed-CI override record is required for this handoff.")
+        # Still canonicalize allowed companion records, including malformed
+        # bare-token fallbacks, before returning absence.
+        if occurrences:
+            TrustedBody.canonical(
+                body,
+                surface=surface,
+                expected_tokens={item.definition.token for item in occurrences},
+            )
+        return None
+    if len(override) != 1:
+        raise AgentLoopError("Managed-CI override carrier contains duplicate override records.")
+    TrustedBody.canonical(
+        body,
+        surface=surface,
+        expected_tokens={item.definition.token for item in occurrences},
+    )
+    parts = override[0].text.strip().split()
+    if not parts or parts[0] != UNPROTECTED_OVERRIDE_TRAILER:
+        raise AgentLoopError("Managed-CI override record has an invalid schema.")
+    fields: list[tuple[str, str]] = []
+    for token in parts[1:]:
+        key, separator, value = token.partition("=")
+        if not separator or not key or not value or any(key == old for old, _ in fields):
+            raise AgentLoopError("Managed-CI override record has an invalid schema.")
+        fields.append((key, value))
+    values = dict(fields)
+    body_keys = {"nonce"}
+    audit_keys = {
+        "nonce", "repo", "base", "head", "protection", "active_label_event_id",
+        "resume_from", "provenance_head", "generation",
+    }
+    if schema == "body":
+        if set(values) != body_keys:
+            raise AgentLoopError("Managed-CI PR-body override record must contain only its nonce.")
+    else:
+        if not {"nonce", "repo", "base", "head", "protection"}.issubset(values) or set(values) - audit_keys:
+            raise AgentLoopError("Managed-CI override audit record has an invalid provenance schema.")
+    nonce = values.get("nonce")
+    if not nonce:
+        raise AgentLoopError("Managed-CI override record has no nonce.")
+    if expected_nonce is not None and nonce != expected_nonce:
+        raise AgentLoopError("Managed-CI override record does not match this creation handoff.")
+    return ManagedCiOverrideRecord(nonce=nonce, fields=tuple(fields))
 
 
 @dataclass(frozen=True)
@@ -167,6 +290,7 @@ class ManagedCiOutcome:
         "merge_conflict",
         "infrastructure_stall",
         "terminal_without_status",
+        "not_started",
     ]
     checks: PullRequestChecks | None = None
     mergeability: PullRequestMergeability | None = None
@@ -693,6 +817,247 @@ def preflight_managed_ci_creation(
     )
 
 
+def _issue_created_tuple(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    issue_number: int,
+    metadata: PullRequestMetadata,
+    expected_branch: str,
+    expected_nonce: str | None,
+    protection_mode: str,
+) -> AuthenticatedIssueCreatedHandoff:
+    """Read and verify the immutable tuple before any handoff publication.
+
+    The GraphQL view is useful to the review loop but cannot attest author,
+    same-repository head, labels, and draft state together.  Require it to
+    agree with the REST tuple and re-read the REST tuple before returning so a
+    transient body/head race cannot escape into a writer.
+    """
+    if not config.base or metadata.number != pr_number or metadata.repo.casefold() != config.repo.casefold():
+        raise AgentLoopError("Managed-CI issue handoff does not match the configured repository/base.")
+    body = metadata.body or ""
+    record = parse_managed_ci_override_record(
+        body,
+        surface=PR_BODY_SURFACE,
+        schema="body",
+        required=expected_nonce is not None,
+        expected_nonce=expected_nonce,
+    )
+    if expected_nonce is None and record is not None:
+        raise AgentLoopError("Strict managed-CI issue handoff must not contain an override record.")
+    linked = parse_strong_issue_reference_evidence(body, repo=config.repo, issue_number=issue_number)
+    if len(linked) != 1:
+        raise AgentLoopError("Managed-CI issue handoff requires one canonical closing reference to its issue.")
+    who = _api_json(runner, config, "user", quiet=True)
+    actor_login = who.get("login") if isinstance(who.get("login"), str) else None
+    actor_id = who.get("id") if isinstance(who.get("id"), int) else None
+    variable = _api_json(
+        runner, config,
+        f"repos/{config.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR",
+        quiet=True,
+    )
+    advertised = variable.get("value") if isinstance(variable.get("value"), str) else None
+    configured = (config.managed_ci_trusted_actor or "").strip()
+    if (
+        not configured or not actor_login or actor_id is None or not advertised
+        or actor_login.casefold() != configured.casefold()
+        or actor_login.casefold() != advertised.casefold()
+    ):
+        raise AgentLoopError("Managed-CI issue handoff actor authentication does not match repository settings.")
+
+    def check_rest(pr: dict[str, object]) -> tuple[str, str]:
+        head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+        base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+        author = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+        head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+        labels = {
+            item.get("name") for item in (pr.get("labels") or [])
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        sha = head.get("sha") if isinstance(head.get("sha"), str) else None
+        branch = head.get("ref") if isinstance(head.get("ref"), str) else None
+        rest_body = pr.get("body") if isinstance(pr.get("body"), str) else ""
+        if (
+            pr.get("state") not in {"open", "OPEN"}
+            or pr.get("draft") is not True
+            or head_repo.get("full_name", "").casefold() != config.repo.casefold()
+            or branch != expected_branch
+            or base.get("ref") != config.base
+            or MANAGED_LABEL not in labels
+            or author.get("login", "").casefold() != actor_login.casefold()
+            or author.get("id") != actor_id
+            or sha != metadata.head_sha
+            or branch != metadata.head_branch
+            or base.get("ref") != metadata.base_branch
+            or rest_body != body
+        ):
+            raise AgentLoopError("Managed-CI issue-created opening tuple is missing or changed.")
+        return sha, branch
+
+    first = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    sha, branch = check_rest(first)
+    second = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    live_sha, live_branch = check_rest(second)
+    if (live_sha, live_branch) != (sha, branch):
+        raise AgentLoopError("Managed-CI issue-created opening tuple changed during validation.")
+    return AuthenticatedIssueCreatedHandoff(
+        pr_number=pr_number,
+        issue_number=issue_number,
+        repository=config.repo,
+        base_ref=config.base,
+        head_sha=sha,
+        branch=branch,
+        trusted_actor_login=actor_login,
+        trusted_actor_id=actor_id,
+        protection_mode=protection_mode,
+        override_nonce=record.nonce if record is not None else None,
+    )
+
+
+def authenticate_issue_created_handoff(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    intent: ManagedCiCreationIntent,
+    issue_number: int,
+    pr_number: int,
+    metadata: PullRequestMetadata,
+) -> AuthenticatedIssueCreatedHandoff:
+    """Authenticate a just-created issue draft before *any* remote write."""
+    return _issue_created_tuple(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        issue_number=issue_number,
+        metadata=metadata,
+        expected_branch=intent.branch,
+        expected_nonce=intent.audit_nonce,
+        protection_mode=intent.protection_mode,
+    )
+
+
+def revalidate_issue_created_handoff(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    metadata: PullRequestMetadata,
+) -> AuthenticatedIssueCreatedHandoff:
+    """Re-read an authenticated handoff at PR-loop entry before any writer."""
+    if handoff.repository.casefold() != config.repo.casefold() or handoff.base_ref != config.base:
+        raise AgentLoopError("Managed-CI handoff does not belong to this invocation.")
+    validated = _issue_created_tuple(
+        runner,
+        config=config,
+        pr_number=handoff.pr_number,
+        issue_number=handoff.issue_number,
+        metadata=metadata,
+        expected_branch=handoff.branch,
+        expected_nonce=handoff.override_nonce,
+        protection_mode=handoff.protection_mode,
+    )
+    if handoff.active_label_event_id is not None:
+        event = _active_managed_label_event(runner, config=config, pr_number=handoff.pr_number)
+        if (
+            event is None
+            or event[0] != handoff.active_label_event_id
+            or event[1].casefold() != handoff.trusted_actor_login.casefold()
+            or event[2] != handoff.trusted_actor_id
+        ):
+            raise AgentLoopError("Managed-CI direct-resume label provenance changed before activation.")
+        validated = replace(validated, active_label_event_id=handoff.active_label_event_id)
+    return validated
+
+
+def recover_issue_created_handoff(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    metadata: PullRequestMetadata,
+) -> AuthenticatedIssueCreatedHandoff | None:
+    """Reconstruct provenance for a direct PR resume without reusing authority.
+
+    This only recognizes the nonce-bearing unprotected body form.  Strict
+    issue-created drafts retain their existing label/timeline activation path;
+    source-managed PRs are handled by ``managed_pr`` before this function.
+    """
+    if not config.managed_ci_pr_mode:
+        return None
+    body = metadata.body or ""
+    if UNPROTECTED_OVERRIDE_TRAILER not in body:
+        return None
+    record = parse_managed_ci_override_record(
+        body, surface=PR_BODY_SURFACE, schema="body", required=True,
+    )
+    branch = metadata.head_branch or ""
+    match = re.fullmatch(r"agent-loop/managed-([1-9]\d*)", branch)
+    if match is None:
+        raise AgentLoopError("Managed-CI direct resume requires the exact issue-created managed branch.")
+    issue_number = int(match.group(1))
+    # A resumed nonce is provenance only.  Its value is checked against the
+    # live body, then activation mints a fresh audit/generation.
+    handoff = _issue_created_tuple(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        issue_number=issue_number,
+        metadata=metadata,
+        expected_branch=branch,
+        expected_nonce=record.nonce,
+        protection_mode="voluntary",
+    )
+    event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
+    if (
+        event is None
+        or event[1].casefold() != handoff.trusted_actor_login.casefold()
+        or event[2] != handoff.trusted_actor_id
+    ):
+        raise AgentLoopError("Managed-CI direct resume requires an actor-owned active managed-label event.")
+    comments = _api_list(runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100")
+    if comments is None:
+        raise AgentLoopError("Managed-CI direct resume could not inspect override audit provenance.")
+    if any(
+        UNPROTECTED_OVERRIDE_TRAILER in (comment.get("body") if isinstance(comment.get("body"), str) else "")
+        for comment in comments
+    ) and _find_resume_audit(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        actor_login=handoff.trusted_actor_login,
+        actor_id=handoff.trusted_actor_id,
+        base_ref=handoff.base_ref,
+    ) is None:
+        raise AgentLoopError("Managed-CI direct resume found malformed or uncorrelated override audit provenance.")
+    return replace(handoff, active_label_event_id=event[0])
+
+
+def render_managed_ci_resume_command(
+    config: AgentLoopConfig, *, pr_number: int, managed_ci: bool
+) -> str:
+    """Render the deterministic, shell-quoted public recovery contract."""
+    command = ["agent-loop", "pr", str(pr_number), "--repo", config.repo]
+    if config.base:
+        command.extend(("--base", config.base))
+    if config.auto_merge:
+        command.append("--auto-merge")
+    if config.watch_pending_ci:
+        command.append("--watch-pending-ci")
+    elif config.auto_merge:
+        # CLI invocations enable this by default with --auto-merge, so an
+        # explicit opt-out is required to faithfully reproduce this stop.
+        command.append("--no-watch-pending-ci")
+    if managed_ci:
+        command.append("--managed-ci")
+        if config.managed_ci_trusted_actor:
+            command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
+        if config.allow_unprotected_managed_ci:
+            command.append("--allow-unprotected-managed-ci")
+    return " ".join(shlex.quote(part) for part in command)
+
+
 def _restore_ordinary_ci_after_v2_fallback(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, reason: str
 ) -> None:
@@ -727,6 +1092,7 @@ def _release_for_ordinary_recovery(
     expected_head_sha: str,
     active_event: tuple[int, str, int] | None,
     reason: str,
+    recovery_capable: bool,
 ) -> OrdinaryRecoveryCapability | None:
     """Release the exact active label and return a narrowly scoped capability.
 
@@ -741,6 +1107,13 @@ def _release_for_ordinary_recovery(
     later exact-head ordinary-CI gate remains mandatory before readiness or
     merge.
     """
+    if not recovery_capable:
+        log(
+            config,
+            f"PR #{pr_number}: ordinary recovery was not selected because the base workflow "
+            "does not prove an unlabeled pull_request trigger",
+        )
+        return None
     prior_run_ids: set[int] = set()
     try:
         prior_run_ids = _workflow_run_ids(runner, config=config, head_sha=expected_head_sha)
@@ -824,24 +1197,17 @@ def refresh_ordinary_recovery_capability(
 
 
 def _parse_override_audit(body: str) -> dict[str, str] | None:
-    """Parse only the structured provenance fields of an old audit comment."""
-    first = next((line.strip() for line in body.splitlines() if line.strip().startswith(UNPROTECTED_OVERRIDE_TRAILER)), "")
-    if not first:
+    """Parse the documented richer audit form through the shared validator."""
+    try:
+        record = parse_managed_ci_override_record(
+            body,
+            surface=PR_COMMENT_SURFACE,
+            schema="audit",
+            required=False,
+        )
+    except AgentLoopError:
         return None
-    fields: dict[str, str] = {}
-    for token in first.split()[1:]:
-        key, separator, value = token.partition("=")
-        if not separator or key not in {
-            "nonce", "repo", "base", "head", "protection", "active_label_event_id",
-            "resume_from", "provenance_head", "generation",
-        } or not value:
-            return None
-        if key in fields:
-            return None
-        fields[key] = value
-    if not {"repo", "base", "head", "protection"}.issubset(fields):
-        return None
-    return fields
+    return None if record is None else record.field_map()
 
 
 def _find_resume_audit(
@@ -928,6 +1294,9 @@ def _activate_v2_managed_ci(
     workflow_text = base_workflow.stdout or ""
     if any(marker not in workflow_text for marker in V2_FEATURE_MARKERS):
         raise AgentLoopError("The base branch does not contain the complete managed-CI v2 workflow.")
+    ordinary_recovery_capable = (
+        RECOVERY_MARKER in workflow_text and "pull_request" in workflow_text and "unlabeled" in workflow_text
+    )
 
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -1035,6 +1404,7 @@ def _activate_v2_managed_ci(
                 runner, config=config, pr_number=pr_number, base_ref=base_ref,
                 expected_head_sha=live_sha, active_event=active_event,
                 reason="the active managed-label event is temporarily unreadable",
+                recovery_capable=ordinary_recovery_capable,
             )
             return ManagedCiContract(
                 activation_path="ordinary_fallback",
@@ -1045,6 +1415,7 @@ def _activate_v2_managed_ci(
                 runner, config=config, pr_number=pr_number, base_ref=base_ref,
                 expected_head_sha=live_sha, active_event=active_event,
                 reason="the active managed-label event is not actor-owned",
+                recovery_capable=ordinary_recovery_capable,
             )
             return ManagedCiContract(
                 activation_path="ordinary_fallback",
@@ -1071,6 +1442,7 @@ def _activate_v2_managed_ci(
                     runner, config=config, pr_number=pr_number, base_ref=base_ref,
                     expected_head_sha=live_sha, active_event=active_event,
                     reason="strict protection is unavailable and the explicit waiver is absent",
+                    recovery_capable=ordinary_recovery_capable,
                 )
                 return ManagedCiContract(
                     activation_path="ordinary_fallback", ordinary_recovery=recovery,
@@ -1084,33 +1456,35 @@ def _activate_v2_managed_ci(
                     runner, config=config, pr_number=pr_number, base_ref=base_ref,
                     expected_head_sha=live_sha, active_event=active_event,
                     reason="no unambiguous actor-owned issue-created override audit exists",
+                    recovery_capable=ordinary_recovery_capable,
                 )
                 return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
             resume_audit_id, prior_fields = prior_audit
             resume_provenance_head = prior_fields.get("head")
         elif protection.state != "strict":
             body = pr.get("body") if isinstance(pr.get("body"), str) else ""
-            marker_line = next((line.strip() for line in body.splitlines() if line.strip().startswith(UNPROTECTED_OVERRIDE_TRAILER)), "")
-            if not config.allow_unprotected_managed_ci or protection.state not in {"voluntary", "plan_limited"} or not marker_line:
+            if not config.allow_unprotected_managed_ci or protection.state not in {"voluntary", "plan_limited"}:
                 _restore_ordinary_ci_after_v2_fallback(
                     runner, config=config, pr_number=pr_number,
                     reason="strict protection or the explicit override is unavailable",
                 )
                 return None
-            parts = marker_line.split("nonce=", 1)
-            if len(parts) != 2 or not parts[1].strip():
+            try:
+                override = parse_managed_ci_override_record(
+                    body,
+                    surface=PR_BODY_SURFACE,
+                    schema="body",
+                    required=True,
+                    expected_nonce=config.managed_ci_expected_override_nonce,
+                )
+            except AgentLoopError as error:
                 _restore_ordinary_ci_after_v2_fallback(
                     runner, config=config, pr_number=pr_number,
-                    reason="the override trailer has no nonce",
+                    reason=str(error),
                 )
                 return None
-            override_nonce = parts[1].strip().split()[0]
-            if override_nonce != config.managed_ci_expected_override_nonce:
-                _restore_ordinary_ci_after_v2_fallback(
-                    runner, config=config, pr_number=pr_number,
-                    reason="the override trailer is not correlated to this invocation",
-                )
-                return None
+            assert override is not None
+            override_nonce = override.nonce
             audit_body = TrustedBody.canonical(
                 (
                     f"{UNPROTECTED_OVERRIDE_TRAILER} nonce={override_nonce} repo={config.repo} "
@@ -1170,6 +1544,7 @@ def _activate_v2_managed_ci(
                 runner, config=config, pr_number=pr_number, base_ref=base_ref,
                 expected_head_sha=live_sha, active_event=live_event,
                 reason="the immutable resume tuple changed before activation",
+                recovery_capable=ordinary_recovery_capable,
             )
             return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
         if protection.state != "strict":
@@ -1197,6 +1572,7 @@ def _activate_v2_managed_ci(
                     runner, config=config, pr_number=pr_number, base_ref=base_ref,
                     expected_head_sha=live_sha, active_event=active_event,
                     reason="the fresh resume audit could not be recorded",
+                    recovery_capable=ordinary_recovery_capable,
                 )
                 return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
             try:
@@ -1208,6 +1584,7 @@ def _activate_v2_managed_ci(
                     runner, config=config, pr_number=pr_number, base_ref=base_ref,
                     expected_head_sha=live_sha, active_event=active_event,
                     reason="the fresh resume audit response was malformed",
+                    recovery_capable=ordinary_recovery_capable,
                 )
                 return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
         else:
@@ -1234,6 +1611,7 @@ def _activate_v2_managed_ci(
         active_label_event_id=active_event[0] if active_event is not None else None,
         issue_created_pr=True,
         invocation_applied_label=label_applied,
+        ordinary_recovery_capable=ordinary_recovery_capable,
     )
 
 
@@ -1818,6 +2196,7 @@ def _dispatch_v2_qualification(
             runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
             expected_head_sha=expected_head_sha, active_event=event,
             reason=f"fresh intent ledger could not be reconciled ({exc})",
+            recovery_capable=contract.ordinary_recovery_capable,
         )
         contract.activation_path = "ordinary_fallback"
         contract.ordinary_recovery = recovery
@@ -2204,7 +2583,15 @@ def wait_for_final_qualification(
             final = _find_context(latest, FINAL_CONTEXT)
         status = final.status.lower() if final is not None else "pending"
         log(config, f"Managed CI context '{FINAL_CONTEXT}' status: {status}")
-        if status == "success":
+        complete_board = (
+            latest.check_query_status == "ok"
+            and latest.branch_protection_status in {"configured", "not_found", "forbidden"}
+            and latest.state == "passing"
+            and bool(latest.passing)
+            and not latest.pending
+            and not latest.missing_required
+        )
+        if status == "success" and complete_board:
             if contract is not None and contract.protocol_version == 2:
                 _patch_intent(runner, config=config, contract=contract, state="completed")
             return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
@@ -2226,7 +2613,7 @@ def wait_for_final_qualification(
                 )
                 if final is not None and final.status.lower() in _TERMINAL_CI_STATUSES:
                     status = final.status.lower()
-                    if status == "success":
+                    if status == "success" and complete_board:
                         _patch_intent(runner, config=config, contract=contract, state="completed")
                         return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
                 else:
@@ -2516,6 +2903,11 @@ def wait_for_ordinary_recovery(
     """Wait for a post-unlabel current-head run and a complete ordinary board."""
     expected_head = capability.expected_head_sha
     attempts = max(1, config.ci_timeout_seconds // config.ci_poll_interval_seconds)
+    startup_attempt_limit = max(
+        1,
+        (config.ci_startup_timeout_seconds + config.ci_poll_interval_seconds - 1)
+        // config.ci_poll_interval_seconds,
+    )
     latest: PullRequestChecks | None = None
     for attempt in range(attempts):
         live_head = get_pr_head_sha(runner, config, capability.pr_number)
@@ -2545,21 +2937,24 @@ def wait_for_ordinary_recovery(
                 stall=CiInfrastructureStall(checks=latest.infrastructure_stalls),
             )
         completed = [run for run in recovery_runs if run.get("status") == "completed"]
-        if completed and any(run.get("conclusion") not in {"success", "neutral", "skipped"} for run in completed):
+        if completed and any(run.get("conclusion") != "success" for run in completed):
             return ManagedCiOutcome(status="failed", checks=latest, head_sha=live_head)
         reliable = latest.check_query_status == "ok" and latest.branch_protection_status in {
             "configured", "not_found", "forbidden",
         }
         if (
             recovery_runs
-            and any(run.get("status") == "completed" and run.get("conclusion") in {"success", "neutral", "skipped"} for run in completed)
+            and any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in completed)
             and latest.state == "passing"
+            and bool(latest.passing)
             and reliable
             and not latest.pending
             and not latest.missing_required
         ):
             log(config, f"PR #{capability.pr_number}: ordinary unlabeled recovery passed at {expected_head}")
             return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
+        if not recovery_runs and attempt + 1 >= startup_attempt_limit:
+            return ManagedCiOutcome(status="not_started", checks=latest, head_sha=live_head)
         if attempt < attempts - 1:
             runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
     return ManagedCiOutcome(status="timeout", checks=latest, head_sha=expected_head)

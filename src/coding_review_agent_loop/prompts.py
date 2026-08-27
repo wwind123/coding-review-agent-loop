@@ -1212,13 +1212,15 @@ def _managed_ci_creation_guidance(
         override = (
             " This invocation uses the explicit unprotected override. Include this exact "
             f"PR-body trailer on its own line: `{UNPROTECTED_OVERRIDE_TRAILER} nonce={intent.audit_nonce}`. "
+            "Include it exactly once and do not include any other reserved protocol record in the PR body. "
             "This is a voluntary gate: GitHub cannot force a later human merge, other automation, "
             "a compromised credential, or an agent-loop defect to use the qualified SHA."
         )
     return (
         "\nThis invocation has authenticated managed-CI v2 enabled. Create the PR atomically: "
-        f"use the reserved branch `{intent.branch}`, create or verify the `agent-loop-managed` "
-        "label, then run `gh pr create --draft --label agent-loop-managed`. Do not mark it ready; "
+        f"use exactly the reserved branch `{intent.branch}`, create or verify the `agent-loop-managed` "
+        "label, then run `gh pr create --draft --label agent-loop-managed` so it is born open, draft, "
+        "and labeled. Do not create a second PR or apply a readiness transition. Do not mark it ready; "
         f"agent-loop will dispatch exact-head qualification after review.{override}\n"
     )
 

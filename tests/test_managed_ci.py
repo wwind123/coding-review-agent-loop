@@ -32,10 +32,15 @@ from coding_review_agent_loop.managed_ci import (
     _v2_correlated_status,
     _api_list,
     activate_managed_ci,
+    authenticate_issue_created_handoff,
     dispatch_final_qualification,
     evaluate_managed_ci_readiness,
     intermediate_managed_checks,
     preflight_managed_ci_creation,
+    parse_managed_ci_override_record,
+    render_managed_ci_resume_command,
+    recover_issue_created_handoff,
+    revalidate_issue_created_handoff,
     prepare_v2_merge,
     publish_manual_v2_qualification,
     publish_round_readiness,
@@ -47,6 +52,7 @@ from coding_review_agent_loop.managed_ci import (
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
+from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE, PR_COMMENT_SURFACE
 from coding_review_agent_loop.orchestrator import (
     _finalize_ordinary_recovery_merge,
     _stop_on_terminal_without_status,
@@ -483,6 +489,157 @@ def test_override_activation_requires_the_preflight_nonce_and_releases_label_on_
     )
 
 
+@pytest.mark.parametrize(
+    ("body", "surface", "schema", "accepted"),
+    [
+        (f"{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh", PR_BODY_SURFACE, "body", True),
+        (
+            f"{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh repo=OWNER/REPO base=main head=abc protection=voluntary",
+            PR_COMMENT_SURFACE,
+            "audit",
+            True,
+        ),
+        (f"{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh repo=OWNER/REPO", PR_BODY_SURFACE, "body", False),
+        (f"{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=other", PR_BODY_SURFACE, "body", False),
+        (f"{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh repo=OWNER/REPO", PR_COMMENT_SURFACE, "audit", False),
+    ],
+)
+def test_override_record_parser_enforces_surface_schema_agreement(body, surface, schema, accepted):
+    if accepted:
+        parsed = parse_managed_ci_override_record(body, surface=surface, schema=schema, required=True)
+        assert parsed is not None and parsed.nonce == "fresh"
+    else:
+        with pytest.raises(AgentLoopError):
+            parse_managed_ci_override_record(body, surface=surface, schema=schema, required=True)
+
+
+def test_ordinary_resume_command_preserves_merge_and_watch_mode_without_managed_ci(tmp_path):
+    command = render_managed_ci_resume_command(
+        make_config(
+            tmp_path,
+            auto_merge=True,
+            watch_pending_ci=True,
+            managed_ci=True,
+            managed_ci_trusted_actor="agent-loop",
+            allow_unprotected_managed_ci=True,
+        ),
+        pr_number=42,
+        managed_ci=False,
+    )
+
+    assert command == (
+        "agent-loop pr 42 --repo OWNER/REPO --base main --auto-merge --watch-pending-ci"
+    )
+
+
+def test_managed_resume_command_retains_managed_ci_configuration(tmp_path):
+    command = render_managed_ci_resume_command(
+        make_config(
+            tmp_path,
+            auto_merge=True,
+            watch_pending_ci=True,
+            managed_ci=True,
+            managed_ci_trusted_actor="agent-loop",
+            allow_unprotected_managed_ci=True,
+        ),
+        pr_number=42,
+        managed_ci=True,
+    )
+
+    assert command == (
+        "agent-loop pr 42 --repo OWNER/REPO --base main --auto-merge --watch-pending-ci "
+        "--managed-ci --managed-ci-trusted-actor agent-loop --allow-unprotected-managed-ci"
+    )
+
+
+def test_resume_command_preserves_explicit_ordinary_watch_opt_out(tmp_path):
+    command = render_managed_ci_resume_command(
+        make_config(tmp_path, auto_merge=True, watch_pending_ci=False),
+        pr_number=42,
+        managed_ci=False,
+    )
+
+    assert command.endswith("--auto-merge --no-watch-pending-ci")
+
+
+def test_issue_created_handoff_authenticates_override_before_any_remote_write(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
+    runner = V2ManagedRunner(
+        rest_pr={"state": "open", "body": body},
+    )
+    metadata = PullRequestMetadata(
+        number=7,
+        repo="OWNER/REPO",
+        title="Managed CI",
+        head_branch="agent-loop/managed-643",
+        base_branch="main",
+        head_sha="abc123",
+        url="https://github.com/OWNER/REPO/pull/7",
+        body=body,
+    )
+    intent = managed_ci.ManagedCiCreationIntent(
+        branch="agent-loop/managed-643",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce="fresh",
+    )
+
+    handoff = authenticate_issue_created_handoff(
+        runner,
+        config=make_config(
+            tmp_path,
+            managed_ci=True,
+            base="main",
+            managed_ci_trusted_actor="agent-loop",
+            allow_unprotected_managed_ci=True,
+        ),
+        intent=intent,
+        issue_number=643,
+        pr_number=7,
+        metadata=metadata,
+    )
+
+    assert handoff.head_sha == "abc123"
+    assert handoff.override_nonce == "fresh"
+    assert not any("--method" in command for command, _ in runner.commands)
+
+
+def test_direct_resume_reconstructs_issue_override_as_provenance_before_writes(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=old"
+    runner = V2ManagedRunner(
+        rest_pr={"state": "open", "body": body},
+        issue_events=[label_event()],
+    )
+    metadata = PullRequestMetadata(
+        number=7,
+        repo="OWNER/REPO",
+        title="Managed CI",
+        head_branch="agent-loop/managed-643",
+        base_branch="main",
+        head_sha="abc123",
+        url="https://github.com/OWNER/REPO/pull/7",
+        body=body,
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        base="main",
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    handoff = recover_issue_created_handoff(
+        runner, config=config, pr_number=7, metadata=metadata,
+    )
+    assert handoff is not None
+    assert handoff.active_label_event_id == 101
+    assert revalidate_issue_created_handoff(
+        runner, config=config, handoff=handoff, metadata=metadata,
+    ).override_nonce == "old"
+    assert not any("--method" in command for command, _ in runner.commands)
+
+
 def _resume_audit(*, head="old-head", repo="OWNER/REPO", base="main"):
     return {
         "id": 41,
@@ -516,6 +673,7 @@ def test_pr_mode_resumes_only_from_immutable_issue_draft_facts_and_mints_fresh_a
     assert contract.audit_nonce and contract.audit_nonce != "old-nonce"
     assert contract.audit_comment_id == 17
     assert contract.intent_generation
+    assert contract.ordinary_recovery_capable is True
     assert any("active_label_event_id=101" in " ".join(cmd) for cmd, _ in runner.commands)
 
 
@@ -1953,6 +2111,7 @@ def test_explicit_activation_release_is_terminal_and_unqualified(tmp_path):
             expected_head_sha="abc123",
             active_event=None,
             reason="timeline unavailable",
+            recovery_capable=True,
         )
     assert any(
         command[:5] == [
@@ -1995,6 +2154,36 @@ def test_v2_dispatch_discovers_existing_run_before_dispatching(tmp_path):
 
     assert contract.attached_run_id == 100
     assert not any("/dispatches" in " ".join(cmd) for cmd, _cwd in runner.commands)
+
+
+def test_v2_dispatch_ledger_failure_uses_authenticated_ordinary_recovery_capability(tmp_path, monkeypatch):
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    runner = V2ManagedRunner(issue_events=[label_event()])
+    contract = v2_contract(ordinary_recovery_capable=True)
+
+    def fail_intent(*args, **kwargs):
+        raise AgentLoopError("intent ledger unavailable")
+
+    monkeypatch.setattr(managed_ci, "_ensure_v2_intent", fail_intent)
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert contract.activation_path == "ordinary_fallback"
+    assert contract.ordinary_recovery is not None
+    assert any(
+        command[:5] == [
+            "gh", "api", "--method", "DELETE",
+            f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}",
+        ]
+        for command, _cwd in runner.commands
+    )
 
 
 def test_v2_dispatch_discovers_run_with_display_title_and_qualified_path(tmp_path):

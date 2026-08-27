@@ -352,6 +352,15 @@ def build_parser() -> argparse.ArgumentParser:
             help="Polling interval for the CI check before auto-merge (default: 30).",
         )
         subparser.add_argument(
+            "--ci-startup-timeout-seconds",
+            type=int,
+            default=120,
+            help=(
+                "Maximum time to observe a newly materialized current-head CI run/check before "
+                "stopping with a resumable command (default: 120)."
+            ),
+        )
+        subparser.add_argument(
             "--watch-pending-ci",
             action=argparse.BooleanOptionalAction,
             dest="watch_pending_ci",

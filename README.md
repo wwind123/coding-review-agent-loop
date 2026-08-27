@@ -822,19 +822,24 @@ resume writes a fresh audit and intent generation; prior dispatched runs,
 including rejected or failed runs, remain previous-invocation outcomes and are
 never attached to the new generation.
 
-When safe managed resume is unavailable, agent-loop waits for a new unlabeled
-recovery run on the exact current head and then requires the ordinary required
-checks. Only the draft released by that invocation may be made ready, and only
-with `--auto-merge`; unrelated drafts remain drafts. The head is revalidated
-before and after `gh pr ready`, and merge uses `--match-head-commit`. If that
-later merge fails, the PR remains ready and unmerged for a safe retry.
+When safe managed resume is unavailable, agent-loop selects ordinary recovery
+only when the base workflow proves it has an unlabeled pull-request route. It
+baselines existing current-head runs, retains the draft, and waits at most
+`--ci-startup-timeout-seconds` (default 120) for a new current-head run to
+materialize. A missing, queued-only, or jobless run is not success: the draft
+stays unmerged and the terminal prints a shell-quoted `agent-loop pr` resume
+command. A qualifying recovery also needs a successful run and a non-empty
+passing current-head board. The live head is re-read immediately before merge
+and GitHub receives the same SHA through `--match-head-commit`.
 
 For repositories without that contract, `--auto-merge` foreground-polls the
 complete check board after approval with
 `--ci-timeout-seconds` and
 `--ci-poll-interval-seconds`, without invoking agents while checks are pending.
-Failure resumes the coder with the failed-check details; a successful/no-check
-board is merged. The watcher is synchronous and interruptible: Ctrl-C leaves
+Failure resumes the coder with the failed-check details; only a non-empty
+successful board is mergeable. An empty rollup is a bounded startup state, not
+CI success: after `--ci-startup-timeout-seconds` it stops with a resumable PR
+command and does not ready or merge the PR. The watcher is synchronous and interruptible: Ctrl-C leaves
 no worker behind, and a rerun starts from fresh PR state. On timeout the local
 terminal prints a shell-quoted rerun command; PR comments intentionally contain
 no captured command arguments. Use `--no-watch-pending-ci` with `--auto-merge`
