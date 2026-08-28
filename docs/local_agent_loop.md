@@ -1528,6 +1528,28 @@ editable body nonce never grants authority or gets reused. The audit's
 repository/base fields must match, and missing, malformed, ambiguous, or raced
 audit/timeline data fails closed to deliberate ordinary release.
 
+The preferred recovery for a canonical issue handoff is to rerun the original
+`agent-loop issue <number>` command. That preserves its planning and
+implementation shape and reuses the authenticated issue-to-PR association;
+`agent-loop pr <number>` is the direct fallback when the PR is already known.
+An authenticated ready/unlabeled issue-created or `managed-pr` PR may be
+reconstructed only when the new invocation has an explicit `--managed-ci`.
+An implicit `--auto-merge` invocation leaves that state ready and unlabeled,
+prints the exact flow-preserving retry, and performs no label, body, comment,
+dispatch, or readiness write. Draft/labeled and ready/unlabeled are the only
+accepted lifecycle states; mixed states stop before agents run.
+
+Base resolution records whether the value came from an explicit `--base`, the
+repository default, or live PR metadata. This base provenance crosses the
+issue-to-PR boundary unchanged. If an inherited repository default differs
+from the live PR base, the run stops before workdir setup and prints a retry
+with the live base explicitly supplied. An operator-provided `--base` remains
+authoritative. Recovery commands replay parser-valid invocation tokens,
+including repeated common options and shell metacharacters, and remove only
+options that the target subcommand cannot accept. Historical audit records and
+old qualification ledgers are provenance only: recovery mints fresh authority
+and never asks the operator to delete durable records.
+
 A successful resume records a fresh audit, nonce, and invocation intent
 generation. Earlier ledger entries and attached workflow runs remain history:
 even a queued, successful, failed, or rejected prior run is logged as the

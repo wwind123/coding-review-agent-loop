@@ -792,6 +792,23 @@ manual run, rerun `agent-loop pr <number> --managed-ci
 the previous manual-merge command is suspended until a fresh review and
 qualification succeeds. A changed head always needs a new cycle.
 
+For a canonical issue handoff, rerun the original `agent-loop issue <number>`
+command first; it preserves the planning/implementation shape while
+reauthenticating the issue-to-PR handoff. Direct `pr` mode is the fallback for
+a known PR. Ready/unlabeled reconstruction requires an explicit `--managed-ci`
+request. An implicit `--auto-merge` retry leaves an authenticated PR ready and
+unlabeled, performs no label/body/comment/dispatch/readiness write, and prints
+the exact retry with `--managed-ci`. The recovery path accepts only
+draft/labeled or ready/unlabeled lifecycle states and treats historical audit
+records as provenance, never as reusable authority or something to delete.
+
+Base provenance is retained across the issue-to-PR boundary. If an inherited
+repository-default base differs from the live PR base, the run stops before
+workdir setup and prints a retry with the live `--base` explicitly included;
+an operator-supplied `--base` remains authoritative. Recovery commands replay
+parser-valid original arguments, preserving repeated common options and safe
+shell quoting while removing only selectors invalid for the target subcommand.
+
 Already-open PRs remain ordinary CI by default. A repository can separately
 advertise safe adoption and an operator can explicitly request it only with
 `agent-loop pr <n> --auto-merge --managed-ci-trusted-actor <login>
