@@ -1653,6 +1653,19 @@ def test_repair_prompt_coder_followup_fenced_json_example():
     assert "NOT needed" in _REPAIR_PROMPT or "not needed" in _REPAIR_PROMPT.lower()
 
 
+def test_repair_prompt_uses_unique_issue_implementation_format_and_selection_rule():
+    assert _REPAIR_PROMPT.count("## Valid Format D — Plan Revision:") == 1
+    assert _REPAIR_PROMPT.count("## Valid Format K — Issue Implementation:") == 1
+    assert 'Use Format K if the original contains "issue_implementation" or "pr_number".' in _REPAIR_PROMPT
+
+    prompt = _build_repair_prompt(
+        '{"kind":"issue_implementation","pr_number":77}',
+        expected_kind="issue_implementation",
+    )
+    assert "Repair only the issue_implementation envelope." in prompt
+    assert "Preserve `summary`, `pr_number`, `tests_run`," in prompt
+
+
 def test_repair_prompt_coder_followup_examples_include_current_requirement_schema():
     format_c = _REPAIR_PROMPT.split("## Valid Format C — Coder Follow-up:", 1)[1].split(
         "## Valid Format E", 1

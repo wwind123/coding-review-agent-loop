@@ -658,19 +658,17 @@ def _issue_implementation_terminal_marker_guidance(
     """
     return f"""{_agent_unavailable_guidance(coder_signature)}
 Do not wait for {reviewer_name} yourself; this local orchestrator will run
-{reviewer_name} after you create the PR. Use blocking here to hand the PR to
-{reviewer_name} for review. If you cannot safely proceed and cannot create a
-PR, explain the blocker and end with `AGENT_STATE: blocking` (without an
-`AGENT_PR` marker), or ask a final focused question with `AGENT_CLARIFY`.
-Otherwise, use a positive PR number. Do not invent placeholder identifiers such
-as `AGENT_PR: 0`. Do not place your signature before the AGENT_STATE marker.
-Your response must end with, in this exact order for a completed implementation:
+{reviewer_name} after you create the PR. Use the structured
+`issue_implementation` JSON contract above. A positive `pr_number` hands the
+PR to {reviewer_name} for review; `pr_number: null` is the terminal no-PR
+blocking result. A signed requirement discovered to be blocked after a PR was
+opened requires `pr_number: null` with the real PR reference retained in the
+summary or disposition evidence. Do not invent a placeholder PR identity or
+add an `AGENT_PR` marker to the structured result. For clarification, use the
+separate `AGENT_CLARIFY` terminal alternative.
 
-<!-- AGENT_PR: <number> -->
-<!-- AGENT_STATE: blocking -->
--- {coder_signature}
+The structured response must end with this exact footer and signature:
 
-For a no-PR blocking result:
 <!-- AGENT_STATE: blocking -->
 -- {coder_signature}
 
@@ -744,6 +742,77 @@ def _structured_coder_followup_guidance(
             "No signed human requirements are surfaced in this prompt, so structured replies must set both `human_requirement_dispositions` and `human_requirements.addressed_ids` to `[]`, with `checked_discussion_directly` false. Do not put issue numbers, issue acceptance criteria, reviewer item IDs, reviewer comments, summaries, or arbitrary labels in `addressed_ids`; only exact surfaced signed requirement labels are valid when such labels are actually shown."
         )
     return "\n".join(lines) + "\n"
+
+
+def _structured_issue_implementation_guidance(
+    *,
+    human_requirements_context: CoderHumanRequirementsPromptContext,
+    coder_signature: str,
+) -> str:
+    """Return the one structured result contract shared by implementation turns."""
+    if human_requirements_context.surfaced_requirement_ids:
+        disposition_example = [
+            {
+                "requirement_id": requirement_id,
+                "disposition": "addressed",
+                "evidence": "The implementation and tests cover this requirement.",
+            }
+            for requirement_id in human_requirements_context.surfaced_requirement_ids
+        ]
+        addressed_ids = list(human_requirements_context.surfaced_requirement_ids)
+        checked_directly = False
+        requirement_rules = (
+            "`human_requirement_dispositions` must contain exactly one object for every surfaced "
+            "label, with non-empty evidence. Put exactly the addressed labels in "
+            "`human_requirements.addressed_ids`; blocked and not-applicable labels do not belong "
+            "there. Each evidence note must explain how you addressed that item or why it could "
+            "not be satisfied safely."
+        )
+    elif human_requirements_context.requires_direct_discussion_ack:
+        disposition_example = []
+        addressed_ids = []
+        checked_directly = True
+        requirement_rules = (
+            "The detailed signed requirements were omitted for context bounds. Use an empty "
+            "disposition ledger and set `checked_discussion_directly` true only after checking "
+            "the GitHub discussion directly."
+        )
+    else:
+        disposition_example = []
+        addressed_ids = []
+        checked_directly = False
+        requirement_rules = (
+            "No signed human requirements were surfaced, so both the disposition ledger and "
+            "`addressed_ids` must be empty and `checked_discussion_directly` must be false."
+        )
+    example = {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "Implemented the approved plan and opened the pull request.",
+        "pr_number": 123,
+        "human_requirements": {
+            "addressed_ids": addressed_ids,
+            "checked_discussion_directly": checked_directly,
+        },
+        "human_requirement_dispositions": disposition_example,
+        "tests_run": ["python -m pytest tests/test_protocol.py -q"],
+    }
+    return f"""Use this mandatory structured `issue_implementation` result so the orchestrator can validate the implementation deterministically:
+
+{json.dumps(example, indent=2)}
+
+Rules:
+- `schema_version` is 1, `kind` is `issue_implementation`, and `state` is `blocking`.
+- `summary` is non-blank and must explain the implementation outcome. `pr_number` is either a positive integer for the newly reported PR or `null` when no PR was accepted for handoff.
+- {requirement_rules}
+- A created-PR result may not contain a `blocked` signed-requirement disposition. If a signed requirement is discovered to be blocked after a PR was opened, set `pr_number` to `null`, keep the real PR number or URL in the summary or disposition evidence so the operator can locate it, and describe the conflict.
+- A null-PR blocker unrelated to signed requirements is valid with the empty ledger required by the rules above.
+- `tests_run` is optional and may be absent, `null`, or an empty array when no tests ran. When supplied, it contains only exact command strings; report why tests could not run in `summary`.
+- Start directly with exactly one top-level JSON object. Put the `<!-- AGENT_STATE: blocking -->` footer immediately after it and only your standalone signature after the footer.
+
+The structured result is the public implementation record. Do not add prose,
+code fences, a `Tests:` section, an `AGENT_PR` marker, or another footer to it."""
 
 
 def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewItem] | None) -> str:
@@ -1263,13 +1332,13 @@ Use this local checkout as your workspace. Create a branch, implement the fix,
 run relevant tests, commit, push, and open a pull request against {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
-{human_requirements_context.block}{_coder_human_requirements_guidance(
-    human_requirements_context,
-    requirement_label="implementation requirements",
+{human_requirements_context.block}{_structured_issue_implementation_guidance(
+    human_requirements_context=human_requirements_context,
+    coder_signature=coder_signature,
 )}
 {_issue_context_block(issue_context)}
 {_memory_block(memory)}
@@ -1863,13 +1932,13 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
-{human_requirements_context.block}{_coder_human_requirements_guidance(
-    human_requirements_context,
-    requirement_label="implementation requirements",
+{human_requirements_context.block}{_structured_issue_implementation_guidance(
+    human_requirements_context=human_requirements_context,
+    coder_signature=coder_signature,
 )}
 {_issue_context_block(issue_context)}
 {_memory_block(memory)}
@@ -1882,7 +1951,11 @@ Approved implementation plan:
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
 
 
-def build_completion_recovery_prompt(config: AgentLoopConfig) -> str:
+def build_completion_recovery_prompt(
+    config: AgentLoopConfig,
+    *,
+    issue_context: IssueContext | None = None,
+) -> str:
     """One bounded same-session continuation for a stalled implementation turn (#588).
 
     Sent via ``claude --resume <session>`` when a prior implementation turn
@@ -1893,6 +1966,15 @@ def build_completion_recovery_prompt(config: AgentLoopConfig) -> str:
     """
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config)
+    human_requirements_context = _issue_human_requirements_prompt_context(
+        issue_context,
+        requirement_scope="implementation requirements",
+        full_omission_fallback="Fetch the issue discussion directly before implementing.",
+    )
+    implementation_contract = _structured_issue_implementation_guidance(
+        human_requirements_context=human_requirements_context,
+        coder_signature=coder_signature,
+    )
     return f"""Your previous turn on this same implementation ended without a valid
 terminal response, and its text suggested required work (tests, a build, or
 similar) was left running in the background instead of being finished before
@@ -1910,7 +1992,9 @@ task-output file. If you know its process ID, terminate it once (a single
 foreground under the bounded timeout below, waiting for it to finish; launch
 nothing new in the background. Then commit, push, and open the pull request if
 that is not already done, or continue exactly where you left off.
-{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{human_requirements_context.block}
+{implementation_contract}
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
 
 

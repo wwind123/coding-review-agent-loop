@@ -31,6 +31,7 @@ from .protocol import (
     ParsedReview,
     ReviewItemDisposition,
     StructuredCoderFollowup,
+    StructuredIssueImplementation,
     StructuredPlanState,
     StructuredPlanRevision,
     UnresolvedReviewItem,
@@ -677,6 +678,44 @@ def _render_public_coder_followup_comment(
     return "\n\n".join(section for section in sections if section)
 
 
+def _render_public_issue_implementation_comment(
+    parsed: StructuredIssueImplementation,
+    *,
+    agent: str,
+    config: AgentLoopConfig | None = None,
+    model_used: str | None = None,
+) -> str:
+    """Render an implementation result without exposing its JSON envelope."""
+    has_blocked_requirement = any(
+        item.disposition == "blocked"
+        for item in parsed.human_requirement_dispositions
+    )
+    if has_blocked_requirement and parsed.pr_number is not None:
+        result = (
+            f"Rejected for handoff: reported PR #{parsed.pr_number} was not accepted "
+            "because a signed human requirement is blocked."
+        )
+    elif parsed.pr_number is None:
+        result = "No pull request was accepted for handoff."
+    else:
+        result = f"Pull request reported: #{parsed.pr_number}."
+    sections = ["## Issue implementation", parsed.summary.strip(), f"### Result\n{result}"]
+    if parsed.tests_run:
+        sections.append("\n".join(["### Tests run", *[f"- {test}" for test in parsed.tests_run]]))
+    human_section = render_human_requirement_dispositions(
+        parsed.human_requirement_dispositions
+    )
+    if human_section:
+        sections.append(human_section)
+    sections.extend(
+        [
+            f"<!-- AGENT_STATE: {parsed.state} -->",
+            f"-- {_comment_signature(agent, config, model_used)}",
+        ]
+    )
+    return "\n\n".join(section for section in sections if section)
+
+
 def _extract_plan_revision_human_requirements_block(text: str) -> str:
     stripped = text.lstrip()
     if not stripped.startswith("{"):
@@ -778,6 +817,7 @@ def render_public_agent_comment(
         | StructuredPlanRevision
         | StructuredPlanState
         | ParsedDiscussReview
+        | StructuredIssueImplementation
     ),
     agent: str,
     config: AgentLoopConfig | None = None,
@@ -825,6 +865,17 @@ def render_public_agent_comment(
             parsed,
             agent=agent,
             prior_items=prior_items,
+            config=config,
+            model_used=model_used,
+        )
+    if kind == "issue_implementation":
+        if not isinstance(parsed, StructuredIssueImplementation):
+            raise AgentLoopError(
+                "render_public_agent_comment expected StructuredIssueImplementation."
+            )
+        return _render_public_issue_implementation_comment(
+            parsed,
+            agent=agent,
             config=config,
             model_used=model_used,
         )

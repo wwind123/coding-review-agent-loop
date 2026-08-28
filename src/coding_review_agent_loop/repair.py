@@ -92,7 +92,7 @@ def strip_unknown_prior_item_dispositions(
 
 def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> str | None:
     """Trim envelope-only trailing material without changing structured JSON."""
-    if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "coder_followup", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
+    if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "coder_followup", "issue_implementation", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
         return None
 
     stripped = raw.lstrip()
@@ -207,6 +207,8 @@ You are a format-repair assistant. An AI agent produced an initial plan state, c
 
 {expected_kind_instruction}
 
+{issue_implementation_instruction}
+
 {coder_followup_required_items_instruction}
 
 {coder_followup_human_requirements_instruction}
@@ -278,6 +280,32 @@ You are a format-repair assistant. An AI agent produced an initial plan state, c
 This is a blocking example because it has a `blocked` human-requirement disposition.
 For an approved coder follow-up, use `"state": "approved"`, an
 `<!-- AGENT_STATE: approved -->` footer, and no `blocked` dispositions.
+
+## Valid Format K — Issue Implementation:
+
+{
+  "schema_version": 1,
+  "kind": "issue_implementation",
+  "state": "blocking",
+  "summary": "<implementation outcome, including any blocker>",
+  "pr_number": 123,
+  "human_requirements": {
+    "addressed_ids": [],
+    "checked_discussion_directly": false
+  },
+  "human_requirement_dispositions": [],
+  "tests_run": ["<exact command>"]
+}
+<!-- AGENT_STATE: blocking -->
+-- <Coder Name>
+
+For issue implementation repair, preserve the original PR identity and
+requirement semantics. Use `pr_number: null` for a no-PR result or for a
+blocked signed requirement discovered after a PR was opened, and retain the
+real PR number or URL in the summary or disposition evidence. A positive PR
+with a blocked disposition remains a terminal conflict after repair; do not
+relabel or silently remove that blocker. `tests_run` may be absent, null, or
+an empty array, but supplied values must be exact command strings.
 
 ## Valid Format E — Discuss Review:
 
@@ -506,9 +534,13 @@ The active planning human-requirements context above is authoritative. Do not us
 ## STATE RULES (Format D):
 ### BLOCKING only. plan_revision.state must be "blocking" and must include at least one plan_steps string.
 
+## STATE RULES (Format K):
+### BLOCKING only. issue_implementation.state must be "blocking".
+
 ## FORMAT SELECTION:
 - If an expected response kind is provided above, use ONLY that format. Do not infer a different kind from keywords in the malformed response.
 - Use Format C if the original contains "coder_followup" or "addressed_items" or "remaining_items".
+- Use Format K if the original contains "issue_implementation" or "pr_number".
 - Use Format D if the original contains "plan_revision".
 - Use Format J if the original contains "plan_state" or "plan_steps".
 - Use Format H if the original contains "discuss_semantic_comparison" or "remaining_decisions".
@@ -1019,7 +1051,7 @@ Output ONLY the repaired response. No explanations.
 {raw_response}"""
 
 _REPAIR_MODEL = "gemini-3.1-flash-lite"
-_SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_followup", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation"}
+_SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_followup", "issue_implementation", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation"}
 RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
@@ -1085,11 +1117,16 @@ def _build_repair_prompt(
         raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
     if (
         (surfaced_requirement_ids is not None or requires_direct_discussion_ack)
-        and expected_kind not in {"coder_followup", "plan_state", "plan_revision"}
+        and expected_kind not in {"coder_followup", "issue_implementation", "plan_state", "plan_revision"}
     ):
         raise ValueError(
-            "surfaced_requirement_ids may only be used for coder_followup, plan_state, or plan_revision repair"
+            "surfaced_requirement_ids may only be used for coder_followup, issue_implementation, plan_state, or plan_revision repair"
         )
+    issue_implementation_instruction = _issue_implementation_instruction(
+        expected_kind,
+        surfaced_requirement_ids,
+        requires_direct_discussion_ack,
+    )
     coder_followup_required_items_instruction = _coder_followup_required_items_instruction(
         expected_kind, unresolved_item_ids
     )
@@ -1123,6 +1160,7 @@ def _build_repair_prompt(
     )
     prompt = _REPAIR_PROMPT.replace("{expected_kind_instruction}", expected_kind_instruction, 1)
     replacements = (
+        ("{issue_implementation_instruction}", issue_implementation_instruction),
         ("{coder_followup_required_items_instruction}", coder_followup_required_items_instruction),
         ("{coder_followup_human_requirements_instruction}", coder_followup_human_requirements_instruction),
         ("{planning_human_requirements_instruction}", planning_human_requirements_instruction),
@@ -1133,6 +1171,40 @@ def _build_repair_prompt(
     for placeholder, value in replacements:
         prompt = prompt.replace(placeholder, value, 1)
     return prompt
+
+
+def _issue_implementation_instruction(
+    expected_kind: str | None,
+    surfaced_requirement_ids: Sequence[str] | None,
+    requires_direct_discussion_ack: bool,
+) -> str:
+    if expected_kind != "issue_implementation":
+        return ""
+    ids = tuple(surfaced_requirement_ids or ())
+    if ids:
+        requirement_rule = (
+            "Include exactly one disposition with non-empty evidence for each of: "
+            + ", ".join(f"`{item}`" for item in ids)
+            + ". Put only addressed IDs in addressed_ids."
+        )
+    elif requires_direct_discussion_ack:
+        requirement_rule = (
+            "The detailed signed requirements were omitted. Keep both ledgers empty and set "
+            "checked_discussion_directly true only when the discussion was checked directly."
+        )
+    else:
+        requirement_rule = (
+            "No signed requirements were surfaced. Keep both ledgers empty and set "
+            "checked_discussion_directly false."
+        )
+    return (
+        "## Issue implementation repair rules:\n"
+        "Repair only the issue_implementation envelope. Preserve `summary`, `pr_number`, "
+        "`tests_run`, and the meaning of every disposition; do not invent a PR identity. "
+        + requirement_rule
+        + " A positive PR with a blocked disposition remains a terminal conflict after repair; "
+        "do not relabel or silently remove that blocker.\n"
+    )
 
 
 def execute_repair(

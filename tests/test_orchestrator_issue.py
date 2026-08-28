@@ -8,7 +8,12 @@ import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.decomposition import approved_plan_hash, format_one_shot_impl_handoff_comment
 from coding_review_agent_loop.errors import QuotaResetExceededError
-from coding_review_agent_loop.github import IssueComment, IssueContext, get_issue_context
+from coding_review_agent_loop.github import (
+    HumanReviewRequirement,
+    IssueComment,
+    IssueContext,
+    get_issue_context,
+)
 from coding_review_agent_loop.managed_ci import (
     AuthenticatedIssueCreatedHandoff,
     ManagedCiContract,
@@ -59,6 +64,7 @@ from agent_loop_helpers import (
     structured_plan_revision,
     structured_plan_state,
     structured_pr_review,
+    structured_issue_implementation,
 )
 
 
@@ -78,6 +84,40 @@ def _provenance_pages(message: str):
         }
     }
     return [page, page]
+
+
+def _blocked_issue_implementation(pr_number: int = 77) -> str:
+    return structured_issue_implementation(
+        summary=f"PR #{pr_number} was opened, but Requirement 1 is blocked.",
+        pr_number=pr_number,
+        human_requirement_dispositions=[
+            {
+                "requirement_id": "Requirement 1",
+                "disposition": "blocked",
+                "evidence": "The required integration is unavailable.",
+            }
+        ],
+    )
+
+
+def _issue_context_with_blocked_requirement() -> IssueContext:
+    return IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+        human_requirements=(
+            HumanReviewRequirement(
+                source_type="Issue comment",
+                author="maintainer",
+                created_at="2026-01-01T00:00:00Z",
+                url="https://github.com/OWNER/REPO/issues/56#issuecomment-1",
+                body="Preserve the required integration.",
+            ),
+        ),
+    )
 
 
 def _managed_issue_handoff(*, nonce: str) -> AuthenticatedIssueCreatedHandoff:
@@ -210,6 +250,85 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
     assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["abc123"]
     assert prepared_heads == ["abc123"]
     assert merged_heads == ["abc123"]
+
+
+def test_direct_issue_conflict_posts_once_and_stops_before_pr_handoff_gates(tmp_path, monkeypatch):
+    runner = FakeRunner(claude_outputs=[_blocked_issue_implementation()])
+    config = make_config(tmp_path)
+    issue_context = _issue_context_with_blocked_requirement()
+    gate_calls = []
+
+    monkeypatch.setattr(orchestrator_module, "validate_open_issue", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", lambda *args, **kwargs: issue_context)
+    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator_module, "prepare_agent_memory", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
+
+    def unexpected_gate(name):
+        def _fail(*args, **kwargs):
+            gate_calls.append(name)
+            raise AssertionError(f"{name} must not run after an implementation conflict")
+
+        return _fail
+
+    for name in (
+        "validate_open_pr",
+        "get_pr_review_context",
+        "post_issue_pr_handoff_comment",
+        "run_pr_loop",
+    ):
+        monkeypatch.setattr(orchestrator_module, name, unexpected_gate(name))
+
+    with pytest.raises(AgentLoopError, match="not accepted for handoff"):
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert gate_calls == []
+    assert len(runner.comments) == 1
+    assert runner.comments[0].count("Rejected for handoff: reported PR #77") == 1
+
+
+def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_gates(
+    tmp_path, monkeypatch
+):
+    runner = FakeRunner(claude_outputs=[_blocked_issue_implementation()])
+    config = make_config(tmp_path)
+    issue_context = _issue_context_with_blocked_requirement()
+    gate_calls = []
+
+    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *args, **kwargs: None)
+
+    def unexpected_gate(name):
+        def _fail(*args, **kwargs):
+            gate_calls.append(name)
+            raise AssertionError(f"{name} must not run after an implementation conflict")
+
+        return _fail
+
+    for name in (
+        "validate_open_pr",
+        "get_pr_review_context",
+        "post_issue_pr_handoff_comment",
+        "run_pr_loop",
+    ):
+        monkeypatch.setattr(orchestrator_module, name, unexpected_gate(name))
+
+    with pytest.raises(AgentLoopError, match="not accepted for handoff"):
+        orchestrator_module._implement_approved_issue(
+            runner,
+            issue_number=56,
+            approved_plan="Approved implementation plan.",
+            config=config,
+            memory=None,
+            issue_context=issue_context,
+            coder_session_id=None,
+            usage_context=orchestrator_module._new_usage_context(config),
+        )
+
+    assert gate_calls == []
+    assert len(runner.comments) == 1
+    assert runner.comments[0].count("Rejected for handoff: reported PR #77") == 1
 
 
 def test_plan_first_issue_managed_draft_nonce_is_authenticated_before_pr_review(tmp_path, monkeypatch):
@@ -619,7 +738,7 @@ def test_issue_loop_rejects_missing_initial_issue_human_requirements_acknowledge
     )
     config = make_config(tmp_path)
 
-    with pytest.raises(AgentLoopError, match="missing required signed human requirements marker"):
+    with pytest.raises(AgentLoopError, match="missing requirement ID"):
         run_issue_loop(runner, issue_number=56, config=config)
 
 def test_issue_loop_accepts_initial_issue_human_requirements_acknowledgement(tmp_path):
@@ -2330,7 +2449,7 @@ def test_issue_loop_plan_first_can_implement_after_approval(tmp_path):
     assert len(runner.comments) == 7
     assert "<!-- AGENT_ISSUE_PR_HANDOFF:" in runner.comments[3]
     assert "<!-- AGENT_PLAN_ONE_SHOT_IMPL:" in runner.comments[4]
-    assert runner.comments[5].startswith("Implemented approved plan.")
+    assert runner.comments[5].startswith("## Issue implementation")
     assert runner.comments[6].startswith("**Review verdict:** Approved\n\nLGTM.")
 
 
@@ -2374,7 +2493,7 @@ def test_issue_loop_plan_first_can_override_implementation_model(tmp_path):
     assert claude_calls[0][claude_calls[0].index("--model") + 1] == "claude-fable-5"
     assert claude_calls[1][claude_calls[1].index("--model") + 1] == "claude-sonnet-5"
     assert "--resume" not in claude_calls[1]
-    assert runner.comments[5].startswith("Implemented approved plan.")
+    assert runner.comments[5].startswith("## Issue implementation")
 
 
 def test_issue_loop_rejects_pr_without_issue_reference_in_body(tmp_path):
@@ -2999,7 +3118,7 @@ def test_codex_issue_loop_creates_pr_then_claude_approves(tmp_path):
     assert ["claude", "--print"] in command_names
     assert len(runner.comments) == 3
     assert "<!-- AGENT_ISSUE_PR_HANDOFF:" in runner.comments[0]
-    assert runner.comments[1].startswith("Fixed issue.")
+    assert runner.comments[1].startswith("## Issue implementation")
     assert runner.comments[2].startswith("**Review verdict:** Approved\n\nLooks good.")
 
 def test_codex_issue_loop_alternates_until_claude_approval(tmp_path):
@@ -3051,7 +3170,14 @@ def test_issue_loop_stops_before_pr_lookup_for_invalid_pr_terminal_result(
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     # A genuine coder-declared no-PR terminal is posted to the issue like a
     # PR-success implementation result already is (#588).
-    assert runner.comments == [f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- OpenAI Codex"]
+    if expected_state == "blocking":
+        assert runner.comments[0].startswith("## Issue implementation")
+        assert "Cannot proceed." in runner.comments[0]
+        assert "No pull request was accepted for handoff." in runner.comments[0]
+    else:
+        assert runner.comments == [
+            f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- OpenAI Codex"
+        ]
 
 
 def test_issue_loop_invalid_pr_without_terminal_state_is_protocol_error(tmp_path):
@@ -3060,7 +3186,7 @@ def test_issue_loop_invalid_pr_without_terminal_state_is_protocol_error(tmp_path
 
     with pytest.raises(
         AgentLoopError,
-        match="AGENT_PR marker or PR URL present was invalid",
+        match="required structured `issue_implementation` format",
     ):
         run_issue_loop(runner, issue_number=56, config=config)
 
@@ -3234,7 +3360,7 @@ def test_gemini_issue_loop_creates_pr_then_codex_approves(tmp_path):
     assert agent_commands == [["gemini", "--prompt"], ["codex", "exec"]]
     assert len(runner.comments) == 3
     assert "<!-- AGENT_ISSUE_PR_HANDOFF:" in runner.comments[0]
-    assert runner.comments[1].startswith("Fixed issue.")
+    assert runner.comments[1].startswith("## Issue implementation")
     assert runner.comments[2].startswith("**Review verdict:** Approved\n\nLooks good.")
 
 def test_gemini_issue_loop_resumes_session_for_followup(tmp_path):
@@ -3838,7 +3964,7 @@ def test_approved_plan_no_pr_terminal_result_bypasses_human_requirements_and_pr_
     tmp_path, terminal_marker, expected_state
 ):
     runner = FakeRunner(
-        issue_payload={"body": "Keep the public API stable.\n\n-- Human Reviewer"},
+        issue_payload={"body": "Keep the public API stable."},
         claude_outputs=[f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}"],
     )
     config = make_config(tmp_path)
@@ -3860,7 +3986,14 @@ def test_approved_plan_no_pr_terminal_result_bypasses_human_requirements_and_pr_
     assert not any(cmd[:1] == ["codex"] for cmd, _cwd in runner.commands)
     # A genuine coder-declared no-PR terminal is posted to the issue like a
     # PR-success implementation result already is (#588).
-    assert runner.comments == [f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- Anthropic Claude"]
+    if expected_state == "blocking":
+        assert runner.comments[0].startswith("## Issue implementation")
+        assert "Cannot proceed." in runner.comments[0]
+        assert "No pull request was accepted for handoff." in runner.comments[0]
+    else:
+        assert runner.comments == [
+            f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- Anthropic Claude"
+        ]
 
 
 def test_approved_plan_implementation_rerun_ignores_remote_salvage_on_plan_hash_mismatch(tmp_path):

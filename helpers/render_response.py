@@ -7,7 +7,7 @@ Usage:
     [--reviewer REVIEWER] \\
     [--context-file PATH]
 
-Kinds: pr_review, plan_review, coder_followup, plan_revision, plan_state
+Kinds: pr_review, plan_review, coder_followup, issue_implementation, plan_revision, plan_state
 
 Exit 0 on success; exit 1 with diagnostic on failure.
 """
@@ -50,7 +50,7 @@ def main() -> None:
     parser.add_argument(
         "--kind",
         required=True,
-        choices=["pr_review", "plan_review", "coder_followup", "plan_revision", "plan_state"],
+        choices=["pr_review", "plan_review", "coder_followup", "issue_implementation", "plan_revision", "plan_state"],
     )
     parser.add_argument("--output", required=True, help="Path to write rendered markdown.")
     parser.add_argument("--reviewer", default="Codex", help="Reviewer display name.")
@@ -103,6 +103,35 @@ def main() -> None:
                 parsed=parsed,
                 agent=args.reviewer,
                 prior_items=prior_items,
+                model_used=model_used,
+            )
+        elif args.kind == "issue_implementation":
+            from coding_review_agent_loop.orchestrator import _validate_issue_implementation_response
+
+            raw_requirements = ctx.get("human_requirements", [])
+            requirements = []
+            from coding_review_agent_loop.github import HumanReviewRequirement
+
+            for item in raw_requirements:
+                if isinstance(item, dict):
+                    requirements.append(
+                        HumanReviewRequirement(
+                            source_type=str(item.get("source_type", "issue")),
+                            author=str(item.get("author", "")) or None,
+                            created_at=str(item.get("created_at", "")) or None,
+                            url=str(item.get("url", "")) or None,
+                            body=str(item.get("body", item.get("text", ""))),
+                        )
+                    )
+            parsed_result = _validate_issue_implementation_response(
+                text,
+                human_requirements=requirements,
+            )
+            parsed = getattr(parsed_result, "parsed", parsed_result)
+            rendered = render_public_agent_comment(
+                kind="issue_implementation",
+                parsed=parsed,
+                agent=args.reviewer,
                 model_used=model_used,
             )
         elif args.kind == "plan_revision":

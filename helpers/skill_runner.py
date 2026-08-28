@@ -2817,30 +2817,40 @@ def _validate_coder_implementation_response(
     *,
     workdir: str,
     human_requirements,
-) -> int:
-    """Validate an external coder's implementation response; return the PR number.
+) -> object:
+    """Validate an external coder's typed implementation response.
 
-    Mirrors the guards in ``orchestrator._implement_approved_issue``: a valid
-    ``<!-- AGENT_PR: N -->`` marker, the signed-human-requirements acknowledgement
-    (when any were surfaced), and that the coder's reported test commands ran inside
-    the assigned workdir. Raises ``AgentLoopError`` on any failure (the caller treats
-    that as non-retryable). Factored out so the guards are directly unit-testable.
+    Mirrors the guards in the local implementation path.  The returned value
+    is a ``StructuredIssueImplementation`` or one of the existing terminal
+    alternatives, and all reported commands are checked before PR operations.
     """
     from coding_review_agent_loop.orchestrator import (
-        _require_pr_number,
-        _validate_response_with_human_requirements,
+        _TerminalIssueImplementationConflict,
+        _TerminalNoPrImplementation,
+        _validate_issue_implementation_response,
     )
-    from coding_review_agent_loop.workdir_guard import validate_response_tests_within_workdir
+    from coding_review_agent_loop.protocol import StructuredIssueImplementation
+    from coding_review_agent_loop.workdir_guard import (
+        validate_response_tests_within_workdir,
+        validate_test_commands_within_workdir,
+    )
 
-    pr_number = _validate_response_with_human_requirements(
+    result = _validate_issue_implementation_response(
         coder_output,
-        marker_validator=_require_pr_number,
         human_requirements=human_requirements,
-        requirement_scope="implementation requirements",
-        full_omission_fallback="Fetch the issue discussion directly before implementing.",
     )
-    validate_response_tests_within_workdir(coder_output, assigned_workdir=Path(workdir))
-    return int(pr_number)
+    if isinstance(result, (StructuredIssueImplementation, _TerminalIssueImplementationConflict)):
+        parsed = result if isinstance(result, StructuredIssueImplementation) else result.parsed
+        validate_test_commands_within_workdir(
+            parsed.tests_run,
+            assigned_workdir=Path(workdir),
+        )
+    elif isinstance(result, _TerminalNoPrImplementation):
+        validate_response_tests_within_workdir(
+            coder_output,
+            assigned_workdir=Path(workdir),
+        )
+    return result
 
 
 def _load_required_plan_file(path_text: str, *, action: str) -> str:
@@ -2979,6 +2989,7 @@ def _run_child_or_one_shot_implementation(
     external_args: tuple[str, ...] = (),
 ) -> dict:
     from coding_review_agent_loop.config import sync_coder_base_before_implementation
+    from coding_review_agent_loop.comment_rendering import render_public_agent_comment
     from coding_review_agent_loop.decomposition import (
         approved_plan_hash,
         format_one_shot_impl_handoff_comment,
@@ -2988,6 +2999,11 @@ def _run_child_or_one_shot_implementation(
         validate_open_pr,
         validate_pr_references_issue,
     )
+    from coding_review_agent_loop.orchestrator import (
+        _TerminalIssueImplementationConflict,
+        _TerminalNoPrImplementation,
+    )
+    from coding_review_agent_loop.protocol import StructuredIssueImplementation
     from coding_review_agent_loop.workdir_guard import validate_assigned_head_advanced
     from helpers.prompt_builders import build_implementation_prompt_for_skill
 
@@ -3039,7 +3055,7 @@ def _run_child_or_one_shot_implementation(
                 coder_usage = None
 
         try:
-            pr_number = _validate_coder_implementation_response(
+            implementation_result = _validate_coder_implementation_response(
                 coder_output,
                 workdir=str(workdir),
                 human_requirements=issue_context.human_requirements,
@@ -3055,6 +3071,49 @@ def _run_child_or_one_shot_implementation(
                 file=sys.stderr,
             )
             sys.exit(1)
+
+        if isinstance(implementation_result, (StructuredIssueImplementation, _TerminalIssueImplementationConflict)):
+            parsed = (
+                implementation_result
+                if isinstance(implementation_result, StructuredIssueImplementation)
+                else implementation_result.parsed
+            )
+            rendered = render_public_agent_comment(
+                kind="issue_implementation",
+                parsed=parsed,
+                agent=coder,
+                config=config,
+                model_used=_model_used_from_usage(usage_file),
+            )
+            rendered_output = tmpdir / "impl-rendered.md"
+            _write_text(rendered_output, rendered)
+            if parsed.pr_number is None or isinstance(implementation_result, _TerminalIssueImplementationConflict):
+                if not dry_run:
+                    _run_helper(
+                        "helpers.gh_ops", "post-issue-comment",
+                        "--issue", str(issue), "--file", str(rendered_output), "--repo", repo,
+                    )
+                result_json: dict = {
+                    "pr": None,
+                    "issue": issue,
+                    "terminal": "conflict" if isinstance(implementation_result, _TerminalIssueImplementationConflict) else "blocking",
+                }
+                usage = _aggregate_reviewer_usage([{"usage": coder_usage}] if coder_usage else [])
+                if usage is not None:
+                    result_json["usage"] = usage
+                return result_json
+            pr_number = parsed.pr_number
+        elif isinstance(implementation_result, _TerminalNoPrImplementation):
+            rendered_output = tmpdir / "impl-rendered.md"
+            _write_text(rendered_output, coder_output)
+            if not dry_run:
+                _run_helper(
+                    "helpers.gh_ops", "post-issue-comment",
+                    "--issue", str(issue), "--file", str(rendered_output), "--repo", repo,
+                )
+            return {"pr": None, "issue": issue, "terminal": implementation_result.state}
+        else:
+            raise AgentLoopError("Unexpected issue implementation result type.")
 
         if dry_run:
             head_sha = "dry-run-sha"
@@ -3072,10 +3131,21 @@ def _run_child_or_one_shot_implementation(
                 runner, config=config, pr_number=pr_number,
             ).metadata.head_sha or "unknown"
 
+        rendered_output = tmpdir / "impl-rendered.md"
+        _write_text(
+            rendered_output,
+            render_public_agent_comment(
+                kind="issue_implementation",
+                parsed=implementation_result,
+                agent=coder,
+                config=config,
+                model_used=_model_used_from_usage(usage_file),
+            ),
+        )
         tagged = tmpdir / "impl-tagged.md"
         _run_helper(
             "helpers.state_manager", "attach-metadata",
-            "--body-file", str(raw_output),
+            "--body-file", str(rendered_output),
             "--output", str(tagged),
             "--flow", "pr",
             "--role", "coder",
@@ -3083,6 +3153,7 @@ def _run_child_or_one_shot_implementation(
             "--round-number", "1",
             "--subject", str(head_sha),
             "--state", "approved",
+            "--raw-structured-coder-response-file", str(raw_output),
         )
         if not dry_run:
             _run_helper(
@@ -3200,6 +3271,8 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         external_args=_run_external_antigravity_args(args),
     )
     print(json.dumps(result_json, indent=2))
+    if result_json.get("pr") is None:
+        return
     print(
         f"hint: PR #{result_json['pr']} opened — review it with: python -m helpers.skill_runner "
         f"run-pr-round --pr {result_json['pr']} --repo {repo} --reviewers claude gemini",
@@ -3922,16 +3995,6 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         )
         return
 
-    post_phase_implementation_handoff_comment(
-        decompose_runner,
-        config=decompose_config,
-        parent_issue=issue,
-        mode=mode,
-        plan_hash=plan_hash,
-        phase_index=1,
-        created=first_phase,
-    )
-
     impl_config = _implementation_config(
         repo=repo, coder=coder, workdir=workdir, base=base, dry_run=False,
     )
@@ -3954,6 +4017,29 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         runner=impl_runner,
         post_one_shot_handoff=False,
         external_args=_run_external_antigravity_args(args),
+    )
+    if impl_result.get("pr") is None:
+        result_json.update({
+            "state": "blocked",
+            "handoff_posted": False,
+            "child_issue": first_phase.issue_number,
+            "child_implementation": impl_result,
+        })
+        print(json.dumps(result_json, indent=2))
+        print(
+            f"hint: phase 1 implementation for child issue #{first_phase.issue_number} "
+            "did not produce an accepted PR; no phase handoff was posted.",
+            file=sys.stderr,
+        )
+        return
+    post_phase_implementation_handoff_comment(
+        decompose_runner,
+        config=decompose_config,
+        parent_issue=issue,
+        mode=mode,
+        plan_hash=plan_hash,
+        phase_index=1,
+        created=first_phase,
     )
     result_json.update({
         "state": "implemented",

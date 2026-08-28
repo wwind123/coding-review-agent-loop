@@ -2738,7 +2738,29 @@ class TestHostReviewerPR:
 # helpers/skill_runner.py — reverse implementation: run-implement (#316)
 # ---------------------------------------------------------------------------
 
-_IMPL_WITH_PR = "Implemented the plan.\n\n<!-- AGENT_PR: 5 -->\n-- Codex\n"
+_IMPL_WITH_PR = json.dumps({
+    "schema_version": 1,
+    "kind": "issue_implementation",
+    "state": "blocking",
+    "summary": "Implemented the plan and opened PR 5.",
+    "pr_number": 5,
+    "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+    "human_requirement_dispositions": [],
+}) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
+
+_IMPL_WITH_BLOCKED_REQUIREMENT = json.dumps({
+    "schema_version": 1,
+    "kind": "issue_implementation",
+    "state": "blocking",
+    "summary": "PR 5 was opened, but Requirement 1 is blocked.",
+    "pr_number": 5,
+    "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+    "human_requirement_dispositions": [{
+        "requirement_id": "Requirement 1",
+        "disposition": "blocked",
+        "evidence": "The required integration is unavailable.",
+    }],
+}) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
 
 
 def _human_req():
@@ -2762,7 +2784,7 @@ class TestRunExternalImplStub:
                 "--dry-run",
             )
             assert result.returncode == 0
-            assert "<!-- AGENT_PR: 1 -->" in out.read_text(encoding="utf-8")
+            assert '"kind": "issue_implementation"' in out.read_text(encoding="utf-8")
 
 
 class TestRunExternalDecomposeStub:
@@ -2835,7 +2857,7 @@ class TestValidateCoderImplementationResponse:
         pr = _validate_coder_implementation_response(
             _IMPL_WITH_PR, workdir="/tmp/wd", human_requirements=(),
         )
-        assert pr == 5
+        assert pr.pr_number == 5
 
     def test_missing_human_ack_rejected(self) -> None:
         from coding_review_agent_loop.errors import AgentLoopError
@@ -2848,15 +2870,33 @@ class TestValidateCoderImplementationResponse:
     def test_out_of_workdir_test_rejected(self) -> None:
         from coding_review_agent_loop.errors import AgentLoopError
         from helpers.skill_runner import _validate_coder_implementation_response
-        bad = (
-            "Implemented the plan.\n"
-            "Tests: cd /nonexistent/other-dir && pytest passed.\n\n"
-            "<!-- AGENT_PR: 5 -->\n-- Codex\n"
-        )
+        bad = json.dumps({
+            "schema_version": 1,
+            "kind": "issue_implementation",
+            "state": "blocking",
+            "summary": "Implemented the plan and opened PR 5.",
+            "pr_number": 5,
+            "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+            "human_requirement_dispositions": [],
+            "tests_run": ["cd /nonexistent/other-dir && pytest"],
+        }) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
         with pytest.raises(AgentLoopError):
             _validate_coder_implementation_response(
                 bad, workdir="/tmp/wd", human_requirements=(),
             )
+
+    def test_blocked_positive_pr_is_returned_as_terminal_conflict(self) -> None:
+        from helpers.skill_runner import _validate_coder_implementation_response
+        from coding_review_agent_loop.orchestrator import _TerminalIssueImplementationConflict
+
+        result = _validate_coder_implementation_response(
+            _IMPL_WITH_BLOCKED_REQUIREMENT,
+            workdir="/tmp/wd",
+            human_requirements=(_human_req(),),
+        )
+
+        assert isinstance(result, _TerminalIssueImplementationConflict)
+        assert result.parsed.pr_number == 5
 
 
 # ---------------------------------------------------------------------------
@@ -3290,6 +3330,68 @@ class TestRunImplement:
             assert result.returncode != 0
             assert "push-capable" in result.stderr
 
+    def test_conflict_posts_one_terminal_comment_without_handoff(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.github import IssueContext
+        from coding_review_agent_loop.runner import Runner
+
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        config = sr._implementation_config(
+            repo="o/r",
+            coder="codex",
+            workdir=str(workdir),
+            base="main",
+            dry_run=False,
+        )
+        runner = Runner(dry_run=False)
+        issue_context = IssueContext(
+            number=1,
+            repo="o/r",
+            title="Issue",
+            body="Body",
+            url="https://example/issue/1",
+            comments=(),
+            human_requirements=(_human_req(),),
+        )
+        helper_calls = []
+
+        def fake_run_helper(*args, **kwargs):
+            helper_calls.append(args)
+            if args[0] == "helpers.run_external":
+                output_path = Path(args[args.index("--output") + 1])
+                output_path.write_text(_IMPL_WITH_BLOCKED_REQUIREMENT, encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0)
+
+        monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(sr, "_git_head", lambda workdir: "head")
+        monkeypatch.setattr(
+            "coding_review_agent_loop.config.sync_coder_base_before_implementation",
+            lambda *args, **kwargs: None,
+        )
+
+        result = sr._run_child_or_one_shot_implementation(
+            issue=1,
+            repo="o/r",
+            coder="codex",
+            base="main",
+            dry_run=False,
+            workdir=str(workdir),
+            approved_plan="Approved plan.",
+            issue_context=issue_context,
+            config=config,
+            runner=runner,
+            post_one_shot_handoff=True,
+        )
+
+        assert result["pr"] is None
+        assert result["terminal"] == "conflict"
+        post_comment_calls = [
+            call for call in helper_calls if call[:2] == ("helpers.gh_ops", "post-issue-comment")
+        ]
+        assert len(post_comment_calls) == 1
+        assert not any(call[:2] == ("helpers.state_manager", "attach-metadata") for call in helper_calls)
+
 
 # ---------------------------------------------------------------------------
 # helpers/skill_runner.py — approved-plan decomposition: run-decompose (#318)
@@ -3570,7 +3672,7 @@ class TestRunImplementByPhase:
 
         sr.cmd_run_implement_by_phase(self._args(tmp_path))
 
-        assert events == ["handoff:123", "implement:123"]
+        assert events == ["implement:123", "handoff:123"]
         output = self._last_json(capsys.readouterr().out)
         assert output["state"] == "implemented"
         assert output["child_implementation"]["pr"] == 456

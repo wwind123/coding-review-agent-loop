@@ -13,7 +13,9 @@ from coding_review_agent_loop.cli import (
 )
 from coding_review_agent_loop.orchestrator import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+    _TerminalIssueImplementationConflict,
     _review_freeform_summary_text,
+    _validate_issue_implementation_response,
     _validate_coder_followup_response,
     _validate_plan_revision_response,
     _validate_review_response,
@@ -55,6 +57,7 @@ from coding_review_agent_loop.protocol import (
     parse_signed_human_requirement_body,
     parse_unresolved_item_dispositions,
     ReviewItemDisposition,
+    validate_structured_issue_implementation,
     UnresolvedReviewItem,
     validate_human_requirements_acknowledgement,
     validate_structured_coder_followup,
@@ -65,6 +68,73 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
     validate_structured_plan_revision,
 )
+
+
+def _issue_implementation_text(**overrides):
+    payload = {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "Implemented the change.",
+        "pr_number": None,
+        "human_requirements": {
+            "addressed_ids": [],
+            "checked_discussion_directly": False,
+        },
+        "human_requirement_dispositions": [],
+        "tests_run": None,
+    }
+    payload.update(overrides)
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Coder"
+
+
+def test_issue_implementation_protocol_accepts_null_pr_and_nullable_tests():
+    parsed = validate_structured_issue_implementation(_issue_implementation_text())
+
+    assert parsed is not None
+    assert parsed.pr_number is None
+    assert parsed.tests_run is None
+
+
+def test_issue_implementation_protocol_preserves_positive_pr_blocked_conflict():
+    text = _issue_implementation_text(
+        summary="PR 77 exists, but the signed requirement is blocked.",
+        pr_number=77,
+        human_requirement_dispositions=[
+            {
+                "requirement_id": "Requirement 1",
+                "disposition": "blocked",
+                "evidence": "The required integration is unavailable.",
+            }
+        ],
+    )
+    from coding_review_agent_loop.github import HumanReviewRequirement
+
+    result = _validate_issue_implementation_response(
+        text,
+        human_requirements=(
+            HumanReviewRequirement(
+                source_type="Issue comment",
+                author="maintainer",
+                created_at="2026-01-01T00:00:00Z",
+                url="https://example.test/issue-comment",
+                body="Preserve the integration."
+            ),
+        ),
+    )
+
+    assert isinstance(result, _TerminalIssueImplementationConflict)
+    assert result.parsed.pr_number == 77
+    assert result.parsed.human_requirement_dispositions[0].evidence.endswith("unavailable.")
+
+
+def test_issue_implementation_protocol_rejects_wrong_footer_state():
+    text = _issue_implementation_text().replace(
+        "<!-- AGENT_STATE: blocking -->", "<!-- AGENT_STATE: approved -->"
+    )
+
+    with pytest.raises(AgentLoopError, match="footer AGENT_STATE"):
+        validate_structured_issue_implementation(text)
 
 
 def _discuss_answer_text(payload: dict) -> str:
