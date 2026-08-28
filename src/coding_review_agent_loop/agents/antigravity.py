@@ -499,46 +499,46 @@ class AntigravityBackend:
                         injected_gemini_prefix + (existing_gemini or ""),
                         encoding="utf-8",
                     )
-                    try:
-                        result = runner.run_with_log(
-                            args,
-                            cwd=config.antigravity_dir,
-                            log_path=log_path,
-                            label=f"Antigravity ({model})",
-                            progress_interval_seconds=config.progress_interval_seconds,
-                            check=False,
-                            env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
-                            use_pty=True,
-                            timeout_seconds=(
-                                config.repair_timeout_seconds
-                                if role == "repair"
-                                else timeout_seconds
-                            ),
-                        )
-                    finally:
-                        strip_injected_prefix()
+                    result = runner.run_with_log(
+                        args,
+                        cwd=config.antigravity_dir,
+                        log_path=log_path,
+                        label=f"Antigravity ({model})",
+                        progress_interval_seconds=config.progress_interval_seconds,
+                        check=False,
+                        env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
+                        use_pty=True,
+                        timeout_seconds=(
+                            config.repair_timeout_seconds
+                            if role == "repair"
+                            else timeout_seconds
+                        ),
+                    )
                 finally:
-                    # Parse only after cleanup, while both locks are still held.
-                    if role != "repair" and result is not None:
-                        response_file_text = read_public_response_file(response_path)
+                    # This also handles a partial GEMINI.md write that raises
+                    # before the subprocess is spawned.
+                    strip_injected_prefix()
+                # Parse only after cleanup, while both locks are still held.
+                if role != "repair" and result is not None:
+                    response_file_text = read_public_response_file(response_path)
+                    candidate = classify_antigravity_executable_replacement_interruption(
+                        result,
+                        command=config.antigravity_cmd,
+                        response_file_text=response_file_text,
+                    )
+                    if candidate is not None:
+                        after_snapshot = capture_workdir_snapshot(
+                            runner,
+                            config.antigravity_dir,
+                            tolerate_exceptions=True,
+                        )
                         candidate = classify_antigravity_executable_replacement_interruption(
                             result,
                             command=config.antigravity_cmd,
                             response_file_text=response_file_text,
+                            before_snapshot=before_snapshot,
+                            after_snapshot=after_snapshot,
                         )
-                        if candidate is not None:
-                            after_snapshot = capture_workdir_snapshot(
-                                runner,
-                                config.antigravity_dir,
-                                tolerate_exceptions=True,
-                            )
-                            candidate = classify_antigravity_executable_replacement_interruption(
-                                result,
-                                command=config.antigravity_cmd,
-                                response_file_text=response_file_text,
-                                before_snapshot=before_snapshot,
-                                after_snapshot=after_snapshot,
-                            )
             finally:
                 fcntl.flock(gemini_lock_file, fcntl.LOCK_UN)
                 gemini_lock_file.close()

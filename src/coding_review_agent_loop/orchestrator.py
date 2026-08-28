@@ -2347,6 +2347,7 @@ def _run_validated_agent(
     }
 
     for attempt in range(1, max_attempts + 1):
+        replacement_stability_failed = False
         attempt_config = (
             antigravity_attempts.singleton_config(config)
             if antigravity_attempts is not None
@@ -2502,6 +2503,7 @@ def _run_validated_agent(
                 replay_timeout = timeout_seconds
                 deadline_exhausted = False
             if not stable or deadline_exhausted:
+                replacement_stability_failed = True
                 deadline_label = (
                     "within the invocation deadline"
                     if uses_remaining_deadline
@@ -2553,7 +2555,11 @@ def _run_validated_agent(
             if result.command_result is not None and result.command_result.capture_diagnostics:
                 classification_text += "\nsubprocess capture unavailable; retryable tooling failure"
             last_classification_text = classification_text
-            should_retry = bool(result.command_result and result.command_result.capture_diagnostics) or _is_transient_agent_output(classification_text)
+            should_retry = (
+                replacement_stability_failed
+                or bool(result.command_result and result.command_result.capture_diagnostics)
+                or _is_transient_agent_output(classification_text)
+            )
             last_failure_category = _failure_category(classification_text)
             capacity = classify_antigravity_capacity(
                 classification_text,
@@ -2569,7 +2575,9 @@ def _run_validated_agent(
             last_error = "agent response was empty"
             classification_text = _agent_failure_classification_text(result, phase="empty")
             last_classification_text = classification_text
-            should_retry = _is_transient_agent_output(classification_text)
+            should_retry = replacement_stability_failed or _is_transient_agent_output(
+                classification_text
+            )
             last_failure_category = _failure_category(classification_text)
             capacity = classify_antigravity_capacity(
                 classification_text,
@@ -2665,7 +2673,7 @@ def _run_validated_agent(
                 response_failure_is_unsupported = last_failure_category == "unsupported_model"
                 # Marker near-misses are a separate first-attempt nudge for common footer typos;
                 # structured JSON protocol drift still remains repairable when retries are exhausted.
-                should_retry = public_text_is_transient or (
+                should_retry = replacement_stability_failed or public_text_is_transient or (
                     not response_failure_is_unsupported
                     and attempt == 1
                     and _is_retryable_marker_near_miss(classification_text)
