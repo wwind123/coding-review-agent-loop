@@ -62,6 +62,72 @@ class WorkdirSnapshot:
         return self.head.available and self.status.available
 
 
+@dataclass(frozen=True)
+class WorkdirReplayEvidence:
+    """Replacement evidence plus an optional fail-closed replay refusal."""
+
+    reason: str
+    replay_refusal_kind: str | None = None
+    replay_refusal_detail: str | None = None
+
+
+def _workdir_probe_label(snapshot: WorkdirSnapshot) -> str:
+    def describe(probe: GitProbeResult) -> str:
+        if probe.kind == "available":
+            return repr(probe.value)
+        if probe.kind == "exception":
+            return f"{probe.exception_type}: {probe.detail}"
+        if probe.kind == "command-failed":
+            return f"returncode={probe.returncode!r}"
+        return "blank"
+
+    return f"HEAD={describe(snapshot.head)}, status={describe(snapshot.status)}"
+
+
+def gate_workdir_replay(
+    provider_label: str,
+    reason: str,
+    *,
+    before_snapshot: WorkdirSnapshot | None,
+    after_snapshot: WorkdirSnapshot | None,
+) -> WorkdirReplayEvidence:
+    """Allow replay only when both checkout snapshots are available and equal.
+
+    The provider label is deliberately supplied by each backend so refusal
+    diagnostics identify the actual backend while the metadata contract stays
+    provider-neutral.
+    """
+    if before_snapshot is None and after_snapshot is None:
+        return WorkdirReplayEvidence(reason)
+    if before_snapshot is None or not before_snapshot.available:
+        detail = (
+            f"{provider_label} replay refused: before workdir snapshot unavailable "
+            f"({ _workdir_probe_label(before_snapshot) if before_snapshot else 'missing'})."
+        )
+        return WorkdirReplayEvidence(reason, "before-unavailable", detail)
+    if after_snapshot is None or not after_snapshot.available:
+        detail = (
+            f"{provider_label} replay refused: after workdir snapshot unavailable "
+            f"({ _workdir_probe_label(after_snapshot) if after_snapshot else 'missing'})."
+        )
+        return WorkdirReplayEvidence(reason, "after-unavailable", detail)
+    if before_snapshot.head.value != after_snapshot.head.value:
+        detail = (
+            f"{provider_label} replay refused: assigned checkout HEAD changed during "
+            f"invocation (before={before_snapshot.head.value!r}, "
+            f"after={after_snapshot.head.value!r})."
+        )
+        return WorkdirReplayEvidence(reason, "changed-head", detail)
+    if before_snapshot.status.value != after_snapshot.status.value:
+        detail = (
+            f"{provider_label} replay refused: dirty workdir status changed during "
+            f"invocation (before={before_snapshot.status.value!r}, "
+            f"after={after_snapshot.status.value!r})."
+        )
+        return WorkdirReplayEvidence(reason, "changed-status", detail)
+    return WorkdirReplayEvidence(reason)
+
+
 def _git_probe(
     runner: object,
     *,

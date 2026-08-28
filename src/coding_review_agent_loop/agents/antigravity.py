@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import re
 import tempfile
 from typing import TYPE_CHECKING
 
@@ -37,10 +38,12 @@ from .base import (
     read_public_response_file,
     with_public_response_file_instruction,
 )
+from .replacement import classify_provider_executable_replacement_interruption
 from ..errors import AgentLoopError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
-from ..runner import Runner, strip_ansi
+from ..runner import CommandResult, Runner, strip_ansi
+from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
@@ -152,6 +155,61 @@ background tasks, or invoke subagents. Use only the malformed response and proto
 examples in the prompt. Return the repaired response immediately.
 
 """
+
+# `agy --print` normally emits a small amount of startup chrome before it can
+# reach the Node launcher. Replacement replay is safe only when every residual
+# line is one of these known startup/loader diagnostics; narration and tool
+# output are treated as progress.
+_ANTIGRAVITY_STARTUP_LINE_RE = re.compile(
+    r"(?ix)^(?:"
+    r"(?:agy|antigravity)(?:\s+cli)?(?:\s+(?:v|version)\s*[\w.-]+)?|"
+    r"(?:starting|initiali[sz]ing|loading)\s+(?:agy|antigravity|gemini)(?:\s+cli)?|"
+    r"(?:using|selected|requested)\s+model\s*[:=].+|"
+    r"model\s*[:=].+|"
+    r"version\s*[:=]\s*[\w.-]+|"
+    r"loaded\s+(?:configuration|credentials|settings)\b.*|"
+    r"(?:checking|applying)\s+(?:for\s+)?(?:(?:agy|antigravity|gemini)\s+)?updates?\b.*"
+    r")$"
+)
+_ANTIGRAVITY_LOADER_LINE_RE = re.compile(
+    r"(?ix)(?:"
+    r"MODULE_NOT_FOUND|cannot\s+find\s+module|"
+    r"^node:(?:internal/)?modules/.*|^at\s+.+node:(?:internal/)?modules/.*|"
+    r"^throw\s+err;?$|^require\s+stack:.*|"
+    r"^code\s*[:=]\s*['\"]?(?:MODULE_NOT_FOUND|ENOENT)['\"]?\s*$|"
+    r"(?:ENOENT|ENOEXEC)|exec(?:ution)?\s+format\s+error|"
+    r"no\s+such\s+file\s+or\s+directory|"
+    r"(?:agy|antigravity|gemini|node|npm|launcher|executable|binary).*(?:not\s+found|missing|failed|error)|"
+    r"(?:failed|error).*(?:launch|launcher|startup|updat(?:e|er)|replacement)|"
+    r"(?:updat(?:e|er)|launcher|replacement).*(?:failed|error|unavailable|in\s+progress)"
+    r")"
+)
+
+
+def classify_antigravity_executable_replacement_interruption(
+    result: CommandResult,
+    *,
+    command: str,
+    response_file_text: str | None,
+    before_snapshot: WorkdirSnapshot | None = None,
+    after_snapshot: WorkdirSnapshot | None = None,
+) -> WorkdirReplayEvidence | None:
+    return classify_provider_executable_replacement_interruption(
+        result,
+        command=command,
+        response_file_text=response_file_text,
+        startup_line_re=_ANTIGRAVITY_STARTUP_LINE_RE,
+        loader_line_re=_ANTIGRAVITY_LOADER_LINE_RE,
+        provider_label="Antigravity executable replacement",
+        reason="Antigravity executable changed during invocation",
+        before_snapshot=before_snapshot,
+        after_snapshot=after_snapshot,
+    )
+
+
+classify_executable_replacement_interruption = (
+    classify_antigravity_executable_replacement_interruption
+)
 
 
 def _antigravity_settings_path() -> Path:
@@ -320,80 +378,65 @@ class AntigravityBackend:
         settings_lock_path = settings_path.with_suffix(".json.lock")
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_lock = settings_lock_path.open("a+")
+        before_snapshot: WorkdirSnapshot | None = None
+        after_snapshot: WorkdirSnapshot | None = None
+        candidate: WorkdirReplayEvidence | None = None
+        response_file_text: str | None = None
+        result: CommandResult | None = None
+
+        def strip_injected_prefix() -> None:
+            if not gemini_md_path.exists():
+                return
+            current = gemini_md_path.read_text(encoding="utf-8")
+            if current.startswith(injected_gemini_prefix):
+                remainder = current[len(injected_gemini_prefix):]
+                if remainder:
+                    gemini_md_path.write_text(remainder, encoding="utf-8")
+                else:
+                    gemini_md_path.unlink()
+
+        settings_was_injected = role in {"reviewer", "repair"}
+        original_settings_text: str | None = None
+        settings_restore_required = False
         try:
             fcntl.flock(settings_lock, fcntl.LOCK_EX)
-            if role in {"reviewer", "repair"}:
+            existing_settings: dict[str, object] = {}
+            if settings_was_injected:
                 try:
                     original_settings_text = settings_path.read_text(encoding="utf-8")
                     try:
-                        existing_settings = json.loads(original_settings_text)
+                        parsed_settings = json.loads(original_settings_text)
                     except json.JSONDecodeError as exc:
                         raise AgentLoopError(f"settings.json malformed: {exc}") from exc
-                    if not isinstance(existing_settings, dict):
+                    if not isinstance(parsed_settings, dict):
                         raise AgentLoopError("settings.json root is not a JSON object")
+                    existing_settings = parsed_settings
                 except FileNotFoundError:
                     original_settings_text = None
-                    existing_settings = {}
-                try:
-                    injection = (
-                        _REPAIR_SETTINGS_INJECTION
-                        if role == "repair"
-                        else _REVIEWER_SETTINGS_INJECTION
+                injection = (
+                    _REPAIR_SETTINGS_INJECTION
+                    if role == "repair"
+                    else _REVIEWER_SETTINGS_INJECTION
+                )
+                injected = {**existing_settings, **injection}
+                # Mark this before writing: a partial write that raises still
+                # needs the original settings restored in the outer finally.
+                settings_restore_required = True
+                settings_path.write_text(json.dumps(injected, indent=2), encoding="utf-8")
+
+            # Hold both locks across the complete normal-run lifecycle. Repair
+            # uses an isolated temporary directory and intentionally performs no
+            # checkout probes or replacement classification.
+            gemini_lock_file = gemini_lock_path.open("a+")
+            try:
+                fcntl.flock(gemini_lock_file, fcntl.LOCK_EX)
+                if role != "repair":
+                    before_snapshot = capture_workdir_snapshot(
+                        runner,
+                        config.antigravity_dir,
+                        tolerate_exceptions=True,
                     )
-                    injected = {**existing_settings, **injection}
-                    settings_path.write_text(json.dumps(injected, indent=2), encoding="utf-8")
-                    # Inner: GEMINI.md lock
-                    gemini_lock_file = gemini_lock_path.open("a+")
-                    try:
-                        fcntl.flock(gemini_lock_file, fcntl.LOCK_EX)
-                        try:
-                            existing_gemini = gemini_md_path.read_text(encoding="utf-8")
-                        except FileNotFoundError:
-                            existing_gemini = None
-                        gemini_md_path.write_text(
-                            injected_gemini_prefix + (existing_gemini or ""),
-                            encoding="utf-8",
-                        )
-                        try:
-                            result = runner.run_with_log(
-                                args,
-                                cwd=config.antigravity_dir,
-                                log_path=log_path,
-                                label=f"Antigravity ({model})",
-                                progress_interval_seconds=config.progress_interval_seconds,
-                                check=False,
-                                env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
-                                use_pty=True,
-                                timeout_seconds=(
-                                    config.repair_timeout_seconds
-                                    if role == "repair"
-                                    else timeout_seconds
-                                ),
-                            )
-                        finally:
-                            if gemini_md_path.exists():
-                                current = gemini_md_path.read_text(encoding="utf-8")
-                                if current.startswith(injected_gemini_prefix):
-                                    remainder = current[len(injected_gemini_prefix):]
-                                    if remainder:
-                                        gemini_md_path.write_text(remainder, encoding="utf-8")
-                                    else:
-                                        gemini_md_path.unlink()
-                    finally:
-                        fcntl.flock(gemini_lock_file, fcntl.LOCK_UN)
-                        gemini_lock_file.close()
-                        if role == "repair":
-                            gemini_lock_path.unlink(missing_ok=True)
-                finally:
-                    if original_settings_text is None:
-                        settings_path.unlink(missing_ok=True)
-                    else:
-                        settings_path.write_text(original_settings_text, encoding="utf-8")
-            else:
-                # Coder path: hold settings lock without modifying settings.json
-                gemini_lock_file = gemini_lock_path.open("a+")
                 try:
-                    fcntl.flock(gemini_lock_file, fcntl.LOCK_EX)
                     try:
                         existing_gemini = gemini_md_path.read_text(encoding="utf-8")
                     except FileNotFoundError:
@@ -402,38 +445,66 @@ class AntigravityBackend:
                         injected_gemini_prefix + (existing_gemini or ""),
                         encoding="utf-8",
                     )
-                    try:
-                        result = runner.run_with_log(
-                            args,
-                            cwd=config.antigravity_dir,
-                            log_path=log_path,
-                            label=f"Antigravity ({model})",
-                            progress_interval_seconds=config.progress_interval_seconds,
-                            check=False,
-                            env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
-                            use_pty=True,
-                            timeout_seconds=timeout_seconds,
-                        )
-                    finally:
-                        if gemini_md_path.exists():
-                            current = gemini_md_path.read_text(encoding="utf-8")
-                            if current.startswith(injected_gemini_prefix):
-                                remainder = current[len(injected_gemini_prefix):]
-                                if remainder:
-                                    gemini_md_path.write_text(remainder, encoding="utf-8")
-                                else:
-                                    gemini_md_path.unlink()
+                    result = runner.run_with_log(
+                        args,
+                        cwd=config.antigravity_dir,
+                        log_path=log_path,
+                        label=f"Antigravity ({model})",
+                        progress_interval_seconds=config.progress_interval_seconds,
+                        check=False,
+                        env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
+                        use_pty=True,
+                        timeout_seconds=(
+                            config.repair_timeout_seconds
+                            if role == "repair"
+                            else timeout_seconds
+                        ),
+                    )
                 finally:
-                    fcntl.flock(gemini_lock_file, fcntl.LOCK_UN)
-                    gemini_lock_file.close()
+                    # This also handles a partial GEMINI.md write that raises
+                    # before the subprocess is spawned.
+                    strip_injected_prefix()
+                # Parse only after cleanup, while both locks are still held.
+                if role != "repair" and result is not None:
+                    response_file_text = read_public_response_file(response_path)
+                    candidate = classify_antigravity_executable_replacement_interruption(
+                        result,
+                        command=config.antigravity_cmd,
+                        response_file_text=response_file_text,
+                    )
+                    if candidate is not None:
+                        after_snapshot = capture_workdir_snapshot(
+                            runner,
+                            config.antigravity_dir,
+                            tolerate_exceptions=True,
+                        )
+                        candidate = classify_antigravity_executable_replacement_interruption(
+                            result,
+                            command=config.antigravity_cmd,
+                            response_file_text=response_file_text,
+                            before_snapshot=before_snapshot,
+                            after_snapshot=after_snapshot,
+                        )
+            finally:
+                fcntl.flock(gemini_lock_file, fcntl.LOCK_UN)
+                gemini_lock_file.close()
+                if role == "repair":
+                    gemini_lock_path.unlink(missing_ok=True)
         finally:
+            if settings_restore_required:
+                if original_settings_text is None:
+                    settings_path.unlink(missing_ok=True)
+                else:
+                    settings_path.write_text(original_settings_text, encoding="utf-8")
             fcntl.flock(settings_lock, fcntl.LOCK_UN)
             settings_lock.close()
         log(config, f"Antigravity ({model}) finished; log: {log_path}")
 
         # Prefer the public response file the prompt asks the agent to write; else
         # keep only what follows the public-response marker in stdout; else stdout.
-        response_file_text = read_public_response_file(response_path)
+        if role == "repair":
+            response_file_text = read_public_response_file(response_path)
+        assert result is not None
         if response_file_text is not None:
             message_text, text_source = response_file_text, "response_file"
         else:
@@ -454,6 +525,13 @@ class AntigravityBackend:
             # caller's attempt state advances to a fallback model if needed.
             model_used=model,
             command_result=result,
+            self_update_reason=candidate.reason if candidate else None,
+            self_update_replay_refusal_kind=(
+                candidate.replay_refusal_kind if candidate else None
+            ),
+            self_update_replay_refusal_detail=(
+                candidate.replay_refusal_detail if candidate else None
+            ),
         )
 
     def run_repair(

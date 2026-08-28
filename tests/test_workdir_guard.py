@@ -2,7 +2,10 @@ from agent_loop_helpers import *  # noqa: F403
 
 from coding_review_agent_loop.workdir_guard import (
     capture_workdir_snapshot,
+    gate_workdir_replay,
+    GitProbeResult,
     read_workdir_head,
+    WorkdirSnapshot,
 )
 from coding_review_agent_loop.orchestrator import _read_assigned_workdir_head
 
@@ -103,6 +106,28 @@ def test_workdir_snapshot_tolerates_agent_loop_error_and_oserror_per_probe(tmp_p
     assert snapshot.head.exception_type == "AgentLoopError"
     assert snapshot.status.kind == "exception"
     assert snapshot.status.exception_type == "OSError"
+
+
+def test_workdir_replay_gate_preserves_provider_label_and_changed_status_refusal():
+    before = WorkdirSnapshot(
+        GitProbeResult(("git", "rev-parse", "HEAD"), "available", "abc123"),
+        GitProbeResult(("git", "status", "--porcelain"), "available", ""),
+    )
+    after = WorkdirSnapshot(
+        GitProbeResult(("git", "rev-parse", "HEAD"), "available", "abc123"),
+        GitProbeResult(("git", "status", "--porcelain"), "available", " M file.py\n"),
+    )
+
+    evidence = gate_workdir_replay(
+        "Gemini executable replacement",
+        "Gemini executable changed during invocation",
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+
+    assert evidence.reason == "Gemini executable changed during invocation"
+    assert evidence.replay_refusal_kind == "changed-status"
+    assert "Gemini executable replacement" in evidence.replay_refusal_detail
 
 
 def test_head_only_probe_does_not_invoke_status_and_strict_mode_reraises(tmp_path):

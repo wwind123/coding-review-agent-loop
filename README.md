@@ -132,6 +132,36 @@ no-capacity errors retry the active model before advancing through this chain.
 defaults and control fallback eligibility. Invalid settings, unsupported models,
 timeouts, and schema-invalid responses remain deterministic and do not fall back.
 
+### Executable replacement recovery
+
+Gemini and Antigravity use a conservative startup gate for launcher replacement:
+the command must have a direct before/after identity change, an integer exit,
+healthy PTY capture, and no response-file artifact, public-response marker,
+structured payload, or ordinary narration/tool progress. Gemini accepts only an
+empty transcript or recognized startup/Node-loader/updater diagnostics; Antigravity
+also accepts its version/model startup chrome. A valid response-file artifact has
+priority over replacement handling, including after a nonzero exit or timeout.
+
+For Gemini, the checkout HEAD and exact porcelain status are captured immediately
+before spawn and the after probe is taken only for a surviving candidate. For
+Antigravity, reviewer and coder probes run while the settings lock and the
+exclusive `GEMINI.md` lock are held: before injection, then after invocation and
+prefix cleanup. This prevents peer prompt injection or cleanup from creating a
+false worktree delta. Isolated formatting-repair runs bypass both probes and all
+replacement metadata. These read-only snapshots are evidence gates only; they do
+not prevent an agent from making external changes, so replacement replay is
+conservative rather than a general side-effect safety guarantee.
+
+Each eligible Gemini or Antigravity invocation gets one bounded executable
+stability wait and at most one fresh full-timeout replay, logged with the
+`executable-replacement-attempt2` suffix. Gemini's budget is
+`agent_max_retries + 2`; Antigravity's is
+`len(models) + agent_max_retries + 1`. The dedicated replay does not consume an
+ordinary retry; Antigravity also keeps the same model and leaves its retry,
+model-index, and attempt counters unchanged until a later ordinary failure.
+Failed stability checks retain the normal Gemini retry or Antigravity model
+fallback chain.
+
 Each `agy --print` invocation is run with `--print-timeout` set from
 `--antigravity-print-timeout-seconds` (default 600, i.e. ten minutes), which
 overrides `agy`'s own five-minute print-mode default so long coder/reviewer

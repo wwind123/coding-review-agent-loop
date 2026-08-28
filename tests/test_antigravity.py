@@ -763,6 +763,83 @@ def test_antigravity_backend_strips_dangerously_skip_permissions_for_reviewer(
     )
     assert "--dangerously-skip-permissions" in captured_args[-1]
 
+
+@pytest.mark.parametrize("role", [None, "reviewer"])
+def test_antigravity_after_snapshot_runs_after_gemini_cleanup_under_lock(
+    tmp_path, monkeypatch, role
+):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+    from coding_review_agent_loop.runner import CommandResult, ExecutableIdentity, ExecutionObservation
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir(parents=True)
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+    if role == "reviewer":
+        settings_file.write_text('{"existing": true}', encoding="utf-8")
+
+    identity = ExecutableIdentity(
+        "agy", "agy-target", (1, 1, 90_000_000_000), (1, 2, 90_000_000_000)
+    )
+    changed = ExecutableIdentity(
+        "agy", "agy-new-target", (1, 3, 100_000_000_000), (1, 4, 100_000_000_000)
+    )
+    observation = ExecutionObservation(100, 100, 101, 1, identity, changed, False)
+    snapshots_seen: list[tuple[bool, str]] = []
+
+    class ObservedRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            raw = super().run_with_log(args, cwd=cwd, **kwargs)
+            return CommandResult(
+                raw.args, raw.cwd, raw.stdout, raw.stderr, raw.returncode, observation,
+                raw.capture_diagnostics,
+            )
+
+        def run(self, args, *, cwd, **kwargs):
+            if tuple(args) == ("git", "status", "--porcelain"):
+                path = Path(cwd) / "GEMINI.md"
+                snapshots_seen.append((path.exists(), path.read_text(encoding="utf-8") if path.exists() else ""))
+            return super().run(args, cwd=cwd, **kwargs)
+
+    output = "agy v0.8.0\nModel: Gemini 3.1 Pro (High)\nError: Cannot find module launcher.js\n"
+    runner = ObservedRunner(
+        antigravity_outputs=[(output, 1)],
+        git_probe_results=[
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "", "returncode": 0},
+            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "", "returncode": 0},
+        ],
+    )
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    result = AntigravityBackend().run(runner, config, "Review.", role=role)
+
+    assert result.self_update_reason == "Antigravity executable changed during invocation"
+    assert result.self_update_replay_refusal_kind is None
+    assert len(snapshots_seen) == 2
+    assert snapshots_seen[1][0] is False
+    assert "Agent Loop Single-Shot Session" not in snapshots_seen[1][1]
+
+
+def test_antigravity_repair_skips_checkout_probes_and_replacement_metadata(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+    config = make_config(tmp_path, antigravity_dir=tmp_path / "agy")
+    runner = FakeRunner(antigravity_outputs=[("MODULE_NOT_FOUND", 1)])
+
+    result = AntigravityBackend().run_repair(
+        runner, config, "Repair this response.", model="ModelA"
+    )
+
+    assert runner.git_probe_calls == []
+    assert result.self_update_reason is None
+    assert result.self_update_replay_refusal_kind is None
+    assert result.self_update_replay_refusal_detail is None
+
 def test_antigravity_backend_lock_order_settings_outer_gemini_inner(tmp_path, monkeypatch):
     """Settings lock (outer) is acquired before GEMINI.md lock (inner);
     settings are restored before the settings lock is released."""

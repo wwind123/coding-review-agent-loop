@@ -167,6 +167,44 @@ Currently supported local agent CLIs:
 - Claude Code via `claude`
 - OpenAI Codex CLI via `codex`
 - Gemini CLI via `gemini` (best-effort support for users whose organization or API-key setup still has access)
+- Antigravity CLI via `agy` (first-class backend; also the Gemini CLI migration path)
+
+### Startup replacement evidence and replay
+
+The Gemini and Antigravity backends classify executable replacement only from
+attempt-local evidence. The launcher identity must change between the pre-spawn
+and post-exit observations, the exit must be an integer, capture must not report
+an interruption, timeout, or PTY read failure, and no non-empty public response
+file, public-response marker, structured payload, or ordinary narration may be
+present. Gemini's residual output is limited to empty output and recognized
+startup, Node-loader, or updater diagnostics. Antigravity additionally permits
+recognized `agy` version/model startup chrome; unknown lines are treated as
+progress and suppress replay. A valid response-file artifact is accepted before
+this gate, even for a failed or timed-out command; a malformed artifact follows
+normal validation/repair.
+
+Gemini takes a read-only `HEAD` and exact `git status --porcelain` snapshot
+immediately before `run_with_log`, then lazily takes the after snapshot only for
+an otherwise eligible candidate. Antigravity takes the before snapshot after
+acquiring both the settings lock and the exclusive `GEMINI.md` lock, before
+tool-owned injection. It invokes the backend, removes the injected prefix in a
+`finally` path, parses the candidate, and takes the after snapshot before
+releasing either lock. Reviewer and coder paths therefore cannot observe a peer's
+injected prompt as worktree activity. Isolated `role=repair` / `run_repair`
+invocations skip Git probes, replacement metadata, and replay eligibility. The
+snapshots are read-only evidence gates and cannot guarantee that a backend had no
+other external side effects.
+
+When the gate succeeds, Gemini and Antigravity wait for one bounded executable
+stability window and may make one fresh full-timeout replay using the
+`executable-replacement-attempt2` log suffix. Gemini allows
+`agent_max_retries + 2` total slots; Antigravity allows
+`len(antigravity_models) + agent_max_retries + 1`. The dedicated replay is outside
+ordinary retry accounting. Antigravity replays the same singleton model without
+advancing `retries_remaining`, `model_index`, or `attempts`; only a later ordinary
+failure may retry or fall back. A failed stability wait keeps ordinary retry and
+fallback eligibility, while changed or unavailable snapshots retain diagnostic
+refusal metadata without triggering stability waiting.
 
 ## Prerequisites
 
