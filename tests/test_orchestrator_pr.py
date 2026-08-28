@@ -1833,6 +1833,44 @@ def test_watch_timeout_renders_local_rerun_without_leaking_it_to_comment(
     assert all("token value" not in comment for comment in runner.comments)
 
 
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_watch_budget_exhaustion_stops_before_announcing_new_poll(
+    tmp_path, monkeypatch, capsys, auto_merge
+):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Old head approved."),
+            structured_pr_review(state="approved", summary="New head approved."),
+        ]
+    )
+    config = make_config(
+        tmp_path,
+        watch_pending_ci=True,
+        auto_merge=auto_merge,
+        max_rounds=1,
+        ci_timeout_seconds=20,
+        ci_poll_interval_seconds=10,
+    )
+    watch_calls = []
+
+    def watch(*args, **kwargs):
+        watch_calls.append(kwargs)
+        runner.pr_payload["headRefOid"] = "new-head"
+        return CiWatchOutcome(status="head_changed", head_sha="new-head", attempts_used=2)
+
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+
+    if auto_merge:
+        with pytest.raises(AgentLoopError, match="watch budget was exhausted"):
+            run_pr_loop(runner, pr_number=77, config=config)
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(watch_calls) == 1
+    assert sum("watching GitHub checks" in comment for comment in runner.comments) == 1
+    assert sum("CI watch budget was exhausted" in line for line in capsys.readouterr().out.splitlines()) == 1
+
+
 def test_watch_dry_run_previews_without_poll_sleep_coder_or_merge(tmp_path, capsys):
     runner = FakeRunner(
         codex_outputs=[structured_pr_review(state="approved", summary="Approved.")]

@@ -6708,6 +6708,68 @@ def _stop_on_terminal_without_status(
     return 0
 
 
+def _stop_after_ci_watch_timeout(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    head_sha: str | None,
+    pr_comments: Sequence[object],
+    followups: list[ApprovedFollowup],
+    details: list[str],
+    reason: Literal["budget_exhausted", "timeout"],
+) -> int:
+    """Publish resumable guidance for a watch that cannot continue or finish."""
+    _publish_approved_followups(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        pr_comments=pr_comments,
+        followups=followups,
+    )
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=_pending_ci_stop_message(pr_number, "pending", details),
+    )
+    rerun = _render_ci_rerun_command(config, pr_number=pr_number)
+    note = (
+        ""
+        if config.invocation_argv
+        else " (deterministic fallback; original invocation unavailable)"
+    )
+    if reason == "budget_exhausted":
+        log(
+            config,
+            f"Round {round_number}: PR #{pr_number} shared CI watch budget was "
+            "exhausted before a fresh poll; no merge attempted",
+        )
+        print(
+            f"PR #{pr_number} CI watch budget was exhausted by earlier rounds; "
+            f"no fresh poll was performed and no merge was attempted. "
+            f"Rerun: {rerun}{note}"
+        )
+        if config.auto_merge:
+            raise AgentLoopError(
+                f"PR #{pr_number} full-board CI watch budget was exhausted before "
+                "a fresh poll; no merge attempted."
+            )
+    else:
+        print(
+            f"PR #{pr_number} CI watch timed out: {'; '.join(details)}. "
+            f"Rerun: {rerun}{note}"
+        )
+        if config.auto_merge:
+            raise AgentLoopError(
+                f"PR #{pr_number} full-board CI watch did not pass within "
+                f"{config.ci_timeout_seconds}s; no merge attempted."
+            )
+    return 0
+
+
 def run_pr_loop(
     runner: Runner,
     *,
@@ -8208,6 +8270,22 @@ def run_pr_loop(
                             1,
                             config.ci_timeout_seconds // config.ci_poll_interval_seconds,
                         )
+                    assert watch_attempts_remaining is not None
+                    if watch_attempts_remaining <= 0:
+                        return _stop_after_ci_watch_timeout(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            round_number=round_number,
+                            head_sha=pr_metadata.head_sha,
+                            pr_comments=pr_comments,
+                            followups=future_followups,
+                            details=[
+                                "The shared CI watch budget was exhausted by earlier watcher rounds; "
+                                "no fresh CI poll was performed."
+                            ],
+                            reason="budget_exhausted",
+                        )
                     watching_message = (
                         f"Reviewers approved PR #{pr_number}; watching GitHub checks "
                         "in the foreground. "
@@ -8220,48 +8298,6 @@ def run_pr_loop(
                         pr_number=pr_number,
                         body=watching_message + "\n\n-- coding-review-agent-loop",
                     )
-                    assert watch_attempts_remaining is not None
-                    if watch_attempts_remaining <= 0:
-                        _publish_approved_followups(
-                            runner,
-                            config=config,
-                            pr_number=pr_number,
-                            head_sha=pr_metadata.head_sha,
-                            pr_comments=pr_comments,
-                            followups=future_followups,
-                        )
-                        details = [
-                            "The shared CI watch budget was exhausted by earlier watcher rounds; "
-                            "no fresh CI poll was performed."
-                        ]
-                        post_pr_comment(
-                            runner,
-                            config=config,
-                            pr_number=pr_number,
-                            body=_pending_ci_stop_message(pr_number, "pending", details),
-                        )
-                        rerun = _render_ci_rerun_command(config, pr_number=pr_number)
-                        note = (
-                            ""
-                            if config.invocation_argv
-                            else " (deterministic fallback; original invocation unavailable)"
-                        )
-                        log(
-                            config,
-                            f"Round {round_number}: PR #{pr_number} shared CI watch budget was "
-                            "exhausted before a fresh poll; no merge attempted",
-                        )
-                        print(
-                            f"PR #{pr_number} CI watch budget was exhausted by earlier rounds; "
-                            f"no fresh poll was performed and no merge was attempted. "
-                            f"Rerun: {rerun}{note}"
-                        )
-                        if config.auto_merge:
-                            raise AgentLoopError(
-                                f"PR #{pr_number} full-board CI watch budget was exhausted before "
-                                "a fresh poll; no merge attempted."
-                            )
-                        return 0
                     watch_outcome = watch_pr_checks(
                         runner,
                         config,
@@ -8351,41 +8387,22 @@ def run_pr_loop(
                         print(f"PR #{pr_number} CI watch stopped: external CI infrastructure is stalled.")
                         return 0
                     if watch_outcome.status == "timeout":
-                        _publish_approved_followups(
-                            runner,
-                            config=config,
-                            pr_number=pr_number,
-                            head_sha=pr_metadata.head_sha,
-                            pr_comments=pr_comments,
-                            followups=future_followups,
-                        )
                         details = (
                             _pr_check_details(watch_outcome.pr_checks)
                             if watch_outcome.pr_checks
                             else ["No reliable check snapshot was available."]
                         )
-                        post_pr_comment(
+                        return _stop_after_ci_watch_timeout(
                             runner,
                             config=config,
                             pr_number=pr_number,
-                            body=_pending_ci_stop_message(pr_number, "pending", details),
+                            round_number=round_number,
+                            head_sha=pr_metadata.head_sha,
+                            pr_comments=pr_comments,
+                            followups=future_followups,
+                            details=details,
+                            reason="timeout",
                         )
-                        rerun = _render_ci_rerun_command(config, pr_number=pr_number)
-                        note = (
-                            ""
-                            if config.invocation_argv
-                            else " (deterministic fallback; original invocation unavailable)"
-                        )
-                        print(
-                            f"PR #{pr_number} CI watch timed out: {'; '.join(details)}. "
-                            f"Rerun: {rerun}{note}"
-                        )
-                        if config.auto_merge:
-                            raise AgentLoopError(
-                                f"PR #{pr_number} full-board CI watch did not pass within "
-                                f"{config.ci_timeout_seconds}s; no merge attempted."
-                            )
-                        return 0
                     if watch_outcome.status == "head_changed":
                         log(config, f"PR #{pr_number} head changed while watching; re-review is required")
                         # Consume a fresh review round without dispatching the
@@ -8707,7 +8724,6 @@ def run_pr_loop(
                                 for item in unresolved_items
                                 if item.status in {"blocking", "same-pr"}
                             ]
-                            wait_outcome = None
                         elif ordinary_recovery_selected:
                             if ordinary_recovery is None:
                                 raise AgentLoopError(

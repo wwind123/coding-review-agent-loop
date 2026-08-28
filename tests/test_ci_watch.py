@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from coding_review_agent_loop.ci_health import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import PullRequestMetadata, PullRequestMergeability, watch_pr_checks
@@ -24,10 +26,18 @@ def _metadata():
     return PullRequestMetadata(7, "OWNER/REPO", "title", "head", "main", "sha", "url")
 
 
-def _checks(state, *, failing=(), pending=(), query="ok", protection="configured"):
+def _checks(
+    state,
+    *,
+    failing=(),
+    pending=(),
+    missing_required=(),
+    query="ok",
+    protection="configured",
+):
     return PullRequestChecks(
         state=state, required_checks=(), passing=(), pending=pending, failing=failing,
-        missing_required=(), branch_protection_status=protection, branch_protection_note=None,
+        missing_required=tuple(missing_required), branch_protection_status=protection, branch_protection_note=None,
         check_query_status=query, check_query_errors=(), infrastructure_stalls=(),
     )
 
@@ -51,6 +61,39 @@ def test_watch_pending_to_failure_reports_failed_records_and_sleeps(tmp_path):
     assert outcome.status == "failed"
     assert outcome.failed_checks == (failed,)
     assert [command[0] for command in runner.commands] == ["sleep"]
+
+
+@pytest.mark.parametrize(
+    ("missing_required", "query"),
+    [(("build",), "ok"), ((), "partial")],
+)
+def test_watch_reports_observed_failure_despite_incomplete_board_metadata(
+    tmp_path, missing_required, query
+):
+    runner = _Runner()
+    failed = PullRequestCheck(
+        name="test", kind="check_run", status="failure", url="https://checks/1"
+    )
+    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
+         patch("coding_review_agent_loop.github.get_pr_mergeability", return_value=_mergeability()), \
+         patch(
+             "coding_review_agent_loop.github.get_pr_checks",
+             return_value=_checks(
+                 "failing",
+                 failing=(failed,),
+                 missing_required=missing_required,
+                 query=query,
+             ),
+         ):
+        outcome = watch_pr_checks(
+            runner,
+            make_config(tmp_path, watch_pending_ci=True),
+            7,
+            metadata=_metadata(),
+        )
+    assert outcome.status == "failed"
+    assert outcome.failed_checks == (failed,)
+    assert runner.commands == []
 
 
 def test_watch_success_and_head_change_are_terminal(tmp_path):
