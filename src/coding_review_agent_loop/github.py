@@ -1185,8 +1185,8 @@ def _dedupe_checks(checks: list[PullRequestCheck]) -> tuple[PullRequestCheck, ..
 def _parse_check_runs_payload(payload: object) -> tuple[list[PullRequestCheck], list[str]]:
     """Parse the `commits/{sha}/check-runs` response into `PullRequestCheck`s.
 
-    Shared by `get_pr_checks` (full board) and `get_check_record` (a single
-    configured check's full timestamped record for the auto-merge wait loop).
+    The full-board `get_pr_checks` query and its watcher both rely on this
+    parser; it deliberately does not select a named merge gate.
     """
     checks: list[PullRequestCheck] = []
     errors: list[str] = []
@@ -1913,42 +1913,9 @@ def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> 
     return sha
 
 
-def get_check_record(runner: Runner, config: AgentLoopConfig, head_sha: str) -> PullRequestCheck | None:
-    """Full timestamped record for `config.ci_check_name`, or None if absent/unavailable."""
-    result = runner.run(
-        [config.gh_cmd, "api", f"repos/{config.repo}/commits/{head_sha}/check-runs"],
-        cwd=active_workdir(config),
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return None
-    checks, _errors = _parse_check_runs_payload(payload)
-    for check in checks:
-        if check.name == config.ci_check_name:
-            return check
-    return None
-
-
-def get_check_status(runner: Runner, config: AgentLoopConfig, head_sha: str) -> str:
-    record = get_check_record(runner, config, head_sha)
-    return record.status if record is not None else "pending"
-
-
-@dataclass(frozen=True)
-class CiWaitOutcome:
-    status: Literal["passed", "infrastructure_stall", "merge_conflict"]
-    stall: CiInfrastructureStall | None = None
-    pr_checks: PullRequestChecks | None = None
-    mergeability: PullRequestMergeability | None = None
-
-
 @dataclass(frozen=True)
 class CiWatchOutcome:
-    """Terminal result from the opt-in full-board post-approval watcher."""
+    """Terminal result from the full-board post-approval watcher."""
 
     status: Literal[
         "passed",
@@ -1979,7 +1946,6 @@ def watch_pr_checks(
 ) -> CiWatchOutcome:
     """Synchronously watch the complete current-head check board.
 
-    This deliberately sits beside the legacy single-check ``wait_for_ci``.
     It has no worker or persisted process; interrupting the foreground runner
     stops it immediately and a later invocation simply fetches fresh state.
     """
@@ -2025,14 +1991,14 @@ def watch_pr_checks(
                 stall=CiInfrastructureStall(checks=snapshot.infrastructure_stalls),
                 attempts_used=attempt + 1,
             )
-        if snapshot.state == "failing":
+        reliable = snapshot.check_query_status == "ok" and snapshot.branch_protection_status in {
+            "configured", "not_found", "forbidden",
+        }
+        if snapshot.state == "failing" and reliable and not snapshot.missing_required:
             return CiWatchOutcome(
                 status="failed", pr_checks=snapshot, failed_checks=snapshot.failing,
                 head_sha=current_head, attempts_used=attempt + 1,
             )
-        reliable = snapshot.check_query_status == "ok" and snapshot.branch_protection_status in {
-            "configured", "not_found", "forbidden",
-        }
         if snapshot.state == "passing" and reliable and not snapshot.pending and not snapshot.missing_required:
             return CiWatchOutcome(
                 status="passed", pr_checks=snapshot, head_sha=current_head,
@@ -2057,70 +2023,6 @@ def watch_pr_checks(
             )
         runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
     raise AssertionError("CI watch loop must return a terminal outcome")
-
-
-def wait_for_ci(
-    runner: Runner,
-    config: AgentLoopConfig,
-    pr_number: int,
-    *,
-    metadata: PullRequestMetadata,
-) -> CiWaitOutcome:
-    """Poll the configured CI check before auto-merge.
-
-    A queued-too-long or pre-execution-cancelled check is not, by itself,
-    grounds to stop: a stall on the single configured check only ends the
-    wait once a full `get_pr_checks` snapshot confirms the whole PR check
-    board is wholly infrastructure-blocked (`is_wholly_infrastructure_blocked`).
-    Otherwise this keeps today's contract exactly: keep polling and ultimately
-    raise `AgentLoopError` on a genuine terminal failure or `ci_timeout_seconds`
-    expiry.
-
-    Each poll also re-checks GitHub mergeability first (#606): once the base
-    advances or a rebase-required situation appears, the PR's current-head CI
-    is no longer a reliable merge signal, so a confirmed conflict ends the
-    wait immediately without attempting a merge.
-    """
-    log(config, f"Waiting for GitHub check '{config.ci_check_name}' before merge")
-    head_sha = get_pr_head_sha(runner, config, pr_number)
-    attempts = max(1, config.ci_timeout_seconds // config.ci_poll_interval_seconds)
-    terminal_failures = {
-        "failure",
-        "cancelled",
-        "timed_out",
-        "action_required",
-        "startup_failure",
-        "skipped",
-    }
-    for attempt in range(attempts):
-        mergeability = get_pr_mergeability(runner, config=config, pr_number=pr_number)
-        if mergeability.state == "conflicted":
-            log(config, f"PR #{pr_number}: GitHub reports a merge conflict; stopping CI wait")
-            return CiWaitOutcome(status="merge_conflict", mergeability=mergeability)
-
-        record = get_check_record(runner, config, head_sha)
-        status = record.status if record is not None else "pending"
-        log(config, f"GitHub check '{config.ci_check_name}' status: {status}")
-        if status == "success":
-            return CiWaitOutcome(status="passed")
-
-        stall = classify_ci_infrastructure_stall(
-            [record] if record is not None else [],
-            now=datetime.datetime.now(datetime.timezone.utc),
-            grace_seconds=config.ci_queued_grace_seconds,
-        )
-        if stall.is_stalled:
-            snapshot = get_pr_checks(runner, config=config, metadata=metadata)
-            if is_wholly_infrastructure_blocked(snapshot):
-                return CiWaitOutcome(status="infrastructure_stall", stall=stall, pr_checks=snapshot)
-
-        if status in terminal_failures:
-            raise AgentLoopError(f"CI check '{config.ci_check_name}' failed with status: {status}")
-        if attempt < attempts - 1:
-            runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
-    raise AgentLoopError(
-        f"CI check '{config.ci_check_name}' did not pass within {config.ci_timeout_seconds}s"
-    )
 
 
 def merge_pr(

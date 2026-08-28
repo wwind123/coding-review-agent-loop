@@ -35,7 +35,7 @@ from coding_review_agent_loop.config import (
     resolve_base_branch,
 )
 from coding_review_agent_loop.errors import AgentInvocationError, QuotaResetExceededError
-from coding_review_agent_loop.github import CiWatchOutcome, IssueComment
+from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.managed_ci import ManagedCiReadiness, ProtectionAssessment
 from coding_review_agent_loop.managed_pr import ManagedPrHandoff
 from coding_review_agent_loop.runner import CommandResult, ExecutableIdentity, ExecutionObservation
@@ -1445,6 +1445,9 @@ def test_config_enables_ci_watch_with_auto_merge_without_rebuilding_antigravity_
         invocation_argv=("agent-loop", "pr", "77"),
     )
     assert config.watch_pending_ci is True
+    assert config.watch_pending_ci_explicit is False
+    assert config.ci_check_name == "test"
+    assert config.ci_check_name_explicit is False
     assert config.managed_ci_pr_mode is True
     assert config.invocation_argv[-1] == "77"
     assert config.antigravity_models == ("Gemini 3.1 Pro (High)",)
@@ -1621,18 +1624,6 @@ def test_managed_ci_preflight_uses_documented_nonready_exit_codes(monkeypatch, s
     assert main(["managed-ci", "preflight", "--repo", "OWNER/REPO", "--trusted-actor", "agent-loop"]) == expected
 
 
-def test_no_checks_never_merges_when_managed_label_state_is_unreadable(tmp_path):
-    runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
-    config = make_config(tmp_path, auto_merge=True, watch_pending_ci=True)
-
-    with (
-        patch.object(orchestrator_module, "watch_pr_checks", return_value=CiWatchOutcome(status="no_checks")),
-        patch.object(orchestrator_module, "managed_label_present", return_value=None),
-        pytest.raises(AgentLoopError, match="present or unreadable"),
-    ):
-        run_pr_loop(runner, pr_number=77, config=config)
-
-
 def test_config_does_not_enable_ci_watch_without_auto_merge(tmp_path):
     parser = build_parser()
     args = parser.parse_args(["pr", "77", "--repo", "OWNER/REPO"])
@@ -1651,6 +1642,41 @@ def test_config_allows_disabling_auto_merge_ci_watch(tmp_path):
     config = config_from_args(args, FakeRunner())
 
     assert config.watch_pending_ci is False
+    assert config.watch_pending_ci_explicit is True
+
+
+def test_config_records_explicit_legacy_ci_name_without_changing_effective_name(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "pr", "77", "--repo", "OWNER/REPO", "--auto-merge", "--ci-check-name", "legacy-ci",
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.ci_check_name == "legacy-ci"
+    assert config.ci_check_name_explicit is True
+    assert config.watch_pending_ci is True
+
+
+def test_auto_merge_compatibility_options_emit_warnings(tmp_path, monkeypatch, capsys):
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        watch_pending_ci=False,
+        ci_check_name_explicit=True,
+        watch_pending_ci_explicit=True,
+    )
+    monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: config)
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *args, **kwargs: 0)
+
+    assert main([
+        "pr", "77", "--repo", "OWNER/REPO", "--auto-merge",
+        "--ci-check-name", "legacy-ci", "--no-watch-pending-ci",
+    ]) == 0
+
+    warning = capsys.readouterr().err
+    assert "--ci-check-name is retained for compatibility" in warning
+    assert "--no-watch-pending-ci is retained for compatibility" in warning
 
 
 def test_config_honors_explicit_ci_watch_without_auto_merge(tmp_path):

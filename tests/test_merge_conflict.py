@@ -62,7 +62,7 @@ def test_conflict_at_round_start_skips_reviewers_and_routes_to_coder(tmp_path):
     assert check_runs_index_before_claude == []
 
 
-def test_conflict_after_review_before_merge_blocks_ci_wait_and_merge(tmp_path):
+def test_conflict_after_review_before_merge_blocks_watcher_and_merge(tmp_path):
     runner = FakeRunner(
         claude_outputs=["Resolved the conflict.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
         codex_outputs=[
@@ -87,15 +87,16 @@ def test_conflict_after_review_before_merge_blocks_ci_wait_and_merge(tmp_path):
     config = make_config(tmp_path, auto_merge=True)
 
     with patch(
-        "coding_review_agent_loop.orchestrator.wait_for_ci", wraps=orchestrator.wait_for_ci
-    ) as wait_spy, patch("coding_review_agent_loop.orchestrator.merge_pr") as merge_spy:
+        "coding_review_agent_loop.orchestrator.watch_pr_checks",
+        wraps=orchestrator.watch_pr_checks,
+    ) as watch_spy, patch("coding_review_agent_loop.orchestrator.merge_pr") as merge_spy:
         result = run_pr_loop(runner, pr_number=77, config=config)
 
     assert result == 0
     # The merge-gate probe (right before CI checks) caught the conflict, so
     # CI was never polled and the merge was never attempted in round 1;
     # both only happen after the coder resolves and round 2 re-approves.
-    assert wait_spy.call_count == 1
+    assert watch_spy.call_count == 1
     assert merge_spy.call_count == 1
     assert len(_codex_exec_commands(runner)) == 2
     assert len(_claude_commands(runner)) == 1

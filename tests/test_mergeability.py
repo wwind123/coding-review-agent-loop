@@ -1,4 +1,4 @@
-"""Tests for GitHub mergeability probing and its use in wait_for_ci (#606)."""
+"""Tests for GitHub mergeability probing and its full-board watcher use (#606)."""
 import json
 
 from coding_review_agent_loop.comment_rendering import _format_unresolved_item_label
@@ -6,7 +6,7 @@ from coding_review_agent_loop.github import (
     PullRequestMergeability,
     PullRequestMetadata,
     get_pr_mergeability,
-    wait_for_ci,
+    watch_pr_checks,
 )
 from coding_review_agent_loop.protocol import UnresolvedReviewItem, validate_structured_coder_followup
 from coding_review_agent_loop.runner import CommandResult, Runner
@@ -52,6 +52,10 @@ class _StubMergeabilityRunner(Runner):
         if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/check-runs"):
             payload = self.check_runs_responses.pop(0) if self.check_runs_responses else {"check_runs": []}
             return CommandResult(cmd, cwd, json.dumps(payload), "", 0)
+        if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/status"):
+            return CommandResult(cmd, cwd, json.dumps({"statuses": []}), "", 0)
+        if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/protection/required_status_checks"):
+            return CommandResult(cmd, cwd, json.dumps({"contexts": []}), "", 0)
         raise AssertionError(f"unexpected command: {cmd}")
 
 
@@ -189,10 +193,10 @@ def test_dry_run_never_calls_gh(tmp_path):
     assert runner.commands == []
 
 
-# --- wait_for_ci merge_conflict outcome -------------------------------------
+# --- full-board watcher mergeability outcomes -------------------------------
 
 
-def test_wait_for_ci_returns_merge_conflict_on_first_poll(tmp_path):
+def test_watcher_returns_merge_conflict_before_check_board_poll(tmp_path):
     config = make_config(tmp_path, ci_timeout_seconds=120, ci_poll_interval_seconds=10)
     runner = _StubMergeabilityRunner(
         mergeability_responses=[
@@ -200,7 +204,7 @@ def test_wait_for_ci_returns_merge_conflict_on_first_poll(tmp_path):
         ],
     )
 
-    outcome = wait_for_ci(runner, config, 77, metadata=_metadata())
+    outcome = watch_pr_checks(runner, config, 77, metadata=_metadata())
 
     assert outcome.status == "merge_conflict"
     assert outcome.mergeability is not None
@@ -210,7 +214,7 @@ def test_wait_for_ci_returns_merge_conflict_on_first_poll(tmp_path):
     assert runner.sleep_calls == []
 
 
-def test_wait_for_ci_passes_when_not_conflicted(tmp_path):
+def test_watcher_passes_full_board_when_not_conflicted(tmp_path):
     config = make_config(tmp_path, ci_timeout_seconds=120, ci_poll_interval_seconds=10)
     runner = _StubMergeabilityRunner(
         mergeability_responses=[
@@ -218,13 +222,13 @@ def test_wait_for_ci_passes_when_not_conflicted(tmp_path):
         ],
     )
 
-    outcome = wait_for_ci(runner, config, 77, metadata=_metadata())
+    outcome = watch_pr_checks(runner, config, 77, metadata=_metadata())
 
     assert outcome.status == "passed"
-    assert outcome.mergeability is None
+    assert outcome.head_sha == "headsha1"
 
 
-def test_wait_for_ci_reprobes_conflict_on_later_poll(tmp_path):
+def test_watcher_reprobes_conflict_on_later_poll(tmp_path):
     config = make_config(tmp_path, ci_timeout_seconds=120, ci_poll_interval_seconds=10)
     runner = _StubMergeabilityRunner(
         mergeability_responses=[
@@ -236,7 +240,7 @@ def test_wait_for_ci_reprobes_conflict_on_later_poll(tmp_path):
         ],
     )
 
-    outcome = wait_for_ci(runner, config, 77, metadata=_metadata())
+    outcome = watch_pr_checks(runner, config, 77, metadata=_metadata())
 
     assert outcome.status == "merge_conflict"
     assert outcome.mergeability is not None

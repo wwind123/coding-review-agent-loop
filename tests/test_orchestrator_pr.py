@@ -26,7 +26,6 @@ from coding_review_agent_loop.followups import (
     reconcile_plan_approved_followups,
 )
 from coding_review_agent_loop.github import (
-    CiWaitOutcome,
     CiWatchOutcome,
     HumanReviewRequirement,
     IssueComment,
@@ -1176,7 +1175,7 @@ def _watch_check_board(
 
 
 @pytest.mark.parametrize("auto_merge", [False, True])
-def test_watch_mode_success_skips_legacy_wait_for_ci(
+def test_watch_mode_success_uses_full_board_without_second_wait(
     tmp_path, monkeypatch, auto_merge
 ):
     runner = FakeRunner(codex_outputs=[structured_pr_review(state="approved", summary="Approved.")])
@@ -1184,12 +1183,9 @@ def test_watch_mode_success_skips_legacy_wait_for_ci(
     monkeypatch.setattr(
         orchestrator,
         "watch_pr_checks",
-        lambda *args, **kwargs: CiWatchOutcome(status="passed", attempts_used=1),
-    )
-    monkeypatch.setattr(
-        orchestrator,
-        "wait_for_ci",
-        lambda *args, **kwargs: pytest.fail("legacy CI waiter must not run in watch mode"),
+        lambda *args, **kwargs: CiWatchOutcome(
+            status="passed", head_sha="abc123", attempts_used=1
+        ),
     )
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert any("watching GitHub checks" in comment for comment in runner.comments)
@@ -1597,7 +1593,7 @@ def test_watch_failure_on_final_round_dispatches_coder_with_check_diagnostic(
                 failed_checks=(failed_check,),
                 attempts_used=1,
             ),
-            CiWatchOutcome(status="passed", attempts_used=1),
+            CiWatchOutcome(status="passed", head_sha="abc123", attempts_used=1),
         ]
     )
     runner = FakeRunner(
@@ -1858,7 +1854,7 @@ def test_watch_dry_run_previews_without_poll_sleep_coder_or_merge(tmp_path, caps
 
 
 @pytest.mark.parametrize("auto_merge", [False, True])
-def test_disabled_watch_mode_preserves_legacy_pending_and_auto_merge_paths(
+def test_disabled_watch_mode_preserves_manual_path_and_auto_merge_uses_full_board(
     tmp_path, monkeypatch, auto_merge
 ):
     runner = FakeRunner(
@@ -1870,28 +1866,55 @@ def test_disabled_watch_mode_preserves_legacy_pending_and_auto_merge_paths(
         },
     )
     config = make_config(tmp_path, watch_pending_ci=False, auto_merge=auto_merge)
-    monkeypatch.setattr(
-        orchestrator,
-        "watch_pr_checks",
-        lambda *args, **kwargs: pytest.fail("disabled watch mode must not invoke watcher"),
-    )
-    wait_calls = []
+    watch_calls = []
 
-    def legacy_wait(*args, **kwargs):
-        wait_calls.append((args, kwargs))
-        return CiWaitOutcome(status="passed")
+    def watch(*args, **kwargs):
+        watch_calls.append((args, kwargs))
+        return CiWatchOutcome(status="passed", head_sha="abc123", attempts_used=1)
 
-    monkeypatch.setattr(orchestrator, "wait_for_ci", legacy_wait)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert bool(wait_calls) is auto_merge
+    assert bool(watch_calls) is auto_merge
     merge_commands = [
         cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "merge"]
     ]
     assert bool(merge_commands) is auto_merge
     if not auto_merge:
         assert any("checks are still pending" in comment for comment in runner.comments)
+
+
+def test_auto_merge_green_board_ignores_legacy_check_name_and_merges_once(
+    tmp_path, monkeypatch
+):
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
+        pr_check_runs_payload={
+            "check_runs": [
+                {"name": "lint", "status": "completed", "conclusion": "success"}
+            ]
+        },
+        pr_status_payload={"state": "success", "statuses": []},
+        pr_branch_protection_payload={"contexts": []},
+    )
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        watch_pending_ci=False,
+        ci_check_name="legacy-ci",
+    )
+    with patch.object(orchestrator, "watch_pr_checks", wraps=orchestrator.watch_pr_checks) as watch_spy:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert watch_spy.call_count == 1
+    merge_commands = [
+        cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "merge"]
+    ]
+    assert merge_commands == [[
+        "gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge",
+        "--match-head-commit", "abc123",
+    ]]
 
 
 def test_watch_publishes_approved_followups_only_after_terminal_success(
@@ -1947,7 +1970,7 @@ def test_watch_publishes_approved_followups_only_after_terminal_success(
                 failed_checks=(failed_check,),
                 attempts_used=1,
             )
-        return CiWatchOutcome(status="passed", attempts_used=1)
+        return CiWatchOutcome(status="passed", head_sha="abc123", attempts_used=1)
 
     monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
 
@@ -2138,10 +2161,11 @@ def test_pr_loop_downgrades_pending_ci_only_blocking_review_with_auto_merge(tmp_
     )
     config = make_config(tmp_path, auto_merge=True)
 
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    with pytest.raises(AgentLoopError, match="full-board CI watch did not pass within"):
+        run_pr_loop(runner, pr_number=77, config=config)
 
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
-    assert any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
     review_comment = runner.comments[0]
     assert review_comment.startswith("**Review verdict:** Approved")
 
@@ -2822,7 +2846,7 @@ def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
 
     agent_commands = [cmd[:2] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
     assert agent_commands == [["codex", "exec"], ["claude", "--print"]]
-    assert len(runner.comments) == 2
+    assert len(runner.comments) == 3
     commands = [cmd for cmd, _cwd in runner.commands]
     metadata_fetches = [
         cmd

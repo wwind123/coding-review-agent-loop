@@ -38,13 +38,11 @@ from .managed_ci import (
 from .managed_pr import create_managed_pr
 from .github import (
     detect_repo,
-    get_check_status,
     get_pr_head_sha,
     merge_pr,
     post_pr_comment,
     validate_open_issue,
     validate_open_pr,
-    wait_for_ci,
 )
 from .logging import agent_log_path, log
 from .orchestrator import (
@@ -336,20 +334,24 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.add_argument(
             "--ci-check-name",
-            default="test",
-            help="GitHub check-run name required before --auto-merge (default: test).",
+            default=None,
+            help=(
+                "Retained for compatibility (default: test); ordinary --auto-merge now "
+                "gates on the complete full-board check snapshot, so this name does not "
+                "select the merge gate."
+            ),
         )
         subparser.add_argument(
             "--ci-timeout-seconds",
             type=int,
             default=1200,
-            help="Maximum time to wait for the CI check before auto-merge (default: 1200).",
+            help="Maximum time to watch the full CI board before auto-merge (default: 1200).",
         )
         subparser.add_argument(
             "--ci-poll-interval-seconds",
             type=int,
             default=30,
-            help="Polling interval for the CI check before auto-merge (default: 30).",
+            help="Polling interval for the full CI board before auto-merge (default: 30).",
         )
         subparser.add_argument(
             "--ci-startup-timeout-seconds",
@@ -366,9 +368,10 @@ def build_parser() -> argparse.ArgumentParser:
             dest="watch_pending_ci",
             default=None,
             help=(
-                "For ordinary CI, foreground-poll the full GitHub check board after approval "
-                "and resume the coder if CI fails (enabled by default with --auto-merge). "
-                "Managed exact-head qualification remains its own gate."
+                "For ordinary CI without --auto-merge, foreground-poll the full GitHub check "
+                "board after approval and resume the coder if CI fails. Ordinary --auto-merge "
+                "always uses this full-board gate; --no-watch-pending-ci is retained only as a "
+                "compatibility warning. Managed exact-head qualification remains its own gate."
             ),
         )
         subparser.add_argument(
@@ -884,6 +887,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not (args.managed_ci_trusted_actor or "").strip():
                 raise AgentLoopError("--managed-ci requires --managed-ci-trusted-actor.")
         config = config_from_args(args, runner, invocation_argv=invocation)
+        if config.auto_merge and config.ci_check_name_explicit:
+            print(
+                "agent-loop: warning: --ci-check-name is retained for compatibility and "
+                "no longer selects the ordinary auto-merge gate; the complete full-board "
+                "watcher is used.",
+                file=sys.stderr,
+            )
+        if config.auto_merge and config.watch_pending_ci_explicit and not config.watch_pending_ci:
+            print(
+                "agent-loop: warning: --no-watch-pending-ci is retained for compatibility "
+                "and no longer disables the ordinary auto-merge full-board watcher.",
+                file=sys.stderr,
+            )
         implementation_override_requested = (
             args.implementation_coder is not None
             or args.implementation_coder_model

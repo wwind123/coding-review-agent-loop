@@ -16,8 +16,6 @@ from coding_review_agent_loop.github import (
     PullRequestCheck as GithubPullRequestCheck,
     PullRequestChecks as GithubPullRequestChecks,
     PullRequestMetadata,
-    get_check_record,
-    get_check_status,
     get_pr_checks,
 )
 from coding_review_agent_loop.runner import CommandResult, Runner
@@ -403,34 +401,6 @@ def test_reexported_names_import_from_github_module():
     assert GithubPullRequestChecks is PullRequestChecks
 
 
-def test_get_check_record_returns_full_record(tmp_path):
-    config = make_config(tmp_path)
-    runner = _StubGhRunner(
-        check_runs_payload={
-            "check_runs": [
-                {
-                    "id": 42,
-                    "name": "test",
-                    "status": "completed",
-                    "conclusion": "success",
-                    "started_at": "2026-05-23T11:00:00Z",
-                    "completed_at": "2026-05-23T11:05:00Z",
-                }
-            ]
-        }
-    )
-
-    record = get_check_record(runner, config, "abc123")
-
-    assert record is not None
-    assert record.check_id == 42
-    assert record.status == "success"
-    assert get_check_status(runner, config, "abc123") == "success"
-
-
-def test_get_check_record_missing_check_returns_none(tmp_path):
-    config = make_config(tmp_path)
-    runner = _StubGhRunner(check_runs_payload={"check_runs": []})
-
-    assert get_check_record(runner, config, "abc123") is None
-    assert get_check_status(runner, config, "abc123") == "pending"
+def test_full_board_types_remain_reexported_for_current_callers():
+    assert github_module.PullRequestCheck.__name__ == "PullRequestCheck"
+    assert github_module.PullRequestChecks.__name__ == "PullRequestChecks"
