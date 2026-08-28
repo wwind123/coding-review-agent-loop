@@ -17,9 +17,10 @@ from .base import (
     read_public_response_file,
     with_public_response_file_instruction,
 )
+from .replacement import classify_provider_executable_replacement_interruption
 from ..logging import agent_log_path, log
 from ..protocol import CLARIFY_RE, PLAN_STATE_RE, PUBLIC_RESPONSE_MARKER, STATE_RE
-from ..runner import CommandResult, Runner, executable_identity_changed, strip_ansi
+from ..runner import CommandResult, Runner
 from ..usage import UsageMetadata, coerce_int, first_present
 from ..workdir_guard import (
     WorkdirReplayEvidence,
@@ -87,38 +88,6 @@ _GEMINI_LOADER_LINE_RE = re.compile(
     r"(?:updat(?:e|er)|launcher|replacement).*(?:failed|error|unavailable|in\s+progress)"
     r")"
 )
-_GEMINI_DIAGNOSTIC_MAX_LINES = 40
-_GEMINI_DIAGNOSTIC_MAX_CHARS = 8192
-
-
-def _json_structured_payload(raw: str) -> bool:
-    """Return true for a complete or line-delimited structured payload."""
-    candidates = [raw, *raw.splitlines()]
-    for candidate in candidates:
-        if not candidate.strip():
-            continue
-        try:
-            json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        return True
-    return False
-
-
-def _gemini_startup_or_loader_diagnostics(raw: str) -> bool:
-    normalized = strip_ansi(raw).strip()
-    if not normalized:
-        return True
-    if len(normalized) > _GEMINI_DIAGNOSTIC_MAX_CHARS:
-        return False
-    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
-    if len(lines) > _GEMINI_DIAGNOSTIC_MAX_LINES:
-        return False
-    return all(
-        _GEMINI_STARTUP_LINE_RE.fullmatch(line) is not None
-        or _GEMINI_LOADER_LINE_RE.search(line) is not None
-        for line in lines
-    )
 
 
 def classify_gemini_executable_replacement_interruption(
@@ -129,33 +98,14 @@ def classify_gemini_executable_replacement_interruption(
     before_snapshot: WorkdirSnapshot | None = None,
     after_snapshot: WorkdirSnapshot | None = None,
 ) -> WorkdirReplayEvidence | None:
-    """Classify a quiet Gemini launcher replacement with fail-closed gates."""
-    observation = result.observation
-    if (
-        type(result.returncode) is not int
-        or observation is None
-        or observation.interrupted
-        or result.capture_diagnostics
-        or response_file_text
-        or PUBLIC_RESPONSE_MARKER in result.stdout
-        or _json_structured_payload(result.stdout)
-        or not _gemini_startup_or_loader_diagnostics(result.stdout)
-    ):
-        return None
-    if not executable_identity_changed(
-        observation.before,
-        observation.after,
+    return classify_provider_executable_replacement_interruption(
+        result,
         command=command,
-        spawn_wall_time=observation.spawn_wall_time,
-        exit_wall_time=observation.spawn_wall_time + observation.elapsed_seconds,
-    ):
-        return None
-    reason = "Gemini executable changed during invocation"
-    if before_snapshot is None and after_snapshot is None:
-        return WorkdirReplayEvidence(reason)
-    return gate_workdir_replay(
-        "Gemini executable replacement",
-        reason,
+        response_file_text=response_file_text,
+        startup_line_re=_GEMINI_STARTUP_LINE_RE,
+        loader_line_re=_GEMINI_LOADER_LINE_RE,
+        provider_label="Gemini executable replacement",
+        reason="Gemini executable changed during invocation",
         before_snapshot=before_snapshot,
         after_snapshot=after_snapshot,
     )

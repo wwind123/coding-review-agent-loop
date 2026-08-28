@@ -4184,7 +4184,7 @@ def test_codex_unstable_replacement_retains_ordinary_retry(tmp_path):
     )
     results = iter(
         [
-            _observed_codex_result(tmp_path, raw_output="overloaded_error"),
+            _observed_codex_result(tmp_path),
             AgentResult(text=valid, raw_output=valid, returncode=0),
         ]
     )
@@ -4311,7 +4311,7 @@ def test_gemini_unstable_replacement_preserves_ordinary_retry(tmp_path):
                 tmp_path,
                 command="gemini",
                 reason="Gemini executable changed during invocation",
-                raw_output="overloaded_error",
+                returncode=0,
             ),
             AgentResult(text=valid, raw_output=valid, returncode=0),
         ]
@@ -4335,6 +4335,90 @@ def test_gemini_unstable_replacement_preserves_ordinary_retry(tmp_path):
     assert response.marker_value.state == "approved"
     assert run_mock.call_count == 2
     assert "attempt_suffix" not in run_mock.call_args_list[1].kwargs
+
+
+def test_claude_quiet_unstable_replacement_keeps_ordinary_retry(tmp_path):
+    valid = structured_pr_review(
+        state="approved", summary="Ordinary retry recovered.", reviewer="Anthropic Claude"
+    )
+    results = iter(
+        [
+            _observed_replacement_result(
+                tmp_path,
+                command="claude",
+                reason="Claude Code updater diagnostic",
+            ),
+            AgentResult(text=valid, raw_output=valid, returncode=0),
+        ]
+    )
+    runner = FakeRunner()
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: False
+    config = make_config(tmp_path, reviewer="claude", agent_max_retries=1)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="test",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="Anthropic Claude", unresolved_items=()
+            ),
+        )
+
+    assert response.marker_value.state == "approved"
+    assert run_mock.call_count == 2
+    assert run_mock.call_args_list[1].kwargs["attempt_suffix"] == "attempt2"
+
+
+def test_antigravity_quiet_unstable_replacement_reaches_model_fallback(tmp_path):
+    valid = structured_pr_review(
+        state="approved", summary="Fallback recovered.", reviewer="Google Antigravity"
+    )
+    results = iter(
+        [
+            _observed_replacement_result(
+                tmp_path,
+                command="agy",
+                reason="Antigravity executable changed during invocation",
+                returncode=0,
+                model_used="ModelA",
+            ),
+            AgentResult(text="", raw_output="quota exceeded", returncode=1, model_used="ModelA"),
+            AgentResult(text=valid, raw_output=valid, returncode=0, model_used="ModelB"),
+        ]
+    )
+    runner = FakeRunner()
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: False
+    config = make_config(
+        tmp_path,
+        reviewer="antigravity",
+        antigravity_models=("ModelA", "ModelB"),
+        agent_max_retries=1,
+    )
+    models: list[tuple[str, ...]] = []
+
+    def mock_run(_runner, *, config, **_kwargs):
+        models.append(config.antigravity_models)
+        return next(results)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=mock_run) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="antigravity",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="test",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="Google Antigravity", unresolved_items=()
+            ),
+        )
+
+    assert response.marker_value.state == "approved"
+    assert models == [("ModelA",), ("ModelA",), ("ModelB",)]
+    assert "attempt_suffix" not in run_mock.call_args_list[1].kwargs
+    assert "attempt_suffix" not in run_mock.call_args_list[2].kwargs
 
 
 def test_antigravity_replacement_replay_does_not_advance_model_state(tmp_path):

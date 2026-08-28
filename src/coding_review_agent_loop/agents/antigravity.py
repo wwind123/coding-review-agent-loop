@@ -39,10 +39,11 @@ from .base import (
     read_public_response_file,
     with_public_response_file_instruction,
 )
+from .replacement import classify_provider_executable_replacement_interruption
 from ..errors import AgentLoopError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
-from ..runner import CommandResult, Runner, executable_identity_changed, strip_ansi
+from ..runner import CommandResult, Runner, strip_ansi
 from ..workdir_guard import (
     WorkdirReplayEvidence,
     WorkdirSnapshot,
@@ -173,7 +174,7 @@ _ANTIGRAVITY_STARTUP_LINE_RE = re.compile(
     r"model\s*[:=].+|"
     r"version\s*[:=]\s*[\w.-]+|"
     r"loaded\s+(?:configuration|credentials|settings)\b.*|"
-    r"(?:checking|applying)\s+(?:for\s+)?(?:agy|antigravity|gemini\s+)?updates?\b.*"
+    r"(?:checking|applying)\s+(?:for\s+)?(?:(?:agy|antigravity|gemini)\s+)?updates?\b.*"
     r")$"
 )
 _ANTIGRAVITY_LOADER_LINE_RE = re.compile(
@@ -189,38 +190,6 @@ _ANTIGRAVITY_LOADER_LINE_RE = re.compile(
     r"(?:updat(?:e|er)|launcher|replacement).*(?:failed|error|unavailable|in\s+progress)"
     r")"
 )
-_ANTIGRAVITY_DIAGNOSTIC_MAX_LINES = 40
-_ANTIGRAVITY_DIAGNOSTIC_MAX_CHARS = 8192
-
-
-def _agy_structured_payload(raw: str) -> bool:
-    for candidate in (raw, *raw.splitlines()):
-        if not candidate.strip():
-            continue
-        try:
-            json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        return True
-    return False
-
-
-def _agy_startup_or_loader_diagnostics(raw: str) -> bool:
-    normalized = strip_ansi(raw).strip()
-    if not normalized:
-        return True
-    if len(normalized) > _ANTIGRAVITY_DIAGNOSTIC_MAX_CHARS:
-        return False
-    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
-    if len(lines) > _ANTIGRAVITY_DIAGNOSTIC_MAX_LINES:
-        return False
-    return all(
-        _ANTIGRAVITY_STARTUP_LINE_RE.fullmatch(line) is not None
-        or _ANTIGRAVITY_LOADER_LINE_RE.search(line) is not None
-        for line in lines
-    )
-
-
 def classify_antigravity_executable_replacement_interruption(
     result: CommandResult,
     *,
@@ -229,33 +198,14 @@ def classify_antigravity_executable_replacement_interruption(
     before_snapshot: WorkdirSnapshot | None = None,
     after_snapshot: WorkdirSnapshot | None = None,
 ) -> WorkdirReplayEvidence | None:
-    """Classify a quiet `agy` launcher replacement with fail-closed gates."""
-    observation = result.observation
-    if (
-        type(result.returncode) is not int
-        or observation is None
-        or observation.interrupted
-        or result.capture_diagnostics
-        or response_file_text
-        or PUBLIC_RESPONSE_MARKER in result.stdout
-        or _agy_structured_payload(result.stdout)
-        or not _agy_startup_or_loader_diagnostics(result.stdout)
-    ):
-        return None
-    if not executable_identity_changed(
-        observation.before,
-        observation.after,
+    return classify_provider_executable_replacement_interruption(
+        result,
         command=command,
-        spawn_wall_time=observation.spawn_wall_time,
-        exit_wall_time=observation.spawn_wall_time + observation.elapsed_seconds,
-    ):
-        return None
-    reason = "Antigravity executable changed during invocation"
-    if before_snapshot is None and after_snapshot is None:
-        return WorkdirReplayEvidence(reason)
-    return gate_workdir_replay(
-        "Antigravity executable replacement",
-        reason,
+        response_file_text=response_file_text,
+        startup_line_re=_ANTIGRAVITY_STARTUP_LINE_RE,
+        loader_line_re=_ANTIGRAVITY_LOADER_LINE_RE,
+        provider_label="Antigravity executable replacement",
+        reason="Antigravity executable changed during invocation",
         before_snapshot=before_snapshot,
         after_snapshot=after_snapshot,
     )

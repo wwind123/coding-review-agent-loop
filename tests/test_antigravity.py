@@ -775,9 +775,9 @@ def test_antigravity_after_snapshot_runs_after_gemini_cleanup_under_lock(
     agy_dir = tmp_path / "agy"
     agy_dir.mkdir(parents=True)
     settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
     if role == "reviewer":
         settings_file.write_text('{"existing": true}', encoding="utf-8")
-        monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
 
     identity = ExecutableIdentity(
         "agy", "agy-target", (1, 1, 90_000_000_000), (1, 2, 90_000_000_000)

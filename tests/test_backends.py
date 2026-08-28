@@ -316,6 +316,7 @@ def test_gemini_replacement_rejects_progress_public_payload_and_artifacts(output
 def test_antigravity_replacement_accepts_startup_chrome_and_loader_failure(returncode):
     output = (
         "Antigravity CLI v0.8.0\n"
+        "Checking for agy updates...\n"
         "Model: Gemini 3.1 Pro (High)\n"
         "Error: Cannot find module '/opt/agy/launcher.js'\n"
         "code: 'MODULE_NOT_FOUND'\n"
