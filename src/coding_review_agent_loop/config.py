@@ -178,7 +178,8 @@ class AgentLoopConfig:
     mergeability_poll_interval_seconds: int = 5
     # Foreground full-board CI watch after reviewer approval (#587). CLI
     # invocations enable this automatically with --auto-merge; direct config
-    # constructions remain conservative unless they set it explicitly.
+    # constructions remain conservative unless they set it explicitly. Ordinary
+    # auto-merge uses the watcher regardless of this compatibility value.
     watch_pending_ci: bool = False
     # Explicit request to activate managed exact-head CI without requesting a
     # merge. `auto_merge` remains an implicit managed-CI eligibility signal so
@@ -216,6 +217,11 @@ class AgentLoopConfig:
     # Separate bounded startup observation for CI that has not materialized a
     # run/check yet.  Empty boards are never evidence that CI succeeded.
     ci_startup_timeout_seconds: int = 120
+    # CLI provenance for compatibility options. These are intentionally kept
+    # separate from their effective values so auto-merge can warn when an old
+    # selector or opt-out no longer changes the full-board gate.
+    ci_check_name_explicit: bool = False
+    watch_pending_ci_explicit: bool = False
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -1022,7 +1028,7 @@ def config_from_args(
         review_parallel=getattr(args, "review_parallel", False),
         test_command=test_command,
         pre_review_tests=args.pre_review_tests,
-        ci_check_name=args.ci_check_name,
+        ci_check_name=getattr(args, "ci_check_name", None) or "test",
         ci_timeout_seconds=args.ci_timeout_seconds,
         ci_poll_interval_seconds=args.ci_poll_interval_seconds,
         ci_startup_timeout_seconds=getattr(args, "ci_startup_timeout_seconds", 120),
@@ -1031,6 +1037,8 @@ def config_from_args(
             if getattr(args, "watch_pending_ci", None) is None
             else bool(args.watch_pending_ci)
         ),
+        ci_check_name_explicit=getattr(args, "ci_check_name", None) is not None,
+        watch_pending_ci_explicit=getattr(args, "watch_pending_ci", None) is not None,
         managed_ci_trusted_actor=getattr(args, "managed_ci_trusted_actor", None),
         managed_ci=getattr(args, "managed_ci", False),
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),

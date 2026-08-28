@@ -527,9 +527,7 @@ def test_ordinary_resume_command_preserves_merge_and_watch_mode_without_managed_
         managed_ci=False,
     )
 
-    assert command == (
-        "agent-loop pr 42 --repo OWNER/REPO --base main --auto-merge --watch-pending-ci"
-    )
+    assert command == "agent-loop pr 42 --repo OWNER/REPO --base main --auto-merge"
 
 
 def test_managed_resume_command_retains_managed_ci_configuration(tmp_path):
@@ -547,19 +545,19 @@ def test_managed_resume_command_retains_managed_ci_configuration(tmp_path):
     )
 
     assert command == (
-        "agent-loop pr 42 --repo OWNER/REPO --base main --auto-merge --watch-pending-ci "
+        "agent-loop pr 42 --repo OWNER/REPO --base main --auto-merge "
         "--managed-ci --managed-ci-trusted-actor agent-loop --allow-unprotected-managed-ci"
     )
 
 
-def test_resume_command_preserves_explicit_ordinary_watch_opt_out(tmp_path):
+def test_resume_command_omits_retired_ordinary_watch_opt_out(tmp_path):
     command = render_managed_ci_resume_command(
         make_config(tmp_path, auto_merge=True, watch_pending_ci=False),
         pr_number=42,
         managed_ci=False,
     )
 
-    assert command.endswith("--auto-merge --no-watch-pending-ci")
+    assert command.endswith("--auto-merge")
 
 
 def test_issue_created_handoff_authenticates_override_before_any_remote_write(tmp_path):

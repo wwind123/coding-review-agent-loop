@@ -877,17 +877,25 @@ For repositories without that contract, `--auto-merge` foreground-polls the
 complete check board after approval with
 `--ci-timeout-seconds` and
 `--ci-poll-interval-seconds`, without invoking agents while checks are pending.
-Failure resumes the coder with the failed-check details; only a non-empty
-successful board is mergeable. An empty rollup is a bounded startup state, not
-CI success: after `--ci-startup-timeout-seconds` it stops with a resumable PR
-command and does not ready or merge the PR. The watcher is synchronous and interruptible: Ctrl-C leaves
-no worker behind, and a rerun starts from fresh PR state. On timeout the local
-terminal prints a shell-quoted rerun command; PR comments intentionally contain
-no captured command arguments. Use `--no-watch-pending-ci` with `--auto-merge`
-to retain the previous behavior. Without `--auto-merge`, agent-loop reports an
-approved PR as merge-ready and does not wait for CI, unless `--watch-pending-ci`
-is passed explicitly, in which case it still watches the check board and
-reports merge-ready without merging.
+Failure resumes the coder with the failed-check details; only a reliable,
+non-empty current-head board is mergeable. Reliability requires an available
+check query and branch-protection result, no pending or missing required
+checks, and passing reported checks. Partial or unavailable snapshots remain
+fail-closed and are polled; an otherwise reliable empty board is bounded
+startup, not CI success. After `--ci-startup-timeout-seconds` it stops with a
+resumable PR command and does not ready or merge the PR. The live head is
+re-read immediately before the exact-head merge proof. The watcher is
+synchronous and interruptible: Ctrl-C leaves no worker behind, and a rerun
+starts from fresh PR state. One timeout and attempt budget is shared across
+watcher polls and any coder-failure or head-change rounds. Auto-merge timeout,
+bounded-startup, and already-exhausted-budget stops retain resumable diagnostics
+and return non-zero; explicit manual `--watch-pending-ci` stops return zero
+without merging. `--ci-check-name` and `--no-watch-pending-ci` remain parseable
+compatibility options, but do not select or disable this auto-merge gate and
+warn when explicitly supplied with auto-merge. Without `--auto-merge`,
+agent-loop reports an approved PR as merge-ready and does not wait for CI,
+unless `--watch-pending-ci` is passed explicitly, in which case it still
+watches the check board and reports merge-ready without merging.
 
 By default Claude is the coder and Codex is the reviewer. Reverse that with:
 

@@ -128,6 +128,17 @@ def test_readme_links_to_managed_exact_head_ci_and_scopes_watch_mode():
     )
 
 
+def test_watch_docs_define_full_board_policy_and_compatibility_behavior():
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    normalized_text = " ".join(text.split())
+
+    assert "ordinary `--auto-merge` always enters the full-board watcher" in normalized_text
+    assert "reliable, non-empty current-head board" in normalized_text
+    assert "shared across all watcher entries" in normalized_text
+    assert "Auto-merge timeout, `not_started`, and pre-poll exhaustion" in normalized_text
+    assert "legacy single `--ci-check-name` waiter" not in normalized_text
+
+
 def test_managed_ci_docs_describe_explicit_existing_pr_adoption_and_opt_out():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert "#### Optional adoption of an existing PR" in text

@@ -948,7 +948,13 @@ class FakeRunner(Runner):
 
         if cmd[:3] == ["gh", "pr", "view"]:
             if "--jq" in cmd and ".headRefOid" in cmd:
-                return CommandResult(cmd, cwd_path, "abc123\n", "", 0)
+                return CommandResult(
+                    cmd,
+                    cwd_path,
+                    f"{self.pr_payload.get('headRefOid', 'abc123')}\n",
+                    "",
+                    0,
+                )
             return CommandResult(cmd, cwd_path, json_dumps(self.pr_payload), "", 0)
 
         if cmd[:3] == ["gh", "repo", "view"] and "defaultBranchRef" in cmd:

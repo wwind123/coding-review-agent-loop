@@ -1043,12 +1043,8 @@ def render_managed_ci_resume_command(
         command.extend(("--base", config.base))
     if config.auto_merge:
         command.append("--auto-merge")
-    if config.watch_pending_ci:
+    if config.watch_pending_ci and not config.auto_merge:
         command.append("--watch-pending-ci")
-    elif config.auto_merge:
-        # CLI invocations enable this by default with --auto-merge, so an
-        # explicit opt-out is required to faithfully reproduce this stop.
-        command.append("--no-watch-pending-ci")
     if managed_ci:
         command.append("--managed-ci")
         if config.managed_ci_trusted_actor:

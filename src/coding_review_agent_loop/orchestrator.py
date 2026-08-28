@@ -82,7 +82,6 @@ from .github import (
     validate_pr_expected_closing_issues,
     validate_pr_references_issue,
     validate_pull_request_provenance,
-    wait_for_ci,
     watch_pr_checks,
 )
 from .issue_pr_handoff import (
@@ -180,6 +179,7 @@ from .prompts import (
 )
 from .protocol import (
     AgentUnavailable,
+    ApprovedFollowup,
     ApprovedFollowups,
     DISCUSS_FAILED_OUTCOME,
     DISCUSS_RESEARCH_TARGET_VALUES,
@@ -514,6 +514,24 @@ class ExactHeadCiProof:
 
     head_sha: str
     source: str
+
+
+def _render_ci_rerun_command(config: AgentLoopConfig, *, pr_number: int) -> str:
+    """Render local CI recovery guidance without retired auto-merge selectors."""
+    if config.invocation_argv:
+        argv = config.invocation_argv
+        if config.auto_merge:
+            argv = tuple(
+                token
+                for token in argv
+                if token not in {"--watch-pending-ci", "--no-watch-pending-ci"}
+            )
+        return shlex.join(argv)
+    return (
+        f"agent-loop pr {pr_number} --auto-merge"
+        if config.auto_merge
+        else f"agent-loop pr {pr_number} --watch-pending-ci"
+    )
 
 
 def _merge_with_exact_head_proof(
@@ -6691,6 +6709,68 @@ def _stop_on_terminal_without_status(
     return 0
 
 
+def _stop_after_ci_watch_timeout(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    head_sha: str | None,
+    pr_comments: Sequence[object],
+    followups: list[ApprovedFollowup],
+    details: list[str],
+    reason: Literal["budget_exhausted", "timeout"],
+) -> int:
+    """Publish resumable guidance for a watch that cannot continue or finish."""
+    _publish_approved_followups(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        pr_comments=pr_comments,
+        followups=followups,
+    )
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=_pending_ci_stop_message(pr_number, "pending", details),
+    )
+    rerun = _render_ci_rerun_command(config, pr_number=pr_number)
+    note = (
+        ""
+        if config.invocation_argv
+        else " (deterministic fallback; original invocation unavailable)"
+    )
+    if reason == "budget_exhausted":
+        log(
+            config,
+            f"Round {round_number}: PR #{pr_number} shared CI watch budget was "
+            "exhausted before a fresh poll; no merge attempted",
+        )
+        print(
+            f"PR #{pr_number} CI watch budget was exhausted by earlier rounds; "
+            f"no fresh poll was performed and no merge was attempted. "
+            f"Rerun: {rerun}{note}"
+        )
+        if config.auto_merge:
+            raise AgentLoopError(
+                f"PR #{pr_number} full-board CI watch budget was exhausted before "
+                "a fresh poll; no merge attempted."
+            )
+    else:
+        print(
+            f"PR #{pr_number} CI watch timed out: {'; '.join(details)}. "
+            f"Rerun: {rerun}{note}"
+        )
+        if config.auto_merge:
+            raise AgentLoopError(
+                f"PR #{pr_number} full-board CI watch did not pass within "
+                f"{config.ci_timeout_seconds}s; no merge attempted."
+            )
+    return 0
+
+
 def run_pr_loop(
     runner: Runner,
     *,
@@ -8174,12 +8254,38 @@ def run_pr_loop(
                     if merged:
                         print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
                     return 0
-                if not must_fix_items and config.watch_pending_ci and not managed_ci_active(pr_metadata):
+                if (
+                    not must_fix_items
+                    and (config.auto_merge or config.watch_pending_ci)
+                    and not managed_ci_active(pr_metadata)
+                    # A failure already visible in the approval snapshot is
+                    # existing actionable reviewer feedback; preserve the
+                    # normal coder-routing path. The watcher handles failures
+                    # discovered by a fresh poll after an otherwise clean
+                    # approval snapshot.
+                    and (pr_checks is None or pr_checks.state != "failing")
+                ):
                     if watch_deadline is None:
                         watch_deadline = time.monotonic() + config.ci_timeout_seconds
                         watch_attempts_remaining = max(
                             1,
                             config.ci_timeout_seconds // config.ci_poll_interval_seconds,
+                        )
+                    assert watch_attempts_remaining is not None
+                    if watch_attempts_remaining <= 0:
+                        return _stop_after_ci_watch_timeout(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            round_number=round_number,
+                            head_sha=pr_metadata.head_sha,
+                            pr_comments=pr_comments,
+                            followups=future_followups,
+                            details=[
+                                "The shared CI watch budget was exhausted by earlier watcher rounds; "
+                                "no fresh CI poll was performed."
+                            ],
+                            reason="budget_exhausted",
                         )
                     watching_message = (
                         f"Reviewers approved PR #{pr_number}; watching GitHub checks "
@@ -8193,18 +8299,14 @@ def run_pr_loop(
                         pr_number=pr_number,
                         body=watching_message + "\n\n-- coding-review-agent-loop",
                     )
-                    assert watch_attempts_remaining is not None
-                    if watch_attempts_remaining <= 0:
-                        watch_outcome = CiWatchOutcome(status="timeout")
-                    else:
-                        watch_outcome = watch_pr_checks(
-                            runner,
-                            config,
-                            pr_number,
-                            metadata=pr_metadata,
-                            deadline=watch_deadline,
-                            attempts=watch_attempts_remaining,
-                        )
+                    watch_outcome = watch_pr_checks(
+                        runner,
+                        config,
+                        pr_number,
+                        metadata=pr_metadata,
+                        deadline=watch_deadline,
+                        attempts=watch_attempts_remaining,
+                    )
                     watch_attempts_remaining -= watch_outcome.attempts_used
                     if watch_outcome.status == "dry_run":
                         print(f"PR #{pr_number} approval found; dry-run preview did not perform live CI watching.")
@@ -8220,12 +8322,17 @@ def run_pr_loop(
                         )
                         run_optional_tests(runner, config)
                         if config.auto_merge:
+                            if not watch_outcome.head_sha:
+                                raise AgentLoopError(
+                                    f"PR #{pr_number} full-board CI passed without a current-head "
+                                    "proof; no merge attempted."
+                                )
                             _merge_with_exact_head_proof(
                                 runner,
                                 config=config,
                                 pr_number=pr_number,
                                 proof=ExactHeadCiProof(
-                                    head_sha=pr_metadata.head_sha or "",
+                                    head_sha=watch_outcome.head_sha,
                                     source="full-board",
                                 ),
                             )
@@ -8246,27 +8353,11 @@ def run_pr_loop(
                             f"PR #{pr_number} has no materialized current-head CI board. No merge was "
                             f"attempted; resume with `{command}`."
                         )
-                        return 0
-                    # Compatibility fail-safe for an older watcher/provider
-                    # that still emits the retired outcome. It is never a
-                    # merge permit; unreadable managed suppression remains a
-                    # hard error rather than silently becoming ordinary CI.
-                    if watch_outcome.status == "no_checks":
-                        label_live = managed_label_present(
-                            runner, config=config, pr_number=pr_number
-                        )
-                        if label_live is not False:
+                        if config.auto_merge:
                             raise AgentLoopError(
-                                f"PR #{pr_number} has no ordinary CI checks while `{MANAGED_LABEL}` "
-                                "is present or unreadable; remove the label and wait for real CI before merging."
+                                f"PR #{pr_number} full-board CI did not start within the bounded "
+                                "startup window; no merge attempted."
                             )
-                        command = render_managed_ci_resume_command(
-                            config, pr_number=pr_number, managed_ci=False,
-                        )
-                        print(
-                            f"PR #{pr_number} has an empty CI board. No merge was attempted; "
-                            f"resume with `{command}`."
-                        )
                         return 0
                     if watch_outcome.status == "infrastructure_stall":
                         _publish_approved_followups(
@@ -8297,40 +8388,22 @@ def run_pr_loop(
                         print(f"PR #{pr_number} CI watch stopped: external CI infrastructure is stalled.")
                         return 0
                     if watch_outcome.status == "timeout":
-                        _publish_approved_followups(
-                            runner,
-                            config=config,
-                            pr_number=pr_number,
-                            head_sha=pr_metadata.head_sha,
-                            pr_comments=pr_comments,
-                            followups=future_followups,
-                        )
                         details = (
                             _pr_check_details(watch_outcome.pr_checks)
                             if watch_outcome.pr_checks
                             else ["No reliable check snapshot was available."]
                         )
-                        post_pr_comment(
+                        return _stop_after_ci_watch_timeout(
                             runner,
                             config=config,
                             pr_number=pr_number,
-                            body=_pending_ci_stop_message(pr_number, "pending", details),
+                            round_number=round_number,
+                            head_sha=pr_metadata.head_sha,
+                            pr_comments=pr_comments,
+                            followups=future_followups,
+                            details=details,
+                            reason="timeout",
                         )
-                        rerun = (
-                            shlex.join(config.invocation_argv)
-                            if config.invocation_argv
-                            else f"agent-loop pr {pr_number} --watch-pending-ci"
-                        )
-                        note = (
-                            ""
-                            if config.invocation_argv
-                            else " (deterministic fallback; original invocation unavailable)"
-                        )
-                        print(
-                            f"PR #{pr_number} CI watch timed out: {'; '.join(details)}. "
-                            f"Rerun: {rerun}{note}"
-                        )
-                        return 0
                     if watch_outcome.status == "head_changed":
                         log(config, f"PR #{pr_number} head changed while watching; re-review is required")
                         # Consume a fresh review round without dispatching the
@@ -8652,7 +8725,6 @@ def run_pr_loop(
                                 for item in unresolved_items
                                 if item.status in {"blocking", "same-pr"}
                             ]
-                            wait_outcome = None
                         elif ordinary_recovery_selected:
                             if ordinary_recovery is None:
                                 raise AgentLoopError(
@@ -8668,67 +8740,10 @@ def run_pr_loop(
                             if merged:
                                 print(f"PR #{pr_number} merged after deliberate ordinary recovery.")
                             return 0
-                        else:
-                            wait_outcome = wait_for_ci(
-                                runner, config, pr_number, metadata=pr_metadata
-                            )
-                        if wait_outcome is None:
-                            pass
-                        elif wait_outcome.status == "infrastructure_stall":
-                            assert wait_outcome.stall is not None
-                            post_pr_comment(
-                                runner,
-                                config=config,
-                                pr_number=pr_number,
-                                body=_format_ci_infrastructure_comment(pr_number, wait_outcome.stall),
-                            )
-                            post_pr_comment(
-                                runner,
-                                config=config,
-                                pr_number=pr_number,
-                                body=_ci_infrastructure_stop_message(pr_number, wait_outcome.stall, []),
-                            )
-                            log(
-                                config,
-                                f"Round {round_number}: PR #{pr_number} CI wait stopped on external "
-                                "infrastructure blocking; no merge attempted",
-                            )
-                            print(
-                                f"PR #{pr_number} was approved by "
-                                f"{format_agent_list(configured_reviewers)}, but external GitHub "
-                                "Actions infrastructure is blocking CI "
-                                f"({'; '.join(_ci_infrastructure_details(wait_outcome.stall))}). "
-                                "No merge was attempted; rerun the same command once GitHub Actions "
-                                "runners recover."
-                            )
-                            return 0
-                        elif wait_outcome.status == "merge_conflict":
-                            assert wait_outcome.mergeability is not None
-                            latest_mergeability = wait_outcome.mergeability
-                            unresolved_items = _reconcile_merge_conflict_item(
-                                unresolved_items,
-                                mergeability=wait_outcome.mergeability,
-                                source_round=round_number,
-                                current_head_sha=pr_metadata.head_sha,
-                            )
-                            must_fix_items = [
-                                item for item in unresolved_items if item.status in {"blocking", "same-pr"}
-                            ]
-                            log(
-                                config,
-                                f"Round {round_number}: PR #{pr_number} became conflicted with "
-                                f"{wait_outcome.mergeability.base_branch or config.base or 'the base branch'} "
-                                "during the CI wait; no merge attempted",
-                            )
-                        else:
-                            _merge_with_exact_head_proof(
-                                runner,
-                                config=config,
-                                pr_number=pr_number,
-                                proof=ExactHeadCiProof(
-                                    head_sha=pr_metadata.head_sha or "",
-                                    source="configured CI",
-                                ),
+                        elif config.auto_merge:
+                            raise AgentLoopError(
+                                f"PR #{pr_number} reached the ordinary auto-merge path without "
+                                "consuming a full-board CI watcher result; no merge attempted."
                             )
                     if not must_fix_items:
                         print(f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}.")

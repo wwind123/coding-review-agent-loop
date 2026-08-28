@@ -1434,15 +1434,25 @@ Auto-merge is disabled by default. Enable it explicitly:
 ```bash
 agent-loop pr 123 \
   --repo OWNER/REPO \
-  --auto-merge \
-  --ci-check-name test
+  --auto-merge
 ```
 
-For repositories without the managed exact-head CI contract, enabling auto-merge
-with the full-board watcher (the default — see "Watch pending CI" below) makes
-the tool foreground-poll the whole PR check board before merging.
-With `--no-watch-pending-ci`, it instead waits for the single configured
-`--ci-check-name` check-run to pass before merging, as in earlier releases.
+For repositories without the managed exact-head CI contract, auto-merge always
+uses the full-board watcher. A merge permit requires a reliable, non-empty
+current-head board: the check query and branch protection must be available,
+there must be no pending or missing required checks, and all reported checks
+must pass. Partial or unavailable snapshots remain fail-closed and are polled;
+an otherwise reliable empty board is bounded startup, not success. The live
+head is re-read immediately before an exact-head merge proof is sent to GitHub.
+
+`--ci-check-name` and `--no-watch-pending-ci` remain parseable compatibility
+options, but neither selects nor disables the ordinary auto-merge gate; an
+explicit use with auto-merge emits a warning. One timeout and attempt budget is
+shared across watcher polls, coder-failure rounds, and head-change rounds.
+Auto-merge timeout, bounded-startup, and already-exhausted-budget stops retain
+their resumable diagnostics and return a non-zero exit. An explicit manual
+`--watch-pending-ci` run keeps the same watcher outcomes but stops cleanly
+without merging.
 Local `--test-command` is an additional local gate, not a replacement for CI.
 By default, `--test-command` also runs after coder-created or coder-updated
 changes before reviewer rounds, so reviewers are less likely to spend rounds
@@ -1763,7 +1773,7 @@ invocation-owned managed label is released and the next invocation
 re-adopts/reapplies managed mode. A corrected head requires a fresh exact-head
 review. The managed route is selected independently of `--watch-pending-ci`;
 neither that flag nor `--no-watch-pending-ci` replaces exact-head
-qualification with an ordinary full-board or named-check wait.
+qualification with ordinary full-board watching.
 
 #### Managed-CI GitHub CLI compatibility
 
@@ -1792,29 +1802,41 @@ recovery trigger for this path.
 
 ### Watch pending CI
 
-For repositories not using managed exact-head CI, `--watch-pending-ci` is
-enabled by default whenever `--auto-merge` is set;
-pass `--no-watch-pending-ci` to fall back to the legacy single
-`--ci-check-name` waiter described above. It can also be passed explicitly
-without `--auto-merge`, in which case it watches ordinary checks after approval
-and reports merge-ready without merging. It does not activate suppression or
-replace managed exact-head qualification; when `--managed-ci` is active it is
-inert for that managed route.
+For repositories not using managed exact-head CI, ordinary `--auto-merge`
+always enters the full-board watcher, regardless of the effective
+`--watch-pending-ci` value. `--ci-check-name` and `--no-watch-pending-ci` remain
+parseable for compatibility and produce a warning when explicitly supplied
+with auto-merge; they do not select or weaken that gate. An explicit
+`--watch-pending-ci` without `--auto-merge` watches ordinary checks after
+approval and reports merge-ready without merging. It does not activate
+suppression or replace managed exact-head qualification; when `--managed-ci` is
+active it is inert for that managed route.
 
 When active, it foreground-polls the full PR check/status/required-check board
 using the existing timeout and poll interval controls. It does not call
 reviewers or the coder while checks remain pending. A completed actionable
 failure resumes the normal coder loop with the check name, conclusion, and
-URL; success or a reliable no-check board is merge-ready, or merges directly
-with `--auto-merge`. A new head is re-reviewed, and the final-round
-CI-failure path receives one bounded extra round.
+URL. A merge permit requires a reliable, non-empty current-head board with no
+pending or missing required checks, and all reported checks passing. Unavailable
+or partial queries, unavailable protection, pending checks, and missing
+required checks remain fail-closed polling states; only a reliable empty board
+uses the bounded `not_started` startup outcome. A new head is re-reviewed, and
+the final-round CI-failure path receives one bounded extra round.
+
+One deadline and attempt budget is shared across all watcher entries in an
+invocation, including rounds caused by a CI failure or head change. If that
+budget is already exhausted, the loop records that no fresh poll occurred.
+Auto-merge timeout, `not_started`, and pre-poll exhaustion retain resumable
+diagnostics and exit non-zero; explicit manual watch-only runs stop cleanly
+with exit zero. A passing board is consumed immediately by the exact-head merge
+proof, so it does not enter a second CI wait.
 
 The watch runs synchronously with interruptible `sleep` subprocesses, so Ctrl-C
 and restarts leave no hidden worker. Timeout and transient API snapshots remain
 bounded and print a shell-quoted rerun command only locally; GitHub comments do
 not repeat invocation arguments. Dry-run previews the watch without polling,
-sleeping, resuming agents, or merging. `--no-watch-pending-ci` retains the
-legacy named-check-only behavior described above.
+sleeping, resuming agents, or merging. `--no-watch-pending-ci` does not disable
+the ordinary auto-merge watcher.
 
 ### External CI infrastructure stalls
 
