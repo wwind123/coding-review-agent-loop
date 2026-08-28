@@ -179,6 +179,7 @@ from .prompts import (
 )
 from .protocol import (
     AgentUnavailable,
+    ApprovedFollowup,
     ApprovedFollowups,
     DISCUSS_FAILED_OUTCOME,
     DISCUSS_RESEARCH_TARGET_VALUES,
