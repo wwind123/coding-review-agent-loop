@@ -2748,6 +2748,20 @@ _IMPL_WITH_PR = json.dumps({
     "human_requirement_dispositions": [],
 }) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
 
+_IMPL_WITH_BLOCKED_REQUIREMENT = json.dumps({
+    "schema_version": 1,
+    "kind": "issue_implementation",
+    "state": "blocking",
+    "summary": "PR 5 was opened, but Requirement 1 is blocked.",
+    "pr_number": 5,
+    "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+    "human_requirement_dispositions": [{
+        "requirement_id": "Requirement 1",
+        "disposition": "blocked",
+        "evidence": "The required integration is unavailable.",
+    }],
+}) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
+
 
 def _human_req():
     from coding_review_agent_loop.github import HumanReviewRequirement
@@ -2870,6 +2884,19 @@ class TestValidateCoderImplementationResponse:
             _validate_coder_implementation_response(
                 bad, workdir="/tmp/wd", human_requirements=(),
             )
+
+    def test_blocked_positive_pr_is_returned_as_terminal_conflict(self) -> None:
+        from helpers.skill_runner import _validate_coder_implementation_response
+        from coding_review_agent_loop.orchestrator import _TerminalIssueImplementationConflict
+
+        result = _validate_coder_implementation_response(
+            _IMPL_WITH_BLOCKED_REQUIREMENT,
+            workdir="/tmp/wd",
+            human_requirements=(_human_req(),),
+        )
+
+        assert isinstance(result, _TerminalIssueImplementationConflict)
+        assert result.parsed.pr_number == 5
 
 
 # ---------------------------------------------------------------------------
@@ -3302,6 +3329,68 @@ class TestRunImplement:
             )
             assert result.returncode != 0
             assert "push-capable" in result.stderr
+
+    def test_conflict_posts_one_terminal_comment_without_handoff(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.github import IssueContext
+        from coding_review_agent_loop.runner import Runner
+
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        config = sr._implementation_config(
+            repo="o/r",
+            coder="codex",
+            workdir=str(workdir),
+            base="main",
+            dry_run=False,
+        )
+        runner = Runner(dry_run=False)
+        issue_context = IssueContext(
+            number=1,
+            repo="o/r",
+            title="Issue",
+            body="Body",
+            url="https://example/issue/1",
+            comments=(),
+            human_requirements=(_human_req(),),
+        )
+        helper_calls = []
+
+        def fake_run_helper(*args, **kwargs):
+            helper_calls.append(args)
+            if args[0] == "helpers.run_external":
+                output_path = Path(args[args.index("--output") + 1])
+                output_path.write_text(_IMPL_WITH_BLOCKED_REQUIREMENT, encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0)
+
+        monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(sr, "_git_head", lambda workdir: "head")
+        monkeypatch.setattr(
+            "coding_review_agent_loop.config.sync_coder_base_before_implementation",
+            lambda *args, **kwargs: None,
+        )
+
+        result = sr._run_child_or_one_shot_implementation(
+            issue=1,
+            repo="o/r",
+            coder="codex",
+            base="main",
+            dry_run=False,
+            workdir=str(workdir),
+            approved_plan="Approved plan.",
+            issue_context=issue_context,
+            config=config,
+            runner=runner,
+            post_one_shot_handoff=True,
+        )
+
+        assert result["pr"] is None
+        assert result["terminal"] == "conflict"
+        post_comment_calls = [
+            call for call in helper_calls if call[:2] == ("helpers.gh_ops", "post-issue-comment")
+        ]
+        assert len(post_comment_calls) == 1
+        assert not any(call[:2] == ("helpers.state_manager", "attach-metadata") for call in helper_calls)
 
 
 # ---------------------------------------------------------------------------

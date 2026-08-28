@@ -8,6 +8,7 @@ import re
 
 import pytest
 
+from coding_review_agent_loop.github import HumanReviewRequirement
 from coding_review_agent_loop.comment_rendering import (
     _render_public_coder_followup_comment,
     _render_public_discuss_review_comment,
@@ -30,6 +31,8 @@ from coding_review_agent_loop.orchestrator import (
     _format_unresolved_item_label,
     _render_public_review_comment,
     _review_freeform_summary_text,
+    _TerminalIssueImplementationConflict,
+    _validate_issue_implementation_response,
     render_canonical_plan_revision,
     render_canonical_plan_steps,
     render_public_agent_comment,
@@ -82,6 +85,43 @@ def test_render_issue_implementation_no_pr_keeps_summary_tests_and_result_identi
     assert "No pull request was accepted for handoff." in rendered
     assert "No safe PR was accepted." in rendered
     assert "python3 -m pytest tests/test_protocol.py -q" in rendered
+    assert '"kind": "issue_implementation"' not in rendered
+
+
+def test_render_issue_implementation_conflict_explains_rejected_pr_handoff():
+    text = structured_issue_implementation(
+        pr_number=77,
+        summary="PR #77 was opened, but Requirement 1 is blocked.",
+        human_requirement_dispositions=[
+            {
+                "requirement_id": "Requirement 1",
+                "disposition": "blocked",
+                "evidence": "The required integration is unavailable.",
+            }
+        ],
+    )
+    result = _validate_issue_implementation_response(
+        text,
+        human_requirements=(
+            HumanReviewRequirement(
+                source_type="Issue comment",
+                author="maintainer",
+                created_at="2026-01-01T00:00:00Z",
+                url="https://example.test/issue-comment",
+                body="Preserve the integration.",
+            ),
+        ),
+    )
+
+    assert isinstance(result, _TerminalIssueImplementationConflict)
+    rendered = _render_public_issue_implementation_comment(
+        result.parsed,
+        agent="claude",
+        model_used="claude-test",
+    )
+
+    assert "Rejected for handoff: reported PR #77 was not accepted" in rendered
+    assert "PR #77 was opened, but Requirement 1 is blocked." in rendered
     assert '"kind": "issue_implementation"' not in rendered
 
 

@@ -231,19 +231,20 @@ def test_completion_recovery_prompt_shares_terminal_marker_grammar_with_implemen
 
     recovery_prompt = build_completion_recovery_prompt(config)
     implementation_prompt = build_issue_implementation_prompt(56, "1. Fix it.", config)
+    issue_prompt = build_issue_prompt(56, config)
 
-    for marker_line in (
-        "<!-- AGENT_STATE: blocking -->",
-        "<!-- AGENT_CLARIFY -->",
-        "<!-- AGENT_UNAVAILABLE -->",
-        "For clarification:",
-    ):
-        assert marker_line in recovery_prompt
-        assert marker_line in implementation_prompt
-    assert "`pr_number: null`" in recovery_prompt
-    assert "`pr_number: null`" in implementation_prompt
-    assert "<!-- AGENT_PR:" not in recovery_prompt
-    assert "<!-- AGENT_PR:" not in implementation_prompt
+    for prompt in (recovery_prompt, implementation_prompt, issue_prompt):
+        for marker_line in (
+            "<!-- AGENT_STATE: blocking -->",
+            "<!-- AGENT_CLARIFY -->",
+            "<!-- AGENT_UNAVAILABLE -->",
+            "For clarification:",
+        ):
+            assert marker_line in prompt
+        assert prompt.count('"kind": "agent_unavailable"') == 1
+    for prompt in (recovery_prompt, implementation_prompt, issue_prompt):
+        assert "`pr_number: null`" in prompt
+        assert "<!-- AGENT_PR:" not in prompt
 
 
 def test_issue_plan_prompt_requires_complete_structured_plan_state_contract(tmp_path):

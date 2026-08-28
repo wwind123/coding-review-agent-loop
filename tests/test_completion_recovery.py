@@ -19,8 +19,6 @@ from coding_review_agent_loop.orchestrator import (
     ValidatedAgentResponse,
     _attempt_claude_completion_recovery,
     _new_usage_context,
-    _require_issue_implementation_result,
-    _TerminalNoPrImplementation,
 )
 from coding_review_agent_loop.protocol import (
     AgentUnavailable,
@@ -30,6 +28,15 @@ from coding_review_agent_loop.protocol import (
 )
 
 from agent_loop_helpers import FakeRunner, make_config, structured_issue_implementation
+
+
+def _validate_structured_implementation_result(text):
+    parsed = validate_structured_issue_implementation(text)
+    if parsed is None:
+        raise AgentLoopError(
+            "Issue implementation response must use the required structured `issue_implementation` format."
+        )
+    return parsed
 
 
 def _claude_resume_commands(runner):
@@ -49,7 +56,7 @@ def test_recovery_success_returns_validated_response_and_resumes_session(tmp_pat
         config=config,
         completion_recovery=CompletionRecoveryPolicy(issue_number=56),
         session_id="sess-1",
-        validate=validate_structured_issue_implementation,
+        validate=_validate_structured_implementation_result,
         usage_context=_new_usage_context(config),
         run_id="run-1",
         role=None,
@@ -75,7 +82,10 @@ def test_recovery_success_returns_validated_response_and_resumes_session(tmp_pat
 def test_recovery_success_no_pr_blocking_result_is_not_posted_by_helper(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
-            "Cannot proceed.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            structured_issue_implementation(
+                pr_number=None,
+                summary="Cannot proceed safely.",
+            ),
         ],
     )
     config = make_config(tmp_path, coder="claude")
@@ -85,7 +95,7 @@ def test_recovery_success_no_pr_blocking_result_is_not_posted_by_helper(tmp_path
         config=config,
         completion_recovery=CompletionRecoveryPolicy(issue_number=56),
         session_id="sess-1",
-        validate=_require_issue_implementation_result,
+        validate=validate_structured_issue_implementation,
         usage_context=_new_usage_context(config),
         run_id="run-1",
         role=None,
@@ -94,8 +104,8 @@ def test_recovery_success_no_pr_blocking_result_is_not_posted_by_helper(tmp_path
     )
 
     assert outcome.validated is not None
-    assert isinstance(outcome.validated.marker_value, _TerminalNoPrImplementation)
-    assert outcome.validated.marker_value.state == "blocking"
+    assert isinstance(outcome.validated.marker_value, StructuredIssueImplementation)
+    assert outcome.validated.marker_value.pr_number is None
     # Posting a genuine no-PR terminal to the issue is the caller's job
     # (_post_no_pr_implementation_terminal_comment), not this helper's.
     assert runner.comments == []
@@ -124,7 +134,7 @@ def test_recovery_agent_declared_unavailable_is_terminal_regardless_of_retryable
 
     def _validate(text):
         validate_calls.append(text)
-        return _require_issue_implementation_result(text)
+        return _validate_structured_implementation_result(text)
 
     outcome = _attempt_claude_completion_recovery(
         runner,
@@ -161,7 +171,7 @@ def test_recovery_transport_failure_nonzero_exit_synthesizes_unavailable(tmp_pat
         config=config,
         completion_recovery=CompletionRecoveryPolicy(issue_number=56),
         session_id="sess-1",
-        validate=_require_issue_implementation_result,
+        validate=_validate_structured_implementation_result,
         usage_context=_new_usage_context(config),
         run_id="run-1",
         role=None,
@@ -214,7 +224,7 @@ def test_recovery_transport_failure_empty_output_synthesizes_unavailable(tmp_pat
         config=config,
         completion_recovery=CompletionRecoveryPolicy(issue_number=56),
         session_id="sess-1",
-        validate=_require_issue_implementation_result,
+        validate=_validate_structured_implementation_result,
         usage_context=_new_usage_context(config),
         run_id="run-1",
         role=None,
@@ -236,7 +246,7 @@ def test_recovery_transport_failure_timeout_synthesizes_unavailable(tmp_path):
         config=config,
         completion_recovery=CompletionRecoveryPolicy(issue_number=56),
         session_id="sess-1",
-        validate=_require_issue_implementation_result,
+        validate=_validate_structured_implementation_result,
         usage_context=_new_usage_context(config),
         run_id="run-1",
         role=None,
@@ -266,7 +276,7 @@ def test_recovery_repeated_background_wait_is_deterministic_not_unavailable(tmp_
         config=config,
         completion_recovery=CompletionRecoveryPolicy(issue_number=56),
         session_id="sess-1",
-        validate=_require_issue_implementation_result,
+        validate=_validate_structured_implementation_result,
         usage_context=_new_usage_context(config),
         run_id="run-1",
         role=None,
@@ -319,7 +329,7 @@ def test_recovery_response_file_is_attempt_local_even_when_original_file_still_h
         config=config,
         completion_recovery=CompletionRecoveryPolicy(issue_number=56),
         session_id="sess-1",
-        validate=_require_issue_implementation_result,
+        validate=_validate_structured_implementation_result,
         usage_context=_new_usage_context(config),
         run_id="run-1",
         role=None,
@@ -337,7 +347,7 @@ def test_recovery_response_file_is_attempt_local_even_when_original_file_still_h
         "I'll wait for the background test run to finish."
     )
     assert outcome.validated is None
-    assert "did not create a valid PR" in outcome.error
+    assert "required structured" in outcome.error
 
 
 def test_issue_loop_recovers_after_one_bounded_resume_then_succeeds(tmp_path):
@@ -349,7 +359,7 @@ def test_issue_loop_recovers_after_one_bounded_resume_then_succeeds(tmp_path):
                     "session_id": "sess-1",
                 }
             ),
-            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            structured_issue_implementation(pr_number=77, summary="Created PR."),
             "Fixed review.\n<!-- AGENT_STATE: blocking -->",
         ],
         codex_outputs=[
@@ -386,7 +396,7 @@ def test_issue_loop_recovers_from_claude_waiting_on_background_wording(tmp_path)
                     "session_id": "sess-waiting-on",
                 }
             ),
-            "Created PR.\n<!-- AGENT_PR: 88 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            structured_issue_implementation(pr_number=88, summary="Created PR."),
             "Fixed review.\n<!-- AGENT_STATE: blocking -->",
         ],
         codex_outputs=[
@@ -485,7 +495,7 @@ def test_coder_followup_pr_loop_never_resumes_even_with_backgrounding_language(t
     backgrounded_followup_failure = "I'll wait for the background test run to finish."
     runner = FakeRunner(
         claude_outputs=[
-            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            structured_issue_implementation(pr_number=77, summary="Created PR."),
         ]
         + [backgrounded_followup_failure] * (config.agent_max_retries + 1),
         codex_outputs=[

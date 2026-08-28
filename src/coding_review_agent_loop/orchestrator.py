@@ -207,8 +207,6 @@ from .protocol import (
     StructuredPlanState,
     StructuredPlanRevision,
     UnresolvedReviewItem,
-    PrReference,
-    classify_pr_reference,
     human_requirements_resolved,
     is_clarification_request,
     parse_human_requirements_acknowledgement,
@@ -1932,8 +1930,8 @@ def _run_structured_repair(
 class CompletionRecoveryPolicy:
     """Explicit opt-in for the bounded same-session completion-recovery pass (#588).
 
-    Passed only by the direct issue-implementation call sites that already
-    validate with `_require_issue_implementation_result`; every other
+    Passed only by the direct issue-implementation call sites that validate
+    structured `issue_implementation` results; every other
     `_run_validated_agent` caller (planning, plan/PR review, discuss, task,
     and the coder follow-up/PR loop) leaves this `None` and is therefore
     ineligible by construction -- eligibility is never inferred from the
@@ -2031,7 +2029,6 @@ def _attempt_claude_completion_recovery(
     """
     recovery_prompt = build_completion_recovery_prompt(
         config,
-        issue_number=completion_recovery.issue_number,
         issue_context=completion_recovery.issue_context,
     )
     recovery_result = run_agent_result(
@@ -3271,33 +3268,6 @@ def _validate_issue_implementation_response(
     return parsed
 
 
-def _require_issue_implementation_result(text: str) -> int | _TerminalNoPrImplementation:
-    """Accept a positive PR, or an explicit terminal blocking/clarify outcome."""
-    reference: PrReference = classify_pr_reference(text)
-    if reference.is_valid:
-        assert reference.number is not None
-        return reference.number
-
-    if is_clarification_request(text):
-        return _TerminalNoPrImplementation("clarification")
-    try:
-        state = parse_agent_state(text)
-    except AgentLoopError:
-        state = None
-    if state == "blocking":
-        return _TerminalNoPrImplementation("blocking")
-
-    reference_error = (
-        "the AGENT_PR marker or PR URL present was invalid"
-        if reference.kind == "invalid"
-        else "response did not include a PR marker or PR URL"
-    )
-    raise AgentLoopError(
-        f"Coder did not create a valid PR: {reference_error} "
-        "or a terminal blocking/clarification marker."
-    )
-
-
 def _post_no_pr_implementation_terminal_comment(
     runner: Runner,
     *,
@@ -4123,15 +4093,16 @@ def _advisory_issue_pr_provenance(
         )
 
 
-def _validate_response_tests_with_post_pr_context(
-    text: str,
+def _validate_tests_with_post_pr_context(
+    validate_tests: Callable[[], None],
     *,
     runner: Runner,
     config: AgentLoopConfig,
     pr_number: int,
+    report_description: str,
 ) -> None:
     try:
-        validate_response_tests_within_workdir(text, assigned_workdir=active_workdir(config))
+        validate_tests()
     except AgentLoopError as exc:
         try:
             validate_open_pr(runner, config=config, pr_number=pr_number)
@@ -4139,16 +4110,34 @@ def _validate_response_tests_with_post_pr_context(
             raise AgentLoopError(
                 f"{exc}\n\n"
                 f"The coder reported PR #{pr_number}, but the orchestrator could not confirm it is open. "
-                "The handoff/reviewer comments were not posted because the test report was invalid. "
+                f"The handoff/reviewer comments were not posted because the {report_description} was invalid. "
                 "Inspect the PR state on GitHub before deciding whether to resume the existing PR or rerun "
                 "implementation."
             ) from pr_exc
         raise AgentLoopError(
             f"{exc}\n\n"
             f"PR #{pr_number} was confirmed open, but the handoff/reviewer comments were not posted because "
-            "the test report was invalid. Correct the PR/comment if needed, then continue safely with "
+            f"the {report_description} was invalid. Correct the PR/comment if needed, then continue safely with "
             f"`agent-loop pr {pr_number}` instead of rerunning implementation and creating a duplicate PR."
         ) from exc
+
+
+def _validate_response_tests_with_post_pr_context(
+    text: str,
+    *,
+    runner: Runner,
+    config: AgentLoopConfig,
+    pr_number: int,
+) -> None:
+    _validate_tests_with_post_pr_context(
+        lambda: validate_response_tests_within_workdir(
+            text, assigned_workdir=active_workdir(config)
+        ),
+        runner=runner,
+        config=config,
+        pr_number=pr_number,
+        report_description="test report",
+    )
 
 
 def _validate_structured_response_tests_with_post_pr_context(
@@ -4159,28 +4148,16 @@ def _validate_structured_response_tests_with_post_pr_context(
     pr_number: int,
 ) -> None:
     """Validate structured test commands with the same confirmed-PR diagnostic."""
-    try:
-        validate_test_commands_within_workdir(
+    _validate_tests_with_post_pr_context(
+        lambda: validate_test_commands_within_workdir(
             tests_run,
             assigned_workdir=active_workdir(config),
-        )
-    except AgentLoopError as exc:
-        try:
-            validate_open_pr(runner, config=config, pr_number=pr_number)
-        except Exception as pr_exc:
-            raise AgentLoopError(
-                f"{exc}\n\n"
-                f"The coder reported PR #{pr_number}, but the orchestrator could not confirm it is open. "
-                "The handoff/reviewer comments were not posted because the structured test report was invalid. "
-                "Inspect the PR state on GitHub before deciding whether to resume the existing PR or rerun "
-                "implementation."
-            ) from pr_exc
-        raise AgentLoopError(
-            f"{exc}\n\n"
-            f"PR #{pr_number} was confirmed open, but the handoff/reviewer comments were not posted because "
-            "the structured test report was invalid. Correct the PR/comment if needed, then continue safely with "
-            f"`agent-loop pr {pr_number}` instead of rerunning implementation and creating a duplicate PR."
-        ) from exc
+        ),
+        runner=runner,
+        config=config,
+        pr_number=pr_number,
+        report_description="structured test report",
+    )
 
 
 def _round_ledger_may_be_incomplete(
@@ -4281,6 +4258,9 @@ def _implement_approved_issue(
     implementation_session_id = coder_session_id if reuse_planning_session else None
     plan_hash = approved_plan_hash(approved_plan)
     plan_additions = _extract_current_expected_closing_issue_ids(approved_plan)
+    implementation_human_requirements_context = render_coder_human_requirements_prompt_context(
+        issue_context.human_requirements,
+    )
 
     # A prior implementation attempt may have created a PR and then aborted
     # before recording any handoff marker/comment (e.g. the #493 test-report
@@ -4450,12 +4430,8 @@ def _implement_approved_issue(
         usage_context=usage_context,
         use_repair=True,
         repair_expected_kind="issue_implementation",
-        repair_surfaced_requirement_ids=render_coder_human_requirements_prompt_context(
-            issue_context.human_requirements,
-        ).surfaced_requirement_ids,
-        repair_requires_direct_discussion_ack=render_coder_human_requirements_prompt_context(
-            issue_context.human_requirements,
-        ).requires_direct_discussion_ack,
+        repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,
+        repair_requires_direct_discussion_ack=implementation_human_requirements_context.requires_direct_discussion_ack,
         salvage_context=SalvageContext(
             repo=implementation_config.repo,
             issue_number=issue_number,
@@ -6175,6 +6151,9 @@ def run_issue_loop(
             expected_closing_contract_resolved=True,
         )
 
+        implementation_human_requirements_context = render_coder_human_requirements_prompt_context(
+            issue_context.human_requirements,
+        )
         sync_coder_base_before_implementation(config, runner)
         managed_ci_creation_intent = None
         if config.managed_ci:
@@ -6219,12 +6198,8 @@ def run_issue_loop(
             usage_context=usage_context,
             use_repair=True,
             repair_expected_kind="issue_implementation",
-            repair_surfaced_requirement_ids=render_coder_human_requirements_prompt_context(
-                issue_context.human_requirements,
-            ).surfaced_requirement_ids,
-            repair_requires_direct_discussion_ack=render_coder_human_requirements_prompt_context(
-                issue_context.human_requirements,
-            ).requires_direct_discussion_ack,
+            repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,
+            repair_requires_direct_discussion_ack=implementation_human_requirements_context.requires_direct_discussion_ack,
             salvage_context=SalvageContext(
                 repo=config.repo,
                 issue_number=issue_number,

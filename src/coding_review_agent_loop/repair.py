@@ -281,7 +281,7 @@ This is a blocking example because it has a `blocked` human-requirement disposit
 For an approved coder follow-up, use `"state": "approved"`, an
 `<!-- AGENT_STATE: approved -->` footer, and no `blocked` dispositions.
 
-## Valid Format D — Issue Implementation:
+## Valid Format K — Issue Implementation:
 
 {
   "schema_version": 1,
@@ -534,9 +534,13 @@ The active planning human-requirements context above is authoritative. Do not us
 ## STATE RULES (Format D):
 ### BLOCKING only. plan_revision.state must be "blocking" and must include at least one plan_steps string.
 
+## STATE RULES (Format K):
+### BLOCKING only. issue_implementation.state must be "blocking".
+
 ## FORMAT SELECTION:
 - If an expected response kind is provided above, use ONLY that format. Do not infer a different kind from keywords in the malformed response.
 - Use Format C if the original contains "coder_followup" or "addressed_items" or "remaining_items".
+- Use Format K if the original contains "issue_implementation" or "pr_number".
 - Use Format D if the original contains "plan_revision".
 - Use Format J if the original contains "plan_state" or "plan_steps".
 - Use Format H if the original contains "discuss_semantic_comparison" or "remaining_decisions".
@@ -1196,7 +1200,7 @@ def _issue_implementation_instruction(
     return (
         "## Issue implementation repair rules:\n"
         "Repair only the issue_implementation envelope. Preserve `summary`, `pr_number`, "
-        "tests_run`, and the meaning of every disposition; do not invent a PR identity. "
+        "`tests_run`, and the meaning of every disposition; do not invent a PR identity. "
         + requirement_rule
         + " A positive PR with a blocked disposition remains a terminal conflict after repair; "
         "do not relabel or silently remove that blocker.\n"

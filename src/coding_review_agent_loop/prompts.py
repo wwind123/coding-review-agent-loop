@@ -812,8 +812,7 @@ Rules:
 - Start directly with exactly one top-level JSON object. Put the `<!-- AGENT_STATE: blocking -->` footer immediately after it and only your standalone signature after the footer.
 
 The structured result is the public implementation record. Do not add prose,
-code fences, a `Tests:` section, an `AGENT_PR` marker, or another footer to it.
-{_agent_unavailable_guidance(coder_signature)}"""
+code fences, a `Tests:` section, an `AGENT_PR` marker, or another footer to it."""
 
 
 def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewItem] | None) -> str:
@@ -1955,7 +1954,6 @@ Approved implementation plan:
 def build_completion_recovery_prompt(
     config: AgentLoopConfig,
     *,
-    issue_number: int | None = None,
     issue_context: IssueContext | None = None,
 ) -> str:
     """One bounded same-session continuation for a stalled implementation turn (#588).
