@@ -20,7 +20,12 @@ from .base import (
 from ..logging import agent_log_path, log
 from ..runner import CommandResult, Runner, executable_identity_changed
 from ..usage import UsageMetadata, coerce_int, first_present
-from ..workdir_guard import WorkdirSnapshot, capture_workdir_snapshot
+from ..workdir_guard import (
+    WorkdirReplayEvidence,
+    WorkdirSnapshot,
+    capture_workdir_snapshot,
+    gate_workdir_replay,
+)
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
@@ -108,68 +113,6 @@ def _has_updater_diagnostic(output: str) -> bool:
     return bool(_UPDATER_DIAGNOSTIC_RE.search("\n".join(lines)[-2048:]))
 
 
-@dataclass(frozen=True)
-class SelfUpdateInterruptionEvidence:
-    """Positive updater evidence and, independently, a replay refusal."""
-
-    reason: str
-    replay_refusal_kind: str | None = None
-    replay_refusal_detail: str | None = None
-
-def _workdir_probe_label(snapshot: WorkdirSnapshot) -> str:
-    def describe(probe) -> str:
-        if probe.kind == "available":
-            return repr(probe.value)
-        if probe.kind == "exception":
-            return f"{probe.exception_type}: {probe.detail}"
-        if probe.kind == "command-failed":
-            return f"returncode={probe.returncode!r}"
-        return "blank"
-
-    return f"HEAD={describe(snapshot.head)}, status={describe(snapshot.status)}"
-
-
-def _gate_self_update_replay(
-    reason: str,
-    *,
-    before_snapshot: WorkdirSnapshot | None,
-    after_snapshot: WorkdirSnapshot | None,
-) -> SelfUpdateInterruptionEvidence:
-    """Accept a candidate only when both read-only snapshots are identical."""
-    # Calls without snapshots retain the historical evidence-only helper
-    # contract. ClaudeBackend always supplies both snapshots after candidate
-    # detection, so replay policy itself remains fail-closed there.
-    if before_snapshot is None and after_snapshot is None:
-        return SelfUpdateInterruptionEvidence(reason)
-    if before_snapshot is None or not before_snapshot.available:
-        detail = (
-            "Claude self-update replay refused: before workdir snapshot "
-            f"unavailable ({_workdir_probe_label(before_snapshot) if before_snapshot else 'missing'})."
-        )
-        return SelfUpdateInterruptionEvidence(reason, "before-unavailable", detail)
-    if after_snapshot is None or not after_snapshot.available:
-        detail = (
-            "Claude self-update replay refused: after workdir snapshot "
-            f"unavailable ({_workdir_probe_label(after_snapshot) if after_snapshot else 'missing'})."
-        )
-        return SelfUpdateInterruptionEvidence(reason, "after-unavailable", detail)
-    if before_snapshot.head.value != after_snapshot.head.value:
-        detail = (
-            "Claude self-update replay refused: assigned checkout HEAD changed "
-            f"during invocation (before={before_snapshot.head.value!r}, "
-            f"after={after_snapshot.head.value!r})."
-        )
-        return SelfUpdateInterruptionEvidence(reason, "changed-head", detail)
-    if before_snapshot.status.value != after_snapshot.status.value:
-        detail = (
-            "Claude self-update replay refused: dirty workdir status changed "
-            f"during invocation (before={before_snapshot.status.value!r}, "
-            f"after={after_snapshot.status.value!r})."
-        )
-        return SelfUpdateInterruptionEvidence(reason, "changed-status", detail)
-    return SelfUpdateInterruptionEvidence(reason)
-
-
 def classify_self_update_interruption(
     result: CommandResult,
     *,
@@ -178,7 +121,7 @@ def classify_self_update_interruption(
     session_id: str | None,
     before_snapshot: WorkdirSnapshot | None = None,
     after_snapshot: WorkdirSnapshot | None = None,
-) -> SelfUpdateInterruptionEvidence | None:
+) -> WorkdirReplayEvidence | None:
     """Return bounded Claude-updater evidence, then apply the workdir gate."""
     observation = result.observation
     if not isinstance(result.returncode, int) or result.returncode == 0 or observation is None:
@@ -194,7 +137,8 @@ def classify_self_update_interruption(
             pass
     if _has_updater_diagnostic(result.stdout):
         reason = "Claude Code updater diagnostic"
-        return _gate_self_update_replay(
+        return gate_workdir_replay(
+            "Claude self-update",
             reason,
             before_snapshot=before_snapshot,
             after_snapshot=after_snapshot,
@@ -212,7 +156,8 @@ def classify_self_update_interruption(
         exit_wall_time=observation.spawn_wall_time + observation.elapsed_seconds,
     ):
         reason = "Claude executable changed during invocation"
-        return _gate_self_update_replay(
+        return gate_workdir_replay(
+            "Claude self-update",
             reason,
             before_snapshot=before_snapshot,
             after_snapshot=after_snapshot,

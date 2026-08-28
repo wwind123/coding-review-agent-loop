@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,8 +19,14 @@ from .base import (
 )
 from ..logging import agent_log_path, log
 from ..protocol import CLARIFY_RE, PLAN_STATE_RE, PUBLIC_RESPONSE_MARKER, STATE_RE
-from ..runner import Runner
+from ..runner import CommandResult, Runner, executable_identity_changed, strip_ansi
 from ..usage import UsageMetadata, coerce_int, first_present
+from ..workdir_guard import (
+    WorkdirReplayEvidence,
+    WorkdirSnapshot,
+    capture_workdir_snapshot,
+    gate_workdir_replay,
+)
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
@@ -52,6 +59,111 @@ _GEMINI_RETIREMENT_SIGNATURES = (
     "no longer",
     "retir",
 )
+
+# A replacement can leave Gemini's Node launcher with no public response. Keep
+# this classifier deliberately narrow: ordinary prose, tool narration, and
+# unknown diagnostics are progress and must suppress replay.
+_GEMINI_STARTUP_LINE_RE = re.compile(
+    r"(?ix)^(?:"
+    r"gemini(?:\s+cli)?(?:\s+(?:v|version)\s*[\w.-]+)?|"
+    r"(?:starting|initiali[sz]ing|loading)\s+gemini(?:\s+cli)?|"
+    r"(?:using|selected|requested)\s+model\s*[:=].+|"
+    r"model\s*[:=].+|"
+    r"version\s*[:=]\s*[\w.-]+|"
+    r"loaded\s+(?:configuration|credentials|settings)\b.*|"
+    r"(?:checking|applying)\s+(?:for\s+)?(?:gemini\s+)?updates?\b.*"
+    r")$"
+)
+_GEMINI_LOADER_LINE_RE = re.compile(
+    r"(?ix)(?:"
+    r"MODULE_NOT_FOUND|cannot\s+find\s+module|"
+    r"^node:(?:internal/)?modules/.*|^at\s+.+node:(?:internal/)?modules/.*|"
+    r"^throw\s+err;?$|^require\s+stack:.*|"
+    r"^code\s*[:=]\s*['\"]?(?:MODULE_NOT_FOUND|ENOENT)['\"]?\s*$|"
+    r"(?:ENOENT|ENOEXEC)|exec(?:ution)?\s+format\s+error|"
+    r"no\s+such\s+file\s+or\s+directory|"
+    r"(?:gemini|node|npm|launcher|executable|binary).*(?:not\s+found|missing|failed|error)|"
+    r"(?:failed|error).*(?:launch|launcher|startup|updat(?:e|er)|replacement)|"
+    r"(?:updat(?:e|er)|launcher|replacement).*(?:failed|error|unavailable|in\s+progress)"
+    r")"
+)
+_GEMINI_DIAGNOSTIC_MAX_LINES = 40
+_GEMINI_DIAGNOSTIC_MAX_CHARS = 8192
+
+
+def _json_structured_payload(raw: str) -> bool:
+    """Return true for a complete or line-delimited structured payload."""
+    candidates = [raw, *raw.splitlines()]
+    for candidate in candidates:
+        if not candidate.strip():
+            continue
+        try:
+            json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        return True
+    return False
+
+
+def _gemini_startup_or_loader_diagnostics(raw: str) -> bool:
+    normalized = strip_ansi(raw).strip()
+    if not normalized:
+        return True
+    if len(normalized) > _GEMINI_DIAGNOSTIC_MAX_CHARS:
+        return False
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if len(lines) > _GEMINI_DIAGNOSTIC_MAX_LINES:
+        return False
+    return all(
+        _GEMINI_STARTUP_LINE_RE.fullmatch(line) is not None
+        or _GEMINI_LOADER_LINE_RE.search(line) is not None
+        for line in lines
+    )
+
+
+def classify_gemini_executable_replacement_interruption(
+    result: CommandResult,
+    *,
+    command: str,
+    response_file_text: str | None,
+    before_snapshot: WorkdirSnapshot | None = None,
+    after_snapshot: WorkdirSnapshot | None = None,
+) -> WorkdirReplayEvidence | None:
+    """Classify a quiet Gemini launcher replacement with fail-closed gates."""
+    observation = result.observation
+    if (
+        type(result.returncode) is not int
+        or observation is None
+        or observation.interrupted
+        or result.capture_diagnostics
+        or response_file_text
+        or PUBLIC_RESPONSE_MARKER in result.stdout
+        or _json_structured_payload(result.stdout)
+        or not _gemini_startup_or_loader_diagnostics(result.stdout)
+    ):
+        return None
+    if not executable_identity_changed(
+        observation.before,
+        observation.after,
+        command=command,
+        spawn_wall_time=observation.spawn_wall_time,
+        exit_wall_time=observation.spawn_wall_time + observation.elapsed_seconds,
+    ):
+        return None
+    reason = "Gemini executable changed during invocation"
+    if before_snapshot is None and after_snapshot is None:
+        return WorkdirReplayEvidence(reason)
+    return gate_workdir_replay(
+        "Gemini executable replacement",
+        reason,
+        before_snapshot=before_snapshot,
+        after_snapshot=after_snapshot,
+    )
+
+
+# Keep the provider-local spelling parallel with Codex's existing classifier;
+# callers that operate on a backend do not need to know the provider's helper name.
+classify_executable_replacement_interruption = classify_gemini_executable_replacement_interruption
 
 # Gemini's documented headless mode is selected by --prompt.  For large tasks,
 # stdin carries the complete prompt and this short trailing prompt tells Gemini
@@ -237,6 +349,14 @@ class GeminiBackend:
             args += ["--model", config.gemini_model]
         if session_id:
             args += ["--resume", session_id]
+        # Capture the assigned checkout immediately before spawn. The after
+        # probe is deliberately lazy and only runs for positive replacement
+        # evidence, keeping ordinary Gemini failures cheap and side-effect free.
+        before_snapshot = capture_workdir_snapshot(
+            runner,
+            config.gemini_dir,
+            tolerate_exceptions=True,
+        )
         result = runner.run_with_log(
             args,
             cwd=config.gemini_dir,
@@ -258,6 +378,25 @@ class GeminiBackend:
             )
         message_text, new_session_id, usage, raw_usage, message_source = _parse_gemini_payload(result.stdout)
         response_file_text = read_public_response_file(response_path)
+        candidate = classify_gemini_executable_replacement_interruption(
+            result,
+            command=config.gemini_cmd,
+            response_file_text=response_file_text,
+        )
+        after_snapshot = None
+        if candidate is not None:
+            after_snapshot = capture_workdir_snapshot(
+                runner,
+                config.gemini_dir,
+                tolerate_exceptions=True,
+            )
+            candidate = classify_gemini_executable_replacement_interruption(
+                result,
+                command=config.gemini_cmd,
+                response_file_text=response_file_text,
+                before_snapshot=before_snapshot,
+                after_snapshot=after_snapshot,
+            )
         raw_output = result.stdout
         if retired_failure:
             # Append the guidance to the *returned* output, not just stderr: callers
@@ -280,6 +419,13 @@ class GeminiBackend:
             raw_usage=raw_usage,
             model_used=config.gemini_model or None,
             command_result=result,
+            self_update_reason=candidate.reason if candidate else None,
+            self_update_replay_refusal_kind=(
+                candidate.replay_refusal_kind if candidate else None
+            ),
+            self_update_replay_refusal_detail=(
+                candidate.replay_refusal_detail if candidate else None
+            ),
         )
 
 

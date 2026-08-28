@@ -26,6 +26,10 @@ from coding_review_agent_loop.agents.gemini import (
     _OVERSIZED_PROMPT_DIRECTIVE,
     _normalize_gemini_usage,
     _parse_gemini_payload,
+    classify_gemini_executable_replacement_interruption,
+)
+from coding_review_agent_loop.agents.antigravity import (
+    classify_antigravity_executable_replacement_interruption,
 )
 
 from agent_loop_helpers import (
@@ -223,6 +227,124 @@ def _codex_result(
         observation,
         capture_diagnostics,
     )
+
+
+def _replacement_result(*, command, stdout="", returncode=1, changed=True, **kwargs):
+    before = ExecutableIdentity(
+        command, f"{command}-target", (1, 1, 90_000_000_000), (1, 2, 90_000_000_000)
+    )
+    after = (
+        ExecutableIdentity(
+            command, f"{command}-new-target", (1, 3, 100_000_000_000),
+            (1, 4, 100_000_000_000),
+        )
+        if changed else before
+    )
+    observation = ExecutionObservation(100, 100, 101, 1, before, after, kwargs.pop("interrupted", False))
+    return CommandResult(
+        [command], Path.cwd(), stdout, "", returncode, observation,
+        kwargs.pop("capture_diagnostics", ()),
+    )
+
+
+def _snapshot(head="abc123", status=""):
+    from coding_review_agent_loop.workdir_guard import GitProbeResult, WorkdirSnapshot
+
+    return WorkdirSnapshot(
+        GitProbeResult(("git", "rev-parse", "HEAD"), "available", head),
+        GitProbeResult(("git", "status", "--porcelain"), "available", status),
+    )
+
+
+def test_gemini_replacement_accepts_realistic_node_loader_failure_and_snapshot_gate():
+    output = (
+        "Gemini CLI v1.2.3\n"
+        "Using model: gemini-3.5-flash\n"
+        "node:internal/modules/cjs/loader:1228\n"
+        "throw err;\n"
+        "Error: Cannot find module '/opt/gemini/launcher.js'\n"
+        "code: 'MODULE_NOT_FOUND'\n"
+    )
+    result = _replacement_result(command="gemini", stdout=output)
+
+    evidence = classify_gemini_executable_replacement_interruption(
+        result, command="gemini", response_file_text=None,
+    )
+    assert evidence is not None
+    assert evidence.reason == "Gemini executable changed during invocation"
+
+    accepted = classify_gemini_executable_replacement_interruption(
+        result,
+        command="gemini",
+        response_file_text=None,
+        before_snapshot=_snapshot(),
+        after_snapshot=_snapshot(),
+    )
+    assert accepted is not None
+    assert accepted.replay_refusal_kind is None
+
+    refused = classify_gemini_executable_replacement_interruption(
+        result,
+        command="gemini",
+        response_file_text=None,
+        before_snapshot=_snapshot(),
+        after_snapshot=_snapshot(status=" M changed.py\n"),
+    )
+    assert refused is not None
+    assert refused.replay_refusal_kind == "changed-status"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "I will inspect the repository before responding.",
+        f"{PUBLIC_RESPONSE_MARKER}\nSTATE: approved",
+        json.dumps({"response": "STATE: approved", "session_id": "s"}),
+    ],
+)
+def test_gemini_replacement_rejects_progress_public_payload_and_artifacts(output):
+    result = _replacement_result(command="gemini", stdout=output)
+    assert classify_gemini_executable_replacement_interruption(
+        result, command="gemini", response_file_text=None,
+    ) is None
+    assert classify_gemini_executable_replacement_interruption(
+        result, command="gemini", response_file_text="malformed but present",
+    ) is None
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_antigravity_replacement_accepts_startup_chrome_and_loader_failure(returncode):
+    output = (
+        "Antigravity CLI v0.8.0\n"
+        "Model: Gemini 3.1 Pro (High)\n"
+        "Error: Cannot find module '/opt/agy/launcher.js'\n"
+        "code: 'MODULE_NOT_FOUND'\n"
+    )
+    result = _replacement_result(command="agy", stdout=output, returncode=returncode)
+    evidence = classify_antigravity_executable_replacement_interruption(
+        result,
+        command="agy",
+        response_file_text=None,
+        before_snapshot=_snapshot(),
+        after_snapshot=_snapshot(),
+    )
+    assert evidence is not None
+    assert evidence.reason == "Antigravity executable changed during invocation"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"interrupted": True},
+        {"capture_diagnostics": ("capture_read_failed:OSError: injected",)},
+        {"returncode": None},
+    ],
+)
+def test_antigravity_replacement_rejects_unhealthy_capture(kwargs):
+    result = _replacement_result(command="agy", stdout="", **kwargs)
+    assert classify_antigravity_executable_replacement_interruption(
+        result, command="agy", response_file_text=None,
+    ) is None
 
 
 @pytest.mark.parametrize("returncode", [0, 1])

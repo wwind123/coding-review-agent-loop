@@ -1375,6 +1375,10 @@ def _executable_replacement_failure_detail(
         label = "Claude self-update"
     elif provider == "codex":
         label = "Codex executable replacement"
+    elif provider == "gemini":
+        label = "Gemini executable replacement"
+    elif provider == "antigravity":
+        label = "Antigravity executable replacement"
     else:
         label = "agent executable replacement"
     detail = f"likely {label} interruption"
@@ -1403,9 +1407,9 @@ def _failure_suggestion(
     if category == "self-update-interruption":
         if agent_name.lower() == "claude":
             return "Suggestion: wait for the Claude Code self-update to finish, then re-run."
-        return "Suggestion: wait for the agent executable replacement to finish, then re-run."
+        return f"Suggestion: wait for the {agent_name} executable replacement to finish, then re-run."
     if category == "executable-replacement":
-        return "Suggestion: wait for the Codex executable replacement to finish, then re-run."
+        return f"Suggestion: wait for the {agent_name} executable replacement to finish, then re-run."
     if category == "transient":
         if _QUOTA_RATE_LIMIT_RE.search(combined):
             return (
@@ -1497,9 +1501,9 @@ def _format_invalid_agent_response_error(
         if agent_name.lower() == "claude":
             category_hint = " Failure category: self-update-interruption (Claude Code updated during startup)."
         else:
-            category_hint = " Failure category: self-update-interruption (the agent executable changed during invocation)."
+            category_hint = f" Failure category: self-update-interruption ({agent_name} executable changed during invocation)."
     elif category == "executable-replacement":
-        category_hint = " Failure category: executable-replacement (Codex changed during invocation)."
+        category_hint = f" Failure category: executable-replacement ({agent_name} changed during invocation)."
     elif category == "agent-unavailable":
         category_hint = " Failure category: agent-unavailable (the agent explicitly could not continue)."
     if not classification_text:
@@ -2283,11 +2287,12 @@ def _run_validated_agent(
         if agent == "antigravity"
         else None
     )
-    # Each fallback retains an initial attempt; retry allowance is shared.
+    # Each fallback retains an initial attempt; retry allowance is shared. The
+    # provider-specific replacement replay gets one explicit extra slot.
     max_attempts = (
-        len(config.antigravity_models) + config.agent_max_retries
+        len(config.antigravity_models) + config.agent_max_retries + 1
         if antigravity_attempts is not None
-        else config.agent_max_retries + 2 if agent in {"claude", "codex"} else config.agent_max_retries + 1
+        else config.agent_max_retries + 2
     )
     last_error = f"{agent_name} produced no output."
     last_result: AgentResult | None = None
@@ -2314,6 +2319,32 @@ def _run_validated_agent(
     latest_replay_refusal_detail: str | None = None
     next_timeout_seconds = timeout_seconds
     marker_safety_repair_attempted = False
+    executable_replacement_policies: dict[AgentName, tuple[str, str, str, bool]] = {
+        "claude": (
+            config.claude_cmd,
+            "Claude self-update",
+            "self-update-attempt2",
+            True,
+        ),
+        "codex": (
+            config.codex_cmd,
+            "Codex executable replacement",
+            "executable-replacement-attempt2",
+            False,
+        ),
+        "gemini": (
+            config.gemini_cmd,
+            "Gemini executable replacement",
+            "executable-replacement-attempt2",
+            False,
+        ),
+        "antigravity": (
+            config.antigravity_cmd,
+            "Antigravity executable replacement",
+            "executable-replacement-attempt2",
+            False,
+        ),
+    }
 
     for attempt in range(1, max_attempts + 1):
         attempt_config = (
@@ -2329,8 +2360,8 @@ def _run_validated_agent(
                 if is_executable_replacement_replay
                 else f"attempt{ordinary_retries_used + 1}"
             )
-        elif agent == "codex" and is_executable_replacement_replay:
-            invocation_kwargs["attempt_suffix"] = "executable-replacement-attempt2"
+        elif is_executable_replacement_replay:
+            invocation_kwargs["attempt_suffix"] = executable_replacement_policies[agent][2]
         result = run_agent_result(
             runner,
             agent=agent,
@@ -2428,15 +2459,12 @@ def _run_validated_agent(
                 "continuing with provider-derived retry classification",
             )
 
-        # Claude or Codex can be replaced after spawning. Codex remains driven
-        # by its JSONL setup-versus-progress evidence; Claude's non-streaming
-        # JSON output additionally uses the workdir snapshot gate below.
-        # This is exclusive with
-        # ordinary transient classification and gets one full replay only after
-        # the configured executable is stable. A Claude workdir refusal above
-        # deliberately does not enter this branch.
+        # A configured provider executable can be replaced after spawning. Each
+        # backend supplies its own evidence gate, while this branch owns the
+        # bounded stability wait, one replay, and retry accounting. A workdir
+        # refusal deliberately remains diagnostic-only and cannot enter it.
         if (
-            agent in {"claude", "codex"}
+            agent in executable_replacement_policies
             and result.self_update_reason is not None
             and result.self_update_replay_refusal_kind is None
             and not executable_replacement_considered
@@ -2446,7 +2474,10 @@ def _run_validated_agent(
             executable_replacement_provider = agent
             executable_replacement_reason = result.self_update_reason
             observation = result.command_result.observation
-            if agent == "claude":
+            command, provider_label, _suffix, uses_remaining_deadline = (
+                executable_replacement_policies[agent]
+            )
+            if uses_remaining_deadline:
                 self_update_deadline = (
                     observation.spawn_monotonic + timeout_seconds
                     if timeout_seconds is not None and observation is not None
@@ -2462,23 +2493,18 @@ def _run_validated_agent(
                 replay_timeout = remaining
                 deadline_exhausted = remaining is not None and remaining <= 0
             else:
-                # Codex replacement recovery has its own bounded six-second
-                # stability observation. The replay is a fresh invocation and
-                # receives the full configured timeout, if any.
+                # Codex, Gemini, and Antigravity use a bounded six-second
+                # stability observation. Their replay is fresh and receives the
+                # complete configured timeout, if any.
                 stable = runner.wait_for_executable_stability(
-                    config.codex_cmd, deadline=None
+                    command, deadline=None
                 )
                 replay_timeout = timeout_seconds
                 deadline_exhausted = False
             if not stable or deadline_exhausted:
-                provider_label = (
-                    "Claude self-update"
-                    if agent == "claude"
-                    else "Codex executable replacement"
-                )
                 deadline_label = (
                     "within the invocation deadline"
-                    if agent == "claude"
+                    if uses_remaining_deadline
                     else "within the bounded stability window"
                 )
                 self_update_stability_error = (
@@ -2488,7 +2514,7 @@ def _run_validated_agent(
                 if usage_record is not None:
                     usage_record.outcome = (
                         "self_update_interruption"
-                        if agent == "claude"
+                        if uses_remaining_deadline
                         else "executable_replacement_interruption"
                     )
                     usage_record.log_path = str(result.log_path) if result.log_path else None
@@ -2499,7 +2525,7 @@ def _run_validated_agent(
                 if usage_record is not None:
                     usage_record.outcome = (
                         "self_update_interruption"
-                        if agent == "claude"
+                        if uses_remaining_deadline
                         else "executable_replacement_interruption"
                     )
                     usage_record.log_path = str(result.log_path) if result.log_path else None

@@ -3,6 +3,27 @@ from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.usage import RunUsageContext, UsageMetadata
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "executable_replacement_interruption",
+        "self_update_replay_refused_changed_workdir",
+        "self_update_replay_refused_unavailable_workdir",
+    ],
+)
+def test_replacement_outcomes_are_serialized_without_provider_specific_values(tmp_path, outcome):
+    context = RunUsageContext(run_id="run-usage", summary_path=tmp_path / "usage.json")
+    context.add_record(
+        agent="gemini",
+        session_id=None,
+        returncode=1,
+        usage=UsageMetadata(mode="estimated", input_tokens=1, output_tokens=1, total_tokens=2),
+        outcome=outcome,
+    )
+
+    assert context.records[0].to_dict()["outcome"] == outcome
+
+
 def test_completion_recovery_role_survives_record_and_summary(tmp_path):
     context = RunUsageContext(run_id="run-1", summary_path=tmp_path / "usage.json")
     record = context.add_record(

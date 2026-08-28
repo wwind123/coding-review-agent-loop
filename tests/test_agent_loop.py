@@ -4238,6 +4238,156 @@ def test_codex_replacement_context_does_not_change_long_quota_exit_priority(tmp_
     assert "Codex executable replacement" in str(error.value)
 
 
+def _observed_replacement_result(
+    tmp_path, *, command, reason, raw_output="", returncode=1, model_used=None
+):
+    identity = ExecutableIdentity(
+        command, f"{command}-target", (1, 1, 90_000_000_000), (1, 2, 90_000_000_000)
+    )
+    changed = ExecutableIdentity(
+        command, f"{command}-new-target", (1, 3, 100_000_000_000), (1, 4, 100_000_000_000)
+    )
+    observation = ExecutionObservation(100, 100, 101, 1, identity, changed, False)
+    return AgentResult(
+        text="",
+        raw_output=raw_output,
+        returncode=returncode,
+        model_used=model_used,
+        command_result=CommandResult(
+            [command], tmp_path, raw_output, "", returncode, observation
+        ),
+        self_update_reason=reason,
+    )
+
+
+def test_gemini_replacement_replay_uses_fresh_timeout_and_provider_suffix(tmp_path):
+    valid = structured_pr_review(
+        state="approved", summary="Gemini recovered.", reviewer="Google Gemini"
+    )
+    results = iter(
+        [
+            _observed_replacement_result(
+                tmp_path,
+                command="gemini",
+                reason="Gemini executable changed during invocation",
+            ),
+            AgentResult(text=valid, raw_output=valid, returncode=0, model_used="gemini-model"),
+        ]
+    )
+    runner = FakeRunner()
+    stability_calls = []
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: (
+        stability_calls.append((command, deadline)) or True
+    )
+    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="gemini",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="test",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="Google Gemini", unresolved_items=()
+            ),
+            timeout_seconds=60,
+        )
+
+    assert response.marker_value.state == "approved"
+    assert stability_calls == [(config.gemini_cmd, None)]
+    assert run_mock.call_args_list[0].kwargs["timeout_seconds"] == 60
+    assert run_mock.call_args_list[1].kwargs["timeout_seconds"] == 60
+    assert run_mock.call_args_list[1].kwargs["attempt_suffix"] == "executable-replacement-attempt2"
+
+
+def test_gemini_unstable_replacement_preserves_ordinary_retry(tmp_path):
+    valid = structured_pr_review(
+        state="approved", summary="Ordinary retry recovered.", reviewer="Google Gemini"
+    )
+    results = iter(
+        [
+            _observed_replacement_result(
+                tmp_path,
+                command="gemini",
+                reason="Gemini executable changed during invocation",
+                raw_output="overloaded_error",
+            ),
+            AgentResult(text=valid, raw_output=valid, returncode=0),
+        ]
+    )
+    runner = FakeRunner()
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: False
+    config = make_config(tmp_path, reviewer="gemini", agent_max_retries=1)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="gemini",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="test",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="Google Gemini", unresolved_items=()
+            ),
+        )
+
+    assert response.marker_value.state == "approved"
+    assert run_mock.call_count == 2
+    assert "attempt_suffix" not in run_mock.call_args_list[1].kwargs
+
+
+def test_antigravity_replacement_replay_does_not_advance_model_state(tmp_path):
+    valid = structured_pr_review(
+        state="approved", summary="Antigravity recovered.", reviewer="Google Antigravity"
+    )
+    results = iter(
+        [
+            _observed_replacement_result(
+                tmp_path,
+                command="agy",
+                reason="Antigravity executable changed during invocation",
+                model_used="ModelA",
+            ),
+            AgentResult(text="", raw_output="overloaded_error", returncode=1, model_used="ModelA"),
+            AgentResult(text="", raw_output="quota exceeded", returncode=1, model_used="ModelA"),
+            AgentResult(text=valid, raw_output=valid, returncode=0, model_used="ModelB"),
+        ]
+    )
+    runner = FakeRunner()
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: True
+    config = make_config(
+        tmp_path,
+        reviewer="antigravity",
+        antigravity_models=("ModelA", "ModelB"),
+        agent_max_retries=1,
+    )
+    models: list[tuple[str, ...]] = []
+
+    def mock_run(_runner, *, config, **_kwargs):
+        models.append(config.antigravity_models)
+        return next(results)
+
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=mock_run) as run_mock:
+        response = _run_validated_agent(
+            runner,
+            agent="antigravity",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="test",
+            validate=lambda text: _validate_review_response(
+                text, reviewer="Google Antigravity", unresolved_items=()
+            ),
+            timeout_seconds=60,
+        )
+
+    assert response.marker_value.state == "approved"
+    assert models == [("ModelA",), ("ModelA",), ("ModelA",), ("ModelB",)]
+    assert run_mock.call_args_list[1].kwargs["attempt_suffix"] == "executable-replacement-attempt2"
+    assert "attempt_suffix" not in run_mock.call_args_list[2].kwargs
+    assert "attempt_suffix" not in run_mock.call_args_list[3].kwargs
+
+
 # ---------------------------------------------------------------------------
 # Antigravity (agy) backend + Gemini retirement guidance (#215)
 # ---------------------------------------------------------------------------
@@ -4269,6 +4419,58 @@ def test_runner_pty_reports_tty_and_strips_ansi(tmp_path):
     assert "GREEN" in result.stdout
     assert "\x1b[" not in result.stdout  # ANSI stripped from captured output
     assert result.returncode == 0
+
+
+def test_runner_pty_preserves_bytes_and_reports_unexpected_master_read_failure(
+    tmp_path, monkeypatch
+):
+    import errno
+    import pty
+    import coding_review_agent_loop.runner as runner_module
+
+    program = (
+        "import sys, time\n"
+        "sys.stdout.write('captured-before-read-failure\\n'); sys.stdout.flush()\n"
+        "time.sleep(1)\n"
+    )
+    calls = [0]
+    master_fd: list[int] = []
+    real_openpty = pty.openpty
+    real_read = runner_module.os.read
+
+    def capture_master_fd():
+        pair = real_openpty()
+        master_fd.append(pair[0])
+        return pair
+
+    monkeypatch.setattr(pty, "openpty", capture_master_fd)
+
+    def fail_after_first_read(fd, size):
+        if not master_fd or fd != master_fd[0]:
+            return real_read(fd, size)
+        calls[0] += 1
+        if calls[0] == 1:
+            # Seed the real PTY capture buffer deterministically; process
+            # scheduling may otherwise let the child close before the first
+            # select/read cycle is reached.
+            return b"captured-before-read-failure\n"
+        raise OSError(errno.EBADF, "injected PTY read failure")
+
+    monkeypatch.setattr(runner_module.os, "read", fail_after_first_read)
+    result = Runner().run_with_log(
+        [sys.executable, "-c", program],
+        cwd=tmp_path,
+        log_path=tmp_path / "logs" / "pty-read-failure.log",
+        label="PtyReadFailureProbe",
+        progress_interval_seconds=999,
+        check=False,
+        use_pty=True,
+    )
+
+    assert "captured-before-read-failure" in result.stdout
+    assert result.capture_diagnostics == (
+        "capture_read_failed:OSError:[Errno 9] injected PTY read failure",
+    )
 
 
 def test_runner_keeps_output_when_capture_path_is_unlinked(tmp_path):

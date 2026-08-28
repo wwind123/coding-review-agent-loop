@@ -538,6 +538,7 @@ class Runner:
         next_progress = started + progress_interval_seconds
         header = f"$ {' '.join(cmd)}\n\n"
         chunks: list[bytes] = []
+        capture_diagnostics: list[str] = []
         with log_path.open("wb") as log_file:
             log_file.write(header.encode("utf-8"))
             log_file.flush()
@@ -585,12 +586,32 @@ class Runner:
                         wait_seconds = min(1.0, max(0.0, deadline - now))
                     else:
                         wait_seconds = 1.0
-                    ready, _, _ = select.select([master_fd], [], [], wait_seconds)
+                    try:
+                        ready, _, _ = select.select([master_fd], [], [], wait_seconds)
+                    except OSError as exc:
+                        capture_diagnostics.append(
+                            f"capture_select_failed:{type(exc).__name__}:{exc}"
+                        )
+                        if proc.poll() is None:
+                            self._terminate_process_group(proc)
+                        break
                     if master_fd in ready:
                         try:
                             data = os.read(master_fd, 65536)
-                        except OSError:
-                            data = b""  # EIO once the slave side has fully closed
+                        except OSError as exc:
+                            # Linux reports EIO when the PTY slave closes. That is
+                            # the normal equivalent of EOF; every other read
+                            # failure is observable capture loss and must remain
+                            # fail-closed for callers that classify quiet output.
+                            if exc.errno == errno.EIO:
+                                data = b""
+                            else:
+                                capture_diagnostics.append(
+                                    f"capture_read_failed:{type(exc).__name__}:{exc}"
+                                )
+                                if proc.poll() is None:
+                                    self._terminate_process_group(proc)
+                                break
                         if data:
                             log_file.write(data)
                             log_file.flush()
@@ -637,6 +658,7 @@ class Runner:
                 executable_identity(cmd[0]),
                 self._interrupted,
             ),
+            tuple(capture_diagnostics),
         )
         if check and returncode != 0:
             raise AgentLoopError(
