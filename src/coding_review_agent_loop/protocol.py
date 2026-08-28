@@ -8,7 +8,7 @@ from collections.abc import Sequence
 import dataclasses
 from dataclasses import dataclass, field
 
-from .errors import AgentLoopError
+from .errors import AgentLoopError, IssueImplementationConflictError
 
 PUBLIC_RESPONSE_MARKER = "=== AGENT_LOOP_PUBLIC_RESPONSE_BELOW ==="
 
@@ -232,6 +232,20 @@ class StructuredCoderFollowup:
     disputed_items: tuple[str, ...] = ()
     dispute_evidence: dict[str, str] = field(default_factory=dict)
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
+
+
+@dataclass(frozen=True)
+class StructuredIssueImplementation:
+    """The strict terminal result emitted by an issue implementation coder."""
+
+    schema_version: int
+    kind: str
+    state: str
+    summary: str
+    pr_number: int | None
+    human_requirements: StructuredHumanRequirementsPayload
+    human_requirement_dispositions: tuple[HumanRequirementDisposition, ...]
+    tests_run: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1487,6 +1501,23 @@ def _extract_structured_coder_followup_payload(text: str) -> dict[str, object] |
     )
 
 
+def _extract_structured_issue_implementation_payload(
+    text: str,
+) -> dict[str, object] | None:
+    text, _status = normalize_response_file_structured_text(text)
+    extracted = _extract_json_object_prefix(text)
+    if extracted is None:
+        return None
+    payload, trailing = extracted
+    return _consume_structured_footer_and_signature(
+        payload=payload,
+        trailing=trailing,
+        state_re=STATE_RE,
+        state_marker_name="AGENT_STATE",
+        context_label="Structured issue implementation",
+    )
+
+
 def _require_supported_schema_version(payload: dict[str, object]) -> None:
     if "schema_version" not in payload:
         raise AgentLoopError("Structured response is missing required field: schema_version")
@@ -1940,6 +1971,104 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
         disputed_items=disputed_items,
         dispute_evidence=dispute_evidence,
     )
+
+
+def validate_structured_issue_implementation(
+    text: str,
+) -> StructuredIssueImplementation | None:
+    """Parse and validate the strict issue-implementation result envelope.
+
+    Context-sensitive requirement coverage is applied by the orchestrator,
+    because only the caller knows which signed labels were surfaced.  Basic
+    payload shape is validated here so malformed responses remain repairable.
+    """
+    payload = _extract_structured_issue_implementation_payload(text)
+    if payload is None:
+        return None
+    _require_supported_schema_version(payload)
+    if payload.get("kind") != "issue_implementation":
+        raise AgentLoopError(
+            "Structured response kind mismatch: expected `issue_implementation`."
+        )
+    _expect_exact_keys(
+        payload,
+        context="issue_implementation",
+        required={
+            "schema_version",
+            "kind",
+            "state",
+            "summary",
+            "pr_number",
+            "human_requirements",
+            "human_requirement_dispositions",
+        },
+        optional={"tests_run"},
+    )
+    state = _expect_non_empty_string(payload["state"], context="issue_implementation.state")
+    if state != "blocking":
+        raise AgentLoopError("issue_implementation.state must be `blocking`.")
+    summary = _expect_non_empty_string(
+        payload["summary"], context="issue_implementation.summary"
+    )
+    pr_value = payload["pr_number"]
+    if pr_value is None:
+        pr_number = None
+    else:
+        pr_number = _expect_int(pr_value, context="issue_implementation.pr_number")
+        if pr_number <= 0:
+            raise AgentLoopError(
+                "issue_implementation.pr_number must be a positive integer or null."
+            )
+    human_payload = _expect_object(
+        payload["human_requirements"], context="issue_implementation.human_requirements"
+    )
+    _expect_exact_keys(
+        human_payload,
+        context="issue_implementation.human_requirements",
+        required={"addressed_ids", "checked_discussion_directly"},
+    )
+    dispositions = _expect_human_requirement_dispositions(
+        payload["human_requirement_dispositions"],
+        context="issue_implementation.human_requirement_dispositions",
+    )
+    tests_value = payload.get("tests_run")
+    tests_run = (
+        _expect_string_list(
+            tests_value,
+            context="issue_implementation.tests_run",
+            item_context="issue_implementation.tests_run",
+        )
+        if tests_value is not None
+        else None
+    )
+    parsed = StructuredIssueImplementation(
+        schema_version=1,
+        kind="issue_implementation",
+        state=state,
+        summary=summary,
+        pr_number=pr_number,
+        human_requirements=StructuredHumanRequirementsPayload(
+            addressed_ids=_expect_requirement_id_list(
+                human_payload["addressed_ids"],
+                context="issue_implementation.human_requirements.addressed_ids",
+            ),
+            checked_discussion_directly=_expect_bool(
+                human_payload["checked_discussion_directly"],
+                context="issue_implementation.human_requirements.checked_discussion_directly",
+            ),
+        ),
+        human_requirement_dispositions=dispositions,
+        tests_run=tests_run,
+    )
+    # Keep this semantic contradiction visible to callers as a dedicated error
+    # with the typed payload attached.  The orchestration adapter first
+    # re-applies caller-specific requirement coverage before treating it as a
+    # terminal conflict.
+    if parsed.pr_number is not None and any(
+        item.disposition == "blocked" for item in parsed.human_requirement_dispositions
+    ):
+        raise IssueImplementationConflictError(parsed)
+    return parsed
 
 
 def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | None:

@@ -14,6 +14,7 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_plan_review_comment,
     _render_public_plan_revision_comment,
     _render_public_pr_review_comment,
+    _render_public_issue_implementation_comment,
     decode_deferred_stages_marker,
     normalize_freeform_signature,
     render_agent_unavailable_comment,
@@ -43,6 +44,7 @@ from coding_review_agent_loop.protocol import (
     parse_structured_plan_review,
     parse_unresolved_item_dispositions,
     validate_structured_coder_followup,
+    validate_structured_issue_implementation,
     validate_structured_plan_revision,
     validate_structured_plan_state,
 )
@@ -53,11 +55,34 @@ from agent_loop_helpers import (
     prior_item_dispositions,
     prior_plan_item_dispositions,
     structured_coder_followup,
+    structured_issue_implementation,
     structured_plan_review,
     structured_plan_revision,
     structured_plan_state,
     structured_pr_review,
 )
+
+
+def test_render_issue_implementation_no_pr_keeps_summary_tests_and_result_identity():
+    parsed = validate_structured_issue_implementation(
+        structured_issue_implementation(
+            pr_number=None,
+            summary="No safe PR was accepted.",
+            tests_run=["python3 -m pytest tests/test_protocol.py -q"],
+        )
+    )
+
+    assert parsed is not None
+    rendered = _render_public_issue_implementation_comment(
+        parsed,
+        agent="claude",
+        model_used="claude-test",
+    )
+
+    assert "No pull request was accepted for handoff." in rendered
+    assert "No safe PR was accepted." in rendered
+    assert "python3 -m pytest tests/test_protocol.py -q" in rendered
+    assert '"kind": "issue_implementation"' not in rendered
 
 
 def test_render_agent_unavailable_comment_round_trips_through_parser():

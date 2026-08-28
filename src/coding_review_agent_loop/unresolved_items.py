@@ -5,7 +5,11 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
-from .errors import AgentLoopError, UnknownPriorItemDispositionError
+from .errors import (
+    AgentLoopError,
+    IssueImplementationConflictError,
+    UnknownPriorItemDispositionError,
+)
 from .github import PullRequestMergeability
 from .prompts import render_coder_human_requirements_prompt_context
 from .protocol import (
@@ -13,12 +17,14 @@ from .protocol import (
     ParsedReview,
     ReviewItemDisposition,
     StructuredCoderFollowup,
+    StructuredIssueImplementation,
     UnresolvedReviewItem,
     parse_plan_review,
     parse_pr_review,
     validate_human_requirements_acknowledgement,
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
+    validate_structured_issue_implementation,
     validate_human_requirement_dispositions,
 )
 
@@ -239,26 +245,47 @@ def _reconcile_human_requirements_ack_item(
     if not prompt_context.surfaced_requirement_ids and not prompt_context.requires_direct_discussion_ack:
         return _clear_human_requirements_ack_item(unresolved_items)
     try:
-        structured_followup = validate_structured_coder_followup(coder_output)
-        if structured_followup is not None:
+        structured_followup = None
+        try:
+            structured_implementation = validate_structured_issue_implementation(coder_output)
+        except IssueImplementationConflictError as exc:
+            structured_implementation = exc.payload
+        except AgentLoopError:
+            structured_implementation = None
+        if isinstance(structured_implementation, StructuredIssueImplementation):
             validate_human_requirement_dispositions(
-                structured_followup.human_requirement_dispositions,
+                structured_implementation.human_requirement_dispositions,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
-                context="coder_followup.human_requirement_dispositions",
+                context="issue_implementation.human_requirement_dispositions",
             )
             validate_structured_human_requirements_acknowledgement(
-                structured_followup.human_requirements.addressed_ids,
-                dispositions=structured_followup.human_requirement_dispositions,
-                checked_discussion_directly=structured_followup.human_requirements.checked_discussion_directly,
+                structured_implementation.human_requirements.addressed_ids,
+                dispositions=structured_implementation.human_requirement_dispositions,
+                checked_discussion_directly=structured_implementation.human_requirements.checked_discussion_directly,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
             )
         else:
-            validate_human_requirements_acknowledgement(
-                coder_output,
-                surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
-                requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
-            )
+            structured_followup = validate_structured_coder_followup(coder_output)
+            if structured_followup is None:
+                validate_human_requirements_acknowledgement(
+                    coder_output,
+                    surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
+                    requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+                )
+            else:
+                validate_human_requirement_dispositions(
+                    structured_followup.human_requirement_dispositions,
+                    surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
+                    context="coder_followup.human_requirement_dispositions",
+                )
+                validate_structured_human_requirements_acknowledgement(
+                    structured_followup.human_requirements.addressed_ids,
+                    dispositions=structured_followup.human_requirement_dispositions,
+                    checked_discussion_directly=structured_followup.human_requirements.checked_discussion_directly,
+                    surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
+                    requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+                )
     except AgentLoopError as exc:
         return _upsert_human_requirements_ack_item(
             unresolved_items,

@@ -51,7 +51,8 @@ The skill helpers reuse the same library entry points used by the headless CLI:
 
 - `_validate_plan_review_response` / `_validate_review_response` (unresolved_items)
 - `_resume_plan_round` / `_resume_pr_round` (round_state)
-- `parse_plan_state` / `validate_structured_plan_revision` (protocol)
+- `parse_plan_state` / `validate_structured_plan_revision` /
+  `validate_structured_issue_implementation` (protocol)
 
 GitHub comment metadata markers (`AGENT_LOOP_META`) written by the skill are
 identical to those written by the headless CLI, so mixed-mode operation (start
@@ -73,12 +74,16 @@ mirroring the CLI's `--coder` / `--reviewer` reversal — so an external agent
   `pending`. The host reads the posted plan/PR, writes its structured review
   there, and finalizes it with `complete-host-review --dir <dir>` (works for both
   plan and PR rounds); re-running the round then recomputes the final state.
-- **Implement, reversed**: after a plan is approved, an external coder implements
-  it and opens a PR — see [Approved-plan execution helpers](#approved-plan-execution-helpers)
-  — which the host then reviews with `run-pr-round`. If that review blocks,
-  `run-pr-fix --coder X --reviewers ... --workdir <push-capable clone>` sends the
-  same external coder back to the open PR branch, posts a coder follow-up for the
-  new head, and hands the PR back to `run-pr-round`.
+- **Implement, reversed**: after a plan is approved, an external coder emits the
+  typed `issue_implementation` result and may open a PR — see [Approved-plan
+  execution helpers](#approved-plan-execution-helpers) — which the host then
+  reviews with `run-pr-round`. A null-PR result is posted to the issue and stops
+  before handoff. A positive PR combined with a blocked signed requirement is
+  posted once as a rejected terminal conflict, preserving the real PR reference
+  in the summary/evidence without retrying or entering review/merge gates. If
+  that review blocks, `run-pr-fix --coder X --reviewers ... --workdir <push-capable
+  clone>` sends the same external coder back to the open PR branch, posts a coder
+  follow-up for the new head, and hands the PR back to `run-pr-round`.
 
 End to end: external coder plans -> reviewers review -> external coder implements
 (one-shot / decompose / by-phase) -> host + external reviewers review the PR ->
@@ -116,8 +121,11 @@ Skill mode also exposes the external-coder execution helpers used after a plan
 has already been approved:
 
 - `run-implement` performs the existing one-shot reverse implementation. It
-  keeps using the durable `AGENT_PLAN_ONE_SHOT_IMPL` marker and is unchanged by
-  by-phase support.
+  validates and renders the external coder's `issue_implementation` result,
+  validates structured test commands inside the assigned workdir, preserves the
+  raw payload in accepted PR metadata, and stops before handoff for null-PR or
+  rejected-conflict terminal results. It keeps using the durable
+  `AGENT_PLAN_ONE_SHOT_IMPL` marker and is unchanged by by-phase support.
 - `run-decompose` decomposes an approved plan into child phase issues with mode
   `decompose-only`.
 - `run-implement-by-phase` decomposes with mode `implement-by-phase`, then
@@ -144,9 +152,10 @@ python -m helpers.skill_runner run-implement-by-phase \
 ```
 
 Live by-phase implementation creates or reuses child phase issues, posts the
-parent decomposition summary, posts a phase implementation handoff before
-running the child implementation, and then runs the external coder in the
-push-capable workdir. Reruns with an existing phase handoff stop with a child
+parent decomposition summary, runs the external coder in the push-capable
+workdir, and posts a phase implementation handoff only after the coder returns
+an accepted positive PR. Null-PR and rejected-conflict terminal results stop
+without handoff. Reruns with an existing phase handoff stop with a child
 issue resume hint rather than invoking the coder again. If phase 1 is
 `human-action` or `manual-close`, the command stops after decomposition and
 reports the child issue that needs human work.

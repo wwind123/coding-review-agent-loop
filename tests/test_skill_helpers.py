@@ -2738,7 +2738,15 @@ class TestHostReviewerPR:
 # helpers/skill_runner.py — reverse implementation: run-implement (#316)
 # ---------------------------------------------------------------------------
 
-_IMPL_WITH_PR = "Implemented the plan.\n\n<!-- AGENT_PR: 5 -->\n-- Codex\n"
+_IMPL_WITH_PR = json.dumps({
+    "schema_version": 1,
+    "kind": "issue_implementation",
+    "state": "blocking",
+    "summary": "Implemented the plan and opened PR 5.",
+    "pr_number": 5,
+    "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+    "human_requirement_dispositions": [],
+}) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
 
 
 def _human_req():
@@ -2762,7 +2770,7 @@ class TestRunExternalImplStub:
                 "--dry-run",
             )
             assert result.returncode == 0
-            assert "<!-- AGENT_PR: 1 -->" in out.read_text(encoding="utf-8")
+            assert '"kind": "issue_implementation"' in out.read_text(encoding="utf-8")
 
 
 class TestRunExternalDecomposeStub:
@@ -2835,7 +2843,7 @@ class TestValidateCoderImplementationResponse:
         pr = _validate_coder_implementation_response(
             _IMPL_WITH_PR, workdir="/tmp/wd", human_requirements=(),
         )
-        assert pr == 5
+        assert pr.pr_number == 5
 
     def test_missing_human_ack_rejected(self) -> None:
         from coding_review_agent_loop.errors import AgentLoopError
@@ -2848,11 +2856,16 @@ class TestValidateCoderImplementationResponse:
     def test_out_of_workdir_test_rejected(self) -> None:
         from coding_review_agent_loop.errors import AgentLoopError
         from helpers.skill_runner import _validate_coder_implementation_response
-        bad = (
-            "Implemented the plan.\n"
-            "Tests: cd /nonexistent/other-dir && pytest passed.\n\n"
-            "<!-- AGENT_PR: 5 -->\n-- Codex\n"
-        )
+        bad = json.dumps({
+            "schema_version": 1,
+            "kind": "issue_implementation",
+            "state": "blocking",
+            "summary": "Implemented the plan and opened PR 5.",
+            "pr_number": 5,
+            "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+            "human_requirement_dispositions": [],
+            "tests_run": ["cd /nonexistent/other-dir && pytest"],
+        }) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
         with pytest.raises(AgentLoopError):
             _validate_coder_implementation_response(
                 bad, workdir="/tmp/wd", human_requirements=(),
@@ -3570,7 +3583,7 @@ class TestRunImplementByPhase:
 
         sr.cmd_run_implement_by_phase(self._args(tmp_path))
 
-        assert events == ["handoff:123", "implement:123"]
+        assert events == ["implement:123", "handoff:123"]
         output = self._last_json(capsys.readouterr().out)
         assert output["state"] == "implemented"
         assert output["child_implementation"]["pr"] == 456

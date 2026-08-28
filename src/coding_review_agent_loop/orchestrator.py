@@ -47,6 +47,7 @@ from .decomposition import (
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
+    IssueImplementationConflictError,
     QuotaResetExceededError,
     UnknownPriorItemDispositionError,
 )
@@ -202,6 +203,7 @@ from .protocol import (
     PUBLIC_RESPONSE_MARKER,
     ReviewItemDisposition,
     StructuredCoderFollowup,
+    StructuredIssueImplementation,
     StructuredPlanState,
     StructuredPlanRevision,
     UnresolvedReviewItem,
@@ -222,6 +224,8 @@ from .protocol import (
     validate_human_requirements_acknowledgement,
     validate_human_requirement_dispositions,
     validate_structured_coder_followup,
+    validate_structured_human_requirements_acknowledgement,
+    validate_structured_issue_implementation,
     validate_structured_plan_state,
     validate_structured_plan_revision,
     validate_structured_discuss_agenda,
@@ -406,7 +410,7 @@ PUBLIC_RESPONSE_ARTIFACT_PREFIX_RE = re.compile(
     re.I,
 )
 STRUCTURED_PUBLIC_RESPONSE_KINDS = frozenset(
-    {"plan_state", "plan_review", "pr_review", "coder_followup", "plan_revision", "discuss_review", "discuss_answer", "discuss_semantic_comparison", "discuss_answer_confirmation"}
+    {"plan_state", "plan_review", "pr_review", "coder_followup", "issue_implementation", "plan_revision", "discuss_review", "discuss_answer", "discuss_semantic_comparison", "discuss_answer_confirmation"}
 )
 PLAN_REVISION_FOOTER_RE = re.compile(r"(?m)^<!--\s*AGENT_PLAN_STATE:\s*(approved|blocking)\s*-->\s*$")
 STRUCTURED_FENCE_RE = re.compile(
@@ -1706,6 +1710,8 @@ def _operation_description_from_context(
         return "PR review"
     if repair_expected_kind == "coder_followup":
         return "structured PR feedback follow-up repair"
+    if repair_expected_kind == "issue_implementation":
+        return "issue implementation response repair"
     if repair_expected_kind == "discuss_review":
         return "discuss review"
     if repair_expected_kind == "discuss_agenda":
@@ -1935,6 +1941,7 @@ class CompletionRecoveryPolicy:
     """
 
     issue_number: int
+    issue_context: IssueContext | None = None
 
 
 @dataclass(frozen=True)
@@ -2022,7 +2029,11 @@ def _attempt_claude_completion_recovery(
 
     In every terminal case there is exactly one ``--resume`` call total.
     """
-    recovery_prompt = build_completion_recovery_prompt(config)
+    recovery_prompt = build_completion_recovery_prompt(
+        config,
+        issue_number=completion_recovery.issue_number,
+        issue_context=completion_recovery.issue_context,
+    )
     recovery_result = run_agent_result(
         runner,
         agent="claude",
@@ -2965,7 +2976,7 @@ def _run_validated_agent(
                     repair_kwargs: dict[str, object] = {"expected_kind": repair_expected_kind}
                     if repair_unresolved_item_ids is not None:
                         repair_kwargs["unresolved_item_ids"] = tuple(repair_unresolved_item_ids)
-                    if repair_expected_kind in {"plan_state", "plan_revision"}:
+                    if repair_expected_kind in {"issue_implementation", "plan_state", "plan_revision"}:
                         repair_kwargs["surfaced_requirement_ids"] = tuple(
                             repair_surfaced_requirement_ids or ()
                         )
@@ -3203,6 +3214,63 @@ class _TerminalNoPrImplementation:
     state: str
 
 
+@dataclass(frozen=True)
+class _TerminalIssueImplementationConflict:
+    """A valid implementation payload rejected from handoff by semantics."""
+
+    parsed: StructuredIssueImplementation
+
+
+def _validate_issue_implementation_contract(
+    parsed: StructuredIssueImplementation,
+    *,
+    human_requirements,
+) -> None:
+    prompt_context = render_coder_human_requirements_prompt_context(
+        human_requirements,
+        requirement_scope="implementation requirements",
+        full_omission_fallback="Fetch the issue discussion directly before implementing.",
+    )
+    validate_human_requirement_dispositions(
+        parsed.human_requirement_dispositions,
+        surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
+        context="issue_implementation.human_requirement_dispositions",
+    )
+    validate_structured_human_requirements_acknowledgement(
+        parsed.human_requirements.addressed_ids,
+        dispositions=parsed.human_requirement_dispositions,
+        checked_discussion_directly=parsed.human_requirements.checked_discussion_directly,
+        surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
+        requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+    )
+
+
+def _validate_issue_implementation_response(
+    text: str,
+    *,
+    human_requirements,
+) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
+    """Validate an implementation result and isolate the terminal conflict path."""
+    if is_clarification_request(text):
+        return _TerminalNoPrImplementation("clarification")
+    try:
+        parsed = validate_structured_issue_implementation(text)
+    except IssueImplementationConflictError as exc:
+        parsed = exc.payload
+        if not isinstance(parsed, StructuredIssueImplementation):
+            raise AgentLoopError("Issue implementation conflict did not retain a typed payload.") from exc
+        # A conflict is terminal only after the normal acknowledgement and
+        # exact-ledger contract has been proven valid for this issue.
+        _validate_issue_implementation_contract(parsed, human_requirements=human_requirements)
+        return _TerminalIssueImplementationConflict(parsed)
+    if parsed is None:
+        raise AgentLoopError(
+            "Issue implementation response must use the required structured `issue_implementation` format."
+        )
+    _validate_issue_implementation_contract(parsed, human_requirements=human_requirements)
+    return parsed
+
+
 def _require_issue_implementation_result(text: str) -> int | _TerminalNoPrImplementation:
     """Accept a positive PR, or an explicit terminal blocking/clarify outcome."""
     reference: PrReference = classify_pr_reference(text)
@@ -3252,6 +3320,29 @@ def _post_no_pr_implementation_terminal_comment(
             agent=config.coder,
             config=config,
             model_used=coder_response.model_used,
+        ),
+    )
+
+
+def _post_structured_issue_implementation_terminal_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    parsed: StructuredIssueImplementation,
+    model_used: str | None,
+) -> None:
+    """Publish a typed no-PR or rejected-conflict implementation result."""
+    post_issue_comment(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        body=render_public_agent_comment(
+            kind="issue_implementation",
+            parsed=parsed,
+            agent=config.coder,
+            config=config,
+            model_used=model_used,
         ),
     )
 
@@ -4060,6 +4151,38 @@ def _validate_response_tests_with_post_pr_context(
         ) from exc
 
 
+def _validate_structured_response_tests_with_post_pr_context(
+    tests_run: Sequence[str] | None,
+    *,
+    runner: Runner,
+    config: AgentLoopConfig,
+    pr_number: int,
+) -> None:
+    """Validate structured test commands with the same confirmed-PR diagnostic."""
+    try:
+        validate_test_commands_within_workdir(
+            tests_run,
+            assigned_workdir=active_workdir(config),
+        )
+    except AgentLoopError as exc:
+        try:
+            validate_open_pr(runner, config=config, pr_number=pr_number)
+        except Exception as pr_exc:
+            raise AgentLoopError(
+                f"{exc}\n\n"
+                f"The coder reported PR #{pr_number}, but the orchestrator could not confirm it is open. "
+                "The handoff/reviewer comments were not posted because the structured test report was invalid. "
+                "Inspect the PR state on GitHub before deciding whether to resume the existing PR or rerun "
+                "implementation."
+            ) from pr_exc
+        raise AgentLoopError(
+            f"{exc}\n\n"
+            f"PR #{pr_number} was confirmed open, but the handoff/reviewer comments were not posted because "
+            "the structured test report was invalid. Correct the PR/comment if needed, then continue safely with "
+            f"`agent-loop pr {pr_number}` instead of rerunning implementation and creating a duplicate PR."
+        ) from exc
+
+
 def _round_ledger_may_be_incomplete(
     *,
     current_resume: ResumedReviewRound | None,
@@ -4319,9 +4442,20 @@ def _implement_approved_issue(
             managed_ci_creation_intent=managed_ci_creation_intent,
         ),
         session_id=implementation_session_id,
-        marker_description="positive <!-- AGENT_PR: <number> -->, PR URL, blocking, or clarification",
-        validate=_require_issue_implementation_result,
+        marker_description="structured issue_implementation result, blocking, or clarification",
+        validate=lambda text: _validate_issue_implementation_response(
+            text,
+            human_requirements=issue_context.human_requirements,
+        ),
         usage_context=usage_context,
+        use_repair=True,
+        repair_expected_kind="issue_implementation",
+        repair_surfaced_requirement_ids=render_coder_human_requirements_prompt_context(
+            issue_context.human_requirements,
+        ).surfaced_requirement_ids,
+        repair_requires_direct_discussion_ack=render_coder_human_requirements_prompt_context(
+            issue_context.human_requirements,
+        ).requires_direct_discussion_ack,
         salvage_context=SalvageContext(
             repo=implementation_config.repo,
             issue_number=issue_number,
@@ -4331,11 +4465,53 @@ def _implement_approved_issue(
             approved_plan_hash=plan_hash,
         ),
         operation_description="approved-plan implementation",
-        completion_recovery=CompletionRecoveryPolicy(issue_number=issue_number),
+        completion_recovery=CompletionRecoveryPolicy(
+            issue_number=issue_number,
+            issue_context=issue_context,
+        ),
     )
     coder_output = coder_response.text
     implementation_result = coder_response.marker_value
-    if isinstance(implementation_result, _TerminalNoPrImplementation):
+    if isinstance(implementation_result, _TerminalIssueImplementationConflict):
+        validate_test_commands_within_workdir(
+            implementation_result.parsed.tests_run,
+            assigned_workdir=active_workdir(implementation_config),
+        )
+        _post_structured_issue_implementation_terminal_comment(
+            runner,
+            config=implementation_config,
+            issue_number=issue_number,
+            parsed=implementation_result.parsed,
+            model_used=coder_response.model_used,
+        )
+        raise AgentLoopError(
+            "Coder implementation result was not accepted for handoff because a signed "
+            "human requirement is blocked."
+        )
+    if isinstance(implementation_result, StructuredIssueImplementation):
+        if implementation_result.pr_number is None:
+            validate_test_commands_within_workdir(
+                implementation_result.tests_run,
+                assigned_workdir=active_workdir(implementation_config),
+            )
+            _post_structured_issue_implementation_terminal_comment(
+                runner,
+                config=implementation_config,
+                issue_number=issue_number,
+                parsed=implementation_result,
+                model_used=coder_response.model_used,
+            )
+            raise AgentLoopError(
+                "Coder did not create a valid PR; implementation is blocking."
+            )
+        _validate_structured_response_tests_with_post_pr_context(
+            implementation_result.tests_run,
+            runner=runner,
+            config=implementation_config,
+            pr_number=implementation_result.pr_number,
+        )
+        pr_number = implementation_result.pr_number
+    elif isinstance(implementation_result, _TerminalNoPrImplementation):
         _post_no_pr_implementation_terminal_comment(
             runner,
             config=implementation_config,
@@ -4345,20 +4521,8 @@ def _implement_approved_issue(
         raise AgentLoopError(
             "Coder did not create a valid PR; implementation is " + implementation_result.state + "."
         )
-    pr_number = int(implementation_result)
-    _validate_response_with_human_requirements(
-        coder_output,
-        marker_validator=_require_pr_number,
-        human_requirements=issue_context.human_requirements,
-        requirement_scope="implementation requirements",
-        full_omission_fallback="Fetch the issue discussion directly before implementing.",
-    )
-    _validate_response_tests_with_post_pr_context(
-        coder_output,
-        runner=runner,
-        config=implementation_config,
-        pr_number=pr_number,
-    )
+    else:
+        raise AgentLoopError("Issue implementation validator returned an unknown result type.")
     validate_assigned_head_advanced(
         before_head=assigned_head_before,
         after_head=_read_assigned_workdir_head(runner, implementation_config),
@@ -4454,8 +4618,9 @@ def _implement_approved_issue(
             pr_head_sha=initial_pr_context.metadata.head_sha,
         )
     initial_coder_body = _attach_round_metadata(
-        normalize_freeform_signature(
-            coder_output,
+        render_public_agent_comment(
+            kind="issue_implementation",
+            parsed=implementation_result,
             agent=implementation_config.coder,
             config=implementation_config,
             model_used=coder_response.model_used,
@@ -4467,6 +4632,7 @@ def _implement_approved_issue(
             round_number=1,
             subject=str(initial_pr_context.metadata.head_sha or "unknown"),
             prior_items=(),
+            raw_structured_coder_response=coder_output,
             model_used=coder_response.model_used,
             acquisition_outcome=coder_response.acquisition_outcome,
             acquisition_returncode=coder_response.acquisition_returncode,
@@ -5435,22 +5601,13 @@ def _run_plan_first_loop(
                         f"`agent-loop issue {handoff.child_issue_number}`."
                     )
                     return 0
-                post_phase_implementation_handoff_comment(
-                    runner,
-                    config=config,
-                    parent_issue=issue_number,
-                    mode=mode,
-                    plan_hash=plan_hash,
-                    phase_index=1,
-                    created=first_agent_phase,
-                )
                 child_issue_context = get_issue_context(
                     runner,
                     config=config,
                     issue_number=first_agent_phase.issue_number,
                 )
                 phase_parent_context = first_agent_phase.phase.parent_context or current_plan
-                return _implement_approved_issue(
+                implementation_result = _implement_approved_issue(
                     runner,
                     issue_number=first_agent_phase.issue_number,
                     approved_plan=phase_parent_context,
@@ -5460,6 +5617,16 @@ def _run_plan_first_loop(
                     coder_session_id=coder_session_id,
                     usage_context=usage_context,
                 )
+                post_phase_implementation_handoff_comment(
+                    runner,
+                    config=config,
+                    parent_issue=issue_number,
+                    mode=mode,
+                    plan_hash=plan_hash,
+                    phase_index=1,
+                    created=first_agent_phase,
+                )
+                return implementation_result
 
             if mode == "implement-one-shot":
                 plan_hash = approved_plan_hash(current_plan)
@@ -6044,9 +6211,20 @@ def run_issue_loop(
                 staged_parent_issue=staged_parent_issue,
                 managed_ci_creation_intent=managed_ci_creation_intent,
             ),
-            marker_description="positive <!-- AGENT_PR: <number> -->, PR URL, blocking, or clarification",
-            validate=_require_issue_implementation_result,
+            marker_description="structured issue_implementation result, blocking, or clarification",
+            validate=lambda text: _validate_issue_implementation_response(
+                text,
+                human_requirements=issue_context.human_requirements,
+            ),
             usage_context=usage_context,
+            use_repair=True,
+            repair_expected_kind="issue_implementation",
+            repair_surfaced_requirement_ids=render_coder_human_requirements_prompt_context(
+                issue_context.human_requirements,
+            ).surfaced_requirement_ids,
+            repair_requires_direct_discussion_ack=render_coder_human_requirements_prompt_context(
+                issue_context.human_requirements,
+            ).requires_direct_discussion_ack,
             salvage_context=SalvageContext(
                 repo=config.repo,
                 issue_number=issue_number,
@@ -6055,35 +6233,68 @@ def run_issue_loop(
                 run_id=usage_context.run_id,
             ),
             operation_description="issue implementation",
-            completion_recovery=CompletionRecoveryPolicy(issue_number=issue_number),
+            completion_recovery=CompletionRecoveryPolicy(
+                issue_number=issue_number,
+                issue_context=issue_context,
+            ),
         )
         coder_output = coder_response.text
         coder_session_id = coder_response.session_id
         implementation_result = coder_response.marker_value
-        if isinstance(implementation_result, _TerminalNoPrImplementation):
-            _post_no_pr_implementation_terminal_comment(
+        if isinstance(implementation_result, _TerminalIssueImplementationConflict):
+            validate_test_commands_within_workdir(
+                implementation_result.parsed.tests_run,
+                assigned_workdir=active_workdir(config),
+            )
+            _post_structured_issue_implementation_terminal_comment(
                 runner,
                 config=config,
                 issue_number=issue_number,
-                coder_response=coder_response,
+                parsed=implementation_result.parsed,
+                model_used=coder_response.model_used,
             )
             raise AgentLoopError(
-                "Coder did not create a valid PR; implementation is " + implementation_result.state + "."
+                "Coder implementation result was not accepted for handoff because a signed "
+                "human requirement is blocked."
             )
-        pr_number = int(implementation_result)
-        _validate_response_with_human_requirements(
-            coder_output,
-            marker_validator=_require_pr_number,
-            human_requirements=issue_context.human_requirements,
-            requirement_scope="implementation requirements",
-            full_omission_fallback="Fetch the issue discussion directly before implementing.",
-        )
-        _validate_response_tests_with_post_pr_context(
-            coder_output,
-            runner=runner,
-            config=config,
-            pr_number=pr_number,
-        )
+        if isinstance(implementation_result, StructuredIssueImplementation):
+            if implementation_result.pr_number is None:
+                validate_test_commands_within_workdir(
+                    implementation_result.tests_run,
+                    assigned_workdir=active_workdir(config),
+                )
+                _post_structured_issue_implementation_terminal_comment(
+                    runner,
+                    config=config,
+                    issue_number=issue_number,
+                    parsed=implementation_result,
+                    model_used=coder_response.model_used,
+                )
+                raise AgentLoopError(
+                    "Coder did not create a valid PR; implementation is blocking."
+                )
+            _validate_structured_response_tests_with_post_pr_context(
+                implementation_result.tests_run,
+                runner=runner,
+                config=config,
+                pr_number=implementation_result.pr_number,
+            )
+            pr_number = implementation_result.pr_number
+        else:
+            # Clarification remains the legacy terminal alternative.
+            if isinstance(implementation_result, _TerminalNoPrImplementation):
+                _post_no_pr_implementation_terminal_comment(
+                    runner,
+                    config=config,
+                    issue_number=issue_number,
+                    coder_response=coder_response,
+                )
+                raise AgentLoopError(
+                    "Coder did not create a valid PR; implementation is "
+                    + implementation_result.state
+                    + "."
+                )
+            raise AgentLoopError("Issue implementation validator returned an unknown result type.")
         validate_assigned_head_advanced(
             before_head=assigned_head_before,
             after_head=_read_assigned_workdir_head(runner, config),
@@ -6164,8 +6375,9 @@ def run_issue_loop(
             expected_closing_issue_ids=closing_contract.issue_ids,
         )
         initial_coder_body = _attach_round_metadata(
-            normalize_freeform_signature(
-                coder_output,
+            render_public_agent_comment(
+                kind="issue_implementation",
+                parsed=implementation_result,
                 agent=config.coder,
                 config=config,
                 model_used=coder_response.model_used,
@@ -6177,6 +6389,7 @@ def run_issue_loop(
                 round_number=1,
                 subject=str(initial_pr_metadata.head_sha or "unknown"),
                 prior_items=(),
+                raw_structured_coder_response=coder_output,
                 model_used=coder_response.model_used,
                 acquisition_outcome=coder_response.acquisition_outcome,
                 acquisition_returncode=coder_response.acquisition_returncode,
@@ -6358,6 +6571,14 @@ def _extract_structured_coder_summary(text: str | None) -> str | None:
     if not text:
         return None
     try:
+        try:
+            implementation = validate_structured_issue_implementation(text)
+        except IssueImplementationConflictError as exc:
+            implementation = exc.payload
+        except AgentLoopError:
+            implementation = None
+        if isinstance(implementation, StructuredIssueImplementation):
+            return implementation.summary
         parsed = validate_structured_coder_followup(text)
         return parsed.summary if parsed else None
     except AgentLoopError:
@@ -6368,6 +6589,14 @@ def _extract_structured_coder_tests_run(text: str | None) -> tuple[str, ...] | N
     if not text:
         return None
     try:
+        try:
+            implementation = validate_structured_issue_implementation(text)
+        except IssueImplementationConflictError as exc:
+            implementation = exc.payload
+        except AgentLoopError:
+            implementation = None
+        if isinstance(implementation, StructuredIssueImplementation):
+            return implementation.tests_run
         parsed = validate_structured_coder_followup(text)
         return parsed.tests_run if parsed else None
     except AgentLoopError:

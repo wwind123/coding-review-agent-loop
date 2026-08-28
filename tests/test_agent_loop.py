@@ -69,6 +69,7 @@ from coding_review_agent_loop.protocol import (
     parse_plan_item_dispositions,
     parse_plan_review,
     parse_pr_review,
+    validate_structured_issue_implementation,
     validate_structured_coder_followup,
     validate_structured_plan_revision,
 )
@@ -80,6 +81,7 @@ from agent_loop_helpers import (
     prior_item_dispositions,
     prior_plan_item_dispositions,
     structured_coder_followup,
+    structured_issue_implementation,
     structured_plan_review,
     structured_plan_revision,
     structured_plan_state,
@@ -2160,9 +2162,10 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
     pr_review_text = structured_pr_review(state="approved", summary="PR approved.")
     plan_review_marker = parse_plan_review(plan_review_text, reviewer="Google Gemini")
     pr_review_marker = parse_pr_review(pr_review_text, reviewer="Google Gemini")
-    implementation_text = (
-        "Created PR.\nTests: python -m pytest passed.\n"
-        "<!-- AGENT_PR: 77 -->\n-- OpenAI Codex"
+    implementation_text = structured_issue_implementation(
+        summary="Created PR 77.",
+        pr_number=77,
+        reviewer="OpenAI Codex",
     )
     calls = []
     runner = FakeRunner(pr_payload={"body": "Fixes #56"})
@@ -2207,7 +2210,7 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
                 text=implementation_text,
                 model_used="gpt-5.5 (high)",
                 session_id="implementation-session",
-                marker_value="77",
+                marker_value=validate_structured_issue_implementation(implementation_text),
             )
         return ValidatedAgentResponse(
             text=pr_review_text,

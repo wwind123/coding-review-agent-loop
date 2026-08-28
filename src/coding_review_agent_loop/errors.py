@@ -28,6 +28,24 @@ class UnknownPriorItemDispositionError(AgentLoopError):
         super().__init__(message)
 
 
+class IssueImplementationConflictError(AgentLoopError):
+    """A parsed implementation result cannot be handed off as reported.
+
+    A coder may discover a signed human requirement is blocked after opening a
+    PR.  The payload is still valuable operator evidence, but a positive PR
+    identity combined with a blocked requirement is not an accepted
+    implementation result.  Retain the parsed payload so the orchestrator can
+    publish that terminal conflict without retrying or entering PR gates.
+    """
+
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+        super().__init__(
+            "issue_implementation cannot report a positive PR while a signed "
+            "human requirement is blocked."
+        )
+
+
 class AgentInvocationError(AgentLoopError):
     """Raised when an agent invocation fails after retries/repair.
 

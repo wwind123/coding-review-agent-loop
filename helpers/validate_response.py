@@ -10,6 +10,7 @@ Kinds:
   plan_review      -- reviewer plan review structured JSON
   pr_review        -- reviewer PR review structured JSON
   coder_followup   -- coder follow-up structured JSON
+  issue_implementation -- issue implementation structured JSON
   plan_revision    -- coder plan revision structured JSON
 
 The optional --context-file is a JSON file with schema:
@@ -34,7 +35,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
-from coding_review_agent_loop.protocol import parse_plan_state, validate_structured_plan_revision
+from coding_review_agent_loop.protocol import (
+    parse_plan_state,
+    validate_structured_plan_revision,
+)
 from coding_review_agent_loop.unresolved_items import (
     _validate_plan_review_response,
     _validate_review_response,
@@ -44,7 +48,7 @@ from coding_review_agent_loop.round_state import _deserialize_unresolved_item
 from coding_review_agent_loop.github import HumanReviewRequirement
 
 
-_KINDS = ("plan_state", "plan_review", "pr_review", "coder_followup", "plan_revision")
+_KINDS = ("plan_state", "plan_review", "pr_review", "coder_followup", "issue_implementation", "plan_revision")
 
 
 def _load_context(path: str | None) -> dict[str, object]:
@@ -152,6 +156,13 @@ def validate_response_text(
             text,
             unresolved_items=deserialized_prior,
             human_requirements=deserialized_requirements or None,
+        )
+    if kind == "issue_implementation":
+        from coding_review_agent_loop.orchestrator import _validate_issue_implementation_response
+
+        return _validate_issue_implementation_response(
+            text,
+            human_requirements=deserialized_requirements,
         )
 
     parsed = validate_structured_plan_revision(text)

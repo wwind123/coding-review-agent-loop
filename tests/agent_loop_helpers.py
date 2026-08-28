@@ -73,6 +73,7 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_plan_review_comment,
     _render_public_plan_revision_comment,
     _render_public_pr_review_comment,
+    _render_public_issue_implementation_comment,
     normalize_freeform_signature,
 )
 from coding_review_agent_loop.decomposition import (
@@ -179,6 +180,7 @@ from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
     validate_human_requirements_acknowledgement,
     validate_structured_coder_followup,
+    validate_structured_issue_implementation,
     validate_structured_human_requirements_acknowledgement,
     validate_structured_plan_state,
     validate_structured_plan_revision,
@@ -473,6 +475,47 @@ class FakeRunner(Runner):
                     if HUMAN_REQUIREMENTS_ADDRESSED_MARKER in output
                     else ""
                 ),
+                )
+        if '"kind": "issue_implementation"' in prompt and (
+            "<!-- AGENT_STATE:" in output or parse_pr_number(output) is not None
+        ):
+            pr_number = parse_pr_number(output)
+            summary = _review_freeform_summary_text(output) or "Implementation completed."
+            labels = sorted(
+                set(re.findall(r"\bRequirement\s+\d+\b", output, re.I)),
+                key=lambda value: int(value.split()[-1]),
+            )
+            labels = [f"Requirement {value.split()[-1]}" for value in labels]
+            blocked = {
+                label
+                for label in labels
+                if re.search(
+                    rf"{re.escape(label)}.{{0,160}}(?:blocked|cannot|unavailable|impossible)",
+                    output,
+                    re.I | re.S,
+                )
+            }
+            dispositions = [
+                {
+                    "requirement_id": label,
+                    "disposition": "blocked" if label in blocked else "addressed",
+                    "evidence": (
+                        f"{label} is blocked according to the legacy implementation response."
+                        if label in blocked
+                        else f"{label} is covered by the legacy implementation response."
+                    ),
+                }
+                for label in labels
+            ]
+            return structured_issue_implementation(
+                state="blocking",
+                summary=summary,
+                pr_number=pr_number,
+                human_requirement_dispositions=dispositions,
+                human_requirement_ids=[label for label in labels if label not in blocked],
+                checked_discussion_directly=HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK in output,
+                tests_run=list(extract_reported_tests_from_response(output)) or None,
+                reviewer=signature,
             )
         if '"kind": "coder_followup"' in prompt and "<!-- AGENT_STATE:" in output:
             item_ids = sorted(set(re.findall(r"\[(item-[A-Za-z0-9._-]+)\]", prompt)))
@@ -523,7 +566,42 @@ class FakeRunner(Runner):
     def _maybe_advance_git_head_for_agent_pr(self, text: str) -> None:
         if not self.advance_git_head_on_pr:
             return
-        if "<!-- AGENT_PR:" not in text and "github.com/OWNER/REPO/pull/" not in text:
+        has_pr_identity = "<!-- AGENT_PR:" in text or "github.com/OWNER/REPO/pull/" in text
+        if not has_pr_identity and text.lstrip().startswith("{"):
+            try:
+                payload, _ = json.JSONDecoder().raw_decode(text.lstrip())
+            except json.JSONDecodeError:
+                payload = None
+            has_pr_identity = (
+                isinstance(payload, dict)
+                and payload.get("kind") == "issue_implementation"
+                and isinstance(payload.get("pr_number"), int)
+                and not isinstance(payload.get("pr_number"), bool)
+                and payload["pr_number"] > 0
+            )
+            if not has_pr_identity and isinstance(payload, dict):
+                for key in ("response", "result"):
+                    value = payload.get(key)
+                    if isinstance(value, str):
+                        has_pr_identity = (
+                            "<!-- AGENT_PR:" in value
+                            or "github.com/OWNER/REPO/pull/" in value
+                        )
+                        if not has_pr_identity and value.lstrip().startswith("{"):
+                            try:
+                                nested, _ = json.JSONDecoder().raw_decode(value.lstrip())
+                            except json.JSONDecodeError:
+                                nested = None
+                            has_pr_identity = (
+                                isinstance(nested, dict)
+                                and nested.get("kind") == "issue_implementation"
+                                and isinstance(nested.get("pr_number"), int)
+                                and not isinstance(nested.get("pr_number"), bool)
+                                and nested["pr_number"] > 0
+                            )
+                        if has_pr_identity:
+                            break
+        if not has_pr_identity:
             return
         self._agent_pr_counter += 1
         self.git_head = f"{self.git_head}-agent-{self._agent_pr_counter}"
@@ -1349,6 +1427,46 @@ def structured_coder_followup(
         payload["disputed_items"] = disputed_items
     if dispute_evidence is not None:
         payload["dispute_evidence"] = dispute_evidence
+    return json.dumps(payload) + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+
+
+def structured_issue_implementation(
+    *,
+    state: str = "blocking",
+    summary: str = "Implemented the requested change.",
+    pr_number: int | None = 77,
+    human_requirement_ids: list[str] | None = None,
+    human_requirement_dispositions: list[dict[str, str]] | None = None,
+    checked_discussion_directly: bool = False,
+    tests_run: list[str] | None = None,
+    reviewer: str = "Anthropic Claude",
+) -> str:
+    ids = human_requirement_ids or []
+    payload: dict = {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": state,
+        "summary": summary,
+        "pr_number": pr_number,
+        "human_requirements": {
+            "addressed_ids": ids,
+            "checked_discussion_directly": checked_discussion_directly,
+        },
+        "human_requirement_dispositions": (
+            human_requirement_dispositions
+            if human_requirement_dispositions is not None
+            else [
+                {
+                    "requirement_id": requirement_id,
+                    "disposition": "addressed",
+                    "evidence": "The implementation covers the surfaced requirement.",
+                }
+                for requirement_id in ids
+            ]
+        ),
+    }
+    if tests_run is not None:
+        payload["tests_run"] = tests_run
     return json.dumps(payload) + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
 
 

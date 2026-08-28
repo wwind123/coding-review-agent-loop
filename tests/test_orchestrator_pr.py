@@ -66,6 +66,7 @@ from coding_review_agent_loop.protocol import (
     parse_pr_review,
     parse_review,
     parse_unresolved_item_dispositions,
+    validate_structured_issue_implementation,
     validate_structured_coder_followup,
 )
 from agent_loop_helpers import (
@@ -75,6 +76,7 @@ from agent_loop_helpers import (
     make_config,
     prior_item_dispositions,
     structured_coder_followup,
+    structured_issue_implementation,
     structured_plan_review,
     structured_pr_review,
 )
@@ -5769,11 +5771,10 @@ def test_pr_initial_coder_post_includes_model(tmp_path):
     plan_text = "Plan content.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
     plan_review_text = structured_plan_review(summary="Approved.")
     plan_review_marker = parse_plan_review(plan_review_text, reviewer="OpenAI Codex")
-    pr_coder_text = (
-        "Implemented the feature.\n"
-        "<!-- AGENT_PR: 77 -->\n"
-        "<!-- AGENT_STATE: blocking -->\n"
-        "-- Anthropic Claude"
+    pr_coder_text = structured_issue_implementation(
+        summary="Implemented the feature in PR 77.",
+        pr_number=77,
+        reviewer="Anthropic Claude",
     )
     pr_review_text = structured_pr_review(state="approved", summary="LGTM.")
     pr_review_marker = parse_pr_review(pr_review_text, reviewer="OpenAI Codex")
@@ -5794,7 +5795,7 @@ def test_pr_initial_coder_post_includes_model(tmp_path):
                 text=pr_coder_text,
                 model_used="gpt-5.5 (medium)",
                 session_id=None,
-                marker_value=77,
+                marker_value=validate_structured_issue_implementation(pr_coder_text),
             )
         if call_count[0] == 2:
             return ValidatedAgentResponse(

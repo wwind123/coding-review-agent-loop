@@ -3,7 +3,7 @@ Run an external agent (Codex or Gemini) for one reviewer or coder turn.
 
 In --dry-run mode, writes a canned approved stub to --output and exits 0:
   --role reviewer → plan_review stub
-  --role coder    → plan_state stub
+  --role coder    → plan_state stub, or issue_implementation for --flow pr
 In live mode, invokes the agent CLI and writes the response to --output.
 
 Usage:
@@ -71,15 +71,24 @@ _CANNED_PLAN_STATE = """\
 -- Codex (dry-run stub)
 """
 
-# Coder implementation turn (reversed roles, #316). Reports a PR number and makes
-# no out-of-workdir test claims, so the workdir test guard passes trivially.
-_CANNED_IMPLEMENTATION = """\
-Implemented the approved plan (dry-run stub): created a branch, made the changes,
-and opened a pull request.
-
-<!-- AGENT_PR: 1 -->
--- Codex (dry-run stub)
-"""
+# Coder implementation turn (reversed roles, #316). The dry-run follows the
+# same typed result contract as a live issue implementation.
+_CANNED_IMPLEMENTATION = json.dumps(
+    {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "Dry-run stub: created a branch, made the changes, and opened a pull request.",
+        "pr_number": 1,
+        "human_requirements": {
+            "addressed_ids": [],
+            "checked_discussion_directly": False,
+        },
+        "human_requirement_dispositions": [],
+        "tests_run": None,
+    },
+    indent=2,
+) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex (dry-run stub)\n"
 
 _CANNED_PLAN_DECOMPOSITION = json.dumps(
     {

@@ -22,9 +22,14 @@ from coding_review_agent_loop.orchestrator import (
     _require_issue_implementation_result,
     _TerminalNoPrImplementation,
 )
-from coding_review_agent_loop.protocol import AgentUnavailable, parse_agent_unavailable
+from coding_review_agent_loop.protocol import (
+    AgentUnavailable,
+    StructuredIssueImplementation,
+    parse_agent_unavailable,
+    validate_structured_issue_implementation,
+)
 
-from agent_loop_helpers import FakeRunner, make_config
+from agent_loop_helpers import FakeRunner, make_config, structured_issue_implementation
 
 
 def _claude_resume_commands(runner):
@@ -34,7 +39,7 @@ def _claude_resume_commands(runner):
 def test_recovery_success_returns_validated_response_and_resumes_session(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
-            "Created PR.\n<!-- AGENT_PR: 99 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            structured_issue_implementation(pr_number=99),
         ],
     )
     config = make_config(tmp_path, coder="claude")
@@ -44,7 +49,7 @@ def test_recovery_success_returns_validated_response_and_resumes_session(tmp_pat
         config=config,
         completion_recovery=CompletionRecoveryPolicy(issue_number=56),
         session_id="sess-1",
-        validate=_require_issue_implementation_result,
+        validate=validate_structured_issue_implementation,
         usage_context=_new_usage_context(config),
         run_id="run-1",
         role=None,
@@ -54,7 +59,8 @@ def test_recovery_success_returns_validated_response_and_resumes_session(tmp_pat
 
     assert outcome.validated is not None
     assert isinstance(outcome.validated, ValidatedAgentResponse)
-    assert outcome.validated.marker_value == 99
+    assert isinstance(outcome.validated.marker_value, StructuredIssueImplementation)
+    assert outcome.validated.marker_value.pr_number == 99
     assert outcome.terminal_public_response is None
     claude_commands = _claude_resume_commands(runner)
     assert len(claude_commands) == 1
@@ -176,7 +182,7 @@ def test_recovery_transport_failure_nonzero_exit_synthesizes_unavailable(tmp_pat
 
 @pytest.mark.parametrize("returncode", [1, None])
 def test_recovery_accepts_valid_response_file_after_failed_exit(tmp_path, returncode):
-    valid = "Created PR.\n<!-- AGENT_PR: 99 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    valid = structured_issue_implementation(pr_number=99)
     runner = FakeRunner(
         claude_outputs=[("Error: timeout waiting for response", returncode)],
         public_response_outputs=[valid],
@@ -185,7 +191,7 @@ def test_recovery_accepts_valid_response_file_after_failed_exit(tmp_path, return
     config = make_config(tmp_path, coder="claude")
     outcome = _attempt_claude_completion_recovery(
         runner, config=config, completion_recovery=CompletionRecoveryPolicy(issue_number=56),
-        session_id="sess-1", validate=_require_issue_implementation_result,
+        session_id="sess-1", validate=validate_structured_issue_implementation,
         usage_context=usage, run_id="run-1", role=None, label=None, timeout_seconds=30.0,
     )
     assert outcome.validated is not None

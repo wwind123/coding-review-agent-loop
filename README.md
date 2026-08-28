@@ -283,6 +283,16 @@ original issue body:
 agent-loop issue 123 --repo OWNER/REPO
 ```
 
+Issue implementation turns use a strict `issue_implementation` result. The
+result contains the implementation summary, a positive `pr_number` or `null`,
+an auditable `human_requirement_dispositions` ledger, and optional structured
+`tests_run` commands. A null PR is rendered as a readable terminal issue
+comment and does not enter PR review or handoff. If a signed requirement is
+found blocked after a PR was opened, the result keeps the actual PR reference
+in its summary or evidence but uses `pr_number: null`; the issue comment
+records the rejected handoff for operator follow-up. A created PR may not be
+reported alongside a blocked signed requirement.
+
 For larger or ambiguous issues, add `--plan-first` to run a plan review on the
 issue before code is written. The coder may inspect the checkout but must not
 edit files, push, or open a PR during planning. Reviewers approve or block with
@@ -329,14 +339,15 @@ by the backward-compatible `--implement-after-approval` flag. `decompose-only`
 asks the coder to turn the approved plan into ordered phases, always creates
 one GitHub child issue per phase, posts a parent summary table, and stops.
 `implement-by-phase` creates every child issue, then implements only the first
-`agent-pr` phase and stops after that PR review loop. Before entering that child
-implementation, the parent issue records a one-time handoff marker. Parent
-reruns after that marker do not re-run the child implementation; resume directly
-with `agent-loop issue <child>`. If decomposition already exists without a
-handoff marker, the first child is treated as not yet attempted and the handoff
-is recorded once. If the first phase is `human-action` or `manual-close`, the
-loop creates and reports all child issues but stops so a human can do the
-required work, add a remark/update, and close that child issue.
+`agent-pr` phase and stops after that PR review loop. The parent issue records a
+one-time handoff only after the child implementation returns an accepted PR, so
+null-PR and rejected-conflict terminal results never create a misleading
+handoff. Parent reruns after that marker do not re-run the child implementation;
+resume directly with `agent-loop issue <child>`. If decomposition already exists
+without a handoff marker, the first child is treated as not yet attempted and
+the handoff is recorded once. If the first phase is `human-action` or
+`manual-close`, the loop creates and reports all child issues but stops so a
+human can do the required work, add a remark/update, and close that child issue.
 
 Plan-first implementation can use a different implementation agent than the
 planning agent. Planning and plan revisions still use `--coder`; the override

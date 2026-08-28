@@ -233,15 +233,17 @@ def test_completion_recovery_prompt_shares_terminal_marker_grammar_with_implemen
     implementation_prompt = build_issue_implementation_prompt(56, "1. Fix it.", config)
 
     for marker_line in (
-        "<!-- AGENT_PR: <number> -->",
         "<!-- AGENT_STATE: blocking -->",
         "<!-- AGENT_CLARIFY -->",
         "<!-- AGENT_UNAVAILABLE -->",
-        "For a no-PR blocking result:",
         "For clarification:",
     ):
         assert marker_line in recovery_prompt
         assert marker_line in implementation_prompt
+    assert "`pr_number: null`" in recovery_prompt
+    assert "`pr_number: null`" in implementation_prompt
+    assert "<!-- AGENT_PR:" not in recovery_prompt
+    assert "<!-- AGENT_PR:" not in implementation_prompt
 
 
 def test_issue_plan_prompt_requires_complete_structured_plan_state_contract(tmp_path):
@@ -1494,8 +1496,10 @@ def test_non_plan_prompts_request_human_requirement_dispositions_not_plan_dispos
 
     assert '"human_requirement_dispositions"' in prompts[0]
     assert '"human_requirement_dispositions"' in prompts[1]
-    for prompt in prompts[2:]:
+    for prompt in prompts[2:4]:
         assert '"human_requirement_dispositions"' not in prompt
+    for prompt in prompts[4:]:
+        assert '"human_requirement_dispositions"' in prompt
 
 
 def test_coder_followup_guidance_renders_valid_blocked_requirement_example(tmp_path):
@@ -1892,21 +1896,25 @@ def test_coder_prompts_require_focused_bounded_local_tests(tmp_path, builder):
 
 
 @pytest.mark.parametrize(
-    "builder",
+    ("builder", "structured"),
     [
-        lambda config: build_issue_prompt(56, config),
-        lambda config: build_issue_implementation_prompt(56, "1. Fix it.", config),
-        lambda config: build_completion_recovery_prompt(config),
-        lambda config: build_task_prompt("Fix the bug.", config),
-        lambda config: build_task_clarification_prompt("Fix the bug.", [], config),
+        (lambda config: build_issue_prompt(56, config), True),
+        (lambda config: build_issue_implementation_prompt(56, "1. Fix it.", config), True),
+        (lambda config: build_completion_recovery_prompt(config), True),
+        (lambda config: build_task_prompt("Fix the bug.", config), False),
+        (lambda config: build_task_clarification_prompt("Fix the bug.", [], config), False),
     ],
 )
-def test_free_form_coder_prompts_report_tests_via_tests_line(tmp_path, builder):
+def test_coder_prompts_report_tests_using_the_selected_contract(tmp_path, builder, structured):
     config = make_config(tmp_path)
     prompt = " ".join(builder(config).split())
 
-    assert "include a short `Tests:` line" in prompt
-    assert "next to the exact commands in the `Tests:` line" in prompt
+    if structured:
+        assert '"tests_run"' in prompt
+        assert "exact command strings" in prompt
+    else:
+        assert "include a short `Tests:` line" in prompt
+        assert "next to the exact commands in the `Tests:` line" in prompt
 
 
 @pytest.mark.parametrize(

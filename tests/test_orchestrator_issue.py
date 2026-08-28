@@ -619,7 +619,7 @@ def test_issue_loop_rejects_missing_initial_issue_human_requirements_acknowledge
     )
     config = make_config(tmp_path)
 
-    with pytest.raises(AgentLoopError, match="missing required signed human requirements marker"):
+    with pytest.raises(AgentLoopError, match="missing requirement ID"):
         run_issue_loop(runner, issue_number=56, config=config)
 
 def test_issue_loop_accepts_initial_issue_human_requirements_acknowledgement(tmp_path):
@@ -2330,7 +2330,7 @@ def test_issue_loop_plan_first_can_implement_after_approval(tmp_path):
     assert len(runner.comments) == 7
     assert "<!-- AGENT_ISSUE_PR_HANDOFF:" in runner.comments[3]
     assert "<!-- AGENT_PLAN_ONE_SHOT_IMPL:" in runner.comments[4]
-    assert runner.comments[5].startswith("Implemented approved plan.")
+    assert runner.comments[5].startswith("## Issue implementation")
     assert runner.comments[6].startswith("**Review verdict:** Approved\n\nLGTM.")
 
 
@@ -2374,7 +2374,7 @@ def test_issue_loop_plan_first_can_override_implementation_model(tmp_path):
     assert claude_calls[0][claude_calls[0].index("--model") + 1] == "claude-fable-5"
     assert claude_calls[1][claude_calls[1].index("--model") + 1] == "claude-sonnet-5"
     assert "--resume" not in claude_calls[1]
-    assert runner.comments[5].startswith("Implemented approved plan.")
+    assert runner.comments[5].startswith("## Issue implementation")
 
 
 def test_issue_loop_rejects_pr_without_issue_reference_in_body(tmp_path):
@@ -2999,7 +2999,7 @@ def test_codex_issue_loop_creates_pr_then_claude_approves(tmp_path):
     assert ["claude", "--print"] in command_names
     assert len(runner.comments) == 3
     assert "<!-- AGENT_ISSUE_PR_HANDOFF:" in runner.comments[0]
-    assert runner.comments[1].startswith("Fixed issue.")
+    assert runner.comments[1].startswith("## Issue implementation")
     assert runner.comments[2].startswith("**Review verdict:** Approved\n\nLooks good.")
 
 def test_codex_issue_loop_alternates_until_claude_approval(tmp_path):
@@ -3051,7 +3051,14 @@ def test_issue_loop_stops_before_pr_lookup_for_invalid_pr_terminal_result(
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     # A genuine coder-declared no-PR terminal is posted to the issue like a
     # PR-success implementation result already is (#588).
-    assert runner.comments == [f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- OpenAI Codex"]
+    if expected_state == "blocking":
+        assert runner.comments[0].startswith("## Issue implementation")
+        assert "Cannot proceed." in runner.comments[0]
+        assert "No pull request was accepted for handoff." in runner.comments[0]
+    else:
+        assert runner.comments == [
+            f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- OpenAI Codex"
+        ]
 
 
 def test_issue_loop_invalid_pr_without_terminal_state_is_protocol_error(tmp_path):
@@ -3060,7 +3067,7 @@ def test_issue_loop_invalid_pr_without_terminal_state_is_protocol_error(tmp_path
 
     with pytest.raises(
         AgentLoopError,
-        match="AGENT_PR marker or PR URL present was invalid",
+        match="required structured `issue_implementation` format",
     ):
         run_issue_loop(runner, issue_number=56, config=config)
 
@@ -3234,7 +3241,7 @@ def test_gemini_issue_loop_creates_pr_then_codex_approves(tmp_path):
     assert agent_commands == [["gemini", "--prompt"], ["codex", "exec"]]
     assert len(runner.comments) == 3
     assert "<!-- AGENT_ISSUE_PR_HANDOFF:" in runner.comments[0]
-    assert runner.comments[1].startswith("Fixed issue.")
+    assert runner.comments[1].startswith("## Issue implementation")
     assert runner.comments[2].startswith("**Review verdict:** Approved\n\nLooks good.")
 
 def test_gemini_issue_loop_resumes_session_for_followup(tmp_path):
@@ -3838,7 +3845,7 @@ def test_approved_plan_no_pr_terminal_result_bypasses_human_requirements_and_pr_
     tmp_path, terminal_marker, expected_state
 ):
     runner = FakeRunner(
-        issue_payload={"body": "Keep the public API stable.\n\n-- Human Reviewer"},
+        issue_payload={"body": "Keep the public API stable."},
         claude_outputs=[f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}"],
     )
     config = make_config(tmp_path)
@@ -3860,7 +3867,14 @@ def test_approved_plan_no_pr_terminal_result_bypasses_human_requirements_and_pr_
     assert not any(cmd[:1] == ["codex"] for cmd, _cwd in runner.commands)
     # A genuine coder-declared no-PR terminal is posted to the issue like a
     # PR-success implementation result already is (#588).
-    assert runner.comments == [f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- Anthropic Claude"]
+    if expected_state == "blocking":
+        assert runner.comments[0].startswith("## Issue implementation")
+        assert "Cannot proceed." in runner.comments[0]
+        assert "No pull request was accepted for handoff." in runner.comments[0]
+    else:
+        assert runner.comments == [
+            f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- Anthropic Claude"
+        ]
 
 
 def test_approved_plan_implementation_rerun_ignores_remote_salvage_on_plan_hash_mismatch(tmp_path):

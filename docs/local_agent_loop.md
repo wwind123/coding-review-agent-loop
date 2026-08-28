@@ -226,6 +226,18 @@ Issue mode includes the issue title, body, and comments in the coder prompt and
 issue-origin review prompts. Comments are ordered oldest to newest so later
 discussion can refine or supersede the original body.
 
+The issue implementation coder uses the structured `issue_implementation`
+contract. It reports a non-blank summary, a positive `pr_number` or `null`, an
+exact signed-human-requirement disposition ledger, and optional `tests_run`
+command strings. The orchestrator validates supplied commands inside the
+assigned checkout. A null-PR result is posted as a readable issue-level
+terminal comment and stops before PR operations. If a signed requirement is
+blocked after a PR was opened, the coder must retain the real PR number or URL
+in the summary or disposition evidence while setting `pr_number` to `null`;
+the conflict is posted once without retrying or entering handoff, review, or
+merge gates. Accepted created-PR results are rendered for GitHub and retain the
+raw structured payload in round metadata so resume can restore the typed result.
+
 Run issue mode as plan-first discussion before implementation:
 
 ```bash
@@ -286,7 +298,8 @@ The modes are:
   This is also what `--implement-after-approval` selects for compatibility.
 - `implement-by-phase`: create/link every phase issue, implement only the first
   `agent-pr` child issue, then stop after that PR review loop. The parent issue
-  records a one-time handoff before child implementation starts; parent reruns
+  records a one-time handoff only after an accepted positive implementation PR;
+  null-PR and rejected-conflict results stop without a handoff. Parent reruns
   after that handoff do not re-run the child and should be resumed directly with
   `agent-loop issue <child>`. Older decomposition summaries without this marker
   are treated as not yet handed off, so the first child handoff is recorded once.
