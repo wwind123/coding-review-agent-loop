@@ -24,7 +24,6 @@ emits no token usage (usage falls back to the estimated path).
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import json
 from pathlib import Path
 import re
 import tempfile
@@ -44,12 +43,7 @@ from ..errors import AgentLoopError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
 from ..runner import CommandResult, Runner, strip_ansi
-from ..workdir_guard import (
-    WorkdirReplayEvidence,
-    WorkdirSnapshot,
-    capture_workdir_snapshot,
-    gate_workdir_replay,
-)
+from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
@@ -190,6 +184,8 @@ _ANTIGRAVITY_LOADER_LINE_RE = re.compile(
     r"(?:updat(?:e|er)|launcher|replacement).*(?:failed|error|unavailable|in\s+progress)"
     r")"
 )
+
+
 def classify_antigravity_executable_replacement_interruption(
     result: CommandResult,
     *,

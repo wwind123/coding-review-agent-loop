@@ -22,12 +22,7 @@ from ..logging import agent_log_path, log
 from ..protocol import CLARIFY_RE, PLAN_STATE_RE, PUBLIC_RESPONSE_MARKER, STATE_RE
 from ..runner import CommandResult, Runner
 from ..usage import UsageMetadata, coerce_int, first_present
-from ..workdir_guard import (
-    WorkdirReplayEvidence,
-    WorkdirSnapshot,
-    capture_workdir_snapshot,
-    gate_workdir_replay,
-)
+from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
