@@ -158,6 +158,20 @@ def test_managed_ci_docs_describe_safe_issue_draft_resume_and_fallback():
     assert "remains ready" in text
 
 
+def test_managed_ci_docs_describe_lifecycle_gated_issue_resume_and_base_provenance():
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    readme_text = README.read_text(encoding="utf-8")
+    for document in (text, readme_text):
+        normalized_document = document.lower()
+        assert "canonical issue" in normalized_document
+        assert "ready/unlabeled" in normalized_document
+        assert "explicit `--managed-ci`" in normalized_document
+        assert "historical audit" in normalized_document or "historical records" in normalized_document
+        assert "base provenance" in normalized_document
+    assert "prints the exact flow-preserving retry" in text
+    assert "never asks the operator to delete durable records" in text
+
+
 def test_managed_ci_docs_describe_precreation_managed_pr_mode():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert "agent-loop managed-pr" in text

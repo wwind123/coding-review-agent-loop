@@ -1,5 +1,6 @@
 import ast
 import json
+import shlex
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from coding_review_agent_loop.github import (
     merge_pr,
 )
 from coding_review_agent_loop.managed_ci import (
+    AuthenticatedManagedResume,
     FINAL_CONTEXT,
     MANAGED_LABEL,
     MANAGED_OPT_OUT_LABEL,
@@ -39,6 +41,7 @@ from coding_review_agent_loop.managed_ci import (
     preflight_managed_ci_creation,
     parse_managed_ci_override_record,
     render_managed_ci_resume_command,
+    _render_recovery_command,
     recover_issue_created_handoff,
     revalidate_issue_created_handoff,
     prepare_v2_merge,
@@ -55,9 +58,12 @@ from coding_review_agent_loop.managed_ci import (
 from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE, PR_COMMENT_SURFACE
 from coding_review_agent_loop.orchestrator import (
     _finalize_ordinary_recovery_merge,
+    _render_ci_rerun_command,
     _stop_on_terminal_without_status,
 )
 from coding_review_agent_loop.runner import CommandResult
+from coding_review_agent_loop.cli import build_parser
+from coding_review_agent_loop.config import resolve_base_branch
 
 from agent_loop_helpers import FakeRunner, make_config
 
@@ -636,6 +642,470 @@ def test_direct_resume_reconstructs_issue_override_as_provenance_before_writes(t
         runner, config=config, handoff=handoff, metadata=metadata,
     ).override_nonce == "old"
     assert not any("--method" in command for command, _ in runner.commands)
+
+
+@pytest.mark.parametrize(
+    ("managed_ci_pr_mode", "issue_number"),
+    [(False, 643), (True, None)],
+)
+def test_issue_and_pr_resume_authenticate_nonce_bearing_advanced_head(
+    tmp_path, managed_ci_pr_mode, issue_number
+):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=after-coder-round"
+    advanced_sha = "coder-round-head"
+    runner = V2ManagedRunner(
+        rest_pr={
+            "state": "open",
+            "draft": True,
+            "labels": [{"name": MANAGED_LABEL}],
+            "body": body,
+            "head": {
+                "repo": {"full_name": "OWNER/REPO"},
+                "sha": advanced_sha,
+                "ref": "agent-loop/managed-643",
+            },
+        },
+        issue_events=[label_event()],
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=managed_ci_pr_mode,
+        managed_ci_pr_mode=managed_ci_pr_mode,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    metadata = replace(_ready_issue_metadata(body=body), head_sha=advanced_sha)
+
+    handoff = recover_issue_created_handoff(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=metadata,
+        issue_number=issue_number,
+    )
+
+    assert handoff is not None
+    assert handoff.head_sha == advanced_sha
+    assert handoff.lifecycle == "draft-labeled"
+    assert not any("--method" in command for command, _ in runner.commands)
+
+
+def _ready_issue_metadata(body="Fixes #643", base_branch="main"):
+    return PullRequestMetadata(
+        number=7,
+        repo="OWNER/REPO",
+        title="Managed CI",
+        head_branch="agent-loop/managed-643",
+        base_branch=base_branch,
+        head_sha="abc123",
+        url="https://github.com/OWNER/REPO/pull/7",
+        body=body,
+    )
+
+
+def test_strict_ready_unlabeled_issue_resume_reauthenticates_then_restores_label(tmp_path):
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    runner = ManualQualificationRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={
+            "state": "open",
+            "draft": False,
+            "labels": [],
+            "body": "Fixes #643",
+        },
+        issue_events=[],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    handoff = recover_issue_created_handoff(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=_ready_issue_metadata(),
+    )
+    assert handoff is not None
+    assert handoff.lifecycle == "ready-unlabeled-reentry"
+    resume = AuthenticatedManagedResume(
+        origin="issue-created",
+        lifecycle=handoff.lifecycle,
+        issue_created_handoff=handoff,
+    )
+    contract = activate_managed_ci(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=_ready_issue_metadata(),
+        managed_resume=resume,
+    )
+
+    assert contract is not None
+    assert contract.origin == "issue-created"
+    assert contract.lifecycle == "ready-unlabeled-reentry"
+    assert contract.intent_generation
+    assert contract.audit_nonce is None
+    commands = [command for command, _cwd in runner.commands]
+    undo_index = next(index for index, command in enumerate(commands) if "--undo" in command)
+    label_index = next(
+        index
+        for index, command in enumerate(commands)
+        if command[:5] == [
+            "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
+        ]
+    )
+    assert undo_index < label_index
+    assert not any(UNPROTECTED_OVERRIDE_TRAILER in " ".join(command) for command in commands)
+
+
+def test_explicit_managed_issue_resume_reclaims_draft_unlabeled_state(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=old"
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={
+            "state": "open",
+            "draft": True,
+            "labels": [],
+            "body": body,
+            "head": {
+                "repo": {"full_name": "OWNER/REPO"},
+                "sha": "coder-round-head",
+                "ref": "agent-loop/managed-643",
+            },
+        },
+        issue_events=[],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="coder-round-head")
+
+    handoff = recover_issue_created_handoff(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=metadata,
+        issue_number=643,
+    )
+    assert handoff is not None
+    assert handoff.lifecycle == "draft-unlabeled-reentry"
+
+    contract = activate_managed_ci(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=metadata,
+        managed_resume=AuthenticatedManagedResume(
+            origin="issue-created",
+            lifecycle=handoff.lifecycle,
+            issue_created_handoff=handoff,
+        ),
+    )
+
+    assert contract is not None
+    assert contract.lifecycle == "draft-unlabeled-reentry"
+    assert any(
+        command[:5] == [
+            "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
+        ]
+        for command, _cwd in runner.commands
+    )
+
+
+@pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
+def test_implicit_auto_merge_leaves_ready_unlabeled_resume_unchanged(tmp_path, origin):
+    config = make_config(
+        tmp_path,
+        auto_merge=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        managed_ci_pr_mode=True,
+    )
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"state": "open", "draft": False, "labels": [], "body": "Fixes #643"},
+        issue_events=[],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+    resume = AuthenticatedManagedResume(origin=origin, lifecycle="ready-unlabeled-reentry")
+
+    with pytest.raises(AgentLoopError, match="explicit `--managed-ci`"):
+        activate_managed_ci(
+            runner,
+            config=config,
+            pr_number=7,
+            metadata=_ready_issue_metadata(),
+            managed_resume=resume,
+        )
+
+    assert not any(
+        command[:3] == ["gh", "pr", "ready"]
+        or ("--method" in command and "POST" in command)
+        or ("--method" in command and "PATCH" in command)
+        for command, _cwd in runner.commands
+    )
+
+
+def test_repository_default_base_mismatch_prints_explicit_live_base_retry(tmp_path):
+    runner = V2ManagedRunner(base_ref="release")
+    config = make_config(
+        tmp_path,
+        base=None,
+        invocation_argv=("agent-loop", "issue", "643", "--auto-merge"),
+    )
+    resolved = resolve_base_branch(
+        config, runner, pr_metadata=_ready_issue_metadata(base_branch="release")
+    )
+    assert resolved.base == "release"
+    assert resolved.base_provenance == "pr-metadata"
+
+    inherited = resolve_base_branch(make_config(tmp_path, base=None), V2ManagedRunner())
+    assert inherited.base == "main"
+    assert inherited.base_provenance == "repository-default"
+    with pytest.raises(AgentLoopError, match=r"repository-default.*--base release"):
+        resolve_base_branch(
+            inherited,
+            runner,
+            pr_metadata=_ready_issue_metadata(base_branch="release"),
+        )
+
+
+def test_recovery_renderer_retargets_both_directions_with_parser_valid_argv(tmp_path):
+    parser = build_parser()
+    issue_to_pr = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "issue", "643", "--plan-first", "--plan-execution-mode",
+            "implement-one-shot", "--implementation-coder", "codex", "--split-stage", "700",
+            "--reviewer", "codex", "--reviewer=gemini", "--codex-arg=--literal=$HOME;echo",
+        ),
+    )
+    rendered = _render_recovery_command(
+        issue_to_pr, target="pr", identifier=7, managed_ci=True,
+    )
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.command == "pr"
+    assert args.pr_number == 7
+    assert not hasattr(args, "plan_first")
+    assert args.reviewer == ["codex", "gemini"]
+    assert args.codex_arg == ["--literal=$HOME;echo"]
+
+    pr_to_issue = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci-adopt-existing-pr",
+            "--managed-ci", "--managed-ci-trusted-actor=agent-loop",
+            "--reviewer", "codex",
+        ),
+    )
+    rendered = _render_recovery_command(
+        pr_to_issue, target="issue", identifier=643, managed_ci=True,
+    )
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.command == "issue"
+    assert args.issue_number == 643
+    assert not hasattr(args, "managed_ci_adopt_existing_pr")
+    assert args.managed_ci_trusted_actor == "agent-loop"
+
+    managed_pr_to_issue = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "managed-pr", "--head", "feature/ref",
+            "--title=Managed PR", "--body-file", "/tmp/body.md",
+            "--reviewer", "codex",
+        ),
+    )
+    rendered = _render_recovery_command(
+        managed_pr_to_issue, target="issue", identifier=643, managed_ci=False,
+    )
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.command == "issue"
+    assert args.issue_number == 643
+
+
+def test_recovery_renderer_finds_issue_identifier_after_options_and_consumes_stdin_value(tmp_path):
+    parser = build_parser()
+    config = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "issue", "--repo", "OWNER/REPO", "--gh-cmd", "gh", "643",
+            "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
+        ),
+    )
+    rendered = render_managed_ci_resume_command(config, pr_number=7, managed_ci=True)
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.command == "issue"
+    assert args.issue_number == 643
+    assert args.repo == "OWNER/REPO"
+    assert args.gh_cmd == "gh"
+
+    managed_pr = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "managed-pr", "--head", "feature/ref",
+            "--title", "Managed PR", "--body-file", "-", "--reviewer", "codex",
+        ),
+    )
+    rendered = _render_recovery_command(
+        managed_pr, target="issue", identifier=643, managed_ci=False,
+    )
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.command == "issue"
+    assert args.issue_number == 643
+
+
+def test_recovery_value_option_table_covers_all_recovery_subparsers():
+    parser = build_parser()
+    subparsers = next(action for action in parser._actions if action.dest == "command")
+
+    for command in ("issue", "pr", "managed-pr"):
+        subparser = subparsers.choices[command]
+        value_options = {
+            option
+            for action in subparser._actions
+            if action.nargs != 0
+            for option in action.option_strings
+            if option.startswith("--")
+        }
+        assert value_options <= managed_ci._RECOVERY_VALUE_OPTIONS, (
+            f"{command} value-taking recovery options are not classified: "
+            f"{sorted(value_options - managed_ci._RECOVERY_VALUE_OPTIONS)}"
+        )
+
+
+def test_issue_created_tuple_actor_refusal_includes_trusted_actor_remediation(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        invocation_argv=("agent-loop", "issue", "643", "--repo", "OWNER/REPO"),
+    )
+    runner = V2ManagedRunner(rest_pr={"state": "open", "body": body})
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="abc123")
+    intent = managed_ci.ManagedCiCreationIntent(
+        branch="agent-loop/managed-643",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce="fresh",
+    )
+
+    with pytest.raises(AgentLoopError, match=r"--managed-ci-trusted-actor agent-loop"):
+        authenticate_issue_created_handoff(
+            runner,
+            config=config,
+            intent=intent,
+            issue_number=643,
+            pr_number=7,
+            metadata=metadata,
+        )
+
+
+def test_issue_created_tuple_actor_refusal_replaces_existing_trusted_actor(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="operator-actor",
+        invocation_argv=(
+            "agent-loop", "issue", "643", "--repo", "OWNER/REPO", "--managed-ci",
+            "--managed-ci-trusted-actor", "operator-actor",
+        ),
+    )
+    runner = V2ManagedRunner(rest_pr={"state": "open", "body": body})
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="abc123")
+    intent = managed_ci.ManagedCiCreationIntent(
+        branch="agent-loop/managed-643",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce="fresh",
+    )
+
+    with pytest.raises(AgentLoopError) as error:
+        authenticate_issue_created_handoff(
+            runner,
+            config=config,
+            intent=intent,
+            issue_number=643,
+            pr_number=7,
+            metadata=metadata,
+        )
+
+    message = str(error.value)
+    assert "gh login=`agent-loop`" in message
+    assert "--managed-ci-trusted-actor=`operator-actor`" in message
+    assert "AGENT_LOOP_MANAGED_ACTOR=`agent-loop`" in message
+    remediation = message.split("`", 7)[7]
+    assert remediation.count("--managed-ci-trusted-actor") == 1
+    assert "--managed-ci-trusted-actor agent-loop" in remediation
+    assert "operator-actor" not in remediation
+
+
+def test_issue_created_tuple_mismatch_includes_shell_quoted_resume_command(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        invocation_argv=(
+            "agent-loop", "issue", "643", "--repo", "OWNER/REPO", "--gh-cmd", "gh",
+        ),
+    )
+    runner = V2ManagedRunner(
+        rest_pr={"state": "open", "body": body, "head": {
+            "repo": {"full_name": "OWNER/REPO"},
+            "sha": "changed-head",
+            "ref": "agent-loop/managed-643",
+        }},
+    )
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="abc123")
+    intent = managed_ci.ManagedCiCreationIntent(
+        branch="agent-loop/managed-643",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce="fresh",
+    )
+
+    with pytest.raises(AgentLoopError) as error:
+        authenticate_issue_created_handoff(
+            runner,
+            config=config,
+            intent=intent,
+            issue_number=643,
+            pr_number=7,
+            metadata=metadata,
+        )
+
+    message = str(error.value)
+    assert "opening tuple is missing or changed" in message
+    assert "agent-loop issue 643 --repo OWNER/REPO --gh-cmd gh" in message
+    assert "--managed-ci-trusted-actor agent-loop" in message
+
+
+def test_ci_timeout_renderer_preserves_explicit_managed_options(tmp_path):
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        auto_merge=True,
+        invocation_argv=(
+            "agent-loop", "issue", "643", "--auto-merge", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop", "--allow-unprotected-managed-ci",
+        ),
+    )
+
+    command = _render_ci_rerun_command(config, pr_number=7)
+
+    assert "--managed-ci" in command
+    assert "--managed-ci-trusted-actor agent-loop" in command
+    assert "--allow-unprotected-managed-ci" in command
 
 
 def _resume_audit(*, head="old-head", repo="OWNER/REPO", base="main"):

@@ -59,6 +59,7 @@ DISCUSS_RESEARCH_MODES: frozenset[str] = frozenset({"none", "required", "auto"})
 # Discuss-mode debater failure policy values (#475).
 DISCUSS_DEBATER_FAILURE_MODES: frozenset[str] = frozenset({"fail", "partial"})
 DISCUSS_RESULT_MODES: frozenset[str] = frozenset({"triage", "answer"})
+BASE_PROVENANCE_VALUES = frozenset({"explicit", "repository-default", "pr-metadata"})
 
 
 @dataclass(frozen=True)
@@ -222,6 +223,10 @@ class AgentLoopConfig:
     # selector or opt-out no longer changes the full-board gate.
     ci_check_name_explicit: bool = False
     watch_pending_ci_explicit: bool = False
+    # The first source that resolved ``base``.  This is carried across an
+    # issue-to-PR handoff so a repository-default base cannot silently replace
+    # the live PR base on a later invocation.
+    base_provenance: str | None = None
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -295,6 +300,10 @@ class AgentLoopConfig:
         object.__setattr__(self, "expected_closing_issue_ids", normalized_expected)
         if self.pr_origin_flow not in {"direct-pr", "managed-pr"}:
             raise AgentLoopError("pr_origin_flow must be 'direct-pr' or 'managed-pr'.")
+        if self.base_provenance is not None and self.base_provenance not in BASE_PROVENANCE_VALUES:
+            raise AgentLoopError(
+                "base_provenance must be 'explicit', 'repository-default', or 'pr-metadata'."
+            )
 
 
 def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
@@ -321,15 +330,54 @@ def resolve_base_branch(
     cwd: Path | None = None,
 ) -> AgentLoopConfig:
     explicit_base = (config.base or "").strip()
+    live_pr_base = (pr_metadata.base_branch or "").strip() if pr_metadata is not None else ""
+
+    def mismatch_message(expected: str, actual: str) -> AgentLoopError:
+        invocation = list(config.invocation_argv)
+        if invocation:
+            rewritten: list[str] = []
+            index = 0
+            while index < len(invocation):
+                token = invocation[index]
+                if token == "--base":
+                    index += 2
+                    continue
+                if token.startswith("--base="):
+                    index += 1
+                    continue
+                rewritten.append(token)
+                index += 1
+            rewritten.extend(("--base", actual))
+            retry = shlex.join(rewritten)
+        else:
+            retry = f"agent-loop issue <issue-number> --base {shlex.quote(actual)}"
+        return AgentLoopError(
+            f"Configured base {expected!r} ({config.base_provenance or 'unrecorded'}) "
+            f"differs from the live PR base {actual!r}. No workdir setup or remote write was performed. "
+            f"Rerun the canonical issue command with an explicit live base: {retry}"
+        )
+
+    if (
+        explicit_base
+        and live_pr_base
+        and config.base_provenance in {"repository-default", "pr-metadata"}
+        and explicit_base != live_pr_base
+    ):
+        raise mismatch_message(explicit_base, live_pr_base)
+
     if explicit_base:
-        return config if explicit_base == config.base else replace(config, base=explicit_base)
+        resolved = config if explicit_base == config.base else replace(config, base=explicit_base)
+        if resolved.base_provenance is None:
+            resolved = replace(resolved, base_provenance="explicit")
+        # An operator-supplied --base is authoritative.  The live PR is still
+        # validated by the managed tuple and ordinary review gates.
+        return resolved
 
     if config.dry_run:
-        return replace(config, base="main")
+        return replace(config, base="main", base_provenance="repository-default")
 
-    pr_base = (pr_metadata.base_branch or "").strip() if pr_metadata is not None else ""
-    if pr_base:
-        return replace(config, base=pr_base)
+    if live_pr_base:
+        return replace(config, base=live_pr_base, base_provenance="pr-metadata")
 
     default_branch = get_repo_default_branch(
         runner,
@@ -337,7 +385,7 @@ def resolve_base_branch(
         cwd=cwd or github_bootstrap_cwd(config),
     )
     if default_branch:
-        return replace(config, base=default_branch)
+        return replace(config, base=default_branch, base_provenance="repository-default")
 
     raise AgentLoopError(
         f"Unable to resolve a base branch for {config.repo}. "
@@ -964,6 +1012,7 @@ def config_from_args(
         coder=args.coder,
         reviewer=configured_reviewers,
         base=getattr(args, "base", None),
+        base_provenance="explicit" if getattr(args, "base", None) else None,
         max_rounds=args.max_rounds,
         auto_merge=args.auto_merge,
         dry_run=args.dry_run,

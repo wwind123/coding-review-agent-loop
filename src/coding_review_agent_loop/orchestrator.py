@@ -125,12 +125,14 @@ from .evidence_reconciliation import (
 )
 from .memory import AgentMemoryContext, prepare_agent_memory
 from .managed_ci import (
+    AuthenticatedManagedResume,
     AuthenticatedIssueCreatedHandoff,
     FINAL_CONTEXT,
     MANAGED_LABEL,
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
     activate_managed_ci,
+    authenticate_source_managed_resume,
     authenticate_issue_created_handoff,
     dispatch_final_qualification,
     intermediate_managed_checks,
@@ -517,20 +519,18 @@ class ExactHeadCiProof:
 
 
 def _render_ci_rerun_command(config: AgentLoopConfig, *, pr_number: int) -> str:
-    """Render local CI recovery guidance without retired auto-merge selectors."""
-    if config.invocation_argv:
-        argv = config.invocation_argv
-        if config.auto_merge:
-            argv = tuple(
-                token
-                for token in argv
-                if token not in {"--watch-pending-ci", "--no-watch-pending-ci"}
-            )
-        return shlex.join(argv)
-    return (
-        f"agent-loop pr {pr_number} --auto-merge"
-        if config.auto_merge
-        else f"agent-loop pr {pr_number} --watch-pending-ci"
+    """Render local CI recovery guidance through the shared token builder."""
+    return render_managed_ci_resume_command(
+        config,
+        pr_number=pr_number,
+        managed_ci=config.managed_ci,
+        preserve_managed_options=(
+            config.managed_ci
+            or config.managed_ci_trusted_actor is not None
+            or config.allow_unprotected_managed_ci
+            or config.managed_ci_adopt_existing_pr
+        ),
+        include_context=False,
     )
 
 
@@ -4403,6 +4403,7 @@ def _implement_approved_issue(
             config=implementation_config,
             issue_context=issue_context,
             usage_context=usage_context,
+            managed_ci_issue_number=issue_number,
         )
 
     salvage_summary = latest_salvage_context(
@@ -5761,6 +5762,7 @@ def _run_plan_first_loop(
                         config=config,
                         issue_context=target_issue_context,
                         usage_context=usage_context,
+                        managed_ci_issue_number=target_issue_number,
                     )
 
                 existing_handoff = find_existing_one_shot_impl_handoff(
@@ -5829,6 +5831,7 @@ def _run_plan_first_loop(
                             config=config,
                             issue_context=target_issue_context,
                             usage_context=usage_context,
+                            managed_ci_issue_number=target_issue_number,
                         )
                     else:
                         print(
@@ -6141,6 +6144,7 @@ def run_issue_loop(
                 config=config,
                 issue_context=issue_context,
                 usage_context=usage_context,
+                managed_ci_issue_number=issue_number,
             )
 
         memory = prepare_agent_memory(runner, config)
@@ -6784,6 +6788,7 @@ def run_pr_loop(
     pre_review_test_pending: bool = False,
     managed_pr_origin: tuple[str, str, str, str | None] | None = None,
     managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None,
+    managed_ci_issue_number: int | None = None,
 ) -> int:
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
@@ -6792,12 +6797,22 @@ def run_pr_loop(
     ordinary_recovery_selected = False
     managed_ci_qualified = False
     managed_pr_recovered = False
+    authenticated_managed_resume: AuthenticatedManagedResume | None = None
     try:
         bootstrap_cwd = github_bootstrap_cwd(config)
         initial_pr_context = get_pr_review_context(
             runner,
             config=config,
             pr_number=pr_number,
+            cwd=bootstrap_cwd,
+        )
+        # Resolve the live PR base before any managed-CI authentication or
+        # workdir setup.  An inherited repository default is provenance, not
+        # permission to reinterpret a PR targeting another branch.
+        config = resolve_base_branch(
+            config,
+            runner,
+            pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
         if managed_ci_handoff is not None:
@@ -6821,6 +6836,7 @@ def run_pr_loop(
                     config=config,
                     pr_number=pr_number,
                     metadata=initial_pr_context.metadata,
+                    issue_number=managed_ci_issue_number,
                 )
                 if managed_ci_handoff is None:
                     reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
@@ -6830,6 +6846,12 @@ def run_pr_loop(
                         config=config,
                         handoff=managed_ci_handoff,
                         metadata=initial_pr_context.metadata,
+                    )
+                    authenticated_managed_resume = AuthenticatedManagedResume(
+                        origin="issue-created",
+                        lifecycle=managed_ci_handoff.lifecycle,
+                        issue_created_handoff=managed_ci_handoff,
+                        override_nonce=managed_ci_handoff.override_nonce,
                     )
         if managed_pr_origin is not None:
             source_branch, source_sha, managed_branch, override_nonce = managed_pr_origin
@@ -6845,6 +6867,16 @@ def run_pr_loop(
                 expected_base_branch=config.base,
                 require_creation_head_sha=not managed_pr_recovered,
             )
+            if managed_pr_recovered and authenticated_managed_resume is None and config.effective_managed_ci:
+                authenticated_managed_resume = authenticate_source_managed_resume(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    source_branch=source_branch,
+                    source_sha=source_sha,
+                    managed_branch=managed_branch,
+                    override_nonce=override_nonce,
+                )
         recorded_pr_contract = find_latest_pr_contract(
             initial_pr_context.comments,
             repository=config.repo,
@@ -7013,16 +7045,45 @@ def run_pr_loop(
                     "Issue-side and PR-side expected closing contracts disagree before "
                     "supersession; no durable metadata changed."
                 )
-        config = resolve_base_branch(
-            config,
-            runner,
-            pr_metadata=initial_pr_context.metadata,
-            cwd=bootstrap_cwd,
-        )
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)
         if config.review_parallel:
             _ensure_parallel_reviewer_workdirs(config, flag_name="--review-parallel", role_label="reviewer")
+        # Select managed activation before any PR-side contract/comment write.
+        # In particular, an authenticated ready/unlabeled re-entry reached by
+        # implicit auto-merge must be able to stop with the PR untouched.
+        activation = activate_managed_ci(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            metadata=initial_pr_context.metadata,
+            managed_resume=authenticated_managed_resume,
+            resume_origin=(
+                "source-managed"
+                if managed_pr_origin is not None and authenticated_managed_resume is None
+                else None
+            ),
+        )
+        if activation is not None and activation.activation_path == "ordinary_fallback":
+            ordinary_recovery_selected = True
+            ordinary_recovery = activation.ordinary_recovery
+            managed_ci = None
+            log(
+                config,
+                f"PR #{pr_number}: ordinary recovery selected; "
+                "the previous managed activation is not being resumed",
+            )
+            if ordinary_recovery is None:
+                command = render_managed_ci_resume_command(
+                    config, pr_number=pr_number, managed_ci=True,
+                )
+                print(
+                    f"PR #{pr_number} remains draft and unmerged because managed recovery provenance or "
+                    f"an unlabeled CI route is unavailable. Resume with `{command}`."
+                )
+                return 0
+        else:
+            managed_ci = activation
         log(config, f"Validating PR #{pr_number}")
         validate_open_pr(runner, config=config, pr_number=pr_number)
         if closing_contract is not None:
@@ -7069,33 +7130,6 @@ def run_pr_loop(
                     expected_closing_issue_ids=closing_contract.expected_closing_issue_ids,
                     supersedes_hash=closing_contract.supersedes_hash,
                 )
-        activation = activate_managed_ci(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            metadata=initial_pr_context.metadata,
-        )
-        if activation is not None and activation.activation_path == "ordinary_fallback":
-            ordinary_recovery_selected = True
-            ordinary_recovery = activation.ordinary_recovery
-            managed_ci = None
-            log(
-                config,
-                f"PR #{pr_number}: ordinary recovery selected; "
-                "the previous managed activation is not being resumed",
-            )
-            if ordinary_recovery is None:
-                command = render_managed_ci_resume_command(
-                    config, pr_number=pr_number, managed_ci=True,
-                )
-                print(
-                    f"PR #{pr_number} remains draft and unmerged because managed recovery provenance or "
-                    f"an unlabeled CI route is unavailable. Resume with `{command}`."
-                )
-                return 0
-        else:
-            managed_ci = activation
-
         def managed_ci_active(metadata: PullRequestMetadata) -> bool:
             """Drop adopted filtering immediately when its live handshake changes."""
             nonlocal managed_ci
@@ -7104,7 +7138,7 @@ def run_pr_loop(
             if revalidate_adopted_managed_ci(
                 runner, config=config, pr_number=pr_number, metadata=metadata, contract=managed_ci
             ):
-                if managed_ci.issue_created_pr:
+                if managed_ci.origin in {"issue-created", "source-managed"} or managed_ci.issue_created_pr:
                     label_state = managed_label_present(
                         runner, config=config, pr_number=pr_number,
                     )
@@ -9001,7 +9035,11 @@ def run_pr_loop(
             managed_ci is not None
             and not managed_ci_qualified
         ):
-            should_release = managed_ci.adopted_existing_pr or config.managed_ci
+            should_release = (
+                managed_ci.adopted_existing_pr
+                or managed_ci.origin in {"issue-created", "source-managed"}
+                or config.managed_ci
+            )
             if should_release and not release_adopted_managed_ci(
                 runner,
                 config=config,
