@@ -521,7 +521,16 @@ class ExactHeadCiProof:
 def _render_ci_rerun_command(config: AgentLoopConfig, *, pr_number: int) -> str:
     """Render local CI recovery guidance through the shared token builder."""
     return render_managed_ci_resume_command(
-        config, pr_number=pr_number, managed_ci=False, include_context=False,
+        config,
+        pr_number=pr_number,
+        managed_ci=config.managed_ci,
+        preserve_managed_options=(
+            config.managed_ci
+            or config.managed_ci_trusted_actor is not None
+            or config.allow_unprotected_managed_ci
+            or config.managed_ci_adopt_existing_pr
+        ),
+        include_context=False,
     )
 
 
@@ -4394,6 +4403,7 @@ def _implement_approved_issue(
             config=implementation_config,
             issue_context=issue_context,
             usage_context=usage_context,
+            managed_ci_issue_number=issue_number,
         )
 
     salvage_summary = latest_salvage_context(
@@ -5821,6 +5831,7 @@ def _run_plan_first_loop(
                             config=config,
                             issue_context=target_issue_context,
                             usage_context=usage_context,
+                            managed_ci_issue_number=target_issue_number,
                         )
                     else:
                         print(

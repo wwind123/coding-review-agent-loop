@@ -146,7 +146,9 @@ class ManagedCiContract:
     # Explicit lifecycle provenance.  These fields are intentionally not
     # inferred from public mode flags after activation.
     origin: Literal["issue-created", "source-managed"] | None = None
-    lifecycle: Literal["creation", "draft-labeled", "ready-unlabeled-reentry"] | None = None
+    lifecycle: Literal[
+        "creation", "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
+    ] | None = None
     authenticated_resume: "AuthenticatedManagedResume | None" = None
 
 
@@ -191,7 +193,9 @@ class AuthenticatedIssueCreatedHandoff:
     protection_mode: str
     override_nonce: str | None
     active_label_event_id: int | None = None
-    lifecycle: Literal["draft-labeled", "ready-unlabeled-reentry"] = "draft-labeled"
+    lifecycle: Literal[
+        "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
+    ] = "draft-labeled"
 
 
 @dataclass(frozen=True)
@@ -204,7 +208,9 @@ class AuthenticatedManagedResume:
     """
 
     origin: Literal["issue-created", "source-managed"]
-    lifecycle: Literal["draft-labeled", "ready-unlabeled-reentry"]
+    lifecycle: Literal[
+        "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
+    ]
     issue_created_handoff: AuthenticatedIssueCreatedHandoff | None = None
     source_branch: str | None = None
     source_sha: str | None = None
@@ -855,7 +861,7 @@ def _issue_created_tuple(
     expected_branch: str,
     expected_nonce: str | None,
     protection_mode: str,
-    lifecycle: Literal["draft-labeled", "ready-unlabeled"] = "draft-labeled",
+    lifecycle: Literal["draft-labeled", "draft-unlabeled", "ready-unlabeled"] = "draft-labeled",
 ) -> AuthenticatedIssueCreatedHandoff:
     """Read and verify the immutable tuple before any handoff publication.
 
@@ -911,6 +917,8 @@ def _issue_created_tuple(
         lifecycle_matches = (
             pr.get("draft") is True and MANAGED_LABEL in labels
             if lifecycle == "draft-labeled"
+            else pr.get("draft") is True and MANAGED_LABEL not in labels
+            if lifecycle == "draft-unlabeled"
             else pr.get("draft") is False and MANAGED_LABEL not in labels
         )
         if (
@@ -919,11 +927,8 @@ def _issue_created_tuple(
             or head_repo.get("full_name", "").casefold() != config.repo.casefold()
             or branch != expected_branch
             or base.get("ref") != config.base
-            or (
-                MANAGED_LABEL not in labels
-                if lifecycle == "draft-labeled"
-                else MANAGED_LABEL in labels
-            )
+            or (lifecycle == "draft-labeled" and MANAGED_LABEL not in labels)
+            or (lifecycle != "draft-labeled" and MANAGED_LABEL in labels)
             or author.get("login", "").casefold() != actor_login.casefold()
             or author.get("id") != actor_id
             or sha != metadata.head_sha
@@ -951,9 +956,11 @@ def _issue_created_tuple(
         trusted_actor_id=actor_id,
         protection_mode=protection_mode,
         override_nonce=record.nonce if record is not None else None,
-        lifecycle=(
-            "ready-unlabeled-reentry" if lifecycle == "ready-unlabeled" else "draft-labeled"
-        ),
+        lifecycle={
+            "draft-labeled": "draft-labeled",
+            "draft-unlabeled": "draft-unlabeled-reentry",
+            "ready-unlabeled": "ready-unlabeled-reentry",
+        }[lifecycle],
     )
 
 
@@ -1002,6 +1009,8 @@ def revalidate_issue_created_handoff(
         lifecycle=(
             "ready-unlabeled"
             if handoff.lifecycle == "ready-unlabeled-reentry"
+            else "draft-unlabeled"
+            if handoff.lifecycle == "draft-unlabeled-reentry"
             else "draft-labeled"
         ),
     )
@@ -1041,9 +1050,16 @@ def recover_issue_created_handoff(
         return None
     branch_issue_number = int(match.group(1))
     if issue_number is not None and issue_number != branch_issue_number:
+        command = render_managed_ci_resume_command(
+            config,
+            pr_number=pr_number,
+            issue_number=issue_number,
+            managed_ci=True,
+        )
         raise AgentLoopError(
             f"Managed-CI issue association targets issue #{issue_number}, but the authenticated "
-            f"managed branch targets issue #{branch_issue_number}. The PR was left unchanged."
+            f"managed branch targets issue #{branch_issue_number}. The PR was left unchanged. "
+            f"Rerun the canonical issue command after correcting the issue association: `{command}`"
         )
     issue_number = branch_issue_number
     record = None
@@ -1059,15 +1075,30 @@ def recover_issue_created_handoff(
     draft = pr.get("draft")
     if draft is True and MANAGED_LABEL in labels:
         lifecycle = "draft-labeled"
+    elif draft is True and MANAGED_LABEL not in labels and config.managed_ci:
+        # A failed explicit managed-CI invocation deliberately releases its
+        # suppression label.  Re-admit that durable draft state only when the
+        # operator explicitly asks for managed qualification again.
+        lifecycle = "draft-unlabeled"
     elif draft is False and MANAGED_LABEL not in labels:
         lifecycle = "ready-unlabeled"
     else:
-        state = "draft/labeled" if draft is True and MANAGED_LABEL in labels else (
-            "ready/labeled" if draft is False and MANAGED_LABEL in labels else "draft/unlabeled"
+        if draft is True:
+            state = "draft/labeled" if MANAGED_LABEL in labels else "draft/unlabeled"
+        elif draft is False:
+            state = "ready/labeled" if MANAGED_LABEL in labels else "ready/unlabeled"
+        else:
+            state = "unknown/labeled" if MANAGED_LABEL in labels else "unknown/unlabeled"
+        command = render_managed_ci_resume_command(
+            config,
+            pr_number=pr_number,
+            issue_number=issue_number,
+            managed_ci=True,
         )
         raise AgentLoopError(
             f"Managed-CI issue-created resume for PR #{pr_number} observed mixed lifecycle state "
-            f"{state}; expected draft/labeled or ready/unlabeled. The PR was left unchanged."
+            f"{state}; expected draft/labeled, draft/unlabeled with explicit managed CI, or "
+            f"ready/unlabeled. The PR was left unchanged. Resume with `{command}`."
         )
     # A resumed nonce is provenance only.  Its value is checked against the
     # live body, then activation mints a fresh audit/generation.
@@ -1135,14 +1166,26 @@ def authenticate_source_managed_resume(
         if isinstance(item, dict) and isinstance(item.get("name"), str)
     }
     if pr.get("draft") is True and MANAGED_LABEL in labels:
-        lifecycle: Literal["draft-labeled", "ready-unlabeled-reentry"] = "draft-labeled"
+        lifecycle: Literal[
+            "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
+        ] = "draft-labeled"
+    elif pr.get("draft") is True and MANAGED_LABEL not in labels and config.managed_ci:
+        lifecycle = "draft-unlabeled-reentry"
     elif pr.get("draft") is False and MANAGED_LABEL not in labels:
         lifecycle = "ready-unlabeled-reentry"
     else:
-        state = "ready/labeled" if pr.get("draft") is False else "draft/unlabeled"
+        draft = pr.get("draft")
+        if draft is True:
+            state = "draft/labeled" if MANAGED_LABEL in labels else "draft/unlabeled"
+        elif draft is False:
+            state = "ready/labeled" if MANAGED_LABEL in labels else "ready/unlabeled"
+        else:
+            state = "unknown/labeled" if MANAGED_LABEL in labels else "unknown/unlabeled"
+        command = render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
         raise AgentLoopError(
             f"Managed source PR #{pr_number} observed mixed lifecycle state {state}; "
-            "expected draft/labeled or authenticated ready/unlabeled. The PR was left unchanged."
+            f"expected draft/labeled, draft/unlabeled with explicit managed CI, or authenticated "
+            f"ready/unlabeled. The PR was left unchanged. Resume with `{command}`."
         )
     return AuthenticatedManagedResume(
         origin="source-managed",
@@ -1155,7 +1198,7 @@ def authenticate_source_managed_resume(
 
 
 _RECOVERY_VALUE_OPTIONS = frozenset({
-    "--base", "--claude-dir", "--codex-dir", "--gemini-dir", "--antigravity-dir",
+    "--repo", "--base", "--claude-dir", "--codex-dir", "--gemini-dir", "--antigravity-dir",
     "--coder", "--reviewer", "--max-rounds", "--managed-ci-trusted-actor",
     "--implementation-coder", "--implementation-coder-model",
     "--implementation-codex-reasoning-effort", "--claude-cmd", "--codex-cmd",
@@ -1172,6 +1215,10 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--agent-memory-dir", "--salvage-comment-patch-max-bytes", "--planning-context-mode",
     "--pr-review-context-mode", "--expected-closing-issue",
     "--plan-execution-mode", "--split-stage", "--head", "--title", "--body-file",
+    "--approved-followups",
+})
+_RECOVERY_NARGS_VALUE_OPTIONS = frozenset({
+    "--antigravity-models", "--antigravity-quota-signatures", "--agent-retry-backoff-seconds",
 })
 _ISSUE_ONLY_RECOVERY_OPTIONS = frozenset({
     "--plan-first", "--implement-after-approval", "--plan-execution-mode",
@@ -1184,17 +1231,43 @@ _MANAGED_RECOVERY_OPTIONS = frozenset({
     "--managed-ci", "--managed-ci-trusted-actor", "--allow-unprotected-managed-ci",
     "--managed-ci-adopt-existing-pr",
 })
-_RECOVERY_BOOL_OPTIONS = frozenset({
-    "--auto-merge", "--dry-run", "--allow-shared-dir", "--dangerous-agent-permissions",
-    "--pre-review-tests", "--no-pre-review-tests", "--quiet", "--refresh-agent-memory",
-    "--refresh-test-profile", "--salvage-comments", "--no-salvage-comments",
-    "--review-parallel", "--watch-pending-ci", "--no-watch-pending-ci", "--agent-memory",
-    "--no-agent-memory", "--supersede-expected-closing-contract",
-})
-
-
 def _option_name(token: str) -> str:
     return token.split("=", 1)[0]
+
+
+def _recovery_option_end(argv: list[str], index: int) -> int:
+    """Return the first token after one option and its value payload."""
+    token = argv[index]
+    name = _option_name(token)
+    if "=" in token or name not in _RECOVERY_VALUE_OPTIONS:
+        return index + 1
+    if name in _RECOVERY_NARGS_VALUE_OPTIONS:
+        index += 1
+        while index < len(argv) and (
+            not argv[index].startswith("-") or argv[index] == "-"
+        ):
+            index += 1
+        return index
+    if index + 1 < len(argv) and (
+        not argv[index + 1].startswith("-") or argv[index + 1] == "-"
+    ):
+        return index + 2
+    return index + 1
+
+
+def _find_recovery_positional_index(argv: list[str], command_index: int) -> int | None:
+    """Find an issue/PR identifier even when options precede it."""
+    index = command_index + 1
+    while index < len(argv):
+        if argv[index].startswith("-"):
+            index = _recovery_option_end(argv, index)
+            continue
+        try:
+            int(argv[index])
+        except ValueError:
+            return None
+        return index
+    return None
 
 
 def _strip_recovery_options(
@@ -1206,12 +1279,7 @@ def _strip_recovery_options(
         token = argv[index]
         name = _option_name(token)
         if name in names:
-            index += 1
-            if "=" not in token and name in _RECOVERY_VALUE_OPTIONS:
-                # `nargs='+'` options consume a variable number of values.  The
-                # target parser's next option is the only reliable delimiter.
-                while index < len(argv) and not argv[index].startswith("-"):
-                    index += 1
+            index = _recovery_option_end(argv, index)
             continue
         result.append(token)
         index += 1
@@ -1228,6 +1296,7 @@ def _render_recovery_command(
     target: Literal["issue", "pr"],
     identifier: int,
     managed_ci: bool,
+    preserve_managed_options: bool = False,
     include_context: bool = True,
 ) -> str:
     """Build one parser-valid, shell-quoted recovery command.
@@ -1280,10 +1349,17 @@ def _render_recovery_command(
             if source == "managed-pr":
                 remove.update(_MANAGED_PR_ONLY_RECOVERY_OPTIONS)
         if not managed_ci:
-            remove.update(_MANAGED_RECOVERY_OPTIONS)
+            if not preserve_managed_options:
+                remove.update(_MANAGED_RECOVERY_OPTIONS)
         if config.auto_merge:
             remove.update({"--watch-pending-ci", "--no-watch-pending-ci"})
         command = _strip_recovery_options(command, names=frozenset(remove))
+        if source in {"issue", "pr"}:
+            # Remove the source command's positional before inserting the
+            # retargeted identifier. This also handles `issue --repo X 123`.
+            positional_index = _find_recovery_positional_index(command, command_index)
+            if positional_index is not None:
+                del command[positional_index]
         command_index = next(
             index for index, token in enumerate(command) if token in {"issue", "pr", "managed-pr"}
         )
@@ -1304,7 +1380,13 @@ def _render_recovery_command(
 
 
 def render_managed_ci_resume_command(
-    config: AgentLoopConfig, *, pr_number: int, managed_ci: bool, include_context: bool = True
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    managed_ci: bool,
+    preserve_managed_options: bool = False,
+    issue_number: int | None = None,
+    include_context: bool = True,
 ) -> str:
     """Render the deterministic, parser-valid, shell-quoted recovery contract."""
     target: Literal["issue", "pr"] = "pr"
@@ -1320,13 +1402,19 @@ def render_managed_ci_resume_command(
         )
         if command_index is not None and config.invocation_argv[command_index] == "issue":
             target = "issue"
-            if command_index + 1 < len(config.invocation_argv):
-                try:
-                    identifier = int(config.invocation_argv[command_index + 1])
-                except ValueError:
-                    identifier = pr_number
+            identifier = issue_number if issue_number is not None else pr_number
+            if issue_number is None:
+                positional_index = _find_recovery_positional_index(
+                    list(config.invocation_argv), command_index
+                )
+                if positional_index is not None:
+                    identifier = int(config.invocation_argv[positional_index])
     return _render_recovery_command(
-        config, target=target, identifier=identifier, managed_ci=managed_ci,
+        config,
+        target=target,
+        identifier=identifier,
+        managed_ci=managed_ci,
+        preserve_managed_options=preserve_managed_options,
         include_context=include_context,
     )
 
@@ -1619,6 +1707,8 @@ def _activate_v2_managed_ci(
             lifecycle = "ready-unlabeled-reentry"
         elif pr.get("draft") is True and MANAGED_LABEL in labels:
             lifecycle = "draft-labeled"
+        elif pr.get("draft") is True and MANAGED_LABEL not in labels:
+            lifecycle = "draft-unlabeled-reentry"
         else:
             # The orchestration recovery path reports mixed lifecycle states;
             # retain the low-level API's historical no-match result for an
@@ -1683,7 +1773,7 @@ def _activate_v2_managed_ci(
             or head_repo.get("full_name", "").casefold() != config.repo.casefold()
             or author.get("login") != actor_login
             or author.get("id") != actor_id
-            or labels and MANAGED_LABEL in labels
+            or MANAGED_LABEL in labels
         ):
             # There is no trusted active label to remove in the unlabeled
             # re-entry case. Report the draft/unlabeled state without claiming
@@ -1693,13 +1783,44 @@ def _activate_v2_managed_ci(
                 "the ready-to-draft transition; the head is NOT qualified by this run. "
                 "The PR must be draft and unlabeled before rerunning managed qualification."
             )
-    elif pr.get("draft") is not True or MANAGED_LABEL not in labels:
+    elif lifecycle == "draft-unlabeled-reentry" and (
+        pr.get("draft") is not True or MANAGED_LABEL in labels
+    ):
+        draft = pr.get("draft")
+        if draft is True:
+            state = "draft/labeled"
+        elif draft is False:
+            state = "ready/labeled" if MANAGED_LABEL in labels else "ready/unlabeled"
+        else:
+            state = "unknown/labeled" if MANAGED_LABEL in labels else "unknown/unlabeled"
+        command = render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
+        raise AgentLoopError(
+            f"Managed-CI {origin} draft re-entry for PR #{pr_number} observed {state}; "
+            f"the PR was left unchanged. Resume with `{command}` after restoring draft/unlabeled state."
+        )
+    elif lifecycle == "draft-unlabeled-reentry" and not config.managed_ci:
+        command = render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
+        raise AgentLoopError(
+            f"PR #{pr_number} is an authenticated managed {origin} draft/unlabeled re-entry. "
+            f"It was left unchanged; rerun with explicit `--managed-ci`: {command}"
+        )
+    elif lifecycle != "draft-unlabeled-reentry" and (
+        pr.get("draft") is not True or MANAGED_LABEL not in labels
+    ):
         if managed_resume is None and resume_origin is None:
             return None
-        state = "ready/labeled" if pr.get("draft") is False else "draft/unlabeled"
+        draft = pr.get("draft")
+        if draft is True:
+            state = "draft/labeled" if MANAGED_LABEL in labels else "draft/unlabeled"
+        elif draft is False:
+            state = "ready/labeled" if MANAGED_LABEL in labels else "ready/unlabeled"
+        else:
+            state = "unknown/labeled" if MANAGED_LABEL in labels else "unknown/unlabeled"
+        command = render_managed_ci_resume_command(config, pr_number=pr_number, managed_ci=True)
         raise AgentLoopError(
             f"Managed-CI {origin} resume for PR #{pr_number} observed {state}; "
-            "expected draft/labeled or authenticated ready/unlabeled. The PR was left unchanged."
+            f"expected draft/labeled, draft/unlabeled, or authenticated ready/unlabeled. "
+            f"The PR was left unchanged. Resume with `{command}`."
         )
     if MANAGED_LABEL not in labels:
         if not ensure_managed_label(runner, config=config):

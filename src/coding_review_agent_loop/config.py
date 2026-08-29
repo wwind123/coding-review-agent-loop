@@ -377,12 +377,6 @@ def resolve_base_branch(
         return replace(config, base="main", base_provenance="repository-default")
 
     if live_pr_base:
-        if config.base_provenance == "repository-default" and config.base and config.base != live_pr_base:
-            raise mismatch_message(config.base, live_pr_base)
-        if config.base_provenance == "pr-metadata" and config.base and config.base != live_pr_base:
-            raise mismatch_message(config.base, live_pr_base)
-        if config.base and config.base == live_pr_base and config.base_provenance is not None:
-            return config
         return replace(config, base=live_pr_base, base_provenance="pr-metadata")
 
     default_branch = get_repo_default_branch(

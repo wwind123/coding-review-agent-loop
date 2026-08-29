@@ -798,9 +798,11 @@ reauthenticating the issue-to-PR handoff. Direct `pr` mode is the fallback for
 a known PR. Ready/unlabeled reconstruction requires an explicit `--managed-ci`
 request. An implicit `--auto-merge` retry leaves an authenticated PR ready and
 unlabeled, performs no label/body/comment/dispatch/readiness write, and prints
-the exact retry with `--managed-ci`. The recovery path accepts only
-draft/labeled or ready/unlabeled lifecycle states and treats historical audit
-records as provenance, never as reusable authority or something to delete.
+the exact retry with `--managed-ci`. The recovery path accepts draft/labeled
+and ready/unlabeled lifecycle states; after an explicit managed-CI failure it
+can also re-admit draft/unlabeled only with an explicit `--managed-ci` request.
+Other mixed states stop before agents run. Historical audit records remain
+provenance, never reusable authority or something to delete.
 
 Base provenance is retained across the issue-to-PR boundary. If an inherited
 repository-default base differs from the live PR base, the run stops before

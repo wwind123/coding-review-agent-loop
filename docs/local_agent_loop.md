@@ -1536,8 +1536,10 @@ An authenticated ready/unlabeled issue-created or `managed-pr` PR may be
 reconstructed only when the new invocation has an explicit `--managed-ci`.
 An implicit `--auto-merge` invocation leaves that state ready and unlabeled,
 prints the exact flow-preserving retry, and performs no label, body, comment,
-dispatch, or readiness write. Draft/labeled and ready/unlabeled are the only
-accepted lifecycle states; mixed states stop before agents run.
+dispatch, or readiness write. Draft/labeled and ready/unlabeled are the normal
+accepted lifecycle states; an explicit `--managed-ci` retry may also re-admit
+the draft/unlabeled state left by a failed explicit managed run. Other mixed
+states stop before agents run.
 
 Base resolution records whether the value came from an explicit `--base`, the
 repository default, or live PR metadata. This base provenance crosses the
