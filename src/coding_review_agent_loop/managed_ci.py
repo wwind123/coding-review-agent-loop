@@ -918,6 +918,9 @@ def _issue_created_tuple(
             ) + " --managed-ci-trusted-actor '<trusted-actor>'"
         raise AgentLoopError(
             "Managed-CI issue handoff actor authentication does not match repository settings. "
+            f"Observed identities: gh login=`{actor_login or '<missing>'}`, "
+            f"--managed-ci-trusted-actor=`{configured or '<missing>'}`, "
+            f"AGENT_LOOP_MANAGED_ACTOR=`{advertised or '<missing>'}`; expected all three to match. "
             f"Rerun with the configured trusted actor: `{remediation}`."
         )
 
@@ -1405,7 +1408,10 @@ def _render_recovery_command(
     if managed_ci:
         if not _has_option(command, "--managed-ci"):
             command.append("--managed-ci")
-        if config.managed_ci_trusted_actor and not _has_option(command, "--managed-ci-trusted-actor"):
+        if config.managed_ci_trusted_actor:
+            command = _strip_recovery_options(
+                command, names=frozenset({"--managed-ci-trusted-actor"})
+            )
             command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
         if config.allow_unprotected_managed_ci and not _has_option(command, "--allow-unprotected-managed-ci"):
             command.append("--allow-unprotected-managed-ci")

@@ -1007,6 +1007,46 @@ def test_issue_created_tuple_actor_refusal_includes_trusted_actor_remediation(tm
         )
 
 
+def test_issue_created_tuple_actor_refusal_replaces_existing_trusted_actor(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="operator-actor",
+        invocation_argv=(
+            "agent-loop", "issue", "643", "--repo", "OWNER/REPO", "--managed-ci",
+            "--managed-ci-trusted-actor", "operator-actor",
+        ),
+    )
+    runner = V2ManagedRunner(rest_pr={"state": "open", "body": body})
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="abc123")
+    intent = managed_ci.ManagedCiCreationIntent(
+        branch="agent-loop/managed-643",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce="fresh",
+    )
+
+    with pytest.raises(AgentLoopError) as error:
+        authenticate_issue_created_handoff(
+            runner,
+            config=config,
+            intent=intent,
+            issue_number=643,
+            pr_number=7,
+            metadata=metadata,
+        )
+
+    message = str(error.value)
+    assert "gh login=`agent-loop`" in message
+    assert "--managed-ci-trusted-actor=`operator-actor`" in message
+    assert "AGENT_LOOP_MANAGED_ACTOR=`agent-loop`" in message
+    remediation = message.split("`", 7)[7]
+    assert remediation.count("--managed-ci-trusted-actor") == 1
+    assert "--managed-ci-trusted-actor agent-loop" in remediation
+    assert "operator-actor" not in remediation
+
+
 def test_issue_created_tuple_mismatch_includes_shell_quoted_resume_command(tmp_path):
     body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
     config = make_config(
