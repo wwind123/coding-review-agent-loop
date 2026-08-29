@@ -900,7 +900,33 @@ def _issue_created_tuple(
         or actor_login.casefold() != configured.casefold()
         or actor_login.casefold() != advertised.casefold()
     ):
-        raise AgentLoopError("Managed-CI issue handoff actor authentication does not match repository settings.")
+        trusted_actor = advertised or actor_login or configured
+        if trusted_actor:
+            remediation_config = replace(config, managed_ci_trusted_actor=trusted_actor)
+            remediation = render_managed_ci_resume_command(
+                remediation_config,
+                pr_number=pr_number,
+                issue_number=issue_number,
+                managed_ci=True,
+            )
+        else:
+            remediation = render_managed_ci_resume_command(
+                config,
+                pr_number=pr_number,
+                issue_number=issue_number,
+                managed_ci=True,
+            ) + " --managed-ci-trusted-actor '<trusted-actor>'"
+        raise AgentLoopError(
+            "Managed-CI issue handoff actor authentication does not match repository settings. "
+            f"Rerun with the configured trusted actor: `{remediation}`."
+        )
+
+    remediation = render_managed_ci_resume_command(
+        config,
+        pr_number=pr_number,
+        issue_number=issue_number,
+        managed_ci=True,
+    )
 
     def check_rest(pr: dict[str, object]) -> tuple[str, str]:
         head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -936,7 +962,10 @@ def _issue_created_tuple(
             or base.get("ref") != metadata.base_branch
             or rest_body != body
         ):
-            raise AgentLoopError("Managed-CI issue-created opening tuple is missing or changed.")
+            raise AgentLoopError(
+                "Managed-CI issue-created opening tuple is missing or changed. "
+                f"The PR was left unchanged. Resume with `{remediation}`."
+            )
         return sha, branch
 
     first = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
@@ -944,7 +973,10 @@ def _issue_created_tuple(
     second = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
     live_sha, live_branch = check_rest(second)
     if (live_sha, live_branch) != (sha, branch):
-        raise AgentLoopError("Managed-CI issue-created opening tuple changed during validation.")
+        raise AgentLoopError(
+            "Managed-CI issue-created opening tuple changed during validation. "
+            f"The PR was left unchanged. Resume with `{remediation}`."
+        )
     return AuthenticatedIssueCreatedHandoff(
         pr_number=pr_number,
         issue_number=issue_number,
@@ -1206,6 +1238,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--repair-backend", "--repair-model", "--repair-timeout-seconds",
     "--antigravity-model", "--antigravity-models", "--antigravity-quota-signatures",
     "--codex-model", "--codex-reasoning-effort", "--gemini-model", "--claude-model",
+    "--gh-cmd",
     "--claude-arg", "--codex-arg", "--gemini-arg", "--antigravity-arg",
     "--test-command", "--ci-check-name", "--ci-timeout-seconds",
     "--ci-poll-interval-seconds", "--ci-startup-timeout-seconds",

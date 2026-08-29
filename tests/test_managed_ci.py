@@ -935,7 +935,7 @@ def test_recovery_renderer_finds_issue_identifier_after_options_and_consumes_std
     config = make_config(
         tmp_path,
         invocation_argv=(
-            "agent-loop", "issue", "--repo", "OWNER/REPO", "643",
+            "agent-loop", "issue", "--repo", "OWNER/REPO", "--gh-cmd", "gh", "643",
             "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
         ),
     )
@@ -944,6 +944,7 @@ def test_recovery_renderer_finds_issue_identifier_after_options_and_consumes_std
     assert args.command == "issue"
     assert args.issue_number == 643
     assert args.repo == "OWNER/REPO"
+    assert args.gh_cmd == "gh"
 
     managed_pr = make_config(
         tmp_path,
@@ -958,6 +959,93 @@ def test_recovery_renderer_finds_issue_identifier_after_options_and_consumes_std
     args = parser.parse_args(shlex.split(rendered)[1:])
     assert args.command == "issue"
     assert args.issue_number == 643
+
+
+def test_recovery_value_option_table_covers_all_recovery_subparsers():
+    parser = build_parser()
+    subparsers = next(action for action in parser._actions if action.dest == "command")
+
+    for command in ("issue", "pr", "managed-pr"):
+        subparser = subparsers.choices[command]
+        value_options = {
+            option
+            for action in subparser._actions
+            if action.nargs != 0
+            for option in action.option_strings
+            if option.startswith("--")
+        }
+        assert value_options <= managed_ci._RECOVERY_VALUE_OPTIONS, (
+            f"{command} value-taking recovery options are not classified: "
+            f"{sorted(value_options - managed_ci._RECOVERY_VALUE_OPTIONS)}"
+        )
+
+
+def test_issue_created_tuple_actor_refusal_includes_trusted_actor_remediation(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        invocation_argv=("agent-loop", "issue", "643", "--repo", "OWNER/REPO"),
+    )
+    runner = V2ManagedRunner(rest_pr={"state": "open", "body": body})
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="abc123")
+    intent = managed_ci.ManagedCiCreationIntent(
+        branch="agent-loop/managed-643",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce="fresh",
+    )
+
+    with pytest.raises(AgentLoopError, match=r"--managed-ci-trusted-actor agent-loop"):
+        authenticate_issue_created_handoff(
+            runner,
+            config=config,
+            intent=intent,
+            issue_number=643,
+            pr_number=7,
+            metadata=metadata,
+        )
+
+
+def test_issue_created_tuple_mismatch_includes_shell_quoted_resume_command(tmp_path):
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=fresh"
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        invocation_argv=(
+            "agent-loop", "issue", "643", "--repo", "OWNER/REPO", "--gh-cmd", "gh",
+        ),
+    )
+    runner = V2ManagedRunner(
+        rest_pr={"state": "open", "body": body, "head": {
+            "repo": {"full_name": "OWNER/REPO"},
+            "sha": "changed-head",
+            "ref": "agent-loop/managed-643",
+        }},
+    )
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="abc123")
+    intent = managed_ci.ManagedCiCreationIntent(
+        branch="agent-loop/managed-643",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce="fresh",
+    )
+
+    with pytest.raises(AgentLoopError) as error:
+        authenticate_issue_created_handoff(
+            runner,
+            config=config,
+            intent=intent,
+            issue_number=643,
+            pr_number=7,
+            metadata=metadata,
+        )
+
+    message = str(error.value)
+    assert "opening tuple is missing or changed" in message
+    assert "agent-loop issue 643 --repo OWNER/REPO --gh-cmd gh" in message
+    assert "--managed-ci-trusted-actor agent-loop" in message
 
 
 def test_ci_timeout_renderer_preserves_explicit_managed_options(tmp_path):
