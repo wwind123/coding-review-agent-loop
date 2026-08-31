@@ -3668,7 +3668,7 @@ def _should_record_new_blocking_item(
     return len(non_empty_lines[0]) >= 80
 
 
-_INCOMPLETE_PR_REVIEW_RE = re.compile(
+_INCOMPLETE_REVIEW_RE = re.compile(
     r"\breview\s+(?:is\s+)?incomplete\b|"
     r"\b(?:resolution|finding)\s+could\s+not\s+be\s+confirmed\b|"
     r"\b(?:could\s+not|cannot|can't|unable\s+to)\s+"
@@ -3693,7 +3693,7 @@ def _is_incomplete_pr_review(parsed_review: ParsedReview) -> bool:
         return False
     candidate_texts = [parsed_review.summary]
     candidate_texts.extend(disposition.note for disposition in parsed_review.dispositions)
-    return any(text and _INCOMPLETE_PR_REVIEW_RE.search(text) for text in candidate_texts)
+    return any(text and _INCOMPLETE_REVIEW_RE.search(text) for text in candidate_texts)
 
 
 def _describe_pr_review_outcome(parsed_review: ParsedReview, *, has_blocking_summary: bool) -> str:
@@ -3760,7 +3760,7 @@ def _is_incomplete_plan_review(parsed_review: ParsedPlanReview) -> bool:
         return False
     candidate_texts = [parsed_review.summary]
     candidate_texts.extend(disposition.note for disposition in parsed_review.dispositions)
-    return any(text and _INCOMPLETE_PR_REVIEW_RE.search(text) for text in candidate_texts)
+    return any(text and _INCOMPLETE_REVIEW_RE.search(text) for text in candidate_texts)
 
 
 def _describe_plan_review_outcome(parsed_review: ParsedPlanReview) -> str:
