@@ -983,6 +983,48 @@ def test_antigravity_repair_validates_once_and_falls_back_to_catalog_chain(tmp_p
     assert all(use_pty for _, use_pty in calls)
 
 
+def test_antigravity_repair_accepts_agy_1_1_22_two_column_catalog(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    valid = structured_pr_review(state="approved", reviewer="Google Antigravity")
+    catalog = (
+        "\r\u280b Fetching available models..."
+        "\r\x1b[Kgemini-3.7-flash-high     Gemini 3.7 Flash (High)\r\n"
+        "gemini-3.7-flash-medium   Gemini 3.7 Flash (Medium)\r\n"
+    )
+    runner = FakeRunner(
+        antigravity_catalog_outputs=[(catalog, 0)],
+        antigravity_outputs=[(valid, 0)],
+    )
+    config = make_config(
+        tmp_path,
+        repair_models=("Gemini 3.5 Flash (Medium)",),
+        antigravity_models=("Gemini 3.7 Flash (High)",),
+    )
+
+    repaired, _, attempts = execute_repair(
+        "malformed",
+        runner=runner,
+        config=config,
+        run_id="catalog-1-1-22",
+        usage_context=None,
+        validate=lambda text: parse_structured_pr_review(
+            text, reviewer="Google Antigravity"
+        ),
+        expected_kind="pr_review",
+    )
+
+    assert repaired == valid
+    assert [attempt.model for attempt in attempts] == [
+        "Gemini 3.5 Flash (Medium)",
+        "Gemini 3.7 Flash (High)",
+    ]
+    assert attempts[0].outcome == "unavailable_model"
+    assert attempts[1].outcome == "succeeded"
+    assert "Fetching available models" not in attempts[0].diagnostic
+
+
 def test_antigravity_repair_attempts_directly_when_catalog_fails(tmp_path, monkeypatch):
     from coding_review_agent_loop.agents import antigravity as agy_mod
 
