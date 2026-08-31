@@ -62,6 +62,11 @@ class ChildTopologyPreflight:
     missing_count: int
 
 
+def parent_child_search_query(parent_issue: int) -> str:
+    """Find both flat-child title conventions in one recovery query."""
+    return f'"(from #{parent_issue})" in:title OR "[#{parent_issue} stage]" in:title'
+
+
 def preflight_flat_child_count(
     *,
     parent_issue: int,
@@ -97,7 +102,3 @@ def preflight_flat_child_count(
             configured_limit=configured_limit,
         )
     return result
-
-
-def is_needs_human(value: object) -> bool:
-    return isinstance(value, NeedsHumanDecision)

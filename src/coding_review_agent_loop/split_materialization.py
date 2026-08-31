@@ -14,7 +14,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .config import AgentLoopConfig
-from .child_topology import NeedsHumanDecision, preflight_flat_child_count
+from .child_topology import (
+    NeedsHumanDecision,
+    parent_child_search_query,
+    preflight_flat_child_count,
+)
 from .decomposition import _decode_json_payload, _encode_json_payload, _issue_number_from_url
 from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
@@ -297,32 +301,6 @@ def format_split_materialization_summary(
     return "\n".join(lines)
 
 
-def _adopt_from_search(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    parent_issue: int,
-    remaining: Sequence[SplitStageProposal],
-) -> dict[str, FoundIssue]:
-    """Crash-window recovery: look for children created before a prior run
-    crashed between `create_issue` and posting the parent marker (#476)."""
-    if not remaining:
-        return {}
-    results = search_issues(
-        runner,
-        config=config,
-        search=f'"[#{parent_issue} stage]" in:title',
-        state="all",
-    )
-    return _adopt_from_found(
-        results,
-        parent_issue=parent_issue,
-        remaining=remaining,
-        runner=runner,
-        config=config,
-    )[0]
-
-
 def _adopt_from_found(
     results: Sequence[FoundIssue],
     *,
@@ -452,7 +430,7 @@ def materialize_split_proposals(
     search_results = search_issues(
         runner,
         config=config,
-        search=f'"[#{parent_issue} stage]" in:title',
+        search=parent_child_search_query(parent_issue),
         state="all",
     )
     adopted_by_key, recognized_from_search = _adopt_from_found(

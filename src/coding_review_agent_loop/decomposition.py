@@ -6,15 +6,21 @@ import base64
 import hashlib
 import json
 import re
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .config import AgentLoopConfig
-from .child_topology import NeedsHumanDecision, preflight_flat_child_count
+from .child_topology import (
+    NeedsHumanDecision,
+    parent_child_search_query,
+    preflight_flat_child_count,
+)
 from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .runner import Runner
 from .protocol_markers import TrustedBody, sanitize_historical_text
+from .round_transport import MAX_GITHUB_BODY_CHARS
 
 AUTOMATION_CLASSES = {"agent-pr", "human-action", "manual-close"}
 DECOMPOSITION_MARKER_RE = re.compile(
@@ -324,45 +330,94 @@ def adapt_typed_child_stages(
 
 
 def _checkpoint_payload(checkpoint: TopologyCheckpoint) -> dict[str, object]:
+    contexts = tuple(phase.parent_context for phase in checkpoint.phases)
+    shared_context = (
+        contexts[0]
+        if contexts and all(context == contexts[0] for context in contexts)
+        else None
+    )
+    phase_payloads: list[dict[str, object]] = []
+    for phase in checkpoint.phases:
+        payload = _phase_payload(phase)
+        if shared_context is not None:
+            payload.pop("parent_context", None)
+        phase_payloads.append(payload)
+    retained_payload = None
+    if checkpoint.retained_parent_scope is not None:
+        retained_payload = {
+            "plan_subject": checkpoint.retained_parent_scope.plan_subject,
+            "plan_hash": checkpoint.retained_parent_scope.plan_hash,
+            "excerpt": checkpoint.retained_parent_scope.excerpt,
+        }
+        # Typed phases and the retained parent scope deliberately share this
+        # excerpt. Keep it in one place in the checkpoint marker.
+        if (
+            shared_context is not None
+            and checkpoint.retained_parent_scope.excerpt == shared_context
+        ):
+            retained_payload.pop("excerpt")
     return {
         "parent_issue": checkpoint.parent_issue,
         "plan_hash": checkpoint.plan_hash,
         "mode": checkpoint.mode,
         "topology_source": checkpoint.topology_source,
-        "phases": [_phase_payload(phase) for phase in checkpoint.phases],
-        "retained_parent_scope": (
-            {
-                "plan_subject": checkpoint.retained_parent_scope.plan_subject,
-                "plan_hash": checkpoint.retained_parent_scope.plan_hash,
-                "excerpt": checkpoint.retained_parent_scope.excerpt,
-            }
-            if checkpoint.retained_parent_scope is not None
-            else None
-        ),
+        "shared_parent_context": shared_context,
+        "phases": phase_payloads,
+        "retained_parent_scope": retained_payload,
     }
 
 
-def _phase_from_payload(payload: object) -> PlanPhase:
+def _phase_from_payload(payload: object, *, shared_parent_context: str | None = None) -> PlanPhase:
     if not isinstance(payload, dict):
         raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
     depends = payload.get("depends_on", [])
     if not isinstance(depends, list):
         raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
     values = {}
-    for key in ("title", "scope", "non_goals", "dependency_notes", "rollout_risk", "validation", "parent_context", "automation"):
+    for key in (
+        "title",
+        "scope",
+        "non_goals",
+        "dependency_notes",
+        "rollout_risk",
+        "validation",
+        "automation",
+    ):
         value = payload.get(key)
         if not isinstance(value, str):
             raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
         values[key] = value
+    parent_context = payload.get("parent_context", shared_parent_context)
+    if not isinstance(parent_context, str):
+        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+    values["parent_context"] = parent_context
     return PlanPhase(**values, depends_on=tuple(str(item) for item in depends))
 
 
 def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
-    payload = _decode_json_payload(encoded, marker_name="AGENT_PLAN_TOPOLOGY_CHECKPOINT")
+    try:
+        if encoded.startswith("v1_"):
+            raw = zlib.decompress(
+                base64.urlsafe_b64decode(encoded[3:].encode("ascii"))
+            )
+            payload = json.loads(raw.decode("utf-8"))
+        else:
+            # Read the original uncompressed representation for checkpoints
+            # already posted before the compact payload format was introduced.
+            payload = _decode_json_payload(
+                encoded, marker_name="AGENT_PLAN_TOPOLOGY_CHECKPOINT"
+            )
+    except (ValueError, json.JSONDecodeError, zlib.error) as exc:
+        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.") from exc
+    if not isinstance(payload, dict):
+        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
     phases_payload = payload.get("phases")
     if not isinstance(phases_payload, list) or not phases_payload:
         raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
     retained_payload = payload.get("retained_parent_scope")
+    shared_parent_context = payload.get("shared_parent_context")
+    if shared_parent_context is not None and not isinstance(shared_parent_context, str):
+        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
     retained = None
     if retained_payload is not None:
         if not isinstance(retained_payload, dict):
@@ -370,7 +425,7 @@ def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
         retained = RetainedParentScope(
             plan_subject=str(retained_payload.get("plan_subject") or ""),
             plan_hash=str(retained_payload.get("plan_hash") or ""),
-            excerpt=str(retained_payload.get("excerpt") or ""),
+            excerpt=str(retained_payload.get("excerpt") or shared_parent_context or ""),
         )
     try:
         return TopologyCheckpoint(
@@ -378,7 +433,10 @@ def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
             plan_hash=str(payload["plan_hash"]),
             mode=str(payload["mode"]),
             topology_source=str(payload["topology_source"]),
-            phases=tuple(_phase_from_payload(item) for item in phases_payload),
+            phases=tuple(
+                _phase_from_payload(item, shared_parent_context=shared_parent_context)
+                for item in phases_payload
+            ),
             retained_parent_scope=retained,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -405,7 +463,14 @@ def find_existing_topology_checkpoint(
 
 
 def format_topology_checkpoint(checkpoint: TopologyCheckpoint) -> str:
-    return "\n".join(
+    raw = json.dumps(
+        _checkpoint_payload(checkpoint),
+        separators=(",", ":"),
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    encoded = "v1_" + base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii")
+    body = "\n".join(
         [
             f"Topology checkpoint recorded for issue #{checkpoint.parent_issue}.",
             "",
@@ -413,10 +478,16 @@ def format_topology_checkpoint(checkpoint: TopologyCheckpoint) -> str:
             f"Mode: {checkpoint.mode}",
             f"Stages: {len(checkpoint.phases)}",
             "",
-            f"<!-- AGENT_PLAN_TOPOLOGY_CHECKPOINT: {_encode_json_payload(_checkpoint_payload(checkpoint))} -->",
+            f"<!-- AGENT_PLAN_TOPOLOGY_CHECKPOINT: {encoded} -->",
             "-- coding-review-agent-loop",
         ]
     )
+    if len(body) > MAX_GITHUB_BODY_CHARS:
+        raise AgentLoopError(
+            "Topology checkpoint exceeds the GitHub comment size limit after compact encoding; "
+            "shorten the approved plan or use a smaller flat topology."
+        )
+    return body
 
 
 def post_topology_checkpoint(
@@ -526,7 +597,7 @@ def format_phase_issue_body(
             phase.non_goals,
             "",
             "## Constraints and invariants from the parent plan",
-            sanitize_historical_text(approved_plan.strip()),
+            "The approved parent-plan excerpt above is the complete historical constraint context for this phase.",
             "",
             "## Dependency notes",
             phase.dependency_notes,
@@ -581,7 +652,7 @@ def create_decomposition_child_issues(
     found = search_issues(
         runner,
         config=config,
-        search=f'"(from #{parent_issue})" in:title',
+        search=parent_child_search_query(parent_issue),
         state="all",
     )
     expected_ids = {
@@ -723,7 +794,7 @@ def create_decomposition_child_issues(
                 )
             )
             continue
-        unresolved = _unresolved_dependencies(phase, created)
+        unresolved = () if config.dry_run else _unresolved_dependencies(phase, created)
         if unresolved:
             raise AgentLoopError(
                 "Cannot create decomposition phase because dependency issue references are unavailable: "
@@ -754,6 +825,10 @@ def create_decomposition_child_issues(
                 expected_tokens=("AGENT_PLAN_PHASE_IDENTITY",),
             ),
         )
+        if config.dry_run:
+            # A test double may return a URL even though the real dry-run
+            # Runner intentionally returns no remote issue reference.
+            issue_url = None
         created.append(
             CreatedPhaseIssue(
                 phase=phase,
@@ -971,8 +1046,6 @@ def format_decomposition_parent_summary(
         f"Mode: {mode}",
         f"Topology source: {topology_source}",
         "",
-        "| Phase | Automation | Child issue | Risk |",
-        "| --- | --- | --- | --- |",
     ]
     if retained_parent_scope is not None:
         lines.extend(
@@ -987,6 +1060,12 @@ def format_decomposition_parent_summary(
                 "",
             ]
         )
+    lines.extend(
+        [
+            "| Phase | Automation | Child issue | Risk |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
     for index, item in enumerate(created, start=1):
         if item.issue_url:
             child = item.issue_url

@@ -5628,6 +5628,12 @@ def _run_plan_first_loop(
                         f"({first_phase.phase.automation}), so implementation is stopping."
                     )
                     return 0
+                if config.dry_run:
+                    print(
+                        f"Issue #{issue_number} dry-run decomposed the approved plan; "
+                        "phase implementation is not started."
+                    )
+                    return 0
                 if first_agent_phase is None or first_agent_phase.issue_number is None:
                     raise AgentLoopError(
                         "Cannot implement first decomposed phase because its child issue number "

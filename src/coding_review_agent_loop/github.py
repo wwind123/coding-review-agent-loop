@@ -91,7 +91,6 @@ class FoundIssue:
     title: str | None
     url: str | None
     body: str | None
-    state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +120,9 @@ class PullRequestMergeability:
 
 PR_METADATA_FIELDS = "number,title,headRefName,baseRefName,headRefOid,url,body"
 PR_REVIEW_CONTEXT_FIELDS = f"{PR_METADATA_FIELDS},comments,reviews"
+# Recovery searches must not inherit gh's small default page size: a parent
+# may have hundreds of unrelated issues before its child topology is found.
+ISSUE_RECOVERY_SEARCH_LIMIT = 100_000
 
 # This intentionally remains looser than the recovery parser below.  It is
 # used by PR review context inference, where a same-repository issue URL is
@@ -1846,9 +1848,9 @@ def search_issues(
                 "--state",
                 state,
                 "--limit",
-                "100000",
+                str(ISSUE_RECOVERY_SEARCH_LIMIT),
                 "--json",
-                "number,title,url,body,state",
+                "number,title,url,body",
             ],
             cwd=active_workdir(config),
         )
@@ -1865,9 +1867,9 @@ def search_issues(
             "--state",
             state,
             "--limit",
-            "100000",
+            str(ISSUE_RECOVERY_SEARCH_LIMIT),
             "--json",
-            "number,title,url,body,state",
+            "number,title,url,body",
         ],
         cwd=active_workdir(config),
     )
@@ -1891,7 +1893,6 @@ def search_issues(
                 title=_optional_str(item.get("title")),
                 url=_optional_str(item.get("url")),
                 body=_optional_str(item.get("body")),
-                state=_optional_str(item.get("state")),
             )
         )
     return tuple(found)

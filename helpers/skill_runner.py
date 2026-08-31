@@ -3855,59 +3855,38 @@ def _run_decomposition_for_skill(
             "plan_hash": retained_parent_scope.plan_hash,
             "excerpt": retained_parent_scope.excerpt,
         }
-    try:
-        created = create_decomposition_child_issues(
-            runner,
-            config=config,
-            parent_issue=issue,
-            approved_plan=approved_plan,
-            decomposition=decomposition,
-            topology_source=topology_source,
-            issue_comments=issue_context.comments,
-            mode=mode,
-            retained_parent_scope=retained_parent_scope,
-        )
-    except TypeError as exc:
-        if "unexpected keyword argument" not in str(exc):
-            raise
-        created = create_decomposition_child_issues(
-            runner,
-            config=config,
-            parent_issue=issue,
-            approved_plan=approved_plan,
-            decomposition=decomposition,
-        )
+    created = create_decomposition_child_issues(
+        runner,
+        config=config,
+        parent_issue=issue,
+        approved_plan=approved_plan,
+        decomposition=decomposition,
+        topology_source=topology_source,
+        issue_comments=issue_context.comments,
+        mode=mode,
+        retained_parent_scope=retained_parent_scope,
+    )
     if isinstance(created, NeedsHumanDecision):
         result_json["state"] = "needs-human"
         result_json["decision"] = created.as_dict()
+        result_json["would_post_checkpoint"] = False
+        result_json["would_post_parent_summary"] = False
         result_json["adopted_children"] = []
         result_json["created_children"] = []
         result_json["phases"] = []
         result_json["phase_count"] = 0
         return result_json, (), issue_context, config, runner, plan_hash, approved_plan, str(workdir)
     if not dry_run:
-        try:
-            post_decomposition_parent_summary(
-                runner,
-                config=config,
-                parent_issue=issue,
-                mode=mode,
-                plan_hash=plan_hash,
-                created=created,
-                topology_source=topology_source,
-                retained_parent_scope=retained_parent_scope,
-            )
-        except TypeError as exc:
-            if "unexpected keyword argument" not in str(exc):
-                raise
-            post_decomposition_parent_summary(
-                runner,
-                config=config,
-                parent_issue=issue,
-                mode=mode,
-                plan_hash=plan_hash,
-                created=created,
-            )
+        post_decomposition_parent_summary(
+            runner,
+            config=config,
+            parent_issue=issue,
+            mode=mode,
+            plan_hash=plan_hash,
+            created=created,
+            topology_source=topology_source,
+            retained_parent_scope=retained_parent_scope,
+        )
     result_json["phases"] = [
         _decomposition_phase_json(
             index, created_issue.phase,

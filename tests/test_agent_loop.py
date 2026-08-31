@@ -2137,6 +2137,34 @@ def test_plan_first_post_approval_options_require_plan_first(capsys):
     assert "--plan-execution-mode requires --plan-first" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("mode", ["decompose-only", "implement-by-phase"])
+def test_cli_rejects_split_materialization_with_decomposition_modes(tmp_path, capsys, mode):
+    result = main([
+        "issue", "56", "--repo", "OWNER/REPO", "--plan-first",
+        "--plan-execution-mode", mode, "--materialize-split-issues",
+        "--claude-dir", str(tmp_path / "claude"),
+        "--codex-dir", str(tmp_path / "codex"),
+        "--gemini-dir", str(tmp_path / "gemini"),
+        "--dry-run",
+    ])
+
+    assert result == 1
+    assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_flat_child_limit_cli_is_configurable(tmp_path):
+    args = build_parser().parse_args([
+        "issue", "56", "--repo", "OWNER/REPO", "--flat-child-limit", "23",
+        "--claude-dir", str(tmp_path / "claude"),
+        "--codex-dir", str(tmp_path / "codex"),
+        "--gemini-dir", str(tmp_path / "gemini"),
+    ])
+
+    config = config_from_args(args, FakeRunner())
+
+    assert config.flat_child_limit == 23
+
+
 def test_implementation_codex_reasoning_effort_requires_codex_and_model(tmp_path):
     parser = build_parser()
     args = parser.parse_args([

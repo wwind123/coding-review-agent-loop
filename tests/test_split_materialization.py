@@ -23,6 +23,7 @@ from coding_review_agent_loop.split_materialization import (
     split_stage_proposal_from_deferred_stage,
     split_stage_proposal_from_text,
 )
+from coding_review_agent_loop.decomposition import _encode_json_payload
 from coding_review_agent_loop.child_topology import NeedsHumanDecision
 from coding_review_agent_loop.protocol import ChildStage, DeferredStage
 from agent_loop_helpers import FakeRunner, make_config
@@ -212,7 +213,9 @@ def test_materialize_split_proposals_partial_failure_adopts_existing_child(tmp_p
         issue_comments=(),
     )
 
-    assert runner.search_issues_calls == ['"[#56 stage]" in:title']
+    assert runner.search_issues_calls == [
+        '"(from #56)" in:title OR "[#56 stage]" in:title'
+    ]
     # Only the unmatched (billing) proposal was created; auth was adopted.
     assert len(runner.issues) == 1
     assert runner.issues[0]["title"] == "[#56 stage] Billing flow"
@@ -293,8 +296,40 @@ def test_materialize_split_proposals_dry_run_previews_search_and_create(tmp_path
     # Dry-run still previews the `gh issue list --search` and `gh issue create`
     # commands (so the materialization path is visible), it just never
     # persists application-level state outside of GitHub CLI echo commands.
-    assert runner.search_issues_calls == ['"[#56 stage]" in:title']
+    assert runner.search_issues_calls == [
+        '"(from #56)" in:title OR "[#56 stage]" in:title'
+    ]
     assert len(runner.issues) == 1
+
+
+def test_split_preflight_counts_decomposition_children_toward_shared_limit(tmp_path):
+    identity_payload = _encode_json_payload(
+        {"identity": "existing-decomposition", "parent_issue": 56}
+    )
+    runner = FakeRunner(
+        search_issues_payload=[
+            {
+                "number": 101,
+                "title": "Phase 1: Existing (from #56)",
+                "url": "https://github.com/OWNER/REPO/issues/101",
+                "body": f"Part of #56\n<!-- AGENT_PLAN_PHASE_IDENTITY: {identity_payload} -->",
+            }
+        ]
+    )
+
+    decision = materialize_split_proposals(
+        runner,
+        config=make_config(tmp_path, flat_child_limit=1),
+        parent_issue=56,
+        subject="discussion",
+        proposals=[split_stage_proposal_from_text("New stage")],
+    )
+
+    assert isinstance(decision, NeedsHumanDecision)
+    assert decision.recognized_existing_count == 1
+    assert decision.projected_total == 2
+    assert runner.issues == []
+    assert runner.comments == []
 
 
 def test_materialize_typed_child_adopts_existing_canonical_issue_instead_of_duplicate(tmp_path):
@@ -367,7 +402,9 @@ def test_materialize_discuss_proposal_skips_canonical_title_search(tmp_path):
         proposals=[split_stage_proposal_from_text('Stage "4"\n\nNew work.')],
     )
 
-    assert runner.search_issues_calls == ['"[#479 stage]" in:title']
+    assert runner.search_issues_calls == [
+        '"(from #479)" in:title OR "[#479 stage]" in:title'
+    ]
 
 
 def test_discuss_split_proposal_can_reference_parent_issue_without_rejection(tmp_path):

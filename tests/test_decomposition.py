@@ -4,15 +4,24 @@ from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
+    PlanDecomposition,
+    PlanPhase,
     RecordedPhase,
+    RetainedParentScope,
+    TopologyCheckpoint,
     approved_plan_hash,
+    format_phase_issue_body,
     find_existing_phase_implementation_handoff,
+    find_existing_topology_checkpoint,
     format_decomposition_parent_summary,
     format_phase_implementation_handoff_comment,
+    format_topology_checkpoint,
+    phase_identity,
     parse_plan_decomposition,
     create_decomposition_child_issues,
 )
 from coding_review_agent_loop.github import IssueComment
+from coding_review_agent_loop.child_topology import NeedsHumanDecision
 from coding_review_agent_loop.orchestrator import PostedRoundMetadata, _attach_round_metadata, _plan_subject
 from agent_loop_helpers import (
     FakeRunner,
@@ -176,6 +185,320 @@ def test_parse_plan_decomposition_rejects_duplicates_but_leaves_cap_to_preflight
     phases = [dict(phase, title=f"Phase {index}") for index in range(DEFAULT_FLAT_CHILD_LIMIT + 1)]
     parsed = parse_plan_decomposition(plan_decomposition_json(*phases))
     assert len(parsed.phases) == DEFAULT_FLAT_CHILD_LIMIT + 1
+
+
+def _phase(title: str, *, depends_on: tuple[str, ...] = ()) -> PlanPhase:
+    return PlanPhase(
+        title=title,
+        scope=f"Implement {title}.",
+        non_goals="No unrelated changes.",
+        dependency_notes="Follow the parent plan.",
+        rollout_risk="low.",
+        validation="Run focused tests.",
+        parent_context="Approved parent constraints.",
+        automation="agent-pr",
+        depends_on=depends_on,
+    )
+
+
+def test_topology_checkpoint_stores_shared_context_once_and_round_trips(tmp_path):
+    excerpt = "Approved parent constraints.\n" + ("constraint detail\n" * 500)
+    phases = tuple(
+        PlanPhase(
+            title=f"Stage {index}",
+            scope=f"Implement stage {index}.",
+            non_goals="No unrelated changes.",
+            dependency_notes="Follow the parent plan.",
+            rollout_risk="low.",
+            validation="Run focused tests.",
+            parent_context=excerpt,
+            automation="agent-pr",
+            depends_on=(),
+        )
+        for index in range(13)
+    )
+    checkpoint = TopologyCheckpoint(
+        parent_issue=56,
+        plan_hash="plan-hash",
+        mode="decompose-only",
+        topology_source="typed",
+        phases=phases,
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="Primary scope",
+            plan_hash="plan-hash",
+            excerpt=excerpt,
+        ),
+    )
+
+    body = format_topology_checkpoint(checkpoint)
+    restored = find_existing_topology_checkpoint(
+        (IssueComment(author="bot", created_at=None, body=body),),
+        parent_issue=56,
+        plan_hash="plan-hash",
+        mode="decompose-only",
+    )
+
+    assert len(body) < 60000
+    assert "constraint detail" not in body
+    assert restored == checkpoint
+
+
+def test_dry_run_decomposition_previews_dependency_phases_without_issue_numbers(tmp_path):
+    phases = parse_plan_decomposition(
+        plan_decomposition_json(
+            {
+                "title": "First phase",
+                "scope": "First.",
+                "non_goals": "None.",
+                "dependency_notes": "First.",
+                "rollout_risk": "low.",
+                "validation": "Tests.",
+                "parent_context": "Context.",
+                "automation": "agent-pr",
+                "depends_on": [],
+            },
+            {
+                "title": "Second phase",
+                "scope": "Second.",
+                "non_goals": "None.",
+                "dependency_notes": "After first.",
+                "rollout_risk": "low.",
+                "validation": "Tests.",
+                "parent_context": "Context.",
+                "automation": "agent-pr",
+                "depends_on": ["First phase"],
+            },
+        )
+    )
+    runner = FakeRunner()
+
+    created = create_decomposition_child_issues(
+        runner,
+        config=make_config(tmp_path, dry_run=True),
+        parent_issue=56,
+        approved_plan="approved plan",
+        decomposition=phases,
+    )
+
+    assert len(created) == 2
+    assert all(item.issue_url is None and item.issue_number is None for item in created)
+    assert len(runner.issues) == 2
+    assert runner.comments == []
+
+
+def test_decomposition_preflight_counts_split_children_toward_shared_limit(tmp_path):
+    existing_children = [
+        {
+            "number": 100 + index,
+            "title": f"[#56 stage] Existing {index}",
+            "url": f"https://github.com/OWNER/REPO/issues/{100 + index}",
+            "body": f"Part of #56\n<!-- AGENT_SPLIT_CHILD: parent=56 key={index + 1:064x} -->",
+        }
+        for index in range(DEFAULT_FLAT_CHILD_LIMIT)
+    ]
+    runner = FakeRunner(search_issues_payload=existing_children)
+
+    decision = create_decomposition_child_issues(
+        runner,
+        config=make_config(tmp_path),
+        parent_issue=56,
+        approved_plan="approved plan",
+        decomposition=PlanDecomposition(phases=(_phase("New phase"),)),
+    )
+
+    assert isinstance(decision, NeedsHumanDecision)
+    assert decision.recognized_existing_count == DEFAULT_FLAT_CHILD_LIMIT
+    assert decision.projected_total == DEFAULT_FLAT_CHILD_LIMIT + 1
+    assert runner.issues == []
+    assert runner.comments == []
+
+
+def test_decomposition_adopts_closed_exact_identity(tmp_path):
+    phase = _phase("Schema helpers")
+    plan = "approved plan"
+    identity = phase_identity(
+        parent_issue=56,
+        plan_hash=approved_plan_hash(plan),
+        topology_source="model",
+        phase_index=1,
+        phase=phase,
+    )
+    body = format_phase_issue_body(
+        repo="OWNER/REPO",
+        parent_issue=56,
+        approved_plan=plan,
+        phase=phase,
+        created_so_far=(),
+        phase_identity_value=identity,
+        topology_source="model",
+        phase_index=1,
+        phase_plan_hash=approved_plan_hash(plan),
+    )
+    runner = FakeRunner(
+        search_issues_payload=[
+            {
+                "number": 101,
+                "title": "Phase 1: Schema helpers (from #56)",
+                "url": "https://github.com/OWNER/REPO/issues/101",
+                "body": body,
+                "state": "closed",
+            }
+        ]
+    )
+
+    created = create_decomposition_child_issues(
+        runner,
+        config=make_config(tmp_path),
+        parent_issue=56,
+        approved_plan=plan,
+        decomposition=PlanDecomposition(phases=(phase,)),
+    )
+
+    assert created[0].origin == "adopted"
+    assert created[0].issue_number == 101
+    assert runner.issues == []
+
+
+def test_decomposition_rejects_ambiguous_exact_identity_before_checkpoint(tmp_path):
+    phase = _phase("Schema helpers")
+    plan = "approved plan"
+    identity = phase_identity(
+        parent_issue=56,
+        plan_hash=approved_plan_hash(plan),
+        topology_source="model",
+        phase_index=1,
+        phase=phase,
+    )
+    body = format_phase_issue_body(
+        repo="OWNER/REPO",
+        parent_issue=56,
+        approved_plan=plan,
+        phase=phase,
+        created_so_far=(),
+        phase_identity_value=identity,
+        topology_source="model",
+        phase_index=1,
+        phase_plan_hash=approved_plan_hash(plan),
+    )
+    runner = FakeRunner(search_issues_payload=[
+        {"number": 101, "title": "Phase 1: Schema helpers (from #56)", "url": "u101", "body": body},
+        {"number": 102, "title": "Phase 1: Schema helpers (from #56)", "url": "u102", "body": body},
+    ])
+
+    with pytest.raises(AgentLoopError, match="Ambiguous decomposition recovery"):
+        create_decomposition_child_issues(
+            runner,
+            config=make_config(tmp_path),
+            parent_issue=56,
+            approved_plan=plan,
+            decomposition=PlanDecomposition(phases=(phase,)),
+        )
+    assert runner.issues == []
+    assert runner.comments == []
+
+
+def test_decomposition_partial_create_recovers_from_checkpoint_and_identity(tmp_path, monkeypatch):
+    phases = parse_plan_decomposition(
+        plan_decomposition_json(
+            {
+                "title": "First phase",
+                "scope": "First.",
+                "non_goals": "None.",
+                "dependency_notes": "First.",
+                "rollout_risk": "low.",
+                "validation": "Tests.",
+                "parent_context": "Context.",
+                "automation": "agent-pr",
+                "depends_on": [],
+            },
+            {
+                "title": "Second phase",
+                "scope": "Second.",
+                "non_goals": "None.",
+                "dependency_notes": "Second.",
+                "rollout_risk": "low.",
+                "validation": "Tests.",
+                "parent_context": "Context.",
+                "automation": "agent-pr",
+                "depends_on": [],
+            },
+        )
+    )
+    plan = "approved plan"
+    runner = FakeRunner(
+        issue_urls=[
+            "https://github.com/OWNER/REPO/issues/101",
+            "https://github.com/OWNER/REPO/issues/102",
+        ],
+        search_issues_payload=[[]],
+    )
+    config = make_config(tmp_path)
+    original_create = __import__(
+        "coding_review_agent_loop.decomposition", fromlist=["create_issue"]
+    ).create_issue
+    calls = {"count": 0}
+
+    def fail_after_first(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise AgentLoopError("simulated create failure")
+        return original_create(*args, **kwargs)
+
+    import coding_review_agent_loop.decomposition as decomp
+
+    monkeypatch.setattr(decomp, "create_issue", fail_after_first)
+    with pytest.raises(AgentLoopError, match="simulated create failure"):
+        create_decomposition_child_issues(
+            runner,
+            config=config,
+            parent_issue=56,
+            approved_plan=plan,
+            decomposition=phases,
+        )
+    assert len(runner.issues) == 1
+    checkpoint_comments = tuple(
+        IssueComment(author="bot", created_at=None, body=comment["body"])
+        for comment in runner.issue_comments
+    )
+    first_identity = phase_identity(
+        parent_issue=56,
+        plan_hash=approved_plan_hash(plan),
+        topology_source="model",
+        phase_index=1,
+        phase=phases.phases[0],
+    )
+    first_body = format_phase_issue_body(
+        repo="OWNER/REPO",
+        parent_issue=56,
+        approved_plan=plan,
+        phase=phases.phases[0],
+        created_so_far=(),
+        phase_identity_value=first_identity,
+        topology_source="model",
+        phase_index=1,
+        phase_plan_hash=approved_plan_hash(plan),
+    )
+    runner.search_issues_payload = [{
+        "number": 101,
+        "title": "Phase 1: First phase (from #56)",
+        "url": "https://github.com/OWNER/REPO/issues/101",
+        "body": first_body,
+    }]
+    monkeypatch.setattr(decomp, "create_issue", original_create)
+
+    resumed = create_decomposition_child_issues(
+        runner,
+        config=config,
+        parent_issue=56,
+        approved_plan=plan,
+        decomposition=phases,
+        issue_comments=checkpoint_comments,
+    )
+
+    assert [item.origin for item in resumed] == ["adopted", "created"]
+    assert [item.issue_number for item in resumed] == [101, 102]
+    assert len(runner.issues) == 2
+    assert sum("Topology checkpoint recorded" in comment for comment in runner.comments) == 1
 
 
 def test_typed_decompose_only_materializes_one_thirteen_stage_topology(tmp_path):
@@ -603,6 +926,55 @@ def test_issue_loop_plan_first_implement_by_phase_stops_on_human_first_phase(tmp
     assert runner.issues[0]["title"].startswith("[Human] Phase 1")
     assert not any("<!-- AGENT_PLAN_PHASE_IMPLEMENTATION:" in comment for comment in runner.comments)
     assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in runner.commands)
+
+
+def test_issue_loop_dry_run_implement_by_phase_allows_dependency_preview(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_plan_state(summary="Add schema helpers."),
+            plan_decomposition_json(
+                {
+                    "title": "First phase",
+                    "scope": "First.",
+                    "non_goals": "None.",
+                    "dependency_notes": "First.",
+                    "rollout_risk": "low.",
+                    "validation": "Tests.",
+                    "parent_context": "Context.",
+                    "automation": "agent-pr",
+                    "depends_on": [],
+                },
+                {
+                    "title": "Second phase",
+                    "scope": "Second.",
+                    "non_goals": "None.",
+                    "dependency_notes": "After first.",
+                    "rollout_risk": "low.",
+                    "validation": "Tests.",
+                    "parent_context": "Context.",
+                    "automation": "agent-pr",
+                    "depends_on": ["First phase"],
+                },
+            ),
+        ],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+
+    result = run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(
+            tmp_path,
+            dry_run=True,
+            plan_execution_mode="implement-by-phase",
+        ),
+        plan_first=True,
+    )
+
+    assert result == 0
+    assert len(runner.issues) == 2
+    claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert len(claude_calls) == 2
 
 def test_issue_loop_plan_first_implement_by_phase_implements_first_agent_phase(tmp_path):
     runner = FakeRunner(
