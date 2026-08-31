@@ -231,9 +231,29 @@ def _parse_model_catalog(raw: str) -> set[str]:
         if not value or set(value) <= {"-", "=", "_"}:
             continue
         lowered = value.lower().rstrip(":")
+        status = "fetching available models..."
+        if status in lowered:
+            # PTY capture normalizes carriage-return spinner updates away, so
+            # the final status frame can be joined directly to the first row.
+            value = value[lowered.rfind(status) + len(status) :].strip()
+            if not value:
+                continue
+            lowered = value.lower().rstrip(":")
         if lowered in {"models", "available models", "available model", "name", "model"}:
             continue
         if lowered.startswith(("error:", "warning:", "usage:", "command:")):
+            continue
+        # agy 1.1.22 renders a two-column catalog (machine slug followed by
+        # display label), while older releases emitted one label per line.
+        # Accept either spelling because --model supports both forms.
+        row = re.fullmatch(
+            r"(?P<slug>[a-z0-9][a-z0-9._-]*)[ \t]{2,}(?P<label>\S.*)",
+            value,
+            re.IGNORECASE,
+        )
+        if row is not None:
+            models.add(row.group("slug"))
+            models.add(row.group("label").strip())
             continue
         models.add(value)
     return models
