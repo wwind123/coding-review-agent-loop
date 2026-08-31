@@ -1923,7 +1923,7 @@ def test_disabled_watch_mode_preserves_manual_path_and_auto_merge_uses_full_boar
         assert any("checks are still pending" in comment for comment in runner.comments)
 
 
-def test_auto_merge_green_board_ignores_legacy_check_name_and_merges_once(
+def test_auto_merge_green_full_board_merges_once(
     tmp_path, monkeypatch
 ):
     runner = FakeRunner(
@@ -1940,7 +1940,6 @@ def test_auto_merge_green_board_ignores_legacy_check_name_and_merges_once(
         tmp_path,
         auto_merge=True,
         watch_pending_ci=False,
-        ci_check_name="legacy-ci",
     )
     with patch.object(orchestrator, "watch_pr_checks", wraps=orchestrator.watch_pr_checks) as watch_spy:
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
