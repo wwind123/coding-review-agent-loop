@@ -336,8 +336,11 @@ agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode implem
 
 `plan-only` is the default. `implement-one-shot` is the same behavior selected
 by the backward-compatible `--implement-after-approval` flag. `decompose-only`
-asks the coder to turn the approved plan into ordered phases, always creates
-one GitHub child issue per phase, posts a parent summary table, and stops.
+uses typed `child_stages` directly when the approved plan has them; otherwise it
+asks the coder to turn the approved plan into ordered phases. It creates one
+GitHub child issue per selected phase, posts a parent summary table, and stops.
+Typed stages are the plan's remainder; the primary scope remains owned by the
+parent and is recorded in the summary.
 `implement-by-phase` creates every child issue, then implements only the first
 `agent-pr` phase and stops after that PR review loop. The parent issue records a
 one-time handoff only after the child implementation returns an accepted PR, so
@@ -374,10 +377,10 @@ the implementation signature can name the model reliably.
 
 ### Choosing a child-issue mechanism
 
-`decompose-only` / `implement-by-phase` and `--materialize-split-issues` are
-two separate child-issue creation paths. Combining them files duplicate
-children — decompose modes already create one detailed issue per phase, and
-`--materialize-split-issues` is not suppressed by them.
+`decompose-only` / `implement-by-phase` and `--materialize-split-issues` select
+different workflows. The decomposition modes reject that combination before
+any GitHub write and use one topology source. All flat child workflows share
+one configurable parent-wide cap (`--flat-child-limit`, default 15).
 
 | Situation | Correct mechanism |
 | --- | --- |
@@ -397,19 +400,22 @@ agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode plan-o
 See [Phased decomposition versus split
 materialization](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization)
 for the full decision rule, stop points, worked examples, and the
-duplicate-issue failure mode.
+duplicate-issue failure mode. The explicit topology choice prevents duplicate children.
 
 Each generated child issue copies the relevant parent-plan slice, constraints
 and invariants, dependency notes, scope and non-goals, rollout risk,
 validation/soak requirements, automation classification, and instructions for
-agent execution or human closure. Decomposition is capped at 8 phases; an
-over-cap response is rejected and must be consolidated, not truncated. This cap
-is separate from the approved-review follow-up issue cap used by
-`--approved-followups`.
+agent execution or human closure. The complete flat topology is preflighted
+before a checkpoint or issue create. It is capped at 15 children by default
+(override with `--flat-child-limit`); an over-limit plan is never truncated or
+partially filed and returns a structured human decision to consolidate or use
+the hierarchical design tracked in #720. Recovery reuses checkpoints and
+exact child identities, including closed children.
 
-If the approved plan narrows scope via explicit `child_stages`, pass
-`--materialize-split-issues` to file those bounded implementation stages as
-linked child issues. `external_dependencies`, `deferred_work`, `plan_actions`,
+If the approved plan narrows scope via explicit `child_stages`, decomposition
+modes file those bounded implementation stages as linked child issues;
+`--materialize-split-issues` is reserved for discuss `split` proposals and
+plan-only/one-shot split workflows. `external_dependencies`, `deferred_work`, `plan_actions`,
 and legacy structured `deferred_stages` are recorded only; legacy discuss
 `split` proposals remain eligible for filing. Materialization is off by default,
 and the orchestrator warns explicitly when eligible stages would otherwise go

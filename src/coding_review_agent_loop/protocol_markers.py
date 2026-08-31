@@ -215,6 +215,8 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
         _b64_definition("AGENT_TYPED_PLAN_STAGES", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_DEFERRED_STAGES", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_PLAN_DECOMPOSITION", surfaces=_ISSUE_ONLY),
+        _b64_definition("AGENT_PLAN_TOPOLOGY_CHECKPOINT", surfaces=_ISSUE_ONLY),
+        _b64_definition("AGENT_PLAN_PHASE_IDENTITY", surfaces=_ISSUE),
         _b64_definition("AGENT_PLAN_PHASE_IMPLEMENTATION", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_PLAN_ONE_SHOT_IMPL", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_DISCUSS_SPLIT", surfaces=_ISSUE_ONLY),

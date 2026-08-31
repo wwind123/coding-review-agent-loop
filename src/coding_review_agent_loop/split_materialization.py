@@ -14,21 +14,25 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .config import AgentLoopConfig
+from .child_topology import NeedsHumanDecision, preflight_flat_child_count
 from .decomposition import _decode_json_payload, _encode_json_payload, _issue_number_from_url
 from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .logging import log
 from .protocol import ChildStage, DeferredStage, ISSUE_REFERENCE_RE, TRACKER_ACTION_TITLE_RE
 from .runner import Runner
-from .protocol_markers import TrustedBody
+from .protocol_markers import TrustedBody, sanitize_historical_text
 
-MAX_SPLIT_CHILDREN = 8
 DISCUSS_SPLIT_MARKER_RE = re.compile(
     r"<!--\s*AGENT_DISCUSS_SPLIT:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
     re.I,
 )
 SPLIT_CHILD_MARKER_RE = re.compile(
     r"<!--\s*AGENT_SPLIT_CHILD:\s*parent=(?P<parent>\d+)\s+key=(?P<key>[0-9a-f]{64})\s*-->",
+    re.I,
+)
+DECOMPOSITION_CHILD_IDENTITY_RE = re.compile(
+    r"<!--\s*AGENT_PLAN_PHASE_IDENTITY:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
     re.I,
 )
 SPLIT_STAGE_HANDOFF_MARKER_RE = re.compile(
@@ -144,7 +148,7 @@ def _sibling_lines(children: Sequence[MaterializedSplitChild]) -> list[str]:
     lines = []
     for child in children:
         ref = child.url or (f"#{child.number}" if child.number is not None else "unavailable")
-        lines.append(f"- {child.title}: {ref}")
+        lines.append(f"- {sanitize_historical_text(child.title)}: {ref}")
     return lines
 
 
@@ -161,13 +165,13 @@ def _format_child_issue_body(
         f"Child stage issue split out of parent #{parent_issue}.",
         "",
         "## Proposed scope",
-        proposal.body,
+        sanitize_historical_text(proposal.body),
         "",
         "## Split rationale from parent discussion",
     ]
     if rationale:
         for reviewer, text in rationale:
-            lines.append(f"- {reviewer}: {text}")
+            lines.append(f"- {sanitize_historical_text(reviewer)}: {sanitize_historical_text(text)}")
     else:
         lines.append("- No structured rationale was recorded; see the parent issue discussion.")
     lines.extend(
@@ -310,21 +314,60 @@ def _adopt_from_search(
         search=f'"[#{parent_issue} stage]" in:title',
         state="all",
     )
+    return _adopt_from_found(
+        results,
+        parent_issue=parent_issue,
+        remaining=remaining,
+        runner=runner,
+        config=config,
+    )[0]
+
+
+def _adopt_from_found(
+    results: Sequence[FoundIssue],
+    *,
+    parent_issue: int,
+    remaining: Sequence[SplitStageProposal],
+    runner: Runner,
+    config: AgentLoopConfig,
+) -> tuple[dict[str, FoundIssue], set[str]]:
+    """Resolve exact split identities and return all recognized parent keys."""
     by_key: dict[str, FoundIssue] = {}
+    recognized: set[str] = set()
     remaining_keys = {proposal.key for proposal in remaining}
     for found in results:
         if not found.title:
             continue
         marker_match = SPLIT_CHILD_MARKER_RE.search(found.body or "")
-        if marker_match and int(marker_match.group("parent")) == parent_issue:
+        decomposition_match = DECOMPOSITION_CHILD_IDENTITY_RE.search(found.body or "")
+        if decomposition_match:
+            payload = _decode_json_payload(
+                decomposition_match.group("payload"),
+                marker_name="AGENT_PLAN_PHASE_IDENTITY",
+            )
+            if payload.get("parent_issue") == parent_issue and isinstance(payload.get("identity"), str):
+                # A detailed decomposition child is already owned by this
+                # parent, even when it is not one of the split proposals.
+                recognized.add("decomposition:" + payload["identity"])
+            key = ""
+        elif marker_match and int(marker_match.group("parent")) == parent_issue:
             key = marker_match.group("key")
+            recognized.add(key)
         else:
             # Fallback for results missing the AGENT_SPLIT_CHILD body marker
             # (e.g. `gh issue list --search` didn't return a body): titles are
             # created as `[#<parent> stage] <proposal title>`, so strip that
             # prefix before hashing to match a bare proposal key.
-            key = _stage_key(_strip_child_title_prefix(found.title, parent_issue))
-        if key in remaining_keys and key not in by_key:
+            if not found.body and found.title.startswith(f"[#{parent_issue} stage] "):
+                key = _stage_key(_strip_child_title_prefix(found.title, parent_issue))
+                recognized.add(key)
+            else:
+                key = ""
+        if key in remaining_keys:
+            if key in by_key:
+                raise AgentLoopError(
+                    f"Ambiguous split-child recovery: multiple child issues match stage key {key}."
+                )
             by_key[key] = found
     # A typed child can be canonicalized by another workflow and lack our
     # marker/prefix. Only adopt an *open*, parent-linked candidate: generic
@@ -334,6 +377,7 @@ def _adopt_from_search(
     for proposal in remaining:
         if proposal.key in by_key or not proposal.typed_child:
             continue
+        weak_matches = []
         for found in search_issues(
             runner,
             config=config,
@@ -345,9 +389,15 @@ def _adopt_from_search(
                 and _stage_key(found.title) == proposal.key
                 and _references_parent_issue(found.body, parent_issue)
             ):
-                by_key[proposal.key] = found
-                break
-    return by_key
+                weak_matches.append(found)
+        if len(weak_matches) > 1:
+            raise AgentLoopError(
+                f"Ambiguous cross-workflow split-child recovery for stage {proposal.title!r}."
+            )
+        if weak_matches:
+            by_key[proposal.key] = weak_matches[0]
+            recognized.add(proposal.key)
+    return by_key, recognized
 
 
 def materialize_split_proposals(
@@ -359,7 +409,7 @@ def materialize_split_proposals(
     proposals: Sequence[SplitStageProposal],
     rationale: Sequence[tuple[str, str]] = (),
     issue_comments: Sequence[object] = (),
-) -> SplitMaterializationMetadata | None:
+) -> SplitMaterializationMetadata | NeedsHumanDecision | None:
     """File one child issue per remaining stage in `proposals`, idempotently.
 
     `proposals` must already exclude the stage the current run is
@@ -396,32 +446,62 @@ def materialize_split_proposals(
     if not to_resolve:
         return existing
 
-    # Remaining capacity is derived from children already recorded in the
-    # parent's cumulative metadata, not just this call's unresolved proposals,
-    # so repeated reruns with the same over-cap proposal set cannot keep
-    # filing new children past MAX_SPLIT_CHILDREN (#492 review).
-    remaining_capacity = max(0, MAX_SPLIT_CHILDREN - len(known_by_key))
-    capped = to_resolve[:remaining_capacity]
-    skipped = to_resolve[remaining_capacity:]
-
-    if not capped:
-        skipped_titles = ", ".join(proposal.title for proposal in skipped)
-        log(
-            config,
-            f"Split materialization for issue #{parent_issue}: skipped {len(skipped)} "
-            f"stage(s) by cap (MAX_SPLIT_CHILDREN={MAX_SPLIT_CHILDREN}, already at cap): "
-            f"{skipped_titles}",
-        )
-        return existing
-
-    adopted_by_key = _adopt_from_search(
-        runner, config=config, parent_issue=parent_issue, remaining=capped
+    # Search and adoption are read-only.  Count every recognized canonical
+    # child owned by this parent before deciding whether the complete desired
+    # topology fits; never slice and silently skip approved stages.
+    search_results = search_issues(
+        runner,
+        config=config,
+        search=f'"[#{parent_issue} stage]" in:title',
+        state="all",
     )
+    adopted_by_key, recognized_from_search = _adopt_from_found(
+        search_results,
+        parent_issue=parent_issue,
+        remaining=to_resolve,
+        runner=runner,
+        config=config,
+    )
+    recognized_keys = set(known_by_key) | recognized_from_search
+    count = preflight_flat_child_count(
+        parent_issue=parent_issue,
+        source="split",
+        desired_keys=(proposal.key for proposal in deduped),
+        recognized_keys=recognized_keys,
+        configured_limit=config.flat_child_limit,
+    )
+    if isinstance(count, NeedsHumanDecision):
+        return count
+
+    # Every draft is immutable and validated before the first create.  Values
+    # copied from historical discussion are neutralized, while the generated
+    # title remains current untrusted input and is rejected if it carries a
+    # reserved record.
+    draft_siblings = tuple(
+        MaterializedSplitChild(
+            title=proposal.title,
+            key=proposal.key,
+            url=None,
+            number=None,
+            origin="created",
+        )
+        for proposal in deduped
+    )
+    for proposal in deduped:
+        title = _child_issue_title(parent_issue, proposal)
+        TrustedBody.current_untrusted_visible(title)
+        draft = _format_child_issue_body(
+            parent_issue=parent_issue,
+            proposal=proposal,
+            rationale=rationale,
+            siblings_so_far=draft_siblings,
+        )
+        TrustedBody.canonical(draft, expected_tokens=("AGENT_SPLIT_CHILD",))
 
     new_children: list[MaterializedSplitChild] = []
     resolved_so_far: list[MaterializedSplitChild] = list(known_by_key.values())
 
-    for proposal in capped:
+    for proposal in to_resolve:
         found = adopted_by_key.get(proposal.key)
         if found is not None:
             child = MaterializedSplitChild(
@@ -464,15 +544,6 @@ def materialize_split_proposals(
             config,
             f"Split materialization for issue #{parent_issue}: {child.origin} child "
             f"{child.title!r} ({location}).",
-        )
-
-    if skipped:
-        skipped_titles = ", ".join(proposal.title for proposal in skipped)
-        # Not filed; surfaced via log only, matching decomposition's cap note style.
-        log(
-            config,
-            f"Split materialization for issue #{parent_issue}: skipped {len(skipped)} "
-            f"stage(s) by cap (MAX_SPLIT_CHILDREN={MAX_SPLIT_CHILDREN}): {skipped_titles}",
         )
 
     all_children = tuple(known_by_key.values()) + tuple(new_children)

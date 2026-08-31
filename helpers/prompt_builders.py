@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.agents.base import AgentName
-from coding_review_agent_loop.config import AgentLoopConfig
+from coding_review_agent_loop.config import AgentLoopConfig, DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.github import IssueContext, IssueComment
 from coding_review_agent_loop.memory import AgentMemoryContext
 from coding_review_agent_loop.prompts import (
@@ -49,6 +49,7 @@ def make_minimal_config(
     agent_memory: bool = False,
     agent_memory_dir: Path | None = None,
     refresh_agent_memory: bool = False,
+    flat_child_limit: int = DEFAULT_FLAT_CHILD_LIMIT,
 ) -> AgentLoopConfig:
     tmp_base = Path(tempfile.gettempdir()) / "coding-review-agent-loop"
     legacy = tmp_base / "skill-runner"
@@ -99,6 +100,7 @@ def make_minimal_config(
         refresh_test_profile=False,
         auto_agent_dirs=tuple(reviewer_names),
         approved_followups=approved_followups,
+        flat_child_limit=flat_child_limit,
     )
 
 

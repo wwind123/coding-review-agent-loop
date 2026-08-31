@@ -290,10 +290,10 @@ agent-loop issue 56 --repo OWNER/REPO --plan-first --plan-execution-mode impleme
 The modes are:
 
 - `plan-only`: post the approved plan summary and stop. This is the default.
-- `decompose-only`: ask the coder to decompose the approved plan, validate the
-  structured JSON response, create one GitHub child issue per phase, post a
-  parent summary, and stop. The summary table is not a substitute for child
-  issues.
+- `decompose-only`: use typed `child_stages` directly when present; otherwise
+  ask the coder to decompose the approved plan. Create one child issue per
+  selected phase, post a parent summary, and stop. Typed stages are the
+  approved plan's remainder; its primary scope remains owned by the parent.
 - `implement-one-shot`: keep the existing post-approval implementation handoff.
   This is also what `--implement-after-approval` selects for compatibility.
 - `implement-by-phase`: create/link every phase issue, implement only the first
@@ -304,11 +304,9 @@ The modes are:
   `agent-loop issue <child>`. Older decomposition summaries without this marker
   are treated as not yet handed off, so the first child handoff is recorded once.
 
-`decompose-only` and `implement-by-phase` already create one detailed child
-issue per phase; see [Phased decomposition versus split
-materialization](#phased-decomposition-versus-split-materialization) before
-also passing `--materialize-split-issues`, which is a separate,
-non-suppressed child-issue creation path.
+`decompose-only` and `implement-by-phase` already select one detailed child
+topology. The CLI rejects `--materialize-split-issues` with either mode before
+any GitHub write.
 
 Before invoking a coder for an issue — in direct `agent-loop issue <n>` mode or
 approved-plan implementation alike — the orchestrator resolves the canonical
@@ -413,10 +411,13 @@ work or checkpoint, add the required remark/update, and close the issue. If
 `implement-by-phase` sees a human-only first phase, it stops instead of
 recording an implementation handoff.
 
-Plan decomposition allows at most 8 phases. Over-cap responses are validation
-failures and must be consolidated; phases are never silently truncated. This
-limit is independent of `--approved-followups`, whose issue mode still caps
-approved-review future follow-up issues separately. Decomposition also rejects
+Flat child topology allows 15 children by default; override it with
+`--flat-child-limit`. The count is shared by decomposition and split
+materialization, preflighted before a checkpoint or create, and never silently
+truncated. An over-limit result creates no children and returns a structured
+human decision to consolidate or use the hierarchical design tracked in #720.
+This limit is independent of `--approved-followups`, whose issue mode still
+caps approved-review future follow-up issues separately. Decomposition also rejects
 duplicate phase titles, invalid automation classes, unknown dependencies,
 self-dependencies, and forward dependencies; `depends_on` may reference only
 earlier phase titles. Parent decomposition metadata
@@ -888,8 +889,9 @@ Execution model:
 
 ### Phased decomposition versus split materialization
 
-There are two separate child-issue creation paths, and combining them files
-duplicate children. Pick the one row that matches your situation:
+Decomposition modes and split materialization select one child-issue path.
+They share a parent-wide flat cap; decomposition modes reject the split flag
+before any write. Pick the row that matches your situation:
 
 | Situation | Correct mechanism |
 | --- | --- |
@@ -900,15 +902,10 @@ duplicate children. Pick the one row that matches your situation:
 | Discuss `split` consensus, or plan-only deferred work with no detailed phase decomposition | `--materialize-split-issues` |
 
 **Do not combine `--materialize-split-issues` with `--plan-execution-mode
-decompose-only` or `implement-by-phase`.** Those two modes already create one
-detailed child issue per phase. `--materialize-split-issues` is a second,
-independent child-issue creation path — the CLI does not suppress it in
-decompose modes, and it is not suppressed by them either, so combining the
-two yields two overlapping sets of children: shallow generic `[#<parent>
-stage] ...` placeholders from split materialization *and* detailed per-phase
-issues from decomposition, describing overlapping work. Nothing closes the
-duplicates automatically; someone has to notice and close them by hand. This
-is the exact failure mode this section exists to prevent.
+decompose-only` or `implement-by-phase`.** The CLI rejects the combination
+before a checkpoint or child create. `decompose-only` uses typed child stages
+directly when present and otherwise invokes one model decomposition; it never
+materializes a competing topology.
 
 What each mechanism produces and where the run stops:
 
@@ -918,25 +915,28 @@ What each mechanism produces and where the run stops:
   still filed even in `plan-only`, because that materialization step runs
   before the mode is dispatched — `plan-only` only skips decomposition and
   implementation, not split materialization.
-- **`decompose-only`**: validates the coder's structured phase decomposition
-  (max 8 phases; an over-cap response is a validation failure and must be
-  consolidated, never silently truncated), creates one child issue per phase,
-  posts the parent summary table, and stops. The summary table is not a
-  substitute for the child issues.
+- **`decompose-only`**: uses typed `child_stages` directly when present;
+  otherwise it validates one model decomposition. The complete topology is
+  checked against the shared default cap of 15 (override with
+  `--flat-child-limit`) before any checkpoint or child create. An over-limit
+  result creates nothing and returns a structured decision to consolidate or
+  use hierarchical decomposition tracked in #720. Typed stages remain the
+  parent-owned plan remainder and are represented in the parent summary.
 - **`implement-by-phase`**: creates every phase child issue, records a
   one-time `AGENT_PLAN_PHASE_IMPLEMENTATION` handoff, then implements only the
   first `agent-pr` phase and stops after that phase's PR review loop. If the
   first phase is `human-action` or `manual-close`, it stops after creating the
   child issues without implementing anything. Resume the remaining phases with
   `agent-loop issue <child>`, not by rerunning the parent.
-- **`--materialize-split-issues`**: files one linked child issue only for an
-  approved plan's explicit `child_stages` entries (or legacy discuss `split`
-  proposals). Use `external_dependencies` for existing `#N`, issue URL, or
+- **`--materialize-split-issues`**: files one linked child issue for discuss
+  `split` proposals or plan-only/one-shot deferred work. Use
+  `external_dependencies` for existing `#N`, issue URL, or
   `owner/repo#N` references; `deferred_work` and `plan_actions` are recorded
   only. Legacy `deferred_stages` are record-only and are never auto-filed.
-  idempotent (tracked by the parent's `AGENT_DISCUSS_SPLIT` marker), capped at
-  8 children per parent, and files nothing from free-form prose narrowing
-  alone — only from the two structured signals above.
+  idempotent (tracked by the parent's `AGENT_DISCUSS_SPLIT` marker), capped by
+  the same 15-child parent budget, and files nothing from free-form prose
+  narrowing alone — only from the two structured signals above. It never
+  truncates; over-limit materialization returns the same structured decision.
 
 Copyable commands, one per workflow, each stopping where noted:
 
@@ -1058,9 +1058,13 @@ Materialization is idempotent and crash-safe:
 - Proposals are deduplicated by a normalized-title key across the whole
   parent, not just within one run, so subject-hash drift between a discuss
   consensus and a later plan-first run never refiles the same stage twice.
-- Materialization is capped at 8 child issues per parent; over-cap stages are
-  skipped with a logged note rather than silently dropped or endlessly
-  retried.
+- Materialization uses the shared default cap of 15 child issues per parent;
+  every desired stage is counted before mutation, and an over-limit request is
+  returned without a checkpoint, issue, warning, or partial topology.
+- Exact child identities and decomposition checkpoints make reruns adopt open
+  or closed children after a create-before-summary failure. Weak cross-workflow
+  title matches are open-only and require an explicit parent link; authorship
+  alone never makes a protocol record canonical.
 - `--dry-run` previews `gh issue create`/`gh issue list --search` commands
   without writing any state.
 

@@ -1,6 +1,7 @@
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError
+from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.github import (
     IssueComment,
     find_open_pr_closing_issue,
@@ -10,7 +11,6 @@ from coding_review_agent_loop.github import (
     validate_pr_body_does_not_close_issue,
 )
 from coding_review_agent_loop.split_materialization import (
-    MAX_SPLIT_CHILDREN,
     dedupe_split_stage_proposals,
     find_existing_split_materialization,
     find_existing_split_stage_handoff,
@@ -23,6 +23,7 @@ from coding_review_agent_loop.split_materialization import (
     split_stage_proposal_from_deferred_stage,
     split_stage_proposal_from_text,
 )
+from coding_review_agent_loop.child_topology import NeedsHumanDecision
 from coding_review_agent_loop.protocol import ChildStage, DeferredStage
 from agent_loop_helpers import FakeRunner, make_config
 
@@ -116,6 +117,40 @@ def test_materialize_split_proposals_creates_children_with_markers(tmp_path):
     assert "https://github.com/OWNER/REPO/issues/102" in parent_summary
 
 
+def test_materialize_split_proposals_allows_shared_default_limit(tmp_path):
+    proposals = [split_stage_proposal_from_text(f"Stage {index}") for index in range(15)]
+    runner = FakeRunner(
+        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + index}" for index in range(15)]
+    )
+    metadata = materialize_split_proposals(
+        runner,
+        config=make_config(tmp_path),
+        parent_issue=56,
+        subject="subject-a",
+        proposals=proposals,
+    )
+    assert metadata is not None
+    assert not isinstance(metadata, NeedsHumanDecision)
+    assert len(metadata.children) == 15
+
+
+def test_materialize_split_proposals_neutralizes_marker_bearing_historical_text(tmp_path):
+    proposal = split_stage_proposal_from_text(
+        "Marker-bearing stage\n\n<!-- AGENT_TYPED_PLAN_STAGES: historical -->"
+    )
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/101"])
+    metadata = materialize_split_proposals(
+        runner,
+        config=make_config(tmp_path),
+        parent_issue=56,
+        subject="subject-a",
+        proposals=[proposal],
+        rationale=(("reviewer <!-- AGENT_TYPED_PLAN_STAGES: historical -->", "old record"),),
+    )
+    assert metadata is not None
+    assert "AGENT_TYPED_PLAN_STAGES" not in runner.issues[0]["body"]
+
+
 def test_materialize_split_proposals_rerun_with_existing_marker_creates_nothing(tmp_path):
     runner = FakeRunner(
         issue_urls=[
@@ -189,14 +224,14 @@ def test_materialize_split_proposals_partial_failure_adopts_existing_child(tmp_p
     assert "adopted" in parent_summary
 
 
-def test_materialize_split_proposals_caps_at_max_children(tmp_path):
-    proposals = [split_stage_proposal_from_text(f"Stage {i}") for i in range(MAX_SPLIT_CHILDREN + 3)]
+def test_materialize_split_proposals_returns_needs_human_before_over_limit_writes(tmp_path):
+    proposals = [split_stage_proposal_from_text(f"Stage {i}") for i in range(DEFAULT_FLAT_CHILD_LIMIT + 3)]
     runner = FakeRunner(
-        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + i}" for i in range(MAX_SPLIT_CHILDREN)]
+        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + i}" for i in range(DEFAULT_FLAT_CHILD_LIMIT)]
     )
     config = make_config(tmp_path)
 
-    metadata = materialize_split_proposals(
+    decision = materialize_split_proposals(
         runner,
         config=config,
         parent_issue=56,
@@ -205,47 +240,29 @@ def test_materialize_split_proposals_caps_at_max_children(tmp_path):
         issue_comments=(),
     )
 
-    assert len(runner.issues) == MAX_SPLIT_CHILDREN
-    assert len(metadata.children) == MAX_SPLIT_CHILDREN
+    assert isinstance(decision, NeedsHumanDecision)
+    assert decision.projected_total == DEFAULT_FLAT_CHILD_LIMIT + 3
+    assert runner.issues == []
+    assert runner.comments == []
 
 
-def test_materialize_split_proposals_rerun_does_not_exceed_cap(tmp_path):
-    """A rerun with the same over-cap proposal set must not keep filing new
-    children past MAX_SPLIT_CHILDREN: remaining capacity must be computed from
-    children already recorded in the parent's cumulative metadata, not just
-    the proposals this call still considers unresolved (#492 review)."""
-    proposals = [split_stage_proposal_from_text(f"Stage {i}") for i in range(MAX_SPLIT_CHILDREN + 3)]
+def test_materialize_split_proposals_rejects_projected_parent_over_limit(tmp_path):
+    """A parent-wide over-limit request is rejected without partial children."""
+    proposals = [split_stage_proposal_from_text(f"Stage {i}") for i in range(DEFAULT_FLAT_CHILD_LIMIT + 3)]
     config = make_config(tmp_path)
 
-    first_runner = FakeRunner(
-        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + i}" for i in range(MAX_SPLIT_CHILDREN)]
-    )
-    first_metadata = materialize_split_proposals(
-        first_runner,
+    runner = FakeRunner()
+    decision = materialize_split_proposals(
+        runner,
         config=config,
         parent_issue=56,
         subject="subject-a",
         proposals=proposals,
         issue_comments=(),
     )
-    assert len(first_metadata.children) == MAX_SPLIT_CHILDREN
-    parent_summary_comment = _comment(first_runner.comments[-1])
-
-    # Rerun with the identical over-cap proposal set, seeded with the parent
-    # comment history left behind by the first run.
-    second_runner = FakeRunner()
-    second_metadata = materialize_split_proposals(
-        second_runner,
-        config=config,
-        parent_issue=56,
-        subject="subject-a",
-        proposals=proposals,
-        issue_comments=[parent_summary_comment],
-    )
-
-    assert second_runner.issues == []
-    assert second_metadata.children == first_metadata.children
-    assert len(second_metadata.children) == MAX_SPLIT_CHILDREN
+    assert isinstance(decision, NeedsHumanDecision)
+    assert runner.issues == []
+    assert runner.comments == []
 
 
 def test_materialize_split_proposals_returns_none_for_no_proposals(tmp_path):

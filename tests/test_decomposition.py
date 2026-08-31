@@ -1,15 +1,16 @@
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
+from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
-    MAX_DECOMPOSITION_PHASES,
     RecordedPhase,
     approved_plan_hash,
     find_existing_phase_implementation_handoff,
     format_decomposition_parent_summary,
     format_phase_implementation_handoff_comment,
     parse_plan_decomposition,
+    create_decomposition_child_issues,
 )
 from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.orchestrator import PostedRoundMetadata, _attach_round_metadata, _plan_subject
@@ -157,7 +158,7 @@ def test_parse_plan_decomposition_rejects_invalid_phase_fields(mutate, message):
     with pytest.raises(AgentLoopError, match=message):
         parse_plan_decomposition(plan_decomposition_json(phase))
 
-def test_parse_plan_decomposition_rejects_duplicates_and_over_cap():
+def test_parse_plan_decomposition_rejects_duplicates_but_leaves_cap_to_preflight():
     phase = {
         "title": "Repeated phase",
         "scope": "Add helpers.",
@@ -172,9 +173,71 @@ def test_parse_plan_decomposition_rejects_duplicates_and_over_cap():
     with pytest.raises(AgentLoopError, match="duplicate phase title"):
         parse_plan_decomposition(plan_decomposition_json(phase, dict(phase)))
 
-    phases = [dict(phase, title=f"Phase {index}") for index in range(MAX_DECOMPOSITION_PHASES + 1)]
-    with pytest.raises(AgentLoopError, match="MAX_DECOMPOSITION_PHASES"):
-        parse_plan_decomposition(plan_decomposition_json(*phases))
+    phases = [dict(phase, title=f"Phase {index}") for index in range(DEFAULT_FLAT_CHILD_LIMIT + 1)]
+    parsed = parse_plan_decomposition(plan_decomposition_json(*phases))
+    assert len(parsed.phases) == DEFAULT_FLAT_CHILD_LIMIT + 1
+
+
+def test_typed_decompose_only_materializes_one_thirteen_stage_topology(tmp_path):
+    stages = [
+        {"title": f"Backend stage {index}", "summary": f"Backend work {index}."}
+        for index in range(8)
+    ] + [
+        {"title": f"Frontend stage {index}", "summary": f"Frontend work {index}."}
+        for index in range(5)
+    ]
+    runner = FakeRunner(
+        claude_outputs=[structured_plan_state(summary="Primary approved scope", child_stages=stages)],
+        codex_outputs=[structured_plan_review(state="approved")],
+        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + index}" for index in range(13)],
+    )
+    config = make_config(tmp_path, plan_execution_mode="decompose-only")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert len(runner.issues) == 13
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]) == 1
+    assert not any("AGENT_TYPED_PLAN_STAGES" in issue["body"] for issue in runner.issues)
+    assert "Retained parent scope" in runner.comments[-1]
+
+
+def test_decomposition_preflights_last_unsafe_phase_before_any_write(tmp_path):
+    phases = parse_plan_decomposition(
+        plan_decomposition_json(
+            {
+                "title": "Safe phase",
+                "scope": "Safe.",
+                "non_goals": "None.",
+                "dependency_notes": "None.",
+                "rollout_risk": "low.",
+                "validation": "Tests.",
+                "parent_context": "Context.",
+                "automation": "agent-pr",
+                "depends_on": [],
+            },
+            {
+                "title": "Unsafe phase",
+                "scope": "Contains <!-- AGENT_TYPED_PLAN_STAGES: historical -->",
+                "non_goals": "None.",
+                "dependency_notes": "None.",
+                "rollout_risk": "low.",
+                "validation": "Tests.",
+                "parent_context": "Context.",
+                "automation": "agent-pr",
+                "depends_on": [],
+            },
+        )
+    )
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/101"])
+    with pytest.raises(AgentLoopError, match="marker set mismatch"):
+        create_decomposition_child_issues(
+            runner,
+            config=make_config(tmp_path),
+            parent_issue=56,
+            approved_plan="approved plan",
+            decomposition=phases,
+        )
+    assert runner.issues == []
+    assert runner.comments == []
 
 def test_issue_loop_plan_first_decompose_only_summarizes_instead_of_filing_plan_followups(tmp_path):
     runner = FakeRunner(

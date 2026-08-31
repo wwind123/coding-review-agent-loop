@@ -12,7 +12,7 @@ from typing import Sequence
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .config import AgentLoopConfig, reviewers
-from .decomposition import MAX_DECOMPOSITION_PHASES, approved_plan_hash
+from .decomposition import approved_plan_hash
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provenance
 from .memory import AgentMemoryContext, format_agent_memory_context
@@ -1677,7 +1677,7 @@ Schema:
 }}
 
 Rules:
-- Use between 1 and {MAX_DECOMPOSITION_PHASES} phases. If the plan seems larger,
+- Use between 1 and {config.flat_child_limit} phases. If the plan seems larger,
   consolidate related steps; do not exceed the cap.
 - Preserve dependency ordering. `depends_on` must reference earlier phase titles.
 - Every child issue must be self-contained enough for `agent-loop issue <N>` to

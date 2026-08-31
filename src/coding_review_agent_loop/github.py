@@ -91,6 +91,7 @@ class FoundIssue:
     title: str | None
     url: str | None
     body: str | None
+    state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1844,8 +1845,10 @@ def search_issues(
                 search,
                 "--state",
                 state,
+                "--limit",
+                "100000",
                 "--json",
-                "number,title,url,body",
+                "number,title,url,body,state",
             ],
             cwd=active_workdir(config),
         )
@@ -1861,8 +1864,10 @@ def search_issues(
             search,
             "--state",
             state,
+            "--limit",
+            "100000",
             "--json",
-            "number,title,url,body",
+            "number,title,url,body,state",
         ],
         cwd=active_workdir(config),
     )
@@ -1886,6 +1891,7 @@ def search_issues(
                 title=_optional_str(item.get("title")),
                 url=_optional_str(item.get("url")),
                 body=_optional_str(item.get("body")),
+                state=_optional_str(item.get("state")),
             )
         )
     return tuple(found)

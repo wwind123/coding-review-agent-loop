@@ -1250,7 +1250,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--progress-interval-seconds", "--agent-max-retries", "--agent-retry-backoff-seconds",
     "--agent-memory-dir", "--salvage-comment-patch-max-bytes", "--planning-context-mode",
     "--pr-review-context-mode", "--expected-closing-issue",
-    "--plan-execution-mode", "--split-stage", "--head", "--title", "--body-file",
+    "--plan-execution-mode", "--flat-child-limit", "--split-stage", "--head", "--title", "--body-file",
     "--approved-followups",
 })
 _RECOVERY_NARGS_VALUE_OPTIONS = frozenset({

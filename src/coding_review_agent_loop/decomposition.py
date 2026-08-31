@@ -10,12 +10,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .config import AgentLoopConfig
+from .child_topology import NeedsHumanDecision, preflight_flat_child_count
 from .errors import AgentLoopError
-from .github import create_issue, post_issue_comment
+from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .runner import Runner
-from .protocol_markers import TrustedBody
+from .protocol_markers import TrustedBody, sanitize_historical_text
 
-MAX_DECOMPOSITION_PHASES = 8
 AUTOMATION_CLASSES = {"agent-pr", "human-action", "manual-close"}
 DECOMPOSITION_MARKER_RE = re.compile(
     r"<!--\s*AGENT_PLAN_DECOMPOSITION:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
@@ -23,6 +23,18 @@ DECOMPOSITION_MARKER_RE = re.compile(
 )
 PHASE_IMPLEMENTATION_MARKER_RE = re.compile(
     r"<!--\s*AGENT_PLAN_PHASE_IMPLEMENTATION:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.I,
+)
+TOPOLOGY_CHECKPOINT_MARKER_RE = re.compile(
+    r"<!--\s*AGENT_PLAN_TOPOLOGY_CHECKPOINT:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.I,
+)
+PHASE_IDENTITY_MARKER_RE = re.compile(
+    r"<!--\s*AGENT_PLAN_PHASE_IDENTITY:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.I,
+)
+LEGACY_SPLIT_IDENTITY_RE = re.compile(
+    r"<!--\s*AGENT_SPLIT_CHILD:\s*parent=(?P<parent>\d+)\s+key=(?P<key>[0-9a-f]{64})\s*-->",
     re.I,
 )
 ONE_SHOT_IMPL_HANDOFF_MARKER_RE = re.compile(
@@ -63,6 +75,14 @@ class CreatedPhaseIssue:
     phase: PlanPhase | RecordedPhase
     issue_url: str | None
     issue_number: int | None
+    origin: str = "created"
+
+
+@dataclass(frozen=True)
+class RetainedParentScope:
+    plan_subject: str
+    plan_hash: str
+    excerpt: str
 
 
 @dataclass(frozen=True)
@@ -74,6 +94,18 @@ class DecompositionMetadata:
     phase_titles: tuple[str, ...]
     automation: tuple[str, ...]
     children: tuple[tuple[str, str | None, int | None], ...]
+    topology_source: str = "model"
+    retained_parent_scope: RetainedParentScope | None = None
+
+
+@dataclass(frozen=True)
+class TopologyCheckpoint:
+    parent_issue: int
+    plan_hash: str
+    mode: str
+    topology_source: str
+    phases: tuple[PlanPhase, ...]
+    retained_parent_scope: RetainedParentScope | None = None
 
 
 @dataclass(frozen=True)
@@ -134,12 +166,6 @@ def parse_plan_decomposition(text: str) -> PlanDecomposition:
     phases_payload = payload.get("phases")
     if not isinstance(phases_payload, list) or not phases_payload:
         raise AgentLoopError("Invalid plan decomposition: `phases` must be a non-empty list.")
-    if len(phases_payload) > MAX_DECOMPOSITION_PHASES:
-        raise AgentLoopError(
-            f"Invalid plan decomposition: {len(phases_payload)} phases exceeds "
-            f"MAX_DECOMPOSITION_PHASES={MAX_DECOMPOSITION_PHASES}; consolidate phases."
-        )
-
     title_keys = [
         " ".join(phase_payload["title"].lower().split())
         for phase_payload in phases_payload
@@ -217,22 +243,244 @@ def _phase_issue_title(parent_issue: int, index: int, phase: PlanPhase) -> str:
     return f"{prefix}Phase {index}: {phase.title} (from #{parent_issue})"[:120]
 
 
-def _dependency_lines(phase: PlanPhase, created: Sequence[CreatedPhaseIssue]) -> list[str]:
+def _phase_payload(phase: PlanPhase) -> dict[str, object]:
+    return {
+        "title": phase.title,
+        "scope": phase.scope,
+        "non_goals": phase.non_goals,
+        "dependency_notes": phase.dependency_notes,
+        "rollout_risk": phase.rollout_risk,
+        "validation": phase.validation,
+        "parent_context": phase.parent_context,
+        "automation": phase.automation,
+        "depends_on": list(phase.depends_on),
+    }
+
+
+def phase_identity(
+    *,
+    parent_issue: int,
+    plan_hash: str,
+    topology_source: str,
+    phase_index: int,
+    phase: PlanPhase,
+) -> str:
+    """Return a stable identity independent of the display title truncation."""
+    material = {
+        "parent_issue": parent_issue,
+        "plan_hash": plan_hash,
+        "source": topology_source,
+        "stage_id": phase_index,
+        "phase": _phase_payload(phase),
+    }
+    encoded = json.dumps(material, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _phase_identity_marker(identity: str, *, parent_issue: int, plan_hash: str, source: str, index: int) -> str:
+    return f"<!-- AGENT_PLAN_PHASE_IDENTITY: {_encode_json_payload({'identity': identity, 'parent_issue': parent_issue, 'plan_hash': plan_hash, 'source': source, 'stage_id': index})} -->"
+
+
+def adapt_typed_child_stages(
+    stages: Sequence[object],
+    *,
+    approved_plan: str,
+    plan_subject: str,
+) -> tuple[PlanDecomposition, RetainedParentScope]:
+    """Adapt the two-field typed remainder into the decomposition contract."""
+    excerpt = sanitize_historical_text(approved_plan.strip())
+    retained = RetainedParentScope(
+        plan_subject=sanitize_historical_text(plan_subject),
+        plan_hash=approved_plan_hash(approved_plan),
+        excerpt=excerpt,
+    )
+    phases = tuple(
+        PlanPhase(
+            title=str(stage.title),
+            scope=str(stage.summary),
+            non_goals=(
+                "No stage-specific non-goals were declared; refer to the neutralized "
+                "parent constraints above."
+            ),
+            dependency_notes=(
+                "No stage-specific dependency notes were declared; this typed stage "
+                "has no explicit inter-stage dependency."
+            ),
+            rollout_risk=(
+                "No stage-specific rollout risk was declared; follow the neutralized "
+                "parent constraints above."
+            ),
+            validation=(
+                "No stage-specific validation state was declared; follow the parent "
+                "plan's validation requirements."
+            ),
+            parent_context=excerpt,
+            automation="agent-pr",
+            depends_on=(),
+        )
+        for stage in stages
+    )
+    return PlanDecomposition(phases=phases), retained
+
+
+def _checkpoint_payload(checkpoint: TopologyCheckpoint) -> dict[str, object]:
+    return {
+        "parent_issue": checkpoint.parent_issue,
+        "plan_hash": checkpoint.plan_hash,
+        "mode": checkpoint.mode,
+        "topology_source": checkpoint.topology_source,
+        "phases": [_phase_payload(phase) for phase in checkpoint.phases],
+        "retained_parent_scope": (
+            {
+                "plan_subject": checkpoint.retained_parent_scope.plan_subject,
+                "plan_hash": checkpoint.retained_parent_scope.plan_hash,
+                "excerpt": checkpoint.retained_parent_scope.excerpt,
+            }
+            if checkpoint.retained_parent_scope is not None
+            else None
+        ),
+    }
+
+
+def _phase_from_payload(payload: object) -> PlanPhase:
+    if not isinstance(payload, dict):
+        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+    depends = payload.get("depends_on", [])
+    if not isinstance(depends, list):
+        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+    values = {}
+    for key in ("title", "scope", "non_goals", "dependency_notes", "rollout_risk", "validation", "parent_context", "automation"):
+        value = payload.get(key)
+        if not isinstance(value, str):
+            raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+        values[key] = value
+    return PlanPhase(**values, depends_on=tuple(str(item) for item in depends))
+
+
+def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
+    payload = _decode_json_payload(encoded, marker_name="AGENT_PLAN_TOPOLOGY_CHECKPOINT")
+    phases_payload = payload.get("phases")
+    if not isinstance(phases_payload, list) or not phases_payload:
+        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+    retained_payload = payload.get("retained_parent_scope")
+    retained = None
+    if retained_payload is not None:
+        if not isinstance(retained_payload, dict):
+            raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+        retained = RetainedParentScope(
+            plan_subject=str(retained_payload.get("plan_subject") or ""),
+            plan_hash=str(retained_payload.get("plan_hash") or ""),
+            excerpt=str(retained_payload.get("excerpt") or ""),
+        )
+    try:
+        return TopologyCheckpoint(
+            parent_issue=int(payload["parent_issue"]),
+            plan_hash=str(payload["plan_hash"]),
+            mode=str(payload["mode"]),
+            topology_source=str(payload["topology_source"]),
+            phases=tuple(_phase_from_payload(item) for item in phases_payload),
+            retained_parent_scope=retained,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.") from exc
+
+
+def find_existing_topology_checkpoint(
+    comments: Sequence[object], *, parent_issue: int, plan_hash: str, mode: str
+) -> TopologyCheckpoint | None:
+    found: TopologyCheckpoint | None = None
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in TOPOLOGY_CHECKPOINT_MARKER_RE.finditer(body):
+            checkpoint = _decode_checkpoint(match.group("payload"))
+            if (
+                checkpoint.parent_issue == parent_issue
+                and checkpoint.plan_hash == plan_hash
+                and checkpoint.mode == mode
+            ):
+                found = checkpoint
+    return found
+
+
+def format_topology_checkpoint(checkpoint: TopologyCheckpoint) -> str:
+    return "\n".join(
+        [
+            f"Topology checkpoint recorded for issue #{checkpoint.parent_issue}.",
+            "",
+            f"Source: {checkpoint.topology_source}",
+            f"Mode: {checkpoint.mode}",
+            f"Stages: {len(checkpoint.phases)}",
+            "",
+            f"<!-- AGENT_PLAN_TOPOLOGY_CHECKPOINT: {_encode_json_payload(_checkpoint_payload(checkpoint))} -->",
+            "-- coding-review-agent-loop",
+        ]
+    )
+
+
+def post_topology_checkpoint(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    checkpoint: TopologyCheckpoint,
+) -> None:
+    post_issue_comment(
+        runner,
+        config=config,
+        issue_number=checkpoint.parent_issue,
+        body=TrustedBody.canonical(
+            format_topology_checkpoint(checkpoint),
+            expected_tokens=("AGENT_PLAN_TOPOLOGY_CHECKPOINT",),
+        ),
+    )
+
+
+def _dependency_lines(
+    phase: PlanPhase,
+    created: Sequence[CreatedPhaseIssue],
+    *,
+    placeholders: bool = False,
+) -> list[str]:
     if not phase.depends_on:
         return ["- None."]
-    by_title = {item.phase.title: item for item in created}
+    by_title = {
+        " ".join(item.phase.title.lower().split()): item
+        for item in created
+    }
     lines: list[str] = []
     for dependency in phase.depends_on:
-        created_issue = by_title.get(dependency)
+        created_issue = by_title.get(" ".join(dependency.lower().split()))
         if created_issue and created_issue.issue_number is not None:
             lines.append(f"- depends on #{created_issue.issue_number}: {dependency}")
         elif created_issue and created_issue.issue_url:
             lines.append(f"- depends on {created_issue.issue_url}: {dependency}")
         elif created_issue:
-            lines.append(f"- depends on previously created phase with unavailable issue URL: {dependency}")
+            if placeholders:
+                lines.append(f"- depends on __ORCHESTRATOR_ISSUE_NUMBER__: {dependency}")
+            else:
+                lines.append(f"- depends on previously created phase with unavailable issue URL: {dependency}")
         else:
             lines.append(f"- depends on prior phase: {dependency}")
     return lines
+
+
+def _unresolved_dependencies(
+    phase: PlanPhase,
+    created: Sequence[CreatedPhaseIssue],
+) -> tuple[str, ...]:
+    by_title = {
+        " ".join(item.phase.title.lower().split()): item
+        for item in created
+    }
+    return tuple(
+        dependency
+        for dependency in phase.depends_on
+        if (
+            (item := by_title.get(" ".join(dependency.lower().split()))) is None
+            or (item.issue_number is None and not item.issue_url)
+        )
+    )
 
 
 def format_phase_issue_body(
@@ -242,6 +490,11 @@ def format_phase_issue_body(
     approved_plan: str,
     phase: PlanPhase,
     created_so_far: Sequence[CreatedPhaseIssue],
+    phase_identity_value: str | None = None,
+    dependency_placeholders: bool = False,
+    topology_source: str = "model",
+    phase_index: int = 0,
+    phase_plan_hash: str | None = None,
 ) -> str:
     parent_url = f"https://github.com/{repo}/issues/{parent_issue}"
     if phase.automation == "agent-pr":
@@ -259,12 +512,12 @@ def format_phase_issue_body(
             "This phase is a manual closure/checkpoint. A human should add the required remark/update and "
             "close this issue when the checkpoint is satisfied."
         )
-    return "\n".join(
+    body = "\n".join(
         [
             f"Child phase issue for parent #{parent_issue}: {parent_url}",
             "",
             "## Approved parent-plan excerpt for this phase",
-            phase.parent_context,
+            sanitize_historical_text(phase.parent_context),
             "",
             "## Scope",
             phase.scope,
@@ -273,13 +526,13 @@ def format_phase_issue_body(
             phase.non_goals,
             "",
             "## Constraints and invariants from the parent plan",
-            approved_plan.strip(),
+            sanitize_historical_text(approved_plan.strip()),
             "",
             "## Dependency notes",
             phase.dependency_notes,
             "",
             "## Dependency links",
-            *_dependency_lines(phase, created_so_far),
+            *_dependency_lines(phase, created_so_far, placeholders=dependency_placeholders),
             "",
             "## Rollout risk",
             phase.rollout_risk,
@@ -294,6 +547,15 @@ def format_phase_issue_body(
             execution,
         ]
     )
+    if phase_identity_value is not None:
+        body += "\n\n" + _phase_identity_marker(
+            phase_identity_value,
+            parent_issue=parent_issue,
+            plan_hash=phase_plan_hash or approved_plan_hash(approved_plan),
+            source=topology_source,
+            index=phase_index,
+        )
+    return body
 
 
 def create_decomposition_child_issues(
@@ -303,19 +565,193 @@ def create_decomposition_child_issues(
     parent_issue: int,
     approved_plan: str,
     decomposition: PlanDecomposition,
-) -> tuple[CreatedPhaseIssue, ...]:
+    topology_source: str = "model",
+    issue_comments: Sequence[object] = (),
+    mode: str = "decompose-only",
+    retained_parent_scope: RetainedParentScope | None = None,
+) -> tuple[CreatedPhaseIssue, ...] | NeedsHumanDecision:
+    """Preflight, recover, and create one immutable decomposition topology."""
+    plan_hash = approved_plan_hash(approved_plan)
+    phases = tuple(decomposition.phases)
+    if not phases:
+        raise AgentLoopError("Plan decomposition produced no phases.")
+
+    # Search is read-only and intentionally includes every issue state.  It
+    # closes the create-before-summary crash window without trusting authorship.
+    found = search_issues(
+        runner,
+        config=config,
+        search=f'"(from #{parent_issue})" in:title',
+        state="all",
+    )
+    expected_ids = {
+        index: phase_identity(
+            parent_issue=parent_issue,
+            plan_hash=plan_hash,
+            topology_source=topology_source,
+            phase_index=index,
+            phase=phase,
+        )
+        for index, phase in enumerate(phases, start=1)
+    }
+    exact: dict[str, FoundIssue] = {}
+    recognized: set[str] = set()
+    for candidate in found:
+        marker = PHASE_IDENTITY_MARKER_RE.search(candidate.body or "")
+        candidate_identity: str | None = None
+        candidate_parent: int | None = None
+        candidate_plan_hash: str | None = None
+        candidate_source: str | None = None
+        candidate_stage_id: int | None = None
+        if marker:
+            payload = _decode_json_payload(marker.group("payload"), marker_name="AGENT_PLAN_PHASE_IDENTITY")
+            if isinstance(payload.get("identity"), str):
+                candidate_identity = payload["identity"]
+            if isinstance(payload.get("parent_issue"), int) and not isinstance(payload.get("parent_issue"), bool):
+                candidate_parent = payload["parent_issue"]
+            if isinstance(payload.get("plan_hash"), str):
+                candidate_plan_hash = payload["plan_hash"]
+            if isinstance(payload.get("source"), str):
+                candidate_source = payload["source"]
+            if isinstance(payload.get("stage_id"), int) and not isinstance(payload.get("stage_id"), bool):
+                candidate_stage_id = payload["stage_id"]
+        if candidate_identity is not None and candidate_parent == parent_issue:
+            recognized.add(candidate_identity)
+            for index, expected in expected_ids.items():
+                if candidate_identity == expected:
+                    if (
+                        candidate_plan_hash != plan_hash
+                        or candidate_source != topology_source
+                        or candidate_stage_id != index
+                    ):
+                        raise AgentLoopError(
+                            f"Invalid decomposition recovery identity metadata for phase {index}."
+                        )
+                    if expected in exact:
+                        raise AgentLoopError(
+                            f"Ambiguous decomposition recovery: multiple child issues carry identity {expected}."
+                        )
+                    exact[expected] = candidate
+        else:
+            legacy = LEGACY_SPLIT_IDENTITY_RE.search(candidate.body or "")
+            if legacy and int(legacy.group("parent")) == parent_issue:
+                recognized.add("legacy:" + legacy.group("key").lower())
+            elif candidate.body and f"#{parent_issue}" in candidate.body and candidate.title:
+                # Count a parent-linked canonical child from another workflow
+                # toward the parent budget, without adopting it as a desired
+                # decomposition phase.
+                recognized.add("linked:" + " ".join(candidate.title.casefold().split()))
+        if not candidate.body and candidate.title:
+            # Some GitHub search responses omit bodies.  The generated parent
+            # prefixed title is a canonical recovery key in that narrow case.
+            for index, phase in enumerate(phases, start=1):
+                if candidate.title == _phase_issue_title(parent_issue, index, phase):
+                    identity = expected_ids[index]
+                    if identity in exact:
+                        raise AgentLoopError(
+                            f"Ambiguous decomposition recovery: multiple title matches for phase {index}."
+                        )
+                    exact[identity] = candidate
+                    recognized.add(identity)
+
+    count = preflight_flat_child_count(
+        parent_issue=parent_issue,
+        source=topology_source,
+        desired_keys=expected_ids.values(),
+        recognized_keys=recognized,
+        configured_limit=config.flat_child_limit,
+    )
+    if isinstance(count, NeedsHumanDecision):
+        return count
+
+    # Validate every title and body before any checkpoint or create.  Dependency
+    # slots are orchestrator-owned placeholders and can only be replaced later
+    # by adopted/created issue references.
+    empty_prior = [
+        CreatedPhaseIssue(phase=phase, issue_url=None, issue_number=None)
+        for phase in phases
+    ]
+    for index, phase in enumerate(phases, start=1):
+        title = _phase_issue_title(parent_issue, index, phase)
+        TrustedBody.current_untrusted_visible(title)
+        draft = format_phase_issue_body(
+            repo=config.repo,
+            parent_issue=parent_issue,
+            approved_plan=approved_plan,
+            phase=phase,
+            created_so_far=empty_prior[: index - 1],
+            phase_identity_value=expected_ids[index],
+            dependency_placeholders=True,
+            topology_source=topology_source,
+            phase_index=index,
+            phase_plan_hash=plan_hash,
+        )
+        TrustedBody.canonical(draft, expected_tokens=("AGENT_PLAN_PHASE_IDENTITY",))
+
+    # The checkpoint is the durable handoff between complete preflight and
+    # child creation.  It is deliberately not posted for dry-run previews.
+    if not config.dry_run and find_existing_topology_checkpoint(
+        issue_comments,
+        parent_issue=parent_issue,
+        plan_hash=plan_hash,
+        mode=mode,
+    ) is None:
+        post_topology_checkpoint(
+            runner,
+            config=config,
+            checkpoint=TopologyCheckpoint(
+                parent_issue=parent_issue,
+                plan_hash=plan_hash,
+                mode=mode,
+                topology_source=topology_source,
+                phases=phases,
+                retained_parent_scope=retained_parent_scope,
+            ),
+        )
+
     created: list[CreatedPhaseIssue] = []
-    for index, phase in enumerate(decomposition.phases, start=1):
+    for index, phase in enumerate(phases, start=1):
+        identity = expected_ids[index]
+        found = exact.get(identity)
+        if found is not None:
+            created.append(
+                CreatedPhaseIssue(
+                    phase=phase,
+                    issue_url=found.url,
+                    issue_number=found.number or _issue_number_from_url(found.url),
+                    origin="adopted",
+                )
+            )
+            continue
+        unresolved = _unresolved_dependencies(phase, created)
+        if unresolved:
+            raise AgentLoopError(
+                "Cannot create decomposition phase because dependency issue references are unavailable: "
+                + ", ".join(unresolved)
+            )
+        title = _phase_issue_title(parent_issue, index, phase)
+        body = format_phase_issue_body(
+            repo=config.repo,
+            parent_issue=parent_issue,
+            approved_plan=approved_plan,
+            phase=phase,
+            created_so_far=created,
+            phase_identity_value=identity,
+            topology_source=topology_source,
+            phase_index=index,
+            phase_plan_hash=plan_hash,
+        )
+        if "__ORCHESTRATOR_ISSUE_NUMBER__" in body:
+            raise AgentLoopError(
+                "Cannot create decomposition phase because a dependency reference was not resolved."
+            )
         issue_url = create_issue(
             runner,
             config=config,
-            title=_phase_issue_title(parent_issue, index, phase),
-            body=format_phase_issue_body(
-                repo=config.repo,
-                parent_issue=parent_issue,
-                approved_plan=approved_plan,
-                phase=phase,
-                created_so_far=created,
+            title=title,
+            body=TrustedBody.canonical(
+                body,
+                expected_tokens=("AGENT_PLAN_PHASE_IDENTITY",),
             ),
         )
         created.append(
@@ -323,6 +759,7 @@ def create_decomposition_child_issues(
                 phase=phase,
                 issue_url=issue_url,
                 issue_number=_issue_number_from_url(issue_url),
+                origin="created",
             )
         )
     return tuple(created)
@@ -356,6 +793,16 @@ def _encode_metadata(metadata: DecompositionMetadata) -> str:
                 {"title": title, "url": url, "number": number}
                 for title, url, number in metadata.children
             ],
+            "topology_source": metadata.topology_source,
+            "retained_parent_scope": (
+                {
+                    "plan_subject": metadata.retained_parent_scope.plan_subject,
+                    "plan_hash": metadata.retained_parent_scope.plan_hash,
+                    "excerpt": metadata.retained_parent_scope.excerpt,
+                }
+                if metadata.retained_parent_scope is not None
+                else None
+            ),
         }
     )
 
@@ -379,6 +826,14 @@ def _decode_metadata(encoded: str) -> DecompositionMetadata:
             )
         )
     try:
+        retained_payload = payload.get("retained_parent_scope")
+        retained = None
+        if isinstance(retained_payload, dict):
+            retained = RetainedParentScope(
+                plan_subject=str(retained_payload.get("plan_subject") or ""),
+                plan_hash=str(retained_payload.get("plan_hash") or ""),
+                excerpt=str(retained_payload.get("excerpt") or ""),
+            )
         return DecompositionMetadata(
             parent_issue=int(payload["parent_issue"]),
             plan_hash=str(payload["plan_hash"]),
@@ -387,6 +842,8 @@ def _decode_metadata(encoded: str) -> DecompositionMetadata:
             phase_titles=tuple(str(value) for value in payload["phase_titles"]),
             automation=tuple(str(value) for value in payload["automation"]),
             children=tuple(children),
+            topology_source=str(payload.get("topology_source") or "model"),
+            retained_parent_scope=retained,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise AgentLoopError("Invalid AGENT_PLAN_DECOMPOSITION payload.") from exc
@@ -491,6 +948,8 @@ def format_decomposition_parent_summary(
     mode: str,
     plan_hash: str,
     created: Sequence[CreatedPhaseIssue],
+    topology_source: str = "model",
+    retained_parent_scope: RetainedParentScope | None = None,
 ) -> str:
     metadata = DecompositionMetadata(
         parent_issue=parent_issue,
@@ -503,15 +962,31 @@ def format_decomposition_parent_summary(
             (item.phase.title, item.issue_url, item.issue_number)
             for item in created
         ),
+        topology_source=topology_source,
+        retained_parent_scope=retained_parent_scope,
     )
     lines = [
         f"Approved plan decomposed for issue #{parent_issue}.",
         "",
         f"Mode: {mode}",
+        f"Topology source: {topology_source}",
         "",
         "| Phase | Automation | Child issue | Risk |",
         "| --- | --- | --- | --- |",
     ]
+    if retained_parent_scope is not None:
+        lines.extend(
+            [
+                "## Retained parent scope",
+                f"Plan subject: {sanitize_historical_text(retained_parent_scope.plan_subject)}",
+                f"Plan hash: {retained_parent_scope.plan_hash}",
+                "The approved plan's primary scope remains owned by the parent; "
+                "the typed stages below are its declared remainder.",
+                "",
+                retained_parent_scope.excerpt,
+                "",
+            ]
+        )
     for index, item in enumerate(created, start=1):
         if item.issue_url:
             child = item.issue_url
@@ -609,6 +1084,8 @@ def post_decomposition_parent_summary(
     mode: str,
     plan_hash: str,
     created: Sequence[CreatedPhaseIssue],
+    topology_source: str = "model",
+    retained_parent_scope: RetainedParentScope | None = None,
 ) -> None:
     post_issue_comment(
         runner,
@@ -620,6 +1097,8 @@ def post_decomposition_parent_summary(
                 mode=mode,
                 plan_hash=plan_hash,
                 created=created,
+                topology_source=topology_source,
+                retained_parent_scope=retained_parent_scope,
             ),
             expected_tokens=("AGENT_PLAN_DECOMPOSITION",),
         ),
