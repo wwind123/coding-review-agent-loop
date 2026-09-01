@@ -42,15 +42,15 @@ DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES: tuple[str, ...] = (
 # legacy antigravity_model nor an explicit antigravity_models chain is given. Named
 # for discoverability/symmetry with DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES.
 DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
+    "Gemini 3.7 Flash (High)",
     "Gemini 3.6 Flash (High)",
-    "Gemini 3.5 Flash (High)",
     "Gemini 3.1 Pro (High)",
 )
 DEFAULT_MAX_ROUNDS = 10
 # `agy --print` otherwise defaults to five minutes, which is too short for
 # complex reviews and causes it to exit with "timeout waiting for response".
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
-DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3.5 Flash (Medium)",)
+DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3.7 Flash (Medium)",)
 # One parent-wide flat topology budget shared by decomposition and split
 # materialization.  Keeping this policy in config prevents each workflow from
 # obtaining a second allowance of children.

@@ -83,8 +83,8 @@ mode, you need `OWNER/REPO` and the reviewer set (`codex`, `gemini`, and/or
 that Google retires on 2026-06-18). `antigravity` works wherever an external
 coder/reviewer does (`--coder antigravity` / `--reviewers antigravity ...`); `agy` is
 accepted as an alias (e.g. `--coder agy` / `--reviewers agy`), normalized to `antigravity`.
-With no override, it uses the ordered fallback chain `Gemini 3.6 Flash (High)` →
-`Gemini 3.5 Flash (High)` → `Gemini 3.1 Pro (High)`. Use `--model MODEL` for the legacy single-model
+With no override, it uses the ordered fallback chain `Gemini 3.7 Flash (High)` →
+`Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)`. Use `--model MODEL` for the legacy single-model
 override or `--antigravity-models MODEL [MODEL ...]` for a custom ordered chain;
 the two model options are mutually exclusive. Customize fallback detection with
 `--antigravity-quota-signatures SIGNATURE [SIGNATURE ...]`. Each `agy --print`

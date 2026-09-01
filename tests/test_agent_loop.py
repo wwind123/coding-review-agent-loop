@@ -5161,7 +5161,7 @@ def test_agent_signature_uses_configured_model(tmp_path):
     config = make_config(tmp_path, codex_model="gpt-5.2-codex", codex_reasoning_effort="high")
     assert agent_signature("codex", config) == "OpenAI Codex: gpt-5.2-codex (high)"
     # antigravity model is always declared (effort already embedded).
-    assert agent_signature("antigravity", config) == "Google Antigravity: Gemini 3.6 Flash (High)"
+    assert agent_signature("antigravity", config) == "Google Antigravity: Gemini 3.7 Flash (High)"
     # gemini with no declared model falls back to the generic signature.
     assert agent_signature("gemini", make_config(tmp_path)) == "Google Gemini"
 
