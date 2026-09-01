@@ -915,9 +915,9 @@ starts from fresh PR state. One timeout and attempt budget is shared across
 watcher polls and any coder-failure or head-change rounds. Auto-merge timeout,
 bounded-startup, and already-exhausted-budget stops retain resumable diagnostics
 and return non-zero; explicit manual `--watch-pending-ci` stops return zero
-without merging. `--ci-check-name` and `--no-watch-pending-ci` remain parseable
-compatibility options, but do not select or disable this auto-merge gate and
-warn when explicitly supplied with auto-merge. Without `--auto-merge`,
+without merging. `--no-watch-pending-ci` remains a parseable compatibility
+option, but does not disable this auto-merge gate and warns when explicitly
+supplied with auto-merge. Without `--auto-merge`,
 agent-loop reports an approved PR as merge-ready and does not wait for CI,
 unless `--watch-pending-ci` is passed explicitly, in which case it still
 watches the check board and reports merge-ready without merging.

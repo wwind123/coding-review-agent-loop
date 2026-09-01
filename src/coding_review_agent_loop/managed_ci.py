@@ -1243,7 +1243,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--codex-model", "--codex-reasoning-effort", "--gemini-model", "--claude-model",
     "--gh-cmd",
     "--claude-arg", "--codex-arg", "--gemini-arg", "--antigravity-arg",
-    "--test-command", "--ci-check-name", "--ci-timeout-seconds",
+    "--test-command", "--ci-timeout-seconds",
     "--ci-poll-interval-seconds", "--ci-startup-timeout-seconds",
     "--ci-queued-grace-seconds", "--mergeability-poll-attempts",
     "--mergeability-poll-interval-seconds", "--log-dir", "--subprocess-log-dir",

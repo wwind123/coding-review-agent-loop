@@ -86,7 +86,6 @@ def make_minimal_config(
         gemini_args=("--skip-trust",),
         test_command=None,
         pre_review_tests=False,
-        ci_check_name="",
         ci_timeout_seconds=300,
         ci_poll_interval_seconds=30,
         quiet=False,

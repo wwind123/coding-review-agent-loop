@@ -344,15 +344,6 @@ def build_parser() -> argparse.ArgumentParser:
             help="Do not run --test-command before reviewer rounds.",
         )
         subparser.add_argument(
-            "--ci-check-name",
-            default=None,
-            help=(
-                "Retained for compatibility (default: test); ordinary --auto-merge now "
-                "gates on the complete full-board check snapshot, so this name does not "
-                "select the merge gate."
-            ),
-        )
-        subparser.add_argument(
             "--ci-timeout-seconds",
             type=int,
             default=1200,
@@ -898,13 +889,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not (args.managed_ci_trusted_actor or "").strip():
                 raise AgentLoopError("--managed-ci requires --managed-ci-trusted-actor.")
         config = config_from_args(args, runner, invocation_argv=invocation)
-        if config.auto_merge and config.ci_check_name_explicit:
-            print(
-                "agent-loop: warning: --ci-check-name is retained for compatibility and "
-                "no longer selects the ordinary auto-merge gate; the complete full-board "
-                "watcher is used.",
-                file=sys.stderr,
-            )
         if config.auto_merge and config.watch_pending_ci_explicit and not config.watch_pending_ci:
             print(
                 "agent-loop: warning: --no-watch-pending-ci is retained for compatibility "

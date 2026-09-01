@@ -1449,10 +1449,10 @@ must pass. Partial or unavailable snapshots remain fail-closed and are polled;
 an otherwise reliable empty board is bounded startup, not success. The live
 head is re-read immediately before an exact-head merge proof is sent to GitHub.
 
-`--ci-check-name` and `--no-watch-pending-ci` remain parseable compatibility
-options, but neither selects nor disables the ordinary auto-merge gate; an
-explicit use with auto-merge emits a warning. One timeout and attempt budget is
-shared across watcher polls, coder-failure rounds, and head-change rounds.
+`--no-watch-pending-ci` remains parseable for compatibility, but does not
+disable the ordinary auto-merge gate; an explicit use with auto-merge emits a
+warning. One timeout and attempt budget is shared across watcher polls,
+coder-failure rounds, and head-change rounds.
 Auto-merge timeout, bounded-startup, and already-exhausted-budget stops retain
 their resumable diagnostics and return a non-zero exit. An explicit manual
 `--watch-pending-ci` run keeps the same watcher outcomes but stops cleanly
@@ -1832,9 +1832,9 @@ recovery trigger for this path.
 
 For repositories not using managed exact-head CI, ordinary `--auto-merge`
 always enters the full-board watcher, regardless of the effective
-`--watch-pending-ci` value. `--ci-check-name` and `--no-watch-pending-ci` remain
-parseable for compatibility and produce a warning when explicitly supplied
-with auto-merge; they do not select or weaken that gate. An explicit
+`--watch-pending-ci` value. `--no-watch-pending-ci` remains parseable for
+compatibility and produces a warning when explicitly supplied with auto-merge;
+it does not weaken that gate. An explicit
 `--watch-pending-ci` without `--auto-merge` watches ordinary checks after
 approval and reports merge-ready without merging. It does not activate
 suppression or replace managed exact-head qualification; when `--managed-ci` is

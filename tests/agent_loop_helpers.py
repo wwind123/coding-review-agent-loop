@@ -1497,7 +1497,6 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         "gemini_args": (),
         "test_command": None,
         "pre_review_tests": True,
-        "ci_check_name": "test",
         "ci_timeout_seconds": 1200,
         "ci_poll_interval_seconds": 30,
         "quiet": True,

@@ -1446,8 +1446,6 @@ def test_config_enables_ci_watch_with_auto_merge_without_rebuilding_antigravity_
     )
     assert config.watch_pending_ci is True
     assert config.watch_pending_ci_explicit is False
-    assert config.ci_check_name == "test"
-    assert config.ci_check_name_explicit is False
     assert config.managed_ci_pr_mode is True
     assert config.invocation_argv[-1] == "77"
     assert config.antigravity_models == ("Gemini 3.1 Pro (High)",)
@@ -1645,25 +1643,26 @@ def test_config_allows_disabling_auto_merge_ci_watch(tmp_path):
     assert config.watch_pending_ci_explicit is True
 
 
-def test_config_records_explicit_legacy_ci_name_without_changing_effective_name(tmp_path):
+@pytest.mark.parametrize(
+    "legacy_args",
+    [["--ci-check-name", "legacy-ci"], ["--ci-check-name=legacy-ci"]],
+)
+def test_retired_ci_name_option_is_rejected(legacy_args, capsys):
     parser = build_parser()
-    args = parser.parse_args([
-        "pr", "77", "--repo", "OWNER/REPO", "--auto-merge", "--ci-check-name", "legacy-ci",
-    ])
+    arguments = ["pr", "77", "--repo", "OWNER/REPO", "--auto-merge", *legacy_args]
 
-    config = config_from_args(args, FakeRunner())
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(arguments)
 
-    assert config.ci_check_name == "legacy-ci"
-    assert config.ci_check_name_explicit is True
-    assert config.watch_pending_ci is True
+    assert exc_info.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
 
 
-def test_auto_merge_compatibility_options_emit_warnings(tmp_path, monkeypatch, capsys):
+def test_auto_merge_legacy_ci_watch_option_emits_warning(tmp_path, monkeypatch, capsys):
     config = make_config(
         tmp_path,
         auto_merge=True,
         watch_pending_ci=False,
-        ci_check_name_explicit=True,
         watch_pending_ci_explicit=True,
     )
     monkeypatch.setattr(cli_module, "config_from_args", lambda *args, **kwargs: config)
@@ -1671,11 +1670,10 @@ def test_auto_merge_compatibility_options_emit_warnings(tmp_path, monkeypatch, c
 
     assert main([
         "pr", "77", "--repo", "OWNER/REPO", "--auto-merge",
-        "--ci-check-name", "legacy-ci", "--no-watch-pending-ci",
+        "--no-watch-pending-ci",
     ]) == 0
 
     warning = capsys.readouterr().err
-    assert "--ci-check-name is retained for compatibility" in warning
     assert "--no-watch-pending-ci is retained for compatibility" in warning
 
 

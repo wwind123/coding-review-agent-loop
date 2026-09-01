@@ -88,7 +88,6 @@ class AgentLoopConfig:
     gemini_args: tuple[str, ...]
     test_command: tuple[str, ...] | None
     pre_review_tests: bool
-    ci_check_name: str
     ci_timeout_seconds: int
     ci_poll_interval_seconds: int
     quiet: bool
@@ -225,10 +224,9 @@ class AgentLoopConfig:
     # Separate bounded startup observation for CI that has not materialized a
     # run/check yet.  Empty boards are never evidence that CI succeeded.
     ci_startup_timeout_seconds: int = 120
-    # CLI provenance for compatibility options. These are intentionally kept
-    # separate from their effective values so auto-merge can warn when an old
-    # selector or opt-out no longer changes the full-board gate.
-    ci_check_name_explicit: bool = False
+    # CLI provenance for the compatibility opt-out. It remains separate from
+    # its effective value so auto-merge can warn when the old opt-out no longer
+    # changes the full-board gate.
     watch_pending_ci_explicit: bool = False
     # The first source that resolved ``base``.  This is carried across an
     # issue-to-PR handoff so a repository-default base cannot silently replace
@@ -1087,7 +1085,6 @@ def config_from_args(
         review_parallel=getattr(args, "review_parallel", False),
         test_command=test_command,
         pre_review_tests=args.pre_review_tests,
-        ci_check_name=getattr(args, "ci_check_name", None) or "test",
         ci_timeout_seconds=args.ci_timeout_seconds,
         ci_poll_interval_seconds=args.ci_poll_interval_seconds,
         ci_startup_timeout_seconds=getattr(args, "ci_startup_timeout_seconds", 120),
@@ -1096,7 +1093,6 @@ def config_from_args(
             if getattr(args, "watch_pending_ci", None) is None
             else bool(args.watch_pending_ci)
         ),
-        ci_check_name_explicit=getattr(args, "ci_check_name", None) is not None,
         watch_pending_ci_explicit=getattr(args, "watch_pending_ci", None) is not None,
         managed_ci_trusted_actor=getattr(args, "managed_ci_trusted_actor", None),
         managed_ci=getattr(args, "managed_ci", False),
