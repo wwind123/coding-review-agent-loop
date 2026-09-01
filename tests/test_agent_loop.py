@@ -1643,12 +1643,13 @@ def test_config_allows_disabling_auto_merge_ci_watch(tmp_path):
     assert config.watch_pending_ci_explicit is True
 
 
-@pytest.mark.parametrize("legacy_option", ["--ci" "-check-name", "--ci" "-check-name=legacy-ci"])
-def test_retired_ci_name_option_is_rejected(legacy_option, capsys):
+@pytest.mark.parametrize(
+    "legacy_args",
+    [["--ci-check-name", "legacy-ci"], ["--ci-check-name=legacy-ci"]],
+)
+def test_retired_ci_name_option_is_rejected(legacy_args, capsys):
     parser = build_parser()
-    arguments = ["pr", "77", "--repo", "OWNER/REPO", "--auto-merge", legacy_option]
-    if legacy_option == "--ci" "-check-name":
-        arguments.append("legacy-ci")
+    arguments = ["pr", "77", "--repo", "OWNER/REPO", "--auto-merge", *legacy_args]
 
     with pytest.raises(SystemExit) as exc_info:
         parser.parse_args(arguments)

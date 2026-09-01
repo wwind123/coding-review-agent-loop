@@ -132,7 +132,7 @@ def test_watch_docs_define_full_board_policy_and_compatibility_behavior():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     normalized_text = " ".join(text.split())
     readme_text = README.read_text(encoding="utf-8")
-    retired_option = "--ci" "-check-name"
+    retired_option = "--ci-check-name"
 
     assert "ordinary `--auto-merge` always enters the full-board watcher" in normalized_text
     assert "reliable, non-empty current-head board" in normalized_text

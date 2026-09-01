@@ -979,7 +979,7 @@ def test_recovery_value_option_table_covers_all_recovery_subparsers():
             f"{sorted(value_options - managed_ci._RECOVERY_VALUE_OPTIONS)}"
         )
 
-    assert "--ci" "-check-name" not in managed_ci._RECOVERY_VALUE_OPTIONS
+    assert "--ci-check-name" not in managed_ci._RECOVERY_VALUE_OPTIONS
     assert {
         "--ci-timeout-seconds",
         "--ci-poll-interval-seconds",
