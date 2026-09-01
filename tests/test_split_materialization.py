@@ -214,7 +214,8 @@ def test_materialize_split_proposals_partial_failure_adopts_existing_child(tmp_p
     )
 
     assert runner.search_issues_calls == [
-        '"(from #56)" in:title OR "[#56 stage]" in:title'
+        '"(from #56)" in:title',
+        '"[#56 stage]" in:title',
     ]
     # Only the unmatched (billing) proposal was created; auth was adopted.
     assert len(runner.issues) == 1
@@ -297,7 +298,8 @@ def test_materialize_split_proposals_dry_run_previews_search_and_create(tmp_path
     # commands (so the materialization path is visible), it just never
     # persists application-level state outside of GitHub CLI echo commands.
     assert runner.search_issues_calls == [
-        '"(from #56)" in:title OR "[#56 stage]" in:title'
+        '"(from #56)" in:title',
+        '"[#56 stage]" in:title',
     ]
     assert len(runner.issues) == 1
 
@@ -336,6 +338,7 @@ def test_materialize_typed_child_adopts_existing_canonical_issue_instead_of_dupl
     runner = FakeRunner(
         search_issues_payload=[
             [],
+            [],
             [
                 {
                     "number": 480,
@@ -365,6 +368,7 @@ def test_materialize_typed_child_does_not_adopt_unrelated_title_match(tmp_path):
     runner = FakeRunner(
         issue_urls=["https://github.com/OWNER/REPO/issues/481"],
         search_issues_payload=[
+            [],
             [],
             [
                 {
@@ -403,7 +407,8 @@ def test_materialize_discuss_proposal_skips_canonical_title_search(tmp_path):
     )
 
     assert runner.search_issues_calls == [
-        '"(from #479)" in:title OR "[#479 stage]" in:title'
+        '"(from #479)" in:title',
+        '"[#479 stage]" in:title',
     ]
 
 

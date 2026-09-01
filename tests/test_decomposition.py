@@ -201,6 +201,19 @@ def _phase(title: str, *, depends_on: tuple[str, ...] = ()) -> PlanPhase:
     )
 
 
+def test_format_phase_body_points_to_parent_for_complete_constraints():
+    body = format_phase_issue_body(
+        repo="OWNER/REPO",
+        parent_issue=56,
+        approved_plan="The complete approved plan.",
+        phase=_phase("Model-selected phase"),
+        created_so_far=(),
+    )
+
+    assert "The linked parent issue is the source of truth" in body
+    assert "complete historical constraint context" not in body
+
+
 def test_topology_checkpoint_stores_shared_context_once_and_round_trips(tmp_path):
     excerpt = "Approved parent constraints.\n" + ("constraint detail\n" * 500)
     phases = tuple(

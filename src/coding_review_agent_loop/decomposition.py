@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from .config import AgentLoopConfig
 from .child_topology import (
     NeedsHumanDecision,
-    parent_child_search_query,
+    merge_found_issues,
+    parent_child_search_queries,
     preflight_flat_child_count,
 )
 from .errors import AgentLoopError
@@ -597,7 +598,7 @@ def format_phase_issue_body(
             phase.non_goals,
             "",
             "## Constraints and invariants from the parent plan",
-            "The approved parent-plan excerpt above is the complete historical constraint context for this phase.",
+            "The linked parent issue is the source of truth for the complete approved-plan constraints and invariants; the excerpt above is the phase-specific context supplied to this issue.",
             "",
             "## Dependency notes",
             phase.dependency_notes,
@@ -649,11 +650,14 @@ def create_decomposition_child_issues(
 
     # Search is read-only and intentionally includes every issue state.  It
     # closes the create-before-summary crash window without trusting authorship.
-    found = search_issues(
-        runner,
-        config=config,
-        search=parent_child_search_query(parent_issue),
-        state="all",
+    found = merge_found_issues(
+        search_issues(
+            runner,
+            config=config,
+            search=query,
+            state="all",
+        )
+        for query in parent_child_search_queries(parent_issue)
     )
     expected_ids = {
         index: phase_identity(

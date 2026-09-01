@@ -16,7 +16,8 @@ from dataclasses import dataclass
 from .config import AgentLoopConfig
 from .child_topology import (
     NeedsHumanDecision,
-    parent_child_search_query,
+    merge_found_issues,
+    parent_child_search_queries,
     preflight_flat_child_count,
 )
 from .decomposition import _decode_json_payload, _encode_json_payload, _issue_number_from_url
@@ -427,11 +428,14 @@ def materialize_split_proposals(
     # Search and adoption are read-only.  Count every recognized canonical
     # child owned by this parent before deciding whether the complete desired
     # topology fits; never slice and silently skip approved stages.
-    search_results = search_issues(
-        runner,
-        config=config,
-        search=parent_child_search_query(parent_issue),
-        state="all",
+    search_results = merge_found_issues(
+        search_issues(
+            runner,
+            config=config,
+            search=query,
+            state="all",
+        )
+        for query in parent_child_search_queries(parent_issue)
     )
     adopted_by_key, recognized_from_search = _adopt_from_found(
         search_results,

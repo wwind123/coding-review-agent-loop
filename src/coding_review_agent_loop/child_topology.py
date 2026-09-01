@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+from .github import FoundIssue
+
 
 @dataclass(frozen=True)
 class NeedsHumanDecision:
@@ -62,9 +64,42 @@ class ChildTopologyPreflight:
     missing_count: int
 
 
-def parent_child_search_query(parent_issue: int) -> str:
-    """Find both flat-child title conventions in one recovery query."""
-    return f'"(from #{parent_issue})" in:title OR "[#{parent_issue} stage]" in:title'
+def parent_child_search_queries(parent_issue: int) -> tuple[str, str]:
+    """Return the supported flat-child title searches separately.
+
+    GitHub issue search does not implement the boolean ``OR`` operator used by
+    code search. Keeping these as separate queries avoids silently missing one
+    of the two historical child-title conventions during recovery.
+    """
+    return (
+        f'"(from #{parent_issue})" in:title',
+        f'"[#{parent_issue} stage]" in:title',
+    )
+
+
+def merge_found_issues(result_sets: Iterable[Iterable[FoundIssue]]) -> tuple[FoundIssue, ...]:
+    """Merge parent-child search results, de-duplicating by issue number."""
+    merged: dict[int, FoundIssue] = {}
+    without_number: list[FoundIssue] = []
+    for results in result_sets:
+        for found in results:
+            if found.number is None:
+                if found not in without_number:
+                    without_number.append(found)
+                continue
+            previous = merged.get(found.number)
+            if previous is None:
+                merged[found.number] = found
+                continue
+            # A repeated result can differ in completeness between queries;
+            # preserve whichever non-empty representation is available.
+            merged[found.number] = FoundIssue(
+                number=found.number,
+                title=previous.title or found.title,
+                body=previous.body or found.body,
+                url=previous.url or found.url,
+            )
+    return tuple(merged.values()) + tuple(without_number)
 
 
 def preflight_flat_child_count(
