@@ -13,7 +13,7 @@ The default flow is:
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
-Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick a single model via `--antigravity-model`, or an ordered fallback chain via `--antigravity-models`; default chain `Gemini 3.6 Flash (High)` → `Gemini 3.5 Flash (High)` → `Gemini 3.1 Pro (High)`). Enterprise / API-key Gemini CLI paths may remain available for organizations that still have access, so the `gemini` backend is retained for those users. Direct Gemini CLI support is best-effort: maintainers without enterprise Gemini CLI access need reporter-provided `.agent-loop-logs/*gemini.log` output, response-file contents, CLI version, and any sharable account/access context to debug live `gemini` failures. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
+Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick a single model via `--antigravity-model`, or an ordered fallback chain via `--antigravity-models`; default chain `Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)`). Enterprise / API-key Gemini CLI paths may remain available for organizations that still have access, so the `gemini` backend is retained for those users. Direct Gemini CLI support is best-effort: maintainers without enterprise Gemini CLI access need reporter-provided `.agent-loop-logs/*gemini.log` output, response-file contents, CLI version, and any sharable account/access context to debug live `gemini` failures. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
 
 Every `agy --print` call passes `--print-timeout` from
 `--antigravity-print-timeout-seconds` (default `600`, i.e. ten minutes), which
@@ -2202,7 +2202,7 @@ issue, matching how a successful PR-creating implementation is already posted.
 For structured plan reviews, plan revisions, PR reviews, and coder follow-ups,
 a present but malformed structured response may get a repair pass before the
 local failure is raised. By default the repair pass calls Antigravity through
-the existing PTY backend with the default model `Gemini 3.5 Flash (Medium)`;
+the existing PTY backend with the default model `Gemini 3.7 Flash (Medium)`;
 explicit repair models are followed by the configured coder/reviewer chain. It uses a fresh temporary
 workdir, empty tool permissions, and repair-only instructions forbidding file
 inspection, tests, mutation, background work, and subagents. The format-repair

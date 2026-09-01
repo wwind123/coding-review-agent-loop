@@ -119,8 +119,8 @@ agent-loop task "Fix the flaky test" --repo OWNER/REPO --coder antigravity --rev
 
 Pick the model with `--antigravity-model "<name>"` (as listed by `agy models`),
 or supply an ordered fallback chain with `--antigravity-models "<name>" ["<name>" ...]`
-(tried in order after provider-framed capacity exhaustion; default `Gemini 3.6 Flash (High)` →
-`Gemini 3.5 Flash (High)` → `Gemini 3.1 Pro (High)`). When a `gemini` invocation fails with an
+(tried in order after provider-framed capacity exhaustion; default `Gemini 3.7 Flash (High)` →
+`Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)`). When a `gemini` invocation fails with an
 auth/quota error near or after the cutoff, the tool surfaces this migration
 guidance. Notes: Antigravity turns are single-shot (no cross-round session
 resume) and report estimated token usage (`agy` emits no token counts).
@@ -994,7 +994,7 @@ payloads into normal public GitHub comments, so raw JSON is not posted.
 
 When a structured plan review, plan revision, PR review, or coder follow-up is
 present but malformed, the loop may run a model-backed repair pass. The default
-backend is Antigravity (`agy`) with the default model `Gemini 3.5 Flash (Medium)`. The
+backend is Antigravity (`agy`) with the default model `Gemini 3.7 Flash (Medium)`. The
 repair pass is format-only: it asks the model to re-emit the agent's intent as the
 required JSON object, footer marker, and signature. The repaired response is
 accepted only if it passes the same strict validation as the original response;
@@ -1009,7 +1009,7 @@ duplicates removed. The loop validates candidates once with `agy models`, report
 available choices for stale names, and attempts candidates directly when discovery
 is unavailable. For example:
 
-`--repair-model "Gemini 3.5 Flash (Medium)" --repair-model "Gemini 3.1 Pro (High)"`
+`--repair-model "Gemini 3.7 Flash (Medium)" --repair-model "Gemini 3.1 Pro (High)"`
 
 The legacy `gemini --prompt` path is used only with
 `--repair-backend gemini` and requires non-interactive enterprise/API-key/Vertex

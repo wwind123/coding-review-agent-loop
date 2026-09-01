@@ -93,7 +93,7 @@ Merge stays a human decision.
 The external agent can be `codex`, `gemini`, or `antigravity` (the `agy` CLI —
 the migration path for Gemini CLI consumer access, which Google retires on
 2026-06-18). With no override, Antigravity uses the ordered fallback chain
-`Gemini 3.6 Flash (High)` → `Gemini 3.5 Flash (High)` → `Gemini 3.1 Pro (High)`. Use `--model MODEL` for the
+`Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)`. Use `--model MODEL` for the
 legacy single-model override or `--antigravity-models MODEL [MODEL ...]` for a
 custom ordered chain; these options are mutually exclusive. Use
 `--antigravity-quota-signatures SIGNATURE [SIGNATURE ...]` to customize the
@@ -188,7 +188,7 @@ never falsely reported `approved`. A malformed-but-content-bearing structured
 review is recovered automatically when possible: safe skill normalization,
 envelope normalization, deterministic unknown-prior-item stripping against the
 complete carried ledger, and then model format repair. Local-loop repair now
-defaults to isolated Antigravity with `Gemini 3.5 Flash (Medium)`; explicit repeatable
+defaults to isolated Antigravity with `Gemini 3.7 Flash (Medium)`; explicit repeatable
 repair models are tried first, followed by the configured Antigravity chain. Legacy
 Gemini CLI repair requires
 `--repair-backend gemini` and suitable non-interactive authentication. The
