@@ -1,6 +1,7 @@
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError
+from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.github import (
     IssueComment,
     find_open_pr_closing_issue,
@@ -10,7 +11,6 @@ from coding_review_agent_loop.github import (
     validate_pr_body_does_not_close_issue,
 )
 from coding_review_agent_loop.split_materialization import (
-    MAX_SPLIT_CHILDREN,
     dedupe_split_stage_proposals,
     find_existing_split_materialization,
     find_existing_split_stage_handoff,
@@ -23,6 +23,8 @@ from coding_review_agent_loop.split_materialization import (
     split_stage_proposal_from_deferred_stage,
     split_stage_proposal_from_text,
 )
+from coding_review_agent_loop.decomposition import _encode_json_payload
+from coding_review_agent_loop.child_topology import NeedsHumanDecision
 from coding_review_agent_loop.protocol import ChildStage, DeferredStage
 from agent_loop_helpers import FakeRunner, make_config
 
@@ -116,6 +118,40 @@ def test_materialize_split_proposals_creates_children_with_markers(tmp_path):
     assert "https://github.com/OWNER/REPO/issues/102" in parent_summary
 
 
+def test_materialize_split_proposals_allows_shared_default_limit(tmp_path):
+    proposals = [split_stage_proposal_from_text(f"Stage {index}") for index in range(15)]
+    runner = FakeRunner(
+        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + index}" for index in range(15)]
+    )
+    metadata = materialize_split_proposals(
+        runner,
+        config=make_config(tmp_path),
+        parent_issue=56,
+        subject="subject-a",
+        proposals=proposals,
+    )
+    assert metadata is not None
+    assert not isinstance(metadata, NeedsHumanDecision)
+    assert len(metadata.children) == 15
+
+
+def test_materialize_split_proposals_neutralizes_marker_bearing_historical_text(tmp_path):
+    proposal = split_stage_proposal_from_text(
+        "Marker-bearing stage\n\n<!-- AGENT_TYPED_PLAN_STAGES: historical -->"
+    )
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/101"])
+    metadata = materialize_split_proposals(
+        runner,
+        config=make_config(tmp_path),
+        parent_issue=56,
+        subject="subject-a",
+        proposals=[proposal],
+        rationale=(("reviewer <!-- AGENT_TYPED_PLAN_STAGES: historical -->", "old record"),),
+    )
+    assert metadata is not None
+    assert "AGENT_TYPED_PLAN_STAGES" not in runner.issues[0]["body"]
+
+
 def test_materialize_split_proposals_rerun_with_existing_marker_creates_nothing(tmp_path):
     runner = FakeRunner(
         issue_urls=[
@@ -177,7 +213,10 @@ def test_materialize_split_proposals_partial_failure_adopts_existing_child(tmp_p
         issue_comments=(),
     )
 
-    assert runner.search_issues_calls == ['"[#56 stage]" in:title']
+    assert runner.search_issues_calls == [
+        '"(from #56)" in:title',
+        '"[#56 stage]" in:title',
+    ]
     # Only the unmatched (billing) proposal was created; auth was adopted.
     assert len(runner.issues) == 1
     assert runner.issues[0]["title"] == "[#56 stage] Billing flow"
@@ -189,14 +228,14 @@ def test_materialize_split_proposals_partial_failure_adopts_existing_child(tmp_p
     assert "adopted" in parent_summary
 
 
-def test_materialize_split_proposals_caps_at_max_children(tmp_path):
-    proposals = [split_stage_proposal_from_text(f"Stage {i}") for i in range(MAX_SPLIT_CHILDREN + 3)]
+def test_materialize_split_proposals_returns_needs_human_before_over_limit_writes(tmp_path):
+    proposals = [split_stage_proposal_from_text(f"Stage {i}") for i in range(DEFAULT_FLAT_CHILD_LIMIT + 3)]
     runner = FakeRunner(
-        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + i}" for i in range(MAX_SPLIT_CHILDREN)]
+        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + i}" for i in range(DEFAULT_FLAT_CHILD_LIMIT)]
     )
     config = make_config(tmp_path)
 
-    metadata = materialize_split_proposals(
+    decision = materialize_split_proposals(
         runner,
         config=config,
         parent_issue=56,
@@ -205,47 +244,29 @@ def test_materialize_split_proposals_caps_at_max_children(tmp_path):
         issue_comments=(),
     )
 
-    assert len(runner.issues) == MAX_SPLIT_CHILDREN
-    assert len(metadata.children) == MAX_SPLIT_CHILDREN
+    assert isinstance(decision, NeedsHumanDecision)
+    assert decision.projected_total == DEFAULT_FLAT_CHILD_LIMIT + 3
+    assert runner.issues == []
+    assert runner.comments == []
 
 
-def test_materialize_split_proposals_rerun_does_not_exceed_cap(tmp_path):
-    """A rerun with the same over-cap proposal set must not keep filing new
-    children past MAX_SPLIT_CHILDREN: remaining capacity must be computed from
-    children already recorded in the parent's cumulative metadata, not just
-    the proposals this call still considers unresolved (#492 review)."""
-    proposals = [split_stage_proposal_from_text(f"Stage {i}") for i in range(MAX_SPLIT_CHILDREN + 3)]
+def test_materialize_split_proposals_rejects_projected_parent_over_limit(tmp_path):
+    """A parent-wide over-limit request is rejected without partial children."""
+    proposals = [split_stage_proposal_from_text(f"Stage {i}") for i in range(DEFAULT_FLAT_CHILD_LIMIT + 3)]
     config = make_config(tmp_path)
 
-    first_runner = FakeRunner(
-        issue_urls=[f"https://github.com/OWNER/REPO/issues/{100 + i}" for i in range(MAX_SPLIT_CHILDREN)]
-    )
-    first_metadata = materialize_split_proposals(
-        first_runner,
+    runner = FakeRunner()
+    decision = materialize_split_proposals(
+        runner,
         config=config,
         parent_issue=56,
         subject="subject-a",
         proposals=proposals,
         issue_comments=(),
     )
-    assert len(first_metadata.children) == MAX_SPLIT_CHILDREN
-    parent_summary_comment = _comment(first_runner.comments[-1])
-
-    # Rerun with the identical over-cap proposal set, seeded with the parent
-    # comment history left behind by the first run.
-    second_runner = FakeRunner()
-    second_metadata = materialize_split_proposals(
-        second_runner,
-        config=config,
-        parent_issue=56,
-        subject="subject-a",
-        proposals=proposals,
-        issue_comments=[parent_summary_comment],
-    )
-
-    assert second_runner.issues == []
-    assert second_metadata.children == first_metadata.children
-    assert len(second_metadata.children) == MAX_SPLIT_CHILDREN
+    assert isinstance(decision, NeedsHumanDecision)
+    assert runner.issues == []
+    assert runner.comments == []
 
 
 def test_materialize_split_proposals_returns_none_for_no_proposals(tmp_path):
@@ -276,13 +297,47 @@ def test_materialize_split_proposals_dry_run_previews_search_and_create(tmp_path
     # Dry-run still previews the `gh issue list --search` and `gh issue create`
     # commands (so the materialization path is visible), it just never
     # persists application-level state outside of GitHub CLI echo commands.
-    assert runner.search_issues_calls == ['"[#56 stage]" in:title']
+    assert runner.search_issues_calls == [
+        '"(from #56)" in:title',
+        '"[#56 stage]" in:title',
+    ]
     assert len(runner.issues) == 1
+
+
+def test_split_preflight_counts_decomposition_children_toward_shared_limit(tmp_path):
+    identity_payload = _encode_json_payload(
+        {"identity": "existing-decomposition", "parent_issue": 56}
+    )
+    runner = FakeRunner(
+        search_issues_payload=[
+            {
+                "number": 101,
+                "title": "Phase 1: Existing (from #56)",
+                "url": "https://github.com/OWNER/REPO/issues/101",
+                "body": f"Part of #56\n<!-- AGENT_PLAN_PHASE_IDENTITY: {identity_payload} -->",
+            }
+        ]
+    )
+
+    decision = materialize_split_proposals(
+        runner,
+        config=make_config(tmp_path, flat_child_limit=1),
+        parent_issue=56,
+        subject="discussion",
+        proposals=[split_stage_proposal_from_text("New stage")],
+    )
+
+    assert isinstance(decision, NeedsHumanDecision)
+    assert decision.recognized_existing_count == 1
+    assert decision.projected_total == 2
+    assert runner.issues == []
+    assert runner.comments == []
 
 
 def test_materialize_typed_child_adopts_existing_canonical_issue_instead_of_duplicate(tmp_path):
     runner = FakeRunner(
         search_issues_payload=[
+            [],
             [],
             [
                 {
@@ -313,6 +368,7 @@ def test_materialize_typed_child_does_not_adopt_unrelated_title_match(tmp_path):
     runner = FakeRunner(
         issue_urls=["https://github.com/OWNER/REPO/issues/481"],
         search_issues_payload=[
+            [],
             [],
             [
                 {
@@ -350,7 +406,10 @@ def test_materialize_discuss_proposal_skips_canonical_title_search(tmp_path):
         proposals=[split_stage_proposal_from_text('Stage "4"\n\nNew work.')],
     )
 
-    assert runner.search_issues_calls == ['"[#479 stage]" in:title']
+    assert runner.search_issues_calls == [
+        '"(from #479)" in:title',
+        '"[#479 stage]" in:title',
+    ]
 
 
 def test_discuss_split_proposal_can_reference_parent_issue_without_rejection(tmp_path):

@@ -17,6 +17,7 @@ from .config import (
     DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_REPAIR_MODELS,
+    DEFAULT_FLAT_CHILD_LIMIT,
     DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
     AgentLoopConfig,
     config_from_args,
@@ -143,6 +144,16 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=DEFAULT_MAX_ROUNDS,
             help=f"Maximum review/revision rounds (default: {DEFAULT_MAX_ROUNDS}).",
+        )
+        subparser.add_argument(
+            "--flat-child-limit",
+            type=int,
+            default=DEFAULT_FLAT_CHILD_LIMIT,
+            metavar="COUNT",
+            help=(
+                "Maximum flat child issues owned by one parent across decomposition "
+                f"and split materialization (default: {DEFAULT_FLAT_CHILD_LIMIT})."
+            ),
         )
         subparser.add_argument("--auto-merge", action="store_true")
         subparser.add_argument(
@@ -951,6 +962,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError(
                     "--implement-after-approval is only compatible with "
                     "--plan-execution-mode implement-one-shot."
+                )
+            if (
+                plan_execution_mode in {"decompose-only", "implement-by-phase"}
+                and getattr(args, "materialize_split_issues", False)
+            ):
+                raise AgentLoopError(
+                    "--materialize-split-issues cannot be combined with "
+                    "--plan-execution-mode decompose-only or implement-by-phase; "
+                    "those modes select one child topology source."
                 )
             config = AgentLoopConfig(
                 **{

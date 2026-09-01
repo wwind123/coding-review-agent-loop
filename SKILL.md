@@ -523,8 +523,10 @@ A response that fails validation is non-retryable — fix the cause and re-run.
 
 ### Decompose an approved plan into phase issues
 
-`run-decompose` has an **external coder** turn an approved plan into structured
-phase child issues:
+`run-decompose` has an **external coder** turn an untyped approved plan into
+structured phase child issues. When the plan contains typed `child_stages`, the
+helper adapts those stages directly and does not invoke the coder a second
+time:
 
 ```bash
 python -m helpers.skill_runner run-decompose \
@@ -536,10 +538,13 @@ python -m helpers.skill_runner run-decompose \
 
 Live runs are **side-effecting**: they create real GitHub child issues and post a
 parent summary marker. The command is idempotent by parent issue + approved-plan
-hash + `decompose-only` mode; re-running the same plan returns the recorded child
-issues instead of creating duplicates. `--dry-run` still exercises the
-decomposition parser and prints the child-issue preview JSON, but it does not
-create issues or post comments.
+hash + mode; re-running the same plan returns the recorded child issues instead
+of creating duplicates. Both phase commands accept `--flat-child-limit` (15 by
+default), preflight every title/body before a checkpoint or create, never
+truncate, and recover from checkpoints plus exact child identities. An
+over-limit result exits 2 with structured guidance to consolidate or use the
+hierarchical design tracked in #720. `--dry-run` parses, searches, adopts, and
+validates the full preview without posting state or creating issues.
 
 ---
 

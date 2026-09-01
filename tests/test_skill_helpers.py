@@ -3450,6 +3450,44 @@ class TestRunDecompose:
             assert output["phases"][0]["automation"] == "agent-pr"
             assert output["would_post_parent_summary"] is True
 
+    def test_dry_run_over_limit_returns_structured_needs_human_without_posts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            plan = tmppath / "plan.md"
+            payload = {
+                "schema_version": 1,
+                "kind": "plan_state",
+                "state": "blocking",
+                "summary": "Large typed topology",
+                "plan_steps": ["Materialize all typed stages."],
+                "human_requirement_dispositions": [],
+                "child_stages": [
+                    {"title": f"Stage {index}", "summary": f"Work {index}."}
+                    for index in range(16)
+                ],
+            }
+            plan.write_text(
+                json.dumps(payload)
+                + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n",
+                encoding="utf-8",
+            )
+            result = _run(
+                "helpers.skill_runner", "run-decompose",
+                "--issue", "9992", "--repo", "test/skill-repo",
+                "--coder", "codex", "--plan-file", str(plan),
+                "--workdir", str(tmppath), "--flat-child-limit", "15",
+                "--dry-run", env=env, check=False,
+            )
+
+            assert result.returncode == 2, result.stderr
+            output = self._last_json(result.stdout)
+            assert output["state"] == "needs-human"
+            assert output["decision"]["projected_total"] == 16
+            assert output["would_post_checkpoint"] is False
+            assert output["would_post_parent_summary"] is False
+
     def test_live_path_creates_children_and_posts_parent_summary(self, monkeypatch, tmp_path) -> None:
         import helpers.skill_runner as sr
         import coding_review_agent_loop.decomposition as decomp
@@ -3472,7 +3510,18 @@ class TestRunDecompose:
                 comments=(), human_requirements=(),
             )
 
-        def fake_create(runner, *, config, parent_issue, approved_plan, decomposition):
+        def fake_create(
+            runner,
+            *,
+            config,
+            parent_issue,
+            approved_plan,
+            decomposition,
+            topology_source,
+            issue_comments,
+            mode,
+            retained_parent_scope,
+        ):
             created_calls.append({
                 "parent_issue": parent_issue,
                 "approved_plan": approved_plan,
@@ -3487,7 +3536,17 @@ class TestRunDecompose:
                 ),
             )
 
-        def fake_post(runner, *, config, parent_issue, mode, plan_hash, created):
+        def fake_post(
+            runner,
+            *,
+            config,
+            parent_issue,
+            mode,
+            plan_hash,
+            created,
+            topology_source,
+            retained_parent_scope,
+        ):
             posted_calls.append({
                 "parent_issue": parent_issue,
                 "mode": mode,
@@ -3522,6 +3581,61 @@ class TestRunDecompose:
         assert posted_calls[0]["parent_issue"] == 77
         assert posted_calls[0]["mode"] == "decompose-only"
         assert posted_calls[0]["created"][0].issue_number == 123
+
+    def test_live_over_limit_returns_needs_human_without_summary(self, monkeypatch, tmp_path, capsys) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        from coding_review_agent_loop.child_topology import NeedsHumanDecision
+        from coding_review_agent_loop.github import IssueContext
+
+        def fake_run_helper(*args, **_kwargs):
+            output = Path(args[args.index("--output") + 1])
+            output.write_text(_DECOMP_JSON, encoding="utf-8")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def fake_get_issue_context(_runner, *, config, issue_number):
+            return IssueContext(
+                number=issue_number, repo=config.repo, title="T", body="B", url="u",
+                comments=(), human_requirements=(),
+            )
+
+        def fake_create(*_args, **_kwargs):
+            return NeedsHumanDecision(
+                parent_issue=77,
+                source="model",
+                requested_desired_count=16,
+                recognized_existing_count=0,
+                projected_total=16,
+                configured_limit=15,
+            )
+
+        monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(gh, "get_issue_context", fake_get_issue_context)
+        monkeypatch.setattr(decomp, "create_decomposition_child_issues", fake_create)
+        plan = tmp_path / "plan.md"
+        plan.write_text("Approved plan body", encoding="utf-8")
+
+        with pytest.raises(SystemExit) as exit_info:
+            sr.cmd_run_decompose(types.SimpleNamespace(
+                issue=77,
+                repo="test/skill-repo",
+                coder="codex",
+                plan_file=str(plan),
+                workdir=str(tmp_path),
+                workdir_codex=None,
+                workdir_gemini=None,
+                workdir_antigravity=None,
+                dry_run=False,
+                flat_child_limit=15,
+            ))
+
+        assert exit_info.value.code == 2
+        output = self._last_json(capsys.readouterr().out)
+        assert output["state"] == "needs-human"
+        assert output["decision"]["guidance"].endswith("#720.")
+        assert output["would_post_checkpoint"] is False
+        assert output["would_post_parent_summary"] is False
 
     def test_existing_marker_reuses_without_running_coder(self, monkeypatch, tmp_path, capsys) -> None:
         import helpers.skill_runner as sr

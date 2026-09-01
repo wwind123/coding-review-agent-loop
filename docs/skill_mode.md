@@ -126,15 +126,18 @@ has already been approved:
   raw payload in accepted PR metadata, and stops before handoff for null-PR or
   rejected-conflict terminal results. It keeps using the durable
   `AGENT_PLAN_ONE_SHOT_IMPL` marker and is unchanged by by-phase support.
-- `run-decompose` decomposes an approved plan into child phase issues with mode
+- `run-decompose` uses typed `child_stages` directly when present, otherwise
+  decomposes an approved plan into child phase issues with mode
   `decompose-only`.
 - `run-implement-by-phase` decomposes with mode `implement-by-phase`, then
   implements phase 1 only when that phase is `agent-pr`.
 
-Both helpers already create one detailed child issue per phase; do not also
-pass `--materialize-split-issues` for the same run. See [Phased decomposition
-versus split materialization](local_agent_loop.md#phased-decomposition-versus-split-materialization)
-for the decision rule and the duplicate-issue failure mode it prevents.
+Both helpers use the shared parent-wide flat child cap (default 15, configurable
+with `--flat-child-limit`), preflight every draft before mutation, and recover
+from checkpoints and exact child identities. Over-limit requests return exit 2
+with a structured consolidation-versus-hierarchy decision referencing #720.
+Do not pass `--materialize-split-issues` to these commands; their topology is
+selected once. See [Phased decomposition versus split materialization](local_agent_loop.md#phased-decomposition-versus-split-materialization).
 - `run-pr-fix` addresses a settled blocking PR review for an externally opened
   PR. The target PR must be `OPEN`; `--reviewers` must exactly match the reviewer
   set used by the prior `run-pr-round`; and `--workdir` must be a clean,

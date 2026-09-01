@@ -51,6 +51,10 @@ DEFAULT_MAX_ROUNDS = 10
 # complex reviews and causes it to exit with "timeout waiting for response".
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3.5 Flash (Medium)",)
+# One parent-wide flat topology budget shared by decomposition and split
+# materialization.  Keeping this policy in config prevents each workflow from
+# obtaining a second allowance of children.
+DEFAULT_FLAT_CHILD_LIMIT: int = 15
 
 # Discuss-mode research policy values (#477). The CLI flag choices, the config
 # validation, and the prompt builders all derive from this set.
@@ -152,6 +156,9 @@ class AgentLoopConfig:
     # existing runs keep today's behavior; the orchestrator always warns when
     # split follow-ups would otherwise remain unfiled.
     materialize_split_issues: bool = False
+    # Maximum number of flat child issues owned by one parent.  This is shared
+    # by typed stages, model decomposition, and discuss split proposals.
+    flat_child_limit: int = DEFAULT_FLAT_CHILD_LIMIT
     # Explicit selected-stage resolution for `issue --plan-execution-mode
     # implement-one-shot` when a parent's split proposals were already fully
     # materialized into child issues (#476). None means resolve by unique
@@ -293,6 +300,8 @@ class AgentLoopConfig:
             raise AgentLoopError("--discuss-debater-timeout must be greater than zero seconds.")
         if self.salvage_comment_patch_max_bytes <= 0:
             raise AgentLoopError("--salvage-comment-patch-max-bytes must be greater than zero.")
+        if self.flat_child_limit <= 0:
+            raise AgentLoopError("--flat-child-limit must be greater than zero.")
         normalized_expected = normalize_issue_ids(
             self.expected_closing_issue_ids,
             field_name="expected_closing_issue_ids",
@@ -1071,6 +1080,7 @@ def config_from_args(
         discuss_debater_timeout=getattr(args, "discuss_debater_timeout", None),
         discuss_on_debater_failure=getattr(args, "discuss_on_debater_failure", "fail") or "fail",
         materialize_split_issues=getattr(args, "materialize_split_issues", False),
+        flat_child_limit=getattr(args, "flat_child_limit", DEFAULT_FLAT_CHILD_LIMIT),
         split_stage=getattr(args, "split_stage", None),
         salvage_comments=getattr(args, "salvage_comments", True),
         salvage_comment_patch_max_bytes=getattr(args, "salvage_comment_patch_max_bytes", 20000),

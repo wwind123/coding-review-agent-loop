@@ -108,7 +108,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.agents.base import AgentName, normalize_agent_name
 from coding_review_agent_loop.agents.registry import agent_display_name
-from coding_review_agent_loop.config import ensure_temp_checkout
+from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT, ensure_temp_checkout
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
 from coding_review_agent_loop.followups import (
     _approved_followup_from_unresolved_item,
@@ -3621,8 +3621,9 @@ def _issue_context_for_decompose_preview(repo: str, issue: int):
 
 
 def _decomposition_phase_json(index: int, phase, *, issue_url: str | None = None,
-                              issue_number: int | None = None) -> dict:
-    return {
+                              issue_number: int | None = None,
+                              origin: str | None = None) -> dict:
+    result = {
         "index": index,
         "title": phase.title,
         "phase_title": f"Phase {index}: {phase.title}",
@@ -3637,6 +3638,9 @@ def _decomposition_phase_json(index: int, phase, *, issue_url: str | None = None
         "issue_url": issue_url,
         "issue_number": issue_number,
     }
+    if origin is not None:
+        result["origin"] = origin
+    return result
 
 
 def _existing_decomposition_json(existing) -> list[dict]:
@@ -3661,6 +3665,7 @@ def _created_phase_issues_from_existing(existing):
             phase=RecordedPhase(title=title, automation=automation),
             issue_url=url,
             issue_number=number,
+            origin="adopted",
         )
         for (title, url, number), automation in zip(existing.children, existing.automation, strict=False)
     )
@@ -3684,12 +3689,16 @@ def _run_decomposition_for_skill(
 
     from coding_review_agent_loop.decomposition import (
         approved_plan_hash,
+        adapt_typed_child_stages,
         CreatedPhaseIssue,
         create_decomposition_child_issues,
         find_existing_decomposition,
+        find_existing_topology_checkpoint,
         parse_plan_decomposition,
         post_decomposition_parent_summary,
     )
+    from coding_review_agent_loop.child_topology import NeedsHumanDecision
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
     from coding_review_agent_loop.github import get_issue_context
     from helpers.prompt_builders import (
         build_plan_decomposition_prompt_for_skill,
@@ -3699,6 +3708,7 @@ def _run_decomposition_for_skill(
     config = dataclasses.replace(
         make_minimal_config(repo, coder, (coder,), reviewer=coder, workdir=str(workdir)),  # type: ignore[arg-type]
         dry_run=dry_run,
+        flat_child_limit=getattr(args, "flat_child_limit", DEFAULT_FLAT_CHILD_LIMIT),
     )
     runner = Runner(dry_run=dry_run)
     plan_hash = approved_plan_hash(approved_plan)
@@ -3722,109 +3732,181 @@ def _run_decomposition_for_skill(
             "mode": mode,
             "dry_run": dry_run,
             "reused": True,
+            "state": "reused",
+            "topology_source": existing.topology_source,
             "phase_count": existing.phase_count,
             "phases": _existing_decomposition_json(existing),
+            "adopted_children": _existing_decomposition_json(existing),
+            "created_children": [],
         }
+        if existing.retained_parent_scope is not None:
+            result["retained_parent_scope"] = {
+                "plan_subject": existing.retained_parent_scope.plan_subject,
+                "plan_hash": existing.retained_parent_scope.plan_hash,
+                "excerpt": existing.retained_parent_scope.excerpt,
+            }
         print(
             f"hint: issue #{issue} already has a {mode} decomposition for this plan.",
             file=sys.stderr,
         )
         return result, created, issue_context, config, runner, plan_hash, approved_plan, str(workdir)
 
-    prompt_text = build_plan_decomposition_prompt_for_skill(
-        issue_context, approved_plan, repo=repo, coder=coder, workdir=str(workdir),  # type: ignore[arg-type]
+    topology_source = "model"
+    retained_parent_scope = None
+    checkpoint = find_existing_topology_checkpoint(
+        issue_context.comments,
+        parent_issue=issue,
+        plan_hash=plan_hash,
+        mode=mode,
     )
+    decomposition = None
+    if checkpoint is not None:
+        from coding_review_agent_loop.decomposition import PlanDecomposition
 
-    with tempfile.TemporaryDirectory() as tmpstr:
-        tmpdir = Path(tmpstr)
-        prompt_file = tmpdir / "decompose-prompt.md"
-        raw_output = tmpdir / "decompose-raw.md"
-        usage_file = tmpdir / "decompose-usage.json"
-        _write_text(prompt_file, prompt_text)
-
-        _run_helper(
-            "helpers.run_external",
-            "--agent", coder,
-            "--role", "coder",
-            "--prompt-file", str(prompt_file),
-            "--output", str(raw_output),
-            "--workdir", str(workdir),
-            "--repo", repo,
-            "--flow", "decompose",
-            "--usage-output", str(usage_file),
-            *_run_external_antigravity_args(args),
-            *(["--dry-run"] if dry_run else []),
-        )
-        coder_output = raw_output.read_text(encoding="utf-8")
-        coder_usage: dict | None = None
-        if usage_file.exists():
-            try:
-                coder_usage = json.loads(usage_file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                coder_usage = None
-
+        decomposition = PlanDecomposition(phases=checkpoint.phases)
+        topology_source = checkpoint.topology_source
+        retained_parent_scope = checkpoint.retained_parent_scope
+    else:
         try:
-            decomposition = parse_plan_decomposition(coder_output)
-        except AgentLoopError as exc:
-            debug_dir = _REPAIR_BASE / f"{issue}-decompose-debug"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(raw_output, debug_dir / "raw.md")
-            shutil.copy2(prompt_file, debug_dir / "prompt.md")
-            print(f"skill_runner: decomposition response rejected: {exc}", file=sys.stderr)
-            print(
-                f"skill_runner: raw response saved to {debug_dir}/raw.md — fix the "
-                f"underlying issue and re-run run-decompose (non-retryable).",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        result_json: dict = {
-            "issue": issue,
-            "plan_hash": plan_hash,
-            "mode": mode,
-            "dry_run": dry_run,
-            "reused": False,
-        }
-        if dry_run:
-            result_json["would_post_parent_summary"] = True
-            created = tuple(
-                CreatedPhaseIssue(phase=phase, issue_url=None, issue_number=None)
-                for phase in decomposition.phases
-            )
-            result_json["phases"] = [
-                _decomposition_phase_json(index, item.phase)
-                for index, item in enumerate(created, start=1)
-            ]
-            print("[dry-run] would create child phase issues and post parent decomposition marker")
-        else:
-            created = create_decomposition_child_issues(
-                runner,
-                config=config,
-                parent_issue=issue,
+            parsed_plan = validate_structured_plan_state(approved_plan)
+        except AgentLoopError:
+            parsed_plan = None
+        typed_stages = (
+            parsed_plan.typed_stages.child_stages
+            if parsed_plan is not None and mode == "decompose-only"
+            else ()
+        )
+        if typed_stages:
+            decomposition, retained_parent_scope = adapt_typed_child_stages(
+                typed_stages,
                 approved_plan=approved_plan,
-                decomposition=decomposition,
+                plan_subject=_plan_subject(approved_plan),
             )
-            post_decomposition_parent_summary(
-                runner,
-                config=config,
-                parent_issue=issue,
-                mode=mode,
-                plan_hash=plan_hash,
-                created=created,
+            topology_source = "typed"
+
+    if decomposition is None:
+        prompt_text = build_plan_decomposition_prompt_for_skill(
+            issue_context,
+            approved_plan,
+            repo=repo,
+            coder=coder,
+            workdir=str(workdir),  # type: ignore[arg-type]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpstr:
+            tmpdir = Path(tmpstr)
+            prompt_file = tmpdir / "decompose-prompt.md"
+            raw_output = tmpdir / "decompose-raw.md"
+            usage_file = tmpdir / "decompose-usage.json"
+            _write_text(prompt_file, prompt_text)
+
+            _run_helper(
+                "helpers.run_external",
+                "--agent", coder,
+                "--role", "coder",
+                "--prompt-file", str(prompt_file),
+                "--output", str(raw_output),
+                "--workdir", str(workdir),
+                "--repo", repo,
+                "--flow", "decompose",
+                "--usage-output", str(usage_file),
+                *_run_external_antigravity_args(args),
+                *(["--dry-run"] if dry_run else []),
             )
-            result_json["phases"] = [
-                _decomposition_phase_json(
-                    index, created_issue.phase,
-                    issue_url=created_issue.issue_url,
-                    issue_number=created_issue.issue_number,
+            coder_output = raw_output.read_text(encoding="utf-8")
+            coder_usage: dict | None = None
+            if usage_file.exists():
+                try:
+                    coder_usage = json.loads(usage_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    coder_usage = None
+
+            try:
+                decomposition = parse_plan_decomposition(coder_output)
+            except AgentLoopError as exc:
+                debug_dir = _REPAIR_BASE / f"{issue}-decompose-debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(raw_output, debug_dir / "raw.md")
+                shutil.copy2(prompt_file, debug_dir / "prompt.md")
+                print(f"skill_runner: decomposition response rejected: {exc}", file=sys.stderr)
+                print(
+                    f"skill_runner: raw response saved to {debug_dir}/raw.md — fix the "
+                    f"underlying issue and re-run run-decompose (non-retryable).",
+                    file=sys.stderr,
                 )
-                for index, created_issue in enumerate(created, start=1)
-            ]
-        result_json["phase_count"] = len(result_json["phases"])
-        usage = _aggregate_reviewer_usage([{"usage": coder_usage}] if coder_usage else [])
-        if usage is not None:
-            result_json["usage"] = usage
-        return result_json, created, issue_context, config, runner, plan_hash, approved_plan, str(workdir)
+                sys.exit(1)
+    else:
+        coder_usage = None
+
+    result_json: dict = {
+        "issue": issue,
+        "plan_hash": plan_hash,
+        "mode": mode,
+        "dry_run": dry_run,
+        "reused": False,
+        "state": "planned",
+        "topology_source": topology_source,
+        "would_post_checkpoint": True,
+        "would_post_parent_summary": True,
+    }
+    if retained_parent_scope is not None:
+        result_json["retained_parent_scope"] = {
+            "plan_subject": retained_parent_scope.plan_subject,
+            "plan_hash": retained_parent_scope.plan_hash,
+            "excerpt": retained_parent_scope.excerpt,
+        }
+    created = create_decomposition_child_issues(
+        runner,
+        config=config,
+        parent_issue=issue,
+        approved_plan=approved_plan,
+        decomposition=decomposition,
+        topology_source=topology_source,
+        issue_comments=issue_context.comments,
+        mode=mode,
+        retained_parent_scope=retained_parent_scope,
+    )
+    if isinstance(created, NeedsHumanDecision):
+        result_json["state"] = "needs-human"
+        result_json["decision"] = created.as_dict()
+        result_json["would_post_checkpoint"] = False
+        result_json["would_post_parent_summary"] = False
+        result_json["adopted_children"] = []
+        result_json["created_children"] = []
+        result_json["phases"] = []
+        result_json["phase_count"] = 0
+        return result_json, (), issue_context, config, runner, plan_hash, approved_plan, str(workdir)
+    if not dry_run:
+        post_decomposition_parent_summary(
+            runner,
+            config=config,
+            parent_issue=issue,
+            mode=mode,
+            plan_hash=plan_hash,
+            created=created,
+            topology_source=topology_source,
+            retained_parent_scope=retained_parent_scope,
+        )
+    result_json["phases"] = [
+        _decomposition_phase_json(
+            index, created_issue.phase,
+            issue_url=None if dry_run else created_issue.issue_url,
+            issue_number=None if dry_run else created_issue.issue_number,
+            origin=created_issue.origin,
+        )
+        for index, created_issue in enumerate(created, start=1)
+    ]
+    result_json["adopted_children"] = [
+        phase for phase in result_json["phases"] if phase.get("origin") == "adopted"
+    ]
+    result_json["created_children"] = [
+        phase for phase in result_json["phases"] if phase.get("origin") == "created"
+    ]
+    result_json["phase_count"] = len(result_json["phases"])
+    usage = _aggregate_reviewer_usage([{"usage": coder_usage}] if coder_usage else [])
+    if usage is not None:
+        result_json["usage"] = usage
+    return result_json, created, issue_context, config, runner, plan_hash, approved_plan, str(workdir)
 
 
 def cmd_run_decompose(args: argparse.Namespace) -> None:
@@ -3838,6 +3920,8 @@ def cmd_run_decompose(args: argparse.Namespace) -> None:
         mode="decompose-only",
     )
     print(json.dumps(result_json, indent=2))
+    if result_json.get("state") == "needs-human":
+        sys.exit(2)
 
 
 # ---------------------------------------------------------------------------
@@ -3883,6 +3967,10 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         approved_plan=approved_plan,
     )
 
+    if decomposition_result.get("state") == "needs-human":
+        print(json.dumps(decomposition_result, indent=2))
+        sys.exit(2)
+
     if not created:
         raise AgentLoopError("Plan decomposition produced no phases.")
 
@@ -3892,7 +3980,11 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         "plan_hash": plan_hash,
         "mode": mode,
         "dry_run": dry_run,
+        "state": "ready",
+        "topology_source": decomposition_result.get("topology_source", "model"),
         "decomposition_reused": bool(decomposition_result.get("reused")),
+        "adopted_children": decomposition_result.get("adopted_children", []),
+        "created_children": decomposition_result.get("created_children", []),
         "phase": _decomposition_phase_json(
             1,
             first_phase.phase,
@@ -3900,6 +3992,8 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
             issue_number=first_phase.issue_number,
         ),
     }
+    if "retained_parent_scope" in decomposition_result:
+        result_json["retained_parent_scope"] = decomposition_result["retained_parent_scope"]
 
     if first_phase.phase.automation != "agent-pr":
         result_json.update({
@@ -4245,6 +4339,10 @@ def main() -> None:
     p_impl_phase.add_argument("--workdir-gemini", default=None)
     p_impl_phase.add_argument("--workdir-antigravity", default=None)
     p_impl_phase.add_argument("--dry-run", action="store_true")
+    p_impl_phase.add_argument(
+        "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
+        help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",
+    )
     _add_antigravity_options(p_impl_phase)
 
     # run-decompose
@@ -4266,6 +4364,10 @@ def main() -> None:
     p_decompose.add_argument("--workdir-gemini", default=None)
     p_decompose.add_argument("--workdir-antigravity", default=None)
     p_decompose.add_argument("--dry-run", action="store_true")
+    p_decompose.add_argument(
+        "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
+        help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",
+    )
     _add_antigravity_options(p_decompose)
 
     # run-task-round

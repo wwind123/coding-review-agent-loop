@@ -32,6 +32,7 @@ from .config import (
 from .decomposition import (
     _decode_json_payload,
     CreatedPhaseIssue,
+    PlanDecomposition,
     RecordedPhase,
     approved_plan_hash,
     create_decomposition_child_issues,
@@ -43,7 +44,12 @@ from .decomposition import (
     post_decomposition_parent_summary,
     post_one_shot_impl_handoff_comment,
     post_phase_implementation_handoff_comment,
+    adapt_typed_child_stages,
+    find_existing_topology_checkpoint,
+    post_topology_checkpoint,
+    TopologyCheckpoint,
 )
+from .child_topology import NeedsHumanDecision
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
@@ -3979,7 +3985,7 @@ def _handle_plan_first_split_scope(
     current_plan: str,
     plan_subject: str,
     issue_context: IssueContext,
-) -> bool:
+) -> bool | NeedsHumanDecision:
     """Materialize (or warn about) split/deferred stages before implementation
     handoff (#476), so a plan-first run that narrows scope to one stage cannot
     silently leave the rest unfiled (the #467/#474 gap).
@@ -3991,6 +3997,12 @@ def _handle_plan_first_split_scope(
     `issue_context.comments` snapshot predates this call and would otherwise
     look stale and hide children materialized moments earlier in this same run.
     """
+    # Decomposition modes have exactly one topology source and are dispatched
+    # below.  Keeping split materialization out of this seam prevents typed
+    # stages from being filed once here and again by the decomposition path.
+    if config.plan_execution_mode in {"decompose-only", "implement-by-phase"}:
+        return False
+
     current_deferred_stages = _extract_current_deferred_stages(current_plan)
     current_child_stages = _extract_current_child_stages(current_plan)
     _log_typed_plan_stage_dispositions(current_plan, config=config)
@@ -4014,7 +4026,7 @@ def _handle_plan_first_split_scope(
     )
     if remaining_proposals:
         if config.materialize_split_issues:
-            materialize_split_proposals(
+            materialized = materialize_split_proposals(
                 runner,
                 config=config,
                 parent_issue=issue_number,
@@ -4022,6 +4034,8 @@ def _handle_plan_first_split_scope(
                 proposals=remaining_proposals,
                 issue_comments=issue_context.comments,
             )
+            if isinstance(materialized, NeedsHumanDecision):
+                return materialized
             return True
         log(
             config,
@@ -4663,7 +4677,7 @@ def _decompose_approved_plan(
     mode: str,
     coder_session_id: str | None,
     usage_context: RunUsageContext,
-) -> tuple[CreatedPhaseIssue, ...]:
+) -> tuple[CreatedPhaseIssue, ...] | NeedsHumanDecision:
     plan_hash = approved_plan_hash(approved_plan)
     existing = find_existing_decomposition(
         issue_context.comments,
@@ -4682,33 +4696,64 @@ def _decompose_approved_plan(
             for (title, url, number), automation in zip(existing.children, existing.automation, strict=False)
         )
 
-    coder_name = agent_display_name(config.coder)
-    log(config, f"Planning approved; invoking {coder_name} to decompose issue #{issue_number}")
-    decomposition_response = _run_validated_agent(
-        runner,
-        agent=config.coder,
-        config=config,
-        prompt=build_plan_decomposition_prompt(
-            issue_number,
-            approved_plan,
-            config,
-            memory,
-            issue_context=issue_context,
-        ),
-        session_id=coder_session_id,
-        marker_description="plan decomposition JSON",
-        validate=parse_plan_decomposition,
-        usage_context=usage_context,
-        operation_description="plan decomposition",
+    checkpoint = find_existing_topology_checkpoint(
+        issue_context.comments,
+        parent_issue=issue_number,
+        plan_hash=plan_hash,
+        mode=mode,
     )
-    decomposition = decomposition_response.marker_value
+    retained_parent_scope = None
+    topology_source = "model"
+    if checkpoint is not None:
+        # A checkpoint is the normalized model/typed output.  Reuse it before
+        # invoking a coder so a create-before-summary failure is resumable.
+        decomposition = PlanDecomposition(phases=checkpoint.phases)
+        topology_source = checkpoint.topology_source
+        retained_parent_scope = checkpoint.retained_parent_scope
+    elif mode == "decompose-only":
+        typed_stages = _extract_current_child_stages(approved_plan)
+        if typed_stages:
+            decomposition, retained_parent_scope = adapt_typed_child_stages(
+                typed_stages,
+                approved_plan=approved_plan,
+                plan_subject=_plan_subject(approved_plan),
+            )
+            topology_source = "typed"
+
+    if checkpoint is None and topology_source == "model":
+        coder_name = agent_display_name(config.coder)
+        log(config, f"Planning approved; invoking {coder_name} to decompose issue #{issue_number}")
+        decomposition_response = _run_validated_agent(
+            runner,
+            agent=config.coder,
+            config=config,
+            prompt=build_plan_decomposition_prompt(
+                issue_number,
+                approved_plan,
+                config,
+                memory,
+                issue_context=issue_context,
+            ),
+            session_id=coder_session_id,
+            marker_description="plan decomposition JSON",
+            validate=parse_plan_decomposition,
+            usage_context=usage_context,
+            operation_description="plan decomposition",
+        )
+        decomposition = decomposition_response.marker_value
     created = create_decomposition_child_issues(
         runner,
         config=config,
         parent_issue=issue_number,
         approved_plan=approved_plan,
         decomposition=decomposition,
+        topology_source=topology_source,
+        issue_comments=issue_context.comments,
+        mode=mode,
+        retained_parent_scope=retained_parent_scope,
     )
+    if isinstance(created, NeedsHumanDecision):
+        return created
     post_decomposition_parent_summary(
         runner,
         config=config,
@@ -4716,6 +4761,8 @@ def _decompose_approved_plan(
         mode=mode,
         plan_hash=plan_hash,
         created=created,
+        topology_source=topology_source,
+        retained_parent_scope=retained_parent_scope,
     )
     return created
 
@@ -5535,6 +5582,9 @@ def _run_plan_first_loop(
                 plan_subject=plan_subject,
                 issue_context=issue_context,
             )
+            if isinstance(split_scope_materialized, NeedsHumanDecision):
+                print(json.dumps(split_scope_materialized.as_dict(), sort_keys=True))
+                return 2
             if split_scope_materialized:
                 # Refetch so downstream logic (selected-stage resolution below,
                 # decomposition, etc.) sees the `AGENT_DISCUSS_SPLIT` comment
@@ -5559,6 +5609,9 @@ def _run_plan_first_loop(
                     coder_session_id=coder_session_id,
                     usage_context=usage_context,
                 )
+                if isinstance(created, NeedsHumanDecision):
+                    print(json.dumps(created.as_dict(), sort_keys=True))
+                    return 2
                 if mode == "decompose-only":
                     print(f"Issue #{issue_number} approved plan decomposed into child issues.")
                     return 0
@@ -5573,6 +5626,12 @@ def _run_plan_first_loop(
                     print(
                         f"Issue #{issue_number} approved plan decomposed; first phase requires human work "
                         f"({first_phase.phase.automation}), so implementation is stopping."
+                    )
+                    return 0
+                if config.dry_run:
+                    print(
+                        f"Issue #{issue_number} dry-run decomposed the approved plan; "
+                        "phase implementation is not started."
                     )
                     return 0
                 if first_agent_phase is None or first_agent_phase.issue_number is None:
@@ -9203,7 +9262,7 @@ def _handle_discuss_split_outcome(
     final_votes: Sequence[ParsedDiscussReview],
     issue_comments: Sequence[object],
     post_warning_comment: bool,
-) -> None:
+) -> NeedsHumanDecision | None:
     """Materialize (or warn about) a discuss `split` consensus's proposed sub-issues (#476).
 
     Called both when the final summary is freshly posted and on a resumed/
@@ -9221,7 +9280,7 @@ def _handle_discuss_split_outcome(
         rationale = tuple(
             (vote.reviewer, vote.rationale) for vote in final_votes if vote.outcome == "split"
         )
-        materialize_split_proposals(
+        result = materialize_split_proposals(
             runner,
             config=config,
             parent_issue=issue_number,
@@ -9230,6 +9289,8 @@ def _handle_discuss_split_outcome(
             rationale=rationale,
             issue_comments=issue_comments,
         )
+        if isinstance(result, NeedsHumanDecision):
+            return result
         return
     log(
         config,
@@ -10033,7 +10094,7 @@ def _run_discuss_loop(
         recovered = _resolve_final_split_proposals()
         if recovered is not None:
             split_proposals, final_votes = recovered
-            _handle_discuss_split_outcome(
+            split_result = _handle_discuss_split_outcome(
                 runner,
                 issue_number=issue_number,
                 config=config,
@@ -10043,6 +10104,9 @@ def _run_discuss_loop(
                 issue_comments=issue_context.comments,
                 post_warning_comment=False,
             )
+            if isinstance(split_result, NeedsHumanDecision):
+                print(json.dumps(split_result.as_dict(), sort_keys=True))
+                return 2
         elif config.materialize_split_issues:
             log(
                 config,
@@ -10531,7 +10595,7 @@ def _run_discuss_loop(
                 f"(outcome: {outcome}; kind: {consensus_kind})",
             )
             if outcome == "split":
-                _handle_discuss_split_outcome(
+                split_result = _handle_discuss_split_outcome(
                     runner,
                     issue_number=issue_number,
                     config=config,
@@ -10541,6 +10605,9 @@ def _run_discuss_loop(
                     issue_comments=issue_context.comments,
                     post_warning_comment=True,
                 )
+                if isinstance(split_result, NeedsHumanDecision):
+                    print(json.dumps(split_result.as_dict(), sort_keys=True))
+                    return 2
             return 0
         log(
             config,

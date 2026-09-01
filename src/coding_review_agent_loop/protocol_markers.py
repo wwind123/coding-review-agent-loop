@@ -61,6 +61,17 @@ def _canonical_compressed_mapping(match: re.Match[str], *, token: str) -> str:
     return f"<!-- {token}: {canonical} -->"
 
 
+def _canonical_checkpoint(match: re.Match[str]) -> str:
+    """Accept legacy raw checkpoints while emitting the compact form."""
+    encoded = match.group("payload")
+    if not encoded.startswith("v1_"):
+        value = _decode_b64_json(encoded)
+        return f"<!-- AGENT_PLAN_TOPOLOGY_CHECKPOINT: {_b64_json(value)} -->"
+    return _canonical_compressed_mapping(
+        match, token="AGENT_PLAN_TOPOLOGY_CHECKPOINT"
+    )
+
+
 def _canonical_raw_json(match: re.Match[str], *, token: str) -> str:
     value = json.loads(match.group("payload"))
     return f"<!-- {token} {json.dumps(value, separators=(',', ':'), sort_keys=True)} -->"
@@ -215,6 +226,20 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
         _b64_definition("AGENT_TYPED_PLAN_STAGES", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_DEFERRED_STAGES", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_PLAN_DECOMPOSITION", surfaces=_ISSUE_ONLY),
+        MarkerDefinition(
+            token="AGENT_PLAN_TOPOLOGY_CHECKPOINT",
+            pattern=re.compile(
+                r"<!--\s*AGENT_PLAN_TOPOLOGY_CHECKPOINT:\s*"
+                r"(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+                re.I,
+            ),
+            strictness="well-formed-only",
+            codec="compressed-mapping",
+            surfaces=_ISSUE_ONLY,
+            safe_label="[protocol topology checkpoint record]",
+            canonicalizer=_canonical_checkpoint,
+        ),
+        _b64_definition("AGENT_PLAN_PHASE_IDENTITY", surfaces=_ISSUE),
         _b64_definition("AGENT_PLAN_PHASE_IMPLEMENTATION", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_PLAN_ONE_SHOT_IMPL", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_DISCUSS_SPLIT", surfaces=_ISSUE_ONLY),

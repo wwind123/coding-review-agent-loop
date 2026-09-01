@@ -120,6 +120,9 @@ class PullRequestMergeability:
 
 PR_METADATA_FIELDS = "number,title,headRefName,baseRefName,headRefOid,url,body"
 PR_REVIEW_CONTEXT_FIELDS = f"{PR_METADATA_FIELDS},comments,reviews"
+# Recovery searches must not inherit gh's small default page size: a parent
+# may have hundreds of unrelated issues before its child topology is found.
+ISSUE_RECOVERY_SEARCH_LIMIT = 100_000
 
 # This intentionally remains looser than the recovery parser below.  It is
 # used by PR review context inference, where a same-repository issue URL is
@@ -1844,6 +1847,8 @@ def search_issues(
                 search,
                 "--state",
                 state,
+                "--limit",
+                str(ISSUE_RECOVERY_SEARCH_LIMIT),
                 "--json",
                 "number,title,url,body",
             ],
@@ -1861,6 +1866,8 @@ def search_issues(
             search,
             "--state",
             state,
+            "--limit",
+            str(ISSUE_RECOVERY_SEARCH_LIMIT),
             "--json",
             "number,title,url,body",
         ],

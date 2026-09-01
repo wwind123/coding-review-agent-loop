@@ -78,7 +78,6 @@ from coding_review_agent_loop.comment_rendering import (
 )
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
-    MAX_DECOMPOSITION_PHASES,
     RecordedPhase,
     approved_plan_hash,
     find_existing_phase_implementation_handoff,
