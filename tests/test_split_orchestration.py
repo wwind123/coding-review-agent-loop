@@ -9,11 +9,12 @@ from coding_review_agent_loop.decomposition import (
     approved_plan_hash,
     format_one_shot_impl_handoff_comment,
 )
-from coding_review_agent_loop.github import validate_pr_body_does_not_close_issue
+from coding_review_agent_loop.github import IssueContext, validate_pr_body_does_not_close_issue
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
     _attach_round_metadata,
+    _handle_plan_first_split_scope,
     _log_typed_plan_stage_dispositions,
     _plan_subject,
 )
@@ -243,6 +244,28 @@ def test_plan_first_no_prior_split_warns_when_materialization_disabled(tmp_path)
 
     assert runner.issues == []
     assert any("NOT filed as issues" in comment and "Auth flow" in comment for comment in runner.comments)
+
+
+def test_plan_first_scope_narrowing_warning_posts_trusted_marker(tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path)
+    plan = "Implement one focused PR. File a follow-up issue only if dev telemetry differs."
+    subject = _plan_subject(plan)
+
+    result = _handle_plan_first_split_scope(
+        runner,
+        issue_number=56,
+        config=config,
+        current_plan=plan,
+        plan_subject=subject,
+        issue_context=IssueContext(56, config.repo, "Title", "Body", None, ()),
+    )
+
+    assert result is False
+    warning = next(
+        comment for comment in runner.comments if "Possible unfiled scope narrowing" in comment
+    )
+    assert f"<!-- AGENT_SPLIT_UNFILED_WARNING: issue=56 subject={subject} -->" in warning
 
 
 def test_plan_first_selected_stage_handoff_by_unique_title_match(tmp_path):
