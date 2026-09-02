@@ -4068,20 +4068,23 @@ def _handle_plan_first_split_scope(
         runner,
         config=config,
         issue_number=issue_number,
-        body="\n".join(
-            [
-                "### Possible unfiled scope narrowing",
-                "",
-                "The approved plan's text appears to narrow scope (mentions a stage, "
-                "follow-up issue, or out-of-scope work), but no `deferred_stages` were "
-                "structurally declared and no discuss split proposals exist for this issue. "
-                "If this plan intentionally defers work, declare it via `deferred_stages` in a "
-                "future revision or file the follow-up issue(s) manually. This is a heuristic "
-                "warning only; the orchestrator never auto-creates issues from prose.",
-                "",
-                f"<!-- AGENT_SPLIT_UNFILED_WARNING: issue={issue_number} subject={plan_subject} -->",
-                "-- coding-review-agent-loop",
-            ]
+        body=TrustedBody.canonical(
+            "\n".join(
+                [
+                    "### Possible unfiled scope narrowing",
+                    "",
+                    "The approved plan's text appears to narrow scope (mentions a stage, "
+                    "follow-up issue, or out-of-scope work), but no `deferred_stages` were "
+                    "structurally declared and no discuss split proposals exist for this issue. "
+                    "If this plan intentionally defers work, declare it via `deferred_stages` in a "
+                    "future revision or file the follow-up issue(s) manually. This is a heuristic "
+                    "warning only; the orchestrator never auto-creates issues from prose.",
+                    "",
+                    f"<!-- AGENT_SPLIT_UNFILED_WARNING: issue={issue_number} subject={plan_subject} -->",
+                    "-- coding-review-agent-loop",
+                ]
+            ),
+            expected_tokens=("AGENT_SPLIT_UNFILED_WARNING",),
         ),
     )
     return False
