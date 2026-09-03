@@ -80,6 +80,16 @@ def test_readme_documents_ci_watcher_controls():
     assert "`--ci-poll-interval-seconds` (default 30)" in section
 
 
+def test_readme_describes_tests_directory_as_test_modules():
+    readme_text = README.read_text(encoding="utf-8")
+    section_start = readme_text.index("## Development")
+    section_end = readme_text.index("## Related Tools", section_start)
+    section = " ".join(readme_text[section_start:section_end].split())
+
+    assert "Browse the focused test modules in [`tests/`](tests/)" in section
+    assert "module map in [`tests/`](tests/)" not in section
+
+
 def test_cli_help_points_to_decision_section():
     parser = build_parser()
     issue_parser = None
