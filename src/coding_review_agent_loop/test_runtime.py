@@ -219,6 +219,14 @@ def _relative_or_basename(value: str, cwd: Path) -> str:
     return value
 
 
+def _inner_command(argv: Sequence[str]) -> tuple[str, ...]:
+    try:
+        parsed = parse_managed_test_invocation(argv)
+    except TestRuntimeConfigurationError:
+        parsed = None
+    return parsed.inner_argv if parsed is not None else tuple(str(item) for item in argv)
+
+
 def normalize_test_command(argv: Sequence[str], *, cwd: Path | None = None) -> str:
     """Canonicalize wrapper spellings while retaining meaningful inner argv."""
     base = (cwd or Path.cwd()).resolve()
@@ -261,6 +269,7 @@ def _hash_file(path: Path) -> str:
 def build_input_manifest(argv: Sequence[str], cwd: Path) -> dict[str, str]:
     """Hash cheap, command-relevant checkout inputs without inventory commands."""
     root = cwd.resolve()
+    argv = _inner_command(argv)
     names = {
         "pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg", "package.json",
         "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock",
@@ -305,10 +314,22 @@ def build_input_manifest(argv: Sequence[str], cwd: Path) -> dict[str, str]:
     return manifest
 
 
+def _resolve_executable(argv: Sequence[str], cwd: Path, values: Mapping[str, str]) -> str:
+    inner = _inner_command(argv)
+    if not inner:
+        return ""
+    raw = inner[0]
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+    if raw.startswith((".", "~")) or candidate.parent != Path("."):
+        return str((cwd / candidate).resolve(strict=False))
+    return shutil.which(raw, path=values.get("PATH")) or raw
+
+
 def environment_fingerprint(argv: Sequence[str], cwd: Path, *, env: Mapping[str, str] | None = None) -> str:
     values = env if env is not None else os.environ
-    executable = str(argv[0]) if argv else ""
-    executable_path = shutil.which(executable) or executable
+    executable_path = _resolve_executable(argv, cwd, values)
     try:
         stat = os.stat(executable_path)
         version = f"mtime:{stat.st_mtime_ns}:size:{stat.st_size}"
@@ -528,23 +549,35 @@ def recommend_timeout(
         if row.get("input_manifest") != current_manifest:
             continue
         matching.append(row)
-    successes = [row for row in matching if row.get("outcome") == "passed" and isinstance(row.get("elapsed_seconds"), (int, float))]
+    timestamped: list[tuple[datetime, int, dict]] = []
+    for index, row in enumerate(matching):
+        stamp = _timestamp(row.get("timestamp"))
+        if stamp is not None:
+            timestamped.append((stamp, index, row))
+    timestamped.sort(key=lambda item: (item[0], item[1]))
+    ordered = [row for _stamp, _index, row in timestamped]
+    successes = [row for row in ordered if row.get("outcome") == "passed" and isinstance(row.get("elapsed_seconds"), (int, float))]
     success_values = [float(row["elapsed_seconds"]) for row in successes]
-    latest_success = max(success_values) if success_values else None
-    timeout_values = [
-        float(row["attempted_timeout_seconds"])
-        for row in matching
-        if row.get("outcome") == "timed_out" and isinstance(row.get("attempted_timeout_seconds"), (int, float))
-        and (latest_success is None or float(row["attempted_timeout_seconds"]) > latest_success)
-    ]
-    unresolved = max(timeout_values) if timeout_values else None
+    latest_success = next(
+        (
+            float(row["elapsed_seconds"])
+            for row in reversed(ordered)
+            if row.get("outcome") == "passed" and isinstance(row.get("elapsed_seconds"), (int, float))
+        ),
+        None,
+    )
+    unresolved: float | None = None
+    for row in ordered:
+        if row.get("outcome") == "timed_out" and isinstance(row.get("attempted_timeout_seconds"), (int, float)):
+            unresolved = float(row["attempted_timeout_seconds"])
+        elif row.get("outcome") == "passed":
+            unresolved = None
     candidate = ceiling
     if success_values:
         candidate = max(0, _next_minute(max(1.25 * _nearest_rank(success_values, 0.95), latest_success + 60)))
     if unresolved is not None:
         candidate = max(candidate, _next_minute(max(1.5 * unresolved, unresolved + 300)))
     clamped = min(ceiling, candidate)
-    latest_stamp = max((_timestamp(row.get("timestamp")) for row in matching if _timestamp(row.get("timestamp"))), default=None)
     freshness = "fresh" if matching else "unknown"
     confidence = "high" if len(success_values) >= 3 else ("sparse/low-confidence" if success_values else "unknown")
     insufficient = unresolved is not None and candidate > ceiling

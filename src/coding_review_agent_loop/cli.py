@@ -19,7 +19,6 @@ from .config import (
     DEFAULT_REPAIR_MODELS,
     DEFAULT_FLAT_CHILD_LIMIT,
     DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
-    DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
     AgentLoopConfig,
     config_from_args,
     ensure_agent_workdirs,
@@ -65,6 +64,7 @@ from .prompts import (
 from .protocol import is_clarification_request, parse_agent_state, parse_pr_number
 from .runner import CommandResult, Runner, ensure_log_dir_ignored, run_foreground_test, tail_text
 from .test_runtime import (
+    DEFAULT_TEST_TIMEOUT_SECONDS,
     TestRuntimeConfigurationError,
     inherited_timeout_ceiling,
     record_test_observation,
@@ -339,11 +339,11 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--coder-test-command-timeout-seconds",
             type=float,
-            default=DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+            default=DEFAULT_TEST_TIMEOUT_SECONDS,
             metavar="SECONDS",
             help=(
                 "Finite run-level ceiling and unknown-command watchdog for local coder test "
-                f"commands (default: {DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS}). Known commands "
+                f"commands (default: {DEFAULT_TEST_TIMEOUT_SECONDS}). Known commands "
                 "may use a smaller learned recommendation."
             ),
         )

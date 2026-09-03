@@ -4506,3 +4506,51 @@ class TestWorkdirAntigravityParser:
             captured,
         )
         assert captured.get("workdir_antigravity") == "/tmp/agy"
+
+
+class TestCoderTimeoutParser:
+    @pytest.mark.parametrize(
+        ("argv", "handler"),
+        [
+            (
+                [
+                    "sr", "run-implement", "--issue", "1", "--repo", "o/r",
+                    "--coder", "codex", "--plan-file", "/dev/null",
+                    "--coder-test-command-timeout-seconds", "7200",
+                ],
+                "cmd_run_implement",
+            ),
+            (
+                [
+                    "sr", "run-pr-fix", "--pr", "1", "--repo", "o/r",
+                    "--coder", "codex", "--reviewers", "codex",
+                    "--coder-test-command-timeout-seconds", "7200",
+                ],
+                "cmd_run_pr_fix",
+            ),
+            (
+                [
+                    "sr", "run-implement-by-phase", "--issue", "1", "--repo", "o/r",
+                    "--coder", "codex", "--plan-file", "/dev/null",
+                    "--coder-test-command-timeout-seconds", "7200",
+                ],
+                "cmd_run_implement_by_phase",
+            ),
+            (
+                [
+                    "sr", "run-decompose", "--issue", "1", "--repo", "o/r",
+                    "--coder", "codex", "--plan-file", "/dev/null",
+                    "--coder-test-command-timeout-seconds", "7200",
+                ],
+                "cmd_run_decompose",
+            ),
+        ],
+    )
+    def test_coder_timeout_override_is_accepted(self, monkeypatch, argv, handler):
+        import helpers.skill_runner as sr
+
+        captured = {}
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setattr(sr, handler, lambda args: captured.update(vars(args)))
+        sr.main()
+        assert captured["coder_test_command_timeout_seconds"] == 7200

@@ -27,8 +27,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from coding_review_agent_loop.config import DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS
 from coding_review_agent_loop.runner import Runner
+from coding_review_agent_loop.test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 
 _CANNED_PLAN_REVIEW = json.dumps(
     {
@@ -226,11 +226,11 @@ def main() -> None:
     parser.add_argument(
         "--coder-test-command-timeout-seconds",
         type=float,
-        default=DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+        default=DEFAULT_TEST_TIMEOUT_SECONDS,
         metavar="SECONDS",
         help=(
             "Finite run-level ceiling inherited by coder test wrappers "
-            f"(default: {DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS})."
+            f"(default: {DEFAULT_TEST_TIMEOUT_SECONDS})."
         ),
     )
     args = parser.parse_args()

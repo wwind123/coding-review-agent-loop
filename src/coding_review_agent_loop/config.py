@@ -20,6 +20,7 @@ from .expected_closure import normalize_issue_ids
 from .github import PullRequestMetadata, detect_repo, get_repo_default_branch
 from .logging import datetime_stamp, log
 from .runner import Runner
+from .test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from .workdirs import active_workdir, agent_workdir
 
 # Single source of truth for the Antigravity quota-exhaustion fallback signatures
@@ -56,10 +57,6 @@ DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3.7 Flash (Medium)",)
 # materialization.  Keeping this policy in config prevents each workflow from
 # obtaining a second allowance of children.
 DEFAULT_FLAT_CHILD_LIMIT: int = 15
-# Run-level ceiling for one local coder test command.  Learned recommendations
-# may select a smaller watchdog, but never exceed this policy value.
-DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS: int = 1800
-
 # Discuss-mode research policy values (#477). The CLI flag choices, the config
 # validation, and the prompt builders all derive from this set.
 DISCUSS_RESEARCH_MODES: frozenset[str] = frozenset({"none", "required", "auto"})
@@ -238,7 +235,7 @@ class AgentLoopConfig:
     base_provenance: str | None = None
     # Finite run-level ceiling for local coder test commands.  Kept at the end
     # with a default so direct AgentLoopConfig callers remain source-compatible.
-    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS
+    coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -1104,7 +1101,7 @@ def config_from_args(
         coder_test_command_timeout_seconds=getattr(
             args,
             "coder_test_command_timeout_seconds",
-            DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+            DEFAULT_TEST_TIMEOUT_SECONDS,
         ),
         pre_review_tests=args.pre_review_tests,
         ci_timeout_seconds=args.ci_timeout_seconds,

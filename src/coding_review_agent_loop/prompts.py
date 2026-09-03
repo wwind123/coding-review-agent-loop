@@ -78,35 +78,69 @@ def format_agent_list(agents: Sequence[AgentName]) -> str:
 def _memory_block(
     memory: AgentMemoryContext | None,
     config: AgentLoopConfig | None = None,
+    *,
+    include_runtime: bool = False,
 ) -> str:
     text = format_agent_memory_context(memory)
     if not text:
         return ""
     runtime = ""
-    if config is not None and config.test_command:
-        runtime_text = render_runtime_context(
-            memory.memory_dir,
-            commands=(config.test_command,),
-            cwd=agent_workdir(config, config.coder),
-            policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
-        )
-        recommendation = recommend_timeout(
-            memory.memory_dir,
-            argv=config.test_command,
-            cwd=agent_workdir(config, config.coder),
-            policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
-        )
-        wrapper = render_test_wrapper(
-            config.test_command,
-            timeout_seconds=(recommendation.recommended_timeout_seconds
-                             if recommendation.successful_samples or recommendation.unresolved_timeout_seconds
-                             else None),
-            memory_dir=memory.memory_dir,
-        )
+    if include_runtime and config is not None:
+        cwd = agent_workdir(config, config.coder)
+        commands: list[tuple[str, ...]] = []
+        seen: set[tuple[str, ...]] = set()
+        if config.test_command:
+            commands.append(tuple(config.test_command))
+            seen.add(tuple(config.test_command))
+        for observation in memory.runtime_observations:
+            normalized = observation.get("normalized_command")
+            if not isinstance(normalized, str) or not normalized.strip():
+                continue
+            try:
+                command = tuple(shlex.split(normalized))
+            except ValueError:
+                continue
+            if command and command not in seen:
+                commands.append(command)
+                seen.add(command)
+        commands = commands[:6]
+        if commands:
+            runtime_text = render_runtime_context(
+                memory.memory_dir,
+                commands=commands,
+                cwd=cwd,
+                policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
+            )
+            invocation_lines = []
+            for command in commands:
+                recommendation = recommend_timeout(
+                    memory.memory_dir,
+                    argv=command,
+                    cwd=cwd,
+                    policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
+                )
+                wrapper = render_test_wrapper(
+                    command,
+                    timeout_seconds=(
+                        recommendation.recommended_timeout_seconds
+                        if recommendation.successful_samples or recommendation.unresolved_timeout_seconds
+                        else None
+                    ),
+                    memory_dir=memory.memory_dir,
+                )
+                invocation_lines.append(f"  Invocation guidance: {wrapper}")
+            invocation_guidance = "\n".join(invocation_lines)
+        else:
+            runtime_text = "- No observed local test timings are available for this checkout."
+            placeholder_command = ("<test-command>",)
+            invocation_guidance = (
+                "  Invocation guidance: "
+                f"{render_test_wrapper(placeholder_command, memory_dir=memory.memory_dir)}"
+            )
         runtime = (
             "\n\nObserved local test timing (advisory):\n"
             f"{runtime_text}\n"
-            f"  Invocation guidance: {wrapper}\n"
+            f"{invocation_guidance}\n"
             "  The wrapper watchdog is for the whole command; omit --timeout-seconds for an "
             "unknown command to select the inherited configured ceiling."
         )
@@ -1396,7 +1430,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
     coder_signature=coder_signature,
 )}
 {_issue_context_block(issue_context)}
-{_memory_block(memory, config)}
+{_memory_block(memory, config, include_runtime=True)}
 {_salvage_summary_block(salvage_summary)}
 
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
@@ -1461,7 +1495,7 @@ prose between the JSON object and footer.
     ),
 )}
 {_issue_context_block(issue_context)}
-{_memory_block(memory, config)}
+{_memory_block(memory, config, include_runtime=True)}
 
 {_agent_unavailable_guidance(coder_signature)}
 Do not wait for {reviewer_name} yourself; this local orchestrator will run
@@ -1801,7 +1835,7 @@ branch, commit, push, or open a pull request during this planning stage.
     ),
 )}
 {_issue_context_block(issue_context)}
-{unresolved_items_block}{_memory_block(memory, config)}
+{unresolved_items_block}{_memory_block(memory, config, include_runtime=True)}
 
 Previous plan:
 
@@ -1996,7 +2030,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
     coder_signature=coder_signature,
 )}
 {_issue_context_block(issue_context)}
-{_memory_block(memory, config)}
+{_memory_block(memory, config, include_runtime=True)}
 {_salvage_summary_block(salvage_summary)}
 
 Approved implementation plan:
@@ -2064,7 +2098,7 @@ def build_task_prompt(
 
 Task:
 {task_text}
-{_memory_block(memory, config)}
+{_memory_block(memory, config, include_runtime=True)}
 
 Use this local checkout as your workspace. Decide between two paths:
 {_coder_workdir_guidance(config)}
@@ -2120,7 +2154,7 @@ def build_task_clarification_prompt(
 
 Original task:
 {task_text}
-{_memory_block(memory, config)}
+{_memory_block(memory, config, include_runtime=True)}
 
 Clarification so far:
 
@@ -2750,7 +2784,7 @@ Do not create a new PR.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
-{_memory_block(memory, config)}
+{_memory_block(memory, config, include_runtime=True)}
 
 {reviewer_name} review:
 
@@ -2799,7 +2833,7 @@ remains blocked pending another review round after this cleanup.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
-{_memory_block(memory, config)}
+{_memory_block(memory, config, include_runtime=True)}
 
 Same-PR follow-ups:
 
@@ -2853,7 +2887,7 @@ against the new head after your push.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_documentation_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
-{_memory_block(memory, config)}
+{_memory_block(memory, config, include_runtime=True)}
 
 Other unresolved reviewer items carried into this round (address them in the same \
 push if practical, alongside the conflict resolution):

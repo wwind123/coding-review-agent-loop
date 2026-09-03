@@ -109,7 +109,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from coding_review_agent_loop.agents.base import AgentName, normalize_agent_name
 from coding_review_agent_loop.agents.registry import agent_display_name
 from coding_review_agent_loop.config import (
-    DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_FLAT_CHILD_LIMIT,
     ensure_temp_checkout,
 )
@@ -120,9 +119,11 @@ from coding_review_agent_loop.followups import (
 )
 from coding_review_agent_loop.memory import AgentMemoryContext, prepare_agent_memory
 from coding_review_agent_loop.runner import Runner, run_foreground_test, tail_text
-from coding_review_agent_loop.test_runtime import record_test_observation, resolve_timeout_seconds
-
-DEFAULT_TEST_TIMEOUT_SECONDS = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS
+from coding_review_agent_loop.test_runtime import (
+    DEFAULT_TEST_TIMEOUT_SECONDS,
+    record_test_observation,
+    resolve_timeout_seconds,
+)
 from coding_review_agent_loop.usage import RunUsageContext, UsageMetadata
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
 from coding_review_agent_loop.round_state import (
@@ -4371,6 +4372,7 @@ def main() -> None:
     p_impl.add_argument("--workdir-gemini", default=None)
     p_impl.add_argument("--workdir-antigravity", default=None)
     p_impl.add_argument("--dry-run", action="store_true")
+    _add_test_timeout_option(p_impl)
     _add_antigravity_options(p_impl)
 
     # run-pr-fix
@@ -4398,6 +4400,7 @@ def main() -> None:
     p_pr_fix.add_argument("--workdir-gemini", default=None)
     p_pr_fix.add_argument("--workdir-antigravity", default=None)
     p_pr_fix.add_argument("--dry-run", action="store_true")
+    _add_test_timeout_option(p_pr_fix)
     _add_gemini_cmd_option(p_pr_fix)
     _add_antigravity_options(p_pr_fix)
 
@@ -4427,6 +4430,7 @@ def main() -> None:
     p_impl_phase.add_argument("--workdir-gemini", default=None)
     p_impl_phase.add_argument("--workdir-antigravity", default=None)
     p_impl_phase.add_argument("--dry-run", action="store_true")
+    _add_test_timeout_option(p_impl_phase)
     p_impl_phase.add_argument(
         "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
         help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",
@@ -4452,6 +4456,7 @@ def main() -> None:
     p_decompose.add_argument("--workdir-gemini", default=None)
     p_decompose.add_argument("--workdir-antigravity", default=None)
     p_decompose.add_argument("--dry-run", action="store_true")
+    _add_test_timeout_option(p_decompose)
     p_decompose.add_argument(
         "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
         help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",

@@ -1,5 +1,7 @@
 import json
+import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -122,6 +124,41 @@ def test_foreground_runner_reports_visible_success_failure_timeout_and_tail(tmp_
     assert "before" in timed_out.output_tail
 
 
+def test_foreground_timeout_does_not_wait_for_escaped_descendant(tmp_path):
+    pid_file = tmp_path / "escaped-child.pid"
+    script = f"""
+import os
+import time
+from pathlib import Path
+
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    time.sleep(5)
+else:
+    Path({str(pid_file)!r}).write_text(str(pid))
+    time.sleep(5)
+"""
+    result = None
+    escaped_pid = None
+    started = time.monotonic()
+    try:
+        result = run_foreground_test(
+            [sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=0.1
+        )
+    finally:
+        if pid_file.exists():
+            escaped_pid = int(pid_file.read_text(encoding="utf-8"))
+        if escaped_pid is not None:
+            try:
+                os.kill(escaped_pid, 9)
+            except ProcessLookupError:
+                pass
+    assert result is not None
+    assert result.outcome == "timed_out"
+    assert time.monotonic() - started < 2
+
+
 def test_cli_wrapper_records_omitted_ceiling_and_rejects_over_policy_before_spawn(tmp_path, monkeypatch):
     memory = tmp_path / "memory"
     monkeypatch.chdir(tmp_path)
@@ -157,6 +194,91 @@ def test_runtime_sidecar_recommendations_timeout_lower_bound_and_success_clear(t
     _record(memory, tmp_path, command, outcome="passed", elapsed=700)
     cleared = runtime.recommend_timeout(memory, argv=command, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now())
     assert cleared.unresolved_timeout_seconds is None
+
+
+def test_timeout_resolution_uses_observation_order_not_duration_comparisons(tmp_path):
+    memory = tmp_path / "memory"
+    command = [sys.executable, "-c", "pass"]
+    base = _now() - timedelta(seconds=10)
+    for index, elapsed in enumerate((410, 535)):
+        _record(
+            memory,
+            tmp_path,
+            command,
+            outcome="passed",
+            elapsed=elapsed,
+            timestamp=base + timedelta(seconds=index),
+        )
+    _record(
+        memory,
+        tmp_path,
+        command,
+        outcome="timed_out",
+        elapsed=300,
+        attempted=300,
+        timestamp=base + timedelta(seconds=3),
+    )
+    timed_out = runtime.recommend_timeout(
+        memory, argv=command, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now()
+    )
+    assert timed_out.unresolved_timeout_seconds == 300
+    assert "Last 300s attempt timed out" in runtime.render_runtime_context(
+        memory, commands=(command,), cwd=tmp_path, policy_ceiling_seconds=1800
+    )
+
+    _record(
+        memory,
+        tmp_path,
+        command,
+        outcome="timed_out",
+        elapsed=1,
+        attempted=600,
+        timestamp=base + timedelta(seconds=4),
+    )
+    _record(
+        memory,
+        tmp_path,
+        command,
+        outcome="passed",
+        elapsed=50,
+        timestamp=base + timedelta(seconds=5),
+    )
+    cleared = runtime.recommend_timeout(
+        memory, argv=command, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now()
+    )
+    assert cleared.unresolved_timeout_seconds is None
+
+
+def test_runtime_matches_relative_executables_and_wrapped_commands(tmp_path):
+    executable = tmp_path / ".venv" / "bin" / "pytest"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    relative = [".venv/bin/pytest", "tests/test_protocol.py", "-q"]
+    absolute = [str(executable), "tests/test_protocol.py", "-q"]
+    assert runtime.environment_fingerprint(relative, tmp_path) == runtime.environment_fingerprint(
+        absolute, tmp_path
+    )
+
+    memory = tmp_path / "memory"
+    bare = [sys.executable, "-c", "pass"]
+    _record(memory, tmp_path, bare, outcome="passed", elapsed=12)
+    wrapped = [
+        sys.executable,
+        "-m",
+        "coding_review_agent_loop.cli",
+        "run-tests",
+        "--timeout-seconds",
+        "720",
+        "--memory-dir",
+        str(memory),
+        "--",
+        *bare,
+    ]
+    recommendation = runtime.recommend_timeout(
+        memory, argv=wrapped, cwd=tmp_path, policy_ceiling_seconds=1800, now=_now()
+    )
+    assert recommendation.successful_samples == 1
 
 
 def test_runtime_stale_and_input_manifest_changes_fall_back_to_ceiling(tmp_path):

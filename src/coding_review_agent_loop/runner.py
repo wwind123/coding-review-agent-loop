@@ -67,6 +67,48 @@ class ForegroundTestResult:
         return self.outcome == "passed"
 
 
+TEST_OUTPUT_DRAIN_GRACE_SECONDS = 0.25
+
+
+def _drain_nonblocking_test_output(
+    stream,
+    consume: Callable[[bytes], None],
+    *,
+    grace_seconds: float = TEST_OUTPUT_DRAIN_GRACE_SECONDS,
+) -> None:
+    """Drain currently available output without waiting for pipe EOF."""
+    try:
+        fd = stream.fileno()
+        os.set_blocking(fd, False)
+    except (AttributeError, OSError):
+        return
+
+    import select
+
+    deadline = time.monotonic() + grace_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            readable, _writable, _exceptional = select.select(
+                [fd], [], [], min(remaining, 0.05)
+            )
+        except (OSError, ValueError):
+            return
+        if not readable:
+            continue
+        try:
+            chunk = os.read(fd, 64 * 1024)
+        except (BlockingIOError, InterruptedError):
+            continue
+        except OSError:
+            return
+        if not chunk:
+            return
+        consume(chunk)
+
+
 def run_foreground_test(
     args: Sequence[str],
     *,
@@ -83,6 +125,7 @@ def run_foreground_test(
         return ForegroundTestResult(cmd, cwd, "passed", 0, 0.0, timeout_seconds)
     if not cmd:
         raise AgentLoopError("Test command is empty.")
+    selector = None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -155,13 +198,15 @@ def run_foreground_test(
         _terminate_process_group(proc)
         returncode = proc.wait()
     finally:
+        if selector is not None:
+            selector.close()
         if proc.stdout is not None:
-            # The child has been reaped; remaining buffered diagnostics are safe
-            # to consume without allowing the watchdog to extend.
-            remaining = proc.stdout.read()
-            if remaining:
-                consume(remaining)
+            # A descendant may retain the inherited write end after the direct
+            # child is reaped. Never use read-to-EOF here: it would defeat the
+            # watchdog. Drain only what becomes available during a short grace.
+            _drain_nonblocking_test_output(proc.stdout, consume)
             consume(b"", final=True)
+            proc.stdout.close()
         elapsed = time.monotonic() - started
     outcome = "interrupted" if interrupted else ("timed_out" if timed_out else ("passed" if returncode == 0 else "failed"))
     return ForegroundTestResult(
@@ -313,19 +358,8 @@ class Runner:
 
     @staticmethod
     def _terminate_process_group(proc: subprocess.Popen) -> None:
-        """killpg TERM, short grace, then killpg KILL; tolerate an exited group."""
-        try:
-            os.killpg(proc.pid, 15)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, 9)
-            except ProcessLookupError:
-                pass
-            proc.wait()
+        """Terminate one process group, tolerating an already exited group."""
+        _terminate_process_group(proc)
 
     def terminate_active_processes(self) -> None:
         """Kill every registered agent process group and refuse new spawns.

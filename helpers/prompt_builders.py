@@ -18,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from coding_review_agent_loop.agents.base import AgentName
 from coding_review_agent_loop.config import (
     AgentLoopConfig,
-    DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_FLAT_CHILD_LIMIT,
 )
 from coding_review_agent_loop.github import IssueContext, IssueComment
@@ -35,6 +34,7 @@ from coding_review_agent_loop.prompts import (
     render_coder_human_requirements_prompt_context,
 )
 from coding_review_agent_loop.round_state import _deserialize_unresolved_item
+from coding_review_agent_loop.test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from coding_review_agent_loop.unresolved_items import (
     _format_same_pr_unresolved_items,
     _format_unresolved_items_for_coder,
@@ -54,7 +54,7 @@ def make_minimal_config(
     agent_memory_dir: Path | None = None,
     refresh_agent_memory: bool = False,
     flat_child_limit: int = DEFAULT_FLAT_CHILD_LIMIT,
-    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+    coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> AgentLoopConfig:
     tmp_base = Path(tempfile.gettempdir()) / "coding-review-agent-loop"
     legacy = tmp_base / "skill-runner"
@@ -132,7 +132,7 @@ def build_plan_review_prompt_for_skill(
     all_reviewers: Sequence[AgentName] | None = None,
     workdir: str | None = None,
     memory: AgentMemoryContext | None = None,
-    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+    coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build a plan reviewer prompt from plain dicts.
 
@@ -182,7 +182,7 @@ def build_review_prompt_for_skill(
     workdir: str | None = None,
     approved_followups: str = "ignore",
     memory: AgentMemoryContext | None = None,
-    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+    coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
 
@@ -250,7 +250,7 @@ def build_pr_fix_prompt_for_skill(
     human_requirements: Sequence | None = None,
     same_pr_only: bool = False,
     memory: AgentMemoryContext | None = None,
-    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+    coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build the external-coder PR-fix prompt from skill-mode ledger items."""
     config = make_minimal_config(
@@ -294,7 +294,7 @@ def build_plan_prompt_for_skill(
     reviewers: Sequence[AgentName],
     workdir: str,
     memory: AgentMemoryContext | None = None,
-    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+    coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build the round-1 coder (plan) prompt for an external coder (#307).
 
@@ -322,7 +322,7 @@ def build_plan_revision_prompt_for_skill(
     prior_items_raw: list[dict],
     human_requirements: Sequence | None = None,
     memory: AgentMemoryContext | None = None,
-    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+    coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build the round-N+1 coder (plan revision) prompt for an external coder (#307).
 
@@ -361,7 +361,7 @@ def build_implementation_prompt_for_skill(
     workdir: str,
     base: str = "main",
     memory: AgentMemoryContext | None = None,
-    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+    coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build the external-coder implementation prompt (reversed roles, #316).
 
@@ -388,7 +388,7 @@ def build_plan_decomposition_prompt_for_skill(
     coder: AgentName,
     workdir: str,
     memory: AgentMemoryContext | None = None,
-    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+    coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build the external-coder plan decomposition prompt (#318).
 
