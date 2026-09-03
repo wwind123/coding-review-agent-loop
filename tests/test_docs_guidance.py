@@ -58,6 +58,17 @@ def test_readme_links_to_decision_section_with_derived_anchor():
     assert "duplicate children" in normalized_readme_text
 
 
+def test_readme_documents_same_repo_concurrency_limit():
+    readme_text = README.read_text(encoding="utf-8")
+    section_start = readme_text.index("## Current Limitations")
+    section_end = readme_text.index("## Planning and Decomposition", section_start)
+    section = " ".join(readme_text[section_start:section_end].split())
+
+    assert "one active `agent-loop` invocation per repository per machine" in section
+    assert "does not currently enforce a repository-wide process lock" in section
+    assert "`--review-parallel` is supported within one orchestrator run" in section
+
+
 def test_cli_help_points_to_decision_section():
     parser = build_parser()
     issue_parser = None

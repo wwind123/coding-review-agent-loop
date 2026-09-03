@@ -180,6 +180,25 @@ requirements and remain approval-critical. See
 [Human requirements](docs/local_agent_loop.md#human-requirements) for the exact
 contract.
 
+## Current Limitations
+
+- Run only one active `agent-loop` invocation per repository per machine. The
+  default workdirs and repo-scoped local state are shared, and the tool does not
+  currently enforce a repository-wide process lock. Separate concurrent runs
+  against the same repository can interfere with each other's checkouts and
+  artifacts. `--review-parallel` is supported within one orchestrator run; it
+  does not make multiple same-repository invocations safe.
+- Agent-loop is a local process, not a hosted service. The machine must remain
+  available for the run, and an interrupted in-flight agent turn may need to be
+  repeated. Once a PR exists, resume with `agent-loop pr <number>`.
+- GitHub is the only supported forge, and every selected agent backend must be
+  installed and authenticated locally.
+- Agent CLIs can exhaust quota, time out, update themselves, or return malformed
+  structured output. Retries, repair passes, and salvage reduce lost work but
+  cannot guarantee unattended completion.
+- Default agent checkouts live under `/tmp` and may disappear after a reboot or
+  system cleanup. Configure explicit workdirs for long-lived installations.
+
 ## Planning and Decomposition
 
 Plan-first mode supports four post-approval choices:
