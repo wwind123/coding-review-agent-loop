@@ -14,6 +14,7 @@ from coding_review_agent_loop.orchestrator import (
     _discuss_subject,
     _validate_discuss_analyzer_agenda_fidelity,
     _validate_discuss_final_analyzer_fidelity,
+    _validate_discuss_final_synthesis_fidelity,
     _validate_discuss_round_synthesis_fidelity,
     _adapt_discuss_final_synthesis,
     _mechanical_discuss_final_classification,
@@ -40,6 +41,7 @@ from coding_review_agent_loop.protocol import (
     DiscussSynthesisPosition,
     DiscussSynthesisResponseReference,
     ParsedDiscussRoundSynthesis,
+    ParsedDiscussFinalSynthesis,
     ParsedFailedDiscussResponse,
     serialize_discuss_round_synthesis,
 )
@@ -337,6 +339,7 @@ def _seed_summary_comment(
     failed_debaters: tuple[tuple[str, str], ...] = (),
     result_mode: str = "triage",
     round_synthesis: str | None = None,
+    synthesis_provenance: dict | None = None,
 ) -> dict:
     """Build an issue-comment payload matching what `_run_discuss_loop` posts for a round summary."""
     body = render_discuss_round_summary_comment(
@@ -366,6 +369,7 @@ def _seed_summary_comment(
             failed_debaters=failed_debaters,
             result_mode=result_mode,
             round_synthesis=round_synthesis,
+            synthesis_provenance=synthesis_provenance,
         ),
     )
     return {"author": {"login": "bot"}, "createdAt": "2026-01-01T00:00:00Z", "body": body}
@@ -476,6 +480,44 @@ def test_adapt_near_consensus_handles_truncation_collisions_and_duplicate_review
     )[1] is not None
 
 
+def test_adapt_reuses_exact_semantic_and_debater_confirmed_recommendations():
+    exact_votes = (
+        ParsedDiscussAnswer("answer", "API boundary.", "high", (), "Codex", answer="API boundary."),
+        ParsedDiscussAnswer("answer", "API boundary.", "high", (), "Gemini", answer="API boundary."),
+    )
+    exact = _adapt_discuss_final_synthesis(
+        outcome="answer", consensus_kind="unanimous", final_votes=exact_votes, round_number=1
+    )
+    assert exact is not None and exact.classification == "consensus"
+    assert exact.agreed_conclusions[0].text == "API boundary."
+
+    semantic_votes = (
+        ParsedDiscussAnswer("answer", "API boundary.", "high", (), "Codex", answer="Use an API."),
+        ParsedDiscussAnswer("answer", "API boundary.", "high", (), "Gemini", answer="Use a boundary."),
+    )
+    semantic = _adapt_discuss_final_synthesis(
+        outcome="answer", consensus_kind="semantic-equivalent", final_votes=semantic_votes,
+        round_number=1,
+        semantic_comparison={
+            "classification": "equivalent",
+            "shared_recommendation": "Use an API boundary.",
+        },
+    )
+    assert semantic is not None
+    assert semantic.agreed_conclusions[0].text == "Use an API boundary."
+
+    confirmed = _adapt_discuss_final_synthesis(
+        outcome="answer", consensus_kind="debater-confirmed", final_votes=semantic_votes,
+        round_number=1,
+        semantic_comparison={
+            "classification": "compatible_with_residual_decisions",
+            "confirmed_answer": "Use an API boundary.",
+        },
+    )
+    assert confirmed is not None
+    assert confirmed.agreed_conclusions[0].text == "Use an API boundary."
+
+
 def test_advisory_synthesis_serialization_failure_falls_back(tmp_path):
     synthesis = ParsedDiscussRoundSynthesis(
         consensus=(),
@@ -537,6 +579,7 @@ def test_resume_restores_persisted_round_synthesis_state(tmp_path):
         _seed_summary_comment(
             round_number=1, reviewer_votes=[vote1, vote2], is_final=False, subject=subject,
             result_mode="answer", round_synthesis=serialize_discuss_round_synthesis(synthesis),
+            synthesis_provenance={"source": "round-analyzer", "round": 1},
         ),
     ]
 
@@ -550,7 +593,165 @@ def test_resume_restores_persisted_round_synthesis_state(tmp_path):
 
     assert state is not None
     assert state.prior_round_synthesis == synthesis
+    assert state.synthesis_provenance == {"source": "round-analyzer", "round": 1}
     assert state.next_round_number == 2
+
+
+def test_round_synthesis_fidelity_covers_carry_and_all_state_transitions():
+    current_votes = (
+        _needs_human_vote("Codex", ("Choose pricing. API boundary pricing security",)),
+        _needs_human_vote("Gemini", ("Choose pricing. API boundary pricing security",)),
+    )
+    current_refs = (
+        DiscussSynthesisResponseReference("Codex", 2),
+        DiscussSynthesisResponseReference("Gemini", 2),
+    )
+    prior_refs = (
+        DiscussSynthesisResponseReference("Codex", 1),
+        DiscussSynthesisResponseReference("Gemini", 1),
+    )
+    prior_disagreement = DiscussSynthesisDisagreement(
+        topic="pricing",
+        positions=(
+            DiscussSynthesisPosition(("Codex",), "API boundary pricing"),
+            DiscussSynthesisPosition(("Gemini",), "API boundary pricing"),
+        ),
+        decision_needed="Choose pricing.",
+    )
+    prior = ParsedDiscussRoundSynthesis(
+        consensus=(DiscussSynthesisConsensus("API boundary", prior_refs),),
+        disagreements=(prior_disagreement,),
+        changes=(), missing_facts=(), next_round_focus=(),
+        responding_reviewers=("Codex", "Gemini"),
+    )
+
+    carried = ParsedDiscussRoundSynthesis(
+        consensus=(DiscussSynthesisConsensus("API boundary", prior_refs),),
+        disagreements=(), changes=(), missing_facts=(), next_round_focus=(),
+        responding_reviewers=("Codex", "Gemini"),
+    )
+    _validate_discuss_round_synthesis_fidelity(
+        carried, round_number=2, current_votes=current_votes,
+        prior_synthesis=prior, configured_reviewers=("codex", "gemini"),
+    )
+    changed_refs = ParsedDiscussRoundSynthesis(
+        consensus=(DiscussSynthesisConsensus("API boundary", current_refs),),
+        disagreements=(), changes=(), missing_facts=(), next_round_focus=(),
+        responding_reviewers=("Codex", "Gemini"),
+    )
+    with pytest.raises(AgentLoopError, match="preserve"):
+        _validate_discuss_round_synthesis_fidelity(
+            changed_refs, round_number=2, current_votes=current_votes,
+            prior_synthesis=prior, configured_reviewers=("codex", "gemini"),
+        )
+
+    new_claim = ParsedDiscussRoundSynthesis(
+        consensus=(DiscussSynthesisConsensus("API boundary pricing", current_refs),),
+        disagreements=(), changes=(), missing_facts=(), next_round_focus=(),
+        responding_reviewers=("Codex", "Gemini"),
+    )
+    _validate_discuss_round_synthesis_fidelity(
+        new_claim, round_number=2, current_votes=current_votes,
+        prior_synthesis=prior, configured_reviewers=("codex", "gemini"),
+    )
+    old_refs_claim = ParsedDiscussRoundSynthesis(
+        consensus=(DiscussSynthesisConsensus("API boundary pricing", prior_refs),),
+        disagreements=(), changes=(), missing_facts=(), next_round_focus=(),
+        responding_reviewers=("Codex", "Gemini"),
+    )
+    with pytest.raises(AgentLoopError, match="current responders"):
+        _validate_discuss_round_synthesis_fidelity(
+            old_refs_claim, round_number=2, current_votes=current_votes,
+            prior_synthesis=prior, configured_reviewers=("codex", "gemini"),
+        )
+
+    def transitioned(kind: str, *, topic: str = "pricing") -> ParsedDiscussRoundSynthesis:
+        return ParsedDiscussRoundSynthesis(
+            consensus=(),
+            disagreements=() if kind != "reopened" else (prior_disagreement,),
+            changes=(DiscussSynthesisChange(kind, topic, "API boundary pricing", current_refs),),
+            missing_facts=(), next_round_focus=(),
+            responding_reviewers=("Codex", "Gemini"),
+        )
+
+    for kind in ("resolved", "retracted", "refined"):
+        _validate_discuss_round_synthesis_fidelity(
+            transitioned(kind), round_number=2, current_votes=current_votes,
+            prior_synthesis=prior, configured_reviewers=("codex", "gemini"),
+        )
+    introduced = transitioned("introduced", topic="security")
+    _validate_discuss_round_synthesis_fidelity(
+        introduced, round_number=2, current_votes=current_votes,
+        prior_synthesis=prior, configured_reviewers=("codex", "gemini"),
+    )
+    _validate_discuss_round_synthesis_fidelity(
+        transitioned("reopened"), round_number=2, current_votes=current_votes,
+        prior_synthesis=prior, configured_reviewers=("codex", "gemini"),
+    )
+
+
+def test_final_synthesis_fidelity_validates_classification_references_and_positions():
+    votes = (
+        _needs_human_vote("Codex", ("Choose pricing.",), rationale="API boundary pricing."),
+        _needs_human_vote("Gemini", ("Choose pricing.",), rationale="API boundary pricing."),
+    )
+    refs = (
+        DiscussSynthesisResponseReference("Codex", 1),
+        DiscussSynthesisResponseReference("Gemini", 1),
+    )
+    valid = ParsedDiscussFinalSynthesis(
+        classification="near_consensus",
+        agreed_conclusions=(),
+        remaining_disagreements=(DiscussSynthesisDisagreement(
+            topic="Choose pricing.",
+            positions=(
+                DiscussSynthesisPosition(("Codex",), "Choose pricing."),
+                DiscussSynthesisPosition(("Gemini",), "Choose pricing."),
+            ),
+            decision_needed="Choose pricing.",
+        ),),
+        next_action="A human chooses pricing.",
+    )
+    _validate_discuss_final_synthesis_fidelity(
+        valid, expected_classification="near_consensus", final_votes=votes,
+        round_number=1, configured_reviewers=("codex", "gemini"),
+    )
+    mismatch = ParsedDiscussFinalSynthesis(
+        classification="consensus", agreed_conclusions=(),
+        remaining_disagreements=valid.remaining_disagreements, next_action="Choose.",
+    )
+    with pytest.raises(AgentLoopError, match="classification"):
+        _validate_discuss_final_synthesis_fidelity(
+            mismatch, expected_classification="near_consensus", final_votes=votes,
+            round_number=1, configured_reviewers=("codex", "gemini"),
+        )
+    unsupported = ParsedDiscussFinalSynthesis(
+        classification="near_consensus", agreed_conclusions=(),
+        remaining_disagreements=(DiscussSynthesisDisagreement(
+            topic="Invented topic.",
+            positions=(DiscussSynthesisPosition(("Codex",), "Invented position."),),
+            decision_needed="Invented decision.",
+        ),), next_action="Choose.",
+    )
+    with pytest.raises(AgentLoopError, match="topic"):
+        _validate_discuss_final_synthesis_fidelity(
+            unsupported, expected_classification="near_consensus", final_votes=votes,
+            round_number=1, configured_reviewers=("codex", "gemini"),
+        )
+    unknown_reference = ParsedDiscussFinalSynthesis(
+        classification="near_consensus",
+        agreed_conclusions=(DiscussSynthesisConsensus(
+            "API boundary pricing.",
+            (DiscussSynthesisResponseReference("Claude", 1),),
+        ),),
+        remaining_disagreements=valid.remaining_disagreements,
+        next_action="Choose.",
+    )
+    with pytest.raises(AgentLoopError, match="references"):
+        _validate_discuss_final_synthesis_fidelity(
+            unknown_reference, expected_classification="near_consensus", final_votes=votes,
+            round_number=1, configured_reviewers=("codex", "gemini"),
+        )
 
 
 def test_synthesis_fidelity_rejects_filler_only_support_and_reactivation_without_reopen():
