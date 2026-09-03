@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,221 @@ class CommandResult:
     returncode: int | None
     observation: ExecutionObservation | None = None
     capture_diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ForegroundTestResult:
+    """Result of one visible, bounded foreground test command."""
+
+    args: list[str]
+    cwd: Path
+    outcome: str
+    returncode: int | None
+    elapsed_seconds: float
+    attempted_timeout_seconds: float | None
+    output_tail: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return self.outcome == "passed"
+
+
+TEST_OUTPUT_DRAIN_GRACE_SECONDS = 0.25
+
+
+def _drain_nonblocking_test_output(
+    stream,
+    consume: Callable[[bytes], None],
+    *,
+    grace_seconds: float = TEST_OUTPUT_DRAIN_GRACE_SECONDS,
+) -> None:
+    """Drain currently available output without waiting for pipe EOF."""
+    try:
+        fd = stream.fileno()
+        os.set_blocking(fd, False)
+    except (AttributeError, OSError):
+        return
+
+    import select
+
+    deadline = time.monotonic() + grace_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            readable, _writable, _exceptional = select.select(
+                [fd], [], [], min(remaining, 0.05)
+            )
+        except (OSError, ValueError):
+            return
+        if not readable:
+            continue
+        try:
+            chunk = os.read(fd, 64 * 1024)
+        except (BlockingIOError, InterruptedError):
+            continue
+        except OSError:
+            return
+        if not chunk:
+            return
+        consume(chunk)
+
+
+def run_foreground_test(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float,
+    env: Mapping[str, str] | None = None,
+    dry_run: bool = False,
+) -> ForegroundTestResult:
+    """Run a command in the foreground, teeing output and bounding its process group."""
+    cmd = [str(value) for value in args]
+    started = time.monotonic()
+    if dry_run:
+        print(f"[dry-run] ({cwd}) {' '.join(cmd)}")
+        return ForegroundTestResult(cmd, cwd, "passed", 0, 0.0, timeout_seconds)
+    if not cmd:
+        raise AgentLoopError("Test command is empty.")
+    selector = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+            start_new_session=True,
+            env={**os.environ, **env} if env is not None else None,
+        )
+    except OSError as exc:
+        raise AgentLoopError(f"Could not start test command: {exc}") from exc
+
+    tail: deque[str] = deque(maxlen=80)
+    pending = ""
+
+    def consume(data: bytes, *, final: bool = False) -> None:
+        nonlocal pending
+        text = pending + data.decode("utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        if not final and lines and not lines[-1].endswith(("\n", "\r")):
+            pending = lines.pop()
+        else:
+            pending = ""
+        for line in lines:
+            print(line, end="", flush=True)
+            tail.extend(line.splitlines())
+        if final and pending:
+            print(pending, end="", flush=True)
+            tail.extend(pending.splitlines())
+            pending = ""
+
+    timed_out = False
+    interrupted = False
+    watchdog_deadline = started + timeout_seconds
+    post_termination_deadline: float | None = None
+    try:
+        # A selector keeps output flowing to the terminal while allowing the
+        # monotonic watchdog to fire even when the child is quiet.
+        import selectors
+
+        selector = selectors.DefaultSelector()
+        assert proc.stdout is not None
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        while True:
+            now = time.monotonic()
+            if proc.poll() is None and now >= watchdog_deadline:
+                timed_out = True
+                # Once the watchdog fires, output draining must not extend the
+                # command beyond this absolute deadline.  This also covers a
+                # reaped direct child whose descendants retain the pipe and
+                # continue producing readable output.
+                post_termination_deadline = (
+                    watchdog_deadline + TEST_OUTPUT_DRAIN_GRACE_SECONDS
+                )
+                _terminate_process_group(proc)
+            elif proc.poll() is not None and post_termination_deadline is None:
+                # A normally exiting child can also leave a descendant with a
+                # live pipe.  Allow a short drain, but never past the command's
+                # watchdog-plus-grace absolute bound.
+                post_termination_deadline = min(
+                    watchdog_deadline + TEST_OUTPUT_DRAIN_GRACE_SECONDS,
+                    now + TEST_OUTPUT_DRAIN_GRACE_SECONDS,
+                )
+            if (
+                post_termination_deadline is not None
+                and now >= post_termination_deadline
+            ):
+                break
+            wait_seconds = 0.1
+            if post_termination_deadline is not None:
+                wait_seconds = min(
+                    wait_seconds,
+                    max(0.0, post_termination_deadline - time.monotonic()),
+                )
+            events = selector.select(wait_seconds)
+            for key, _mask in events:
+                chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                if chunk:
+                    consume(chunk)
+                else:
+                    try:
+                        selector.unregister(key.fileobj)
+                    except Exception:  # pragma: no cover - selector cleanup varies by platform
+                        pass
+            if proc.poll() is not None and not selector.get_map():
+                break
+            if proc.poll() is not None and not events:
+                # Give a closed pipe one final non-blocking drain opportunity.
+                break
+        if proc.poll() is None:
+            _terminate_process_group(proc)
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        interrupted = True
+        _terminate_process_group(proc)
+        returncode = proc.wait()
+    finally:
+        if selector is not None:
+            selector.close()
+        if proc.stdout is not None:
+            # A descendant may retain the inherited write end after the direct
+            # child is reaped. Never use read-to-EOF here: it would defeat the
+            # watchdog. Drain only what becomes available during a short grace.
+            remaining_drain_grace = TEST_OUTPUT_DRAIN_GRACE_SECONDS
+            if post_termination_deadline is not None:
+                remaining_drain_grace = max(
+                    0.0, post_termination_deadline - time.monotonic()
+                )
+            _drain_nonblocking_test_output(
+                proc.stdout, consume, grace_seconds=remaining_drain_grace
+            )
+            consume(b"", final=True)
+            proc.stdout.close()
+        elapsed = time.monotonic() - started
+    outcome = "interrupted" if interrupted else ("timed_out" if timed_out else ("passed" if returncode == 0 else "failed"))
+    return ForegroundTestResult(
+        cmd, cwd, outcome, (124 if timed_out else 130 if interrupted else returncode),
+        elapsed, timeout_seconds, "\n".join(tail),
+    )
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, 15)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 9)
+        except ProcessLookupError:
+            pass
+        proc.wait()
 
 
 # Matches ANSI/VT100 control sequences (CSI, OSC, charset selection) that a
@@ -177,19 +393,8 @@ class Runner:
 
     @staticmethod
     def _terminate_process_group(proc: subprocess.Popen) -> None:
-        """killpg TERM, short grace, then killpg KILL; tolerate an exited group."""
-        try:
-            os.killpg(proc.pid, 15)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, 9)
-            except ProcessLookupError:
-                pass
-            proc.wait()
+        """Terminate one process group, tolerating an already exited group."""
+        _terminate_process_group(proc)
 
     def terminate_active_processes(self) -> None:
         """Kill every registered agent process group and refuse new spawns.
@@ -355,6 +560,35 @@ class Runner:
                 f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
             )
         return result
+
+    def run_test_command(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path,
+        timeout_seconds: float,
+        env: Mapping[str, str] | None = None,
+    ) -> ForegroundTestResult:
+        """Run a local test gate through the shared foreground primitive.
+
+        Scripted runners used by the repository's orchestration tests override
+        ``run_with_log``.  Preserve that deterministic simulation while real
+        ``Runner`` instances use the visible process-group implementation.
+        """
+        if type(self).run_with_log is not Runner.run_with_log:
+            result = self.run(args, cwd=cwd, check=False, env=env)
+            outcome = "passed" if result.returncode == 0 else "failed"
+            return ForegroundTestResult(
+                list(map(str, args)), cwd, outcome, result.returncode, 0.0,
+                timeout_seconds, tail_text(result.stdout or result.stderr),
+            )
+        return run_foreground_test(
+            args,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            env=env,
+            dry_run=self.dry_run,
+        )
 
     def run_with_log(
         self,

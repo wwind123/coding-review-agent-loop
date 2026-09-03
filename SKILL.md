@@ -408,9 +408,9 @@ python -m helpers.skill_runner run-task-round \
   touches those surfaces, focused tests demonstrably do not cover it, or a
   human or the issue explicitly asked for full-suite verification. Run
   required completion tests in the foreground with visible output under an
-  explicit bounded timeout (at most 1,800 seconds per required test command).
-  That maximum allowance requires an individually justified command; it is not
-  a reason to choose a broad suite. Never launch pytest (or any required test)
+  explicit bounded timeout no greater than the configured finite run-level
+  ceiling (1,800 seconds by default). That maximum allowance requires an
+  individually justified command; it is not a reason to choose a broad suite. Never launch pytest (or any required test)
   in the background, and never spawn a shell loop that polls a process ID,
   `ps`/`kill -0`/`wait`, or a task-output file to learn whether it finished. If
   a required test exceeds its bound, terminate it and report the blocker
@@ -602,6 +602,23 @@ This location is outside git checkouts, so it never dirties any working tree.
   responses must match the versions expected by the existing library in `src/`.
 
 ---
+
+## Runtime-aware local test timeouts
+
+Local testing has three separate limits: framework per-test timeout, the
+whole-command watchdog, and the backend whole-turn timeout. The run-level
+watchdog ceiling defaults to 1,800 seconds and can be overridden with
+`--coder-test-command-timeout-seconds SECONDS`; it remains finite. Skill gates
+use the ceiling in the foreground. The optional `agent-loop run-tests
+[--timeout-seconds N] -- COMMAND...` wrapper measures the complete command,
+inherits `AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS` from agent-loop, and
+falls back to 1,800 seconds standalone. An explicit positive finite watchdog
+may be smaller but never larger than the ceiling; malformed or over-policy
+requests fail before spawning. Use learned recommendations when rendered and
+omit the option for unknown commands. The backend whole-turn limit must exceed
+the selected command watchdog with headroom; for Antigravity, use at least
+`max(300s, 20%)` beyond it. Split or shard healthy browser/integration matrices
+when that reduces diagnosis and retry cost.
 
 ## Demo
 

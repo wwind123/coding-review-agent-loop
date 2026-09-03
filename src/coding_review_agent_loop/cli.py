@@ -62,7 +62,14 @@ from .prompts import (
     format_agent_list,
 )
 from .protocol import is_clarification_request, parse_agent_state, parse_pr_number
-from .runner import CommandResult, Runner, ensure_log_dir_ignored, tail_text
+from .runner import CommandResult, Runner, ensure_log_dir_ignored, run_foreground_test, tail_text
+from .test_runtime import (
+    DEFAULT_TEST_TIMEOUT_SECONDS,
+    TestRuntimeConfigurationError,
+    inherited_timeout_ceiling,
+    record_test_observation,
+    resolve_timeout_seconds,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -327,6 +334,17 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "Optional command to run as a local test gate. By default it runs after "
                 "coder changes before review and again after reviewer approval before auto-merge."
+            ),
+        )
+        subparser.add_argument(
+            "--coder-test-command-timeout-seconds",
+            type=float,
+            default=DEFAULT_TEST_TIMEOUT_SECONDS,
+            metavar="SECONDS",
+            help=(
+                "Finite run-level ceiling and unknown-command watchdog for local coder test "
+                f"commands (default: {DEFAULT_TEST_TIMEOUT_SECONDS}). Known commands "
+                "may use a smaller learned recommendation."
             ),
         )
         pre_review_tests_group = subparser.add_mutually_exclusive_group()
@@ -839,6 +857,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common(discuss)
 
+    run_tests = subparsers.add_parser(
+        "run-tests",
+        help="Run one foreground test command with a finite watchdog and optional runtime memory.",
+    )
+    run_tests.add_argument(
+        "--timeout-seconds",
+        default=None,
+        metavar="SECONDS",
+        help="Chosen whole-command watchdog for this invocation; it cannot exceed the inherited ceiling.",
+    )
+    run_tests.add_argument(
+        "--memory-dir",
+        type=Path,
+        default=None,
+        help="Optional repo memory directory in which agent-loop records this measured run.",
+    )
+    run_tests.add_argument(
+        "inner_argv",
+        nargs=argparse.REMAINDER,
+        help="Use `--` before the command to run.",
+    )
+
     return parser
 
 
@@ -862,6 +902,37 @@ def _resolve_task_text(args: argparse.Namespace) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "run-tests":
+        raw_inner = list(args.inner_argv)
+        if raw_inner[:1] == ["--"]:
+            raw_inner = raw_inner[1:]
+        try:
+            if not raw_inner:
+                raise TestRuntimeConfigurationError(
+                    "run-tests requires `--` followed by a non-empty command."
+                )
+            policy = inherited_timeout_ceiling()
+            chosen = resolve_timeout_seconds(args.timeout_seconds, policy_ceiling=policy)
+            result = run_foreground_test(
+                raw_inner,
+                cwd=Path.cwd(),
+                timeout_seconds=chosen,
+                dry_run=False,
+            )
+            record_test_observation(
+                args.memory_dir,
+                argv=raw_inner,
+                cwd=Path.cwd(),
+                outcome=result.outcome,
+                elapsed_seconds=result.elapsed_seconds,
+                attempted_timeout_seconds=chosen,
+                policy_ceiling_seconds=policy,
+                returncode=result.returncode,
+            )
+            return int(result.returncode if result.returncode is not None else 1)
+        except (AgentLoopError, OSError, ValueError) as exc:
+            print(f"agent-loop: {exc}", file=sys.stderr)
+            return 1
     if args.command == "managed-ci" and args.managed_ci_command == "preflight":
         try:
             context = ManagedCiProbeContext(args.repo, args.gh_cmd, Path.cwd())

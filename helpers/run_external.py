@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.runner import Runner
+from coding_review_agent_loop.test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 
 _CANNED_PLAN_REVIEW = json.dumps(
     {
@@ -220,7 +221,17 @@ def main() -> None:
         "--response-evidence-output",
         default=None,
         help="Write response_file_text/message_text evidence needed for deterministic "
-             "structured-response recovery. Skipped in --dry-run.",
+        "structured-response recovery. Skipped in --dry-run.",
+    )
+    parser.add_argument(
+        "--coder-test-command-timeout-seconds",
+        type=float,
+        default=DEFAULT_TEST_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Finite run-level ceiling inherited by coder test wrappers "
+            f"(default: {DEFAULT_TEST_TIMEOUT_SECONDS})."
+        ),
     )
     args = parser.parse_args()
 
@@ -349,6 +360,7 @@ def main() -> None:
         agent_memory_dir=log_dir,
         refresh_test_profile=False,
         auto_agent_dirs=(agent_name,),
+        coder_test_command_timeout_seconds=args.coder_test_command_timeout_seconds,
     )
 
     runner = Runner(dry_run=False)

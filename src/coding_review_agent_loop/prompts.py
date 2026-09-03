@@ -34,6 +34,7 @@ from .protocol import (
 )
 from .protocol_markers import sanitize_historical_text
 from .workdirs import agent_workdir
+from .test_runtime import recommend_timeout, render_runtime_context, render_test_wrapper
 
 
 @dataclass(frozen=True)
@@ -74,11 +75,91 @@ def format_agent_list(agents: Sequence[AgentName]) -> str:
     return f"{', '.join(names[:-1])}, and {names[-1]}"
 
 
-def _memory_block(memory: AgentMemoryContext | None) -> str:
+def _memory_block(
+    memory: AgentMemoryContext | None,
+    config: AgentLoopConfig | None = None,
+    *,
+    include_runtime: bool = False,
+) -> str:
     text = format_agent_memory_context(memory)
     if not text:
         return ""
-    return f"Agent memory context:\n{text}\n"
+    runtime = ""
+    if include_runtime and config is not None:
+        cwd = agent_workdir(config, config.coder)
+        commands: list[tuple[str, ...]] = []
+        seen: set[tuple[str, ...]] = set()
+        remembered_keys: dict[tuple[str, ...], tuple[str, str]] = {}
+        if config.test_command:
+            commands.append(tuple(config.test_command))
+            seen.add(tuple(config.test_command))
+        for observation in memory.runtime_observations:
+            normalized = observation.get("normalized_command")
+            if not isinstance(normalized, str) or not normalized.strip():
+                continue
+            try:
+                command = tuple(shlex.split(normalized))
+            except ValueError:
+                continue
+            if command and command not in seen:
+                commands.append(command)
+                seen.add(command)
+                fingerprint = observation.get("environment_fingerprint")
+                if isinstance(fingerprint, str) and fingerprint:
+                    # The stored normalized command and fingerprint are the
+                    # cohort key.  Re-normalizing this display form can hash
+                    # redacted environment values twice or resolve an
+                    # external executable through a different PATH entry.
+                    remembered_keys[command] = (normalized, fingerprint)
+        commands = commands[:6]
+        if commands:
+            recommendations = {}
+            for command in commands:
+                key = remembered_keys.get(command)
+                recommendations[command] = recommend_timeout(
+                    memory.memory_dir,
+                    argv=command,
+                    cwd=cwd,
+                    policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
+                    normalized_command_override=key[0] if key else None,
+                    fingerprint_override=key[1] if key else None,
+                )
+            runtime_text = render_runtime_context(
+                memory.memory_dir,
+                commands=commands,
+                cwd=cwd,
+                policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
+                recommendations=recommendations,
+            )
+            invocation_lines = []
+            for command in commands:
+                recommendation = recommendations[command]
+                wrapper = render_test_wrapper(
+                    command,
+                    timeout_seconds=(
+                        recommendation.recommended_timeout_seconds
+                        if recommendation.successful_samples or recommendation.unresolved_timeout_seconds
+                        else None
+                    ),
+                    memory_dir=memory.memory_dir,
+                )
+                invocation_lines.append(f"  Invocation guidance: {wrapper}")
+            invocation_guidance = "\n".join(invocation_lines)
+        else:
+            runtime_text = "- No observed local test timings are available for this checkout."
+            placeholder_command = ("<test-command>",)
+            invocation_guidance = (
+                "  Invocation guidance: "
+                f"{render_test_wrapper(placeholder_command, memory_dir=memory.memory_dir)}"
+            )
+        runtime = (
+            "\n\nObserved local test timing (advisory):\n"
+            f"{runtime_text}\n"
+            f"{invocation_guidance}\n"
+            "  The wrapper watchdog is for the whole command; omit --timeout-seconds for an "
+            "unknown command to select the inherited configured ceiling."
+        )
+    return f"Agent memory context:\n{text}{runtime}\n"
 
 
 def _scratch_file_guidance() -> str:
@@ -119,11 +200,9 @@ def _coder_test_reporting_guidance(*, structured: bool = False) -> str:
     )
 
 
-CODER_TEST_COMMAND_TIMEOUT_SECONDS = 1800
-"""Maximum foreground timeout for one required coder test command (#648)."""
-
-
-def _coder_local_test_scope_guidance(*, structured: bool = False) -> str:
+def _coder_local_test_scope_guidance(
+    config: AgentLoopConfig | None = None, *, structured: bool = False
+) -> str:
     if structured:
         rationale = (
             "When the change is narrow, give a one-line rationale for each "
@@ -141,7 +220,26 @@ def _coder_local_test_scope_guidance(*, structured: bool = False) -> str:
             "next to the exact commands in the `Tests:` line."
         )
         broad_reason_location = "that same `Tests:` line"
+    ceiling = (
+        config.coder_test_command_timeout_seconds
+        if config is not None
+        else 1800
+    )
+    headroom = max(300, int(ceiling * 0.20))
+    backend_guidance = (
+        f" For Antigravity, the configured print timeout is "
+        f"{config.antigravity_print_timeout_seconds}s; it should exceed the selected "
+        f"whole-command watchdog plus headroom of max(300s, 20%) ({headroom}s)."
+        if config is not None and config.coder == "antigravity"
+        else " The backend whole-turn/invocation timeout must exceed the selected command watchdog with enough headroom for analysis, edits, and reporting."
+    )
     return (
+        "Keep three limits separate: a framework per-test timeout, the wrapper's "
+        "whole-command watchdog, and the backend's whole-turn timeout. "
+        f"The run-level ceiling is {ceiling}s. The wrapper defaults to that ceiling "
+        "when --timeout-seconds is omitted, may use a learned smaller recommendation, "
+        "and can never exceed the inherited ceiling."
+        + backend_guidance + "\n"
         "Select tests proportionate to the files you actually changed and to "
         "the reviewer item you are addressing; prefer the repository's verified "
         "focused test command from the execution profile when one covers the "
@@ -153,7 +251,8 @@ def _coder_local_test_scope_guidance(*, structured: bool = False) -> str:
         f"verification — and when a broad run is justified, state that reason in {broad_reason_location}. "
         "Run required completion tests in the foreground with visible output "
         "and an explicit bounded timeout (a concrete stated cap, at most "
-        f"{CODER_TEST_COMMAND_TIMEOUT_SECONDS} seconds per required test command). "
+        f"{ceiling} seconds per required test command; use the finite "
+        "`--coder-test-command-timeout-seconds` override for justified longer suites). "
         "Never launch pytest in the "
         "background (`&`, `nohup`, background task/tool invocations) and never "
         "spawn auxiliary shell loops that poll process IDs, `ps`/`kill -0`/"
@@ -1161,7 +1260,7 @@ def _compact_plan_stable_prefix(
             workdir_guidance,
             _scratch_file_guidance(),
             response_protocol,
-            _memory_block(memory),
+            _memory_block(memory, config),
             _compact_issue_context_block(issue_context),
             human_requirements_block,
             human_requirements_guidance,
@@ -1337,7 +1436,7 @@ Use this local checkout as your workspace. Create a branch, implement the fix,
 run relevant tests, commit, push, and open a pull request against {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
@@ -1346,7 +1445,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
     coder_signature=coder_signature,
 )}
 {_issue_context_block(issue_context)}
-{_memory_block(memory)}
+{_memory_block(memory, config, include_runtime=True)}
 {_salvage_summary_block(salvage_summary)}
 
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
@@ -1411,7 +1510,7 @@ prose between the JSON object and footer.
     ),
 )}
 {_issue_context_block(issue_context)}
-{_memory_block(memory)}
+{_memory_block(memory, config, include_runtime=True)}
 
 {_agent_unavailable_guidance(coder_signature)}
 Do not wait for {reviewer_name} yourself; this local orchestrator will run
@@ -1480,7 +1579,7 @@ branch, commit, push, or open a pull request during this planning review.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}
-{unresolved_items_block}{_memory_block(memory)}
+{unresolved_items_block}{_memory_block(memory, config)}
 
 Plan from {coder_name}:
 
@@ -1652,7 +1751,7 @@ branch, commit, push, or open a pull request during this decomposition stage.
 {_coder_workdir_guidance(config, implementation=False)}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}
-{_memory_block(memory)}
+{_memory_block(memory, config)}
 
 Approved implementation plan:
 
@@ -1751,7 +1850,7 @@ branch, commit, push, or open a pull request during this planning stage.
     ),
 )}
 {_issue_context_block(issue_context)}
-{unresolved_items_block}{_memory_block(memory)}
+{unresolved_items_block}{_memory_block(memory, config, include_runtime=True)}
 
 Previous plan:
 
@@ -1937,7 +2036,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
@@ -1946,7 +2045,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
     coder_signature=coder_signature,
 )}
 {_issue_context_block(issue_context)}
-{_memory_block(memory)}
+{_memory_block(memory, config, include_runtime=True)}
 {_salvage_summary_block(salvage_summary)}
 
 Approved implementation plan:
@@ -1997,7 +2096,7 @@ task-output file. If you know its process ID, terminate it once (a single
 foreground under the bounded timeout below, waiting for it to finish; launch
 nothing new in the background. Then commit, push, and open the pull request if
 that is not already done, or continue exactly where you left off.
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {human_requirements_context.block}
 {implementation_contract}
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
@@ -2014,7 +2113,7 @@ def build_task_prompt(
 
 Task:
 {task_text}
-{_memory_block(memory)}
+{_memory_block(memory, config, include_runtime=True)}
 
 Use this local checkout as your workspace. Decide between two paths:
 {_coder_workdir_guidance(config)}
@@ -2024,7 +2123,7 @@ Use this local checkout as your workspace. Decide between two paths:
     {config.base}. Do not wait for {reviewer_name}; this local orchestrator
     will run {reviewer_name} after you create the PR.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 
 (b) If the task is genuinely ambiguous or missing information that would change
     the implementation, do NOT write code. Instead, ask focused clarifying
@@ -2070,7 +2169,7 @@ def build_task_clarification_prompt(
 
 Original task:
 {task_text}
-{_memory_block(memory)}
+{_memory_block(memory, config, include_runtime=True)}
 
 Clarification so far:
 
@@ -2079,7 +2178,7 @@ Clarification so far:
 Now proceed. Strongly prefer to implement the task and open a PR. Only ask
 again if a critical detail is still missing.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 
 {_agent_unavailable_guidance(coder_signature)}
 If you cannot safely proceed and cannot create a PR — for example after a
@@ -2264,7 +2363,7 @@ adds a merge migration.
             unresolved_items_guidance,
             followup_guidance,
             human_requirements_guidance,
-            _memory_block(memory),
+            _memory_block(memory, config),
             _compact_pr_review_issue_context_block(issue_context, pr_metadata.body),
             _human_requirements_block(human_requirements),
             _canonical_pr_review_ledger_rules(),
@@ -2579,7 +2678,7 @@ are present in the PR diff.
 {_review_command_policy(config, metadata)}
 {checks_block}{_issue_context_block(issue_context)}
 {_human_requirements_block(human_requirements)}
-{unresolved_items_block}{_memory_block(memory)}
+{unresolved_items_block}{_memory_block(memory, config)}
 
 Suggested commands:
 - Read the verified checkout and local base-to-head diff first.
@@ -2697,10 +2796,10 @@ needed, implement fixes, run relevant tests, commit, and push to the same PR.
 Do not create a new PR.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
-{_memory_block(memory)}
+{_memory_block(memory, config, include_runtime=True)}
 
 {reviewer_name} review:
 
@@ -2746,10 +2845,10 @@ current PR. Keep the change narrowly scoped to the listed items. Do not take on
 larger redesigns or unrelated future work; call that out instead. The PR
 remains blocked pending another review round after this cleanup.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
-{_memory_block(memory)}
+{_memory_block(memory, config, include_runtime=True)}
 
 Same-PR follow-ups:
 
@@ -2800,10 +2899,10 @@ or wait for CI runs in this round -- CI and reviews are re-evaluated automatical
 against the new head after your push.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(structured=True)}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_documentation_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
-{_memory_block(memory)}
+{_memory_block(memory, config, include_runtime=True)}
 
 Other unresolved reviewer items carried into this round (address them in the same \
 push if practical, alongside the conflict resolution):
@@ -3042,7 +3141,7 @@ def build_discuss_agenda_prompt(
 
 You are the analyzer, not a debater. Do not vote on the issue and do not edit
 files, create a branch, commit, push, or open a pull request.
-{_issue_context_block(issue_context)}{_memory_block(memory)}
+{_issue_context_block(issue_context)}{_memory_block(memory, config)}
 Complete debate transcript so far, oldest round first:
 
 {history_block}
@@ -3448,7 +3547,7 @@ def build_discuss_review_prompt(
         return f"""Evaluate GitHub issue #{issue_number} in {config.repo} as an open-ended system/design question.
 
 Use this local checkout only to inspect context. Do not edit files, create a branch, commit, push, or open a pull request.
-{_issue_context_block(issue_context)}{_memory_block(memory)}
+{_issue_context_block(issue_context)}{_memory_block(memory, config)}
 Prior round positions (the analyzer is non-authoritative; do not treat it as a vote):
 {history}{analyzer_context}
 {prior_evidence_index}
@@ -3585,7 +3684,7 @@ Do not include triage fields such as outcome or split_proposals. The analyzer is
 
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this evaluation.
-{_issue_context_block(issue_context)}{_memory_block(memory)}
+{_issue_context_block(issue_context)}{_memory_block(memory, config)}
 {round_context}
 
 {prior_evidence_index}

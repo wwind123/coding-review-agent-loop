@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from .errors import AgentLoopError
 from .protocol import DiscussEvidenceClaim
+from .test_runtime import TestRuntimeConfigurationError, parse_managed_test_invocation
 
 
 TEST_SECTION_RE = re.compile(r"(?im)^\s*tests(?:\s+run)?\s*:\s*(?P<body>.*)$")
@@ -1061,6 +1062,19 @@ def _url_targets_in_clause(clause: _Clause) -> list[str]:
 
 
 def _validate_single_command(command: str, *, assigned: Path, origin: Origin) -> None:
+    # The managed wrapper itself is an absolute executable outside the checkout
+    # by design, and its memory directory is an output location.  Once the
+    # exact contract is recognized, validate the inner executable/targets with
+    # the ordinary path and URL rules so the wrapper cannot hide an escape.
+    try:
+        managed = parse_managed_test_invocation(shlex.split(command))
+    except (ValueError, TestRuntimeConfigurationError):
+        managed = None
+    if managed is not None:
+        _validate_single_command(
+            shlex.join(managed.inner_argv), assigned=assigned, origin=origin
+        )
+        return
     for raw_windows in WINDOWS_PATH_RE.findall(command):
         if _windows_path_is_exempt(command, raw_windows, origin):
             continue

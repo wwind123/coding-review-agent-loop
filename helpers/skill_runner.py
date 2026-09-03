@@ -108,14 +108,22 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.agents.base import AgentName, normalize_agent_name
 from coding_review_agent_loop.agents.registry import agent_display_name
-from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT, ensure_temp_checkout
+from coding_review_agent_loop.config import (
+    DEFAULT_FLAT_CHILD_LIMIT,
+    ensure_temp_checkout,
+)
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
 from coding_review_agent_loop.followups import (
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
 )
 from coding_review_agent_loop.memory import AgentMemoryContext, prepare_agent_memory
-from coding_review_agent_loop.runner import Runner, tail_text
+from coding_review_agent_loop.runner import Runner, run_foreground_test, tail_text
+from coding_review_agent_loop.test_runtime import (
+    DEFAULT_TEST_TIMEOUT_SECONDS,
+    record_test_observation,
+    resolve_timeout_seconds,
+)
 from coding_review_agent_loop.usage import RunUsageContext, UsageMetadata
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
 from coding_review_agent_loop.round_state import (
@@ -598,6 +606,19 @@ def _add_gemini_cmd_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_test_timeout_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--coder-test-command-timeout-seconds",
+        type=float,
+        default=DEFAULT_TEST_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Finite run-level ceiling and watchdog for optional local test gates "
+            f"(default: {DEFAULT_TEST_TIMEOUT_SECONDS})."
+        ),
+    )
+
+
 def _run_external_antigravity_args(args: argparse.Namespace) -> tuple[str, ...]:
     """Convert skill-runner Antigravity options to run_external arguments."""
     result: list[str] = []
@@ -616,6 +637,13 @@ def _run_external_antigravity_args(args: argparse.Namespace) -> tuple[str, ...]:
     if print_timeout_seconds is not None:
         result.extend(("--antigravity-print-timeout-seconds", str(print_timeout_seconds)))
     return tuple(result)
+
+
+def _run_external_timeout_args(args: argparse.Namespace) -> tuple[str, ...]:
+    return (
+        "--coder-test-command-timeout-seconds",
+        str(getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS)),
+    )
 
 
 def _model_used_from_usage(usage_file: Path) -> str:
@@ -645,6 +673,7 @@ def _prepare_skill_memory(
     *,
     refresh: bool,
     dry_run: bool,
+    timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> AgentMemoryContext | None:
     """Build repo-scoped agent memory once for a round (advisory; never crashes).
 
@@ -662,6 +691,7 @@ def _prepare_skill_memory(
             make_minimal_config(
                 repo, first, tuple(reviewers),
                 reviewer=first, workdir=memory_workdir,
+                coder_test_command_timeout_seconds=int(float(timeout_seconds)),
             ),
             agent_memory=True,
             agent_memory_dir=_agent_memory_dir(repo),
@@ -676,7 +706,14 @@ def _prepare_skill_memory(
         return None
 
 
-def _run_test_gate(command: str, workdir: str, *, dry_run: bool) -> dict:
+def _run_test_gate(
+    command: str,
+    workdir: str,
+    *,
+    dry_run: bool,
+    timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
+    memory_dir: Path | None = None,
+) -> dict:
     """Run an optional test command and report the outcome. Never raises.
 
     Distinguishes "ran and failed" (``exit_code`` int, ``output_tail``) from
@@ -694,28 +731,41 @@ def _run_test_gate(command: str, workdir: str, *, dry_run: bool) -> dict:
     if not argv:
         return {**base, "error": "--test-command is empty"}
     try:
-        proc = subprocess.run(
-            argv,
-            cwd=workdir,
-            text=True,
-            errors="replace",  # test output may contain bytes invalid for the locale;
-                               # decode lossily so the gate never raises UnicodeDecodeError
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
+        chosen = resolve_timeout_seconds(timeout_seconds, policy_ceiling=timeout_seconds)
+        result = run_foreground_test(
+            argv, cwd=Path(workdir), timeout_seconds=chosen, dry_run=False
         )
-    except OSError as exc:  # FileNotFoundError, NotADirectoryError, ...
+    except (OSError, AgentLoopError) as exc:  # setup and policy failures remain JSON-visible
         return {**base, "error": f"could not run --test-command: {exc}"}
+    if memory_dir is not None:
+        record_test_observation(
+            memory_dir,
+            argv=argv,
+            cwd=Path(workdir),
+            outcome=result.outcome,
+            elapsed_seconds=result.elapsed_seconds,
+            attempted_timeout_seconds=chosen,
+            policy_ceiling_seconds=chosen,
+            returncode=result.returncode,
+        )
     return {
         "command": command,
-        "passed": proc.returncode == 0,
-        "exit_code": proc.returncode,
-        "output_tail": tail_text(proc.stdout or "", max_lines=50),
+        "passed": result.outcome == "passed",
+        "timed_out": result.outcome == "timed_out",
+        "outcome": result.outcome,
+        "exit_code": result.returncode,
+        "timeout_seconds": chosen,
+        "output_tail": result.output_tail,
     }
 
 
 def _maybe_test_gate(
-    test_command: str | None, test_workdir: str, *, dry_run: bool
+    test_command: str | None,
+    test_workdir: str,
+    *,
+    dry_run: bool,
+    timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
+    memory_dir: Path | None = None,
 ) -> dict | None:
     """Return the test-gate result, or None when no --test-command was provided.
 
@@ -726,7 +776,13 @@ def _maybe_test_gate(
     """
     if test_command is None:
         return None
-    return _run_test_gate(test_command, test_workdir, dry_run=dry_run)
+    return _run_test_gate(
+        test_command,
+        test_workdir,
+        dry_run=dry_run,
+        timeout_seconds=timeout_seconds,
+        memory_dir=memory_dir,
+    )
 
 
 def _mint_new_items(
@@ -1911,6 +1967,7 @@ def _run_external_coder_phase(
         prompt_text = build_plan_prompt_for_skill(
             issue_dict, repo=repo, coder=coder,  # type: ignore[arg-type]
             reviewers=reviewers, workdir=workdir, memory=memory,  # type: ignore[arg-type]
+            coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
         )
         kind = "plan_state"
     else:  # coder-round-next
@@ -1924,6 +1981,7 @@ def _run_external_coder_phase(
             prior_items_raw=next_prior_items_raw,
             human_requirements=human_requirements,
             memory=memory,
+            coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
         )
         kind = "plan_revision"
 
@@ -1950,6 +2008,7 @@ def _run_external_coder_phase(
             "--usage-output", str(usage_file),
             "--response-evidence-output", str(evidence_file),
             *(["--cmd", gemini_cmd] if coder == "gemini" else []),
+            *_run_external_timeout_args(args),
             *_run_external_antigravity_args(args),
             *(["--dry-run"] if dry_run else []),
         )
@@ -2197,6 +2256,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         memory = _prepare_skill_memory(
             repo, reviewers, _workdir_for_agent(reviewers[0], args),
             refresh=getattr(args, "refresh_agent_memory", False), dry_run=dry_run,
+            timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
         )
 
     # Step 3+4 — produce and post the round's plan (host coder or external coder)
@@ -2270,6 +2330,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                     coder=coder,  # type: ignore[arg-type]
                     workdir=workdir,
                     memory=memory,
+                    coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
                 )
             except Exception as exc:  # noqa: BLE001
                 prompt_text = (
@@ -2301,7 +2362,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                 workdir=workdir,
                 dry_run=dry_run,
                 tmpdir=tmpdir,
-                external_args=_run_external_antigravity_args(args),
+                external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
                 item_id_offset=item_id_offset,
                 gemini_cmd=getattr(args, "gemini_cmd", "gemini"),
             )
@@ -2459,6 +2520,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         memory = _prepare_skill_memory(
             repo, reviewers, _workdir_for_agent(reviewers[0], args),
             refresh=getattr(args, "refresh_agent_memory", False), dry_run=dry_run,
+            timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
         )
 
     # Step 6 — run pending reviewers.
@@ -2490,6 +2552,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                     workdir=workdir,
                     approved_followups=getattr(args, "approved_followups", "ignore"),
                     memory=memory,
+                    coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
                 )
             except Exception as exc:  # noqa: BLE001
                 prompt_text = (
@@ -2520,7 +2583,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 workdir=workdir,
                 dry_run=dry_run,
                 tmpdir=tmpdir,
-                external_args=_run_external_antigravity_args(args),
+                external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
                 item_id_offset=item_id_offset,
                 gemini_cmd=getattr(args, "gemini_cmd", "gemini"),
             )
@@ -2604,6 +2667,8 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         getattr(args, "test_command", None),
         getattr(args, "test_workdir", "."),
         dry_run=dry_run,
+        timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        memory_dir=memory.memory_dir if memory is not None else None,
     )
     if gate is not None:
         result_json["tests"] = gate
@@ -2872,6 +2937,7 @@ def _implementation_config(
     workdir: str,
     base: str,
     dry_run: bool,
+    coder_test_command_timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
 ):
     from helpers.prompt_builders import make_minimal_config
 
@@ -2879,7 +2945,10 @@ def _implementation_config(
     # treated as user-owned: sync_coder_base_before_implementation then *rejects* a
     # dirty checkout instead of `git reset --hard`/`clean -fd`-ing the user's clone (#316).
     return dataclasses.replace(
-        make_minimal_config(repo, coder, (coder,), reviewer=coder, workdir=str(workdir), base=base),  # type: ignore[arg-type]
+        make_minimal_config(
+            repo, coder, (coder,), reviewer=coder, workdir=str(workdir), base=base,
+            coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        ),  # type: ignore[arg-type]
         dry_run=dry_run,
         auto_agent_dirs=(),
     )
@@ -2987,6 +3056,7 @@ def _run_child_or_one_shot_implementation(
     post_one_shot_handoff: bool,
     one_shot_mode: str = "implement-one-shot",
     external_args: tuple[str, ...] = (),
+    coder_test_command_timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> dict:
     from coding_review_agent_loop.config import sync_coder_base_before_implementation
     from coding_review_agent_loop.comment_rendering import render_public_agent_comment
@@ -3015,6 +3085,7 @@ def _run_child_or_one_shot_implementation(
         coder=coder,  # type: ignore[arg-type]
         workdir=str(workdir),
         base=base,
+        coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
     )
 
     if dry_run:
@@ -3221,6 +3292,7 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
 
     config = _implementation_config(
         repo=repo, coder=coder, workdir=str(workdir), base=base, dry_run=dry_run,
+        coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
     )
     runner = Runner(dry_run=dry_run)
 
@@ -3268,7 +3340,8 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         runner=runner,
         post_one_shot_handoff=True,
         one_shot_mode=mode,
-        external_args=_run_external_antigravity_args(args),
+        external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
+        coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
     )
     print(json.dumps(result_json, indent=2))
     if result_json.get("pr") is None:
@@ -3357,7 +3430,10 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
     from helpers.prompt_builders import build_pr_fix_prompt_for_skill, make_minimal_config
 
     config = dataclasses.replace(
-        make_minimal_config(repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir),  # type: ignore[arg-type]
+        make_minimal_config(
+            repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
+            coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        ),  # type: ignore[arg-type]
         dry_run=dry_run,
         auto_agent_dirs=(),
     )
@@ -3384,6 +3460,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         issue_context=issue_context,
         human_requirements=human_requirements,
         same_pr_only=same_pr_only,
+        coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
     )
 
     if not dry_run:
@@ -3429,6 +3506,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             "--usage-output", str(usage_file),
             "--response-evidence-output", str(evidence_file),
             *(["--cmd", gemini_cmd] if coder == "gemini" else []),
+            *_run_external_timeout_args(args),
             *_run_external_antigravity_args(args),
             *(["--dry-run"] if dry_run else []),
         )
@@ -3706,7 +3784,10 @@ def _run_decomposition_for_skill(
     )
 
     config = dataclasses.replace(
-        make_minimal_config(repo, coder, (coder,), reviewer=coder, workdir=str(workdir)),  # type: ignore[arg-type]
+        make_minimal_config(
+            repo, coder, (coder,), reviewer=coder, workdir=str(workdir),
+            coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        ),  # type: ignore[arg-type]
         dry_run=dry_run,
         flat_child_limit=getattr(args, "flat_child_limit", DEFAULT_FLAT_CHILD_LIMIT),
     )
@@ -3791,6 +3872,7 @@ def _run_decomposition_for_skill(
             repo=repo,
             coder=coder,
             workdir=str(workdir),  # type: ignore[arg-type]
+            coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
         )
 
         with tempfile.TemporaryDirectory() as tmpstr:
@@ -3810,6 +3892,7 @@ def _run_decomposition_for_skill(
                 "--repo", repo,
                 "--flow", "decompose",
                 "--usage-output", str(usage_file),
+                *_run_external_timeout_args(args),
                 *_run_external_antigravity_args(args),
                 *(["--dry-run"] if dry_run else []),
             )
@@ -4029,6 +4112,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         )
         impl_config = _implementation_config(
             repo=repo, coder=coder, workdir=workdir, base=base, dry_run=True,
+            coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
         )
         impl_runner = Runner(dry_run=True)
         impl_result = _run_child_or_one_shot_implementation(
@@ -4043,7 +4127,8 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
             config=impl_config,
             runner=impl_runner,
             post_one_shot_handoff=False,
-            external_args=_run_external_antigravity_args(args),
+            external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
+            coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
         )
         result_json.update({
             "state": "would-implement",
@@ -4091,6 +4176,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
 
     impl_config = _implementation_config(
         repo=repo, coder=coder, workdir=workdir, base=base, dry_run=False,
+        coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
     )
     impl_runner = Runner(dry_run=False)
     child_issue_context = get_issue_context(
@@ -4110,7 +4196,8 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         config=impl_config,
         runner=impl_runner,
         post_one_shot_handoff=False,
-        external_args=_run_external_antigravity_args(args),
+        external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
+        coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
     )
     if impl_result.get("pr") is None:
         result_json.update({
@@ -4185,6 +4272,7 @@ def main() -> None:
                             help="Disable repo-scoped agent memory.")
     p_plan.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
+    _add_test_timeout_option(p_plan)
     p_plan.add_argument("--dry-run", action="store_true")
     _add_gemini_cmd_option(p_plan)
     _add_antigravity_options(p_plan)
@@ -4227,6 +4315,7 @@ def main() -> None:
                           help="Disable repo-scoped agent memory.")
     p_pr.add_argument("--refresh-agent-memory", action="store_true",
                       help="Regenerate the agent-memory cache before this round.")
+    _add_test_timeout_option(p_pr)
     p_pr.add_argument("--dry-run", action="store_true")
     _add_gemini_cmd_option(p_pr)
     _add_antigravity_options(p_pr)
@@ -4283,6 +4372,7 @@ def main() -> None:
     p_impl.add_argument("--workdir-gemini", default=None)
     p_impl.add_argument("--workdir-antigravity", default=None)
     p_impl.add_argument("--dry-run", action="store_true")
+    _add_test_timeout_option(p_impl)
     _add_antigravity_options(p_impl)
 
     # run-pr-fix
@@ -4310,6 +4400,7 @@ def main() -> None:
     p_pr_fix.add_argument("--workdir-gemini", default=None)
     p_pr_fix.add_argument("--workdir-antigravity", default=None)
     p_pr_fix.add_argument("--dry-run", action="store_true")
+    _add_test_timeout_option(p_pr_fix)
     _add_gemini_cmd_option(p_pr_fix)
     _add_antigravity_options(p_pr_fix)
 
@@ -4339,6 +4430,7 @@ def main() -> None:
     p_impl_phase.add_argument("--workdir-gemini", default=None)
     p_impl_phase.add_argument("--workdir-antigravity", default=None)
     p_impl_phase.add_argument("--dry-run", action="store_true")
+    _add_test_timeout_option(p_impl_phase)
     p_impl_phase.add_argument(
         "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
         help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",
@@ -4364,6 +4456,7 @@ def main() -> None:
     p_decompose.add_argument("--workdir-gemini", default=None)
     p_decompose.add_argument("--workdir-antigravity", default=None)
     p_decompose.add_argument("--dry-run", action="store_true")
+    _add_test_timeout_option(p_decompose)
     p_decompose.add_argument(
         "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
         help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",
@@ -4404,6 +4497,7 @@ def main() -> None:
                             help="Disable repo-scoped agent memory.")
     p_task.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
+    _add_test_timeout_option(p_task)
     p_task.add_argument("--dry-run", action="store_true")
     _add_gemini_cmd_option(p_task)
     _add_antigravity_options(p_task)

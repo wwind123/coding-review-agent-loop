@@ -286,7 +286,12 @@ class AntigravityBackend:
                     label="Antigravity model catalog",
                     progress_interval_seconds=config.progress_interval_seconds,
                     check=False,
-                    env={"AGENT_LOOP_WORKDIR": str(Path(temp_dir).resolve())},
+                    env={
+                        "AGENT_LOOP_WORKDIR": str(Path(temp_dir).resolve()),
+                        "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
+                            config.coder_test_command_timeout_seconds
+                        ),
+                    },
                     use_pty=True,
                     timeout_seconds=timeout_seconds,
                 )
@@ -472,7 +477,12 @@ class AntigravityBackend:
                         label=f"Antigravity ({model})",
                         progress_interval_seconds=config.progress_interval_seconds,
                         check=False,
-                        env={"AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve())},
+                        env={
+                            "AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve()),
+                            "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
+                                config.coder_test_command_timeout_seconds
+                            ),
+                        },
                         use_pty=True,
                         timeout_seconds=(
                             config.repair_timeout_seconds

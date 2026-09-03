@@ -1,8 +1,12 @@
+import sys
+from datetime import datetime as datetime_type, timezone
+
 import pytest
 
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
+import coding_review_agent_loop.test_runtime as runtime
 from coding_review_agent_loop.prompts import (
     build_issue_implementation_prompt,
     build_issue_prompt,
@@ -1885,7 +1889,8 @@ def test_coder_prompts_require_focused_bounded_local_tests(tmp_path, builder):
     assert "one-line rationale for each" in prompt
     assert "Do not run the whole `tests/` suite" in prompt
     assert "broad server/database/integration/end-to-end suites" in prompt
-    assert "at most 1800" in prompt
+    assert "run-level ceiling is 1800s" in prompt
+    assert "at most 1800 seconds" in prompt
     assert "at most 900" not in prompt
     assert "Never launch pytest in the background" in prompt
     assert "poll process IDs" in prompt
@@ -1894,6 +1899,124 @@ def test_coder_prompts_require_focused_bounded_local_tests(tmp_path, builder):
     assert "terminate the run and return a valid" in prompt
     assert "naming the exact command and the timeout" in prompt
     assert "Reserve agent-unavailable for a genuine environment/tooling failure" in prompt
+
+
+def test_coder_prompts_render_a_configured_non_default_timeout_policy(tmp_path):
+    config = make_config(tmp_path, coder_test_command_timeout_seconds=7200)
+    prompt = " ".join(build_issue_prompt(56, config).split())
+
+    assert "run-level ceiling is 7200s" in prompt
+    assert "at most 7200 seconds" in prompt
+    assert "at most 1800 seconds" not in prompt
+    assert "whole-command watchdog" in prompt
+    assert "backend's whole-turn timeout" in prompt
+
+
+def test_coder_prompt_renders_remembered_runtime_context_without_test_gate(tmp_path):
+    command = ["./test-bin", "-q"]
+    executable = tmp_path / "claude" / "test-bin"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    other_executable = tmp_path / "claude" / "other-bin"
+    other_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    other_executable.chmod(0o755)
+    memory_dir = tmp_path / "memory"
+    config = make_config(
+        tmp_path,
+        test_command=None,
+        coder_test_command_timeout_seconds=7200,
+        agent_memory_dir=memory_dir,
+    )
+    assert runtime.record_test_observation(
+        memory_dir,
+        argv=command,
+        cwd=config.claude_dir,
+        outcome="passed",
+        elapsed_seconds=410,
+        attempted_timeout_seconds=7200,
+        policy_ceiling_seconds=7200,
+        timestamp=datetime_type.now(timezone.utc),
+    )
+    assert runtime.record_test_observation(
+        memory_dir,
+        argv=["./other-bin", "-q"],
+        cwd=config.claude_dir,
+        outcome="passed",
+        elapsed_seconds=520,
+        attempted_timeout_seconds=7200,
+        policy_ceiling_seconds=7200,
+        timestamp=datetime_type.now(timezone.utc),
+    )
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit="abc123",
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary="REPO SUMMARY TEXT",
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+        runtime_observations=tuple(runtime.load_runtime_memory(memory_dir)),
+    )
+
+    coder_prompt = build_issue_prompt(56, config, memory=memory)
+    assert "Observed local test timing (advisory)" in coder_prompt
+    assert "Successful samples: 1" in coder_prompt
+    assert "freshness: fresh" in coder_prompt
+    assert "Invocation guidance:" in coder_prompt
+    assert "run-tests" in coder_prompt
+    assert "Recommended whole-command timeout:" in coder_prompt
+    assert "./other-bin -q" in coder_prompt
+
+    reviewer_prompt = build_review_prompt(77, 1, config, reviewer="codex", memory=memory)
+    assert "Observed local test timing (advisory)" not in reviewer_prompt
+    assert "Invocation guidance:" not in reviewer_prompt
+
+
+def test_coder_prompt_reuses_stored_runtime_keys_for_redacted_and_external_commands(tmp_path):
+    memory_dir = tmp_path / "memory"
+    config = make_config(
+        tmp_path,
+        test_command=None,
+        coder_test_command_timeout_seconds=7200,
+        agent_memory_dir=memory_dir,
+    )
+    external = tmp_path / "other-venv" / "bin" / "python"
+    external.parent.mkdir(parents=True)
+    external.write_text("#!/bin/sh\n", encoding="utf-8")
+    external.chmod(0o755)
+    redacted_command = ["PYTHONPATH=/secret/project", sys.executable, "-c", "pass"]
+    external_command = [str(external), "-c", "pass"]
+    for command, elapsed in ((redacted_command, 410), (external_command, 520)):
+        assert runtime.record_test_observation(
+            memory_dir,
+            argv=command,
+            cwd=config.claude_dir,
+            outcome="passed",
+            elapsed_seconds=elapsed,
+            attempted_timeout_seconds=7200,
+            policy_ceiling_seconds=7200,
+            timestamp=datetime_type.now(timezone.utc),
+        )
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit="abc123",
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary="REPO SUMMARY TEXT",
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+        runtime_observations=tuple(runtime.load_runtime_memory(memory_dir)),
+    )
+
+    prompt = build_issue_prompt(56, config, memory=memory)
+
+    assert "Successful samples: 1" in prompt
+    assert "PYTHONPATH=<sha256:" in prompt
+    assert "/secret/project" not in prompt
+    assert "python -c pass" in prompt
 
 
 @pytest.mark.parametrize(

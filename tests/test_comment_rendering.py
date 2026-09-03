@@ -5,6 +5,8 @@ render_public_agent_comment, _render_public_*_comment, and related functions.
 """
 import json
 import re
+import shlex
+import sys
 
 import pytest
 
@@ -16,6 +18,7 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_plan_revision_comment,
     _render_public_pr_review_comment,
     _render_public_issue_implementation_comment,
+    _render_test_command_for_comment,
     decode_deferred_stages_marker,
     normalize_freeform_signature,
     render_agent_unavailable_comment,
@@ -75,6 +78,17 @@ from agent_loop_helpers import (
     structured_plan_state,
     structured_pr_review,
 )
+
+
+def test_managed_test_comment_hides_wrapper_plumbing_and_keeps_inner_command():
+    command = shlex.join([
+        "/opt/venv/bin/agent-loop", "run-tests", "--timeout-seconds=720",
+        "--memory-dir", "/private/cache", "--", sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q",
+    ])
+    rendered = _render_test_command_for_comment(command)
+    assert shlex.join([sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"]) in rendered
+    assert "agent-loop instrumented; whole-command timeout 720s" in rendered
+    assert "/private/cache" not in rendered
 
 
 def test_render_issue_implementation_no_pr_keeps_summary_tests_and_result_identity():
