@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -42,6 +43,12 @@ from .protocol import (
 from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID
 from .protocol_markers import sanitize_historical_text
 from .round_transport import MAX_GITHUB_BODY_CHARS
+from .test_runtime import (
+    DEFAULT_TEST_TIMEOUT_SECONDS,
+    TestRuntimeConfigurationError,
+    parse_managed_test_invocation,
+    resolve_timeout_seconds,
+)
 
 if TYPE_CHECKING:
     from .agents.base import AgentName
@@ -60,6 +67,46 @@ _AGENT_BY_DISPLAY_NAME = {
     agent_display_name(agent): agent
     for agent in ("claude", "codex", "gemini", "antigravity")
 }
+
+
+def _render_test_command_for_comment(
+    command: str,
+    *,
+    config: AgentLoopConfig | None = None,
+) -> str:
+    """Hide managed wrapper plumbing while preserving ordinary reports exactly."""
+    try:
+        parsed = parse_managed_test_invocation(shlex.split(command))
+    except (ValueError, TestRuntimeConfigurationError):
+        return command
+    if parsed is None:
+        return command
+    chosen = parsed.timeout_seconds
+    policy = (
+        config.coder_test_command_timeout_seconds
+        if config is not None
+        else DEFAULT_TEST_TIMEOUT_SECONDS
+    )
+    try:
+        chosen = resolve_timeout_seconds(chosen, policy_ceiling=policy)
+    except TestRuntimeConfigurationError:
+        return command
+    if chosen is None:
+        chosen = policy
+    if float(chosen).is_integer():
+        timeout = str(int(chosen))
+    else:
+        timeout = f"{chosen:g}"
+    return (
+        f"{shlex.join(parsed.inner_argv)} "
+        f"(agent-loop instrumented; whole-command timeout {timeout}s)"
+    )
+
+
+def _render_test_commands_for_comment(
+    commands: Sequence[str], *, config: AgentLoopConfig | None = None
+) -> list[str]:
+    return [_render_test_command_for_comment(command, config=config) for command in commands]
 
 
 def render_agent_unavailable_comment(unavailable: AgentUnavailable, *, signature: str) -> str:
@@ -662,7 +709,14 @@ def _render_public_coder_followup_comment(
         sections.append("\n".join(["### Disputed items", *disputed_items]))
     if parsed_followup.tests_run:
         sections.append(
-            "\n".join(["### Tests run", *[f"- {test}" for test in parsed_followup.tests_run]])
+            "\n".join(
+                ["### Tests run", *[
+                    f"- {test}"
+                    for test in _render_test_commands_for_comment(
+                        parsed_followup.tests_run, config=config
+                    )
+                ]]
+            )
         )
     if parsed_followup.human_requirement_dispositions:
         sections.append(
@@ -704,7 +758,16 @@ def _render_public_issue_implementation_comment(
         result = f"Pull request reported: #{parsed.pr_number}."
     sections = ["## Issue implementation", parsed.summary.strip(), f"### Result\n{result}"]
     if parsed.tests_run:
-        sections.append("\n".join(["### Tests run", *[f"- {test}" for test in parsed.tests_run]]))
+        sections.append(
+            "\n".join(
+                ["### Tests run", *[
+                    f"- {test}"
+                    for test in _render_test_commands_for_comment(
+                        parsed.tests_run, config=config
+                    )
+                ]]
+            )
+        )
     human_section = render_human_requirement_dispositions(
         parsed.human_requirement_dispositions
     )

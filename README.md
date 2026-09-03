@@ -307,7 +307,9 @@ Other important boundaries:
 
 - Automatic merge is off unless `--auto-merge` is present.
 - Reviewer approval is not a substitute for project tests or human judgment.
-- `--test-command` adds a local gate before review and again before auto-merge.
+- `--test-command` adds a local gate before review and again before auto-merge. The
+  finite watchdog defaults to 1,800 seconds and is configurable with
+  `--coder-test-command-timeout-seconds SECONDS`.
 - The tool validates assigned workdirs and reported test locations, but agent
   CLIs may still consume substantial CPU, memory, network, and provider quota.
 - Raw subprocess logs and salvage artifacts can contain sensitive repository
@@ -317,6 +319,33 @@ Other important boundaries:
 Read [Workdirs](docs/local_agent_loop.md#workdirs),
 [Agent permission flags](docs/local_agent_loop.md#agent-permission-flags), and
 [Logs](docs/local_agent_loop.md#logs) before unattended use.
+
+### Runtime-aware local test timeouts
+
+Coder test commands may be run through the backend-neutral wrapper:
+
+```bash
+agent-loop run-tests --memory-dir /path/to/memory -- pytest tests/test_app.py -q
+```
+
+The `--timeout-seconds` value is the watchdog for that one whole command. When
+omitted, the wrapper uses the inherited run ceiling, or 1,800 seconds when run
+outside agent-loop. A positive finite override may be smaller than the ceiling;
+values above it are rejected before the child starts. Agent backends inherit the
+ceiling through `AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS`.
+
+When agent memory is enabled, the wrapper records measured outcomes, elapsed
+time, the attempted cap, a privacy-preserving environment fingerprint, and
+cheap lockfile/configuration hashes in `test-runtime.json`. Recent successful
+runs produce advisory median/p95 recommendations with headroom; timeouts remain
+lower-bound evidence and are never treated as successful durations. Data is
+best-effort, retained to 20 samples per command/fingerprint cohort and 200
+cohorts, and becomes stale after 30 days or when relevant inputs change.
+Remembered commands are suggestions only: agents must inspect the checkout and
+select focused tests. Framework per-test limits, the wrapper whole-command
+watchdog, and the backend whole-turn timeout are separate. The backend turn
+must leave headroom for analysis, edits, and reporting; split or shard healthy
+browser/integration matrices when that improves diagnosis and retry cost.
 
 ## CI and Merge
 

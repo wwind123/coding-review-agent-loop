@@ -247,9 +247,10 @@ module to a changed file or reviewer item. Broad suites remain available when
 the change genuinely touches those surfaces, focused tests demonstrably do
 not cover it, or a human or the issue explicitly asked for full-suite
 verification. Required completion tests must run in the foreground with
-visible output under an explicit bounded timeout (at most 1,800 seconds per
-required test command). That maximum allowance requires an individually
-justified command; it is not a reason to choose a broad suite. Never launch
+visible output under an explicit bounded timeout no greater than the configured
+finite run-level ceiling (1,800 seconds by default). That maximum allowance
+requires an individually justified command; it is not a reason to choose a
+broad suite. Never launch
 pytest in the background or poll a process ID, `ps`/`kill -0`/`wait`, or a
 task-output file to learn whether it finished. If a required test exceeds its
 bound, terminate it and report the blocker immediately, naming the exact
@@ -342,6 +343,19 @@ current terms and product behavior at the time of use.
    ```
    python -m helpers.demo_loop --issue 123 --repo demo/repo
    ```
+
+## Runtime-aware local test timeouts
+
+Skill local test gates use the finite
+`--coder-test-command-timeout-seconds SECONDS` ceiling (default 1,800) and
+return `timed_out` with a bounded diagnostic tail in their JSON result. This
+whole-command watchdog is distinct from framework per-test and backend
+whole-turn limits. The optional `agent-loop run-tests [--timeout-seconds N] --
+COMMAND...` wrapper inherits the ceiling from its environment, defaults to
+1,800 outside agent-loop, rejects malformed or over-ceiling requests before
+spawn, and records measured observations only when skill memory is enabled and
+writable. Long browser/integration matrices remain finite and can be split or
+sharded when useful.
 
 ## Known limitations
 

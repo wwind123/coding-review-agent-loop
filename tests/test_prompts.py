@@ -1885,7 +1885,8 @@ def test_coder_prompts_require_focused_bounded_local_tests(tmp_path, builder):
     assert "one-line rationale for each" in prompt
     assert "Do not run the whole `tests/` suite" in prompt
     assert "broad server/database/integration/end-to-end suites" in prompt
-    assert "at most 1800" in prompt
+    assert "run-level ceiling is 1800s" in prompt
+    assert "at most 1800 seconds" in prompt
     assert "at most 900" not in prompt
     assert "Never launch pytest in the background" in prompt
     assert "poll process IDs" in prompt
@@ -1894,6 +1895,17 @@ def test_coder_prompts_require_focused_bounded_local_tests(tmp_path, builder):
     assert "terminate the run and return a valid" in prompt
     assert "naming the exact command and the timeout" in prompt
     assert "Reserve agent-unavailable for a genuine environment/tooling failure" in prompt
+
+
+def test_coder_prompts_render_a_configured_non_default_timeout_policy(tmp_path):
+    config = make_config(tmp_path, coder_test_command_timeout_seconds=7200)
+    prompt = " ".join(build_issue_prompt(56, config).split())
+
+    assert "run-level ceiling is 7200s" in prompt
+    assert "at most 7200 seconds" in prompt
+    assert "at most 1800 seconds" not in prompt
+    assert "whole-command watchdog" in prompt
+    assert "backend's whole-turn timeout" in prompt
 
 
 @pytest.mark.parametrize(

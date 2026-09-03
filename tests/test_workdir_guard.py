@@ -1,3 +1,8 @@
+import shlex
+import sys
+
+import pytest
+
 from agent_loop_helpers import *  # noqa: F403
 
 from coding_review_agent_loop.workdir_guard import (
@@ -8,6 +13,44 @@ from coding_review_agent_loop.workdir_guard import (
     WorkdirSnapshot,
 )
 from coding_review_agent_loop.orchestrator import _read_assigned_workdir_head
+from coding_review_agent_loop.workdir_guard import validate_test_commands_within_workdir
+
+
+def test_managed_run_tests_wrapper_exempts_only_wrapper_and_memory_output(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    wrapper = [
+        "/home/user/.local/pipx/venvs/agent-loop/bin/agent-loop", "run-tests",
+        "--memory-dir=/outside/cache", "--timeout-seconds", "720", "--",
+        sys.executable, "tests/test_protocol.py", "-q",
+    ]
+    validate_test_commands_within_workdir(
+        [shlex.join(wrapper)], assigned_workdir=checkout
+    )
+
+
+def test_managed_run_tests_wrapper_still_rejects_inner_outside_target(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    outside_target = tmp_path / "outside.py"
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            [shlex.join([
+                sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests",
+                "--", sys.executable, str(outside_target),
+            ])],
+            assigned_workdir=checkout,
+        )
+
+
+def test_malformed_managed_run_tests_never_gets_a_wrapper_exemption(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir(
+            ["/tmp/agent-loop run-tests --unknown -- python3 tests/test_protocol.py"],
+            assigned_workdir=checkout,
+        )
 
 
 def test_workdir_snapshot_runs_exact_read_only_git_probes_and_accepts_clean_status(tmp_path):

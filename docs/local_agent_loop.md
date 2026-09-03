@@ -1973,9 +1973,9 @@ Every coder prompt built by `coding_review_agent_loop.prompts` requires:
   the unnecessary or mis-targeted case is prohibited.
 - **Foreground execution under a bounded timeout.** Required completion
   tests run in the foreground with visible output and a concrete stated cap
-  (at most 1,800 seconds per required test command). This is a maximum
-  allowance for one individually justified command, not a default reason to
-  choose a broad suite. Coders must not launch pytest in the background or
+  no greater than the configured finite run-level ceiling (1,800 seconds by
+  default). This is a maximum allowance for one individually justified
+  command, not a default reason to choose a broad suite. Coders must not launch pytest in the background or
   spawn auxiliary shell loops that poll process IDs, `ps`/`kill -0`/`wait`,
   or task-output files to learn whether a test finished.
 - **A valid terminal path on timeout.** If a required test exceeds its
@@ -1992,11 +1992,12 @@ This per-command coder policy is separate from the three-snapshot,
 120-second GitHub CI observation limit and from the orchestrator's optional
 `--test-command` parsing and execution path; it does not change either one.
 When `antigravity` is the coder, configure
-`--antigravity-print-timeout-seconds` above the 1,800-second command cap and
-leave additional budget for analysis, edits, reporting, and other turn work.
-Its default 600-second whole-invocation deadline cannot accommodate even one
-such command. Apply the same headroom principle to any other backend-imposed
-whole-turn deadline.
+`--antigravity-print-timeout-seconds` above the selected command watchdog plus
+`max(300s, 20%)`, and leave additional budget for analysis, edits, reporting,
+and other turn work. The run-level ceiling can be raised for a justified long
+suite with `--coder-test-command-timeout-seconds`; the default 600-second
+whole-invocation deadline may be too short for that selection. Apply the same
+headroom principle to any other backend-imposed whole-turn deadline.
 
 The completion-recovery prompt (sent once, when a prior implementation turn
 ended without a valid terminal marker and its text suggested deferring to
@@ -2518,3 +2519,31 @@ when only some counters are available. When a backend exposes no usable usage
 data, the orchestrator records an `estimated` fallback based on prompt and
 public-response size, along with raw character and byte counts. `--dry-run`
 does not invent token usage records.
+
+## Runtime-aware local test timeouts
+
+The run-level command ceiling is configured with
+`--coder-test-command-timeout-seconds SECONDS` and defaults to 1,800 seconds.
+It is separate from a framework's per-test timeout and from the backend's
+whole-turn timeout. A backend turn must exceed the selected whole-command
+watchdog with headroom for analysis, edits, and reporting; Antigravity's print
+timeout should exceed it by `max(300s, 20%)`.
+
+The backend-neutral wrapper is `agent-loop run-tests [--timeout-seconds N]
+[--memory-dir DIR] -- COMMAND...`. The scalar is the chosen watchdog for that
+invocation. Omitted values inherit
+`AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS`, falling back to the 1,800-second
+default outside agent-loop. Positive finite values at or below the ceiling are
+accepted; malformed or over-ceiling values are rejected before child spawn.
+Agents may use a learned sub-ceiling recommendation when rendered, but must
+continue to select focused tests and may split or shard long browser,
+integration, or end-to-end matrices.
+
+With writable agent memory, measured wrapper/gate outcomes are stored in the
+versioned `test-runtime.json` sidecar. It records elapsed time, attempted cap,
+outcome, commit, input hashes, and a privacy-preserving local environment
+fingerprint. Successful samples produce conservative median/p95 recommendations;
+timeouts are lower-bound evidence, never successes. Samples are retained up to
+20 per command/fingerprint cohort and 200 cohorts, and stale after 30 days or
+relevant lockfile, configuration, target, or fixture changes. Persistence is
+best-effort and uses an advisory lock plus atomic replacement.

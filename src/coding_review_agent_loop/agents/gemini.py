@@ -309,7 +309,12 @@ class GeminiBackend:
             label="Gemini",
             progress_interval_seconds=config.progress_interval_seconds,
             check=False,
-            env={"AGENT_LOOP_WORKDIR": str(config.gemini_dir.resolve())},
+            env={
+                "AGENT_LOOP_WORKDIR": str(config.gemini_dir.resolve()),
+                "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
+                    config.coder_test_command_timeout_seconds
+                ),
+            },
             timeout_seconds=timeout_seconds,
             input_text=rendered_prompt if oversized_prompt else None,
         )

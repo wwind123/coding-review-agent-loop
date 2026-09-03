@@ -321,7 +321,12 @@ class CodexBackend:
                 ],
                 cwd=config.codex_dir,
                 input_text=input_text,
-                env={"AGENT_LOOP_WORKDIR": str(config.codex_dir.resolve())},
+                env={
+                    "AGENT_LOOP_WORKDIR": str(config.codex_dir.resolve()),
+                    "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
+                        config.coder_test_command_timeout_seconds
+                    ),
+                },
             )
             log(config, f"Codex finished; log: {log_path}")
             return AgentResult(
@@ -356,7 +361,12 @@ class CodexBackend:
                 label="Codex",
                 progress_interval_seconds=config.progress_interval_seconds,
                 check=False,
-                env={"AGENT_LOOP_WORKDIR": str(config.codex_dir.resolve())},
+                env={
+                    "AGENT_LOOP_WORKDIR": str(config.codex_dir.resolve()),
+                    "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
+                        config.coder_test_command_timeout_seconds
+                    ),
+                },
                 input_text=input_text,
                 timeout_seconds=timeout_seconds,
             )

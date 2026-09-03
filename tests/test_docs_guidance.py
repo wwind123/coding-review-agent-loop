@@ -247,8 +247,9 @@ def test_local_agent_loop_doc_has_focused_bounded_local_test_section():
     assert "three-snapshot" in section
     assert "120-second GitHub CI observation limit" in section
     assert "`--test-command` parsing and execution path" in section
-    assert "`--antigravity-print-timeout-seconds` above the 1,800-second command cap" in section
-    assert "default 600-second whole-invocation deadline cannot accommodate" in section
+    assert "`--antigravity-print-timeout-seconds` above the selected command watchdog" in section
+    assert "`--coder-test-command-timeout-seconds`" in section
+    assert "default 600-second whole-invocation deadline may be too short" in section
     assert "additional budget for analysis, edits, reporting, and other turn work" in section
     assert "other backend-imposed whole-turn deadline" in section
 
@@ -265,7 +266,8 @@ def test_skill_docs_keep_focused_bounded_local_test_policy_aligned():
     skill_mode_section = " ".join(skill_mode_text[skill_mode_section_start:skill_mode_section_end].split())
 
     for section in (skill_section, skill_mode_section):
-        assert section.count("1,800 seconds per required test command") == 1
+        assert section.count("1,800 seconds by default") == 1
+        assert "configured finite run-level ceiling" in section
         assert "individually justified command" in section
         assert "not a reason to choose a broad suite" in section
         assert "foreground with visible output" in section

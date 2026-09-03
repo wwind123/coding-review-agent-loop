@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shlex
 import shutil
@@ -55,6 +56,9 @@ DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3.7 Flash (Medium)",)
 # materialization.  Keeping this policy in config prevents each workflow from
 # obtaining a second allowance of children.
 DEFAULT_FLAT_CHILD_LIMIT: int = 15
+# Run-level ceiling for one local coder test command.  Learned recommendations
+# may select a smaller watchdog, but never exceed this policy value.
+DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS: int = 1800
 
 # Discuss-mode research policy values (#477). The CLI flag choices, the config
 # validation, and the prompt builders all derive from this set.
@@ -232,6 +236,9 @@ class AgentLoopConfig:
     # issue-to-PR handoff so a repository-default base cannot silently replace
     # the live PR base on a later invocation.
     base_provenance: str | None = None
+    # Finite run-level ceiling for local coder test commands.  Kept at the end
+    # with a default so direct AgentLoopConfig callers remain source-compatible.
+    coder_test_command_timeout_seconds: int = DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -258,6 +265,16 @@ class AgentLoopConfig:
             raise AgentLoopError("antigravity_models chain cannot be empty or contain blank entries.")
         if self.antigravity_print_timeout_seconds <= 0:
             raise AgentLoopError("--antigravity-print-timeout-seconds must be greater than zero.")
+        timeout = self.coder_test_command_timeout_seconds
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise AgentLoopError(
+                "--coder-test-command-timeout-seconds must be a positive finite integer."
+            )
+        if not math.isfinite(float(timeout)) or timeout <= 0 or float(timeout) != int(timeout):
+            raise AgentLoopError(
+                "--coder-test-command-timeout-seconds must be a positive finite integer."
+            )
+        object.__setattr__(self, "coder_test_command_timeout_seconds", int(timeout))
         if self.repair_backend not in {"antigravity", "gemini"}:
             raise AgentLoopError("--repair-backend must be either 'antigravity' or 'gemini'.")
         if not self.repair_models or any(not model.strip() for model in self.repair_models):
@@ -1084,6 +1101,11 @@ def config_from_args(
         salvage_comment_patch_max_bytes=getattr(args, "salvage_comment_patch_max_bytes", 20000),
         review_parallel=getattr(args, "review_parallel", False),
         test_command=test_command,
+        coder_test_command_timeout_seconds=getattr(
+            args,
+            "coder_test_command_timeout_seconds",
+            DEFAULT_CODER_TEST_COMMAND_TIMEOUT_SECONDS,
+        ),
         pre_review_tests=args.pre_review_tests,
         ci_timeout_seconds=args.ci_timeout_seconds,
         ci_poll_interval_seconds=args.ci_poll_interval_seconds,

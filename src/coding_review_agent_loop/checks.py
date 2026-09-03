@@ -6,7 +6,9 @@ from .ci_health import CiInfrastructureStall
 from .config import AgentLoopConfig
 from .github import PullRequestChecks
 from .logging import log
+from .errors import AgentLoopError
 from .runner import Runner
+from .test_runtime import record_test_observation
 from .workdirs import active_workdir
 
 
@@ -14,7 +16,13 @@ def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
     if not config.test_command:
         return
     log(config, f"Running local test command: {' '.join(config.test_command)}")
-    runner.run(config.test_command, cwd=active_workdir(config))
+    result = runner.run_test_command(
+        config.test_command,
+        cwd=active_workdir(config),
+        timeout_seconds=config.coder_test_command_timeout_seconds,
+    )
+    _record_gate_observation(config, result)
+    _raise_for_gate_result(result, config)
     log(config, "Local test command passed")
 
 
@@ -22,8 +30,47 @@ def run_pre_review_tests(runner: Runner, config: AgentLoopConfig) -> None:
     if not config.pre_review_tests or not config.test_command:
         return
     log(config, f"Running pre-review test command: {' '.join(config.test_command)}")
-    runner.run(config.test_command, cwd=active_workdir(config))
+    result = runner.run_test_command(
+        config.test_command,
+        cwd=active_workdir(config),
+        timeout_seconds=config.coder_test_command_timeout_seconds,
+    )
+    _record_gate_observation(config, result)
+    _raise_for_gate_result(result, config)
     log(config, "Pre-review test command passed")
+
+
+def _record_gate_observation(config: AgentLoopConfig, result) -> None:
+    if config.dry_run or not config.agent_memory:
+        return
+    record_test_observation(
+        config.agent_memory_dir,
+        argv=result.args,
+        cwd=result.cwd,
+        outcome=result.outcome,
+        elapsed_seconds=result.elapsed_seconds,
+        attempted_timeout_seconds=int(config.coder_test_command_timeout_seconds),
+        policy_ceiling_seconds=int(config.coder_test_command_timeout_seconds),
+        returncode=result.returncode,
+    )
+
+
+def _raise_for_gate_result(result, config: AgentLoopConfig) -> None:
+    if result.outcome == "timed_out":
+        raise AgentLoopError(
+            f"Local test command timed out after {int(config.coder_test_command_timeout_seconds)}s: "
+            f"{' '.join(result.args)}\nlast output:\n{result.output_tail}"
+        )
+    if result.outcome == "interrupted":
+        raise AgentLoopError(
+            f"Local test command was interrupted: {' '.join(result.args)}\n"
+            f"last output:\n{result.output_tail}"
+        )
+    if result.outcome != "passed":
+        raise AgentLoopError(
+            f"Local test command failed with exit {result.returncode}: {' '.join(result.args)}\n"
+            f"last output:\n{result.output_tail}"
+        )
 
 
 def _format_pr_checks_comment(pr_number: int, state: str, details: list[str]) -> str:
