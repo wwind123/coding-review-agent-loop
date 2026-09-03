@@ -164,6 +164,8 @@ from .prompts import (
     CompactPriorContext,
     CompactPrReviewTailContext,
     build_discuss_agenda_prompt,
+    build_discuss_round_synthesis_prompt,
+    build_discuss_final_synthesis_prompt,
     build_discuss_final_analysis_prompt,
     build_discuss_evidence_reconciliation_prompt,
     build_discuss_answer_confirmation_prompt,
@@ -197,6 +199,12 @@ from .protocol import (
     ParsedDiscussAgenda,
     ParsedDiscussEvidenceReconciliation,
     ParsedDiscussAnswer,
+    ParsedDiscussFinalSynthesis,
+    ParsedDiscussRoundSynthesis,
+    DiscussSynthesisConsensus,
+    DiscussSynthesisDisagreement,
+    DiscussSynthesisPosition,
+    DiscussSynthesisResponseReference,
     DiscussUnresolvedItem,
     ParsedDiscussSemanticComparison,
     ParsedDiscussResponse,
@@ -235,11 +243,16 @@ from .protocol import (
     validate_structured_plan_state,
     validate_structured_plan_revision,
     validate_structured_discuss_agenda,
+    parse_structured_discuss_final_synthesis,
+    validate_structured_discuss_final_synthesis,
+    validate_structured_discuss_round_synthesis,
     validate_structured_discuss_review,
     validate_structured_discuss_answer,
     validate_structured_discuss_answer_confirmation,
     validate_structured_discuss_evidence_reconciliation,
     validate_structured_discuss_semantic_comparison,
+    serialize_discuss_round_synthesis,
+    serialize_discuss_final_synthesis,
 )
 from .protocol import parse_review
 from .repair import (
@@ -1738,6 +1751,10 @@ def _operation_description_from_context(
         return "discuss review"
     if repair_expected_kind == "discuss_agenda":
         return "discuss analyzer"
+    if repair_expected_kind == "discuss_round_synthesis":
+        return "discuss round synthesis"
+    if repair_expected_kind == "discuss_final_synthesis":
+        return "discuss final synthesis"
     if label and label.startswith("discuss-analyzer"):
         return "discuss analyzer"
     if label and label.startswith("discuss-r"):
@@ -9615,6 +9632,269 @@ def _validate_discuss_analyzer_agenda_fidelity(
             raise AgentLoopError(f"analyzer agenda {field} lacks transcript support: {text}")
 
 
+def _disc_synthesis_vote_text(vote: ParsedDiscussResponse) -> str:
+    parts = [
+        str(getattr(vote, "answer", "") or ""),
+        str(getattr(vote, "rationale", "") or ""),
+        str(getattr(vote, "rebuttal", "") or ""),
+    ]
+    parts.extend(
+        str(item.text)
+        for item in getattr(vote, "unresolved_items", ())
+    )
+    parts.extend(str(item) for item in getattr(vote, "split_proposals", ()))
+    return " ".join(parts)
+
+
+def _disc_synthesis_text_supported_by_vote(text: str, vote: ParsedDiscussResponse) -> bool:
+    """Conservative lexical support check over one current response only."""
+    normalized = _normalize_discuss_agenda_phrase(text)
+    source = _normalize_discuss_agenda_phrase(_disc_synthesis_vote_text(vote))
+    if not normalized or not source:
+        return False
+    if normalized in source:
+        return True
+    words = [word for word in re.findall(r"[a-z0-9]+", normalized) if len(word) > 2]
+    source_words = set(re.findall(r"[a-z0-9]+", source))
+    if not words:
+        return False
+    required = 1 if len(words) <= 4 else max(2, len(words) // 3)
+    return sum(word in source_words for word in set(words)) >= required
+
+
+def _validate_discuss_round_synthesis_fidelity(
+    synthesis: ParsedDiscussRoundSynthesis,
+    *,
+    round_number: int,
+    current_votes: Sequence[ParsedDiscussResponse],
+    prior_synthesis: ParsedDiscussRoundSynthesis | None,
+    configured_reviewers: Sequence[AgentName],
+) -> None:
+    """Validate cumulative synthesis against current responses and legal state transitions."""
+    successful = tuple(vote for vote in current_votes if not is_failed_discuss_response(vote))
+    if len(successful) < 2:
+        raise AgentLoopError("round synthesis requires at least two successful responders.")
+    configured_names = {agent_display_name(agent) for agent in configured_reviewers}
+    current_names = {vote.reviewer for vote in successful}
+    if synthesis.responding_reviewers and set(synthesis.responding_reviewers) != current_names:
+        raise AgentLoopError("round synthesis responding_reviewers must equal current responders.")
+    if not synthesis.responding_reviewers:
+        raise AgentLoopError("round synthesis responding_reviewers must not be empty.")
+    if not current_names <= configured_names:
+        raise AgentLoopError("round synthesis contains an unknown current responder.")
+
+    # The current response set is the only source available to the validator;
+    # prior references are legal only when they identify an existing carried
+    # state, never when they are used as support for a new claim.
+    current_by_name = {vote.reviewer: vote for vote in successful}
+
+    def validate_refs(
+        references: Sequence[DiscussSynthesisResponseReference], *,
+        require_current: bool = False,
+    ) -> None:
+        if not references:
+            raise AgentLoopError("round synthesis statements require response references.")
+        for reference in references:
+            if reference.reviewer not in configured_names:
+                raise AgentLoopError(
+                    f"round synthesis references unknown reviewer {reference.reviewer!r}."
+                )
+            if reference.round > round_number:
+                raise AgentLoopError("round synthesis references a future round.")
+            if require_current and (
+                reference.round != round_number or reference.reviewer not in current_names
+            ):
+                raise AgentLoopError("new round synthesis claims must reference current responders.")
+
+    prior_consensus = {item.text.casefold(): item for item in (prior_synthesis.consensus if prior_synthesis else ())}
+    prior_disagreements = {
+        item.topic.casefold(): item for item in (prior_synthesis.disagreements if prior_synthesis else ())
+    }
+    prior_missing_facts = {
+        item.casefold() for item in (prior_synthesis.missing_facts if prior_synthesis else ())
+    }
+    prior_next_focus = {
+        item.casefold() for item in (prior_synthesis.next_round_focus if prior_synthesis else ())
+    }
+    prior_change_topics = {
+        item.topic.casefold() for item in (prior_synthesis.changes if prior_synthesis else ())
+    }
+
+    consensus_texts: set[str] = set()
+    for item in synthesis.consensus:
+        key = item.text.casefold()
+        if key in consensus_texts:
+            raise AgentLoopError("round synthesis consensus must not contain duplicates.")
+        consensus_texts.add(key)
+        carried = prior_consensus.get(key)
+        if carried is not None:
+            if item.text != carried.text or item.references != carried.references:
+                raise AgentLoopError(
+                    "carried round synthesis consensus must preserve its validated text "
+                    "and response references"
+                )
+            validate_refs(item.references)
+        else:
+            validate_refs(item.references, require_current=True)
+            if any(not _disc_synthesis_text_supported_by_vote(item.text, vote) for vote in successful):
+                raise AgentLoopError(
+                    f"round synthesis consensus lacks independent current support: {item.text}"
+                )
+
+    active_topics: set[str] = set()
+    for item in synthesis.disagreements:
+        topic_key = item.topic.casefold()
+        if topic_key in active_topics:
+            raise AgentLoopError("round synthesis disagreements must not repeat topics.")
+        active_topics.add(topic_key)
+        if not any(_disc_synthesis_text_supported_by_vote(item.topic, vote) for vote in successful):
+            raise AgentLoopError(f"round synthesis disagreement topic lacks current support: {item.topic}")
+        named: set[str] = set()
+        for position in item.positions:
+            for reviewer in position.reviewers:
+                if reviewer in named or reviewer not in current_names:
+                    raise AgentLoopError("round synthesis disagreement has unknown or duplicate reviewer.")
+                named.add(reviewer)
+                if not _disc_synthesis_text_supported_by_vote(position.position, current_by_name[reviewer]):
+                    raise AgentLoopError(
+                        f"round synthesis position lacks support from {reviewer}: {position.position}"
+                    )
+        if not _disc_synthesis_text_supported_by_vote(item.decision_needed, successful[0]):
+            # A decision question can be phrased across responses; require at
+            # least one current response to carry its material vocabulary.
+            if not any(_disc_synthesis_text_supported_by_vote(item.decision_needed, vote) for vote in successful):
+                raise AgentLoopError(
+                    f"round synthesis decision_needed lacks current support: {item.decision_needed}"
+                )
+
+    for change in synthesis.changes:
+        topic_key = change.topic.casefold()
+        validate_refs(change.references, require_current=True)
+        if not any(
+            _disc_synthesis_text_supported_by_vote(change.text, vote)
+            for vote in successful
+        ):
+            raise AgentLoopError(f"round synthesis change lacks current support: {change.text}")
+        if change.kind == "resolved":
+            if prior_synthesis is None or topic_key not in prior_disagreements:
+                raise AgentLoopError("resolved synthesis changes must match a prior active disagreement.")
+            if {ref.reviewer for ref in change.references} != current_names:
+                raise AgentLoopError("resolved synthesis changes require every current responder.")
+            if topic_key in active_topics:
+                raise AgentLoopError("a resolved disagreement cannot remain active in the same snapshot.")
+        elif change.kind == "reopened":
+            if prior_synthesis is None or (
+                topic_key not in prior_consensus
+                and topic_key not in prior_disagreements
+                and topic_key not in prior_change_topics
+            ):
+                raise AgentLoopError("reopened synthesis changes must match prior consensus or resolved state.")
+            if topic_key not in active_topics:
+                raise AgentLoopError("reopened synthesis changes must have an active disagreement.")
+        elif change.kind in {"retracted", "refined"}:
+            if prior_synthesis is None or (
+                topic_key not in prior_consensus
+                and topic_key not in prior_disagreements
+                and topic_key not in prior_change_topics
+            ):
+                raise AgentLoopError("synthesis change does not match prior state.")
+        elif change.kind == "introduced" and prior_synthesis is not None and (
+            topic_key in prior_change_topics
+            or topic_key in prior_disagreements
+        ):
+            raise AgentLoopError("introduced synthesis change repeats prior state.")
+
+    for field_name, values in (
+        ("missing_facts", synthesis.missing_facts),
+        ("next_round_focus", synthesis.next_round_focus),
+    ):
+        for value in values:
+            if value.casefold() in (
+                prior_missing_facts if field_name == "missing_facts" else prior_next_focus
+            ):
+                continue
+            if not any(_disc_synthesis_text_supported_by_vote(value, vote) for vote in successful):
+                raise AgentLoopError(f"round synthesis {field_name} lacks current support: {value}")
+
+
+def _mechanical_discuss_final_classification(
+    *, outcome: str, consensus_kind: str | None, votes: Sequence[ParsedDiscussResponse]
+) -> str:
+    if outcome == "answer" and consensus_kind in {
+        "unanimous", "converged", "semantic-equivalent", "debater-confirmed",
+    }:
+        return "consensus"
+    if (
+        outcome == "needs-human"
+        and consensus_kind in {"unanimous", "converged"}
+        and any(
+            item.status == "human-decision"
+            for vote in votes
+            for item in getattr(vote, "unresolved_items", ())
+        )
+    ):
+        return "near_consensus"
+    if outcome == "deadlock" or consensus_kind in {
+        "deadlock", "material-conflict", "semantic-comparison-failed",
+        "confirmation-failed", "confirmation-disagreement",
+    }:
+        return "material_deadlock"
+    raise AgentLoopError(
+        f"unsupported mechanical answer classification: outcome={outcome!r}, kind={consensus_kind!r}"
+    )
+
+
+def _validate_discuss_final_synthesis_fidelity(
+    synthesis: ParsedDiscussFinalSynthesis,
+    *,
+    expected_classification: str,
+    final_votes: Sequence[ParsedDiscussResponse],
+    round_number: int,
+    configured_reviewers: Sequence[AgentName],
+) -> None:
+    if synthesis.classification != expected_classification:
+        raise AgentLoopError("final synthesis classification does not match the mechanical result.")
+    successful = tuple(vote for vote in final_votes if not is_failed_discuss_response(vote))
+    if len(successful) < 2:
+        raise AgentLoopError("final synthesis requires at least two successful responders.")
+    configured_names = {agent_display_name(agent) for agent in configured_reviewers}
+    names = {vote.reviewer for vote in successful}
+    if not names <= configured_names:
+        raise AgentLoopError("final synthesis contains an unknown responder.")
+
+    def refs_for_current(references: Sequence[DiscussSynthesisResponseReference]) -> None:
+        if {ref.reviewer for ref in references} != names or any(
+            ref.round != round_number for ref in references
+        ):
+            raise AgentLoopError("final synthesis references must cover each final responder exactly once.")
+
+    for item in synthesis.agreed_conclusions:
+        refs_for_current(item.references)
+        if any(not _disc_synthesis_text_supported_by_vote(item.text, vote) for vote in successful):
+            raise AgentLoopError(f"final synthesis agreement lacks independent support: {item.text}")
+    for disagreement in synthesis.remaining_disagreements:
+        if not any(_disc_synthesis_text_supported_by_vote(disagreement.topic, vote) for vote in successful):
+            raise AgentLoopError(f"final synthesis topic lacks final-round support: {disagreement.topic}")
+        named: set[str] = set()
+        for position in disagreement.positions:
+            for reviewer in position.reviewers:
+                if reviewer in named or reviewer not in names:
+                    raise AgentLoopError("final synthesis has an unknown or duplicate reviewer position.")
+                named.add(reviewer)
+                vote = next(vote for vote in successful if vote.reviewer == reviewer)
+                if not _disc_synthesis_text_supported_by_vote(position.position, vote):
+                    raise AgentLoopError(
+                        f"final synthesis position lacks support from {reviewer}: {position.position}"
+                    )
+        if not any(
+            _disc_synthesis_text_supported_by_vote(disagreement.decision_needed, vote)
+            for vote in successful
+        ):
+            raise AgentLoopError(
+                f"final synthesis decision_needed lacks final-round support: {disagreement.decision_needed}"
+            )
+
+
 def _run_discuss_analyzer(
     runner: Runner,
     *,
@@ -9626,12 +9906,13 @@ def _run_discuss_analyzer(
     round_number: int,
     round_history: Sequence[Sequence[ParsedDiscussResponse]],
     prior_agenda: ParsedDiscussAgenda | None,
+    prior_round_synthesis: ParsedDiscussRoundSynthesis | None,
     configured_reviewers: Sequence[AgentName],
     usage_context: RunUsageContext,
-) -> tuple[ParsedDiscussAgenda | None, str | None]:
+) -> tuple[ParsedDiscussAgenda | None, str | None, ParsedDiscussRoundSynthesis | None, str | None]:
     """Run the optional discuss analyzer after a non-final round.
 
-    Returns (parsed_agenda, raw_response). Any analyzer failure that survives
+    Returns (parsed_agenda, raw_response, synthesis, raw_synthesis_response). Any analyzer failure that survives
     the repair pass falls back to (None, None) so the round closes with the
     mechanical agenda and the next debate round sees the full prior positions;
     only a quota-reset stop propagates because the whole run must pause.
@@ -9656,6 +9937,7 @@ def _run_discuss_analyzer(
                 round_number=round_number,
                 round_history=round_history,
                 prior_agenda=prior_agenda,
+                prior_round_synthesis=prior_round_synthesis,
                 research_mode=config.discuss_research,
             ),
             marker_description="<!-- AGENT_PLAN_STATE: approved -->",
@@ -9675,7 +9957,7 @@ def _run_discuss_analyzer(
             f"discuss: analyzer {analyzer_name} failed ({exc}); falling back to the "
             f"mechanical agenda for round {round_number + 1}",
         )
-        return None, None
+        return None, None, None, None
     parsed = response.marker_value
     assert isinstance(parsed, ParsedDiscussAgenda)
     try:
@@ -9693,8 +9975,76 @@ def _run_discuss_analyzer(
             f"discuss: analyzer {analyzer_name} agenda rejected ({exc}); falling back to the "
             f"mechanical agenda for round {round_number + 1}",
         )
-        return None, None
-    return parsed, response.text
+        return None, None, None, None
+    synthesis = (
+        parsed.round_synthesis
+        if config.discuss_result_mode == "answer"
+        else None
+    )
+    if synthesis is not None:
+        try:
+            _validate_discuss_round_synthesis_fidelity(
+                synthesis,
+                round_number=round_number,
+                current_votes=round_history[-1] if round_history else (),
+                prior_synthesis=prior_round_synthesis,
+                configured_reviewers=configured_reviewers,
+            )
+        except AgentLoopError as exc:
+            log(
+                config,
+                f"discuss: analyzer {analyzer_name} synthesis rejected ({exc}); "
+                "falling back to the mechanical agenda",
+            )
+            return None, None, None, None
+        return parsed, response.text, synthesis, None
+
+    if config.discuss_result_mode != "answer" or not round_history:
+        return parsed, response.text, None, None
+    # Legacy agendas are accepted, but answer mode gets one bounded extension
+    # call from the same configured analyzer. The ordinary debaters and coder
+    # never become synthesis agents implicitly.
+    try:
+        fallback = _run_validated_agent(
+            runner,
+            agent=analyzer,
+            config=config,
+            prompt=build_discuss_round_synthesis_prompt(
+                issue_number,
+                config,
+                analyzer=analyzer,
+                round_number=round_number,
+                current_responses=round_history[-1],
+                prior_synthesis=prior_round_synthesis,
+            ),
+            marker_description="<!-- AGENT_PLAN_STATE: approved -->",
+            validate=validate_structured_discuss_round_synthesis,
+            usage_context=usage_context,
+            use_repair=True,
+            repair_expected_kind="discuss_round_synthesis",
+            role="analyzer",
+            label=f"discuss-round-synthesis-r{round_number}",
+            operation_description="discuss round synthesis",
+        )
+        fallback_synthesis = fallback.marker_value
+        assert isinstance(fallback_synthesis, ParsedDiscussRoundSynthesis)
+        _validate_discuss_round_synthesis_fidelity(
+            fallback_synthesis,
+            round_number=round_number,
+            current_votes=round_history[-1],
+            prior_synthesis=prior_round_synthesis,
+            configured_reviewers=configured_reviewers,
+        )
+        return parsed, response.text, fallback_synthesis, fallback.text
+    except QuotaResetExceededError:
+        raise
+    except (AgentLoopError, AgentInvocationError) as exc:
+        log(
+            config,
+            f"discuss: round synthesis fallback unavailable ({exc}); retaining the "
+            "legacy agenda/mechanical rendering",
+        )
+        return parsed, response.text, None, None
 
 
 def _validate_discuss_final_analyzer_fidelity(
@@ -9747,37 +10097,78 @@ def _run_discuss_final_analyzer(
     final_votes: Sequence[ParsedDiscussResponse],
     configured_reviewers: Sequence[AgentName],
     usage_context: RunUsageContext,
-) -> tuple[ParsedDiscussAgenda | None, str | None]:
+    mechanical_classification: str | None = None,
+) -> tuple[ParsedDiscussAgenda | None, str | None, ParsedDiscussFinalSynthesis | None]:
     """Best-effort final-only analyzer pass; failures never affect finalization."""
     if analyzer is None or not final_votes or any(is_failed_discuss_response(vote) for vote in final_votes):
-        return None, None
+        return None, None, None
 
 
     analyzer_name = agent_display_name(analyzer)
     try:
+        def validate_final_output(text: str) -> object:
+            if config.discuss_result_mode == "answer":
+                return validate_structured_discuss_final_synthesis(text)
+            parsed_synthesis = parse_structured_discuss_final_synthesis(text)
+            if parsed_synthesis is not None:
+                return parsed_synthesis
+            return validate_structured_discuss_agenda(text)
+
         response = _run_validated_agent(
             runner, agent=analyzer, config=config,
-            prompt=build_discuss_final_analysis_prompt(
-                issue_number, config, analyzer=analyzer, round_number=round_number,
-                final_votes=final_votes,
+            prompt=(
+                build_discuss_final_synthesis_prompt(
+                    issue_number,
+                    config,
+                    analyzer=analyzer,
+                    round_number=round_number,
+                    final_responses=final_votes,
+                    mechanical_classification=mechanical_classification or "material_deadlock",
+                )
+                if config.discuss_result_mode == "answer"
+                else build_discuss_final_analysis_prompt(
+                    issue_number, config, analyzer=analyzer, round_number=round_number,
+                    final_votes=final_votes,
+                )
             ),
             marker_description="<!-- AGENT_PLAN_STATE: approved -->",
-            validate=validate_structured_discuss_agenda, usage_context=usage_context,
-            use_repair=True, repair_expected_kind="discuss_agenda", role="reviewer",
-            label=f"discuss-final-analyzer-r{round_number}",
-            operation_description="final discuss analyzer",
+            validate=validate_final_output, usage_context=usage_context,
+            use_repair=True,
+            repair_expected_kind=(
+                "discuss_final_synthesis"
+                if config.discuss_result_mode == "answer"
+                else "discuss_agenda"
+            ),
+            role="analyzer",
+            label=(
+                f"discuss-final-synthesis-r{round_number}"
+                if config.discuss_result_mode == "answer"
+                else f"discuss-final-analyzer-r{round_number}"
+            ),
+            operation_description="final discuss synthesis",
         )
         parsed = response.marker_value
+        if isinstance(parsed, ParsedDiscussFinalSynthesis):
+            if mechanical_classification is None:
+                raise AgentLoopError("final synthesis requires a mechanical classification.")
+            _validate_discuss_final_synthesis_fidelity(
+                parsed,
+                expected_classification=mechanical_classification,
+                final_votes=final_votes,
+                round_number=round_number,
+                configured_reviewers=configured_reviewers,
+            )
+            return None, response.text, parsed
         assert isinstance(parsed, ParsedDiscussAgenda)
         _validate_discuss_final_analyzer_fidelity(
             parsed, final_votes=final_votes, configured_reviewers=configured_reviewers, analyzer=analyzer,
         )
-        return parsed, response.text
+        return parsed, response.text, None
     except QuotaResetExceededError:
         raise
-    except Exception as exc:
+    except (AgentLoopError, AgentInvocationError) as exc:
         log(config, f"discuss: final analyzer {analyzer_name} unavailable ({exc}); omitting advisory observations")
-        return None, None
+        return None, None, None
 
 
 def _run_discuss_evidence_reconciler(
@@ -9993,6 +10384,100 @@ def _run_discuss_semantic_finalization(
     return "deadlock", "confirmation-disagreement", audit
 
 
+def _adapt_discuss_final_synthesis(
+    *,
+    outcome: str,
+    consensus_kind: str | None,
+    final_votes: Sequence[ParsedDiscussResponse],
+    round_number: int,
+    semantic_comparison: Mapping[str, object] | None = None,
+) -> ParsedDiscussFinalSynthesis | None:
+    """Reuse mechanically verified artifacts without another analyzer call."""
+    def cap(text: str) -> str:
+        raw = str(text).strip().encode("utf-8")[:512]
+        return raw.decode("utf-8", "ignore").strip() or "(not stated)"
+
+    answers = [vote for vote in final_votes if isinstance(vote, ParsedDiscussAnswer)]
+    references = tuple(
+        DiscussSynthesisResponseReference(vote.reviewer, round_number)
+        for vote in final_votes
+    )
+    if (
+        outcome == "answer"
+        and consensus_kind in {"unanimous", "converged"}
+        and len(answers) == len(final_votes)
+        and answers
+        and all(vote.answer for vote in answers)
+    ):
+        # This is the exact-text path. `_detect_discuss_answer_consensus` has
+        # already established normalized equality, so no model call is needed.
+        return ParsedDiscussFinalSynthesis(
+            classification="consensus",
+            agreed_conclusions=(
+                DiscussSynthesisConsensus(text=cap(answers[0].answer or ""), references=references),
+            ),
+            remaining_disagreements=(),
+            next_action="Proceed with the shared recommendation.",
+        )
+    if semantic_comparison is not None:
+        classification = semantic_comparison.get("classification")
+        if classification == "equivalent" and semantic_comparison.get("shared_recommendation"):
+            return ParsedDiscussFinalSynthesis(
+                classification="consensus",
+                agreed_conclusions=(
+                    DiscussSynthesisConsensus(
+                        text=cap(str(semantic_comparison["shared_recommendation"])),
+                        references=references,
+                    ),
+                ),
+                remaining_disagreements=(),
+                next_action="Proceed with the shared recommendation.",
+            )
+        if consensus_kind == "debater-confirmed" and semantic_comparison.get("confirmed_answer"):
+            return ParsedDiscussFinalSynthesis(
+                classification="consensus",
+                agreed_conclusions=(
+                    DiscussSynthesisConsensus(
+                        text=cap(str(semantic_comparison["confirmed_answer"])),
+                        references=references,
+                    ),
+                ),
+                remaining_disagreements=(),
+                next_action="Proceed with the debater-confirmed recommendation.",
+            )
+    if outcome == "needs-human" and consensus_kind in {"unanimous", "converged"}:
+        human_items = [
+            (vote, item)
+            for vote in final_votes
+            for item in getattr(vote, "unresolved_items", ())
+            if item.status == "human-decision"
+        ]
+        if human_items:
+            groups: dict[str, list[tuple[ParsedDiscussResponse, DiscussUnresolvedItem]]] = {}
+            for vote, item in human_items:
+                groups.setdefault(item.text.casefold(), []).append((vote, item))
+            disagreements = tuple(
+                DiscussSynthesisDisagreement(
+                    topic=cap(items[0][1].text),
+                    positions=tuple(
+                        DiscussSynthesisPosition(
+                            reviewers=(vote.reviewer,), position=cap(vote.rationale)
+                        )
+                        for vote, _item in items
+                    ),
+                    decision_needed=cap(items[0][1].text),
+                )
+                for items in groups.values()
+            )
+            return ParsedDiscussFinalSynthesis(
+                classification="near_consensus",
+                agreed_conclusions=(),
+                remaining_disagreements=disagreements,
+                next_action=cap("A human must decide: " + "; ".join(item[1].text for item in human_items[:8])),
+            )
+    return None
+
+
 def _post_discuss_debater_comment(
     runner: Runner,
     *,
@@ -10148,7 +10633,10 @@ def _run_discuss_loop(
         prior_analyzer_agenda: ParsedDiscussAgenda | None = (
             resume_state.prior_analyzer_agenda if analyzer is not None else None
         )
-        in_progress_votes: dict[str, ParsedDiscussReview] = dict(resume_state.in_progress_votes)
+        prior_round_synthesis: ParsedDiscussRoundSynthesis | None = (
+            resume_state.prior_round_synthesis if analyzer is not None else None
+        )
+        in_progress_votes: dict[str, ParsedDiscussResponse] = dict(resume_state.in_progress_votes)
         if round_history or in_progress_votes:
             log(config, f"discuss: resuming issue #{issue_number} at round {start_round_number}")
     else:
@@ -10156,6 +10644,7 @@ def _run_discuss_loop(
         start_round_number = 1
         prior_round_agenda = []
         prior_analyzer_agenda = None
+        prior_round_synthesis = None
         in_progress_votes = {}
     max_round_number = discuss_max_rounds + 1
     if start_round_number > max_round_number:
@@ -10178,14 +10667,32 @@ def _run_discuss_loop(
         # A resumed partial round (#475) may carry placeholder votes; keep the
         # vote table to real positions and surface the rest as failures.
         final_successful_votes = [
-            vote for vote in final_votes if vote.outcome != DISCUSS_FAILED_OUTCOME
+            vote for vote in final_votes if not is_failed_discuss_response(vote)
         ]
         final_failed_debaters = tuple(
-            (vote.reviewer, failed_discuss_review_category(vote))
+            (
+                vote.reviewer,
+                (
+                    failed_discuss_review_category(vote)
+                    if isinstance(vote, ParsedDiscussReview)
+                    else vote.category
+                ),
+            )
             for vote in final_votes
-            if vote.outcome == DISCUSS_FAILED_OUTCOME
+            if is_failed_discuss_response(vote)
         )
-        final_analyzer_agenda, final_analyzer_response_raw = _run_discuss_final_analyzer(
+        final_synthesis: ParsedDiscussFinalSynthesis | None = None
+        final_analyzer_agenda: ParsedDiscussAgenda | None = None
+        final_analyzer_response_raw: str | None = None
+        final_synthesis_source: str | None = None
+        final_mechanical_classification = (
+            _mechanical_discuss_final_classification(
+                outcome="needs-human", consensus_kind="deadlock", votes=final_votes
+            )
+            if config.discuss_result_mode == "answer"
+            else None
+        )
+        final_analyzer_agenda, final_analyzer_response_raw, final_synthesis = _run_discuss_final_analyzer(
             runner,
             issue_number=issue_number,
             config=config,
@@ -10194,7 +10701,10 @@ def _run_discuss_loop(
             final_votes=final_successful_votes,
             configured_reviewers=configured_reviewers,
             usage_context=usage_context,
+            mechanical_classification=final_mechanical_classification,
         )
+        if final_synthesis is not None:
+            final_synthesis_source = "final-analyzer"
         evidence_groups, evidence_reconciler_raw = _run_discuss_evidence_reconciler(
             runner, issue_number=issue_number, config=config, analyzer=analyzer, subject=f"issue-{issue_number}",
             round_history=round_history, usage_context=usage_context,
@@ -10216,6 +10726,7 @@ def _run_discuss_loop(
             research_mode=config.discuss_research,
             failed_debaters=final_failed_debaters,
             result_mode=config.discuss_result_mode,
+            final_synthesis=final_synthesis,
             evidence_reconciliation=evidence_reconciliation,
         )
         post_issue_comment(
@@ -10234,9 +10745,21 @@ def _run_discuss_loop(
                     consensus_kind="deadlock",
                     agenda=(),
                     final_analyzer_response=final_analyzer_response_raw,
+                    final_synthesis=(
+                        serialize_discuss_final_synthesis(final_synthesis)
+                        if final_synthesis is not None else None
+                    ),
+                    synthesis_provenance=(
+                        {
+                            "source": final_synthesis_source or "final-analyzer",
+                            "round": final_round_number,
+                        }
+                        if final_synthesis is not None else None
+                    ),
                     research_mode=config.discuss_research,
                     failed_debaters=final_failed_debaters,
                     evidence_reconciliation=evidence_reconciliation,
+                    result_mode=config.discuss_result_mode,
                 ),
             ),
         )
@@ -10248,7 +10771,7 @@ def _run_discuss_loop(
         return 0
     for round_number in range(start_round_number, max_round_number + 1):
         prior_round_votes = round_history[-1] if round_history else []
-        votes_by_name: dict[str, ParsedDiscussReview] = {}
+        votes_by_name: dict[str, ParsedDiscussResponse] = {}
         failures_by_name: dict[str, _DiscussDebaterTurnResult] = {}
         pending: list[AgentName] = []
         for reviewer in configured_reviewers:
@@ -10504,10 +11027,19 @@ def _run_discuss_loop(
                 consensus_kind = ("unanimous" if len(round_history) == 1 else "converged") if is_final else None
         next_analyzer_agenda: ParsedDiscussAgenda | None = None
         analyzer_response_raw: str | None = None
+        next_round_synthesis: ParsedDiscussRoundSynthesis | None = None
+        raw_synthesis_response: str | None = None
         final_analyzer_agenda: ParsedDiscussAgenda | None = None
         final_analyzer_response_raw: str | None = None
+        final_synthesis: ParsedDiscussFinalSynthesis | None = None
+        final_synthesis_source: str | None = None
         if not is_final and analyzer is not None:
-            next_analyzer_agenda, analyzer_response_raw = _run_discuss_analyzer(
+            (
+                next_analyzer_agenda,
+                analyzer_response_raw,
+                next_round_synthesis,
+                raw_synthesis_response,
+            ) = _run_discuss_analyzer(
                 runner,
                 issue_number=issue_number,
                 config=config,
@@ -10517,16 +11049,48 @@ def _run_discuss_loop(
                 round_number=round_number,
                 round_history=round_history,
                 prior_agenda=prior_analyzer_agenda,
+                prior_round_synthesis=prior_round_synthesis,
                 configured_reviewers=configured_reviewers,
                 usage_context=usage_context,
             )
-        elif is_final and consensus_kind != "debater-confirmed":
+        elif is_final and config.discuss_result_mode == "answer":
+            final_mechanical_classification = _mechanical_discuss_final_classification(
+                outcome=outcome, consensus_kind=consensus_kind, votes=reviewer_votes
+            )
+            final_synthesis = _adapt_discuss_final_synthesis(
+                outcome=outcome,
+                consensus_kind=consensus_kind,
+                final_votes=successful_votes,
+                round_number=round_number,
+                semantic_comparison=semantic_comparison,
+            )
+            if final_synthesis is not None:
+                final_synthesis_source = (
+                    "semantic-comparison"
+                    if semantic_comparison is not None
+                    else "mechanical-result"
+                )
+            if final_synthesis is None:
+                final_analyzer_agenda, final_analyzer_response_raw, final_synthesis = _run_discuss_final_analyzer(
+                    runner,
+                    issue_number=issue_number,
+                    config=config,
+                    analyzer=analyzer,
+                    round_number=round_number,
+                    final_votes=successful_votes,
+                    configured_reviewers=configured_reviewers,
+                    usage_context=usage_context,
+                    mechanical_classification=final_mechanical_classification,
+                )
+                if final_synthesis is not None:
+                    final_synthesis_source = "final-analyzer"
+        elif is_final:
             # Semantic finalization already used the configured analyzer to
             # compare the completed final-round answers. When every debater
             # confirms that recommendation, keep that audit as the final
             # analyzer record rather than invoking the same analyzer again
             # for advisory observations over identical input.
-            final_analyzer_agenda, final_analyzer_response_raw = _run_discuss_final_analyzer(
+            final_analyzer_agenda, final_analyzer_response_raw, _unused_final_synthesis = _run_discuss_final_analyzer(
                 runner,
                 issue_number=issue_number,
                 config=config,
@@ -10564,6 +11128,8 @@ def _run_discuss_loop(
             result_mode=config.discuss_result_mode,
             semantic_comparison=semantic_comparison,
             evidence_reconciliation=evidence_reconciliation,
+            round_synthesis=next_round_synthesis,
+            final_synthesis=final_synthesis,
         )
         agenda = () if is_final else tuple(_render_discuss_agenda_lines(successful_votes))
         post_issue_comment(
@@ -10583,6 +11149,31 @@ def _run_discuss_loop(
                     agenda=agenda,
                     analyzer_response=analyzer_response_raw,
                     final_analyzer_response=final_analyzer_response_raw,
+                    round_synthesis=(
+                        serialize_discuss_round_synthesis(next_round_synthesis)
+                        if next_round_synthesis is not None else None
+                    ),
+                    final_synthesis=(
+                        serialize_discuss_final_synthesis(final_synthesis)
+                        if final_synthesis is not None else None
+                    ),
+                    raw_synthesis_response=raw_synthesis_response,
+                    synthesis_provenance=(
+                        {
+                            "source": (
+                                "round-analyzer" if raw_synthesis_response is None
+                                else "round-fallback"
+                            ),
+                            "round": round_number,
+                        }
+                        if next_round_synthesis is not None else (
+                            {
+                                "source": final_synthesis_source or "final-analyzer",
+                                "round": round_number,
+                            }
+                            if final_synthesis is not None else None
+                        )
+                    ),
                     research_mode=config.discuss_research,
                     failed_debaters=tuple(failed_debaters),
                     split_proposals=tuple(round_split_proposals) if is_final else (),
@@ -10619,6 +11210,7 @@ def _run_discuss_loop(
         )
         prior_round_agenda = list(agenda)
         prior_analyzer_agenda = next_analyzer_agenda
+        prior_round_synthesis = next_round_synthesis
     return 0
 
 

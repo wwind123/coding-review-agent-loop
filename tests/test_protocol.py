@@ -24,6 +24,8 @@ from coding_review_agent_loop.orchestrator import (
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     DeferredStage,
+    DISCUSS_SYNTHESIS_MAX_ENTRIES,
+    DISCUSS_SYNTHESIS_MAX_TEXT_BYTES,
     DISCUSS_ANALYZER_FRAMING_VALUES,
     DISCUSS_OUTCOME_VALUES,
     DISCUSS_RESEARCH_STATUS_VALUES,
@@ -32,6 +34,11 @@ from coding_review_agent_loop.protocol import (
     DiscussSourcedFact,
     ParsedDiscussAgenda,
     ParsedDiscussReview,
+    parse_canonical_discuss_round_synthesis,
+    parse_structured_discuss_final_synthesis,
+    parse_structured_discuss_round_synthesis,
+    serialize_discuss_final_synthesis,
+    serialize_discuss_round_synthesis,
     _expect_string_list,
     _extract_structured_coder_followup_payload,
     _extract_structured_plan_review_payload,
@@ -3701,3 +3708,105 @@ def test_parse_structured_discuss_agenda_rejects_non_bool_research_required():
     text = _discuss_agenda_with_research(research_required="yes", research_questions=["Q?"])
     with pytest.raises(AgentLoopError, match="must be a boolean"):
         parse_structured_discuss_agenda(text)
+
+
+def _enriched_round_synthesis_payload() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "discuss_round_synthesis",
+        "consensus": [{
+            "text": "Use an API boundary.",
+            "references": [
+                {"reviewer": "Codex", "round": 1},
+                {"reviewer": "Gemini", "round": 1},
+            ],
+        }],
+        "disagreements": [{
+            "topic": "Pricing timing",
+            "positions": [
+                {"reviewers": ["Codex"], "position": "Calibrate before merge."},
+                {"reviewers": ["Gemini"], "position": "Use post-deployment telemetry."},
+            ],
+            "decision_needed": "Choose when representative calibration occurs.",
+        }],
+        "changes": [{
+            "kind": "introduced",
+            "topic": "Pricing timing",
+            "text": "Pricing timing is still unresolved.",
+            "references": [{"reviewer": "Codex", "round": 1}],
+        }],
+        "missing_facts": ["Representative cost data."],
+        "next_round_focus": ["Choose the calibration timing."],
+        "responding_reviewers": ["Codex", "Gemini"],
+    }
+
+
+def _synthesis_response(payload: dict) -> str:
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Analyzer"
+
+
+def test_parse_enriched_discuss_agenda_and_canonical_synthesis_round_trip():
+    payload = json.loads(_discuss_agenda().split("\n", 1)[0])
+    payload["round_synthesis"] = _enriched_round_synthesis_payload()
+    text = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Analyzer"
+
+    agenda = parse_structured_discuss_agenda(text)
+
+    assert agenda is not None
+    assert agenda.round_synthesis is not None
+    assert agenda.round_synthesis.responding_reviewers == ("Codex", "Gemini")
+    canonical = serialize_discuss_round_synthesis(agenda.round_synthesis)
+    restored = parse_canonical_discuss_round_synthesis(canonical)
+    assert restored == agenda.round_synthesis
+
+
+def test_discuss_synthesis_parser_enforces_exact_keys_enums_and_bounds():
+    payload = _enriched_round_synthesis_payload()
+    payload["extra"] = True
+    with pytest.raises(AgentLoopError, match="unknown field"):
+        parse_structured_discuss_round_synthesis(_synthesis_response(payload))
+
+    payload = _enriched_round_synthesis_payload()
+    payload["changes"][0]["kind"] = "ignored"
+    with pytest.raises(AgentLoopError, match="must be one of"):
+        parse_structured_discuss_round_synthesis(_synthesis_response(payload))
+
+    payload = _enriched_round_synthesis_payload()
+    payload["missing_facts"] = [f"Fact {index}" for index in range(DISCUSS_SYNTHESIS_MAX_ENTRIES + 1)]
+    with pytest.raises(AgentLoopError, match="at most"):
+        parse_structured_discuss_round_synthesis(_synthesis_response(payload))
+
+    payload = _enriched_round_synthesis_payload()
+    payload["consensus"][0]["text"] = "x" * (DISCUSS_SYNTHESIS_MAX_TEXT_BYTES + 1)
+    with pytest.raises(AgentLoopError, match="UTF-8 bytes"):
+        parse_structured_discuss_round_synthesis(_synthesis_response(payload))
+
+
+def test_discuss_final_synthesis_parser_rejects_invalid_classification_shape():
+    payload = {
+        "schema_version": 1,
+        "kind": "discuss_final_synthesis",
+        "classification": "consensus",
+        "agreed_conclusions": [],
+        "remaining_disagreements": [],
+        "next_action": "Proceed.",
+    }
+    with pytest.raises(AgentLoopError, match="must include an agreed"):
+        parse_structured_discuss_final_synthesis(_synthesis_response(payload))
+
+    payload["classification"] = "near_consensus"
+    with pytest.raises(AgentLoopError, match="remaining disagreement"):
+        parse_structured_discuss_final_synthesis(_synthesis_response(payload))
+
+    payload = _enriched_round_synthesis_payload()
+    final = {
+        "schema_version": 1,
+        "kind": "discuss_final_synthesis",
+        "classification": "consensus",
+        "agreed_conclusions": payload["consensus"],
+        "remaining_disagreements": [],
+        "next_action": "Proceed.",
+    }
+    parsed = parse_structured_discuss_final_synthesis(_synthesis_response(final))
+    assert parsed is not None
+    assert serialize_discuss_final_synthesis(parsed).startswith('{"schema_version":1')

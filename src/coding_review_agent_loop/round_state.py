@@ -20,6 +20,8 @@ from .protocol import (
     SIGNATURE_RE,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
+    ParsedDiscussFinalSynthesis,
+    ParsedDiscussRoundSynthesis,
     ParsedDiscussResponse,
     ParsedDiscussReview,
     ReviewItemDisposition,
@@ -27,6 +29,8 @@ from .protocol import (
     failed_discuss_review_placeholder,
     failed_discuss_answer_placeholder,
     parse_structured_discuss_agenda,
+    parse_canonical_discuss_final_synthesis,
+    parse_canonical_discuss_round_synthesis,
     parse_structured_discuss_review,
     parse_structured_discuss_answer,
     parse_legacy_structured_discuss_answer,
@@ -89,6 +93,12 @@ class PostedRoundMetadata:
     # configured-order settlement barrier.  Legacy records are authoritative.
     phase: str = "authoritative"
     canonical_reviewer_response: str | None = None
+    # Answer-mode synthesis snapshots are canonical bounded JSON. These keys
+    # are omitted from serialized triage/review metadata for byte stability.
+    round_synthesis: str | None = None
+    final_synthesis: str | None = None
+    raw_synthesis_response: str | None = None
+    synthesis_provenance: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +207,15 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "phase": metadata.phase,
         "canonical_reviewer_response": metadata.canonical_reviewer_response,
     }
+    if metadata.result_mode == "answer":
+        payload.update(
+            {
+                "round_synthesis": metadata.round_synthesis,
+                "final_synthesis": metadata.final_synthesis,
+                "raw_synthesis_response": metadata.raw_synthesis_response,
+                "synthesis_provenance": metadata.synthesis_provenance,
+            }
+        )
     return encode_mapping(payload)
 
 
@@ -270,6 +289,22 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 str(payload["canonical_reviewer_response"])
                 if payload.get("canonical_reviewer_response") is not None else None
             ),
+            round_synthesis=(
+                str(payload["round_synthesis"])
+                if payload.get("round_synthesis") is not None else None
+            ),
+            final_synthesis=(
+                str(payload["final_synthesis"])
+                if payload.get("final_synthesis") is not None else None
+            ),
+            raw_synthesis_response=(
+                str(payload["raw_synthesis_response"])
+                if payload.get("raw_synthesis_response") is not None else None
+            ),
+            synthesis_provenance=(
+                payload.get("synthesis_provenance")
+                if isinstance(payload.get("synthesis_provenance"), dict) else None
+            ),
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise AgentLoopError("Invalid AGENT_LOOP_META payload.") from exc
@@ -328,10 +363,22 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
         if not matches:
             continue
         payload, missing = hydrate_mapping(decode_mapping(matches[-1].group("payload")), bodies)
-        if missing:
+        # Synthesis is advisory. A missing synthesis sidecar must not make a
+        # durable vote or legacy agenda unrecoverable; those fields simply
+        # decode as None. Existing PR/review spill fields remain strict.
+        discuss_optional_missing = (
+            {
+                "round_synthesis", "final_synthesis", "raw_synthesis_response",
+                "analyzer_response", "final_analyzer_response",
+            }
+            if flow == "discuss"
+            else set()
+        )
+        required_missing = missing - discuss_optional_missing
+        if required_missing:
             raise AgentLoopError(
                 "Incomplete round metadata: "
-                f"{', '.join(sorted(missing))} sidecars are unavailable; "
+                f"{', '.join(sorted(required_missing))} sidecars are unavailable; "
                 "restore sidecars or remove the incomplete anchor and rerun."
             )
         metadata = _decode_round_metadata_mapping(payload)
@@ -708,6 +755,8 @@ class ResumedDiscussState:
     next_round_number: int
     prior_round_agenda: tuple[str, ...] = ()
     prior_analyzer_agenda: ParsedDiscussAgenda | None = None
+    prior_round_synthesis: ParsedDiscussRoundSynthesis | None = None
+    synthesis_provenance: dict | None = None
     in_progress_votes: dict[str, ParsedDiscussResponse] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -722,6 +771,25 @@ def _decode_analyzer_agenda(raw: str | None) -> ParsedDiscussAgenda | None:
     try:
         return parse_structured_discuss_agenda(raw)
     except AgentLoopError:
+        return None
+
+
+def _decode_round_synthesis(raw: str | None) -> ParsedDiscussRoundSynthesis | None:
+    """Decode optional canonical synthesis without poisoning a valid resume."""
+    if not raw or len(raw.encode("utf-8")) > 16_000:
+        return None
+    try:
+        return parse_canonical_discuss_round_synthesis(raw)
+    except (AgentLoopError, TypeError, ValueError):
+        return None
+
+
+def _decode_final_synthesis(raw: str | None) -> ParsedDiscussFinalSynthesis | None:
+    if not raw or len(raw.encode("utf-8")) > 16_000:
+        return None
+    try:
+        return parse_canonical_discuss_final_synthesis(raw)
+    except (AgentLoopError, TypeError, ValueError):
         return None
 
 
@@ -786,6 +854,8 @@ def _resume_discuss_round(
     round_history: list[tuple[ParsedDiscussResponse, ...]] = []
     prior_round_agenda: tuple[str, ...] = ()
     prior_analyzer_agenda: ParsedDiscussAgenda | None = None
+    prior_round_synthesis: ParsedDiscussRoundSynthesis | None = None
+    synthesis_provenance: dict | None = None
     next_round_number = 1
     in_progress_votes: dict[str, ParsedDiscussResponse] = {}
     for round_number in sorted(rounds):
@@ -827,6 +897,8 @@ def _resume_discuss_round(
             round_history.append(votes)
             prior_round_agenda = summary_record.metadata.agenda
             prior_analyzer_agenda = _decode_analyzer_agenda(summary_record.metadata.analyzer_response)
+            prior_round_synthesis = _decode_round_synthesis(summary_record.metadata.round_synthesis)
+            synthesis_provenance = summary_record.metadata.synthesis_provenance
             if summary_record.metadata.is_final:
                 return ResumedDiscussState(
                     done=True,
@@ -834,6 +906,8 @@ def _resume_discuss_round(
                     next_round_number=round_number,
                     prior_round_agenda=prior_round_agenda,
                     prior_analyzer_agenda=prior_analyzer_agenda,
+                    prior_round_synthesis=prior_round_synthesis,
+                    synthesis_provenance=synthesis_provenance,
                 )
             next_round_number = round_number + 1
         else:
@@ -849,5 +923,7 @@ def _resume_discuss_round(
         next_round_number=next_round_number,
         prior_round_agenda=prior_round_agenda,
         prior_analyzer_agenda=prior_analyzer_agenda,
+        prior_round_synthesis=prior_round_synthesis,
+        synthesis_provenance=synthesis_provenance,
         in_progress_votes=in_progress_votes,
     )

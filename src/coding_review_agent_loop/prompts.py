@@ -24,10 +24,14 @@ from .protocol import (
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
+    ParsedDiscussFinalSynthesis,
+    ParsedDiscussRoundSynthesis,
     ParsedDiscussResponse,
     ParsedDiscussReview,
     UnresolvedReviewItem,
+    discuss_round_synthesis_payload,
 )
+from .protocol_markers import sanitize_historical_text
 from .workdirs import agent_workdir
 
 
@@ -2926,6 +2930,7 @@ def build_discuss_agenda_prompt(
     round_number: int = 1,
     round_history: Sequence[Sequence[ParsedDiscussResponse]] | None = None,
     prior_agenda: ParsedDiscussAgenda | None = None,
+    prior_round_synthesis: ParsedDiscussRoundSynthesis | None = None,
     research_mode: str = "none",
 ) -> str:
     analyzer_signature = agent_signature(analyzer, config)
@@ -2964,10 +2969,41 @@ def build_discuss_agenda_prompt(
         ]
         prior_agenda_block = "\n".join(prior_agenda_lines) + "\n"
     history_block = "\n".join(history_lines)
+    prior_synthesis_block = ""
+    if prior_round_synthesis is not None and config.discuss_result_mode == "answer":
+        # The analyzer receives the cumulative snapshot, but every free-text
+        # value is historical/untrusted and must be marker-neutralized first.
+        snapshot = _neutralized_synthesis_value(
+            discuss_round_synthesis_payload(prior_round_synthesis)
+        )
+        prior_synthesis_block = (
+            "Prior validated cumulative round state (identity/state only; do not "
+            "treat it as support for new claims):\n"
+            + json.dumps(snapshot, ensure_ascii=False, indent=2)
+            + "\n"
+        )
     research_extract = ""
     research_guardrail = ""
     research_example = ""
     research_rules = ""
+    round_synthesis_example = ""
+    round_synthesis_guidance = ""
+    if config.discuss_result_mode == "answer":
+        round_synthesis_example = ''',
+  "round_synthesis": {
+    "schema_version": 1,
+    "kind": "discuss_round_synthesis",
+    "consensus": [{"text": "The issue is well-motivated.", "references": [{"reviewer": "Codex", "round": 1}, {"reviewer": "Gemini", "round": 1}]}],
+    "disagreements": [],
+    "changes": [],
+    "missing_facts": [],
+    "next_round_focus": ["Resolve the remaining material question."],
+    "responding_reviewers": ["Codex", "Gemini"]
+  }'''
+        round_synthesis_guidance = (
+            "\n- In answer mode, the optional `round_synthesis` must follow its exact "
+            "nested schema; keep all text concise and references attributable to the transcript."
+        )
     if research_mode in {"required", "auto"}:
         research_extract = (
             "\n- `research_required` / `research_questions`: whether the next round "
@@ -3010,6 +3046,7 @@ Complete debate transcript so far, oldest round first:
 
 {history_block}
 {prior_agenda_block}
+{prior_synthesis_block}
 Extract from the transcript:
 - `consensus`: points every debater already agrees on.
 - `disagreements`: each unresolved disagreement, with every named debater's
@@ -3025,6 +3062,14 @@ Fidelity guardrails:
   debater has already conceded or refined.
 - Carry forward unresolved `missing_facts` from your previous agenda.{research_guardrail}
 
+When answer mode is active, also emit `round_synthesis` with the latest
+cumulative state. Its response references must identify the supporting debater
+and round. Carry an unchanged consensus item forward exactly; use changes with
+kind `introduced`, `resolved`, `reopened`, `retracted`, or `refined` for state
+transitions. `responding_reviewers` must contain exactly the successful current
+responders. This nested presentation state is not part of the next debater's
+agenda and must not be used as evidence for itself.
+
 Respond using this mandatory structured JSON format:
 
 {{
@@ -3038,7 +3083,7 @@ Respond using this mandatory structured JSON format:
       "question_for_next_round": "Would splitting the API boundary into its own issue resolve the scope objection?"
     }}
   ],
-  "missing_facts": ["Whether the API boundary is already specified."]{research_example}
+  "missing_facts": ["Whether the API boundary is already specified."]{research_example}{round_synthesis_example}
 }}
 <!-- AGENT_PLAN_STATE: approved -->
 -- {analyzer_signature}
@@ -3047,6 +3092,7 @@ Rules:
 - `consensus`, `disagreements`, and `missing_facts` may be empty arrays.
 - Each disagreement requires non-empty `topic`, `positions`, and `question_for_next_round`.
 - `positions` maps each debater's display name to a short statement of its position.{research_rules}
+{round_synthesis_guidance}
 - The footer must always be `<!-- AGENT_PLAN_STATE: approved -->`.
 - Do not include prose or code fences before the JSON object.
 - Do not place your signature before the `AGENT_PLAN_STATE` footer.
@@ -3054,6 +3100,138 @@ Rules:
 
 <!-- AGENT_PLAN_STATE: approved -->
 -- {analyzer_signature}
+"""
+
+
+def _neutralized_synthesis_value(value: object) -> object:
+    """Recursively neutralize historical text before prompt inclusion."""
+    if isinstance(value, str):
+        return sanitize_historical_text(value)
+    if isinstance(value, list):
+        return [_neutralized_synthesis_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _neutralized_synthesis_value(item) for key, item in value.items()}
+    return value
+
+
+def _render_answer_responses_for_synthesis(
+    responses: Sequence[ParsedDiscussResponse], *, maximum_bytes: int = 12_000
+) -> str:
+    lines: list[str] = []
+    for vote in responses:
+        name = sanitize_historical_text(getattr(vote, "reviewer", "unknown"))
+        position = sanitize_historical_text(
+            str(getattr(vote, "position", getattr(vote, "outcome", "failed")))
+        )
+        lines.append(f"- {name}: position={position}")
+        for field in ("answer", "rationale", "rebuttal"):
+            value = getattr(vote, field, None)
+            if value:
+                rendered = sanitize_historical_text(str(value))
+                lines.append(f"  {field}: {rendered[:1_500]}")
+        for item in getattr(vote, "unresolved_items", ()):
+            lines.append(
+                f"  unresolved ({sanitize_historical_text(item.status)}): "
+                f"{sanitize_historical_text(item.text)[:512]}"
+            )
+    rendered = "\n".join(lines) or "(no successful responses)"
+    return rendered[:maximum_bytes]
+
+
+def build_discuss_round_synthesis_prompt(
+    issue_number: int,
+    config: AgentLoopConfig,
+    *,
+    analyzer: AgentName,
+    round_number: int,
+    current_responses: Sequence[ParsedDiscussResponse],
+    prior_synthesis: ParsedDiscussRoundSynthesis | None = None,
+) -> str:
+    """Build the single bounded fallback used for a legacy agenda."""
+    prior = "(none)"
+    if prior_synthesis is not None:
+        prior_payload = _neutralized_synthesis_value(
+            discuss_round_synthesis_payload(prior_synthesis)
+        )
+        prior = json.dumps(prior_payload, ensure_ascii=False, separators=(",", ":"))[:16_000]
+    return f"""Synthesize only the completed answer-mode responses for GitHub issue #{issue_number} in {config.repo}.
+
+You are the configured discuss analyzer. This is a bounded fallback because the
+normal agenda did not contain its optional synthesis extension. Do not use issue
+prose, earlier agendas, or your own prior synthesis as support for new claims.
+The prior snapshot is identity/state context only.
+
+Completed round {round_number} responses:
+{_render_answer_responses_for_synthesis(current_responses)}
+
+Prior validated snapshot:
+{prior}
+
+Return exactly this object, with all statements attributable to the listed
+responses. `responding_reviewers` must exactly match the successful responses:
+{{
+  "schema_version": 1,
+  "kind": "discuss_round_synthesis",
+  "consensus": [],
+  "disagreements": [],
+  "changes": [],
+  "missing_facts": [],
+  "next_round_focus": [],
+  "responding_reviewers": []
+}}
+Use at most eight entries per collection and five next-round-focus entries;
+each reference is {{"reviewer": "<listed name>", "round": <round number>}}.
+<!-- AGENT_PLAN_STATE: approved -->
+-- {agent_signature(analyzer, config)}
+"""
+
+
+# Kept as an explicit alias for callers that describe the legacy-agenda path
+# as a fallback rather than a synthesis pass.
+build_discuss_round_fallback_prompt = build_discuss_round_synthesis_prompt
+
+
+def build_discuss_final_synthesis_prompt(
+    issue_number: int,
+    config: AgentLoopConfig,
+    *,
+    analyzer: AgentName,
+    round_number: int,
+    final_responses: Sequence[ParsedDiscussResponse],
+    mechanical_classification: str,
+    bounded_context: str = "",
+) -> str:
+    """Build the one bounded advisory final synthesis call."""
+    context = sanitize_historical_text(bounded_context)[:2_000] or "(none)"
+    return f"""Analyze only these completed final-round debater responses for GitHub issue #{issue_number} in {config.repo}, then synthesize their executive conclusion.
+
+You are an advisory analyzer. The mechanically determined classification is
+`{mechanical_classification}` and cannot be changed. Do not use issue prose,
+earlier rounds, prior syntheses, external information, or tools. Do not invent
+agreement. Every conclusion and every named position must be supported by the
+corresponding final response.
+
+Final round {round_number} responses:
+{_render_answer_responses_for_synthesis(final_responses)}
+
+Bounded context:
+{context}
+
+Return exactly:
+{{
+  "schema_version": 1,
+  "kind": "discuss_final_synthesis",
+  "classification": "{mechanical_classification}",
+  "agreed_conclusions": [],
+  "remaining_disagreements": [],
+  "next_action": "State the precise next human action."
+}}
+The classification must remain exactly `{mechanical_classification}`. Use at
+most eight conclusions and disagreements; each conclusion has `text` and
+response `references`, and each disagreement has `topic`, grouped reviewer
+`positions`, and `decision_needed`. Keep every free-text value concise.
+<!-- AGENT_PLAN_STATE: approved -->
+-- {agent_signature(analyzer, config)}
 """
 
 
@@ -3407,7 +3585,7 @@ def build_discuss_semantic_comparison_prompt(
     """A bounded, advisory final-round comparator prompt (#528)."""
     answer_lines = "\n".join(f"- {item.reviewer}: {item.answer}" for item in answers)
     names = [item.reviewer for item in answers]
-    return f"""Compare only these completed final-round answers for GitHub issue #{issue_number} in {config.repo}.
+    return f"""Analyze only these completed final-round debater responses for GitHub issue #{issue_number} in {config.repo}; compare their answers semantically.
 
 This is advisory only and must not create a debater consensus. Do not use web research, tools, repository inspection, or earlier discussion history. Do not decide unresolved product questions.
 

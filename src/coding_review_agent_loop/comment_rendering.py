@@ -24,7 +24,9 @@ from .protocol import (
     HumanRequirementDisposition,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
+    ParsedDiscussFinalSynthesis,
     ParsedFailedDiscussResponse,
+    ParsedDiscussRoundSynthesis,
     ParsedDiscussResponse,
     ParsedDiscussReview,
     ParsedPlanReview,
@@ -39,6 +41,7 @@ from .protocol import (
 )
 from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID
 from .protocol_markers import sanitize_historical_text
+from .round_transport import MAX_GITHUB_BODY_CHARS
 
 if TYPE_CHECKING:
     from .agents.base import AgentName
@@ -1214,6 +1217,8 @@ def render_discuss_round_summary_comment(
     result_mode: str = "triage",
     semantic_comparison: dict[str, object] | None = None,
     evidence_reconciliation: dict[str, object] | None = None,
+    round_synthesis: ParsedDiscussRoundSynthesis | None = None,
+    final_synthesis: ParsedDiscussFinalSynthesis | None = None,
 ) -> str:
     """Render the orchestrator/analyzer round-summary comment.
 
@@ -1237,6 +1242,7 @@ def render_discuss_round_summary_comment(
             analyzer_name=analyzer_name, research_mode=research_mode,
             failed_debaters=failed_debaters, outcome=outcome,
             semantic_comparison=semantic_comparison, evidence_reconciliation=evidence_reconciliation,
+            round_synthesis=round_synthesis, final_synthesis=final_synthesis,
         )
     if not is_final:
         lines: list[str] = [
@@ -1356,6 +1362,111 @@ def render_discuss_round_summary_comment(
     return "\n".join(lines)
 
 
+def _safe_synthesis_text(text: str) -> str:
+    return sanitize_historical_text(text)
+
+
+def _render_synthesis_consensus(item: object) -> list[str]:
+    text = _safe_synthesis_text(item.text)
+    references = ", ".join(
+        f"{_safe_synthesis_text(reference.reviewer)} (round {reference.round})"
+        for reference in item.references
+    )
+    return [f"- {text} _(supported by {references})_"]
+
+
+def _render_synthesis_disagreement(item: object) -> list[str]:
+    lines = [f"- **{_safe_synthesis_text(item.topic)}**"]
+    for position in item.positions:
+        names = ", ".join(_safe_synthesis_text(name) for name in position.reviewers)
+        lines.append(f"  - {names}: {_safe_synthesis_text(position.position)}")
+    lines.append(f"  - Decision needed: {_safe_synthesis_text(item.decision_needed)}")
+    return lines
+
+
+def _render_round_synthesis_lead(
+    synthesis: ParsedDiscussRoundSynthesis, *, round_number: int
+) -> list[str]:
+    respondents = ", ".join(_safe_synthesis_text(name) for name in synthesis.responding_reviewers)
+    lines = [f"## Round {round_number} discussion state", "", "### Current consensus"]
+    if respondents:
+        lines.append(f"Among responding debaters: {respondents}.")
+    lines.extend(
+        [_render_synthesis_consensus(item)[0] for item in synthesis.consensus]
+        or ["- None established yet."]
+    )
+    lines.extend(["", "### Active disagreements"])
+    lines.extend(
+        line for item in synthesis.disagreements for line in _render_synthesis_disagreement(item)
+    )
+    if not synthesis.disagreements:
+        lines.append("- None currently identified.")
+    lines.extend(["", "### Changes this round"])
+    if synthesis.changes:
+        for change in synthesis.changes:
+            refs = ", ".join(
+                f"{_safe_synthesis_text(ref.reviewer)} (round {ref.round})"
+                for ref in change.references
+            )
+            lines.append(
+                f"- **{_safe_synthesis_text(change.kind)}** "
+                f"{_safe_synthesis_text(change.topic)}: {_safe_synthesis_text(change.text)} "
+                f"_(reported by {refs})_"
+            )
+    else:
+        lines.append("- No state changes identified.")
+    lines.extend(["", "### Missing facts"])
+    lines.extend(
+        f"- {_safe_synthesis_text(item)}" for item in synthesis.missing_facts
+    )
+    if not synthesis.missing_facts:
+        lines.append("- None identified.")
+    lines.extend(["", "### Next-round focus"])
+    lines.extend(
+        f"- {_safe_synthesis_text(item)}" for item in synthesis.next_round_focus
+    )
+    if not synthesis.next_round_focus:
+        lines.append("- No additional focus identified.")
+    return lines
+
+
+def _render_final_synthesis_lead(
+    synthesis: ParsedDiscussFinalSynthesis, *, round_number: int
+) -> list[str]:
+    lines = [
+        "## Executive conclusion",
+        "",
+        "### Outcome",
+        "",
+        f"`{_safe_synthesis_text(synthesis.classification)}` after round {round_number}.",
+        "",
+        "### Agreed conclusions",
+    ]
+    lines.extend(
+        line for item in synthesis.agreed_conclusions for line in _render_synthesis_consensus(item)
+    )
+    if not synthesis.agreed_conclusions:
+        lines.append("- None established.")
+    lines.extend(["", "### Remaining disagreements"])
+    lines.extend(
+        line
+        for item in synthesis.remaining_disagreements
+        for line in _render_synthesis_disagreement(item)
+    )
+    if not synthesis.remaining_disagreements:
+        lines.append("- None; the configured mechanical outcome is supported by the final responses.")
+    lines.extend(["", "### Next action", "", _safe_synthesis_text(synthesis.next_action)])
+    return lines
+
+
+def _bounded_answer_audit_excerpt(text: str, *, remaining: int) -> str:
+    safe = sanitize_historical_text(text).replace("|", "\\|").replace("\n", " ")
+    limit = min(1_500, max(0, remaining))
+    if len(safe) > limit:
+        return safe[: max(0, limit - 1)] + "…"
+    return safe
+
+
 def _render_discuss_answer_summary(*, is_final: bool, subject: str, round_number: int,
     reviewer_votes: Sequence[ParsedDiscussAnswer], consensus_kind: str,
     round_history: Sequence[Sequence[ParsedDiscussAnswer]] | None,
@@ -1363,7 +1474,34 @@ def _render_discuss_answer_summary(*, is_final: bool, subject: str, round_number
     final_analyzer_agenda: ParsedDiscussAgenda | None, analyzer_name: str | None,
     research_mode: str | None, failed_debaters: Sequence[tuple[str, str]], outcome: str | None,
     semantic_comparison: dict[str, object] | None = None,
-    evidence_reconciliation: dict[str, object] | None = None) -> str:
+    evidence_reconciliation: dict[str, object] | None = None,
+    round_synthesis: ParsedDiscussRoundSynthesis | None = None,
+    final_synthesis: ParsedDiscussFinalSynthesis | None = None,
+    _bounded_audit: bool = False) -> str:
+    if round_synthesis is not None or final_synthesis is not None:
+        # Keep the pre-synthesis renderer as a bounded audit section. The
+        # executive state remains the only primary reading path.
+        lead = (
+            _render_final_synthesis_lead(final_synthesis, round_number=round_number)
+            if final_synthesis is not None
+            else _render_round_synthesis_lead(round_synthesis, round_number=round_number)
+        )
+        audit = _render_discuss_answer_summary(
+            is_final=is_final, subject=subject, round_number=round_number,
+            reviewer_votes=reviewer_votes, consensus_kind=consensus_kind,
+            round_history=round_history, analyzer_agenda=analyzer_agenda,
+            prior_analyzer_agenda=prior_analyzer_agenda,
+            final_analyzer_agenda=final_analyzer_agenda, analyzer_name=analyzer_name,
+            research_mode=research_mode, failed_debaters=failed_debaters, outcome=outcome,
+            semantic_comparison=semantic_comparison,
+            evidence_reconciliation=evidence_reconciliation,
+            _bounded_audit=True,
+        )
+        # Long answer bodies remain available in their per-agent comments. Keep
+        # the summary audit useful but bounded when the lead is present.
+        if len(("\n".join(lead) + audit).encode("utf-8")) > MAX_GITHUB_BODY_CHARS:
+            audit = "The complete debater responses and provenance remain available in the per-agent audit comments."
+        return "\n".join(lead) + "\n\n<details>\n<summary>Audit details</summary>\n\n" + audit + "\n\n</details>"
     if not is_final:
         heading = f"## Round {round_number} summary: Answer Pending"
     elif outcome == "needs-human":
@@ -1379,8 +1517,15 @@ def _render_discuss_answer_summary(*, is_final: bool, subject: str, round_number
             answer = semantic_comparison.get("confirmed_answer") or semantic_comparison.get("shared_recommendation") if semantic_comparison else answers[0]
             lines.extend(["### Answer", "", str(answer), ""])
     lines.extend(["| Reviewer | Position | Confidence | Answer |", "| --- | --- | --- | --- |"])
+    remaining_excerpt_bytes = 6_000
     for vote in reviewer_votes:
-        answer = (vote.answer or "(no asserted answer)").replace("|", "\\|").replace("\n", " ")
+        if _bounded_audit:
+            answer = _bounded_answer_audit_excerpt(
+                vote.answer or "(no asserted answer)", remaining=remaining_excerpt_bytes
+            )
+            remaining_excerpt_bytes = max(0, remaining_excerpt_bytes - len(answer.encode("utf-8")))
+        else:
+            answer = (vote.answer or "(no asserted answer)").replace("|", "\\|").replace("\n", " ")
         lines.append(f"| {vote.reviewer} | {vote.position} | {vote.confidence} | {answer} |")
     if failed_debaters:
         lines.extend(_render_discuss_failed_debater_lines(failed_debaters, is_final=is_final))

@@ -527,6 +527,82 @@ class DiscussAgendaDisagreement:
     question_for_next_round: str
 
 
+DISCUSS_SYNTHESIS_MAX_ENTRIES = 8
+DISCUSS_SYNTHESIS_MAX_NEXT_ROUND_FOCUS = 5
+DISCUSS_SYNTHESIS_MAX_TEXT_BYTES = 512
+DISCUSS_SYNTHESIS_MAX_CANONICAL_BYTES = 16_000
+DISCUSS_SYNTHESIS_CHANGE_KINDS = frozenset(
+    {"introduced", "resolved", "reopened", "retracted", "refined"}
+)
+DISCUSS_SYNTHESIS_CLASSIFICATIONS = frozenset(
+    {"consensus", "near_consensus", "material_deadlock"}
+)
+
+
+@dataclass(frozen=True)
+class DiscussSynthesisResponseReference:
+    """A response that independently supports a synthesized statement."""
+
+    reviewer: str
+    round: int
+
+
+@dataclass(frozen=True)
+class DiscussSynthesisConsensus:
+    text: str
+    references: tuple[DiscussSynthesisResponseReference, ...]
+
+
+@dataclass(frozen=True)
+class DiscussSynthesisPosition:
+    reviewers: tuple[str, ...]
+    position: str
+
+
+@dataclass(frozen=True)
+class DiscussSynthesisDisagreement:
+    topic: str
+    positions: tuple[DiscussSynthesisPosition, ...]
+    decision_needed: str
+
+
+@dataclass(frozen=True)
+class DiscussSynthesisChange:
+    kind: str
+    topic: str
+    text: str
+    references: tuple[DiscussSynthesisResponseReference, ...]
+
+
+@dataclass(frozen=True)
+class ParsedDiscussRoundSynthesis:
+    """Validated cumulative state for one completed answer-mode round."""
+
+    consensus: tuple[DiscussSynthesisConsensus, ...]
+    disagreements: tuple[DiscussSynthesisDisagreement, ...]
+    changes: tuple[DiscussSynthesisChange, ...]
+    missing_facts: tuple[str, ...]
+    next_round_focus: tuple[str, ...]
+    responding_reviewers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ParsedDiscussFinalSynthesis:
+    """Validated executive conclusion for an answer-mode final result."""
+
+    classification: str
+    agreed_conclusions: tuple[DiscussSynthesisConsensus, ...]
+    remaining_disagreements: tuple[DiscussSynthesisDisagreement, ...]
+    next_action: str
+
+
+# Short aliases keep the public protocol vocabulary easy to discover while
+# retaining the explicit response-reference name in serialized models.
+DiscussSynthesisReference = DiscussSynthesisResponseReference
+DiscussRoundSynthesis = ParsedDiscussRoundSynthesis
+DiscussFinalSynthesis = ParsedDiscussFinalSynthesis
+
+
 @dataclass(frozen=True)
 class ParsedDiscussAgenda:
     consensus: tuple[str, ...]
@@ -538,6 +614,9 @@ class ParsedDiscussAgenda:
     research_required: bool = False
     research_questions: tuple[str, ...] = ()
     research_question_targets: tuple[str, ...] = ()
+    # Optional answer-mode presentation state. Legacy agendas deliberately
+    # remain valid and have no synthesis value.
+    round_synthesis: ParsedDiscussRoundSynthesis | None = None
 
 
 @dataclass(frozen=True)
@@ -3104,6 +3183,417 @@ def _parse_discuss_agenda_disagreement(
     )
 
 
+def _bounded_discuss_synthesis_text(value: object, *, context: str) -> str:
+    text = _expect_non_empty_string(value, context=context)
+    if len(text.encode("utf-8")) > DISCUSS_SYNTHESIS_MAX_TEXT_BYTES:
+        raise AgentLoopError(
+            f"{context} exceeds {DISCUSS_SYNTHESIS_MAX_TEXT_BYTES} UTF-8 bytes."
+        )
+    return text
+
+
+def _bounded_discuss_synthesis_list(
+    value: object,
+    *,
+    context: str,
+    item_context: str,
+    maximum: int = DISCUSS_SYNTHESIS_MAX_ENTRIES,
+) -> tuple[str, ...]:
+    values = _expect_string_list(value, context=context, item_context=item_context)
+    if len(values) > maximum:
+        raise AgentLoopError(f"{context} may contain at most {maximum} item(s).")
+    bounded = tuple(
+        _bounded_discuss_synthesis_text(item, context=f"{item_context} at index {index}")
+        for index, item in enumerate(values)
+    )
+    if len({item.casefold() for item in bounded}) != len(bounded):
+        raise AgentLoopError(f"{context} must not contain duplicate entries.")
+    return bounded
+
+
+def _parse_discuss_synthesis_reference(
+    value: object, *, context: str
+) -> DiscussSynthesisResponseReference:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(payload, context=context, required={"reviewer", "round"})
+    reviewer = _bounded_discuss_synthesis_text(
+        payload["reviewer"], context=f"{context}.reviewer"
+    )
+    round_number = _expect_int(payload["round"], context=f"{context}.round")
+    if round_number < 1:
+        raise AgentLoopError(f"{context}.round must be at least 1.")
+    return DiscussSynthesisResponseReference(reviewer=reviewer, round=round_number)
+
+
+def _parse_discuss_synthesis_references(
+    value: object, *, context: str
+) -> tuple[DiscussSynthesisResponseReference, ...]:
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    if not value:
+        raise AgentLoopError(f"{context} must not be empty.")
+    if len(value) > DISCUSS_SYNTHESIS_MAX_ENTRIES:
+        raise AgentLoopError(
+            f"{context} may contain at most {DISCUSS_SYNTHESIS_MAX_ENTRIES} item(s)."
+        )
+    references = tuple(
+        _parse_discuss_synthesis_reference(item, context=f"{context}[{index}]")
+        for index, item in enumerate(value)
+    )
+    keys = [(item.reviewer.casefold(), item.round) for item in references]
+    if len(set(keys)) != len(keys):
+        raise AgentLoopError(f"{context} must not contain duplicate references.")
+    return references
+
+
+def _parse_discuss_synthesis_consensus(
+    value: object, *, context: str
+) -> DiscussSynthesisConsensus:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(payload, context=context, required={"text", "references"})
+    return DiscussSynthesisConsensus(
+        text=_bounded_discuss_synthesis_text(payload["text"], context=f"{context}.text"),
+        references=_parse_discuss_synthesis_references(
+            payload["references"], context=f"{context}.references"
+        ),
+    )
+
+
+def _parse_discuss_synthesis_position(
+    value: object, *, context: str
+) -> DiscussSynthesisPosition:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(payload, context=context, required={"reviewers", "position"})
+    reviewers = _bounded_discuss_synthesis_list(
+        payload["reviewers"],
+        context=f"{context}.reviewers",
+        item_context=f"{context}.reviewers",
+        maximum=DISCUSS_SYNTHESIS_MAX_ENTRIES,
+    )
+    return DiscussSynthesisPosition(
+        reviewers=reviewers,
+        position=_bounded_discuss_synthesis_text(
+            payload["position"], context=f"{context}.position"
+        ),
+    )
+
+
+def _parse_discuss_synthesis_disagreement(
+    value: object, *, context: str
+) -> DiscussSynthesisDisagreement:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(
+        payload, context=context, required={"topic", "positions", "decision_needed"}
+    )
+    positions_value = payload["positions"]
+    if not isinstance(positions_value, list):
+        raise AgentLoopError(f"{context}.positions must be a JSON array.")
+    if not positions_value:
+        raise AgentLoopError(f"{context}.positions must not be empty.")
+    if len(positions_value) > DISCUSS_SYNTHESIS_MAX_ENTRIES:
+        raise AgentLoopError(
+            f"{context}.positions may contain at most {DISCUSS_SYNTHESIS_MAX_ENTRIES} item(s)."
+        )
+    positions = tuple(
+        _parse_discuss_synthesis_position(item, context=f"{context}.positions[{index}]")
+        for index, item in enumerate(positions_value)
+    )
+    all_reviewers = [reviewer for item in positions for reviewer in item.reviewers]
+    if len({reviewer.casefold() for reviewer in all_reviewers}) != len(all_reviewers):
+        raise AgentLoopError(f"{context}.positions must not repeat a reviewer.")
+    return DiscussSynthesisDisagreement(
+        topic=_bounded_discuss_synthesis_text(payload["topic"], context=f"{context}.topic"),
+        positions=positions,
+        decision_needed=_bounded_discuss_synthesis_text(
+            payload["decision_needed"], context=f"{context}.decision_needed"
+        ),
+    )
+
+
+def _parse_discuss_synthesis_change(
+    value: object, *, context: str
+) -> DiscussSynthesisChange:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(
+        payload, context=context, required={"kind", "topic", "text", "references"}
+    )
+    kind = _bounded_discuss_synthesis_text(payload["kind"], context=f"{context}.kind")
+    if kind not in DISCUSS_SYNTHESIS_CHANGE_KINDS:
+        raise AgentLoopError(
+            f"{context}.kind must be one of: "
+            + ", ".join(sorted(DISCUSS_SYNTHESIS_CHANGE_KINDS))
+        )
+    return DiscussSynthesisChange(
+        kind=kind,
+        topic=_bounded_discuss_synthesis_text(payload["topic"], context=f"{context}.topic"),
+        text=_bounded_discuss_synthesis_text(payload["text"], context=f"{context}.text"),
+        references=_parse_discuss_synthesis_references(
+            payload["references"], context=f"{context}.references"
+        ),
+    )
+
+
+def _parse_round_synthesis_payload(
+    payload: dict[str, object], *, context: str = "discuss_round_synthesis"
+) -> ParsedDiscussRoundSynthesis:
+    _require_supported_schema_version(payload)
+    _expect_exact_keys(
+        payload,
+        context=context,
+        required={
+            "schema_version", "kind", "consensus", "disagreements", "changes",
+            "missing_facts", "next_round_focus", "responding_reviewers",
+        },
+    )
+    if payload.get("kind") != "discuss_round_synthesis":
+        raise AgentLoopError(
+            "Structured response kind mismatch: expected `discuss_round_synthesis`."
+        )
+    consensus = tuple(
+        _parse_discuss_synthesis_consensus(item, context=f"{context}.consensus[{index}]")
+        for index, item in enumerate(
+            _bounded_synthesis_object_list(payload["consensus"], context=f"{context}.consensus")
+        )
+    )
+    disagreements = tuple(
+        _parse_discuss_synthesis_disagreement(
+            item, context=f"{context}.disagreements[{index}]"
+        )
+        for index, item in enumerate(
+            _bounded_synthesis_object_list(payload["disagreements"], context=f"{context}.disagreements")
+        )
+    )
+    changes = tuple(
+        _parse_discuss_synthesis_change(item, context=f"{context}.changes[{index}]")
+        for index, item in enumerate(
+            _bounded_synthesis_object_list(payload["changes"], context=f"{context}.changes")
+        )
+    )
+    topics = [item.topic.casefold() for item in disagreements]
+    if len(set(topics)) != len(topics):
+        raise AgentLoopError(f"{context}.disagreements must not contain duplicate topics.")
+    missing_facts = _bounded_discuss_synthesis_list(
+        payload["missing_facts"], context=f"{context}.missing_facts", item_context=f"{context}.missing_facts"
+    )
+    next_focus = _bounded_discuss_synthesis_list(
+        payload["next_round_focus"], context=f"{context}.next_round_focus", item_context=f"{context}.next_round_focus",
+        maximum=DISCUSS_SYNTHESIS_MAX_NEXT_ROUND_FOCUS,
+    )
+    responding_reviewers = _bounded_discuss_synthesis_list(
+        payload["responding_reviewers"], context=f"{context}.responding_reviewers", item_context=f"{context}.responding_reviewers"
+    )
+    return ParsedDiscussRoundSynthesis(
+        consensus=consensus, disagreements=disagreements, changes=changes,
+        missing_facts=missing_facts, next_round_focus=next_focus,
+        responding_reviewers=responding_reviewers,
+    )
+
+
+def _bounded_synthesis_object_list(value: object, *, context: str) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    if len(value) > DISCUSS_SYNTHESIS_MAX_ENTRIES:
+        raise AgentLoopError(
+            f"{context} may contain at most {DISCUSS_SYNTHESIS_MAX_ENTRIES} item(s)."
+        )
+    return [_expect_object(item, context=f"{context}[{index}]") for index, item in enumerate(value)]
+
+
+def _parse_final_synthesis_payload(
+    payload: dict[str, object], *, context: str = "discuss_final_synthesis"
+) -> ParsedDiscussFinalSynthesis:
+    _require_supported_schema_version(payload)
+    _expect_exact_keys(
+        payload,
+        context=context,
+        required={
+            "schema_version", "kind", "classification", "agreed_conclusions",
+            "remaining_disagreements", "next_action",
+        },
+    )
+    if payload.get("kind") != "discuss_final_synthesis":
+        raise AgentLoopError(
+            "Structured response kind mismatch: expected `discuss_final_synthesis`."
+        )
+    classification = _bounded_discuss_synthesis_text(
+        payload["classification"], context=f"{context}.classification"
+    )
+    if classification not in DISCUSS_SYNTHESIS_CLASSIFICATIONS:
+        raise AgentLoopError(f"{context}.classification is not supported.")
+    agreed = tuple(
+        _parse_discuss_synthesis_consensus(item, context=f"{context}.agreed_conclusions[{index}]")
+        for index, item in enumerate(
+            _bounded_synthesis_object_list(payload["agreed_conclusions"], context=f"{context}.agreed_conclusions")
+        )
+    )
+    disagreements = tuple(
+        _parse_discuss_synthesis_disagreement(
+            item, context=f"{context}.remaining_disagreements[{index}]"
+        )
+        for index, item in enumerate(
+            _bounded_synthesis_object_list(payload["remaining_disagreements"], context=f"{context}.remaining_disagreements")
+        )
+    )
+    topics = [item.topic.casefold() for item in disagreements]
+    if len(set(topics)) != len(topics):
+        raise AgentLoopError(f"{context}.remaining_disagreements must not contain duplicate topics.")
+    if classification == "consensus" and disagreements:
+        raise AgentLoopError("A consensus final synthesis cannot contain remaining disagreements.")
+    if classification == "consensus" and not agreed:
+        raise AgentLoopError("A consensus final synthesis must include an agreed conclusion.")
+    if classification == "near_consensus" and not disagreements:
+        raise AgentLoopError(
+            "A near-consensus final synthesis must include a remaining disagreement."
+        )
+    if classification == "material_deadlock" and not disagreements and not agreed:
+        raise AgentLoopError("A material-deadlock final synthesis must describe the residual state.")
+    return ParsedDiscussFinalSynthesis(
+        classification=classification,
+        agreed_conclusions=agreed,
+        remaining_disagreements=disagreements,
+        next_action=_bounded_discuss_synthesis_text(
+            payload["next_action"], context=f"{context}.next_action"
+        ),
+    )
+
+
+def _disc_synthesis_reference_payload(
+    reference: DiscussSynthesisResponseReference,
+) -> dict[str, object]:
+    return {"reviewer": reference.reviewer, "round": reference.round}
+
+
+def _disc_synthesis_consensus_payload(item: DiscussSynthesisConsensus) -> dict[str, object]:
+    return {
+        "text": item.text,
+        "references": [_disc_synthesis_reference_payload(ref) for ref in item.references],
+    }
+
+
+def _disc_synthesis_disagreement_payload(item: DiscussSynthesisDisagreement) -> dict[str, object]:
+    return {
+        "topic": item.topic,
+        "positions": [
+            {"reviewers": list(position.reviewers), "position": position.position}
+            for position in item.positions
+        ],
+        "decision_needed": item.decision_needed,
+    }
+
+
+def _disc_synthesis_change_payload(item: DiscussSynthesisChange) -> dict[str, object]:
+    return {
+        "kind": item.kind,
+        "topic": item.topic,
+        "text": item.text,
+        "references": [_disc_synthesis_reference_payload(ref) for ref in item.references],
+    }
+
+
+def discuss_round_synthesis_payload(synthesis: ParsedDiscussRoundSynthesis) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "kind": "discuss_round_synthesis",
+        "consensus": [_disc_synthesis_consensus_payload(item) for item in synthesis.consensus],
+        "disagreements": [_disc_synthesis_disagreement_payload(item) for item in synthesis.disagreements],
+        "changes": [_disc_synthesis_change_payload(item) for item in synthesis.changes],
+        "missing_facts": list(synthesis.missing_facts),
+        "next_round_focus": list(synthesis.next_round_focus),
+        "responding_reviewers": list(synthesis.responding_reviewers),
+    }
+
+
+def discuss_final_synthesis_payload(synthesis: ParsedDiscussFinalSynthesis) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "kind": "discuss_final_synthesis",
+        "classification": synthesis.classification,
+        "agreed_conclusions": [_disc_synthesis_consensus_payload(item) for item in synthesis.agreed_conclusions],
+        "remaining_disagreements": [_disc_synthesis_disagreement_payload(item) for item in synthesis.remaining_disagreements],
+        "next_action": synthesis.next_action,
+    }
+
+
+def serialize_discuss_round_synthesis(synthesis: ParsedDiscussRoundSynthesis) -> str:
+    payload = discuss_round_synthesis_payload(synthesis)
+    _parse_round_synthesis_payload(payload)
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) > DISCUSS_SYNTHESIS_MAX_CANONICAL_BYTES:
+        raise AgentLoopError("Canonical discuss round synthesis exceeds 16,000 UTF-8 bytes.")
+    return serialized
+
+
+def serialize_discuss_final_synthesis(synthesis: ParsedDiscussFinalSynthesis) -> str:
+    payload = discuss_final_synthesis_payload(synthesis)
+    _parse_final_synthesis_payload(payload)
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) > DISCUSS_SYNTHESIS_MAX_CANONICAL_BYTES:
+        raise AgentLoopError("Canonical discuss final synthesis exceeds 16,000 UTF-8 bytes.")
+    return serialized
+
+
+def _parse_canonical_discuss_synthesis(text: str, *, kind: str) -> dict[str, object] | None:
+    if not isinstance(text, str) or len(text.encode("utf-8")) > DISCUSS_SYNTHESIS_MAX_CANONICAL_BYTES:
+        return None
+    try:
+        value = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or value.get("kind") != kind:
+        return None
+    return value
+
+
+def parse_structured_discuss_round_synthesis(text: str) -> ParsedDiscussRoundSynthesis | None:
+    payload = _extract_structured_discuss_review_payload(
+        text, context_label="Structured discuss round synthesis"
+    )
+    if payload is None:
+        return None
+    if payload.get("kind") != "discuss_round_synthesis":
+        return None
+    return _parse_round_synthesis_payload(payload)
+
+
+def validate_structured_discuss_round_synthesis(text: str) -> ParsedDiscussRoundSynthesis:
+    parsed = parse_structured_discuss_round_synthesis(text)
+    if parsed is None:
+        raise AgentLoopError("Discuss round synthesis did not use the required structured format.")
+    return parsed
+
+
+def parse_structured_discuss_final_synthesis(text: str) -> ParsedDiscussFinalSynthesis | None:
+    payload = _extract_structured_discuss_review_payload(
+        text, context_label="Structured discuss final synthesis"
+    )
+    if payload is None:
+        return None
+    if payload.get("kind") != "discuss_final_synthesis":
+        return None
+    return _parse_final_synthesis_payload(payload)
+
+
+def validate_structured_discuss_final_synthesis(text: str) -> ParsedDiscussFinalSynthesis:
+    parsed = parse_structured_discuss_final_synthesis(text)
+    if parsed is None:
+        raise AgentLoopError("Discuss final synthesis did not use the required structured format.")
+    return parsed
+
+
+def parse_canonical_discuss_round_synthesis(text: str) -> ParsedDiscussRoundSynthesis | None:
+    payload = _parse_canonical_discuss_synthesis(text, kind="discuss_round_synthesis")
+    if payload is None:
+        return None
+    return _parse_round_synthesis_payload(payload)
+
+
+def parse_canonical_discuss_final_synthesis(text: str) -> ParsedDiscussFinalSynthesis | None:
+    payload = _parse_canonical_discuss_synthesis(text, kind="discuss_final_synthesis")
+    if payload is None:
+        return None
+    return _parse_final_synthesis_payload(payload)
+
+
 def parse_structured_discuss_agenda(text: str) -> ParsedDiscussAgenda | None:
     payload = _extract_structured_discuss_agenda_payload(text)
     if payload is None:
@@ -3116,7 +3606,10 @@ def parse_structured_discuss_agenda(text: str) -> ParsedDiscussAgenda | None:
         payload,
         context="discuss_agenda",
         required={"schema_version", "kind", "consensus", "disagreements"},
-        optional={"missing_facts", "research_required", "research_questions", "research_question_targets"},
+        optional={
+            "missing_facts", "research_required", "research_questions",
+            "research_question_targets", "round_synthesis",
+        },
     )
     consensus = _expect_string_list(
         payload["consensus"],
@@ -3172,6 +3665,14 @@ def parse_structured_discuss_agenda(text: str) -> ParsedDiscussAgenda | None:
         raise AgentLoopError(
             "discuss_agenda.research_questions requires research_required to be true."
         )
+    round_synthesis = None
+    if "round_synthesis" in payload:
+        round_synthesis_payload = _expect_object(
+            payload["round_synthesis"], context="discuss_agenda.round_synthesis"
+        )
+        round_synthesis = _parse_round_synthesis_payload(
+            round_synthesis_payload, context="discuss_agenda.round_synthesis"
+        )
     return ParsedDiscussAgenda(
         consensus=consensus,
         disagreements=disagreements,
@@ -3179,6 +3680,7 @@ def parse_structured_discuss_agenda(text: str) -> ParsedDiscussAgenda | None:
         research_required=research_required,
         research_questions=research_questions,
         research_question_targets=research_question_targets,
+        round_synthesis=round_synthesis,
     )
 
 

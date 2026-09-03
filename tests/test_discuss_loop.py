@@ -613,8 +613,12 @@ def test_discuss_loop_answer_research_required_and_analyzer_prompt_are_mode_awar
     assert run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0) == 0
     assert "Use an API boundary." in runner.comments[-1]
     assert all('"kind": "discuss_answer"' in " ".join(cmd) for cmd, _ in runner.commands if cmd[:1] in (["codex"], ["gemini"]))
-    assert any(
-        "Analyze only these completed final-round debater responses" in " ".join(command)
+    # Exact normalized answer consensus is synthesized directly from the
+    # final responses; the analyzer is not charged a redundant final call.
+    # The pre-existing evidence reconciliation pass may still run for sourced
+    # research, but it is a distinct operation.
+    assert not any(
+        '"kind": "discuss_final_synthesis"' in " ".join(command)
         for command in _claude_commands(runner)
     )
 
@@ -645,6 +649,48 @@ def test_discuss_loop_answer_partial_live_round_records_failure_and_deadlocks(tm
         for command, _ in runner.commands
         if command[:1] == ["agy"]
     )
+
+
+def test_discuss_loop_answer_legacy_agenda_uses_one_bounded_round_fallback(tmp_path):
+    round_synthesis = {
+        "schema_version": 1,
+        "kind": "discuss_round_synthesis",
+        "consensus": [{
+            "text": "Use an API boundary.",
+            "references": [
+                {"reviewer": "Codex", "round": 1},
+                {"reviewer": "Gemini", "round": 1},
+            ],
+        }],
+        "disagreements": [],
+        "changes": [],
+        "missing_facts": [],
+        "next_round_focus": [],
+        "responding_reviewers": ["Codex", "Gemini"],
+    }
+    fallback = json.dumps(round_synthesis) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
+    first = _discuss_answer_text(answer="Use an API boundary.", rationale="First position.")
+    second = _discuss_answer_text(answer="Use a library boundary.", rationale="Different position.")
+    final = _discuss_answer_text(
+        answer="Use an API boundary.", rationale="Converged position.", rebuttal="The boundary concern is resolved."
+    )
+    runner = FakeRunner(
+        codex_outputs=[first, final],
+        gemini_outputs=[second, final],
+        claude_outputs=[_discuss_agenda_text(), fallback],
+        issue_payload=_grounded_agenda_issue_payload(),
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"),
+        discuss_result_mode="answer", discuss_analyzer="claude",
+    )
+
+    assert run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1) == 0
+    first_summary = runner.comments[2]
+    assert "### Current consensus" in first_summary
+    assert "Use an API boundary." in first_summary
+    assert "<details>" in first_summary
+    assert len(_claude_commands(runner)) == 2
 
 
 def test_discuss_loop_answer_mode_never_materializes_split_issues(tmp_path):

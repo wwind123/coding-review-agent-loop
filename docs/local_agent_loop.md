@@ -477,6 +477,31 @@ Analyzer observations remain non-authoritative and cited research remains a
 separate sourced-facts section. Repair and resume preserve the selected mode;
 transcripts cannot mix answer and triage responses.
 
+Answer-mode presentation is intentionally executive-first. When a configured
+discuss analyzer returns the optional enriched agenda, each completed interim
+comment leads with `Current consensus`, `Active disagreements`, `Changes this
+round`, `Missing facts`, and `Next-round focus`; the final comment leads with
+`Outcome`, `Agreed conclusions`, `Remaining disagreements`, and `Next action`.
+The state is cumulative: a resolved item appears in the change record and does
+not return to the active list unless a later response explicitly reopens it.
+The raw table, analyzer audit, and bounded excerpts are collapsed below the
+state, while each per-agent comment remains the complete authoritative audit.
+
+Only the configured discuss analyzer can synthesize. A normal enriched agenda
+adds no call, a valid legacy agenda permits one bounded same-analyzer fallback,
+and exact-text, semantic-equivalent, or debater-confirmed final artifacts are
+adapted directly without another synthesis call. Other complete or partial
+final paths use at most one bounded final synthesis call; partial finalization
+is always mechanically `material_deadlock`. The mechanical classification is
+never changed by advisory text. Analyzer absence, malformed or unsupported
+claims, failed fidelity checks, marker-like text, corrupt resume metadata, and
+sidecar hydration problems fail closed to the existing rendering. Canonical
+snapshots and visible synthesis text are bounded to 16,000 UTF-8 bytes; answer
+excerpts are limited per responder and in aggregate, and large audit payloads
+spill to transport sidecars. Resume consumes a stored snapshot only while a
+discuss analyzer is configured, preserving analyzer gating when configuration
+changes.
+
 To enable semantic comparison for differently worded final answers, configure
 an independent `--discuss-analyzer`. There is no reviewer fallback when it is
 unset. The analyzer receives final-round answers only and is prohibited from

@@ -76,13 +76,14 @@ def test_prepare_round_comment_spills_multiple_fields_in_fixed_order() -> None:
     prepared = transport.prepare_round_comment(_comment(payload))
 
     anchor_payload = _anchor_payload(prepared[-1])
-    assert all(isinstance(anchor_payload[field], dict) for field in transport._SPILL_FIELDS)
+    expected_fields = tuple(field for field in transport._SPILL_FIELDS if field in payload)
+    assert all(isinstance(anchor_payload[field], dict) for field in expected_fields)
     sidecar_fields = []
     for sidecar in prepared[:-1]:
         match = transport.ROUND_TRANSPORT_SIDECAR_RE.search(sidecar)
         assert match is not None
         sidecar_fields.append(json.loads(base64.urlsafe_b64decode(match.group("payload")))["field"])
-    assert list(dict.fromkeys(sidecar_fields)) == list(transport._SPILL_FIELDS)
+    assert list(dict.fromkeys(sidecar_fields)) == list(expected_fields)
 
 
 def test_hydrate_mapping_reports_missing_duplicate_and_corrupt_sidecars() -> None:

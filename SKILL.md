@@ -160,6 +160,23 @@ Run this only when the user asked to implement (see **issue mode**):
 3. Open a PR that references the issue, and note the PR number. Hand off to the
    PR-loop.
 
+### Answer-mode discussion summaries
+
+When the CLI is used for `discuss --discuss-result-mode answer`, the public
+issue comments lead with a concise state rather than the raw transcript. Each
+completed interim round may expose cumulative consensus, active disagreements,
+changes, missing facts, and next-round focus; a final comment exposes the fixed
+mechanical outcome, agreed conclusions, remaining decisions, and next action.
+The configured `--discuss-analyzer` is the only eligible synthesis agent.
+Enriched agendas cost no additional round call; a legacy agenda permits one
+bounded analyzer fallback, and exact/semantic/debater-confirmed final artifacts
+are adapted without a redundant synthesis call. Missing analyzers, invalid or
+unsupported claims, and transport failures retain the existing fail-closed
+rendering. Partial rounds are labeled as covering responding debaters only and
+cannot become final consensus. The latest validated snapshot is persisted for
+resume, while full per-agent responses remain the audit record and synthesis
+text/excerpts are bounded and spillable.
+
 ### External by-phase implementation (after an approved plan)
 
 Use this when the user asks for skill-mode parity with

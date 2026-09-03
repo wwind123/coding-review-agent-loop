@@ -25,6 +25,11 @@ _SPILL_FIELDS = (
     "canonical_reviewer_response",
     "raw_structured_coder_response",
     "canonical_plan",
+    "round_synthesis",
+    "final_synthesis",
+    "analyzer_response",
+    "final_analyzer_response",
+    "raw_synthesis_response",
 )
 _MAX_COMPRESSED = 8_000_000
 _MAX_DECOMPRESSED = 16_000_000
