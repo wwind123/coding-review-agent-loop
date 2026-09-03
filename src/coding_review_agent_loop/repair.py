@@ -92,7 +92,7 @@ def strip_unknown_prior_item_dispositions(
 
 def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> str | None:
     """Trim envelope-only trailing material without changing structured JSON."""
-    if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "coder_followup", "issue_implementation", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
+    if expected_kind not in {"plan_state", "pr_review", "plan_review", "plan_revision", "coder_followup", "issue_implementation", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation", "discuss_evidence_reconciliation"}:
         return None
 
     stripped = raw.lstrip()
@@ -107,7 +107,7 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
 
     json_text = stripped[:json_end].rstrip()
     trailing = stripped[json_end:]
-    state_re = PLAN_STATE_RE if expected_kind in {"plan_state", "plan_review", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation"} else STATE_RE
+    state_re = PLAN_STATE_RE if expected_kind in {"plan_state", "plan_review", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation"} else STATE_RE
     state_match = state_re.search(trailing)
     if state_match is None:
         return None
@@ -439,6 +439,40 @@ Notes:
 - If no agenda content is recoverable, return the closest faithful output even if it remains invalid; the orchestrator will fall back mechanically.
 - footer must always be <!-- AGENT_PLAN_STATE: approved --> (never blocking).
 
+## Valid Format M — Discuss Round Synthesis:
+
+{
+  "schema_version": 1,
+  "kind": "discuss_round_synthesis",
+  "consensus": [{"text": "<supported cumulative conclusion>", "references": [{"reviewer": "<name>", "round": 1}]}],
+  "disagreements": [{"topic": "<topic>", "positions": [{"reviewers": ["<name>"], "position": "<supported position>"}], "decision_needed": "<decision>"}],
+  "changes": [{"kind": "introduced", "topic": "<topic>", "text": "<change>", "references": [{"reviewer": "<name>", "round": 1}]}],
+  "missing_facts": [],
+  "next_round_focus": [],
+  "responding_reviewers": ["<successful reviewer>"]
+}
+<!-- AGENT_PLAN_STATE: approved -->
+-- <Analyzer Name>
+
+Notes: preserve only fields present in the source. Do not manufacture a
+consensus, transition, reviewer, or response reference.
+
+## Valid Format N — Discuss Final Synthesis:
+
+{
+  "schema_version": 1,
+  "kind": "discuss_final_synthesis",
+  "classification": "consensus" | "near_consensus" | "material_deadlock",
+  "agreed_conclusions": [{"text": "<supported conclusion>", "references": [{"reviewer": "<name>", "round": 1}]}],
+  "remaining_disagreements": [],
+  "next_action": "<precise next action>"
+}
+<!-- AGENT_PLAN_STATE: approved -->
+-- <Analyzer Name>
+
+Notes: the classification is mechanically supplied by the caller and must not
+be changed. Preserve only supported conclusions and attributed positions.
+
 ## Valid Format J — Initial Plan State:
 
 {
@@ -543,6 +577,8 @@ The active planning human-requirements context above is authoritative. Do not us
 - Use Format K if the original contains "issue_implementation" or "pr_number".
 - Use Format D if the original contains "plan_revision".
 - Use Format J if the original contains "plan_state" or "plan_steps".
+- Use Format M if the original contains "discuss_round_synthesis" or "responding_reviewers".
+- Use Format N if the original contains "discuss_final_synthesis" or "agreed_conclusions".
 - Use Format H if the original contains "discuss_semantic_comparison" or "remaining_decisions".
 - Use Format I if the original contains "discuss_answer_confirmation" or "decision".
 - Use Format F if the original contains "discuss_agenda" or "question_for_next_round".
@@ -1051,7 +1087,7 @@ Output ONLY the repaired response. No explanations.
 {raw_response}"""
 
 _REPAIR_MODEL = "gemini-3.1-flash-lite"
-_SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_followup", "issue_implementation", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_semantic_comparison", "discuss_answer_confirmation"}
+_SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_followup", "issue_implementation", "plan_revision", "discuss_review", "discuss_answer", "discuss_agenda", "discuss_round_synthesis", "discuss_final_synthesis", "discuss_semantic_comparison", "discuss_answer_confirmation"}
 RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",

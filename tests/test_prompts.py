@@ -2552,14 +2552,20 @@ def test_reviewer_prompt_includes_documentation_check(tmp_path):
 from coding_review_agent_loop.prompts import (
     build_discuss_agenda_prompt,
     build_discuss_final_analysis_prompt,
+    build_discuss_final_synthesis_prompt,
+    build_discuss_round_fallback_prompt,
     build_discuss_review_prompt,
 )
 from coding_review_agent_loop.protocol import (
     DiscussAgendaDisagreement,
+    DiscussSynthesisConsensus,
+    DiscussSynthesisResponseReference,
     DiscussUnresolvedItem,
     ParsedDiscussAnswer,
     ParsedDiscussAgenda,
+    ParsedDiscussRoundSynthesis,
     ParsedDiscussReview,
+    ParsedFailedDiscussResponse,
 )
 
 
@@ -2727,6 +2733,92 @@ def test_build_discuss_answer_prompt_keeps_analyzer_and_research_non_authoritati
     assert '"questions":' in prompt
     assert '"outcome":' not in prompt
     assert '"split_proposals":' not in prompt
+
+
+def test_answer_agenda_prompt_carries_neutralized_prior_synthesis_but_triage_does_not(tmp_path):
+    synthesis = ParsedDiscussRoundSynthesis(
+        consensus=(DiscussSynthesisConsensus(
+            text="Use an API boundary.",
+            references=(DiscussSynthesisResponseReference("Codex", 1),),
+        ),),
+        disagreements=(), changes=(),
+        missing_facts=("<!-- AGENT_LOOP_META: v1_AA -->",),
+        next_round_focus=("Choose the boundary.",),
+        responding_reviewers=("Codex",),
+    )
+    answer_config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer"
+    )
+    answer_prompt = build_discuss_agenda_prompt(
+        56, answer_config, analyzer="claude", round_number=2,
+        round_history=[[_discuss_prompt_vote("Codex")]],
+        prior_round_synthesis=synthesis,
+    )
+    triage_config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    triage_prompt = build_discuss_agenda_prompt(
+        56, triage_config, analyzer="claude", round_number=2,
+        round_history=[[_discuss_prompt_vote("Codex")]],
+        prior_round_synthesis=synthesis,
+    )
+
+    assert "Prior validated cumulative round state" in answer_prompt
+    assert "<!-- AGENT_LOOP_META: v1_AA -->" not in answer_prompt
+    assert "[protocol LOOP_META record]" in answer_prompt
+    assert '"round_synthesis"' in answer_prompt
+    assert "Prior validated cumulative round state" not in triage_prompt
+    assert '"round_synthesis"' not in triage_prompt
+
+
+def test_bounded_round_and_final_synthesis_prompts_are_analyzer_only(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
+    responses = [
+        ParsedDiscussAnswer(
+            position="answer", rationale="Use an API boundary.", confidence="high",
+            unresolved_items=(), reviewer="Codex", answer="Use an API boundary.",
+        ),
+    ]
+    round_prompt = build_discuss_round_fallback_prompt(
+        56, config, analyzer="claude", round_number=1, current_responses=responses
+    )
+    final_prompt = build_discuss_final_synthesis_prompt(
+        56, config, analyzer="claude", round_number=1,
+        final_responses=responses, mechanical_classification="consensus",
+    )
+
+    assert round_prompt.startswith("Synthesize only the completed answer-mode responses")
+    assert '"kind": "discuss_round_synthesis"' in round_prompt
+    assert '"kind": "discuss_final_synthesis"' in final_prompt
+    assert "mechanically determined classification" in final_prompt
+    assert "issue prose" in final_prompt
+
+
+def test_synthesis_prompts_show_classification_valid_nonempty_shapes_and_filter_failures(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
+    responses = [
+        ParsedDiscussAnswer(
+            position="answer", rationale="Use an API boundary.", confidence="high",
+            unresolved_items=(), reviewer="Codex", answer="Use an API boundary.",
+        ),
+        ParsedFailedDiscussResponse(reviewer="Gemini", category="provider", result_mode="answer"),
+    ]
+    round_prompt = build_discuss_round_fallback_prompt(
+        56, config, analyzer="claude", round_number=1, current_responses=responses
+    )
+    assert '"responding_reviewers": ["Codex"]' in round_prompt
+    assert '"responding_reviewers": []' not in round_prompt
+    assert "Gemini" not in round_prompt
+
+    consensus_prompt = build_discuss_final_synthesis_prompt(
+        56, config, analyzer="claude", round_number=1,
+        final_responses=[responses[0]], mechanical_classification="consensus",
+    )
+    near_prompt = build_discuss_final_synthesis_prompt(
+        56, config, analyzer="claude", round_number=1,
+        final_responses=[responses[0]], mechanical_classification="near_consensus",
+    )
+    assert '"remaining_disagreements": []' in consensus_prompt
+    assert '"agreed_conclusions": []' in near_prompt
+    assert '"remaining_disagreements": [' in near_prompt
 
 
 def test_build_discuss_review_prompt_plain_mode_unchanged_without_agenda(tmp_path):

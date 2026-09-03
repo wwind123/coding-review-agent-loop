@@ -254,6 +254,19 @@ Useful optional controls include:
 See [Discuss mode](docs/local_agent_loop.md#open-ended-answer-results) for result
 semantics, research evidence, deadlocks, and resume behavior.
 
+Answer-mode summaries now put a bounded executive state before the audit
+transcript. With a configured `--discuss-analyzer`, completed non-final rounds
+reuse the analyzer's enriched agenda when available and show cumulative current
+consensus, active disagreements, changes, missing facts, and next-round focus.
+The final comment similarly leads with outcome, agreed conclusions, residual
+decisions, and the next action. Exact, semantic-equivalent, and debater-confirmed
+results reuse their mechanically validated artifacts without a redundant final
+synthesis call; only the configured discuss analyzer may perform the explicitly
+bounded fallback or final synthesis call. Analyzer-less or invalid synthesis
+falls back to the existing fail-closed result. Per-agent comments remain the
+authoritative raw audit, and resume metadata carries only the latest validated
+snapshot with bounded, spillable excerpts.
+
 ## Agent Backends
 
 | Backend | CLI | Notes |

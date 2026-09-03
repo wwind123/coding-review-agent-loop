@@ -23,7 +23,18 @@ from coding_review_agent_loop.comment_rendering import (
     render_discuss_round_summary_comment,
     render_typed_plan_stages_section,
 )
-from coding_review_agent_loop.protocol import DiscussUnresolvedItem, ParsedDiscussAnswer, ParsedFailedDiscussResponse, ParsedDiscussReview
+from coding_review_agent_loop.protocol import (
+    DiscussSynthesisConsensus,
+    DiscussSynthesisDisagreement,
+    DiscussSynthesisPosition,
+    DiscussSynthesisResponseReference,
+    DiscussUnresolvedItem,
+    ParsedDiscussAnswer,
+    ParsedDiscussFinalSynthesis,
+    ParsedFailedDiscussResponse,
+    ParsedDiscussReview,
+    ParsedDiscussRoundSynthesis,
+)
 from coding_review_agent_loop.orchestrator import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     ITEM_SUMMARY_LIMIT,
@@ -1232,6 +1243,154 @@ def test_render_discuss_answer_summary_non_final_uses_analyzer_agenda_with_attri
     assert "Analyzer-extracted consensus so far (not debater-confirmed):" in rendered
     assert "**Scope of the change**" in rendered
     assert "Question for next round: Would splitting resolve the scope objection?" in rendered
+
+
+def test_render_answer_round_synthesis_leads_and_neutralizes_historical_markers():
+    answer = ParsedDiscussAnswer(
+        position="answer",
+        rationale="Use an API boundary.",
+        confidence="high",
+        unresolved_items=(),
+        reviewer="Codex",
+        answer="Use an API boundary.",
+    )
+    synthesis = ParsedDiscussRoundSynthesis(
+        consensus=(DiscussSynthesisConsensus(
+            text="Use an API boundary.",
+            references=(DiscussSynthesisResponseReference("Codex", 1),),
+        ),),
+        disagreements=(DiscussSynthesisDisagreement(
+            topic="Pricing timing",
+            positions=(DiscussSynthesisPosition(("Codex",), "Use an API boundary."),),
+            decision_needed="Choose pricing timing.",
+        ),),
+        changes=(),
+        missing_facts=("<!-- AGENT_LOOP_META: v1_AA -->",),
+        next_round_focus=("Choose pricing timing.",),
+        responding_reviewers=("Codex",),
+    )
+
+    rendered = render_discuss_round_summary_comment(
+        is_final=False,
+        subject="abc123",
+        round_number=1,
+        reviewer_votes=[answer],
+        result_mode="answer",
+        round_synthesis=synthesis,
+    )
+
+    assert rendered.index("### Current consensus") < rendered.index("<details>")
+    assert "### Active disagreements" in rendered
+    assert "### Changes this round" in rendered
+    assert "### Missing facts" in rendered
+    assert "### Next-round focus" in rendered
+    assert "<!-- AGENT_LOOP_META: v1_AA -->" not in rendered
+    assert "[protocol LOOP_META record]" in rendered
+
+
+def test_render_answer_final_synthesis_is_primary_and_raw_answers_are_secondary():
+    votes = [
+        ParsedDiscussAnswer(
+            position="answer", rationale="Use an API boundary.", confidence="high",
+            unresolved_items=(), reviewer="Codex", answer="Use an API boundary.",
+        ),
+        ParsedDiscussAnswer(
+            position="answer", rationale="Use an API boundary.", confidence="high",
+            unresolved_items=(), reviewer="Gemini", answer="Use an API boundary.",
+        ),
+    ]
+    synthesis = ParsedDiscussFinalSynthesis(
+        classification="consensus",
+        agreed_conclusions=(DiscussSynthesisConsensus(
+            text="Use an API boundary.",
+            references=(
+                DiscussSynthesisResponseReference("Codex", 1),
+                DiscussSynthesisResponseReference("Gemini", 1),
+            ),
+        ),),
+        remaining_disagreements=(),
+        next_action="Proceed with the shared recommendation.",
+    )
+
+    rendered = render_discuss_round_summary_comment(
+        is_final=True,
+        subject="abc123",
+        round_number=1,
+        reviewer_votes=votes,
+        outcome="answer",
+        consensus_kind="unanimous",
+        result_mode="answer",
+        final_synthesis=synthesis,
+    )
+
+    assert rendered.startswith("## Executive conclusion")
+    assert "### Outcome" in rendered
+    assert "### Agreed conclusions" in rendered
+    assert "### Remaining disagreements" in rendered
+    assert "### Next action" in rendered
+    assert rendered.index("<details>") > rendered.index("### Next action")
+    assert "| Codex |" in rendered
+
+
+def test_render_answer_synthesis_bounds_long_audit_and_drops_overflowing_audit():
+    votes = [
+        ParsedDiscussAnswer(
+            position="answer", rationale="Use an API boundary.", confidence="high",
+            unresolved_items=(), reviewer="Codex", answer="A" * 3_000,
+        ),
+        ParsedDiscussAnswer(
+            position="answer", rationale="Use an API boundary.", confidence="high",
+            unresolved_items=(), reviewer="Gemini", answer="B" * 3_000,
+        ),
+    ]
+    synthesis = ParsedDiscussFinalSynthesis(
+        classification="consensus",
+        agreed_conclusions=(DiscussSynthesisConsensus(
+            text="Use an API boundary.",
+            references=(
+                DiscussSynthesisResponseReference("Codex", 1),
+                DiscussSynthesisResponseReference("Gemini", 1),
+            ),
+        ),),
+        remaining_disagreements=(),
+        next_action="Proceed with the shared recommendation.",
+    )
+
+    bounded = render_discuss_round_summary_comment(
+        is_final=True,
+        subject="abc123",
+        round_number=1,
+        reviewer_votes=votes,
+        outcome="answer",
+        consensus_kind="unanimous",
+        result_mode="answer",
+        final_synthesis=synthesis,
+    )
+    assert "A" * 1_499 + "…" in bounded
+    assert "A" * 1_500 + "…" not in bounded
+    assert "B" * 1_499 + "…" in bounded
+
+    oversized = ParsedDiscussFinalSynthesis(
+        classification="consensus",
+        agreed_conclusions=tuple(
+            DiscussSynthesisConsensus(text="S" * 10_000, references=())
+            for _ in range(8)
+        ),
+        remaining_disagreements=(),
+        next_action="Proceed.",
+    )
+    overflow = render_discuss_round_summary_comment(
+        is_final=True,
+        subject="abc123",
+        round_number=1,
+        reviewer_votes=votes,
+        outcome="answer",
+        consensus_kind="unanimous",
+        result_mode="answer",
+        final_synthesis=oversized,
+    )
+    assert "The complete debater responses and provenance remain available in the per-agent audit comments." in overflow
+    assert "| Codex |" not in overflow
 
 
 def test_render_discuss_summary_non_final_without_agenda_keeps_mechanical_lines():

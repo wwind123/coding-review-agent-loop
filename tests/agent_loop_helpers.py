@@ -49,7 +49,11 @@ from coding_review_agent_loop.cli import (
     run_pr_loop,
     run_task_loop,
 )
-from coding_review_agent_loop.errors import QuotaResetExceededError, UnknownPriorItemDispositionError
+from coding_review_agent_loop.errors import (
+    AgentInvocationError,
+    QuotaResetExceededError,
+    UnknownPriorItemDispositionError,
+)
 from coding_review_agent_loop.orchestrator import (
     _decode_public_response_json_prefix,
     _format_reset_duration,
@@ -531,6 +535,11 @@ class FakeRunner(Runner):
         return output
 
     def _next_agent_output(self, outputs):
+        if not outputs:
+            raise AgentInvocationError(
+                "scripted agent output exhausted",
+                failure_category="deterministic",
+            )
         output = outputs.pop(0)
         if isinstance(output, dict):
             return output
