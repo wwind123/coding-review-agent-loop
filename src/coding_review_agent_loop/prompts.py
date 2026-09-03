@@ -30,6 +30,7 @@ from .protocol import (
     ParsedDiscussReview,
     UnresolvedReviewItem,
     discuss_round_synthesis_payload,
+    is_failed_discuss_response,
 )
 from .protocol_markers import sanitize_historical_text
 from .workdirs import agent_workdir
@@ -3119,6 +3120,8 @@ def _render_answer_responses_for_synthesis(
 ) -> str:
     lines: list[str] = []
     for vote in responses:
+        if is_failed_discuss_response(vote):
+            continue
         name = sanitize_historical_text(getattr(vote, "reviewer", "unknown"))
         position = sanitize_historical_text(
             str(getattr(vote, "position", getattr(vote, "outcome", "failed")))
@@ -3167,8 +3170,10 @@ Completed round {round_number} responses:
 Prior validated snapshot:
 {prior}
 
-Return exactly this object, with all statements attributable to the listed
-responses. `responding_reviewers` must exactly match the successful responses:
+Return exactly an object with all statements attributable to the listed
+responses. `responding_reviewers` must exactly match the successful responses.
+Here is the smallest valid empty-state shape (the reviewer list is already
+filled with the successful responders for this round):
 {{
   "schema_version": 1,
   "kind": "discuss_round_synthesis",
@@ -3177,7 +3182,7 @@ responses. `responding_reviewers` must exactly match the successful responses:
   "changes": [],
   "missing_facts": [],
   "next_round_focus": [],
-  "responding_reviewers": []
+  "responding_reviewers": {json.dumps([sanitize_historical_text(getattr(vote, "reviewer", "unknown")) for vote in current_responses if not is_failed_discuss_response(vote)])}
 }}
 Use at most eight entries per collection and five next-round-focus entries;
 each reference is {{"reviewer": "<listed name>", "round": <round number>}}.
@@ -3203,6 +3208,49 @@ def build_discuss_final_synthesis_prompt(
 ) -> str:
     """Build the one bounded advisory final synthesis call."""
     context = sanitize_historical_text(bounded_context)[:2_000] or "(none)"
+    reviewer_names = [
+        sanitize_historical_text(getattr(vote, "reviewer", "listed reviewer"))
+        for vote in final_responses
+        if not is_failed_discuss_response(vote)
+    ] or ["listed reviewer"]
+    references = [
+        {"reviewer": name, "round": round_number} for name in reviewer_names
+    ]
+    if mechanical_classification == "consensus":
+        example = {
+            "schema_version": 1,
+            "kind": "discuss_final_synthesis",
+            "classification": mechanical_classification,
+            "agreed_conclusions": [
+                {
+                    "text": "Replace with one conclusion supported by every final response.",
+                    "references": references,
+                }
+            ],
+            "remaining_disagreements": [],
+            "next_action": "Proceed with the agreed recommendation.",
+        }
+    else:
+        example = {
+            "schema_version": 1,
+            "kind": "discuss_final_synthesis",
+            "classification": mechanical_classification,
+            "agreed_conclusions": [],
+            "remaining_disagreements": [
+                {
+                    "topic": "Replace with one material residual decision.",
+                    "positions": [
+                        {
+                            "reviewers": [reviewer_names[0]],
+                            "position": "Replace with that reviewer's supported position.",
+                        }
+                    ],
+                    "decision_needed": "Replace with the precise decision needed.",
+                }
+            ],
+            "next_action": "State the precise next human action.",
+        }
+    example_json = json.dumps(example, ensure_ascii=False, indent=2)
     return f"""Analyze only these completed final-round debater responses for GitHub issue #{issue_number} in {config.repo}, then synthesize their executive conclusion.
 
 You are an advisory analyzer. The mechanically determined classification is
@@ -3217,15 +3265,14 @@ Final round {round_number} responses:
 Bounded context:
 {context}
 
-Return exactly:
-{{
-  "schema_version": 1,
-  "kind": "discuss_final_synthesis",
-  "classification": "{mechanical_classification}",
-  "agreed_conclusions": [],
-  "remaining_disagreements": [],
-  "next_action": "State the precise next human action."
-}}
+Return exactly an object matching this classification-valid shape. Replace the
+example text with concise statements supported by the final responses:
+{example_json}
+For `consensus`, include at least one agreed conclusion and no
+remaining disagreements. For `near_consensus`, include at least one remaining
+disagreement. For `material_deadlock`, include at least one agreed conclusion
+or remaining disagreement. The placeholders above are illustrative and must
+be replaced; do not emit angle-bracket placeholders.
 The classification must remain exactly `{mechanical_classification}`. Use at
 most eight conclusions and disagreements; each conclusion has `text` and
 response `references`, and each disagreement has `topic`, grouped reviewer

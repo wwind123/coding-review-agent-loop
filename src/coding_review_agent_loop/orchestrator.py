@@ -193,6 +193,8 @@ from .protocol import (
     ApprovedFollowups,
     DISCUSS_FAILED_OUTCOME,
     DISCUSS_RESEARCH_TARGET_VALUES,
+    DISCUSS_SYNTHESIS_MAX_ENTRIES,
+    DISCUSS_SYNTHESIS_MAX_TEXT_BYTES,
     ChildStage,
     DeferredStage,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
@@ -9652,14 +9654,18 @@ def _disc_synthesis_text_supported_by_vote(text: str, vote: ParsedDiscussRespons
     source = _normalize_discuss_agenda_phrase(_disc_synthesis_vote_text(vote))
     if not normalized or not source:
         return False
-    if normalized in source:
-        return True
-    words = [word for word in re.findall(r"[a-z0-9]+", normalized) if len(word) > 2]
-    source_words = set(re.findall(r"[a-z0-9]+", source))
-    if not words:
+    # Keep synthesis fidelity at least as strict as agenda fidelity. In
+    # particular, boilerplate such as "that", "must", and "should" is not
+    # evidence for an otherwise unsupported claim.
+    if not _tokenize_discuss_agenda_support(normalized):
         return False
-    required = 1 if len(words) <= 4 else max(2, len(words) // 3)
-    return sum(word in source_words for word in set(words)) >= required
+    corpus = _DiscussAgendaSupportCorpus(
+        phrase_segments=(source,),
+        tokens=frozenset(_tokenize_discuss_agenda_support(source)),
+    )
+    return _discuss_agenda_text_has_support(
+        normalized, corpus=corpus, ignored_names=()
+    )
 
 
 def _validate_discuss_round_synthesis_fidelity(
@@ -9719,6 +9725,14 @@ def _validate_discuss_round_synthesis_fidelity(
     prior_change_topics = {
         item.topic.casefold() for item in (prior_synthesis.changes if prior_synthesis else ())
     }
+    prior_settled_topics = {
+        item.text.casefold() for item in (prior_synthesis.consensus if prior_synthesis else ())
+    }
+    prior_settled_topics.update(
+        change.topic.casefold()
+        for change in (prior_synthesis.changes if prior_synthesis else ())
+        if change.kind in {"resolved", "retracted"}
+    )
 
     consensus_texts: set[str] = set()
     for item in synthesis.consensus:
@@ -9746,6 +9760,14 @@ def _validate_discuss_round_synthesis_fidelity(
         topic_key = item.topic.casefold()
         if topic_key in active_topics:
             raise AgentLoopError("round synthesis disagreements must not repeat topics.")
+        reopened = any(
+            change.kind == "reopened" and change.topic.casefold() == topic_key
+            for change in synthesis.changes
+        )
+        if topic_key in prior_settled_topics and not reopened:
+            raise AgentLoopError(
+                "round synthesis cannot reactivate a settled topic without a reopened change."
+            )
         active_topics.add(topic_key)
         if not any(_disc_synthesis_text_supported_by_vote(item.topic, vote) for vote in successful):
             raise AgentLoopError(f"round synthesis disagreement topic lacks current support: {item.topic}")
@@ -9912,10 +9934,11 @@ def _run_discuss_analyzer(
 ) -> tuple[ParsedDiscussAgenda | None, str | None, ParsedDiscussRoundSynthesis | None, str | None]:
     """Run the optional discuss analyzer after a non-final round.
 
-    Returns (parsed_agenda, raw_response, synthesis, raw_synthesis_response). Any analyzer failure that survives
-    the repair pass falls back to (None, None) so the round closes with the
-    mechanical agenda and the next debate round sees the full prior positions;
-    only a quota-reset stop propagates because the whole run must pause.
+    Returns (parsed_agenda, raw_response, synthesis, raw_synthesis_response).
+    Analyzer/agenda failures fall back to the mechanical agenda; a nested
+    synthesis fidelity failure drops only that advisory extension and keeps
+    the validated agenda. Only a quota-reset stop propagates because the
+    whole run must pause.
     """
     analyzer_name = agent_display_name(analyzer)
     log(
@@ -9996,7 +10019,10 @@ def _run_discuss_analyzer(
                 f"discuss: analyzer {analyzer_name} synthesis rejected ({exc}); "
                 "falling back to the mechanical agenda",
             )
-            return None, None, None, None
+            # The synthesis is advisory. Preserve the independently validated
+            # agenda and its raw audit response when only the nested extension
+            # fails fidelity validation.
+            return parsed, response.text, None, None
         return parsed, response.text, synthesis, None
 
     if config.discuss_result_mode != "answer" or not round_history:
@@ -10394,18 +10420,30 @@ def _adapt_discuss_final_synthesis(
 ) -> ParsedDiscussFinalSynthesis | None:
     """Reuse mechanically verified artifacts without another analyzer call."""
     def cap(text: str) -> str:
-        raw = str(text).strip().encode("utf-8")[:512]
+        raw = str(text).strip().encode("utf-8")[:DISCUSS_SYNTHESIS_MAX_TEXT_BYTES]
         return raw.decode("utf-8", "ignore").strip() or "(not stated)"
 
-    answers = [vote for vote in final_votes if isinstance(vote, ParsedDiscussAnswer)]
-    references = tuple(
-        DiscussSynthesisResponseReference(vote.reviewer, round_number)
-        for vote in final_votes
+    def key(text: str) -> str:
+        return cap(text).casefold()
+
+    successful_votes = tuple(
+        vote for vote in final_votes if not is_failed_discuss_response(vote)
     )
+    answers = [vote for vote in successful_votes if isinstance(vote, ParsedDiscussAnswer)]
+    if len(successful_votes) > DISCUSS_SYNTHESIS_MAX_ENTRIES:
+        # The protocol cannot represent a complete reference set above this
+        # bound. Let the normal fail-closed rendering handle that case.
+        references = ()
+    else:
+        references = tuple(
+            DiscussSynthesisResponseReference(vote.reviewer, round_number)
+            for vote in successful_votes
+        )
     if (
         outcome == "answer"
         and consensus_kind in {"unanimous", "converged"}
-        and len(answers) == len(final_votes)
+        and len(answers) == len(successful_votes)
+        and references
         and answers
         and all(vote.answer for vote in answers)
     ):
@@ -10421,7 +10459,11 @@ def _adapt_discuss_final_synthesis(
         )
     if semantic_comparison is not None:
         classification = semantic_comparison.get("classification")
-        if classification == "equivalent" and semantic_comparison.get("shared_recommendation"):
+        if (
+            classification == "equivalent"
+            and semantic_comparison.get("shared_recommendation")
+            and references
+        ):
             return ParsedDiscussFinalSynthesis(
                 classification="consensus",
                 agreed_conclusions=(
@@ -10434,6 +10476,8 @@ def _adapt_discuss_final_synthesis(
                 next_action="Proceed with the shared recommendation.",
             )
         if consensus_kind == "debater-confirmed" and semantic_comparison.get("confirmed_answer"):
+            if not references:
+                return None
             return ParsedDiscussFinalSynthesis(
                 classification="consensus",
                 agreed_conclusions=(
@@ -10448,34 +10492,82 @@ def _adapt_discuss_final_synthesis(
     if outcome == "needs-human" and consensus_kind in {"unanimous", "converged"}:
         human_items = [
             (vote, item)
-            for vote in final_votes
+            for vote in successful_votes
             for item in getattr(vote, "unresolved_items", ())
             if item.status == "human-decision"
         ]
         if human_items:
             groups: dict[str, list[tuple[ParsedDiscussResponse, DiscussUnresolvedItem]]] = {}
             for vote, item in human_items:
-                groups.setdefault(item.text.casefold(), []).append((vote, item))
+                bucket = groups.setdefault(key(item.text), [])
+                if any(existing_vote.reviewer.casefold() == vote.reviewer.casefold() for existing_vote, _ in bucket):
+                    # Multiple equivalent items from one reviewer must not
+                    # create a duplicate reviewer position in one topic.
+                    continue
+                bucket.append((vote, item))
+            groups = dict(list(groups.items())[:DISCUSS_SYNTHESIS_MAX_ENTRIES])
             disagreements = tuple(
                 DiscussSynthesisDisagreement(
                     topic=cap(items[0][1].text),
                     positions=tuple(
                         DiscussSynthesisPosition(
-                            reviewers=(vote.reviewer,), position=cap(vote.rationale)
+                            reviewers=(vote.reviewer,), position=cap(item.text)
                         )
-                        for vote, _item in items
+                        for vote, item in items[:DISCUSS_SYNTHESIS_MAX_ENTRIES]
                     ),
                     decision_needed=cap(items[0][1].text),
                 )
                 for items in groups.values()
             )
+            shared_rationales = [cap(vote.rationale) for vote in successful_votes]
+            agreed_conclusions = ()
+            if (
+                references
+                and shared_rationales
+                and len({_normalize_discuss_answer(item) for item in shared_rationales}) == 1
+            ):
+                agreed_conclusions = (
+                    DiscussSynthesisConsensus(
+                        text=shared_rationales[0], references=references
+                    ),
+                )
             return ParsedDiscussFinalSynthesis(
                 classification="near_consensus",
-                agreed_conclusions=(),
+                agreed_conclusions=agreed_conclusions,
                 remaining_disagreements=disagreements,
-                next_action=cap("A human must decide: " + "; ".join(item[1].text for item in human_items[:8])),
+                next_action=cap(
+                    "A human must decide: "
+                    + "; ".join(item.topic for item in disagreements)
+                ),
             )
     return None
+
+
+def _safe_discuss_synthesis_serialization(
+    synthesis: ParsedDiscussRoundSynthesis | ParsedDiscussFinalSynthesis | None,
+    *,
+    final: bool,
+    config: AgentLoopConfig,
+    location: str,
+) -> tuple[ParsedDiscussRoundSynthesis | ParsedDiscussFinalSynthesis | None, str | None]:
+    """Drop advisory synthesis that cannot be durably encoded.
+
+    Rendering must remain fail-closed even when a mechanically assembled
+    candidate or a legacy structured response is individually valid but cannot
+    fit the canonical sidecar budget.
+    """
+    if synthesis is None:
+        return None, None
+    try:
+        serialized = (
+            serialize_discuss_final_synthesis(synthesis)  # type: ignore[arg-type]
+            if final
+            else serialize_discuss_round_synthesis(synthesis)  # type: ignore[arg-type]
+        )
+    except Exception as exc:
+        log(config, f"discuss: dropping {location} synthesis that could not be serialized ({exc})")
+        return None, None
+    return synthesis, serialized
 
 
 def _post_discuss_debater_comment(
@@ -10705,6 +10797,12 @@ def _run_discuss_loop(
         )
         if final_synthesis is not None:
             final_synthesis_source = "final-analyzer"
+        final_synthesis, final_synthesis_serialized = _safe_discuss_synthesis_serialization(
+            final_synthesis,
+            final=True,
+            config=config,
+            location="resumed final",
+        )
         evidence_groups, evidence_reconciler_raw = _run_discuss_evidence_reconciler(
             runner, issue_number=issue_number, config=config, analyzer=analyzer, subject=f"issue-{issue_number}",
             round_history=round_history, usage_context=usage_context,
@@ -10745,10 +10843,7 @@ def _run_discuss_loop(
                     consensus_kind="deadlock",
                     agenda=(),
                     final_analyzer_response=final_analyzer_response_raw,
-                    final_synthesis=(
-                        serialize_discuss_final_synthesis(final_synthesis)
-                        if final_synthesis is not None else None
-                    ),
+                    final_synthesis=final_synthesis_serialized,
                     synthesis_provenance=(
                         {
                             "source": final_synthesis_source or "final-analyzer",
@@ -11070,7 +11165,11 @@ def _run_discuss_loop(
                     if semantic_comparison is not None
                     else "mechanical-result"
                 )
-            if final_synthesis is None:
+            # Near-consensus candidates are only a bounded mechanical
+            # fallback. Give the configured analyzer the opportunity to
+            # recover agreed recommendations and accurately summarize the
+            # residual human decisions.
+            if final_synthesis is None or final_mechanical_classification == "near_consensus":
                 final_analyzer_agenda, final_analyzer_response_raw, final_synthesis = _run_discuss_final_analyzer(
                     runner,
                     issue_number=issue_number,
@@ -11108,6 +11207,23 @@ def _run_discuss_loop(
             )
             evidence_reconciliation = reconcile_evidence(f"issue-{issue_number}", round_history, evidence_groups)
             evidence_reconciliation["raw_evidence_reconciler_response"] = evidence_reconciler_raw
+        next_round_synthesis, round_synthesis_serialized = _safe_discuss_synthesis_serialization(
+            next_round_synthesis,
+            final=False,
+            config=config,
+            location="round",
+        )
+        raw_synthesis_response = (
+            raw_synthesis_response if next_round_synthesis is not None else None
+        )
+        final_synthesis, final_synthesis_serialized = _safe_discuss_synthesis_serialization(
+            final_synthesis,
+            final=True,
+            config=config,
+            location="final",
+        )
+        if final_synthesis is None:
+            final_synthesis_source = None
         summary_body = render_discuss_round_summary_comment(
             round_number=round_number,
             # The vote table and agenda draw from real positions only; failed
@@ -11149,14 +11265,8 @@ def _run_discuss_loop(
                     agenda=agenda,
                     analyzer_response=analyzer_response_raw,
                     final_analyzer_response=final_analyzer_response_raw,
-                    round_synthesis=(
-                        serialize_discuss_round_synthesis(next_round_synthesis)
-                        if next_round_synthesis is not None else None
-                    ),
-                    final_synthesis=(
-                        serialize_discuss_final_synthesis(final_synthesis)
-                        if final_synthesis is not None else None
-                    ),
+                    round_synthesis=round_synthesis_serialized,
+                    final_synthesis=final_synthesis_serialized,
                     raw_synthesis_response=raw_synthesis_response,
                     synthesis_provenance=(
                         {

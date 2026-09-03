@@ -20,7 +20,6 @@ from .protocol import (
     SIGNATURE_RE,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
-    ParsedDiscussFinalSynthesis,
     ParsedDiscussRoundSynthesis,
     ParsedDiscussResponse,
     ParsedDiscussReview,
@@ -29,7 +28,6 @@ from .protocol import (
     failed_discuss_review_placeholder,
     failed_discuss_answer_placeholder,
     parse_structured_discuss_agenda,
-    parse_canonical_discuss_final_synthesis,
     parse_canonical_discuss_round_synthesis,
     parse_structured_discuss_review,
     parse_structured_discuss_answer,
@@ -780,15 +778,6 @@ def _decode_round_synthesis(raw: str | None) -> ParsedDiscussRoundSynthesis | No
         return None
     try:
         return parse_canonical_discuss_round_synthesis(raw)
-    except (AgentLoopError, TypeError, ValueError):
-        return None
-
-
-def _decode_final_synthesis(raw: str | None) -> ParsedDiscussFinalSynthesis | None:
-    if not raw or len(raw.encode("utf-8")) > 16_000:
-        return None
-    try:
-        return parse_canonical_discuss_final_synthesis(raw)
     except (AgentLoopError, TypeError, ValueError):
         return None
 
