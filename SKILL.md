@@ -28,8 +28,8 @@ reduces reliance on
 `claude -p` for Claude turns if it is ever billed/restricted differently (announced once,
 then reversed) — whether interactive-session usage is treated differently depends on
 Anthropic's current terms and product behavior (see the "Billing and terms note" below),
-so this is about reducing the dependency, not a guaranteed billing outcome. See the
-"Skill vs CLI — which to use" section in [`README.md`](README.md) for the full comparison.
+so this is about reducing the dependency, not a guaranteed billing outcome. See
+[`Claude Code Skill Mode`](README.md#claude-code-skill-mode) in `README.md` for a summary.
 
 ## Prerequisites
 

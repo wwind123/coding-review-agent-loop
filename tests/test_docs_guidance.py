@@ -13,6 +13,7 @@ MANAGED_CI_HEADING_TEXT = "Managed exact-head CI"
 LOCAL_TEST_SCOPE_HEADING_TEXT = "Focused, bounded local test selection"
 SKILL_LOCAL_TEST_SCOPE_HEADING_TEXT = "Gates & guardrails"
 SKILL_MODE_LOCAL_TEST_SCOPE_HEADING_TEXT = "Focused, bounded local test runs"
+README_SKILL_MODE_HEADING_TEXT = "Claude Code Skill Mode"
 SKILL = REPO_ROOT / "SKILL.md"
 SKILL_MODE_DOC = REPO_ROOT / "docs" / "skill_mode.md"
 
@@ -88,6 +89,15 @@ def test_readme_describes_tests_directory_as_test_modules():
 
     assert "Browse the focused test modules in [`tests/`](tests/)" in section
     assert "module map in [`tests/`](tests/)" not in section
+
+
+def test_skill_links_to_current_readme_skill_mode_heading():
+    readme_text = README.read_text(encoding="utf-8")
+    assert f"## {README_SKILL_MODE_HEADING_TEXT}" in readme_text
+    expected_anchor = _github_anchor(README_SKILL_MODE_HEADING_TEXT)
+
+    skill_text = SKILL.read_text(encoding="utf-8")
+    assert f"README.md#{expected_anchor}" in skill_text
 
 
 def test_cli_help_points_to_decision_section():
