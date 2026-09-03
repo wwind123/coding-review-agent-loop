@@ -13,6 +13,7 @@ MANAGED_CI_HEADING_TEXT = "Managed exact-head CI"
 LOCAL_TEST_SCOPE_HEADING_TEXT = "Focused, bounded local test selection"
 SKILL_LOCAL_TEST_SCOPE_HEADING_TEXT = "Gates & guardrails"
 SKILL_MODE_LOCAL_TEST_SCOPE_HEADING_TEXT = "Focused, bounded local test runs"
+README_SKILL_MODE_HEADING_TEXT = "Claude Code Skill Mode"
 SKILL = REPO_ROOT / "SKILL.md"
 SKILL_MODE_DOC = REPO_ROOT / "docs" / "skill_mode.md"
 
@@ -56,6 +57,47 @@ def test_readme_links_to_decision_section_with_derived_anchor():
     assert "`--plan-execution-mode decompose-only`" in readme_text
     assert "`--materialize-split-issues`" in readme_text
     assert "duplicate children" in normalized_readme_text
+
+
+def test_readme_documents_same_repo_concurrency_limit():
+    readme_text = README.read_text(encoding="utf-8")
+    section_start = readme_text.index("## Current Limitations")
+    section_end = readme_text.index("## Planning and Decomposition", section_start)
+    section = " ".join(readme_text[section_start:section_end].split())
+
+    assert "one active `agent-loop` invocation per repository per machine" in section
+    assert "does not currently enforce a repository-wide process lock" in section
+    assert "`--review-parallel` is supported within one orchestrator run" in section
+    assert "system temporary directory (`/tmp` on Linux)" in section
+
+
+def test_readme_documents_ci_watcher_controls():
+    readme_text = README.read_text(encoding="utf-8")
+    section_start = readme_text.index("## CI and Merge")
+    section_end = readme_text.index("## Claude Code Skill Mode", section_start)
+    section = " ".join(readme_text[section_start:section_end].split())
+
+    assert "`--ci-timeout-seconds` (default 1200)" in section
+    assert "`--ci-poll-interval-seconds` (default 30)" in section
+
+
+def test_readme_describes_tests_directory_as_test_modules():
+    readme_text = README.read_text(encoding="utf-8")
+    section_start = readme_text.index("## Development")
+    section_end = readme_text.index("## Related Tools", section_start)
+    section = " ".join(readme_text[section_start:section_end].split())
+
+    assert "Browse the focused test modules in [`tests/`](tests/)" in section
+    assert "module map in [`tests/`](tests/)" not in section
+
+
+def test_skill_links_to_current_readme_skill_mode_heading():
+    readme_text = README.read_text(encoding="utf-8")
+    assert f"## {README_SKILL_MODE_HEADING_TEXT}" in readme_text
+    expected_anchor = _github_anchor(README_SKILL_MODE_HEADING_TEXT)
+
+    skill_text = SKILL.read_text(encoding="utf-8")
+    assert f"README.md#{expected_anchor}" in skill_text
 
 
 def test_cli_help_points_to_decision_section():

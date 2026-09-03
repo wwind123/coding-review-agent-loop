@@ -1,1257 +1,408 @@
 # coding-review-agent-loop
 
-Discuss mode defaults to the backward-compatible implementation-triage result
-contract. For open-ended design or system questions, pass
-`--discuss-result-mode answer`; it produces a consensus recommendation,
-explicit `needs-human` escalation, or a deadlock summary without forcing an
-implementation vote. Answer-mode transcripts are mode-bound for repair and
-resume, while analyzer observations and sourced research remain clearly
-separate from debater-confirmed conclusions.
+`coding-review-agent-loop` is a local command-line orchestrator for GitHub code
+review. One coding agent creates or updates a pull request, one or more other
+agents review it, and the loop sends blocking feedback back to the coder until
+the reviewers approve or the run reaches a clear stopping condition.
 
-Answer-mode uses classified `unresolved_items`, not generic questions. Each item
-is exactly `{"status": "blocker" | "human-decision" | "follow-up", "text":
-"..."}`. `position` describes the debater's asserted response shape; it does
-not override the final outcome. An asserted answer can still carry a blocker
-or human decision. On the final complete round, `human-decision` takes
-precedence over `blocker`, which takes precedence over answer convergence;
-follow-ups alone are non-blocking. Each completed round replaces the prior
-round's active classifications, so concerns may be cleared or reclassified.
-Existing persisted answer-mode transcripts using `open_questions` remain
-resumable: old `needs-human` questions map to `human-decision` and old answer
-questions map conservatively to `blocker`.
-
-When answer-mode final answers differ, semantic convergence is opt-in through
-`--discuss-analyzer`. The explicitly configured analyzer (never an implicit
-reviewer fallback) receives only the final answers and performs no research or
-repository work. Its comparison is advisory: equivalent answers can converge;
-material conflict fails closed to deadlock; and compatible answers get at most
-one extra, budget-exempt confirmation phase. Every debater must then confirm
-the canonical recommendation or refine it, and the effective answers must be
-identical after whitespace/case normalization. The summary preserves the
-analyzer classification separately for audit. When that confirmation succeeds,
-the recorded semantic comparison is reused and no duplicate final-observations
-analyzer pass runs; the debaters' confirmation remains authoritative.
-
-Local command-line orchestration for a coding PR review loop.
-
-Run a local Claude/Codex/Gemini PR review loop using your existing CLI subscriptions.
-
-The main advantage is account reuse: the tool shells out to your
-already-authenticated local CLIs (`claude`, `codex`, `gemini`, and `gh`) instead
-of calling model APIs directly. If your local agent CLIs are backed by existing
-AI subscriptions or authenticated developer accounts, the review loop can use
-those existing entitlements rather than requiring separate model API keys.
-
-**Claude billing note:** Anthropic had announced that non-interactive `claude`
-usage — including `claude -p` as used by this tool — would move from your
-subscription's rate limits to a separate monthly Agent SDK credit. As of
-June 15, 2026 that change has been **postponed**: `claude -p` / Agent SDK usage
-continues to draw from your existing Claude subscription as before, with no
-separate credit, and Anthropic has said it will give advance notice before any
-future change. See
-[Anthropic's support article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
-for the latest. Gemini CLI and Codex CLI have their own separate billing models.
-
-## Who This Is For
-
-This is for developers who already use Claude Code, OpenAI Codex CLI, Gemini
-CLI, and GitHub, and want one local agent to implement or fix a PR while
-another local agent reviews it before merge.
-
-It is especially useful when you are already doing this manually by switching
-between agent CLIs and copying review feedback back and forth.
-
-## Why Not GitHub Actions?
-
-GitHub Actions-based agent loops usually need model API keys, hosted workflow
-permissions, and separate API billing. This tool keeps the loop on your local
-machine and uses the CLI accounts you have already authenticated.
-
-That makes it easier to experiment with agent-to-agent review loops before
-committing to hosted automation. It also keeps local workspace setup,
-credentials, and agent approval prompts under your direct control.
-
-Note that Claude subscriptions have their own usage limits, and Anthropic's
-terms for non-interactive (`claude -p` / Agent SDK) usage may change in the
-future (see the billing note above) — so very high-volume automated use may
-incur costs or hit limits depending on your plan.
-
-## Compared To Similar Tools
-
-Several related projects exist. `coding-review-agent-loop` is deliberately
-positioned as a standalone local CLI for GitHub PR lifecycle orchestration:
-one agent creates or fixes a PR, one or more reviewers review it, and the loop
-continues until approval.
-
-| Tool | Focus | How this project differs |
-|------|-------|--------------------------|
-| [claude-review-loop](https://github.com/hamelsmu/claude-review-loop) | Claude Code plugin that has Claude implement, then Codex review. | This project is not a Claude plugin; it is a standalone CLI that can start from an issue, task, or existing PR and can reverse the coder/reviewer direction. |
-| [codex-review](https://github.com/boyand/codex-review) | Claude Code plugin for Codex review of plans and implementations. | This project focuses on GitHub PR creation, review, fix, and approval loops rather than plan/artifact review inside Claude Code. |
-| [reviewd](https://pypi.org/project/reviewd/) | Local PR review assistant for GitHub/BitBucket using Claude, Gemini, or Codex CLI. | This project focuses on agent-to-agent implementation loops where the coder can create/fix the PR and reviewers gate approval. |
-| [codex-plugin-cc](https://github.com/openai/codex-plugin-cc) | Use Codex from inside Claude Code for review or delegated tasks. | This project stays outside either agent host and orchestrates local CLIs plus GitHub directly. |
-
-## Agent Backends
-
-Currently supported local agent CLIs:
-
-- Claude Code via `claude`
-- OpenAI Codex CLI via `codex`
-- Gemini CLI via `gemini` (best-effort support for users whose organization or
-  API-key setup still has Gemini CLI access)
-- Antigravity CLI via `agy` (first-class backend; also the Gemini CLI migration path — see below)
-
-The `agy` backend is supported in every role the other external agents support — `--coder antigravity` and `--reviewer antigravity` — and in skill mode (`--coder antigravity` / `--reviewers antigravity`). `agy` is also accepted as an alias for `antigravity` in these flags (e.g. `--coder agy`, `--reviewer agy`, skill `--reviewers agy`, `run_external --agent agy`); it is normalized to the canonical `antigravity` internally.
-
-### Gemini CLI → Antigravity migration
-
-Google is retiring **Gemini CLI consumer access** (free / Google AI Pro / Ultra)
-on **June 18, 2026**; personal-account `gemini` usage stops working after that.
-Enterprise and API-key Gemini CLI paths may remain available for organizations
-that still have access, so this project keeps the `gemini` backend for those
-users. Individual users should use the Antigravity CLI (`agy`) instead — it runs
-the same Google account plans with its own quota model:
-
-```bash
-# install agy, authenticate, then select it as a coder or reviewer:
-agent-loop pr 123 --repo OWNER/REPO --reviewer antigravity
-agent-loop task "Fix the flaky test" --repo OWNER/REPO --coder antigravity --reviewer codex
+```text
+GitHub issue, task, or PR
+          |
+          v
+      coding agent  <-------+
+          |                 |
+          v                 |
+     pull request           |
+          |                 |
+          v                 |
+      reviewers ---- feedback
+          |
+          v
+       approved  ->  optional CI wait and merge
 ```
 
-Pick the model with `--antigravity-model "<name>"` (as listed by `agy models`),
-or supply an ordered fallback chain with `--antigravity-models "<name>" ["<name>" ...]`
-(tried in order after provider-framed capacity exhaustion; default `Gemini 3.7 Flash (High)` →
-`Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)`). When a `gemini` invocation fails with an
-auth/quota error near or after the cutoff, the tool surfaces this migration
-guidance. Notes: Antigravity turns are single-shot (no cross-round session
-resume) and report estimated token usage (`agy` emits no token counts).
+The loop runs on your machine and uses the local `claude`, `codex`, `agy`,
+`gemini`, and `gh` programs you have already authenticated. It does not require
+you to put model API keys into this project. You only need the agent CLIs used
+for the roles you select; you do not need to install every supported backend.
 
-Provider capacity diagnostics for high-traffic, rate-limit, resource-exhausted, overload, and
-no-capacity errors retry the active model before advancing through this chain.
-`--agent-max-retries` is shared across the chain, so a run makes at most
-`models + retries` calls. Custom `--antigravity-quota-signatures` replace the
-defaults and control fallback eligibility. Invalid settings, unsupported models,
-timeouts, and schema-invalid responses remain deterministic and do not fall back.
+The project is alpha software. It can let coding agents edit repositories, run
+commands, push branches, and write to GitHub. Start with a repository where you
+can inspect and revert the results.
 
-### Executable replacement recovery
+## Why Use It?
 
-Gemini and Antigravity use a conservative startup gate for launcher replacement:
-the command must have a direct before/after identity change, an integer exit,
-healthy PTY capture, and no response-file artifact, public-response marker,
-structured payload, or ordinary narration/tool progress. Gemini accepts only an
-empty transcript or recognized startup/Node-loader/updater diagnostics; Antigravity
-also accepts its version/model startup chrome. A valid response-file artifact has
-priority over replacement handling, including after a nonzero exit or timeout.
+- Replace the manual cycle of copying reviewer feedback between agent sessions.
+- Assign coding and review to different models or providers.
+- Start from a GitHub issue, an existing pull request, or a free-form task.
+- Review an implementation plan before allowing code changes.
+- Require multiple independent reviewers to approve the same PR head.
+- Resume interrupted work from durable metadata recorded on GitHub.
+- Optionally run local tests, wait for CI, and merge after approval.
 
-For Gemini, the checkout HEAD and exact porcelain status are captured immediately
-before spawn and the after probe is taken only for a surviving candidate. For
-Antigravity, reviewer and coder probes run while the settings lock and the
-exclusive `GEMINI.md` lock are held: before injection, then after invocation and
-prefix cleanup. This prevents peer prompt injection or cleanup from creating a
-false worktree delta. Isolated formatting-repair runs bypass both probes and all
-replacement metadata. These read-only snapshots are evidence gates only; they do
-not prevent an agent from making external changes, so replacement replay is
-conservative rather than a general side-effect safety guarantee.
+The default workflow is deliberately conservative: Claude is the coder, Codex
+is the reviewer, the review limit is 10 rounds, and automatic merge is off.
 
-Each eligible Gemini or Antigravity invocation gets one bounded executable
-stability wait and at most one fresh full-timeout replay, logged with the
-`executable-replacement-attempt2` suffix. Gemini's budget is
-`agent_max_retries + 2`; Antigravity's is
-`len(models) + agent_max_retries + 1`. The dedicated replay does not consume an
-ordinary retry; Antigravity also keeps the same model and leaves its retry,
-model-index, and attempt counters unchanged until a later ordinary failure.
-Failed stability checks retain the normal Gemini retry or Antigravity model
-fallback chain.
+## Requirements
 
-Each `agy --print` invocation is run with `--print-timeout` set from
-`--antigravity-print-timeout-seconds` (default 600, i.e. ten minutes), which
-overrides `agy`'s own five-minute print-mode default so long coder/reviewer
-turns are not cut short. Raise or lower it with, for example,
-`--antigravity-print-timeout-seconds 1800`.
+- Python 3.11 or newer.
+- Git and [GitHub CLI](https://cli.github.com/) with `gh auth status` succeeding.
+- Repository access sufficient for the requested issue, branch, PR, and comment
+  operations.
+- A local CLI for the coder and each reviewer you select:
+  [Claude Code](https://docs.anthropic.com/en/docs/claude-code),
+  [OpenAI Codex CLI](https://github.com/openai/codex),
+  Antigravity CLI (`agy`), or the legacy Gemini CLI backend.
 
-Direct Gemini CLI support is best-effort because maintainers without enterprise
-Gemini CLI access cannot reproduce live `gemini` failures locally. If you report
-a Gemini CLI-specific bug, include the exact command, the raw
-`.agent-loop-logs/*gemini.log` file, the response-file contents, the Gemini CLI
-version, and any sharable account/access context. Bugs that can be reduced to a
-log/response fixture can still be regression-tested without live Gemini CLI
-access.
+Each agent CLI has its own authentication, quota, terms, and model
+availability. Confirm those with the provider; this tool does not combine or
+replace provider subscriptions.
 
-**Billing / quota note:**
-- `agy` usage counts against a **separate Antigravity-specific quota**, not the same token pool as the Gemini app/chat in your subscription. The two meters are tracked independently and can diverge.
-- Your Google AI subscription tier (Pro/Ultra) **raises** the Antigravity limits rather than sharing one pool; the free / Google One tier is small.
-- When the included quota is exhausted, continued use draws on **Google AI credits** (pay-as-you-go), so monitor actual spend for the first runs.
-- Exact limits are not officially well-documented and have changed since launch — treat numbers as fluid.
+## Install
 
-## Install / Use
-
-Clone the repo first:
+Clone the repository and install it into a virtual environment:
 
 ```bash
 gh repo clone wwind123/coding-review-agent-loop
 cd coding-review-agent-loop
-```
-
-Then install the CLI into a local virtual environment:
-
-```bash
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
 agent-loop --help
 ```
 
-This installs the `agent-loop` command from your checkout. The tool still
-requires local `gh`, `claude`, `codex`, and/or `gemini` authentication depending
-on which agents you use.
-
-## Claude Code skill mode
-
-Besides the headless `agent-loop` CLI, the repo ships a **Claude Code skill** that
-runs the same review loop directly inside an interactive Claude Code session
-(host Claude turns use your session instead of `claude -p`). It supports the
-reversed roles end to end: an external agent (Codex/Gemini/Antigravity) can
-plan, implement (one-shot, decompose, or by-phase), address blocking PR review
-with `run-pr-fix`, and hand the PR back for re-review; the host (Claude) can
-review. See [`SKILL.md`](SKILL.md) for the step-by-step instructions and
-[`docs/skill_mode.md`](docs/skill_mode.md) for the design overview.
-
-### Skill vs CLI — which to use
-
-Both drive the same review loop. External agents — Codex, Gemini, and
-Antigravity — still run as subprocesses either way; the main difference is
-whether Claude's turns run as isolated `claude -p` calls or in the active
-Claude Code session.
-
-| Concern | CLI (`agent-loop`) | Claude Code skill |
-|---|---|---|
-| Claude runtime | Each Claude turn starts a separate `claude -p` subprocess. The `claude` binary must be installed and available for every turn; an update or replacement can affect the next turn. | The skill also requires the `claude` binary to start Claude Code. Host turns then run in that already-active session, so replacing the binary on disk does not change the running session or require a new `claude -p` process. |
-| Model selection | Uses the Claude CLI default unless `--claude-model` is supplied. | Uses the active session model. |
-| Claude token use | Usually lower for equivalent work because round control, validation, retries, and state transitions are mechanical Python orchestration; Claude tokens are spent on the explicit Claude agent turns. | Can use more Claude quota because the host session must interpret state and execute the orchestration workflow as well as perform Claude's coder or reviewer work. The actual difference depends on task size, session context, caching, and model behavior. |
-| Configuration | Flags and parameters must be supplied correctly up front. `--help` documents the available choices. | Configuration is conversational: Claude can explain options, remind you of parameters, and translate intent into helper commands even when you do not remember exact flag names. |
-| Unattended operation | Best suited to scripts, cron, and fire-and-forget runs. With `--test-command` and `--auto-merge`, it can run test gates, wait for CI, and merge. Without those flags, it does not add those behaviors. | Intended for an attended session. It lets you watch and steer rounds, and it keeps merge as a human decision. It never auto-merges or waits for CI. |
-| Quota exhaustion | The process stops, but durable GitHub metadata supports resume. You can arrange a shell scheduler or other external job to rerun the command after the reported reset time and leave it unattended. | If the host Claude session exhausts its quota, that session cannot schedule or perform its own later continuation. You must return after reset and resume or start a new session. |
-| Unexpected failures | Failures outside the implemented retry/repair paths normally abort the command and require a later diagnostic or code change. | The host Claude can inspect logs and state, explain the failure, and sometimes perform a safe manual recovery or adapt the next step. This is useful but not guaranteed. |
-| Remote monitoring | Progress is only visible by tailing logs; checking in requires SSH to the machine and terminal commands. There is no conversational interface — you cannot ask what is happening or redirect the loop mid-run without writing code or scripts. | The host session is a live Claude Code session accessible from any device via the Claude web or mobile app. You can read status in plain language, ask what the loop is doing, answer clarification questions, or steer a round — all through a chat UI without needing SSH or a terminal. |
-| Permission prompts | With the appropriate trusted-environment flags, the loop can run without interactive approvals. | Claude Code's own security policy remains in force. The host may still request tool permission during a long run even when the skill instructions ask it not to prompt for particular commands. |
-
-Rule of thumb: **use the CLI for predictable, unattended execution and
-scheduled resume; use the skill for conversational setup, active oversight,
-and hands-on recovery from unusual failures.**
-
-Keeping the skill also **reduces reliance on programmatic `claude -p`** for Claude turns —
-useful if `claude -p` is ever billed or restricted differently (such a change was announced
-once, then reversed). Whether interactive-session usage is actually treated differently
-from `claude -p` depends on Anthropic's current terms and product behavior; see the billing
-note in [`SKILL.md`](SKILL.md). This is about reducing the `claude -p` dependency, not a
-guaranteed billing outcome.
-
-## Develop This Tool
-
-### Durable protocol marker boundary
-
-Durable GitHub records are defined in the centralized
-`src/coding_review_agent_loop/protocol_markers.py` registry. Current
-agent-authored prose is untrusted and marker-free; only canonical producers
-can compose a `TrustedBody` segment for the GitHub surface that permits it.
-Historical ledger prose is a separate input class: reserved spans are replaced
-with stable descriptive labels before summaries are truncated or interpolated.
-Codec-contained salvage and round-state payloads remain opaque at their encoded
-occurrence and are checked when they are later projected into visible prose.
-Ordinary issue/PR writers and managed-PR/CI REST paths fail closed before any
-temp-file creation or remote mutation when provenance, grammar, surface, or
-canonical encoding checks fail.
-
-Use this if you are changing `coding-review-agent-loop` itself:
+Check the CLIs for your chosen roles before the first run:
 
 ```bash
-gh repo clone wwind123/coding-review-agent-loop
-cd coding-review-agent-loop
-python3 -m venv .venv
-. .venv/bin/activate
+gh auth status
+claude --version
+codex --version
+```
+
+Substitute `agy --version` or `gemini --version` when using those backends.
+
+## Quick Start
+
+### Review an existing PR
+
+This is the smallest useful first run. The reviewers inspect the current PR;
+if they find blockers, the coder updates that same PR and review continues.
+
+```bash
+agent-loop pr 456 \
+  --repo OWNER/REPO \
+  --coder claude \
+  --reviewer codex
+```
+
+### Implement a GitHub issue
+
+Issue mode gives the issue title, body, and comments to the coder, validates the
+resulting PR, and then enters the same review loop.
+
+```bash
+agent-loop issue 123 \
+  --repo OWNER/REPO \
+  --coder claude \
+  --reviewer codex
+```
+
+Without `--plan-first`, issue mode asks the coder to implement immediately.
+
+### Review a plan, then implement it
+
+Use plan-first mode for work whose design should be challenged before files are
+changed. `--plan-first` alone stops after plan approval. Add
+`--implement-after-approval` to continue into implementation and PR review.
+
+```bash
+agent-loop issue 123 \
+  --repo OWNER/REPO \
+  --coder codex \
+  --reviewer claude \
+  --plan-first \
+  --implement-after-approval
+```
+
+### Implement a task without an issue
+
+```bash
+agent-loop task "Add a health-check endpoint" \
+  --repo OWNER/REPO \
+  --coder codex \
+  --reviewer claude
+```
+
+## Choose a Workflow
+
+| Command | Use it when |
+| --- | --- |
+| `agent-loop issue` | A GitHub issue defines the work to implement or plan. |
+| `agent-loop pr` | The implementation PR already exists. |
+| `agent-loop task` | You have a direct task and do not need an issue first. |
+| `agent-loop discuss` | You want agents to evaluate an open question without writing code. |
+| `agent-loop managed-pr` | Code is pushed but no PR exists, and the repository uses managed exact-head CI. |
+| `agent-loop managed-ci preflight` | You want a read-only readiness report for managed CI. |
+
+Run `agent-loop <command> --help` for the complete options for one workflow.
+The [full CLI guide](docs/local_agent_loop.md#usage) covers lifecycle and resume
+behavior in detail.
+
+## How the Review Loop Behaves
+
+1. The coder implements the issue or updates the existing PR.
+2. Every configured reviewer reviews the same PR head.
+3. Blocking findings return to the coder as an explicit work ledger.
+4. The updated head is reviewed again.
+5. The run stops on unanimous approval, a terminal blocker, a clarification
+   request, unavailable required input, or the round limit.
+
+Repeat `--reviewer` to require multiple approvals. Use `--review-parallel` when
+the reviewers have distinct workdirs and may run concurrently:
+
+```bash
+agent-loop pr 456 \
+  --repo OWNER/REPO \
+  --coder codex \
+  --reviewer claude \
+  --reviewer agy \
+  --review-parallel
+```
+
+Agent-loop creates separate repo-scoped temporary checkouts for active agents
+unless you provide workdirs. GitHub comments carry durable round and handoff
+metadata, so a later run can reconstruct the active review state. When the PR
+number is known, resume with `agent-loop pr <number>` instead of starting issue
+implementation again.
+
+Signed comments ending in `-- Human Reviewer` are treated as explicit human
+requirements and remain approval-critical. See
+[Human requirements](docs/local_agent_loop.md#human-requirements) for the exact
+contract.
+
+## Current Limitations
+
+- Run only one active `agent-loop` invocation per repository per machine. The
+  default workdirs and repo-scoped local state are shared, and the tool does not
+  currently enforce a repository-wide process lock. Separate concurrent runs
+  against the same repository can interfere with each other's checkouts and
+  artifacts. `--review-parallel` is supported within one orchestrator run; it
+  does not make multiple same-repository invocations safe.
+- Agent-loop is a local process, not a hosted service. The machine must remain
+  available for the run, and an interrupted in-flight agent turn may need to be
+  repeated. Once a PR exists, resume with `agent-loop pr <number>`.
+- GitHub is the only supported forge, and every selected agent backend must be
+  installed and authenticated locally.
+- Agent CLIs can exhaust quota, time out, update themselves, or return malformed
+  structured output. Retries, repair passes, and salvage reduce lost work but
+  cannot guarantee unattended completion.
+- Default agent checkouts live under the system temporary directory (`/tmp` on
+  Linux) and may disappear after a reboot or system cleanup. Configure explicit
+  workdirs for long-lived installations.
+
+## Planning and Decomposition
+
+Plan-first mode supports four post-approval choices:
+
+| Mode | Result after plan approval |
+| --- | --- |
+| `plan-only` | Post the approved plan and stop. This is the default. |
+| `implement-one-shot` | Implement the approved plan in one PR. |
+| `decompose-only` | Create detailed child issues for the approved phases and stop. |
+| `implement-by-phase` | Create the phase issues and implement only the first phase. |
+
+Example:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO \
+  --plan-first \
+  --plan-execution-mode decompose-only
+```
+
+`--plan-execution-mode decompose-only` and `--materialize-split-issues` are
+different mechanisms. Do not combine them for the same decomposition: doing so
+can create duplicate children. Use the former for detailed approved phases and
+the latter for discuss-mode split proposals or eligible plan-only deferred
+work. Read
+[Phased decomposition versus split materialization](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization)
+before filing child issues.
+
+## Discuss Mode
+
+Discuss mode asks agents to evaluate an issue without modifying the repository.
+Use it for architecture choices, product decisions, feasibility questions, or
+whether work should be implemented or split.
+
+```bash
+agent-loop discuss 123 \
+  --repo OWNER/REPO \
+  --reviewer claude \
+  --reviewer codex
+```
+
+The default result contract is implementation triage: `implement`,
+`do-not-implement`, `needs-human`, or `split`. For an open-ended recommendation
+instead of an implementation vote, use `--discuss-result-mode answer`.
+
+Useful optional controls include:
+
+- `--discuss-analyzer AGENT` for a structured consensus/disagreement agenda.
+- `--discuss-research auto|required|none` for current external facts.
+- `--discuss-parallel` for concurrent independent positions.
+- `--materialize-split-issues` to file agreed split proposals.
+
+See [Discuss mode](docs/local_agent_loop.md#open-ended-answer-results) for result
+semantics, research evidence, deadlocks, and resume behavior.
+
+## Agent Backends
+
+| Backend | CLI | Notes |
+| --- | --- | --- |
+| Claude | `claude` | Default coder. Select a model with `--claude-model`. |
+| Codex | `codex` | Default reviewer. Select a model with `--codex-model`. |
+| Antigravity | `agy` | Accepted as `agy` or `antigravity`; supports coder and reviewer roles. |
+| Gemini | `gemini` | Legacy, best-effort path for accounts that still have CLI access. |
+
+The default Antigravity model chain is `Gemini 3.7 Flash (High)`, then
+`Gemini 3.6 Flash (High)`, then `Gemini 3.1 Pro (High)` for eligible capacity
+failures. Override it with `--antigravity-model` or
+`--antigravity-models`. Antigravity turns are single-shot and its usage totals
+are estimated because `agy` does not expose token counts.
+
+Backend-specific authentication, model selection, fallback, timeout, and
+executable-replacement behavior are documented under
+[Agent backends](docs/local_agent_loop.md#agent-backends).
+
+## Safety and Permissions
+
+Agents can run commands and change code. Keep their normal permission prompts
+unless you understand and accept the repository and machine-level risk.
+
+For a trusted local environment, this flag supplies each backend's permission
+bypass option:
+
+```bash
+agent-loop pr 456 --repo OWNER/REPO \
+  --coder codex --reviewer claude \
+  --dangerous-agent-permissions
+```
+
+The flag is intentionally explicit. It does not make agent output, fetched
+issue text, dependencies, shell commands, or generated code trustworthy.
+
+Other important boundaries:
+
+- Automatic merge is off unless `--auto-merge` is present.
+- Reviewer approval is not a substitute for project tests or human judgment.
+- `--test-command` adds a local gate before review and again before auto-merge.
+- The tool validates assigned workdirs and reported test locations, but agent
+  CLIs may still consume substantial CPU, memory, network, and provider quota.
+- Raw subprocess logs and salvage artifacts can contain sensitive repository
+  context. Protect access to the configured log directories and review their
+  retention settings.
+
+Read [Workdirs](docs/local_agent_loop.md#workdirs),
+[Agent permission flags](docs/local_agent_loop.md#agent-permission-flags), and
+[Logs](docs/local_agent_loop.md#logs) before unattended use.
+
+## CI and Merge
+
+Use `--auto-merge` only when the repository's CI and branch protections are
+appropriate for unattended merging:
+
+```bash
+agent-loop pr 456 --repo OWNER/REPO --auto-merge
+```
+
+For ordinary CI, auto-merge waits for a reliable, non-empty check board on the
+current head. Without auto-merge, `--watch-pending-ci` can wait and report that
+an approved PR is merge-ready without merging. Set the total watcher budget
+with `--ci-timeout-seconds` (default 1200) and its polling interval with
+`--ci-poll-interval-seconds` (default 30). GitHub runner stalls are bounded by
+`--ci-queued-grace-seconds`; see
+[External CI infrastructure stalls](docs/local_agent_loop.md#external-ci-infrastructure-stalls).
+
+### Managed exact-head CI
+
+Managed CI is an advanced, repository-integrated workflow that suppresses
+expensive intermediate CI and qualifies one reviewed SHA at the end. Do not
+enable it from a README example alone. First read
+[Managed exact-head CI](docs/local_agent_loop.md#managed-exact-head-ci) and run
+the read-only preflight:
+
+```bash
+agent-loop managed-ci preflight \
+  --repo OWNER/REPO \
+  --base main \
+  --trusted-actor LOGIN
+```
+
+For code already pushed without an open PR, the pre-creation form begins with
+`agent-loop managed-pr --head BRANCH`. Managed issue and PR recovery relies on
+a canonical issue handoff, explicit `--managed-ci` intent, documented
+draft/labeled and ready/unlabeled lifecycle states, immutable actor evidence,
+and preserved base provenance. Historical records are audit evidence only and
+never grant fresh authority.
+
+Qualification and merge remain bound to the live head. The final merge uses
+`--match-head-commit` and merges only that qualified SHA. `--watch-pending-ci`
+and `--no-watch-pending-ci` do not alter managed exact-head qualification.
+
+## Claude Code Skill Mode
+
+The repository also contains a Claude Code skill for running the orchestration
+inside an attended Claude Code session. In skill mode, Claude acts in the
+current interactive session while external agents still run through their
+local CLIs.
+
+Use the standalone CLI for predictable or unattended runs. Use skill mode when
+you want conversational setup, active steering, and interactive recovery.
+Skill mode never auto-merges.
+
+See [`SKILL.md`](SKILL.md) for invocation instructions and
+[`docs/skill_mode.md`](docs/skill_mode.md) for its design and limitations.
+
+## Documentation
+
+- [`agent-loop --help`](docs/local_agent_loop.md#usage): full command and option reference.
+- [`docs/local_agent_loop.md`](docs/local_agent_loop.md): architecture, lifecycle, protocol, recovery, CI, memory, and safety reference.
+- [`docs/skill_mode.md`](docs/skill_mode.md): Claude Code skill architecture and operation.
+- [`SKILL.md`](SKILL.md): executable instructions for Claude Code skill mode.
+
+The detailed guide is intentionally the source for protocol schemas, durable
+markers, repair passes, fallback ladders, CI provenance, and compatibility
+behavior. Those internals are not required for a first successful run.
+
+## Development
+
+Install the development dependency and run the tests:
+
+```bash
 python -m pip install -e '.[dev]'
 python -m pytest
 ```
 
-## Quick Start
-
-Start from a GitHub issue when you want the agent loop to use the issue title,
-body, and comments as the implementation task. Comments are included oldest to
-newest, and prompts tell agents that later comments may refine or supersede the
-original issue body:
+Use focused tests while changing one subsystem, for example:
 
 ```bash
-agent-loop issue 123 --repo OWNER/REPO
-```
-
-Issue implementation turns use a strict `issue_implementation` result. The
-result contains the implementation summary, a positive `pr_number` or `null`,
-an auditable `human_requirement_dispositions` ledger, and optional structured
-`tests_run` commands. A null PR is rendered as a readable terminal issue
-comment and does not enter PR review or handoff. If a signed requirement is
-found blocked after a PR was opened, the result keeps the actual PR reference
-in its summary or evidence but uses `pr_number: null`; the issue comment
-records the rejected handoff for operator follow-up. A created PR may not be
-reported alongside a blocked signed requirement.
-
-For larger or ambiguous issues, add `--plan-first` to run a plan review on the
-issue before code is written. The coder may inspect the checkout but must not
-edit files, push, or open a PR during planning. Reviewers approve or block with
-`AGENT_PLAN_STATE` markers using explicit plan-review sections:
-
-```md
-### Blocking plan issues
-### Same-plan follow-ups
-### Future follow-ups
-```
-
-When earlier plan issues remain open, reviewers encode prior item dispositions
-in the JSON `prior_plan_item_dispositions` array using `"resolved"`,
-`"blocking"`, `"same-plan"`, or `"future"` (with a `"note"`). The orchestrator
-renders those as a `### Prior unresolved plan item dispositions` section in the
-public GitHub comment; reviewers do not add that section themselves. `"future"`
-dispositions are accepted only in approved plan reviews and are reconciled with
-the final approved plan instead of reopening planning. If
-`--approved-followups=issue` or `fix-and-issue` is enabled and implementation
-will continue after approval, those plan-stage future follow-ups are filed as
-separate issues before implementation starts. If implementation continues but
-issue filing is disabled, they are summarized in the planning-complete comment
-with an explicit note that they are not carried into PR review. Planning
-`item-*` IDs visible in issue history are not PR prior review items unless they
-are repeated in the active PR unresolved-item ledger. By default the loop posts
-the approved plan summary and stops without filing follow-up issues; add
-`--implement-after-approval` to continue into the normal PR flow:
-
-```bash
-agent-loop issue 123 --repo OWNER/REPO --plan-first --implement-after-approval
-```
-
-`--plan-first` also supports explicit post-approval modes:
-
-```bash
-agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode plan-only
-agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode decompose-only
-agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode implement-one-shot
-agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode implement-by-phase
-```
-
-`plan-only` is the default. `implement-one-shot` is the same behavior selected
-by the backward-compatible `--implement-after-approval` flag. `decompose-only`
-uses typed `child_stages` directly when the approved plan has them; otherwise it
-asks the coder to turn the approved plan into ordered phases. It creates one
-GitHub child issue per selected phase, posts a parent summary table, and stops.
-Typed stages are the plan's remainder; the primary scope remains owned by the
-parent and is recorded in the summary.
-`implement-by-phase` creates every child issue, then implements only the first
-`agent-pr` phase and stops after that PR review loop. The parent issue records a
-one-time handoff only after the child implementation returns an accepted PR, so
-null-PR and rejected-conflict terminal results never create a misleading
-handoff. Parent reruns after that marker do not re-run the child implementation;
-resume directly with `agent-loop issue <child>`. If decomposition already exists
-without a handoff marker, the first child is treated as not yet attempted and
-the handoff is recorded once. If the first phase is `human-action` or
-`manual-close`, the loop creates and reports all child issues but stops so a
-human can do the required work, add a remark/update, and close that child issue.
-
-Plan-first implementation can use a different implementation agent than the
-planning agent. Planning and plan revisions still use `--coder`; the override
-applies only after the plan is approved and implementation begins:
-
-```bash
-agent-loop issue 123 --repo OWNER/REPO --plan-first --implement-after-approval \
-  --coder claude \
-  --implementation-coder codex \
-  --implementation-coder-model gpt-5.5 \
-  --implementation-codex-reasoning-effort high
-```
-
-`--implementation-coder` accepts the same agent names as `--coder`.
-`--implementation-coder-model` sets the selected implementation coder's model
-for the approved-plan implementation only. If `--implementation-coder-model` is
-provided without `--implementation-coder`, the implementation still uses
-`--coder` but with that implementation-only model.
-`--implementation-codex-reasoning-effort` is valid only when the implementation
-coder is Codex, either explicitly with `--implementation-coder codex` or because
-`--coder codex` is the planning and implementation coder. It also requires a
-declared Codex model via `--implementation-coder-model` or `--codex-model` so
-the implementation signature can name the model reliably.
-
-### Choosing a child-issue mechanism
-
-`decompose-only` / `implement-by-phase` and `--materialize-split-issues` select
-different workflows. The decomposition modes reject that combination before
-any GitHub write and use one topology source. All flat child workflows share
-one configurable parent-wide cap (`--flat-child-limit`, default 15).
-
-| Situation | Correct mechanism |
-| --- | --- |
-| Approved detailed staged plan with phase contracts | `--plan-execution-mode decompose-only` |
-| Same plan, implement only the first phase now | `--plan-execution-mode implement-by-phase` |
-| Approved plan implemented as a single PR | `--plan-execution-mode implement-one-shot` |
-| Plan review only, no child issues | `--plan-execution-mode plan-only` (default) |
-| Discuss `split` consensus or plan-only deferred work, no phase decomposition | `--materialize-split-issues` |
-
-```bash
-agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode decompose-only
-agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode implement-by-phase
-agent-loop discuss 123 --repo OWNER/REPO --materialize-split-issues
-agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-execution-mode plan-only --materialize-split-issues
-```
-
-See [Phased decomposition versus split
-materialization](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization)
-for the full decision rule, stop points, worked examples, and the
-duplicate-issue failure mode. The explicit topology choice prevents duplicate children.
-
-Each generated child issue copies the relevant parent-plan slice, constraints
-and invariants, dependency notes, scope and non-goals, rollout risk,
-validation/soak requirements, automation classification, and instructions for
-agent execution or human closure. The complete flat topology is preflighted
-before a checkpoint or issue create. It is capped at 15 children by default
-(override with `--flat-child-limit`); an over-limit plan is never truncated or
-partially filed and returns a structured human decision to consolidate or use
-the hierarchical design tracked in #720. Recovery reuses checkpoints and
-exact child identities, including closed children.
-
-If the approved plan narrows scope via explicit `child_stages`, decomposition
-modes file those bounded implementation stages as linked child issues;
-`--materialize-split-issues` is reserved for discuss `split` proposals and
-plan-only/one-shot split workflows. `external_dependencies`, `deferred_work`, `plan_actions`,
-and legacy structured `deferred_stages` are recorded only; legacy discuss
-`split` proposals remain eligible for filing. Materialization is off by default,
-and the orchestrator warns explicitly when eligible stages would otherwise go
-unfiled. When a parent's stages are already
-fully materialized, `--implement-after-approval` hands implementation off to
-the specific child the plan covers (via a unique title match or an explicit
-`--split-stage <child>` flag) instead of treating the whole parent as solved,
-and the resulting PR is required to use `Refs #<parent>` rather than a closing
-keyword against it. See [`docs/local_agent_loop.md`](docs/local_agent_loop.md#split-issue-materialization)
-for details, and [Choosing a child-issue
-mechanism](#choosing-a-child-issue-mechanism) above if you are deciding
-between this and `decompose-only` / `implement-by-phase`.
-
-Provide a one-off task directly when there is no issue yet:
-
-```bash
-agent-loop task "Add a health check endpoint" --repo OWNER/REPO
-```
-
-Run the loop against an existing pull request when you want another review and
-iteration pass:
-
-```bash
-agent-loop pr 456 --repo OWNER/REPO
-```
-
-Issue-mode recovery resumes validated `AGENT_ISSUE_PR_HANDOFF` metadata across
-direct and plan-first runs. Without that marker, it adopts at most one open PR
-whose body contains a same-repository GitHub closing phrase (`Fixes`, `Closes`,
-or `Resolves`) for the issue; bare references, `Refs`, contextual URLs, and
-discussion prose are not implementation evidence. Multiple candidates stop
-with cleanup guidance. Use `agent-loop pr <number>` when the PR is known, and
-see [Issue-to-PR association and recovery](docs/local_agent_loop.md#issue-to-pr-association-and-recovery)
-for plan-hash checks and operator recovery. Metadata-free closing-reference
-recovery now requires an exact unauthenticated commit-trailer scope, so
-pre-trailer PRs and `agent-loop managed-pr --head` PRs without that trailer
-must be resumed directly with `agent-loop pr <number>` rather than adopted.
-
-### Expected closing issues
-
-When one implementation PR is intended to complete more than its primary issue,
-declare the complete closing set explicitly with the repeatable
-`--expected-closing-issue POSITIVE_ID` option:
-
-```bash
-agent-loop issue 847 --repo OWNER/REPO --expected-closing-issue 848
-agent-loop pr 900 --repo OWNER/REPO \
-  --expected-closing-issue 847 --expected-closing-issue 848
-agent-loop managed-pr --repo OWNER/REPO --head fix/multi-issue --base main \
-  --title "Complete related issues" --body-file /tmp/pr-body.md \
-  --expected-closing-issue 847 --expected-closing-issue 848
-```
-
-In issue mode the primary issue is always included, and approved-plan
-`additional_closing_issue_ids` declarations are unioned with the CLI additions.
-For direct `pr` and `managed-pr`, the CLI declaration is the complete contract.
-Without authoritative metadata, direct `pr` mode does not infer a contract from
-issue mentions, `Refs`, or related links. A staged child must close the child,
-reference an unfinished parent with `Refs`, and must not include the parent in
-the expected set. Split/decomposed parent workflows reject parent-scoped
-multi-issue declarations; invoke the child with a child-scoped contract.
-
-The expected set is stored in canonical issue handoff and PR metadata and is
-reused after interruption. A PR is checked after creation and before reviewer,
-qualification, or merge handoff. Each expected issue needs its own GitHub
-closing keyword/reference pair (`Closes`, `Fixes`, or `Resolves`, including
-same-repository qualified references and canonical issue URLs); `Closes #847,
-#848` is not treated as two closures. If the body is incomplete, edit the
-existing PR description and resume with `agent-loop pr <number>`—the loop will
-not create another PR. To deliberately widen a recovered contract, repeat the
-full desired set and add `--supersede-expected-closing-contract` on `issue` or
-`pr`; narrowing, replacement, or a missing declaration requires canonical
-metadata repair before resume.
-
-Protocol comments are canonical machine metadata. A bare mention of
-`AGENT_ISSUE_PR_HANDOFF` or `AGENT_PR_EXPECTED_CLOSING_ISSUES` in normal prose
-is allowed, but a well-formed forged marker is rejected before any comment,
-handoff, sidecar, or PR-body write.
-
-Evaluate a GitHub issue without writing any code using discuss mode. Reviewers
-first evaluate independently, then debate if their outcomes disagree:
-
-```bash
-agent-loop discuss 123 --repo OWNER/REPO
-```
-
-Each reviewer returns a `discuss_review` with one of four outcome votes:
-`implement`, `do-not-implement`, `needs-human`, or `split` (with sub-issue
-proposals). Discuss mode posts a readable transcript to the issue instead of a
-single aggregate comment: each round, every reviewer posts its own vote and
-rationale as a separate issue comment, and once all reviewers for the round
-have posted, the orchestrator posts a round-summary comment. If all reviewers
-agree in round 1, that round's summary is the final result and is marked
-`unanimous`. If they disagree, the summary lists the disagreement and the
-agenda for the next round, and each debate round sends reviewers the complete
-previous round positions plus that agenda and requires a non-empty `rebuttal`
-that engages the disagreement. Agreement after debate is marked `converged`. A
-transcript looks like:
-
-```text
-Round 1: Codex position
-Round 1: Antigravity position
-Round 1: Orchestrator summary (agenda for round 2)
-Round 2: Codex rebuttal
-Round 2: Antigravity rebuttal
-Round 2: Orchestrator final consensus/deadlock
-```
-
-By default, discuss mode runs up to two debate rounds after the initial round.
-Use `--discuss-max-rounds` to change that limit:
-
-```bash
-agent-loop discuss 123 --repo OWNER/REPO \
-  --reviewer codex --reviewer antigravity \
-  --discuss-max-rounds 2
-```
-
-Optionally, pass `--discuss-analyzer <agent>` to add an analyzer agent that
-summarizes each non-final round into a structured debate agenda (consensus
-points, each open disagreement with the debaters' positions and a question for
-the next round, and missing facts). With an analyzer, each debate round's
-prompt contains only that agenda plus the debater's own prior position —
-other debaters' full rationales and rebuttals are omitted — and debaters may
-flag `analyzer_framing: "misframed"` with a `framing_note` when the agenda
-misrepresents them. The analyzer is not authoritative: consensus is still
-detected purely from the votes, the agenda is rendered in the round summary
-for auditing, and the final summary keeps "analyzer-extracted consensus"
-distinct from the debater vote table. If the analyzer fails even after the
-repair pass, the round falls back to the plain mechanical agenda and the run
-continues. Omitting the flag keeps plain direct deliberation unchanged:
-
-```bash
-agent-loop discuss 123 --repo OWNER/REPO \
-  --reviewer codex --reviewer antigravity \
-  --discuss-analyzer claude
-```
-
-Discuss mode also takes a research policy via `--discuss-research
-none|required|auto` (default: `none`) for questions that depend on current
-external facts:
-
-- `none`: debaters use only repo/issue context; prompts explicitly forbid
-  online research, so plain discuss mode and analyzer mode stay usable without
-  network-dependent behavior. Best for internal design questions.
-- `required`: every debater must do online research before answering, cite a
-  source for each external fact, and keep sourced facts separate from its own
-  judgment. Responses must carry a `research` object whose `status` is
-  `sourced`, `unavailable`, or `inconclusive` (never `not-needed`), with
-  `sourced_facts` entries of `{fact, source}` pairs when `sourced`. Use this to
-  force research instead of relying on automatic detection.
-- `auto`: debaters (and the analyzer, if configured) decide whether research is
-  needed using conservative triggers — current vendor/product behavior,
-  pricing, quotas, model availability, laws/policies, dependency behavior, or
-  market/tool comparisons — and set `status` to `not-needed` when no trigger
-  applies.
-
-With `--discuss-analyzer` and a non-`none` research policy, the analyzer also
-emits `research_required` and `research_questions` in its agenda; the
-orchestrator forwards those questions to the next round's debaters as a shared
-research brief so parallel turns do not duplicate work. Debater comments show
-each reviewer's research status and cited sourced facts, and the final summary
-includes a Research section that keeps debater-cited facts distinct from agent
-judgment and states explicitly when research was deemed unnecessary, was not
-reported, or came back unavailable or inconclusive — instead of presenting
-stale assumptions as fact:
-
-```bash
-agent-loop discuss 123 --repo OWNER/REPO \
-  --reviewer codex --reviewer antigravity \
-  --discuss-analyzer claude \
-  --discuss-research auto
-```
-
-For design or implementation issues, round-one research defaults to the
-decision-relevant tradeoff: solution design and prior art, cost/latency,
-implementation feasibility, and guardrails. Validate a motivating example only
-when its truth is disputed or outcome-critical. Active research records a target
-and concrete questions; targets are `example-validation`, `solution-design`,
-`cost-latency`, `implementation-feasibility`, and `policy/legal/current-facts`.
-
-Pass `--discuss-parallel` to run same-round debaters concurrently instead of
-sequentially. Prompts are built from shared pre-round state before any debater
-launches and comments are posted only after every debater in the round
-finishes, so same-round debaters never see each other's in-progress output;
-the analyzer, consensus detection, and the round summary still run only after
-that synchronization point. Parallel mode requires a distinct workdir per
-debater — even with `--allow-shared-dir`, which is not honored between
-concurrently scheduled debaters because concurrent git/tool activity in one
-worktree can corrupt it (the analyzer or coder may still share a debater's
-directory). Sequential execution remains the default; keep it if you are
-concerned about concurrent quota/API pressure. On Ctrl-C, the orchestrator
-kills all in-flight debater process groups before exiting.
-
-Two companion flags control per-turn failure handling in both sequential and
-parallel discuss runs:
-
-- `--discuss-debater-timeout SECONDS` (default: none) puts a wall-clock limit
-  on each debater turn. A timed-out turn is killed (whole process group),
-  never retried as transient, and treated per the failure policy with failure
-  category `timeout`.
-- `--discuss-on-debater-failure fail|partial` (default: `fail`) sets the
-  policy when a debater turn fails or times out. `fail` aborts the run after
-  in-flight debaters settle (successful votes are still posted so a rerun
-  resumes them). `partial` continues the round when at least two debaters
-  produced votes: the failed debater is recorded in the round summary under
-  "Debater failures" (and in the summary's resume metadata), appears as a
-  `failed` entry in the round history, and gets a fresh turn in the next
-  round on resume. A partial round never declares final consensus — even if
-  all surviving debaters agree — so a partial final round ends in a
-  `needs-human` deadlock.
-
-```bash
-agent-loop discuss 123 --repo OWNER/REPO \
-  --reviewer codex --reviewer antigravity --reviewer claude \
-  --discuss-analyzer claude \
-  --discuss-parallel \
-  --discuss-debater-timeout 1800 \
-  --discuss-on-debater-failure partial
-```
-
-If reviewers still disagree after the configured debate rounds, the final
-round-summary comment is marked `deadlock`, uses the `needs-human` outcome, and
-summarizes each final position and the core disagreement. `split` proposals
-are merged in first-seen order only when all reviewers in the same round agree
-on `split`. Only the final round-summary comment is marked as the result; the
-per-reviewer and interim round-summary comments remain separately identifiable
-in the issue timeline. Discuss runs are idempotent and resumable: the final
-summary comment includes an `<!-- AGENT_DISCUSS_CONSENSUS: <subject-hash> -->`
-marker derived from the issue title, body, and non-round comment bodies, and
-each posted comment carries round metadata the orchestrator uses to
-reconstruct completed rounds (including a partially-completed round) on the
-next run. Re-running after a final summary posts no second transcript; posting
-a new human comment on the issue invalidates the cached result and triggers a
-fresh evaluation from round 1. If a resumed run's next round would exceed a
-`--discuss-max-rounds` value that was lowered since the prior run, the
-orchestrator immediately posts a final `deadlock` summary from the last
-completed round instead of silently exiting without a result.
-
-Pass `--review-parallel` to `issue`, `pr`, or `task` to run same-round plan or
-PR reviewers concurrently instead of sequentially (`discuss` mode is rejected;
-it has its own `--discuss-parallel`, unaffected by this flag). Every
-reviewer's prompt is built from the same pre-round plan/PR state before any
-reviewer launches, and same-round reviewers never see each other's feedback.
-Each validated healthy reviewer comment is published in completion order,
-without waiting for slower peers. The orchestrator then waits for the full
-round settlement barrier before mutating the shared ledger, numbering items,
-starting coder work, or another round; it posts a neutral reconciliation
-checkpoint with the deterministic configured-reviewer aggregation. A rerun
-recognizes these publication checkpoints regardless of whether
-`--review-parallel` is supplied. Any fatal failure is raised only afterward (a quota
-failure takes priority; otherwise the first configured-order failure), so a
-rerun resumes the reviewers that already succeeded instead of re-invoking
-them. Existing per-reviewer retry, repair, unavailable-reviewer, and
-incomplete-review policies are unchanged, and one failed reviewer never
-cancels a healthy concurrent review. Parallel mode requires a distinct
-workdir per reviewer — even with `--allow-shared-dir` — following the same
-guardrail as `--discuss-parallel`. The coder is never parallelized with
-reviewers, and review rounds never overlap. Sequential execution remains the
-default; keep it if you are concerned about concurrent quota/API pressure.
-
-```bash
-agent-loop pr 456 --repo OWNER/REPO \
-  --reviewer codex --reviewer antigravity \
-  --review-parallel
-```
-
-When `--base` is omitted, `pr` mode uses the pull request's base branch.
-`issue` and `task` modes use the repository default branch. If PR metadata does
-not include a base branch, `pr` mode also falls back to the repository default.
-An explicit `--base BRANCH` always takes precedence.
-
-If `--repo` is omitted, the tool runs `gh repo view` from the current working
-directory, or from `--codex-dir` when that flag is provided, and uses the
-detected `OWNER/REPO`. Pass `--repo` explicitly when running outside the target
-repository.
-
-When `--claude-dir`, `--codex-dir`, or `--gemini-dir` is omitted for an active
-agent, the tool creates or reuses a repo-scoped temporary checkout such as
-`/tmp/coding-review-agent-loop/OWNER-REPO/codex/repo`. Existing clean temp
-checkouts are fetched and fast-forwarded on the resolved base branch before the agent
-runs. Default temp checkouts are tool-owned and disposable; if one is dirty,
-the tool resets and cleans it before reuse. Explicit persistent directories are
-kept conservative: dirty explicit workdirs fail clearly, and existing git
-checkouts must point at the requested repository. Use explicit persistent
-directories for large repositories, long-lived agent worktrees, or setups that
-should survive `/tmp` cleanup or reboot.
-
-Claude's bounded self-update replay guard is read-only. It captures `git rev-parse
-HEAD` and `git status --porcelain` immediately before each Claude invocation; an
-empty porcelain result is the valid clean-worktree state, and non-empty output is
-compared exactly. A replay is accepted only when both available snapshots are
-identical. If either snapshot is unavailable, the guard fails closed for replay
-and records a diagnostic; that diagnostic does not change the provider-derived
-failure category or reviewer availability semantics. The separate PR handoff
-HEAD-advance guard remains strict about runner exceptions, while ordinary Git
-failure or blank HEAD output is treated as an unavailable observation.
-
-Codex is unchanged here because its JSONL stream supplies setup-versus-progress
-evidence and retains its separate fresh-timeout replacement replay. Local HEAD
-and porcelain status cannot observe byte-identical external effects such as a
-push, pull-request creation, or comment, so the snapshot guard reduces replay
-risk without eliminating it.
-
-Agent memory is enabled by default. Before invoking agents, the loop creates or
-refreshes advisory repo memory in a durable, repo-scoped user cache directory
-such as `~/.cache/coding-review-agent-loop/repos/OWNER-REPO/memory` on Linux:
-repo summary, architecture map, module index, execution/test profile, toolchain
-facts, and changed files since the previous memory commit. On macOS the default
-root is `~/Library/Caches/coding-review-agent-loop`; on Windows it is
-`%LOCALAPPDATA%/coding-review-agent-loop/Cache`. Agent prompts state that this
-cache is stale-prone orientation only, and that agents must inspect source files
-and PR diffs directly for correctness claims. The cache is local-only. Disable
-it with `--no-agent-memory`, force a refresh with `--refresh-agent-memory`,
-customize the location with `--agent-memory-dir PATH`, or refresh only test
-command facts with `--refresh-test-profile`. Relative `--agent-memory-dir`
-values are resolved inside the coder checkout. If you keep sensitive repo
-details out of local cache retention, use `--no-agent-memory` or a custom
-short-lived location. If the previous memory commit is unavailable or no longer
-diffable, the loop logs the git failure and treats all tracked files as changed
-for that refresh.
-
-Use `--test-command` to add a local test gate:
-
-```bash
-agent-loop task "Fix the flaky test" --repo OWNER/REPO --test-command "python -m pytest"
-```
-
-By default, the command runs after coder-created or coder-updated changes before
-reviewer rounds, and again after final reviewer approval before auto-merge. Add
-`--no-pre-review-tests` if you only want the final post-approval local test
-gate. The coder prompt also asks the coding agent to report the exact tests it
-ran, or explain why it could not run tests.
-
-A queued GitHub check that never starts a job (a hosted-runner capacity outage)
-or one cancelled before execution because a runner was unavailable is treated
-as external CI infrastructure blocking, not a code defect or actionable coder
-feedback: `--ci-queued-grace-seconds` (default 1200) bounds how long a queued
-check is treated as normal before the loop stops with a resumable message
-instead of a coder round waiting on it. See
-[External CI infrastructure stalls](docs/local_agent_loop.md#external-ci-infrastructure-stalls)
-for details.
-
-A confirmed GitHub merge conflict (`mergeStateStatus: DIRTY` or `mergeable:
-CONFLICTING`) is checked before every reviewer round and again before CI
-checks/auto-merge, and routes the PR to the coder to resolve instead of
-waiting on CI or attempting a merge; `--mergeability-poll-attempts` (default
-3) and `--mergeability-poll-interval-seconds` (default 5) bound how long a
-still-computing (`UNKNOWN`) GitHub mergeability result is re-checked before
-being treated as unresolved. See
-[Merge conflicts](docs/local_agent_loop.md#merge-conflicts) for details.
-
-With `--auto-merge`, or with explicit `--managed-ci`, repositories that advertise the managed exact-head CI
-contract use a dedicated flow. The v2 rollout atomically opens a trusted draft
-with `agent-loop-managed`, dispatches qualification from the base workflow,
-and accepts only nonce/run/attempt-correlated statuses; v1 keeps its post-open
-label handoff. V2 is enabled only when `--managed-ci-trusted-actor <login>`
-matches both the authenticated GitHub CLI user and the repository Actions
-variable `AGENT_LOOP_MANAGED_ACTOR`; without that explicit trust configuration,
-the normal CI path remains in effect. Agent-loop may
-publish local round readiness after a configured pre-review test succeeds,
-dispatches final CI for the reviewers' exact approved SHA. With `--auto-merge`,
-it merges only that qualified SHA with `--match-head-commit`; with explicit
-`--managed-ci`, it publishes the qualified SHA and leaves merging to the human.
-`--watch-pending-ci` and
-`--no-watch-pending-ci` do not alter this managed flow. See
-[Managed exact-head CI](docs/local_agent_loop.md#managed-exact-head-ci) for the
-repository contract and failure behavior.
-
-To qualify a protected exact head while retaining a human merge decision, use:
-
-```bash
-agent-loop issue <number> --managed-ci --managed-ci-trusted-actor <login>
-```
-
-The successful terminal result names the qualified SHA and prints a guarded
-`gh pr merge --match-head-commit <sha>` command; the merge API is not called.
-For an existing issue-created PR left ready and unlabeled after a successful
-manual run, rerun `agent-loop pr <number> --managed-ci
---managed-ci-trusted-actor <login>`. Re-entry first makes that PR a draft, so
-the previous manual-merge command is suspended until a fresh review and
-qualification succeeds. A changed head always needs a new cycle.
-
-For a canonical issue handoff, rerun the original `agent-loop issue <number>`
-command first; it preserves the planning/implementation shape while
-reauthenticating the issue-to-PR handoff. Direct `pr` mode is the fallback for
-a known PR. Ready/unlabeled reconstruction requires an explicit `--managed-ci`
-request. An implicit `--auto-merge` retry leaves an authenticated PR ready and
-unlabeled, performs no label/body/comment/dispatch/readiness write, and prints
-the exact retry with `--managed-ci`. The recovery path accepts draft/labeled
-and ready/unlabeled lifecycle states; after an explicit managed-CI failure it
-can also re-admit draft/unlabeled only with an explicit `--managed-ci` request.
-Other mixed states stop before agents run. Historical audit records remain
-provenance, never reusable authority or something to delete.
-
-Base provenance is retained across the issue-to-PR boundary. If an inherited
-repository-default base differs from the live PR base, the run stops before
-workdir setup and prints a retry with the live `--base` explicitly included;
-an operator-supplied `--base` remains authoritative. Recovery commands replay
-parser-valid original arguments, preserving repeated common options and safe
-shell quoting while removing only selectors invalid for the target subcommand.
-
-Already-open PRs remain ordinary CI by default. A repository can separately
-advertise safe adoption and an operator can explicitly request it only with
-`agent-loop pr <n> --auto-merge --managed-ci-trusted-actor <login>
---managed-ci-adopt-existing-pr`. The managed-CI guide documents the required
-branch-protection guard, timeline provenance, and durable opt-out.
-
-Code that is already pushed to a same-repository branch, but does not yet have
-a PR, can enter managed CI without a placeholder issue:
-
-```bash
-agent-loop managed-pr \
-  --repo OWNER/REPO \
-  --head fix/prepared-change \
-  --base main \
-  --title "Fix prepared change" \
-  --body-file /path/to/pr-body.md \
-  --managed-ci \
-  --managed-ci-trusted-actor LOGIN \
-  --reviewer codex
-```
-
-`managed-pr` verifies readiness before writing, pins the source head to a
-unique reserved branch, opens and labels a managed draft, and immediately
-enters the normal review loop. It refuses a source head that already has an
-open PR; use `agent-loop pr <n>` for that PR instead. Repositories without
-enforceable exact-head protection must repeat the explicit
-`--allow-unprotected-managed-ci` waiver on this command. Use `--managed-ci`
-to leave the qualified PR ready for a manual head-guarded merge, or replace it
-with `--auto-merge` to retain automatic merging.
-
-Before enabling managed CI, run the read-only readiness report:
-
-```bash
-agent-loop managed-ci preflight --repo OWNER/REPO --base main --trusted-actor LOGIN
-```
-
-It exits `0` only for GitHub-enforced exact-head protection, `10` for a
-deterministic configuration/fallback/explicit-override result, and `11` when
-GitHub evidence is unavailable or ambiguous. It makes no writes. Protected mode
-is the default. A personal, consciously supervised private repository that is
-otherwise ready but cannot use GitHub protection may use the deliberately
-per-invocation `--allow-unprotected-managed-ci` flag on authenticated plan-first
-issue work or pre-creation `managed-pr` work; it never applies to existing-PR
-adoption or dangerous permissions.
-This is an intentional tightening for suppression-capable v2 workflows: a
-repository that previously used issue-created v2 without non-bypassable GitHub
-protection now returns to ordinary CI unless that explicit per-run waiver is
-present.
-
-To resume an interrupted issue-created managed draft on an unprotected
-repository while retaining the historical automatic merge, rerun the explicit
-waiver in PR mode:
-
-```bash
-agent-loop pr <number> --auto-merge \
-  --managed-ci-trusted-actor <login> --allow-unprotected-managed-ci
-```
-
-For a manual-merge resume, use the same command with `--managed-ci` instead of
-`--auto-merge`; it publishes a fresh SHA-bound qualification and does not
-merge. This is supported resume, not retroactive adoption. The live PR must still be
-an open same-repository draft authored by the authenticated actor (matching
-its immutable ID), use the reserved `agent-loop/managed-*` ref and live
-base/head, and have an active `agent-loop-managed` label event made by that
-actor. A prior actor-owned override audit is provenance only: its editable
-body nonce is never reused or trusted. Missing, malformed, ambiguous, or
-mismatched history deliberately releases the label to ordinary CI. Successful
-resume writes a fresh audit and intent generation; prior dispatched runs,
-including rejected or failed runs, remain previous-invocation outcomes and are
-never attached to the new generation.
-
-When safe managed resume is unavailable, agent-loop selects ordinary recovery
-only when the base workflow proves it has an unlabeled pull-request route. It
-baselines existing current-head runs, retains the draft, and waits at most
-`--ci-startup-timeout-seconds` (default 120) for a new current-head run to
-materialize. A missing, queued-only, or jobless run is not success: the draft
-stays unmerged and the terminal prints a shell-quoted `agent-loop pr` resume
-command. A qualifying recovery also needs a successful run and a non-empty
-passing current-head board. The live head is re-read immediately before merge
-and GitHub receives the same SHA through `--match-head-commit`.
-
-For repositories without that contract, `--auto-merge` foreground-polls the
-complete check board after approval with
-`--ci-timeout-seconds` and
-`--ci-poll-interval-seconds`, without invoking agents while checks are pending.
-Failure resumes the coder with the failed-check details; only a reliable,
-non-empty current-head board is mergeable. Reliability requires an available
-check query and branch-protection result, no pending or missing required
-checks, and passing reported checks. Partial or unavailable snapshots remain
-fail-closed and are polled; an otherwise reliable empty board is bounded
-startup, not CI success. After `--ci-startup-timeout-seconds` it stops with a
-resumable PR command and does not ready or merge the PR. The live head is
-re-read immediately before the exact-head merge proof. The watcher is
-synchronous and interruptible: Ctrl-C leaves no worker behind, and a rerun
-starts from fresh PR state. One timeout and attempt budget is shared across
-watcher polls and any coder-failure or head-change rounds. Auto-merge timeout,
-bounded-startup, and already-exhausted-budget stops retain resumable diagnostics
-and return non-zero; explicit manual `--watch-pending-ci` stops return zero
-without merging. `--no-watch-pending-ci` remains a parseable compatibility
-option, but does not disable this auto-merge gate and warns when explicitly
-supplied with auto-merge. Without `--auto-merge`,
-agent-loop reports an approved PR as merge-ready and does not wait for CI,
-unless `--watch-pending-ci` is passed explicitly, in which case it still
-watches the check board and reports merge-ready without merging.
-
-By default Claude is the coder and Codex is the reviewer. Reverse that with:
-
-```bash
-agent-loop task "Fix the flaky test" --repo OWNER/REPO --coder codex --reviewer claude
-```
-
-Use Gemini as either side of the loop:
-
-```bash
-agent-loop task "Improve error handling" \
-  --repo OWNER/REPO \
-  --coder gemini \
-  --reviewer codex
-
-agent-loop pr 456 \
-  --repo OWNER/REPO \
-  --reviewer gemini
-```
-
-Repeat `--reviewer` to require approvals from multiple reviewers. The PR is
-approved only after every configured reviewer approves in the same round. The
-coder may also be listed as a reviewer when you want the same agent to work in
-separate coding and review passes:
-
-```bash
-agent-loop pr 456 --repo OWNER/REPO --reviewer codex --reviewer claude
-```
-
-Structured-response runs use a three-level interpretation order:
-
-1. Structured JSON payloads are authoritative when present in the agent output.
-2. For resume/replay, `AGENT_LOOP_META` attached to orchestrator-posted comments is the canonical source of the active round ledger, carried `prior_items`, completed reviewer dispositions, and next `item-N` allocation for that structured-response round.
-3. Markdown section parsing remains a compatibility fallback for interpreting comments that do not include a structured payload or metadata for the current round.
-
-Mixed histories are expected during rollout. Old raw-markdown comments can
-remain earlier in the issue or PR thread, while newer orchestrator-rendered
-comments carry `AGENT_LOOP_META`. When metadata exists for the current head or
-plan subject, resume reconstruction uses that metadata-backed ledger and ignores
-stale visible item IDs from older heads, superseded plans, or replayed rounds.
-Metadata markers use a versioned `v1_` zlib-compressed, URL-safe base64 payload.
-If a marker would exceed GitHub's comment limit, the orchestrator posts one or
-more `AGENT_LOOP_SIDECAR` comments before its anchor comment. These sidecars are
-transport data, not agent output; do not delete them. If resume reports missing
-sidecars, restore them or remove the incomplete anchor and rerun the loop.
-If a PR head advances but no current-head coder metadata was recorded, the PR
-loop recovers from metadata-backed active `blocking` and `same-pr` items on the
-latest recorded head and routes them through a coder follow-up before reviewers
-run again.
-
-Structured JSON is also the preferred coder format for follow-up and plan
-revision rounds. Coder follow-up responses use `kind: "coder_followup"` with
-`state`, `summary`, `addressed_items`, `remaining_items`,
-`human_requirement_dispositions`, and `human_requirements`, plus optional
-`addressed_item_notes` / `remaining_item_notes`, and `tests_run`; every carried reviewer item ID must appear exactly
-once in either `addressed_items` or `remaining_items`.
-The disposition ledger must contain one entry per surfaced signed requirement,
-marked `addressed`, `blocked`, or `not-applicable` with non-blank evidence;
-use an empty ledger when no signed requirements were surfaced.
-In structured follow-ups, `human_requirements.addressed_ids` contains exactly
-the requirements with an `addressed` disposition. A `blocked` disposition
-requires `state: "blocking"`; `not-applicable` may be used in an approved
-follow-up. Markdown fallback acknowledgements retain their legacy rule: they
-must list every surfaced requirement.
-Plan-revision responses use `kind: "plan_revision"` with `state: "blocking"`,
-`summary`, `prior_plan_item_dispositions`, and `plan_steps`. Structured
-responses must start with one top-level JSON object, place the matching
-`AGENT_STATE` or `AGENT_PLAN_STATE` footer immediately after it, and end with
-only the standalone agent signature. The loop renders validated structured
-payloads into normal public GitHub comments, so raw JSON is not posted.
-
-When a structured plan review, plan revision, PR review, or coder follow-up is
-present but malformed, the loop may run a model-backed repair pass. The default
-backend is Antigravity (`agy`) with the default model `Gemini 3.7 Flash (Medium)`. The
-repair pass is format-only: it asks the model to re-emit the agent's intent as the
-required JSON object, footer marker, and signature. The repaired response is
-accepted only if it passes the same strict validation as the original response;
-failed repairs remain local protocol errors and are not posted to GitHub.
-
-Repair runs in a fresh temporary directory with an empty tool allow-list and a
-repair-only `GEMINI.md`; it receives no checkout or repository context. Configure
-it with `--repair-backend antigravity|gemini`, repeat `--repair-model` to define
-an explicit ordered fallback chain, and set `--repair-timeout-seconds`. Explicit
-repair models are tried first, followed by the configured Antigravity chain with
-duplicates removed. The loop validates candidates once with `agy models`, reports
-available choices for stale names, and attempts candidates directly when discovery
-is unavailable. For example:
-
-`--repair-model "Gemini 3.7 Flash (Medium)" --repair-model "Gemini 3.1 Pro (High)"`
-
-The legacy `gemini --prompt` path is used only with
-`--repair-backend gemini` and requires non-interactive enterprise/API-key/Vertex
-authentication. Every attempt, including failures and empty output, is recorded
-as estimated usage and consumes the selected provider's quota.
-
-Signed human reviewer comments are approval-critical when they end with a
-standalone `-- Human Reviewer` signature. The loop surfaces those requirements
-to coders and reviewers. In markdown fallback paths, coders must include
-`<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` plus a `### Human requirements` section
-that covers every surfaced `Requirement N`; in structured coder follow-ups, the
-same acknowledgement is carried in the `human_requirements` object. If details
-were omitted to keep a prompt bounded, the coder must state that it checked the
-GitHub discussion directly before responding. Reviewers cannot approve signed
-requirements as resolved unless the approved review includes
-`<!-- HUMAN_REQUIREMENTS_RESOLVED -->`; otherwise the loop carries a synthetic
-human-requirements acknowledgement item into the next round.
-
-When `--approved-followups` is set to `summarize`, `issue`, or a `fix-and-*`
-mode, approved reviews may include future work under:
-
-```md
-### Future follow-ups
-- Add a follow-up test.
-```
-
-Reviewers should use that section only for substantial work that is better
-handled in a separate issue or PR. The legacy heading
-`### Non-blocking follow-ups` is still parsed as future work for compatibility.
-Approval means the review is fully complete for that round: no new blocking
-work, and no carried-forward unresolved items left active in the reviewer’s
-disposition section.
-
-When `--approved-followups` uses a `fix-and-*` mode, blocking reviews may also
-include small, localized, low-risk current-PR cleanup under:
-
-```md
-### Same-PR follow-ups
-- Rename a helper before merge.
-```
-
-Same-PR follow-ups are sent back to the coder in the existing PR and require a
-new review round. They may not appear in an approved review. They should stay
-narrowly scoped to files already touched by the PR or directly adjacent code;
-larger redesigns and independent work belong under Future follow-ups. Approved
-future follow-ups remain in the round-to-round
-ledger so later reviewers can explicitly confirm they are still future work,
-resolved, or should be promoted back to same-PR or blocking status. The final
-summary or issue creation uses the remaining future items from that reconciled
-ledger, not only the final round's newly written Future follow-ups.
-
-Before posting summaries or creating issues, the loop deduplicates the remaining
-future items across reviewers using deterministic topic keys from headings,
-code identifiers, docs/files, and normalized wording. The selected issue body
-keeps the canonical wording plus an `Original reviewer notes` section so
-reviewer provenance and later disposition notes are not lost. The issue modes
-create at most three follow-up issues to avoid issue noise, and the final PR
-comment reports how many items were filed or summarized, deduplicated, or
-skipped by the cap.
-
-Plan reviews follow the same rule: approved plan reviews may include Future
-follow-ups only. Blocking plan issues, Same-plan follow-ups, or carried-forward
-plan items left `still blocking` or `same-plan` keep the planning round
-unapproved. Plan-stage future follow-up issues are filed before implementation
-begins in issue-filing modes; PR-stage approved-review future follow-up issues
-are filed after final PR approval.
-
-By default, `--approved-followups=ignore` asks reviewers not to include
-approved-review follow-up sections. Reviewers should mark the review blocking
-instead when cleanup should be fixed before merge.
-
-Each top-level `issue`, `task`, or `pr` run also writes a machine-readable
-usage summary beside the normal agent logs in `--log-dir` as
-`<run-id>-usage-summary.json`. The file aggregates per-call, per-agent, and
-whole-run usage, including retries. When a backend exposes token counters, the
-summary records them as `exact` or `partial`; when a backend exposes no usable
-usage data, the loop falls back to a clearly labeled estimate based on prompt
-and public-response size. `--dry-run` does not fabricate token usage.
-
-`--approved-followups` accepts:
-
-- `ignore`: ignore approved follow-up sections. This is the default.
-- `summarize`: post future follow-ups as a grouped PR comment.
-- `issue`: create GitHub issues for future follow-ups, then comment with the created issue links.
-- `fix-and-summarize`: send same-PR follow-ups to the coder for another review round, then summarize future follow-ups after final approval.
-- `fix-and-issue`: send same-PR follow-ups to the coder for another review round, then create issues for future follow-ups after final approval and comment with the created issue links.
-
-To keep a grouped record on the PR or create follow-up issues, use:
-
-```bash
-agent-loop pr 456 --repo OWNER/REPO --approved-followups summarize
-agent-loop pr 456 --repo OWNER/REPO --approved-followups issue
-agent-loop pr 456 --repo OWNER/REPO --approved-followups fix-and-summarize
-```
-
-Bullets and prose paragraphs inside the `Same-PR follow-ups`, `Future follow-ups`,
-and legacy `Non-blocking follow-ups` sections are parsed. Each section ends at
-the next heading, HTML marker, or agent signature, so final protocol markers
-are not mistaken for follow-up text.
-
-The remaining legacy compatibility surface is intentional:
-
-- Markdown review/plan parsing remains supported in the resume path for
-  already-completed reviewer rounds that predate structured metadata.
-- The legacy heading `### Non-blocking follow-ups` still maps to future work.
-- Marker-only markdown paths remain compatibility fallbacks; new follow-up,
-  review, and plan-revision examples should use structured JSON first.
-- Resume reconstruction should not depend on reparsing old prose once
-  `AGENT_LOOP_META` exists for the active structured-response round.
-
-Active subprocess captures are written to a unique directory under the local
-agent-loop cache, outside every managed checkout. Use `--subprocess-log-dir`
-to override it; relative overrides are resolved from the primary agent
-directory, and an override equal to or nested inside a managed checkout is
-rejected. Capture directories are leased for the life of the invocation and
-old, unlocked tool-owned directories are pruned by age. `--log-dir` remains the location
-for salvage and usage artifacts, preserving discovery of legacy
-`.agent-loop-logs/` data. Long-running agents print heartbeat lines with the exact log
-path. GitHub comments come from validated public response files under
-`/tmp/coding-review-agent-loop/responses/...` or validated fallback stdout, not
-from raw logs. If an agent looks stuck or returns diagnostics, inspect the
-heartbeat log path and the response-file path; quota/reset failures may exit
-early with rerun guidance, while narrower transient failures retry according to
-`--agent-max-retries` and `--agent-retry-backoff-seconds`. Repair-pass attempts
-are also visible in the log as schema-validation failure, repair attempt, and
-recovered-or-invalid repair messages.
-
-Claude and Codex also have evidence-gated recovery for an executable that is
-replaced after spawn. The runner records the resolved PATH entry, symlink target,
-and executable identity immediately around each invocation and only considers a
-replacement when that identity changed or disappeared during the invocation.
-Codex replay is deliberately conservative: an outputless failed `codex exec
---json` may contain no parsed events or only one `thread.started` setup event;
-any item, tool, command, error, or `turn.completed` event prevents a fresh
-replay. A usable public response or Codex last-message artifact always wins,
-even if executable metadata changes after completion, and a malformed artifact
-continues through normal validation. Absolute command overrides require direct
-identity evidence; ordinary unchanged-identity Codex failures are not treated
-as replacement interruptions.
-
-After Codex identity evidence, the loop waits for executable stability for at
-most six seconds independently of the interrupted turn's timeout, then makes
-one fresh replay with the full configured timeout. This replay does not consume
-the ordinary retry allowance. Ordinary Codex logs keep their existing names;
-only the dedicated replay is suffixed `executable-replacement-attempt2`.
-Claude retains its invocation deadline and replays only with the remaining
-budget, using `self-update-attempt2`. If stability or replay/retry exhaustion
-leaves a failure, the error retains a specific executable-replacement/self-update
-diagnostic. A genuine long quota reset remains the primary exit-code-3 result,
-with any earlier replacement context appended.
-
-For trusted local automation that must run without approval prompts:
-
-```bash
-agent-loop issue 123 --repo OWNER/REPO --dangerous-agent-permissions
-```
-
-## Real Example
-
-This project uses `agent-loop` to improve itself. This command asked Codex to
-review existing issue and PR feedback, with both Claude and Gemini reviewing
-the result. The work became PR #13:
-https://github.com/wwind123/coding-review-agent-loop/pull/13
-
-```bash
-~/tools/coding-review-agent-loop/.venv/bin/agent-loop task \
-  "Please go over all issue and PR reviews again and see if any future follow-ups are still worth addressing but have not been addressed." \
-  --repo wwind123/coding-review-agent-loop \
-  --coder codex \
-  --reviewer claude \
-  --reviewer gemini \
-  --dangerous-agent-permissions
-```
-
-See [docs/local_agent_loop.md](docs/local_agent_loop.md) for the architecture diagram, full usage, and safety notes.
-
-## Test
-
-```bash
-python -m pytest
-```
-
-Tests use fake subprocess runners. They do not call real `claude`, `codex`, `gemini`, or `gh`.
-
-### Discuss evidence reconciliation
-
-Final discuss summaries reconcile structured debater evidence instead of
-rendering an append-only research ledger. Claims are `verified`,
-`reported-but-unverified`, or `missing`; an explicit update records the
-historical `retracted` or `superseded` state. `verified` means the debater
-attests it directly inspected the cited source or checkout location and that it
-supports the exact claim (`external-source-inspected` with a reference, or
-`checkout-inspected` with a repository-relative `path:line`). Legacy
-`research.sourced_facts` remain reported, never automatically verified.
-
-Debaters provide `evidence.claims` and `evidence.updates`; an update names a
-stable prior observation ID and has `action: retract|supersede` plus a reason.
-Exact fact/source duplicates combine contributor attribution without an
-analyzer. The optional evidence reconciler may group paraphrases, but cannot
-create claims, change statuses, or decide retractions. Final-analyzer
-observations remain final-round-text-only.
-
-The optional reconciler sees at most 64 clipped observations / 24,000 UTF-8
-bytes. The rendered ledger is capped at 50 entries / 16,000 bytes, prioritizing
-updates and targets, final-round claims, verified, reported, missing, then old
-history. Round comments and replay metadata retain the full raw audit trail.
-
-A `checkout-inspected` claim's `path:line` is mechanically cross-checked
-against the reviewer's assigned checkout at live, repair, resume, and split-
-recovery time: the path must resolve inside that checkout, exist as a file,
-and the line number must be in range, or the loop fails outright. This only
-confirms the referenced line exists, not that it supports the claim; see
-`docs/local_agent_loop.md` for the full current-checkout semantics.
-
-### Test file layout
-
-The test suite is split across focused modules for faster, targeted runs:
-
-| File | Contents |
-|------|----------|
-| `tests/test_agent_loop.py` | Main orchestration tests (PR loop, plan loop, issue loop, prompts, config) |
-| `tests/test_backends.py` | Claude, Gemini, and Codex backend output parsing and normalization |
-| `tests/test_protocol.py` | Protocol parsing and validation (parse_review, parse_plan_review, structured payloads) |
-| `tests/test_comment_rendering.py` | Comment rendering (render_canonical_plan_steps, render_public_agent_comment, etc.) |
-| `tests/test_discuss_loop.py` | Discuss mode loop tests (per-round comments, debate/deadlock, idempotent and mid-round/multi-round resume, split proposals, parallel debaters, debater timeout/failure policy) |
-| `tests/test_skill_helpers.py` | Skill helper function tests |
-| `tests/test_skill_loop.py` | Skill loop integration tests |
-| `tests/test_transient.py` | Transient error detection tests |
-| `tests/agent_loop_helpers.py` | Shared helpers: FakeRunner, builder functions, utilities (not a test file) |
-
-Run a focused subsystem:
-
-```bash
-# Backend parsing only
-python -m pytest tests/test_backends.py
-
-# Protocol parsing only
+python -m pytest tests/test_docs_guidance.py
 python -m pytest tests/test_protocol.py
-
-# Comment rendering only
-python -m pytest tests/test_comment_rendering.py
-
-# Full suite
-python -m pytest tests/
+python -m pytest tests/test_orchestrator_pr.py
 ```
+
+Tests use fake subprocess runners and do not invoke real agent CLIs or GitHub.
+Browse the focused test modules in [`tests/`](tests/) and see the architecture
+diagram in [`docs/local_agent_loop.md`](docs/local_agent_loop.md#architecture).
+
+## Related Tools
+
+This project is a standalone local GitHub lifecycle orchestrator. Projects such
+as [claude-review-loop](https://github.com/hamelsmu/claude-review-loop),
+[codex-review](https://github.com/boyand/codex-review), and
+[codex-plugin-cc](https://github.com/openai/codex-plugin-cc) integrate review or
+delegation into a particular agent host. Here, the orchestrator stays outside
+the agent hosts and can reverse coder/reviewer roles.
+
+## License
+
+[MIT](LICENSE)
