@@ -20,6 +20,7 @@ from .protocol import (
     SIGNATURE_RE,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
+    ParsedDiscussFinalSynthesis,
     ParsedDiscussRoundSynthesis,
     ParsedDiscussResponse,
     ParsedDiscussReview,
@@ -28,6 +29,7 @@ from .protocol import (
     failed_discuss_review_placeholder,
     failed_discuss_answer_placeholder,
     parse_structured_discuss_agenda,
+    parse_canonical_discuss_final_synthesis,
     parse_canonical_discuss_round_synthesis,
     parse_structured_discuss_review,
     parse_structured_discuss_answer,
@@ -754,6 +756,7 @@ class ResumedDiscussState:
     prior_round_agenda: tuple[str, ...] = ()
     prior_analyzer_agenda: ParsedDiscussAgenda | None = None
     prior_round_synthesis: ParsedDiscussRoundSynthesis | None = None
+    final_synthesis: ParsedDiscussFinalSynthesis | None = None
     synthesis_provenance: dict | None = None
     in_progress_votes: dict[str, ParsedDiscussResponse] = None  # type: ignore[assignment]
 
@@ -778,6 +781,16 @@ def _decode_round_synthesis(raw: str | None) -> ParsedDiscussRoundSynthesis | No
         return None
     try:
         return parse_canonical_discuss_round_synthesis(raw)
+    except (AgentLoopError, TypeError, ValueError):
+        return None
+
+
+def _decode_final_synthesis(raw: str | None) -> ParsedDiscussFinalSynthesis | None:
+    """Decode an optional canonical final synthesis without poisoning resume."""
+    if not raw or len(raw.encode("utf-8")) > 16_000:
+        return None
+    try:
+        return parse_canonical_discuss_final_synthesis(raw)
     except (AgentLoopError, TypeError, ValueError):
         return None
 
@@ -887,6 +900,7 @@ def _resume_discuss_round(
             prior_round_agenda = summary_record.metadata.agenda
             prior_analyzer_agenda = _decode_analyzer_agenda(summary_record.metadata.analyzer_response)
             prior_round_synthesis = _decode_round_synthesis(summary_record.metadata.round_synthesis)
+            final_synthesis = _decode_final_synthesis(summary_record.metadata.final_synthesis)
             synthesis_provenance = summary_record.metadata.synthesis_provenance
             if summary_record.metadata.is_final:
                 return ResumedDiscussState(
@@ -896,6 +910,7 @@ def _resume_discuss_round(
                     prior_round_agenda=prior_round_agenda,
                     prior_analyzer_agenda=prior_analyzer_agenda,
                     prior_round_synthesis=prior_round_synthesis,
+                    final_synthesis=final_synthesis,
                     synthesis_provenance=synthesis_provenance,
                 )
             next_round_number = round_number + 1
@@ -913,6 +928,7 @@ def _resume_discuss_round(
         prior_round_agenda=prior_round_agenda,
         prior_analyzer_agenda=prior_analyzer_agenda,
         prior_round_synthesis=prior_round_synthesis,
+        final_synthesis=None,
         synthesis_provenance=synthesis_provenance,
         in_progress_votes=in_progress_votes,
     )

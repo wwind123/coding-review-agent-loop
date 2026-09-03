@@ -11170,7 +11170,11 @@ def _run_discuss_loop(
             # recover agreed recommendations and accurately summarize the
             # residual human decisions.
             if final_synthesis is None or final_mechanical_classification == "near_consensus":
-                final_analyzer_agenda, final_analyzer_response_raw, final_synthesis = _run_discuss_final_analyzer(
+                (
+                    final_analyzer_agenda,
+                    final_analyzer_response_raw,
+                    analyzer_synthesis,
+                ) = _run_discuss_final_analyzer(
                     runner,
                     issue_number=issue_number,
                     config=config,
@@ -11181,7 +11185,11 @@ def _run_discuss_loop(
                     usage_context=usage_context,
                     mechanical_classification=final_mechanical_classification,
                 )
-                if final_synthesis is not None:
+                # The mechanical/adapted synthesis is a safe fallback. An
+                # unavailable, malformed, or rejected advisory analyzer must
+                # not erase it and return to the pre-synthesis rendering.
+                if analyzer_synthesis is not None:
+                    final_synthesis = analyzer_synthesis
                     final_synthesis_source = "final-analyzer"
         elif is_final:
             # Semantic finalization already used the configured analyzer to

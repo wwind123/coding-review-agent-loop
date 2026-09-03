@@ -43,6 +43,7 @@ from coding_review_agent_loop.protocol import (
     ParsedDiscussRoundSynthesis,
     ParsedDiscussFinalSynthesis,
     ParsedFailedDiscussResponse,
+    serialize_discuss_final_synthesis,
     serialize_discuss_round_synthesis,
 )
 
@@ -597,6 +598,78 @@ def test_resume_restores_persisted_round_synthesis_state(tmp_path):
     assert state.next_round_number == 2
 
 
+def test_resume_decodes_persisted_final_synthesis_state(tmp_path):
+    subject = _issue_subject()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer")
+    vote1 = ParsedDiscussAnswer(
+        position="answer", rationale="Use an API boundary.", confidence="high",
+        unresolved_items=(), reviewer="Codex", answer="Use an API boundary.",
+    )
+    vote2 = ParsedDiscussAnswer(
+        position="answer", rationale="Use an API boundary.", confidence="high",
+        unresolved_items=(), reviewer="Gemini", answer="Use an API boundary.",
+    )
+    synthesis = ParsedDiscussFinalSynthesis(
+        classification="consensus",
+        agreed_conclusions=(DiscussSynthesisConsensus(
+            "Use an API boundary.",
+            (
+                DiscussSynthesisResponseReference("Codex", 1),
+                DiscussSynthesisResponseReference("Gemini", 1),
+            ),
+        ),),
+        remaining_disagreements=(),
+        next_action="Proceed with the shared recommendation.",
+    )
+    comments = [
+        _seed_answer_debater_comment(
+            reviewer="Codex", round_number=1, subject=subject,
+            answer="Use an API boundary.", config=config,
+        ),
+        _seed_answer_debater_comment(
+            reviewer="Gemini", round_number=1, subject=subject,
+            answer="Use an API boundary.", config=config,
+        ),
+    ]
+    summary_body = render_discuss_round_summary_comment(
+        round_number=1,
+        reviewer_votes=[vote1, vote2],
+        is_final=True,
+        subject=subject,
+        outcome="answer",
+        consensus_kind="unanimous",
+        result_mode="answer",
+        final_synthesis=synthesis,
+    )
+    comments.append({
+        "author": {"login": "bot"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "body": _attach_round_metadata(
+            summary_body,
+            PostedRoundMetadata(
+                flow="discuss", role="summary", agent="Orchestrator", round_number=1,
+                subject=subject, is_final=True, consensus_kind="unanimous",
+                result_mode="answer",
+                final_synthesis=serialize_discuss_final_synthesis(synthesis),
+                synthesis_provenance={"source": "mechanical-result", "round": 1},
+            ),
+        ),
+    })
+
+    state = _resume_discuss_round(
+        [IssueComment(author="bot", created_at="2026-01-01T00:00:00Z", body=comment["body"])
+         for comment in comments],
+        subject=subject,
+        configured_reviewers=("codex", "gemini"),
+        reviewer_workdirs={"Codex": config.codex_dir, "Gemini": config.gemini_dir},
+        result_mode="answer",
+    )
+
+    assert state is not None
+    assert state.done
+    assert state.final_synthesis == synthesis
+
+
 def test_round_synthesis_fidelity_covers_carry_and_all_state_transitions():
     current_votes = (
         _needs_human_vote("Codex", ("Choose pricing. API boundary pricing security",)),
@@ -867,6 +940,37 @@ def test_near_consensus_invokes_final_analyzer_and_keeps_mechanical_classificati
     )
     assert "near_consensus" in runner.comments[-1]
     assert decision in runner.comments[-1]
+
+
+def test_near_consensus_without_analyzer_keeps_mechanical_synthesis(tmp_path):
+    decision = "Choose the pricing timing."
+    codex = _discuss_answer_text(
+        answer=None,
+        position="needs-human",
+        rationale="The implementation direction is shared; choose the pricing timing.",
+        unresolved_items=[{"status": "human-decision", "text": decision}],
+        reviewer="OpenAI Codex",
+    )
+    gemini = _discuss_answer_text(
+        answer=None,
+        position="needs-human",
+        rationale="The implementation direction is shared; choose the pricing timing.",
+        unresolved_items=[{"status": "human-decision", "text": decision}],
+        reviewer="Google Gemini",
+    )
+    runner = FakeRunner(codex_outputs=[codex], gemini_outputs=[gemini])
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), discuss_result_mode="answer"
+    )
+
+    assert run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0) == 0
+
+    final = runner.comments[-1]
+    assert final.startswith("## Executive conclusion")
+    assert "`near_consensus`" in final
+    assert decision in final
+    assert "The debaters did not converge on one normalized answer" not in final
+    assert not any(command[:1] == ["claude"] for command, _cwd in runner.commands)
 
 
 def test_mechanical_final_classification_fails_closed_for_unknown_pair():
