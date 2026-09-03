@@ -23,8 +23,8 @@ def _agent_commands_available(monkeypatch):
 
     real_which = config_module.shutil.which
 
-    def which(command):
-        resolved = real_which(command)
+    def which(command, *args, **kwargs):
+        resolved = real_which(command, *args, **kwargs)
         if resolved is not None:
             return resolved
         if command in {"claude", "codex", "gemini", "agy"}:

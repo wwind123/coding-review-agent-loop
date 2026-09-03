@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -100,6 +101,20 @@ def test_normalization_joins_wrapped_and_bare_commands_without_leaking_values(tm
     normalized = runtime.normalize_test_command(["TOKEN=secret-value", *bare], cwd=tmp_path)
     assert "secret-value" not in normalized
     assert "TOKEN=" in normalized
+    assert runtime.normalize_test_command(shlex.split(normalized), cwd=tmp_path) == normalized
+
+
+def test_environment_fingerprint_tolerates_which_without_path_argument(tmp_path, monkeypatch):
+    real_which = runtime.shutil.which
+
+    def which(command):
+        return real_which(command)
+
+    monkeypatch.setattr(runtime.shutil, "which", which)
+    resolved = runtime._resolve_executable(
+        ["python", "-c", "pass"], tmp_path, {"PATH": os.environ.get("PATH", "")}
+    )
+    assert resolved == (real_which("python") or "python")
 
 
 def test_foreground_runner_reports_visible_success_failure_timeout_and_tail(tmp_path, capsys):
@@ -135,6 +150,43 @@ pid = os.fork()
 if pid == 0:
     os.setsid()
     time.sleep(5)
+else:
+    Path({str(pid_file)!r}).write_text(str(pid))
+    time.sleep(5)
+"""
+    result = None
+    escaped_pid = None
+    started = time.monotonic()
+    try:
+        result = run_foreground_test(
+            [sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=0.1
+        )
+    finally:
+        if pid_file.exists():
+            escaped_pid = int(pid_file.read_text(encoding="utf-8"))
+        if escaped_pid is not None:
+            try:
+                os.kill(escaped_pid, 9)
+            except ProcessLookupError:
+                pass
+    assert result is not None
+    assert result.outcome == "timed_out"
+    assert time.monotonic() - started < 2
+
+
+def test_foreground_timeout_stops_when_escaped_descendant_keeps_writing(tmp_path):
+    pid_file = tmp_path / "writing-escaped-child.pid"
+    script = f"""
+import os
+import time
+from pathlib import Path
+
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    while True:
+        os.write(1, b"x")
+        time.sleep(0.01)
 else:
     Path({str(pid_file)!r}).write_text(str(pid))
     time.sleep(5)

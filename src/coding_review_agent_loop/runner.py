@@ -162,6 +162,8 @@ def run_foreground_test(
 
     timed_out = False
     interrupted = False
+    watchdog_deadline = started + timeout_seconds
+    post_termination_deadline: float | None = None
     try:
         # A selector keeps output flowing to the terminal while allowing the
         # monotonic watchdog to fire even when the child is quiet.
@@ -172,10 +174,36 @@ def run_foreground_test(
         selector.register(proc.stdout, selectors.EVENT_READ)
         while True:
             now = time.monotonic()
-            if proc.poll() is None and now - started >= timeout_seconds:
+            if proc.poll() is None and now >= watchdog_deadline:
                 timed_out = True
+                # Once the watchdog fires, output draining must not extend the
+                # command beyond this absolute deadline.  This also covers a
+                # reaped direct child whose descendants retain the pipe and
+                # continue producing readable output.
+                post_termination_deadline = (
+                    watchdog_deadline + TEST_OUTPUT_DRAIN_GRACE_SECONDS
+                )
                 _terminate_process_group(proc)
-            events = selector.select(0.1)
+            elif proc.poll() is not None and post_termination_deadline is None:
+                # A normally exiting child can also leave a descendant with a
+                # live pipe.  Allow a short drain, but never past the command's
+                # watchdog-plus-grace absolute bound.
+                post_termination_deadline = min(
+                    watchdog_deadline + TEST_OUTPUT_DRAIN_GRACE_SECONDS,
+                    now + TEST_OUTPUT_DRAIN_GRACE_SECONDS,
+                )
+            if (
+                post_termination_deadline is not None
+                and now >= post_termination_deadline
+            ):
+                break
+            wait_seconds = 0.1
+            if post_termination_deadline is not None:
+                wait_seconds = min(
+                    wait_seconds,
+                    max(0.0, post_termination_deadline - time.monotonic()),
+                )
+            events = selector.select(wait_seconds)
             for key, _mask in events:
                 chunk = os.read(key.fileobj.fileno(), 64 * 1024)
                 if chunk:
@@ -204,7 +232,14 @@ def run_foreground_test(
             # A descendant may retain the inherited write end after the direct
             # child is reaped. Never use read-to-EOF here: it would defeat the
             # watchdog. Drain only what becomes available during a short grace.
-            _drain_nonblocking_test_output(proc.stdout, consume)
+            remaining_drain_grace = TEST_OUTPUT_DRAIN_GRACE_SECONDS
+            if post_termination_deadline is not None:
+                remaining_drain_grace = max(
+                    0.0, post_termination_deadline - time.monotonic()
+                )
+            _drain_nonblocking_test_output(
+                proc.stdout, consume, grace_seconds=remaining_drain_grace
+            )
             consume(b"", final=True)
             proc.stdout.close()
         elapsed = time.monotonic() - started

@@ -1974,6 +1974,51 @@ def test_coder_prompt_renders_remembered_runtime_context_without_test_gate(tmp_p
     assert "Invocation guidance:" not in reviewer_prompt
 
 
+def test_coder_prompt_reuses_stored_runtime_keys_for_redacted_and_external_commands(tmp_path):
+    memory_dir = tmp_path / "memory"
+    config = make_config(
+        tmp_path,
+        test_command=None,
+        coder_test_command_timeout_seconds=7200,
+        agent_memory_dir=memory_dir,
+    )
+    external = tmp_path / "other-venv" / "bin" / "python"
+    external.parent.mkdir(parents=True)
+    external.write_text("#!/bin/sh\n", encoding="utf-8")
+    external.chmod(0o755)
+    redacted_command = ["PYTHONPATH=/secret/project", sys.executable, "-c", "pass"]
+    external_command = [str(external), "-c", "pass"]
+    for command, elapsed in ((redacted_command, 410), (external_command, 520)):
+        assert runtime.record_test_observation(
+            memory_dir,
+            argv=command,
+            cwd=config.claude_dir,
+            outcome="passed",
+            elapsed_seconds=elapsed,
+            attempted_timeout_seconds=7200,
+            policy_ceiling_seconds=7200,
+            timestamp=datetime_type.now(timezone.utc),
+        )
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit="abc123",
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary="REPO SUMMARY TEXT",
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+        runtime_observations=tuple(runtime.load_runtime_memory(memory_dir)),
+    )
+
+    prompt = build_issue_prompt(56, config, memory=memory)
+
+    assert "Successful samples: 1" in prompt
+    assert "PYTHONPATH=<sha256:" in prompt
+    assert "/secret/project" not in prompt
+    assert "python -c pass" in prompt
+
+
 @pytest.mark.parametrize(
     ("builder", "structured"),
     [

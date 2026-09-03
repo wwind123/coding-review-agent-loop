@@ -12,6 +12,7 @@ import json
 import math
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -34,6 +35,7 @@ RUNTIME_LOCK_NAME = "test-runtime.json.lock"
 MAX_OBSERVATIONS_PER_COHORT = 20
 MAX_COHORTS = 200
 STALE_AFTER = timedelta(days=30)
+_HASHED_ENV_VALUE_RE = re.compile(r"<sha256:[0-9a-f]{16}>")
 
 
 class TestRuntimeConfigurationError(AgentLoopError):
@@ -240,7 +242,10 @@ def normalize_test_command(argv: Sequence[str], *, cwd: Path | None = None) -> s
     for index, value in enumerate(inner):
         if "=" in value and value.split("=", 1)[0].replace("_", "").isalnum():
             key, _sep, raw = value.partition("=")
-            normalized.append(f"{key}=<sha256:{hashlib.sha256(raw.encode()).hexdigest()[:16]}>")
+            if _HASHED_ENV_VALUE_RE.fullmatch(raw):
+                normalized.append(value)
+            else:
+                normalized.append(f"{key}=<sha256:{hashlib.sha256(raw.encode()).hexdigest()[:16]}>")
         elif index == 0 or value.startswith("/") or value.startswith("~"):
             normalized.append(_relative_or_basename(value, base))
         else:
@@ -324,7 +329,13 @@ def _resolve_executable(argv: Sequence[str], cwd: Path, values: Mapping[str, str
         return str(candidate)
     if raw.startswith((".", "~")) or candidate.parent != Path("."):
         return str((cwd / candidate).resolve(strict=False))
-    return shutil.which(raw, path=values.get("PATH")) or raw
+    try:
+        resolved = shutil.which(raw, path=values.get("PATH"))
+    except TypeError:
+        # Test doubles and older Python-compatible shims may only accept the
+        # command positional argument.  Fingerprinting must remain best-effort.
+        resolved = shutil.which(raw)
+    return resolved or raw
 
 
 def environment_fingerprint(argv: Sequence[str], cwd: Path, *, env: Mapping[str, str] | None = None) -> str:
@@ -532,10 +543,20 @@ def recommend_timeout(
     cwd: Path,
     policy_ceiling_seconds: int,
     now: datetime | None = None,
+    normalized_command_override: str | None = None,
+    fingerprint_override: str | None = None,
 ) -> RuntimeRecommendation:
     ceiling = validate_timeout_ceiling(policy_ceiling_seconds, name="policy ceiling")
-    normalized = normalize_test_command(argv, cwd=cwd)
-    fingerprint = environment_fingerprint(argv, cwd)
+    normalized = (
+        normalized_command_override
+        if normalized_command_override is not None
+        else normalize_test_command(argv, cwd=cwd)
+    )
+    fingerprint = (
+        fingerprint_override
+        if fingerprint_override is not None
+        else environment_fingerprint(argv, cwd)
+    )
     rows = load_runtime_memory(memory_dir) if memory_dir is not None else []
     current_manifest = build_input_manifest(argv, cwd)
     cutoff = (now or _utc_now()).astimezone(timezone.utc) - STALE_AFTER
@@ -595,13 +616,17 @@ def render_runtime_context(
     commands: Iterable[Sequence[str]],
     cwd: Path,
     policy_ceiling_seconds: int,
+    recommendations: Mapping[tuple[str, ...], RuntimeRecommendation] | None = None,
 ) -> str:
     lines: list[str] = []
     for command in list(commands)[:6]:
-        recommendation = recommend_timeout(
-            memory_dir, argv=command, cwd=cwd,
-            policy_ceiling_seconds=policy_ceiling_seconds,
-        )
+        key = tuple(str(item) for item in command)
+        recommendation = recommendations.get(key) if recommendations is not None else None
+        if recommendation is None:
+            recommendation = recommend_timeout(
+                memory_dir, argv=command, cwd=cwd,
+                policy_ceiling_seconds=policy_ceiling_seconds,
+            )
         lines.append(f"- Command: {recommendation.command}")
         if recommendation.successful_samples:
             lines.append(

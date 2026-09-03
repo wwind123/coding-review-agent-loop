@@ -89,6 +89,7 @@ def _memory_block(
         cwd = agent_workdir(config, config.coder)
         commands: list[tuple[str, ...]] = []
         seen: set[tuple[str, ...]] = set()
+        remembered_keys: dict[tuple[str, ...], tuple[str, str]] = {}
         if config.test_command:
             commands.append(tuple(config.test_command))
             seen.add(tuple(config.test_command))
@@ -103,22 +104,36 @@ def _memory_block(
             if command and command not in seen:
                 commands.append(command)
                 seen.add(command)
+                fingerprint = observation.get("environment_fingerprint")
+                if isinstance(fingerprint, str) and fingerprint:
+                    # The stored normalized command and fingerprint are the
+                    # cohort key.  Re-normalizing this display form can hash
+                    # redacted environment values twice or resolve an
+                    # external executable through a different PATH entry.
+                    remembered_keys[command] = (normalized, fingerprint)
         commands = commands[:6]
         if commands:
+            recommendations = {}
+            for command in commands:
+                key = remembered_keys.get(command)
+                recommendations[command] = recommend_timeout(
+                    memory.memory_dir,
+                    argv=command,
+                    cwd=cwd,
+                    policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
+                    normalized_command_override=key[0] if key else None,
+                    fingerprint_override=key[1] if key else None,
+                )
             runtime_text = render_runtime_context(
                 memory.memory_dir,
                 commands=commands,
                 cwd=cwd,
                 policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
+                recommendations=recommendations,
             )
             invocation_lines = []
             for command in commands:
-                recommendation = recommend_timeout(
-                    memory.memory_dir,
-                    argv=command,
-                    cwd=cwd,
-                    policy_ceiling_seconds=config.coder_test_command_timeout_seconds,
-                )
+                recommendation = recommendations[command]
                 wrapper = render_test_wrapper(
                     command,
                     timeout_seconds=(
