@@ -196,8 +196,9 @@ contract.
 - Agent CLIs can exhaust quota, time out, update themselves, or return malformed
   structured output. Retries, repair passes, and salvage reduce lost work but
   cannot guarantee unattended completion.
-- Default agent checkouts live under `/tmp` and may disappear after a reboot or
-  system cleanup. Configure explicit workdirs for long-lived installations.
+- Default agent checkouts live under the system temporary directory (`/tmp` on
+  Linux) and may disappear after a reboot or system cleanup. Configure explicit
+  workdirs for long-lived installations.
 
 ## Planning and Decomposition
 
@@ -315,8 +316,10 @@ agent-loop pr 456 --repo OWNER/REPO --auto-merge
 
 For ordinary CI, auto-merge waits for a reliable, non-empty check board on the
 current head. Without auto-merge, `--watch-pending-ci` can wait and report that
-an approved PR is merge-ready without merging. GitHub runner stalls are bounded
-by `--ci-queued-grace-seconds`; see
+an approved PR is merge-ready without merging. Set the total watcher budget
+with `--ci-timeout-seconds` (default 1200) and its polling interval with
+`--ci-poll-interval-seconds` (default 30). GitHub runner stalls are bounded by
+`--ci-queued-grace-seconds`; see
 [External CI infrastructure stalls](docs/local_agent_loop.md#external-ci-infrastructure-stalls).
 
 ### Managed exact-head CI
@@ -388,8 +391,8 @@ python -m pytest tests/test_orchestrator_pr.py
 ```
 
 Tests use fake subprocess runners and do not invoke real agent CLIs or GitHub.
-See the module map in [`tests/`](tests/) and the architecture diagram in
-[`docs/local_agent_loop.md`](docs/local_agent_loop.md#architecture).
+Browse the focused test modules in [`tests/`](tests/) and see the architecture
+diagram in [`docs/local_agent_loop.md`](docs/local_agent_loop.md#architecture).
 
 ## Related Tools
 

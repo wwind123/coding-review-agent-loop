@@ -67,6 +67,17 @@ def test_readme_documents_same_repo_concurrency_limit():
     assert "one active `agent-loop` invocation per repository per machine" in section
     assert "does not currently enforce a repository-wide process lock" in section
     assert "`--review-parallel` is supported within one orchestrator run" in section
+    assert "system temporary directory (`/tmp` on Linux)" in section
+
+
+def test_readme_documents_ci_watcher_controls():
+    readme_text = README.read_text(encoding="utf-8")
+    section_start = readme_text.index("## CI and Merge")
+    section_end = readme_text.index("## Claude Code Skill Mode", section_start)
+    section = " ".join(readme_text[section_start:section_end].split())
+
+    assert "`--ci-timeout-seconds` (default 1200)" in section
+    assert "`--ci-poll-interval-seconds` (default 30)" in section
 
 
 def test_cli_help_points_to_decision_section():
