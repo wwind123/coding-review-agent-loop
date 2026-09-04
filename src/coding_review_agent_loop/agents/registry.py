@@ -92,6 +92,16 @@ def run_agent_result(
     timeout_seconds: float | None = None,
     attempt_suffix: str | None = None,
 ) -> AgentResult:
+    # Configure the runner at the backend boundary so direct library callers,
+    # skill-mode callers, and the CLI all use the same immutable containment
+    # policy.  Test doubles inherit this method but their scripted spawn path
+    # remains authoritative and does not need a systemd probe.
+    configure = getattr(runner, "configure_from_config", None)
+    if callable(configure):
+        configure(config)
+    set_role = getattr(runner, "set_containment_role", None)
+    if callable(set_role):
+        set_role(role)
     kwargs: dict[str, object] = dict(
         session_id=session_id,
         run_id=run_id,

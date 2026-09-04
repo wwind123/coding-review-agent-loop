@@ -1430,6 +1430,51 @@ class TestRunExternalRetries:
             "message_text": "captured acknowledgement",
         }
 
+    def test_resource_exhaustion_is_reported_without_retry(self, monkeypatch, tmp_path) -> None:
+        import helpers.run_external as rex
+        from coding_review_agent_loop.agents.base import AgentResult
+        from coding_review_agent_loop.containment import ContainmentEvidence
+
+        calls = {"n": 0}
+
+        class FakeBackend:
+            def run(self, runner, config, prompt):
+                calls["n"] += 1
+                return AgentResult(
+                    text="",
+                    raw_output="",
+                    returncode=137,
+                    containment=ContainmentEvidence(
+                        backend="systemd-cgroup-v2",
+                        termination_cause="oom",
+                        applicable_limit="MemoryMax/MemorySwapMax",
+                        diagnostics=("systemd scope result=oom-kill",),
+                    ),
+                )
+
+        monkeypatch.setattr("coding_review_agent_loop.agents.codex.CodexBackend", FakeBackend)
+        prompt = tmp_path / "prompt.md"
+        output = tmp_path / "output.md"
+        evidence = tmp_path / "evidence.json"
+        prompt.write_text("Review this.", encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", [
+            "run_external", "--agent", "codex",
+            "--prompt-file", str(prompt), "--output", str(output),
+            "--workdir", str(tmp_path), "--max-retries", "2",
+            "--invocation-evidence-output", str(evidence),
+        ])
+
+        with pytest.raises(SystemExit) as exc_info:
+            rex.main()
+
+        assert exc_info.value.code == 1
+        assert calls["n"] == 1
+        assert "resource-exhausted" in output.read_text(encoding="utf-8")
+        payload = json.loads(evidence.read_text(encoding="utf-8"))
+        assert payload["termination_cause"] == "oom"
+        assert payload["applicable_limit"] == "MemoryMax/MemorySwapMax"
+        assert payload["diagnostics"] == ["systemd scope result=oom-kill"]
+
 
 # ---------------------------------------------------------------------------
 # helpers/run_external.py  PR workdir sync (#449)

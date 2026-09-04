@@ -15,6 +15,8 @@ from .workdirs import active_workdir
 def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
     if not config.test_command:
         return
+    runner.configure_from_config(config)
+    runner.set_containment_role("test-gate")
     log(config, f"Running local test command: {' '.join(config.test_command)}")
     result = runner.run_test_command(
         config.test_command,
@@ -29,6 +31,8 @@ def run_optional_tests(runner: Runner, config: AgentLoopConfig) -> None:
 def run_pre_review_tests(runner: Runner, config: AgentLoopConfig) -> None:
     if not config.pre_review_tests or not config.test_command:
         return
+    runner.configure_from_config(config)
+    runner.set_containment_role("test-gate")
     log(config, f"Running pre-review test command: {' '.join(config.test_command)}")
     result = runner.run_test_command(
         config.test_command,
@@ -52,10 +56,24 @@ def _record_gate_observation(config: AgentLoopConfig, result) -> None:
         attempted_timeout_seconds=int(config.coder_test_command_timeout_seconds),
         policy_ceiling_seconds=int(config.coder_test_command_timeout_seconds),
         returncode=result.returncode,
+        containment=(result.containment.to_dict() if result.containment is not None else None),
     )
 
 
 def _raise_for_gate_result(result, config: AgentLoopConfig) -> None:
+    evidence = getattr(result, "containment", None)
+    if evidence is not None and evidence.resource_exhausted and result.outcome != "passed":
+        raise AgentLoopError(
+            "Local test command failed with resource-exhausted: "
+            f"limit={evidence.applicable_limit or 'cgroup resource limit'}; "
+            f"diagnostics={'; '.join(evidence.diagnostics) or 'see containment evidence'}\n"
+            f"last output:\n{result.output_tail}"
+        )
+    if evidence is not None and evidence.backend == "systemd-cgroup-v2" and not evidence.cleanup_confirmed:
+        raise AgentLoopError(
+            "Local test command cleanup-failed: managed scope emptiness was not confirmed; "
+            "do not retry until the scope is gone."
+        )
     if result.outcome == "timed_out":
         raise AgentLoopError(
             f"Local test command timed out after {int(config.coder_test_command_timeout_seconds)}s: "

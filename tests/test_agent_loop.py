@@ -28,6 +28,7 @@ from coding_review_agent_loop.cli import (
     run_task_loop,
 )
 from coding_review_agent_loop.comment_rendering import normalize_freeform_signature
+from coding_review_agent_loop.containment import ContainmentEvidence
 from coding_review_agent_loop.config import (
     default_agent_memory_dir,
     default_agent_workdir,
@@ -4693,6 +4694,82 @@ def test_orchestrator_retries_capture_diagnostics_as_tooling_failure(
     assert exc_info.value.failure_category == (
         "deterministic" if returncode != 0 else "transient"
     )
+
+
+def test_orchestrator_classifies_resource_exhaustion_with_diagnostics(tmp_path):
+    config = make_config(tmp_path, coder="codex", reviewer="codex", agent_max_retries=0)
+    result = AgentResult(
+        text="",
+        raw_output="",
+        returncode=137,
+        containment=ContainmentEvidence(
+            backend="systemd-cgroup-v2",
+            termination_cause="oom",
+            applicable_limit="MemoryMax/MemorySwapMax",
+            diagnostics=("systemd scope result=oom-kill",),
+        ),
+    )
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.run_agent_result", return_value=result
+    ):
+        with pytest.raises(AgentInvocationError) as exc_info:
+            _run_validated_agent(
+                FakeRunner(),
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="test",
+                validate=lambda value: value,
+            )
+
+    assert exc_info.value.failure_category == "resource-exhausted"
+    assert "MemoryMax/MemorySwapMax" in str(exc_info.value)
+    assert "systemd-cgroup-v2" in str(exc_info.value)
+
+
+def test_orchestrator_target_exec_error_without_command_result_is_retryable(tmp_path):
+    class TargetExecRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.decisions = []
+
+        def target_exec_retry_decision(self, command, errno_value):
+            self.decisions.append((command, errno_value))
+            return True, "target executable retryable"
+
+    config = make_config(tmp_path, coder="codex", reviewer="codex", agent_max_retries=0)
+    result = AgentResult(
+        text="",
+        raw_output="",
+        returncode=127,
+        containment=ContainmentEvidence(
+            backend="systemd-cgroup-v2",
+            termination_cause="target-exec-error",
+            target_exec_errno=2,
+            cleanup_confirmed=True,
+            diagnostics=("target exec failed (2): missing",),
+        ),
+    )
+    runner = TargetExecRunner()
+
+    with patch(
+        "coding_review_agent_loop.orchestrator.run_agent_result", return_value=result
+    ):
+        with pytest.raises(AgentInvocationError) as exc_info:
+            _run_validated_agent(
+                runner,
+                agent="codex",
+                config=config,
+                prompt="Review the PR.",
+                marker_description="test",
+                validate=lambda value: value,
+            )
+
+    assert exc_info.value.failure_category == "deterministic"
+    assert runner.decisions
+    assert all(command == "" and errno_value == 2 for command, errno_value in runner.decisions)
+    assert "target executable retryable" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("use_pty", [False, True])

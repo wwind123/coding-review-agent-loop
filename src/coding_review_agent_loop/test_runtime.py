@@ -32,6 +32,9 @@ DEFAULT_TEST_TIMEOUT_SECONDS = 1800
 RUNTIME_SCHEMA_VERSION = 1
 RUNTIME_SIDECAR_NAME = "test-runtime.json"
 RUNTIME_LOCK_NAME = "test-runtime.json.lock"
+COMMAND_LANE_LOCK_DIR = "command-lanes"
+OVERLAP_REJECTED_EXIT_CODE = 125
+OVERLAP_REJECTED_MESSAGE = "agent-loop: identical test command is already running in this invocation lane; wait for it to exit or terminate it explicitly."
 MAX_OBSERVATIONS_PER_COHORT = 20
 MAX_COHORTS = 200
 STALE_AFTER = timedelta(days=30)
@@ -40,6 +43,85 @@ _HASHED_ENV_VALUE_RE = re.compile(r"<sha256:[0-9a-f]{16}>")
 
 class TestRuntimeConfigurationError(AgentLoopError):
     """A wrapper policy was malformed or exceeded its inherited ceiling."""
+
+
+class CommandLaneLock:
+    """Non-inherited advisory lock for one canonical test command lane."""
+
+    def __init__(self, handle, path: Path, key: str):
+        self.handle = handle
+        self.path = path
+        self.key = key
+
+    @classmethod
+    def acquire(
+        cls,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str] | None = None,
+    ) -> "CommandLaneLock | None":
+        values = env if env is not None else os.environ
+        invocation_id = values.get("AGENT_LOOP_INVOCATION_ID", "standalone")
+        normalized = normalize_test_command(argv, cwd=cwd)
+        key = f"{cwd.resolve()}\0{normalized}\0{invocation_id}"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        root = Path(values.get("XDG_RUNTIME_DIR", "")) / "agent-loop" / COMMAND_LANE_LOCK_DIR
+        if str(root) == f"agent-loop/{COMMAND_LANE_LOCK_DIR}":
+            root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / COMMAND_LANE_LOCK_DIR
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            path = root / f"{digest}.lock"
+            handle = path.open("a+")
+            if os.name == "nt":
+                import msvcrt
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    handle.close()
+                    return None
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    handle.close()
+                    return None
+            # The descriptor is intentionally not inherited by subprocesses.
+            os.set_inheritable(handle.fileno(), False)
+            return cls(handle, path, key)
+        except OSError:
+            # A lock failure is not permission to run two potentially expensive
+            # copies.  Treat unavailable lock storage as a rejected lane.
+            return None
+
+    def close(self) -> None:
+        if self.handle.closed:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.handle.seek(0)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            self.handle.close()
+
+    def __enter__(self) -> "CommandLaneLock":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+def acquire_command_lane(
+    argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None
+) -> CommandLaneLock | None:
+    return CommandLaneLock.acquire(argv, cwd=cwd, env=env)
 
 
 @dataclass(frozen=True)
@@ -454,6 +536,8 @@ def record_test_observation(
     commit: str | None = None,
     environment: Mapping[str, str] | None = None,
     timestamp: datetime | None = None,
+    containment: Mapping[str, object] | None = None,
+    lane: str | None = None,
 ) -> bool:
     """Append a bounded observation; persistence failure never affects execution."""
     if memory_dir is None:
@@ -481,6 +565,12 @@ def record_test_observation(
                 "commit": commit or _git_commit(cwd),
                 "input_manifest": build_input_manifest(argv, cwd),
             }
+            if lane is not None:
+                observation["lane"] = lane
+            if containment is not None:
+                # Evidence is already bounded by the runner.  Keep only JSON
+                # values and expose unsupported telemetry explicitly.
+                observation["containment"] = dict(containment)
             rows = payload["observations"]
             rows.append(observation)
             by_cohort: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -577,13 +667,23 @@ def recommend_timeout(
             timestamped.append((stamp, index, row))
     timestamped.sort(key=lambda item: (item[0], item[1]))
     ordered = [row for _stamp, _index, row in timestamped]
-    successes = [row for row in ordered if row.get("outcome") == "passed" and isinstance(row.get("elapsed_seconds"), (int, float))]
+    # MemoryHigh/PSI pressure can make a successful run unusually slow.  Keep
+    # the gate operationally successful but do not let that sample inflate the
+    # learned timeout recommendation.
+    successes = [
+        row for row in ordered
+        if row.get("outcome") == "passed"
+        and not bool(isinstance(row.get("containment"), dict) and row["containment"].get("pressure"))
+        and isinstance(row.get("elapsed_seconds"), (int, float))
+    ]
     success_values = [float(row["elapsed_seconds"]) for row in successes]
     latest_success = next(
         (
             float(row["elapsed_seconds"])
             for row in reversed(ordered)
-            if row.get("outcome") == "passed" and isinstance(row.get("elapsed_seconds"), (int, float))
+            if row.get("outcome") == "passed"
+            and not bool(isinstance(row.get("containment"), dict) and row["containment"].get("pressure"))
+            and isinstance(row.get("elapsed_seconds"), (int, float))
         ),
         None,
     )

@@ -941,6 +941,11 @@ def _failure_category(
     """Classify a failure for logging: helps users decide whether to rerun or fix config/code."""
     if not text.strip():
         return "empty-response"
+    lowered = text.lower()
+    if "resource-exhausted" in lowered or "resource exhausted" in lowered:
+        return "resource-exhausted"
+    if "containment-indeterminate" in lowered or "cleanup-failed" in lowered:
+        return "containment-indeterminate"
     if _unsupported_model_classification_text(
         text,
         public_response=public_response,
@@ -2444,6 +2449,7 @@ def _run_validated_agent(
                 returncode=result.returncode,
                 usage=usage,
                 raw_backend_usage=result.raw_usage,
+                containment=(result.containment.to_dict() if result.containment is not None else None),
             )
 
         # A backend always loads the uniquely assigned public response file.
@@ -2491,6 +2497,70 @@ def _run_validated_agent(
                 # Let the existing agent-unavailable policy handle the valid
                 # envelope, even when the command itself failed.
                 text = artifact
+
+        containment = result.containment
+        target_exec_retryable = False
+        if (
+            containment is not None
+            and result.returncode is not None
+            and containment.resource_exhausted
+            # Validate a successful response before consulting cumulative
+            # cgroup counters. A recovered descendant can increment those
+            # counters while the invocation still returns a complete answer.
+            and not (result.returncode == 0 and text.strip())
+        ):
+            # Resource evidence is typed by the runner and takes precedence
+            # over provider/transient regexes.  A killed coder is not required
+            # to narrate its own OOM; response-file salvage above remains valid.
+            last_error = (
+                "agent invocation terminated as resource-exhausted"
+                f" (limit={containment.applicable_limit or 'cgroup resource limit'}; "
+                f"backend={containment.backend})"
+            )
+            last_classification_text = ""
+            last_failure_category = "resource-exhausted"
+            break
+        if (
+            containment is not None
+            and containment.termination_cause == "target-exec-error"
+        ):
+            decision = getattr(runner, "target_exec_retry_decision", None)
+            if decision is not None:
+                target_argv = (
+                    result.command_result.args
+                    if result.command_result is not None
+                    else ()
+                )
+                target_exec_retryable, detail = decision(
+                    target_argv[0] if target_argv else "",
+                    containment.target_exec_errno,
+                )
+            else:
+                detail = "agent target could not be executed; target exec error"
+            if target_exec_retryable:
+                last_error = detail
+                last_classification_text = detail
+                last_failure_category = "transient"
+            else:
+                last_error = (
+                    "agent target could not be executed; "
+                    + ("; ".join(containment.diagnostics) or detail)
+                )
+                last_classification_text = ""
+                last_failure_category = "deterministic"
+                break
+        if (
+            containment is not None
+            and containment.backend == "systemd-cgroup-v2"
+            and not containment.cleanup_confirmed
+        ):
+            last_error = (
+                "agent invocation cleanup-failed: managed scope emptiness was not "
+                "confirmed; retry is blocked until the invocation tree is gone"
+            )
+            last_classification_text = ""
+            last_failure_category = "containment-indeterminate"
+            break
 
         if result.self_update_replay_refusal_kind is not None:
             refusal_detail = result.self_update_replay_refusal_detail or (
@@ -2603,11 +2673,25 @@ def _run_validated_agent(
         if result.returncode != 0 and artifact_unavailable is None:
             last_error = f"agent command exited with {result.returncode}"
             classification_text = _agent_failure_classification_text(result, phase="command")
+            if target_exec_retryable:
+                target_argv = (
+                    result.command_result.args
+                    if result.command_result is not None
+                    else ()
+                )
+                last_error = str(
+                    getattr(runner, "target_exec_retry_decision")(
+                        target_argv[0] if target_argv else "",
+                        containment.target_exec_errno,
+                    )[1]
+                )
+                classification_text = f"{last_error}\n{classification_text}".strip()
             if result.command_result is not None and result.command_result.capture_diagnostics:
                 classification_text += "\nsubprocess capture unavailable; retryable tooling failure"
             last_classification_text = classification_text
             should_retry = (
-                replacement_stability_failed
+                target_exec_retryable
+                or replacement_stability_failed
                 or bool(result.command_result and result.command_result.capture_diagnostics)
                 or _is_transient_agent_output(classification_text)
             )
@@ -3246,6 +3330,7 @@ def _run_validated_agent(
         message,
         failure_category=last_failure_category,
         terminal_public_response=terminal_public_response,
+        containment=last_result.containment if last_result is not None else None,
     )
 
 

@@ -268,6 +268,35 @@ def _coder_local_test_scope_guidance(
         )
         + ". Reserve agent-unavailable for a genuine environment/tooling "
         "failure, not an ordinary slow test.\n"
+        + containment_prompt_guidance(config)
+    )
+
+
+def containment_prompt_guidance(config: AgentLoopConfig | None) -> str:
+    """Explain the mechanical resource boundary without exposing protocol markers."""
+    if config is None:
+        return (
+            "The managed test wrapper uses the configured agent-loop containment "
+            "lane. Never relaunch an identical test command until its previous "
+            "managed attempt has exited or has been explicitly terminated.\n"
+        )
+    try:
+        policy = config.containment_policy
+        aggregate = policy.aggregate.to_dict()
+        role = policy.role_limits("test-gate").to_dict()
+        resolved = f"aggregate={aggregate}; test-gate child={role}"
+    except Exception:  # pragma: no cover - guidance must never block a prompt
+        resolved = "resolved limits are unavailable until local preflight"
+    return (
+        f"Process-tree containment mode is `{config.containment_mode}` ({resolved}). "
+        "On Linux with systemd 253+ and delegated cgroup v2, the same user-scoped "
+        "aggregate slice bounds all agent and test-gate descendants. The foreground "
+        "scope command omits `--wait`; an internal target-start report separates "
+        "launcher failures from target exits. On unsupported hosts, agent-loop visibly "
+        "uses process-group TERM/KILL with deterministic cleanup but no memory ceiling. "
+        "Never relaunch an identical test command until its previous managed attempt "
+        "has exited or has been explicitly terminated; free-form agent logs cannot "
+        "deduplicate unwrapped commands.\n"
     )
 
 

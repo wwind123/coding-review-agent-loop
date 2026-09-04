@@ -99,6 +99,7 @@ class UsageCallRecord:
     ] | None = None
     log_path: str | None = None
     fallback_planned: bool | None = None
+    containment: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -111,7 +112,7 @@ class UsageCallRecord:
         }
         if self.raw_backend_usage is not None:
             payload["raw_backend_usage"] = self.raw_backend_usage
-        for key in ("role", "model", "outcome", "log_path", "fallback_planned"):
+        for key in ("role", "model", "outcome", "log_path", "fallback_planned", "containment"):
             value = getattr(self, key)
             if value is not None:
                 payload[key] = value
@@ -210,6 +211,7 @@ class RunUsageContext:
         ] | None = None,
         log_path: str | None = None,
         fallback_planned: bool | None = None,
+        containment: dict[str, object] | None = None,
     ) -> UsageCallRecord:
         with self._lock:
             record = UsageCallRecord(
@@ -224,6 +226,7 @@ class RunUsageContext:
                 outcome=outcome,
                 log_path=log_path,
                 fallback_planned=fallback_planned,
+                containment=containment,
             )
             self._next_call_id += 1
             self.records.append(record)

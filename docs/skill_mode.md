@@ -26,6 +26,30 @@ skill mode performs host turns in the already-running Claude Code session.
 Replacing or updating the executable on disk therefore affects a later CLI turn
 but not the host turns already running in the current skill session.
 
+### Containment and test gates
+
+External skill agents and the skill-mode test gate use the same shared
+containment policy as the standalone CLI. On a Linux host with systemd 253+
+and delegated cgroup v2, a unique foreground child scope runs under the
+per-user `agent-loop.slice`; aggregate and role-specific memory, swap, and
+task limits protect host headroom across simultaneous processes. The exact
+launcher is `systemd-run --user --scope --quiet` without `--wait`, `--service`,
+or `--pipe`. Use the standalone `agent-loop containment-preflight` command to
+inspect capabilities and resolved defaults before a live skill run.
+
+Unsupported hosts visibly use process-group termination with no memory-ceiling
+claim. `required` mode is available to fail closed. Optional peak, PSI, and
+swap files are capability-aware. Resource-limit termination is reported as
+`resource-exhausted`; pressure is not reported as a kill cause. The managed
+test wrapper rejects an identical same-lane command until the prior attempt
+exits or is explicitly terminated. The interactive Claude host session and
+arbitrary descendants remain part of that host session, so prompt guidance and
+the wrapper are the available boundaries for in-session work.
+
+The skill-mode test gate reads `AGENT_LOOP_CONTAINMENT_MODE` (`auto`,
+`required`, or `off`; default `auto`). This selects the same fallback or
+fail-closed behavior as the standalone CLI.
+
 ## Architecture
 
 ```
