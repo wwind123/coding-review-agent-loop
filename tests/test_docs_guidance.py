@@ -71,6 +71,25 @@ def test_readme_documents_same_repo_concurrency_limit():
     assert "system temporary directory (`/tmp` on Linux)" in section
 
 
+def test_readme_documents_review_and_approval_semantics():
+    readme_text = README.read_text(encoding="utf-8")
+    section_start = readme_text.index('### What "review" and "approval" mean')
+    section_end = readme_text.index("## Current Limitations", section_start)
+    section = " ".join(readme_text[section_start:section_end].split())
+
+    assert "not a native GitHub pull-request review" in section
+    assert (
+        "does not satisfy a branch-protection rule that requires approving GitHub reviews"
+        in section
+    )
+    assert (
+        "The agent CLIs normally share the GitHub identity authenticated through `gh`, "
+        "so their model signatures identify protocol participants rather than distinct "
+        "GitHub accounts."
+        in section
+    )
+
+
 def test_readme_documents_ci_watcher_controls():
     readme_text = README.read_text(encoding="utf-8")
     section_start = readme_text.index("## CI and Merge")

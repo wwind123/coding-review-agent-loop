@@ -215,6 +215,22 @@ requirements and remain approval-critical. See
 [Human requirements](docs/local_agent_loop.md#human-requirements) for the exact
 contract.
 
+### What "review" and "approval" mean
+
+Agent-loop publishes model reviews as structured comments in the pull
+request's conversation. An `Approved` verdict means that the named model
+approved the recorded PR head under agent-loop's protocol. It is not a native
+GitHub pull-request review, does not populate GitHub's **Reviewers** or
+**Reviews** panels, and does not satisfy a branch-protection rule that requires
+approving GitHub reviews.
+
+The agent CLIs normally share the GitHub identity authenticated through `gh`,
+so their model signatures identify protocol participants rather than distinct
+GitHub accounts. If a repository requires native GitHub approvals, obtain them
+separately from an eligible human, bot, or GitHub App identity. GitHub's own
+merge protections remain in force in addition to agent-loop's reviewer and CI
+gates.
+
 ## Current Limitations
 
 - Run only one active `agent-loop` invocation per repository per machine. The
