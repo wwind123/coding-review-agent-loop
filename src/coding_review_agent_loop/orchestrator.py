@@ -2499,10 +2499,15 @@ def _run_validated_agent(
                 text = artifact
 
         containment = result.containment
+        target_exec_retryable = False
         if (
             containment is not None
             and result.returncode is not None
             and containment.resource_exhausted
+            # Validate a successful response before consulting cumulative
+            # cgroup counters. A recovered descendant can increment those
+            # counters while the invocation still returns a complete answer.
+            and not (result.returncode == 0 and text.strip())
         ):
             # Resource evidence is typed by the runner and takes precedence
             # over provider/transient regexes.  A killed coder is not required
@@ -2519,13 +2524,25 @@ def _run_validated_agent(
             containment is not None
             and containment.termination_cause == "target-exec-error"
         ):
-            last_error = (
-                "agent target could not be executed; "
-                + ("; ".join(containment.diagnostics) or "target exec error")
-            )
-            last_classification_text = ""
-            last_failure_category = "deterministic"
-            break
+            decision = getattr(runner, "target_exec_retry_decision", None)
+            if decision is not None:
+                target_exec_retryable, detail = decision(
+                    result.args[0], containment.target_exec_errno
+                )
+            else:
+                detail = "agent target could not be executed; target exec error"
+            if target_exec_retryable:
+                last_error = detail
+                last_classification_text = detail
+                last_failure_category = "transient"
+            else:
+                last_error = (
+                    "agent target could not be executed; "
+                    + ("; ".join(containment.diagnostics) or detail)
+                )
+                last_classification_text = ""
+                last_failure_category = "deterministic"
+                break
         if (
             containment is not None
             and containment.backend == "systemd-cgroup-v2"
@@ -2650,11 +2667,19 @@ def _run_validated_agent(
         if result.returncode != 0 and artifact_unavailable is None:
             last_error = f"agent command exited with {result.returncode}"
             classification_text = _agent_failure_classification_text(result, phase="command")
+            if target_exec_retryable:
+                last_error = str(
+                    getattr(runner, "target_exec_retry_decision")(
+                        result.args[0], containment.target_exec_errno
+                    )[1]
+                )
+                classification_text = f"{last_error}\n{classification_text}".strip()
             if result.command_result is not None and result.command_result.capture_diagnostics:
                 classification_text += "\nsubprocess capture unavailable; retryable tooling failure"
             last_classification_text = classification_text
             should_retry = (
-                replacement_stability_failed
+                target_exec_retryable
+                or replacement_stability_failed
                 or bool(result.command_result and result.command_result.capture_diagnostics)
                 or _is_transient_agent_output(classification_text)
             )

@@ -90,6 +90,9 @@ manager, not cross-user host isolation. A skill host's in-session Claude turn
 and arbitrary descendants remain part of that host session; use the managed
 wrapper for test gates and external skill agents for the mechanical boundary.
 
+In skill mode, the test-gate policy is selected with
+`AGENT_LOOP_CONTAINMENT_MODE=auto|required|off` (default `auto`).
+
 ## Install
 
 Clone the repository and install it into a virtual environment:

@@ -247,6 +247,9 @@ that disappears unexpectedly is indeterminate. OOM, hard memory/swap, and
 `TasksMax` termination is `resource-exhausted`, while `MemoryHigh` and PSI are
 pressure diagnostics and do not by themselves claim to have killed a process.
 
+When the Claude skill invokes its local test gate, the mode can also be selected
+with `AGENT_LOOP_CONTAINMENT_MODE=auto|required|off` (default `auto`).
+
 Each scope contains a target-start/target-exec-error shim. A missing shim
 report means launcher or unit creation failure regardless of the numeric
 systemd exit status. A target-start report binds numeric statuses, including 1

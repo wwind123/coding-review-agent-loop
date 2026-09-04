@@ -96,6 +96,8 @@ class CommandLaneLock:
             return None
 
     def close(self) -> None:
+        if self.handle.closed:
+            return
         try:
             if os.name == "nt":
                 import msvcrt

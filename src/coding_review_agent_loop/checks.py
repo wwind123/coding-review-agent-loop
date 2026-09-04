@@ -62,7 +62,7 @@ def _record_gate_observation(config: AgentLoopConfig, result) -> None:
 
 def _raise_for_gate_result(result, config: AgentLoopConfig) -> None:
     evidence = getattr(result, "containment", None)
-    if evidence is not None and evidence.resource_exhausted:
+    if evidence is not None and evidence.resource_exhausted and result.outcome != "passed":
         raise AgentLoopError(
             "Local test command failed with resource-exhausted: "
             f"limit={evidence.applicable_limit or 'cgroup resource limit'}; "

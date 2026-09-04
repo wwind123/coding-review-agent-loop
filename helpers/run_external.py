@@ -447,6 +447,7 @@ def main() -> None:
     for attempt in range(1, max_attempts + 1):
         candidate = None
         mechanical_failure = False
+        target_exec_retryable = False
         try:
             candidate = backend.run(
                 runner,
@@ -473,6 +474,17 @@ def main() -> None:
                     + ("; ".join(evidence.diagnostics) or "see invocation evidence")
                 )
                 mechanical_failure = True
+            elif evidence.termination_cause == "target-exec-error":
+                decision = getattr(runner, "target_exec_retry_decision", None)
+                if decision is not None:
+                    target_exec_retryable, failure_text = decision(
+                        candidate.command_result.args[0]
+                        if candidate.command_result is not None
+                        else "",
+                        evidence.target_exec_errno,
+                    )
+                else:
+                    failure_text = "agent target could not be executed"
             elif evidence.backend == "systemd-cgroup-v2" and not evidence.cleanup_confirmed:
                 failure_text = (
                     "containment-indeterminate: managed invocation cleanup could not be confirmed; "
@@ -480,7 +492,11 @@ def main() -> None:
                 )
                 mechanical_failure = True
 
-        transient = False if mechanical_failure else is_transient_agent_output(failure_text or "")
+        transient = (
+            False
+            if mechanical_failure
+            else target_exec_retryable or is_transient_agent_output(failure_text or "")
+        )
         capacity = classify_antigravity_capacity(
             failure_text or "",
             returncode=(candidate.returncode if candidate is not None else 1),

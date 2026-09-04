@@ -46,6 +46,10 @@ exits or is explicitly terminated. The interactive Claude host session and
 arbitrary descendants remain part of that host session, so prompt guidance and
 the wrapper are the available boundaries for in-session work.
 
+The skill-mode test gate reads `AGENT_LOOP_CONTAINMENT_MODE` (`auto`,
+`required`, or `off`; default `auto`). This selects the same fallback or
+fail-closed behavior as the standalone CLI.
+
 ## Architecture
 
 ```

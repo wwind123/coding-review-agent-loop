@@ -108,7 +108,10 @@ def parse_limit(value: object, *, name: str, total_bytes: int | None = None) -> 
             if total_bytes is None:
                 raise AgentLoopError(f"{name} percentage needs a host memory total.")
             return int(total_bytes * number / 100)
-        match = re.fullmatch(r"([+]?(?:\d+(?:\.\d*)?|\.\d+))\s*([kmgtpe]?i?b)?", raw)
+        match = re.fullmatch(
+            r"([+]?(?:\d+(?:\.\d*)?|\.\d+))\s*(b|[kmgtpe]i?b?)?",
+            raw,
+        )
         if not match:
             raise AgentLoopError(f"{name} must be bytes, a percentage, or 'max'.")
         number = _finite_number(match.group(1), name=name)
@@ -140,7 +143,10 @@ def parse_limit(value: object, *, name: str, total_bytes: int | None = None) -> 
             "ei": 1024**6,
             "eib": 1024**6,
         }
-        result = number * multipliers[suffix]
+        multiplier = multipliers.get(suffix)
+        if multiplier is None:
+            raise AgentLoopError(f"{name} must be bytes, a percentage, or 'max'.")
+        result = number * multiplier
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
         result = _finite_number(value, name=name)
     else:
@@ -188,9 +194,13 @@ class ResourceLimits:
                 return left
             return min(left, right)
 
+        memory_max = minimum(self.memory_max, other.memory_max)
+        memory_high = minimum(self.memory_high, other.memory_high)
+        if memory_high is not None and memory_max is not None:
+            memory_high = min(memory_high, memory_max)
         return ResourceLimits(
-            minimum(self.memory_high, other.memory_high),
-            minimum(self.memory_max, other.memory_max),
+            memory_high,
+            memory_max,
             minimum(self.memory_swap_max, other.memory_swap_max),
             minimum(self.tasks_max, other.tasks_max),
         ).validate()
@@ -288,9 +298,23 @@ def default_policy(
 ) -> ContainmentPolicy:
     total = host_memory_bytes()
     usable = max(1, int(total * (100 - _finite_number(os_headroom_percent, name="containment OS headroom")) / 100))
+    resolved_memory_max = parse_limit(
+        memory_max if memory_max is not None else usable,
+        name="aggregate MemoryMax",
+        total_bytes=total,
+    )
+    default_memory_high = (
+        int(resolved_memory_max * 0.87)
+        if resolved_memory_max is not None
+        else int(usable * 0.87)
+    )
     aggregate = ResourceLimits(
-        parse_limit(memory_high if memory_high is not None else int(usable * 0.87), name="aggregate MemoryHigh", total_bytes=total),
-        parse_limit(memory_max if memory_max is not None else usable, name="aggregate MemoryMax", total_bytes=total),
+        parse_limit(
+            memory_high if memory_high is not None else default_memory_high,
+            name="aggregate MemoryHigh",
+            total_bytes=total,
+        ),
+        resolved_memory_max,
         parse_limit(memory_swap_max if memory_swap_max is not None else 0, name="aggregate MemorySwapMax", total_bytes=total),
         parse_tasks_limit(tasks_max if tasks_max is not None else min(8192, max(1024, (os.sysconf("SC_CHILD_MAX") if hasattr(os, "sysconf") else 4096))), name="aggregate TasksMax"),
     )
@@ -411,7 +435,7 @@ def _counter_capabilities(cgroup_root: Path) -> tuple[tuple[str, ...], tuple[str
 def _probe_argv(policy: ContainmentPolicy, *, unit: str, report: Path) -> list[str]:
     return build_scope_argv(
         policy,
-        ("/bin/sleep", "2"),
+        (sys.executable, "-c", "import time; time.sleep(2)"),
         report_path=report,
         unit_name=unit,
         limits=policy.aggregate,
@@ -500,6 +524,10 @@ def preflight_containment(policy: ContainmentPolicy, *, cgroup_root: Path = Path
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+            if process is not None:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
             report.unlink(missing_ok=True)
     else:
         supported, unavailable, required_missing = _counter_capabilities(cgroup_root)
@@ -601,23 +629,20 @@ class AggregateLease:
             }
             state = leases + [row]
             _write_leases(state_path, state)
-        lease = cls(policy, effective, row["lease_id"], root)
-        if not _apply_slice_properties(policy, effective):
-            # Do not leave a lease behind when the aggregate ceiling could not
-            # be applied.  In auto mode InvocationHandle.prepare turns this
-            # into the explicit process-group fallback; required mode fails
-            # closed in the same way as preflight.
-            with lock_path.open("a+") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            lease = cls(policy, effective, row["lease_id"], root)
+            if not _apply_slice_properties(policy, effective):
+                # Keep the lease state and systemd property update under the
+                # same lock so concurrent processes cannot publish a weaker
+                # ceiling after this process computes the strictest one.
                 _write_leases(
                     state_path,
-                    [candidate for candidate in _load_leases(state_path)
+                    [candidate for candidate in state
                      if candidate.get("lease_id") != lease.lease_id],
                 )
-            raise AgentLoopError(
-                f"aggregate slice properties could not be applied to {policy.slice_name}"
-            )
-        return lease
+                raise AgentLoopError(
+                    f"aggregate slice properties could not be applied to {policy.slice_name}"
+                )
+            return lease
 
     def close(self) -> None:
         if self._closed:
@@ -773,11 +798,21 @@ class InvocationHandle:
     cleanup_confirmed: bool = False
     termination_cause: str | None = None
     applicable_limit: str | None = None
+    target_exec_errno: int | None = None
     diagnostics: tuple[str, ...] = ()
+    _resource_result: str | None = field(default=None, repr=False, compare=False)
 
     @classmethod
-    def prepare(cls, policy: ContainmentPolicy, *, role: str, target_argv: Sequence[str], env: Mapping[str, str] | None = None) -> "InvocationHandle":
-        manifest = preflight_containment(policy)
+    def prepare(
+        cls,
+        policy: ContainmentPolicy,
+        *,
+        role: str,
+        target_argv: Sequence[str],
+        env: Mapping[str, str] | None = None,
+        manifest: CapabilityManifest | None = None,
+    ) -> "InvocationHandle":
+        manifest = manifest or preflight_containment(policy)
         invocation_id = (env or {}).get("AGENT_LOOP_INVOCATION_ID") or uuid.uuid4().hex
         limits = policy.role_limits(role)
         diagnostics: tuple[str, ...] = ()
@@ -825,12 +860,56 @@ class InvocationHandle:
         return report
 
     def terminate(self, *, signal_name: str = "TERM") -> None:
-        self.termination_cause = "interrupt" if signal_name == "TERM" else "killed"
+        if self.termination_cause is None:
+            self.termination_cause = "interrupt" if signal_name == "TERM" else "killed"
         if self.managed and shutil.which(self.policy.systemctl):
             try:
                 subprocess.run((self.policy.systemctl, "--user", "kill", "--kill-who=all", "--signal", signal_name, self.unit_name), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=5)
             except (OSError, subprocess.TimeoutExpired) as exc:
                 self.diagnostics += (f"scope termination failed: {exc}",)
+
+    def refresh_resource_status(self) -> str | None:
+        """Capture a terminal systemd resource result before the scope vanishes."""
+        if not self.managed or shutil.which(self.policy.systemctl) is None:
+            return None
+        try:
+            result = subprocess.run(
+                (
+                    self.policy.systemctl,
+                    "--user",
+                    "show",
+                    self.unit_name,
+                    "-p",
+                    "Result",
+                    "--value",
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        value = (result.stdout or "").strip()
+        if "=" in value:
+            value = value.split("=", 1)[1].strip()
+        if not value:
+            return None
+        self._resource_result = value
+        if self.termination_cause is None and value == "oom-kill":
+            self.termination_cause = "oom"
+            self.applicable_limit = self.applicable_limit or "MemoryMax/MemorySwapMax"
+        elif self.termination_cause is None and value == "resources":
+            self.termination_cause = "tasks-max"
+            self.applicable_limit = self.applicable_limit or "TasksMax"
+        if value in {"oom-kill", "resources"}:
+            diagnostic = f"systemd scope result={value}"
+            if diagnostic not in self.diagnostics:
+                self.diagnostics += (diagnostic,)
+        return value
 
     def confirm_empty(self, *, timeout: float = 2.0) -> bool:
         if not self.managed:
@@ -859,7 +938,7 @@ class InvocationHandle:
             time.sleep(0.05)
         report = self.refresh_report()
         self.cleanup_confirmed = self._unit_inactive() and (
-            self.cgroup_path is None or not self._cgroup_members()
+            self.cgroup_path is None or self._cgroup_members() == []
         )
         return self.cleanup_confirmed
 
@@ -925,8 +1004,7 @@ def cgroup_path_for_pid(pid: int, *, root: Path = Path("/sys/fs/cgroup")) -> Pat
     for line in text.splitlines():
         if line.startswith("0::"):
             relative = line[3:].strip().lstrip("/")
-            candidate = root / relative
-            return candidate if candidate.exists() else candidate
+            return root / relative
     return None
 
 
@@ -975,15 +1053,17 @@ class ContainmentEvidence:
     after: Mapping[str, object] = field(default_factory=dict)
     termination_cause: str | None = None
     applicable_limit: str | None = None
+    target_exec_errno: int | None = None
     pressure: bool = False
     cleanup_confirmed: bool = False
     diagnostics: tuple[str, ...] = ()
 
     @property
     def resource_exhausted(self) -> bool:
-        events = self.after.get("memory.events", {})
-        pids = self.after.get("pids.events", {})
-        return bool(isinstance(events, dict) and (events.get("oom_kill", 0) or events.get("oom", 0))) or bool(isinstance(pids, dict) and pids.get("max", 0))
+        # cgroup event files are cumulative. A descendant can increment one
+        # while the target still returns a valid response, so counters alone
+        # are not an invocation-level failure signal.
+        return self.termination_cause in {"oom", "tasks-max", "memory-swap-max"}
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -994,7 +1074,9 @@ class ContainmentEvidence:
             "unavailable_counters": list(self.unavailable_counters),
             "before": dict(self.before), "after": dict(self.after),
             "termination_cause": self.termination_cause,
-            "applicable_limit": self.applicable_limit, "pressure": self.pressure,
+            "applicable_limit": self.applicable_limit,
+            "target_exec_errno": self.target_exec_errno,
+            "pressure": self.pressure,
             "cleanup_confirmed": self.cleanup_confirmed, "diagnostics": list(self.diagnostics),
         }
 
@@ -1004,12 +1086,12 @@ def evidence_for(handle: InvocationHandle, before: Mapping[str, object], after: 
     pids = after.get("pids.events", {})
     limit = None
     cause = termination_cause or handle.termination_cause
-    if isinstance(events, dict) and (events.get("oom_kill", 0) or events.get("oom", 0)):
-        cause = "oom"
-        limit = "MemoryMax/MemoryHigh"
-    elif isinstance(pids, dict) and pids.get("max", 0):
-        cause = "tasks-max"
-        limit = "TasksMax"
+    if cause == "oom":
+        limit = handle.applicable_limit or "MemoryMax/MemorySwapMax"
+    elif cause == "tasks-max":
+        limit = handle.applicable_limit or "TasksMax"
+    elif cause == "memory-swap-max":
+        limit = handle.applicable_limit or "MemorySwapMax"
     if handle.termination_cause is None and handle.diagnostics:
         if any("target exec failed" in item for item in handle.diagnostics):
             cause = "target-exec-error"
@@ -1025,6 +1107,7 @@ def evidence_for(handle: InvocationHandle, before: Mapping[str, object], after: 
         unavailable_counters=manifest.unavailable_counters,
         before=before, after=after, termination_cause=cause,
         applicable_limit=limit, pressure=pressure,
+        target_exec_errno=handle.target_exec_errno,
         cleanup_confirmed=handle.cleanup_confirmed if cleanup_confirmed is None else cleanup_confirmed,
         diagnostics=handle.diagnostics,
     )

@@ -62,6 +62,9 @@ structured hook. In-session Claude and arbitrary descendants remain part of
 the host session; use the managed wrapper for test gates and external agents
 for the mechanical containment boundary.
 
+Skill-mode test gates select this policy with
+`AGENT_LOOP_CONTAINMENT_MODE=auto|required|off`; the default is `auto`.
+
 ## How to invoke this skill
 
 Open a Claude Code session **in the `coding-review-agent-loop` repo root** (or

@@ -318,15 +318,25 @@ def run_foreground_test(
             handle.diagnostics += ("no authoritative target shim report; launcher failure",)
         if handle.managed and report is not None and report.state == "target-exec-error":
             target_exec_error = True
+            handle.target_exec_errno = report.errno_value
             handle.diagnostics += (
                 f"target exec failed ({report.errno_value}): {report.error or 'unknown error'}",
             )
-        handle.confirm_empty()
+        handle.refresh_resource_status()
+        final_cgroup = {
+            **last_cgroup,
+            **sample_cgroup(handle.cgroup_path, handle.capabilities),
+        }
+        cleanup_confirmed = _confirm_containment_empty(handle)
+        # A scope may disappear during confirm_empty after systemd has recorded
+        # its terminal result. Keep the pre-cleanup cgroup sample and refresh
+        # the unit result once more for OOM/resource diagnostics.
+        handle.refresh_resource_status()
         evidence = evidence_for(
             handle, before_cgroup, {
-                **last_cgroup,
-                **sample_cgroup(handle.cgroup_path, handle.capabilities),
-            }
+                **final_cgroup,
+            },
+            cleanup_confirmed=cleanup_confirmed,
         )
         handle.close()
         if handle.managed and report is None and returncode == 0:
@@ -368,6 +378,14 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
         except ProcessLookupError:
             pass
         proc.wait()
+
+
+def _confirm_containment_empty(handle: InvocationHandle, *, timeout: float = 2.0) -> bool:
+    """Confirm scope cleanup, escalating once if descendants ignore TERM."""
+    if handle.confirm_empty(timeout=timeout):
+        return True
+    handle.terminate(signal_name="KILL")
+    return handle.confirm_empty(timeout=timeout)
 
 
 # Matches ANSI/VT100 control sequences (CSI, OSC, charset selection) that a
@@ -509,7 +527,13 @@ class Runner:
         # mode has already failed closed in preflight_containment.
         if manifest is None:
             return None
-        handle = InvocationHandle.prepare(self.containment_policy, role=role, target_argv=cmd, env=env)
+        handle = InvocationHandle.prepare(
+            self.containment_policy,
+            role=role,
+            target_argv=cmd,
+            env=env,
+            manifest=manifest,
+        )
         with self._active_procs_lock:
             if self._interrupted:
                 handle.close()
@@ -523,6 +547,20 @@ class Runner:
         with self._active_procs_lock:
             self._active_handles.pop(handle.invocation_id, None)
         handle.close()
+
+    def _cleanup_new_containment_handles(self, existing: set[str]) -> None:
+        """Terminate and close handles leaked by an exceptional run path."""
+        with self._active_procs_lock:
+            handles = [
+                handle for invocation_id, handle in self._active_handles.items()
+                if invocation_id not in existing
+            ]
+        for handle in handles:
+            try:
+                handle.terminate()
+                _confirm_containment_empty(handle)
+            finally:
+                self._close_containment(handle)
 
     def remember_agent_command(
         self,
@@ -570,9 +608,7 @@ class Runner:
         # Escalate once after the bounded TERM confirmation window; ordinary
         # invocation cleanup will finish unregistering the handle.
         for handle in handles:
-            if not handle.confirm_empty(timeout=2.0):
-                handle.terminate(signal_name="KILL")
-                handle.confirm_empty(timeout=2.0)
+            _confirm_containment_empty(handle, timeout=2.0)
 
     def _override_flag_for(self, command: str) -> str:
         override_flag = self._command_override_flags.get(command)
@@ -608,6 +644,23 @@ class Runner:
             f"{_SPAWN_ATTEMPTS} spawn attempts and may be updating; "
             f"retry shortly or pass {override_flag} <path>."
         )
+
+    def target_exec_retry_decision(
+        self, command: str, errno_value: int | None
+    ) -> tuple[bool, str]:
+        """Apply the same bounded PATH-race policy to a contained shim error."""
+        if os.path.isabs(command):
+            return False, str(self._missing_command_error(command))
+        with self._commands_lock:
+            preflighted = command in self._preflighted_commands
+        if errno_value == errno.ENOEXEC and preflighted:
+            return True, str(self._command_non_executable_after_preflight_error(command))
+        current = shutil.which(command)
+        if errno_value == errno.ENOENT and preflighted and current is None:
+            return True, str(self._command_disappeared_after_preflight_error(command))
+        if errno_value == errno.ENOENT and not preflighted:
+            return False, str(self._missing_command_error(command))
+        return False, f"{command} target execution failed (errno={errno_value})"
 
     @staticmethod
     def _is_dangling_symlink(path: str | None) -> bool:
@@ -770,6 +823,42 @@ class Runner:
         timeout_seconds: float | None = None,
         containment_role: str | None = None,
     ) -> CommandResult:
+        """Run a command and clean any newly admitted scope on all exceptions."""
+        with self._active_procs_lock:
+            existing = set(self._active_handles)
+        try:
+            return self._run_with_log_impl(
+                args,
+                cwd=cwd,
+                log_path=log_path,
+                label=label,
+                progress_interval_seconds=progress_interval_seconds,
+                check=check,
+                env=env,
+                input_text=input_text,
+                use_pty=use_pty,
+                timeout_seconds=timeout_seconds,
+                containment_role=containment_role,
+            )
+        except BaseException:
+            self._cleanup_new_containment_handles(existing)
+            raise
+
+    def _run_with_log_impl(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path,
+        log_path: Path,
+        label: str,
+        progress_interval_seconds: int,
+        check: bool = True,
+        env: Mapping[str, str] | None = None,
+        input_text: str | None = None,
+        use_pty: bool = False,
+        timeout_seconds: float | None = None,
+        containment_role: str | None = None,
+    ) -> CommandResult:
         cmd = [str(a) for a in args]
         if self.dry_run:
             print(f"[dry-run] ({cwd}) {' '.join(cmd)}")
@@ -849,7 +938,7 @@ class Runner:
                     spawn_monotonic = time.monotonic()
                     before_identity = executable_identity(cmd[0])
                     try:
-                        proc = spawn()
+                        proc, spawn_wall_time, spawn_monotonic, before_identity = self._spawn_with_retry(cmd, spawn)
                     except OSError:
                         self._close_containment(handle)
                         raise
@@ -894,7 +983,7 @@ class Runner:
                         handle.terminate()
                     self._terminate_process_group(proc)
                     if handle is not None:
-                        handle.confirm_empty()
+                        _confirm_containment_empty(handle)
                         self._close_containment(handle)
                     raise
                 finally:
@@ -910,6 +999,7 @@ class Runner:
                         "no authoritative target shim report; launcher/unit failure"
                     )
                 elif handle.managed and report is not None and report.state == "target-exec-error":
+                    handle.target_exec_errno = report.errno_value
                     detail = f"target exec failed ({report.errno_value}): {report.error or 'unknown error'}"
                     capture_diagnostics.append(detail)
                     handle.diagnostics += (detail,)
@@ -918,11 +1008,18 @@ class Runner:
                     # target exits 1 and 203.  A missing report is never
                     # interpreted from systemd-run's numeric status.
                     returncode = report.returncode
-                handle.confirm_empty()
+                handle.refresh_resource_status()
+                final_cgroup = {
+                    **last_cgroup,
+                    **sample_cgroup(handle.cgroup_path, handle.capabilities),
+                }
+                cleanup_confirmed = _confirm_containment_empty(handle)
+                handle.refresh_resource_status()
                 containment_evidence = evidence_for(
                     handle,
                     {},
-                    {**last_cgroup, **sample_cgroup(handle.cgroup_path, handle.capabilities)},
+                    final_cgroup,
+                    cleanup_confirmed=cleanup_confirmed,
                 )
                 self._close_containment(handle)
                 if handle.managed and report is None and returncode == 0:
@@ -1015,6 +1112,7 @@ class Runner:
             log_file.write(header.encode("utf-8"))
             log_file.flush()
             allocated_fds: tuple[int, int] | None = None
+            launch_env = {**os.environ, **env} if env is not None else dict(os.environ)
 
             def spawn_pty() -> subprocess.Popen[bytes]:
                 nonlocal allocated_fds
@@ -1029,7 +1127,7 @@ class Runner:
                         stderr=slave_fd,
                         close_fds=True,
                         start_new_session=True,
-                        env={**os.environ, **env} if env is not None else None,
+                        env=launch_env,
                     )
                 except BaseException:
                     os.close(master_fd)
@@ -1042,9 +1140,9 @@ class Runner:
                 role=containment_role or self._containment_role or self._role_from_label(label),
                 env=env,
             )
-            if handle is not None and handle.managed:
-                launch_env = {**os.environ, **env} if env is not None else dict(os.environ)
+            if handle is not None:
                 launch_env["AGENT_LOOP_INVOCATION_ID"] = handle.invocation_id
+            if handle is not None and handle.managed:
                 # The closure reads this merged environment when the launcher
                 # is spawned.  Keep the PTY slave and regular descriptors
                 # inherited exactly as in the uncontained path.
@@ -1073,7 +1171,7 @@ class Runner:
                 spawn_monotonic = time.monotonic()
                 before_identity = executable_identity(cmd[0])
                 try:
-                    proc = spawn_fn()
+                    proc, spawn_wall_time, spawn_monotonic, before_identity = self._spawn_with_retry(cmd, spawn_fn)
                 except OSError:
                     self._close_containment(handle)
                     raise
@@ -1155,7 +1253,7 @@ class Runner:
                     handle.terminate()
                 self._terminate_process_group(proc)
                 if handle is not None:
-                    handle.confirm_empty()
+                    _confirm_containment_empty(handle)
                     self._close_containment(handle)
                 raise
             finally:
@@ -1170,14 +1268,24 @@ class Runner:
                         "no authoritative target shim report; launcher/unit failure"
                     )
                 elif handle.managed and report is not None and report.state == "target-exec-error":
+                    handle.target_exec_errno = report.errno_value
                     detail = f"target exec failed ({report.errno_value}): {report.error or 'unknown error'}"
                     capture_diagnostics.append(detail)
                     handle.diagnostics += (detail,)
                 if handle.managed and report is not None and report.state == "target-exited" and returncode is not None:
                     returncode = report.returncode
-                handle.confirm_empty()
+                handle.refresh_resource_status()
+                final_cgroup = {
+                    **last_cgroup,
+                    **sample_cgroup(handle.cgroup_path, handle.capabilities),
+                }
+                cleanup_confirmed = _confirm_containment_empty(handle)
+                handle.refresh_resource_status()
                 containment_evidence = evidence_for(
-                    handle, {}, {**last_cgroup, **sample_cgroup(handle.cgroup_path, handle.capabilities)}
+                    handle,
+                    {},
+                    final_cgroup,
+                    cleanup_confirmed=cleanup_confirmed,
                 )
                 self._close_containment(handle)
                 if handle.managed and report is None and returncode == 0:

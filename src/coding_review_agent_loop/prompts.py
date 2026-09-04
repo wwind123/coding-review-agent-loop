@@ -268,11 +268,11 @@ def _coder_local_test_scope_guidance(
         )
         + ". Reserve agent-unavailable for a genuine environment/tooling "
         "failure, not an ordinary slow test.\n"
-        + _containment_prompt_guidance(config)
+        + containment_prompt_guidance(config)
     )
 
 
-def _containment_prompt_guidance(config: AgentLoopConfig | None) -> str:
+def containment_prompt_guidance(config: AgentLoopConfig | None) -> str:
     """Explain the mechanical resource boundary without exposing protocol markers."""
     if config is None:
         return (

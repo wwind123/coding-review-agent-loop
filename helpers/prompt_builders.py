@@ -32,7 +32,7 @@ from coding_review_agent_loop.prompts import (
     build_review_prompt,
     build_same_pr_followup_prompt,
     render_coder_human_requirements_prompt_context,
-    _containment_prompt_guidance,
+    containment_prompt_guidance,
 )
 from coding_review_agent_loop.round_state import _deserialize_unresolved_item
 from coding_review_agent_loop.test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
@@ -44,7 +44,7 @@ from coding_review_agent_loop.unresolved_items import (
 
 def _with_containment_guidance(prompt: str, config: AgentLoopConfig) -> str:
     """Keep skill-mode prompt construction aligned with the CLI guidance."""
-    guidance = _containment_prompt_guidance(config)
+    guidance = containment_prompt_guidance(config)
     return prompt if guidance.strip() in prompt else f"{prompt}\n{guidance}"
 
 
