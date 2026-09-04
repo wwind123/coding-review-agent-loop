@@ -1290,6 +1290,8 @@ unless the user explicitly authorizes another path. Coder prompts also ask the
 agent to run `pwd` and `git status --branch --short` before tests or commits,
 and to avoid sibling, home, deployment, or duplicate clones such as `~/REPO` or
 `~/claude-code/REPO`.
+Every coder `gh` body must be written to a temporary file outside the checkout
+and passed with `--body-file`.
 
 The orchestrator validates coder-reported test commands before posting normal
 coder progress. For `Tests:` reports and structured `tests_run` entries, it is
@@ -1647,11 +1649,12 @@ through that account).
 For auto-merge issue work, a v2 preflight gives the coder an atomic creation
 intent: create or verify `agent-loop-managed`, use the reserved
 `agent-loop/managed-<issue>` branch, then run `gh pr create --draft --label
-agent-loop-managed`. The workflow can suppress later reopened/synchronize
-matrices only for the complete tuple: same-repository head, trusted REST
-author, reserved branch, draft, and label. The opening event is necessarily
-evaluated before GitHub's separate label write and therefore uses the same
-tuple without the label; agent-loop must apply the label before continuing.
+agent-loop-managed --body-file <path>`. The workflow can suppress later
+reopened/synchronize matrices only for the complete tuple: same-repository
+head, trusted REST author, reserved branch, draft, and label. The opening event
+is necessarily evaluated before GitHub's separate label write and therefore
+uses the same tuple without the label; agent-loop must apply the label before
+continuing.
 A contributor-editable label, branch, or body alone is never trusted. Forks
 and ordinary PRs retain regular CI unless they are explicitly adopted as
 described below.

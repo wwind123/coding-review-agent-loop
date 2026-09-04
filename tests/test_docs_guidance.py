@@ -226,6 +226,21 @@ def test_managed_ci_docs_describe_precreation_managed_pr_mode():
     assert "--allow-unprotected-managed-ci" in text
 
 
+def test_coder_docs_require_github_body_files():
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    normalized_text = " ".join(text.split())
+
+    assert (
+        "Every coder `gh` body must be written to a temporary file outside the checkout"
+        in text
+    )
+    assert "passed with `--body-file`" in text
+    assert (
+        "`gh pr create --draft --label agent-loop-managed --body-file <path>`"
+        in normalized_text
+    )
+
+
 def test_local_agent_loop_doc_has_focused_bounded_local_test_section():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert f"### {LOCAL_TEST_SCOPE_HEADING_TEXT}" in text
