@@ -324,6 +324,18 @@ def _coder_documentation_guidance() -> str:
     )
 
 
+def _coder_github_body_file_guidance() -> str:
+    return (
+        "For every GitHub issue, pull-request, or comment body you create or edit with `gh`, "
+        "first write the exact Markdown to a temporary file outside the repository checkout, "
+        "then pass that file with `--body-file`. Never use `--body` for GitHub body content, "
+        "never use `gh pr create --fill`, and never place Markdown backticks inside a "
+        "double-quoted shell argument: the shell can execute them as command substitutions. "
+        "After the write, fetch the resulting body and verify that headings, lists, code, and "
+        "newlines rendered as intended.\n"
+    )
+
+
 def _issue_pr_provenance_guidance(scope: IssuePrProvenanceScope) -> str:
     trailer = format_issue_pr_provenance(scope)
     return (
@@ -331,9 +343,10 @@ def _issue_pr_provenance_guidance(scope: IssuePrProvenanceScope) -> str:
         "adoption of an unrelated open PR; it is not an authentication boundary. Before creating "
         "the PR, ensure at least one implementation commit carries this complete Git trailer line "
         f"exactly: `{trailer}`. Keep this trailer out of the PR body and all comments. Use an "
-        "explicit PR body when creating the PR; if `gh pr create --fill` copied the trailer into "
-        "the body, remove that copy before opening or update the body explicitly while preserving "
-        "all required closing references. Do not rewrite or force-push solely to add the trailer "
+        "explicit PR body file when creating the PR; never use `gh pr create --fill`, because it "
+        "can copy the trailer into the body. Keep using the explicit body file while preserving "
+        "all required closing references. Do not "
+        "rewrite or force-push solely to add the trailer "
         "after a canonical handoff exists."
         "\n"
     )
@@ -1421,7 +1434,8 @@ def _managed_ci_creation_guidance(
     return (
         "\nThis invocation has authenticated managed-CI v2 enabled. Create the PR atomically: "
         f"use exactly the reserved branch `{intent.branch}`, create or verify the `agent-loop-managed` "
-        "label, then run `gh pr create --draft --label agent-loop-managed` so it is born open, draft, "
+        "label, then run `gh pr create --draft --label agent-loop-managed --body-file <path>` so it "
+        "is born open, draft, "
         "and labeled. Do not create a second PR or apply a readiness transition. Do not mark it ready; "
         f"agent-loop will dispatch exact-head qualification after review.{override}\n"
     )
@@ -1465,7 +1479,7 @@ Use this local checkout as your workspace. Create a branch, implement the fix,
 run relevant tests, commit, push, and open a pull request against {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
@@ -2065,7 +2079,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
@@ -2125,7 +2139,7 @@ task-output file. If you know its process ID, terminate it once (a single
 foreground under the bounded timeout below, waiting for it to finish; launch
 nothing new in the background. Then commit, push, and open the pull request if
 that is not already done, or continue exactly where you left off.
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {human_requirements_context.block}
 {implementation_contract}
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
@@ -2152,7 +2166,7 @@ Use this local checkout as your workspace. Decide between two paths:
     {config.base}. Do not wait for {reviewer_name}; this local orchestrator
     will run {reviewer_name} after you create the PR.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
 (b) If the task is genuinely ambiguous or missing information that would change
     the implementation, do NOT write code. Instead, ask focused clarifying
@@ -2207,7 +2221,7 @@ Clarification so far:
 Now proceed. Strongly prefer to implement the task and open a PR. Only ask
 again if a critical detail is still missing.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
 {_agent_unavailable_guidance(coder_signature)}
 If you cannot safely proceed and cannot create a PR — for example after a
@@ -2825,7 +2839,7 @@ needed, implement fixes, run relevant tests, commit, and push to the same PR.
 Do not create a new PR.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
@@ -2874,7 +2888,7 @@ current PR. Keep the change narrowly scoped to the listed items. Do not take on
 larger redesigns or unrelated future work; call that out instead. The PR
 remains blocked pending another review round after this cleanup.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
@@ -2928,7 +2942,7 @@ or wait for CI runs in this round -- CI and reviews are re-evaluated automatical
 against the new head after your push.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_documentation_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_issue_context_block(issue_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}

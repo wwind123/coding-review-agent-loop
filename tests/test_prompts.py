@@ -302,7 +302,7 @@ def test_issue_implementation_prompts_inject_exact_scoped_trailer_guidance(tmp_p
     for prompt in (direct_prompt, approved_prompt):
         assert "at least one implementation commit carries" in prompt
         assert "Keep this trailer out of the PR body and all comments" in prompt
-        assert "gh pr create --fill" in prompt
+        assert "never use `gh pr create --fill`" in prompt
         assert "preserving all required closing references" in prompt
 
 
@@ -1880,6 +1880,38 @@ def test_coder_prompts_forbid_unbounded_ci_waits_with_exact_bound(tmp_path, buil
         ),
     ],
 )
+def test_coder_prompts_require_github_body_files(tmp_path, builder):
+    prompt = builder(make_config(tmp_path))
+
+    assert "write the exact Markdown to a temporary file" in prompt
+    assert "pass that file with `--body-file`" in prompt
+    assert "Never use `--body` for GitHub body content" in prompt
+    assert "never use `gh pr create --fill`" in prompt
+    assert "shell can execute them as command substitutions" in prompt
+    assert "fetch the resulting body and verify" in prompt
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [
+        lambda config: build_issue_prompt(56, config),
+        lambda config: build_issue_implementation_prompt(56, "1. Fix it.", config),
+        lambda config: build_completion_recovery_prompt(config),
+        lambda config: build_task_prompt("Fix the bug.", config),
+        lambda config: build_task_clarification_prompt("Fix the bug.", [], config),
+        lambda config: build_followup_prompt(77, 1, "Needs tests.", config),
+        lambda config: build_same_pr_followup_prompt(77, 1, "Tighten docs.", config),
+        lambda config: build_merge_conflict_prompt(
+            77,
+            1,
+            "Resolve the conflict.",
+            config,
+            base_branch="main",
+            head_sha="deadbeef",
+            merge_state_detail="mergeable=CONFLICTING",
+        ),
+    ],
+)
 def test_coder_prompts_require_focused_bounded_local_tests(tmp_path, builder):
     config = make_config(tmp_path)
     prompt = " ".join(builder(config).split())
@@ -3137,7 +3169,7 @@ def test_build_issue_prompt_carries_explicit_managed_creation_contract(tmp_path)
     )
 
     assert "agent-loop/managed-56" in prompt
-    assert "gh pr create --draft --label agent-loop-managed" in prompt
+    assert "gh pr create --draft --label agent-loop-managed --body-file <path>" in prompt
     assert "Do not mark it ready" in prompt
     guidance = prompt[prompt.index("This invocation has authenticated managed-CI v2 enabled."):]
     assert guidance.split("\n", 1)[0] in plan_prompt
