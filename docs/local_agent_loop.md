@@ -216,6 +216,55 @@ refusal metadata without triggering stability waiting.
 
 ## Usage
 
+### Process-tree containment
+
+Every standalone CLI agent invocation and every `agent-loop run-tests` gate is
+admitted through the same per-user aggregate policy. The default `auto` mode
+preflights a systemd 253+ user manager with unified cgroup v2 and, when all
+requested properties are accepted, launches a unique foreground scope under
+`agent-loop.slice`. It uses the exact form
+`systemd-run --user --scope --quiet` and intentionally omits `--wait`,
+`--service`, and `--pipe`. `MemoryHigh`, `MemoryMax`, `MemorySwapMax`, and
+`TasksMax` are applied to the aggregate and to the `coder`, `reviewer`,
+`repair`, or `test-gate` child profile. A child profile is never above the
+effective aggregate, including when another process holds a stricter lease.
+
+Use `containment-preflight` before a live run to see the resolved policy,
+systemd version, scope probe result, and supported cgroup counters. Values may
+be bytes (`512MiB`), percentages of physical memory (`70%`), or `max` where a
+finite limit is not requested. The defaults reserve 25% of physical memory
+for the OS and unrelated services. Independent agent-loop processes coordinate
+through crash-recoverable runtime leases keyed by boot ID and PID start
+identity, so one process cannot weaken another's live slice ceiling.
+
+`auto` visibly falls back to process-group TERM/KILL on macOS, non-systemd
+Linux, unavailable user managers, non-unified cgroups, or failed property
+probes. That fallback guarantees deterministic termination but makes no memory
+ceiling claim. `required` fails closed instead. Optional files such as
+`memory.peak`, PSI, and swap counters are capability-tracked and rendered as
+`not collected on this host` when absent; only previously observed evidence
+that disappears unexpectedly is indeterminate. OOM, hard memory/swap, and
+`TasksMax` termination is `resource-exhausted`, while `MemoryHigh` and PSI are
+pressure diagnostics and do not by themselves claim to have killed a process.
+
+Each scope contains a target-start/target-exec-error shim. A missing shim
+report means launcher or unit creation failure regardless of the numeric
+systemd exit status. A target-start report binds numeric statuses, including 1
+and 203, to the target. Timeouts retain the `returncode is None` wall-clock
+convention, salvage a valid response file when available, terminate the full
+scope, confirm emptiness, and only then permit a retry or replacement replay.
+
+The managed test wrapper also locks a lane by canonical cwd, normalized argv,
+and `AGENT_LOOP_INVOCATION_ID`, using a non-inherited advisory descriptor.
+Same-lane duplicates are rejected before spawn with exit 125 and do not enter
+runtime learning. Intentional parallel reviewer workers have distinct lanes.
+An unwrapped command cannot be deduplicated from free-form logs when no
+structured tool hook exists; it is still contained when it is a descendant of
+an agent scope. In skill mode, the host's in-session Claude coder and arbitrary
+descendants remain part of the host session and receive prompt guidance plus
+the managed wrapper when used. The aggregate is per user manager, not a
+cross-user host isolation boundary.
+
 Fix a GitHub issue:
 
 ```bash

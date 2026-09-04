@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .containment import ContainmentEvidence
+
 
 class AgentLoopError(RuntimeError):
     """Raised for expected orchestration failures."""
@@ -61,6 +66,7 @@ class AgentInvocationError(AgentLoopError):
         *,
         failure_category: str | None = None,
         terminal_public_response: str | None = None,
+        containment: "ContainmentEvidence | None" = None,
     ) -> None:
         super().__init__(message)
         self.failure_category = failure_category
@@ -69,6 +75,7 @@ class AgentInvocationError(AgentLoopError):
         # a bounded completion-recovery attempt (#588). None for every other
         # failure path, which is unchanged.
         self.terminal_public_response = terminal_public_response
+        self.containment = containment
 
 
 class QuotaResetExceededError(AgentLoopError):

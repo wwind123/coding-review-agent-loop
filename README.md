@@ -58,6 +58,38 @@ Each agent CLI has its own authentication, quota, terms, and model
 availability. Confirm those with the provider; this tool does not combine or
 replace provider subscriptions.
 
+### Process-tree containment
+
+Agent subprocesses and repository test gates use a shared per-user containment
+policy by default. On Linux with systemd 253+ and delegated cgroup v2,
+agent-loop creates a foreground child scope inside `agent-loop.slice` and
+applies aggregate plus role-specific `MemoryHigh`, `MemoryMax`,
+`MemorySwapMax`, and `TasksMax` limits. The aggregate protects host headroom
+across independent agent-loop processes; a child scope cannot exceed it. The
+portable fallback uses process-group TERM/KILL for deterministic termination
+but provides no memory ceiling. `--containment-mode required` fails closed
+when cgroup preflight is unavailable, while `auto` reports the fallback.
+
+Inspect the resolved policy and capabilities with
+`agent-loop containment-preflight --containment-mode auto`. The systemd
+launcher is the synchronous foreground form
+`systemd-run --user --scope --quiet`; it deliberately does not use `--wait`,
+`--service`, or `--pipe`. A target-start shim report is authoritative when
+distinguishing launcher failures from target exit statuses. Optional cgroup
+telemetry (peak memory, PSI, and swap counters) is capability-aware: missing
+files are reported as not collected rather than treated as lost evidence.
+OOM, hard memory/swap failures, and task-limit failures are
+`resource-exhausted`; `MemoryHigh`/PSI pressure is diagnostic only.
+
+The same-command test wrapper has a per-invocation lane lock. A duplicate is
+rejected before spawn until the earlier managed attempt exits or is explicitly
+terminated. Standalone commands not run through the wrapper cannot be
+deduplicated from free-form agent logs, but their complete agent tree remains
+resource-bounded when launched by agent-loop. The aggregate is per user
+manager, not cross-user host isolation. A skill host's in-session Claude turn
+and arbitrary descendants remain part of that host session; use the managed
+wrapper for test gates and external skill agents for the mechanical boundary.
+
 ## Install
 
 Clone the repository and install it into a virtual environment:

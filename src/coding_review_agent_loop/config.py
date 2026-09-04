@@ -236,6 +236,37 @@ class AgentLoopConfig:
     # Finite run-level ceiling for local coder test commands.  Kept at the end
     # with a default so direct AgentLoopConfig callers remain source-compatible.
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS
+    # Process-tree containment.  Values remain unparsed at the config boundary
+    # so CLI strings such as ``70%`` and ``2GiB`` are resolved exactly once by
+    # containment.policy_from_values().
+    containment_mode: str = "auto"
+    containment_memory_high: object | None = None
+    containment_memory_max: object | None = None
+    containment_memory_swap_max: object | None = None
+    containment_tasks_max: object | None = None
+    containment_aggregate_memory_high: object | None = None
+    containment_aggregate_memory_max: object | None = None
+    containment_aggregate_memory_swap_max: object | None = None
+    containment_aggregate_tasks_max: object | None = None
+    containment_os_headroom_percent: object = 25.0
+    containment_slice: str = "agent-loop.slice"
+    containment_cache_dir: Path | None = None
+    containment_coder_memory_high: object | None = None
+    containment_coder_memory_max: object | None = None
+    containment_coder_memory_swap_max: object | None = None
+    containment_coder_tasks_max: object | None = None
+    containment_reviewer_memory_high: object | None = None
+    containment_reviewer_memory_max: object | None = None
+    containment_reviewer_memory_swap_max: object | None = None
+    containment_reviewer_tasks_max: object | None = None
+    containment_repair_memory_high: object | None = None
+    containment_repair_memory_max: object | None = None
+    containment_repair_memory_swap_max: object | None = None
+    containment_repair_tasks_max: object | None = None
+    containment_test_gate_memory_high: object | None = None
+    containment_test_gate_memory_max: object | None = None
+    containment_test_gate_memory_swap_max: object | None = None
+    containment_test_gate_tasks_max: object | None = None
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -325,6 +356,19 @@ class AgentLoopConfig:
             raise AgentLoopError(
                 "base_provenance must be 'explicit', 'repository-default', or 'pr-metadata'."
             )
+        # Validate containment even for library-created configs.  This is a
+        # pure local parse; capability probing is deferred until a command is
+        # actually admitted by Runner.
+        from .containment import policy_from_values
+
+        policy_from_values(self.__dict__)
+
+    @property
+    def containment_policy(self):
+        """Return the immutable resolved containment policy for this config."""
+        from .containment import policy_from_values
+
+        return policy_from_values(self.__dict__)
 
 
 def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
@@ -1148,4 +1192,32 @@ def config_from_args(
         planning_context_mode=getattr(args, "planning_context_mode", None) or "compact",
         pr_review_context_mode=getattr(args, "pr_review_context_mode", None) or "full",
         auto_agent_dirs=auto_agent_dirs,
+        containment_mode=getattr(args, "containment_mode", "auto"),
+        containment_memory_high=getattr(args, "containment_memory_high", None),
+        containment_memory_max=getattr(args, "containment_memory_max", None),
+        containment_memory_swap_max=getattr(args, "containment_memory_swap_max", None),
+        containment_tasks_max=getattr(args, "containment_tasks_max", None),
+        containment_aggregate_memory_high=getattr(args, "containment_aggregate_memory_high", None),
+        containment_aggregate_memory_max=getattr(args, "containment_aggregate_memory_max", None),
+        containment_aggregate_memory_swap_max=getattr(args, "containment_aggregate_memory_swap_max", None),
+        containment_aggregate_tasks_max=getattr(args, "containment_aggregate_tasks_max", None),
+        containment_os_headroom_percent=getattr(args, "containment_os_headroom_percent", 25.0),
+        containment_slice=getattr(args, "containment_slice", "agent-loop.slice"),
+        containment_cache_dir=getattr(args, "containment_cache_dir", None),
+        containment_coder_memory_high=getattr(args, "containment_coder_memory_high", None),
+        containment_coder_memory_max=getattr(args, "containment_coder_memory_max", None),
+        containment_coder_memory_swap_max=getattr(args, "containment_coder_memory_swap_max", None),
+        containment_coder_tasks_max=getattr(args, "containment_coder_tasks_max", None),
+        containment_reviewer_memory_high=getattr(args, "containment_reviewer_memory_high", None),
+        containment_reviewer_memory_max=getattr(args, "containment_reviewer_memory_max", None),
+        containment_reviewer_memory_swap_max=getattr(args, "containment_reviewer_memory_swap_max", None),
+        containment_reviewer_tasks_max=getattr(args, "containment_reviewer_tasks_max", None),
+        containment_repair_memory_high=getattr(args, "containment_repair_memory_high", None),
+        containment_repair_memory_max=getattr(args, "containment_repair_memory_max", None),
+        containment_repair_memory_swap_max=getattr(args, "containment_repair_memory_swap_max", None),
+        containment_repair_tasks_max=getattr(args, "containment_repair_tasks_max", None),
+        containment_test_gate_memory_high=getattr(args, "containment_test_gate_memory_high", None),
+        containment_test_gate_memory_max=getattr(args, "containment_test_gate_memory_max", None),
+        containment_test_gate_memory_swap_max=getattr(args, "containment_test_gate_memory_swap_max", None),
+        containment_test_gate_tasks_max=getattr(args, "containment_test_gate_tasks_max", None),
     )

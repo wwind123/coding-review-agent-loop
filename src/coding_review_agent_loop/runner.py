@@ -17,7 +17,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping, Sequence, TypeVar
 
+from .containment import (
+    ContainmentEvidence,
+    ContainmentPolicy,
+    InvocationHandle,
+    cgroup_path_for_pid,
+    evidence_for,
+    sample_cgroup,
+)
 from .errors import AgentLoopError
+from .test_runtime import OVERLAP_REJECTED_EXIT_CODE, OVERLAP_REJECTED_MESSAGE, acquire_command_lane
 
 
 @dataclass(frozen=True)
@@ -48,6 +57,11 @@ class CommandResult:
     returncode: int | None
     observation: ExecutionObservation | None = None
     capture_diagnostics: tuple[str, ...] = ()
+    # The target command remains in ``args``.  When containment is active this
+    # records the launcher separately so diagnostics never mistake systemd-run
+    # for the provider executable.
+    launcher_args: list[str] | None = None
+    containment: ContainmentEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +75,8 @@ class ForegroundTestResult:
     elapsed_seconds: float
     attempted_timeout_seconds: float | None
     output_tail: str = ""
+    containment: ContainmentEvidence | None = None
+    overlap_rejected: bool = False
 
     @property
     def passed(self) -> bool:
@@ -116,6 +132,8 @@ def run_foreground_test(
     timeout_seconds: float,
     env: Mapping[str, str] | None = None,
     dry_run: bool = False,
+    containment_policy: ContainmentPolicy | None = None,
+    containment_role: str = "test-gate",
 ) -> ForegroundTestResult:
     """Run a command in the foreground, teeing output and bounding its process group."""
     cmd = [str(value) for value in args]
@@ -125,10 +143,44 @@ def run_foreground_test(
         return ForegroundTestResult(cmd, cwd, "passed", 0, 0.0, timeout_seconds)
     if not cmd:
         raise AgentLoopError("Test command is empty.")
+    lane_lock = acquire_command_lane(cmd, cwd=cwd, env=env)
+    if lane_lock is None:
+        print(OVERLAP_REJECTED_MESSAGE, file=sys.stderr, flush=True)
+        return ForegroundTestResult(
+            cmd, cwd, "overlap-rejected", OVERLAP_REJECTED_EXIT_CODE,
+            0.0, timeout_seconds, OVERLAP_REJECTED_MESSAGE, None, True,
+        )
     selector = None
+    handle: InvocationHandle | None = None
+    inherited_scope = False
+    inherited_cgroup: Path | None = None
+    before_cgroup: dict[str, object] = {}
+    last_cgroup: dict[str, object] = {}
+    target_exec_error = False
     try:
+        if containment_policy is not None and containment_policy.mode != "off":
+            invocation_values = env if env is not None else os.environ
+            if invocation_values.get("AGENT_LOOP_INVOCATION_ID"):
+                # A test wrapper launched from an already-contained agent is a
+                # descendant of that scope.  Keep it in the inherited cgroup
+                # instead of creating a sibling scope which could escape the
+                # parent's aggregate ceiling.
+                inherited_scope = True
+                inherited_cgroup = cgroup_path_for_pid(os.getpid())
+                spawn_cmd = cmd
+            else:
+                try:
+                    handle = InvocationHandle.prepare(
+                        containment_policy, role=containment_role, target_argv=cmd, env=env
+                    )
+                except BaseException:
+                    lane_lock.close()
+                    raise
+                spawn_cmd = list(handle.launcher_argv)
+        else:
+            spawn_cmd = cmd
         proc = subprocess.Popen(
-            cmd,
+            spawn_cmd,
             cwd=cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -138,7 +190,14 @@ def run_foreground_test(
             start_new_session=True,
             env={**os.environ, **env} if env is not None else None,
         )
+        if handle is not None and handle.managed:
+            handle.refresh_report()
+            before_cgroup = sample_cgroup(handle.cgroup_path, handle.capabilities)
+            last_cgroup = dict(before_cgroup)
     except OSError as exc:
+        if handle is not None:
+            handle.close()
+        lane_lock.close()
         raise AgentLoopError(f"Could not start test command: {exc}") from exc
 
     tail: deque[str] = deque(maxlen=80)
@@ -173,6 +232,9 @@ def run_foreground_test(
         assert proc.stdout is not None
         selector.register(proc.stdout, selectors.EVENT_READ)
         while True:
+            if handle is not None and handle.managed:
+                handle.refresh_report()
+                last_cgroup.update(sample_cgroup(handle.cgroup_path, handle.capabilities))
             now = time.monotonic()
             if proc.poll() is None and now >= watchdog_deadline:
                 timed_out = True
@@ -183,6 +245,8 @@ def run_foreground_test(
                 post_termination_deadline = (
                     watchdog_deadline + TEST_OUTPUT_DRAIN_GRACE_SECONDS
                 )
+                if handle is not None:
+                    handle.terminate()
                 _terminate_process_group(proc)
             elif proc.poll() is not None and post_termination_deadline is None:
                 # A normally exiting child can also leave a descendant with a
@@ -219,10 +283,14 @@ def run_foreground_test(
                 # Give a closed pipe one final non-blocking drain opportunity.
                 break
         if proc.poll() is None:
+            if handle is not None:
+                handle.terminate()
             _terminate_process_group(proc)
         returncode = proc.wait()
     except KeyboardInterrupt:
         interrupted = True
+        if handle is not None:
+            handle.terminate()
         _terminate_process_group(proc)
         returncode = proc.wait()
     finally:
@@ -243,10 +311,47 @@ def run_foreground_test(
             consume(b"", final=True)
             proc.stdout.close()
         elapsed = time.monotonic() - started
+    evidence = None
+    if handle is not None:
+        report = handle.refresh_report()
+        if handle.managed and report is None:
+            handle.diagnostics += ("no authoritative target shim report; launcher failure",)
+        if handle.managed and report is not None and report.state == "target-exec-error":
+            target_exec_error = True
+            handle.diagnostics += (
+                f"target exec failed ({report.errno_value}): {report.error or 'unknown error'}",
+            )
+        handle.confirm_empty()
+        evidence = evidence_for(
+            handle, before_cgroup, {
+                **last_cgroup,
+                **sample_cgroup(handle.cgroup_path, handle.capabilities),
+            }
+        )
+        handle.close()
+        if handle.managed and report is None and returncode == 0:
+            returncode = 1
+    elif inherited_scope:
+        inherited_after = sample_cgroup(inherited_cgroup)
+        evidence = ContainmentEvidence(
+            backend=("systemd-cgroup-v2-inherited" if inherited_cgroup is not None else "process-group-inherited"),
+            cgroup_path=str(inherited_cgroup) if inherited_cgroup is not None else None,
+            aggregate_limits=containment_policy.aggregate if containment_policy is not None else None,
+            child_limits=(containment_policy.role_limits(containment_role) if containment_policy is not None else None),
+            supported_counters=tuple(sorted(inherited_after)),
+            before=before_cgroup,
+            after={**last_cgroup, **inherited_after},
+            cleanup_confirmed=True,
+            diagnostics=("test wrapper inherited the active agent invocation scope",),
+        )
+    lane_lock.close()
     outcome = "interrupted" if interrupted else ("timed_out" if timed_out else ("passed" if returncode == 0 else "failed"))
+    if target_exec_error and not timed_out and not interrupted:
+        returncode = None
+        outcome = "failed"
     return ForegroundTestResult(
         cmd, cwd, outcome, (124 if timed_out else 130 if interrupted else returncode),
-        elapsed, timeout_seconds, "\n".join(tail),
+        elapsed, timeout_seconds, "\n".join(tail), evidence,
     )
 
 
@@ -358,7 +463,7 @@ def ensure_log_dir_ignored(log_dir: Path) -> None:
 
 
 class Runner:
-    def __init__(self, *, dry_run: bool = False):
+    def __init__(self, *, dry_run: bool = False, containment_policy: ContainmentPolicy | None = None):
         self.dry_run = dry_run
         self._resolved_commands: dict[str, str] = {}
         self._command_override_flags: dict[str, str] = {}
@@ -370,6 +475,54 @@ class Runner:
         self._active_procs_lock = threading.Lock()
         self._active_procs: dict[int, subprocess.Popen] = {}
         self._interrupted = False
+        self.containment_policy = containment_policy
+        self._containment_manifest = None
+        self._active_handles: dict[str, InvocationHandle] = {}
+        self._containment_role = "coder"
+
+    def set_containment_role(self, role: str | None) -> None:
+        if role in {"coder", "reviewer", "repair", "test-gate"}:
+            self._containment_role = role
+
+    def configure_from_config(self, config: object) -> None:
+        """Attach an immutable containment policy without importing config here."""
+        from .containment import policy_from_values
+
+        values = dict(getattr(config, "__dict__", {}))
+        self.containment_policy = policy_from_values(values)
+        self._containment_manifest = None
+
+    def preflight_containment(self):
+        if self.containment_policy is None:
+            return None
+        if self._containment_manifest is None:
+            from .containment import preflight_containment
+
+            self._containment_manifest = preflight_containment(self.containment_policy)
+        return self._containment_manifest
+
+    def _prepare_containment(self, cmd: Sequence[str], *, role: str, env: Mapping[str, str] | None) -> InvocationHandle | None:
+        if self.containment_policy is None or self.containment_policy.mode == "off":
+            return None
+        manifest = self.preflight_containment()
+        # auto mode explicitly accepts a process-group-only fallback. required
+        # mode has already failed closed in preflight_containment.
+        if manifest is None:
+            return None
+        handle = InvocationHandle.prepare(self.containment_policy, role=role, target_argv=cmd, env=env)
+        with self._active_procs_lock:
+            if self._interrupted:
+                handle.close()
+                raise AgentLoopError("Runner is shutting down after an interrupt; refusing to start new commands.")
+            self._active_handles[handle.invocation_id] = handle
+        return handle
+
+    def _close_containment(self, handle: InvocationHandle | None) -> None:
+        if handle is None:
+            return
+        with self._active_procs_lock:
+            self._active_handles.pop(handle.invocation_id, None)
+        handle.close()
 
     def remember_agent_command(
         self,
@@ -404,12 +557,22 @@ class Runner:
         workers' wait loops so executor shutdown returns promptly, and the
         interrupted flag stops in-flight retry logic from spawning replacements.
         """
-        self._interrupted = True
         with self._active_procs_lock:
+            self._interrupted = True
             procs = list(self._active_procs.values())
+            handles = list(self._active_handles.values())
+        for handle in handles:
+            handle.terminate()
         for proc in procs:
             if proc.poll() is None:
                 self._terminate_process_group(proc)
+        # Do not let an interrupt return while a scope still owns descendants.
+        # Escalate once after the bounded TERM confirmation window; ordinary
+        # invocation cleanup will finish unregistering the handle.
+        for handle in handles:
+            if not handle.confirm_empty(timeout=2.0):
+                handle.terminate(signal_name="KILL")
+                handle.confirm_empty(timeout=2.0)
 
     def _override_flag_for(self, command: str) -> str:
         override_flag = self._command_override_flags.get(command)
@@ -588,6 +751,8 @@ class Runner:
             timeout_seconds=timeout_seconds,
             env=env,
             dry_run=self.dry_run,
+            containment_policy=self.containment_policy,
+            containment_role="test-gate",
         )
 
     def run_with_log(
@@ -603,6 +768,7 @@ class Runner:
         input_text: str | None = None,
         use_pty: bool = False,
         timeout_seconds: float | None = None,
+        containment_role: str | None = None,
     ) -> CommandResult:
         cmd = [str(a) for a in args]
         if self.dry_run:
@@ -626,6 +792,7 @@ class Runner:
                 env=env,
                 input_text=input_text,
                 timeout_seconds=timeout_seconds,
+                containment_role=containment_role,
             )
         started = time.monotonic()
         deadline = started + timeout_seconds if timeout_seconds is not None else None
@@ -637,6 +804,8 @@ class Runner:
             header += f"\n# stdin\n{input_text}\n"
         header += "\n"
         capture_diagnostics: list[str] = []
+        inferred_role = containment_role or self._containment_role or self._role_from_label(label)
+        last_cgroup: dict[str, object] = {}
         with log_path.open("w+", encoding="utf-8") as log_file:
             log_file.write(header)
             log_file.flush()
@@ -652,27 +821,47 @@ class Runner:
                     input_file.write(input_text)
                     input_file.seek(0)
 
+                handle = self._prepare_containment(cmd, role=inferred_role, env=env)
+                launch_cmd = list(handle.launcher_argv) if handle is not None and handle.managed else cmd
+                launch_env = {**os.environ, **env} if env is not None else None
+                if handle is not None:
+                    launch_env = dict(launch_env or os.environ)
+                    launch_env["AGENT_LOOP_INVOCATION_ID"] = handle.invocation_id
+
                 def spawn() -> subprocess.Popen[str]:
                     if input_text is not None:
                         input_file.seek(0)
                     return subprocess.Popen(
-                        cmd,
+                        launch_cmd,
                         cwd=cwd,
                         stdin=input_file if input_text is not None else subprocess.DEVNULL,
                         stdout=log_file,
                         stderr=subprocess.STDOUT,
                         text=True,
                         start_new_session=True,
-                        env={**os.environ, **env} if env is not None else None,
+                        env=launch_env,
                     )
 
-                proc, spawn_wall_time, spawn_monotonic, before_identity = self._spawn_with_retry(
-                    cmd,
-                    spawn,
-                )
+                if handle is None or not handle.managed:
+                    proc, spawn_wall_time, spawn_monotonic, before_identity = self._spawn_with_retry(cmd, spawn)
+                else:
+                    spawn_wall_time = time.time()
+                    spawn_monotonic = time.monotonic()
+                    before_identity = executable_identity(cmd[0])
+                    try:
+                        proc = spawn()
+                    except OSError:
+                        self._close_containment(handle)
+                        raise
+                if handle is not None and handle.managed:
+                    handle.refresh_report()
+                    last_cgroup.update(sample_cgroup(handle.cgroup_path, handle.capabilities))
                 self._register_active_process(proc)
                 try:
                     while True:
+                        if handle is not None and handle.managed:
+                            handle.refresh_report()
+                            last_cgroup.update(sample_cgroup(handle.cgroup_path, handle.capabilities))
                         returncode = proc.poll()
                         if returncode is not None:
                             break
@@ -680,6 +869,8 @@ class Runner:
                         if deadline is not None and now >= deadline:
                             # returncode=None marks the timeout for callers, matching
                             # the pty branch.
+                            if handle is not None:
+                                handle.terminate()
                             self._terminate_process_group(proc)
                             returncode = None
                             break
@@ -699,13 +890,43 @@ class Runner:
                 except KeyboardInterrupt:
                     # The child runs in its own session and no longer receives the
                     # terminal SIGINT; kill its whole process group instead.
+                    if handle is not None:
+                        handle.terminate()
                     self._terminate_process_group(proc)
+                    if handle is not None:
+                        handle.confirm_empty()
+                        self._close_containment(handle)
                     raise
                 finally:
                     self._unregister_active_process(proc)
 
             # Read through the retained descriptor. A concurrent cleanup may
             # unlink the pathname while the child still owns this open file.
+            containment_evidence = None
+            if handle is not None:
+                report = handle.refresh_report()
+                if handle.managed and report is None:
+                    capture_diagnostics.append(
+                        "no authoritative target shim report; launcher/unit failure"
+                    )
+                elif handle.managed and report is not None and report.state == "target-exec-error":
+                    detail = f"target exec failed ({report.errno_value}): {report.error or 'unknown error'}"
+                    capture_diagnostics.append(detail)
+                    handle.diagnostics += (detail,)
+                if handle.managed and report is not None and report.state == "target-exited" and returncode is not None:
+                    # The shim report is authoritative, including ordinary
+                    # target exits 1 and 203.  A missing report is never
+                    # interpreted from systemd-run's numeric status.
+                    returncode = report.returncode
+                handle.confirm_empty()
+                containment_evidence = evidence_for(
+                    handle,
+                    {},
+                    {**last_cgroup, **sample_cgroup(handle.cgroup_path, handle.capabilities)},
+                )
+                self._close_containment(handle)
+                if handle.managed and report is None and returncode == 0:
+                    returncode = 1
             try:
                 log_file.flush()
                 log_file.seek(0)
@@ -731,6 +952,8 @@ class Runner:
                 self._interrupted,
             ),
             tuple(capture_diagnostics),
+            list(handle.launcher_argv) if handle is not None and handle.managed else None,
+            containment_evidence,
         )
         if check and returncode != 0:
             raise AgentLoopError(
@@ -738,6 +961,17 @@ class Runner:
                 f"log: {log_path if not capture_diagnostics else '(capture pathname unavailable)'}\n\nlast output:\n{tail_text(full_output or output)}"
             )
         return result
+
+    @staticmethod
+    def _role_from_label(label: str) -> str:
+        lowered = label.lower()
+        if "test" in lowered or "gate" in lowered:
+            return "test-gate"
+        if "repair" in lowered:
+            return "repair"
+        if "review" in lowered:
+            return "reviewer"
+        return "coder"
 
     def _run_with_log_pty(
         self,
@@ -751,6 +985,7 @@ class Runner:
         env: Mapping[str, str] | None,
         input_text: str | None,
         timeout_seconds: float | None = None,
+        containment_role: str | None = None,
     ) -> CommandResult:
         """Run a command attached to a pseudo-terminal, logging and capturing output.
 
@@ -773,6 +1008,9 @@ class Runner:
         header = f"$ {' '.join(cmd)}\n\n"
         chunks: list[bytes] = []
         capture_diagnostics: list[str] = []
+        handle: InvocationHandle | None = None
+        containment_evidence = None
+        last_cgroup: dict[str, object] = {}
         with log_path.open("wb") as log_file:
             log_file.write(header.encode("utf-8"))
             log_file.flush()
@@ -784,7 +1022,7 @@ class Runner:
                 allocated_fds = (master_fd, slave_fd)
                 try:
                     return subprocess.Popen(
-                        cmd,
+                        list(handle.launcher_argv) if handle is not None and handle.managed else cmd,
                         cwd=cwd,
                         stdin=slave_fd,
                         stdout=slave_fd,
@@ -799,20 +1037,66 @@ class Runner:
                     allocated_fds = None
                     raise
 
-            proc, spawn_wall_time, spawn_monotonic, before_identity = self._spawn_with_retry(
+            handle = self._prepare_containment(
                 cmd,
-                spawn_pty,
+                role=containment_role or self._containment_role or self._role_from_label(label),
+                env=env,
             )
+            if handle is not None and handle.managed:
+                launch_env = {**os.environ, **env} if env is not None else dict(os.environ)
+                launch_env["AGENT_LOOP_INVOCATION_ID"] = handle.invocation_id
+                # The closure reads this merged environment when the launcher
+                # is spawned.  Keep the PTY slave and regular descriptors
+                # inherited exactly as in the uncontained path.
+                def spawn_pty_contained() -> subprocess.Popen[bytes]:
+                    nonlocal allocated_fds
+                    master_fd, slave_fd = pty.openpty()
+                    allocated_fds = (master_fd, slave_fd)
+                    try:
+                        return subprocess.Popen(
+                            list(handle.launcher_argv),
+                            cwd=cwd,
+                            stdin=slave_fd,
+                            stdout=slave_fd,
+                            stderr=slave_fd,
+                            close_fds=True,
+                            start_new_session=True,
+                            env=launch_env,
+                        )
+                    except BaseException:
+                        os.close(master_fd)
+                        os.close(slave_fd)
+                        allocated_fds = None
+                        raise
+                spawn_fn = spawn_pty_contained
+                spawn_wall_time = time.time()
+                spawn_monotonic = time.monotonic()
+                before_identity = executable_identity(cmd[0])
+                try:
+                    proc = spawn_fn()
+                except OSError:
+                    self._close_containment(handle)
+                    raise
+            else:
+                proc, spawn_wall_time, spawn_monotonic, before_identity = self._spawn_with_retry(cmd, spawn_pty)
             assert allocated_fds is not None
             master_fd, slave_fd = allocated_fds
             os.close(slave_fd)
+            if handle is not None and handle.managed:
+                handle.refresh_report()
+                last_cgroup.update(sample_cgroup(handle.cgroup_path, handle.capabilities))
             self._register_active_process(proc)
             try:
                 timed_out = False
                 while True:
+                    if handle is not None and handle.managed:
+                        handle.refresh_report()
+                        last_cgroup.update(sample_cgroup(handle.cgroup_path, handle.capabilities))
                     now = time.monotonic()
                     if deadline is not None and now >= deadline and proc.poll() is None:
                         timed_out = True
+                        if handle is not None:
+                            handle.terminate()
                         self._terminate_process_group(proc)
                     if timed_out:
                         wait_seconds = 0.1
@@ -867,12 +1151,37 @@ class Runner:
             except KeyboardInterrupt:
                 # The child runs in its own session and does not receive the
                 # terminal SIGINT; kill its whole process group instead.
+                if handle is not None:
+                    handle.terminate()
                 self._terminate_process_group(proc)
+                if handle is not None:
+                    handle.confirm_empty()
+                    self._close_containment(handle)
                 raise
             finally:
                 self._unregister_active_process(proc)
                 os.close(master_fd)
             returncode = None if timed_out else proc.wait()
+
+            if handle is not None:
+                report = handle.refresh_report()
+                if handle.managed and report is None:
+                    capture_diagnostics.append(
+                        "no authoritative target shim report; launcher/unit failure"
+                    )
+                elif handle.managed and report is not None and report.state == "target-exec-error":
+                    detail = f"target exec failed ({report.errno_value}): {report.error or 'unknown error'}"
+                    capture_diagnostics.append(detail)
+                    handle.diagnostics += (detail,)
+                if handle.managed and report is not None and report.state == "target-exited" and returncode is not None:
+                    returncode = report.returncode
+                handle.confirm_empty()
+                containment_evidence = evidence_for(
+                    handle, {}, {**last_cgroup, **sample_cgroup(handle.cgroup_path, handle.capabilities)}
+                )
+                self._close_containment(handle)
+                if handle.managed and report is None and returncode == 0:
+                    returncode = 1
 
         raw = b"".join(chunks).decode("utf-8", errors="replace")
         output = strip_ansi(raw)
@@ -893,6 +1202,8 @@ class Runner:
                 self._interrupted,
             ),
             tuple(capture_diagnostics),
+            list(handle.launcher_argv) if handle is not None and handle.managed else None,
+            containment_evidence,
         )
         if check and returncode != 0:
             raise AgentLoopError(

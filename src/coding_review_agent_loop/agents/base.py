@@ -9,6 +9,7 @@ import uuid
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from ..runner import CommandResult, Runner
+from ..containment import ContainmentEvidence
 from ..usage import UsageMetadata
 
 if TYPE_CHECKING:
@@ -54,6 +55,11 @@ class AgentResult:
     self_update_reason: str | None = None
     self_update_replay_refusal_kind: str | None = None
     self_update_replay_refusal_detail: str | None = None
+    containment: ContainmentEvidence | None = None
+
+    def __post_init__(self) -> None:
+        if self.containment is None and self.command_result is not None:
+            object.__setattr__(self, "containment", self.command_result.containment)
 
 
 class AgentBackend(Protocol):

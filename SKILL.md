@@ -38,6 +38,30 @@ so this is about reducing the dependency, not a guaranteed billing outcome. See
 - `gemini` CLI installed (for Gemini reviewer turns).
 - The `coding-review-agent-loop` package importable from `src/` (run from repo root).
 
+## Process-tree containment
+
+External agents and `--test-command` gates are mechanically contained when the
+host supports systemd 253+, a user manager, delegated unified cgroup v2, and
+the requested controllers. They share a per-user `agent-loop.slice`, with a
+conservative aggregate that reserves OS headroom and child profiles for
+`coder`, `reviewer`, `repair`, and `test-gate`. The foreground launcher is
+`systemd-run --user --scope --quiet`; it intentionally has no `--wait`,
+`--service`, or `--pipe`. A scope-internal shim records target start or target
+exec failure, so the report—not a launcher exit number—decides whether a
+numeric status belongs to the target.
+
+Run `agent-loop containment-preflight` to inspect resolved limits and
+capability-aware telemetry. `auto` visibly falls back to process-group
+TERM/KILL, which is deterministic but has no memory ceiling; `required` fails
+closed. OOM, hard memory/swap, and task-limit events are `resource-exhausted`;
+`MemoryHigh` and PSI are pressure diagnostics. Missing optional counters are
+`not collected on this host`, not evidence loss. The managed test wrapper
+rejects a same-lane duplicate before spawn and does not learn its runtime.
+Unwrapped commands cannot be deduplicated from free-form logs without a
+structured hook. In-session Claude and arbitrary descendants remain part of
+the host session; use the managed wrapper for test gates and external agents
+for the mechanical containment boundary.
+
 ## How to invoke this skill
 
 Open a Claude Code session **in the `coding-review-agent-loop` repo root** (or

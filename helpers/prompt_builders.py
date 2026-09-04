@@ -32,6 +32,7 @@ from coding_review_agent_loop.prompts import (
     build_review_prompt,
     build_same_pr_followup_prompt,
     render_coder_human_requirements_prompt_context,
+    _containment_prompt_guidance,
 )
 from coding_review_agent_loop.round_state import _deserialize_unresolved_item
 from coding_review_agent_loop.test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
@@ -39,6 +40,12 @@ from coding_review_agent_loop.unresolved_items import (
     _format_same_pr_unresolved_items,
     _format_unresolved_items_for_coder,
 )
+
+
+def _with_containment_guidance(prompt: str, config: AgentLoopConfig) -> str:
+    """Keep skill-mode prompt construction aligned with the CLI guidance."""
+    guidance = _containment_prompt_guidance(config)
+    return prompt if guidance.strip() in prompt else f"{prompt}\n{guidance}"
 
 
 def make_minimal_config(
@@ -263,7 +270,7 @@ def build_pr_fix_prompt_for_skill(
     )
     if same_pr_only:
         review_text = _format_same_pr_unresolved_items(unresolved)
-        return build_same_pr_followup_prompt(
+        return _with_containment_guidance(build_same_pr_followup_prompt(
             pr_number,
             review_round_number,
             review_text,
@@ -272,9 +279,9 @@ def build_pr_fix_prompt_for_skill(
             issue_context=issue_context,
             human_requirements=human_requirements,
             human_requirements_context=human_requirements_context,
-        )
+        ), config)
     review_text = _format_unresolved_items_for_coder(unresolved)
-    return build_followup_prompt(
+    return _with_containment_guidance(build_followup_prompt(
         pr_number,
         review_round_number,
         review_text,
@@ -283,7 +290,7 @@ def build_pr_fix_prompt_for_skill(
         issue_context=issue_context,
         human_requirements=human_requirements,
         human_requirements_context=human_requirements_context,
-    )
+    ), config)
 
 
 def build_plan_prompt_for_skill(
@@ -306,7 +313,9 @@ def build_plan_prompt_for_skill(
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
     )
     issue_context = _make_issue_context(issue_dict)
-    return build_issue_plan_prompt(issue_context.number, config, memory, issue_context)
+    return _with_containment_guidance(
+        build_issue_plan_prompt(issue_context.number, config, memory, issue_context), config
+    )
 
 
 def build_plan_revision_prompt_for_skill(
@@ -340,7 +349,7 @@ def build_plan_revision_prompt_for_skill(
             human_requirements=tuple(human_requirements),
         )
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
-    return build_plan_revision_prompt(
+    return _with_containment_guidance(build_plan_revision_prompt(
         issue_context.number,
         round_number,
         previous_plan,
@@ -349,7 +358,7 @@ def build_plan_revision_prompt_for_skill(
         memory,
         issue_context,
         unresolved_items=unresolved,
-    )
+    ), config)
 
 
 def build_implementation_prompt_for_skill(
@@ -375,9 +384,9 @@ def build_implementation_prompt_for_skill(
         repo, coder, (coder,), reviewer=coder, workdir=workdir, base=base,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
     )
-    return build_issue_implementation_prompt(
+    return _with_containment_guidance(build_issue_implementation_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,
-    )
+    ), config)
 
 
 def build_plan_decomposition_prompt_for_skill(
@@ -400,6 +409,6 @@ def build_plan_decomposition_prompt_for_skill(
         repo, coder, (coder,), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
     )
-    return build_plan_decomposition_prompt(
+    return _with_containment_guidance(build_plan_decomposition_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,
-    )
+    ), config)

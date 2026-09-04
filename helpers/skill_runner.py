@@ -119,6 +119,7 @@ from coding_review_agent_loop.followups import (
 )
 from coding_review_agent_loop.memory import AgentMemoryContext, prepare_agent_memory
 from coding_review_agent_loop.runner import Runner, run_foreground_test, tail_text
+from coding_review_agent_loop.containment import default_policy
 from coding_review_agent_loop.test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     record_test_observation,
@@ -733,7 +734,9 @@ def _run_test_gate(
     try:
         chosen = resolve_timeout_seconds(timeout_seconds, policy_ceiling=timeout_seconds)
         result = run_foreground_test(
-            argv, cwd=Path(workdir), timeout_seconds=chosen, dry_run=False
+            argv, cwd=Path(workdir), timeout_seconds=chosen, dry_run=False,
+            containment_policy=default_policy(mode=os.environ.get("AGENT_LOOP_CONTAINMENT_MODE", "auto")),
+            containment_role="test-gate",
         )
     except (OSError, AgentLoopError) as exc:  # setup and policy failures remain JSON-visible
         return {**base, "error": f"could not run --test-command: {exc}"}
@@ -747,8 +750,10 @@ def _run_test_gate(
             attempted_timeout_seconds=chosen,
             policy_ceiling_seconds=chosen,
             returncode=result.returncode,
+            containment=(result.containment.to_dict() if result.containment is not None else None),
+            lane=(result.containment.backend if result.containment is not None else None),
         )
-    return {
+    response = {
         "command": command,
         "passed": result.outcome == "passed",
         "timed_out": result.outcome == "timed_out",
@@ -757,6 +762,13 @@ def _run_test_gate(
         "timeout_seconds": chosen,
         "output_tail": result.output_tail,
     }
+    if result.returncode is None and result.outcome == "failed":
+        response["error"] = (
+            "could not run --test-command: target executable was missing or not executable"
+        )
+    if result.containment is not None:
+        response["containment"] = result.containment.to_dict()
+    return response
 
 
 def _maybe_test_gate(

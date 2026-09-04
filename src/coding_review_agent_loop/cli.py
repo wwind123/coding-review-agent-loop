@@ -63,6 +63,13 @@ from .prompts import (
 )
 from .protocol import is_clarification_request, parse_agent_state, parse_pr_number
 from .runner import CommandResult, Runner, ensure_log_dir_ignored, run_foreground_test, tail_text
+from .containment import (
+    CONTAINED_ROLES,
+    CapabilityManifest,
+    render_preflight,
+    policy_from_values,
+    preflight_containment,
+)
 from .test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     TestRuntimeConfigurationError,
@@ -347,6 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "may use a smaller learned recommendation."
             ),
         )
+        add_containment_options(subparser)
         pre_review_tests_group = subparser.add_mutually_exclusive_group()
         pre_review_tests_group.add_argument(
             "--pre-review-tests",
@@ -873,13 +881,78 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional repo memory directory in which agent-loop records this measured run.",
     )
+    add_containment_options(run_tests)
     run_tests.add_argument(
         "inner_argv",
         nargs=argparse.REMAINDER,
         help="Use `--` before the command to run.",
     )
 
+    containment_preflight = subparsers.add_parser(
+        "containment-preflight",
+        help="Report resolved process-tree containment policy and host capabilities.",
+    )
+    add_containment_options(containment_preflight)
+
     return parser
+
+
+def add_containment_options(parser: argparse.ArgumentParser) -> None:
+    """Add resource policy options shared by review flows and ``run-tests``."""
+    parser.add_argument(
+        "--containment-mode",
+        choices=("auto", "required", "off"),
+        default="auto",
+        help=(
+            "Process-tree containment mode: auto uses a systemd v253+ cgroup-v2 "
+            "scope when available and visibly falls back to process groups; "
+            "required fails closed; off disables the cgroup probe (default: auto)."
+        ),
+    )
+    for option, dest, label in (
+        ("memory-high", "containment_aggregate_memory_high", "MemoryHigh"),
+        ("memory-max", "containment_aggregate_memory_max", "MemoryMax"),
+        ("memory-swap-max", "containment_aggregate_memory_swap_max", "MemorySwapMax"),
+        ("tasks-max", "containment_aggregate_tasks_max", "TasksMax"),
+    ):
+        parser.add_argument(
+            f"--containment-{option}",
+            f"--containment-aggregate-{option}",
+            dest=dest,
+            default=None,
+            help=f"Aggregate containment {label} limit (bytes, percentage for memory, or max).",
+        )
+    parser.add_argument(
+        "--containment-os-headroom-percent",
+        type=float,
+        default=25.0,
+        metavar="PERCENT",
+        help="Host memory percentage reserved for the OS and unrelated services (default: 25).",
+    )
+    parser.add_argument(
+        "--containment-slice",
+        default="agent-loop.slice",
+        help="Stable per-user aggregate systemd slice name (default: agent-loop.slice).",
+    )
+    parser.add_argument(
+        "--containment-cache-dir",
+        type=Path,
+        default=None,
+        help="Runtime/cache directory for containment leases and shim reports.",
+    )
+    for role in CONTAINED_ROLES:
+        for option, suffix, label in (
+            ("memory-high", "memory_high", "MemoryHigh"),
+            ("memory-max", "memory_max", "MemoryMax"),
+            ("memory-swap-max", "memory_swap_max", "MemorySwapMax"),
+            ("tasks-max", "tasks_max", "TasksMax"),
+        ):
+            parser.add_argument(
+                f"--containment-{role}-{option}",
+                dest=f"containment_{role}_{suffix}",
+                default=None,
+                help=f"Override {label} for the {role} role.",
+            )
 
 
 def _resolve_task_text(args: argparse.Namespace) -> str:
@@ -902,6 +975,15 @@ def _resolve_task_text(args: argparse.Namespace) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "containment-preflight":
+        try:
+            policy = policy_from_values(vars(args))
+            manifest = preflight_containment(policy)
+            print(render_preflight(policy, manifest))
+            return 0 if manifest.ready or policy.mode != "required" else 2
+        except (AgentLoopError, OSError, ValueError) as exc:
+            print(f"agent-loop: {exc}", file=sys.stderr)
+            return 2
     if args.command == "run-tests":
         raw_inner = list(args.inner_argv)
         if raw_inner[:1] == ["--"]:
@@ -913,11 +995,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             policy = inherited_timeout_ceiling()
             chosen = resolve_timeout_seconds(args.timeout_seconds, policy_ceiling=policy)
+            containment_policy = policy_from_values(vars(args))
             result = run_foreground_test(
                 raw_inner,
                 cwd=Path.cwd(),
                 timeout_seconds=chosen,
                 dry_run=False,
+                containment_policy=containment_policy,
+                containment_role="test-gate",
             )
             record_test_observation(
                 args.memory_dir,
@@ -928,6 +1013,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 attempted_timeout_seconds=chosen,
                 policy_ceiling_seconds=policy,
                 returncode=result.returncode,
+                containment=(result.containment.to_dict() if result.containment is not None else None),
+                lane=(result.containment.backend if result.containment is not None else None),
             )
             return int(result.returncode if result.returncode is not None else 1)
         except (AgentLoopError, OSError, ValueError) as exc:
@@ -960,6 +1047,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not (args.managed_ci_trusted_actor or "").strip():
                 raise AgentLoopError("--managed-ci requires --managed-ci-trusted-actor.")
         config = config_from_args(args, runner, invocation_argv=invocation)
+        runner.configure_from_config(config)
+        if config.dry_run:
+            print(
+                render_preflight(
+                    config.containment_policy,
+                    CapabilityManifest(
+                        "dry-run", True,
+                        reason="host capability probing is deferred in dry-run mode",
+                    ),
+                ),
+                file=sys.stderr,
+            )
         if config.auto_merge and config.watch_pending_ci_explicit and not config.watch_pending_ci:
             print(
                 "agent-loop: warning: --no-watch-pending-ci is retained for compatibility "

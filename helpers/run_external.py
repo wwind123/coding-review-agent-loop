@@ -224,6 +224,14 @@ def main() -> None:
         "structured-response recovery. Skipped in --dry-run.",
     )
     parser.add_argument(
+        "--invocation-evidence-output",
+        default=None,
+        help=(
+            "Write the mechanical containment invocation evidence sidecar, including "
+            "limits, counters, termination cause, and cleanup status."
+        ),
+    )
+    parser.add_argument(
         "--coder-test-command-timeout-seconds",
         type=float,
         default=DEFAULT_TEST_TIMEOUT_SECONDS,
@@ -233,6 +241,19 @@ def main() -> None:
             f"(default: {DEFAULT_TEST_TIMEOUT_SECONDS})."
         ),
     )
+    parser.add_argument(
+        "--containment-mode",
+        choices=["auto", "required", "off"],
+        default="auto",
+        help="Process-tree containment mode for this external invocation (default: auto).",
+    )
+    parser.add_argument("--containment-memory-high", default=None)
+    parser.add_argument("--containment-memory-max", default=None)
+    parser.add_argument("--containment-memory-swap-max", default=None)
+    parser.add_argument("--containment-tasks-max", default=None)
+    parser.add_argument("--containment-os-headroom-percent", type=float, default=25.0)
+    parser.add_argument("--containment-slice", default="agent-loop.slice")
+    parser.add_argument("--containment-cache-dir", type=Path, default=None)
     args = parser.parse_args()
 
     if args.max_retries < 0:
@@ -361,9 +382,19 @@ def main() -> None:
         refresh_test_profile=False,
         auto_agent_dirs=(agent_name,),
         coder_test_command_timeout_seconds=args.coder_test_command_timeout_seconds,
+        containment_mode=args.containment_mode,
+        containment_memory_high=args.containment_memory_high,
+        containment_memory_max=args.containment_memory_max,
+        containment_memory_swap_max=args.containment_memory_swap_max,
+        containment_tasks_max=args.containment_tasks_max,
+        containment_os_headroom_percent=args.containment_os_headroom_percent,
+        containment_slice=args.containment_slice,
+        containment_cache_dir=args.containment_cache_dir,
     )
 
     runner = Runner(dry_run=False)
+    runner.configure_from_config(config)
+    runner.set_containment_role("coder" if args.role == "coder" else "reviewer")
     # Re-clone (if requested) happens once, outside the retry loop: it raises
     # deterministically and re-cloning per attempt would be wasteful.
     if args.repo:
@@ -415,6 +446,7 @@ def main() -> None:
     result = None
     for attempt in range(1, max_attempts + 1):
         candidate = None
+        mechanical_failure = False
         try:
             candidate = backend.run(
                 runner,
@@ -431,14 +463,31 @@ def main() -> None:
                 result = candidate
                 break
 
-        transient = is_transient_agent_output(failure_text or "")
+        if candidate is not None and candidate.containment is not None:
+            evidence = candidate.containment
+            if evidence.resource_exhausted:
+                failure_text = (
+                    "resource-exhausted: "
+                    f"limit={evidence.applicable_limit or 'cgroup resource limit'}; "
+                    f"backend={evidence.backend}; diagnostics="
+                    + ("; ".join(evidence.diagnostics) or "see invocation evidence")
+                )
+                mechanical_failure = True
+            elif evidence.backend == "systemd-cgroup-v2" and not evidence.cleanup_confirmed:
+                failure_text = (
+                    "containment-indeterminate: managed invocation cleanup could not be confirmed; "
+                    "retry is blocked until the scope is empty"
+                )
+                mechanical_failure = True
+
+        transient = False if mechanical_failure else is_transient_agent_output(failure_text or "")
         capacity = classify_antigravity_capacity(
             failure_text or "",
             returncode=(candidate.returncode if candidate is not None else 1),
             empty_response=bool(candidate is not None and candidate.returncode == 0 and not candidate.text.strip()),
             signatures=config.antigravity_quota_signatures,
         ) if agent_name == "antigravity" else None
-        if capacity is not None and capacity.is_capacity:
+        if capacity is not None and capacity.is_capacity and not mechanical_failure:
             transient = True
         transition = (
             antigravity_attempts.next_after_failure(
@@ -469,6 +518,24 @@ def main() -> None:
             output_path.write_text(failure_text or "", encoding="utf-8")
         except OSError:
             pass
+        if args.invocation_evidence_output:
+            try:
+                Path(args.invocation_evidence_output).write_text(
+                    json.dumps(
+                        candidate.containment.to_dict()
+                        if candidate is not None and candidate.containment is not None
+                        else {
+                            "backend": "unknown",
+                            "status": "not-collected",
+                            "failure": failure_text or "",
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"run_external: could not write invocation evidence: {exc}", file=sys.stderr)
         sys.exit(1)
 
     assert result is not None  # loop either set result or exited
@@ -478,14 +545,39 @@ def main() -> None:
     if args.response_evidence_output:
         try:
             Path(args.response_evidence_output).write_text(
-                json.dumps({
-                    "response_file_text": result.response_file_text,
-                    "message_text": result.message_text,
-                }, indent=2),
+                json.dumps(
+                    {
+                        "response_file_text": result.response_file_text,
+                        "message_text": result.message_text,
+                        **(
+                            {"containment": result.containment.to_dict()}
+                            if result.containment is not None
+                            else {}
+                        ),
+                    },
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
         except Exception as exc:  # noqa: BLE001
             print(f"run_external: could not write response evidence: {exc}", file=sys.stderr)
+
+    if args.invocation_evidence_output:
+        try:
+            Path(args.invocation_evidence_output).write_text(
+                json.dumps(
+                    result.containment.to_dict() if result.containment else {
+                        "backend": "unknown",
+                        "status": "not-collected",
+                        "reason": "backend returned no containment evidence",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"run_external: could not write invocation evidence: {exc}", file=sys.stderr)
 
     # External-agent usage for cost tracking (#308). Advisory — never fail the run.
     if args.usage_output:
