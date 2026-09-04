@@ -2526,8 +2526,14 @@ def _run_validated_agent(
         ):
             decision = getattr(runner, "target_exec_retry_decision", None)
             if decision is not None:
+                target_argv = (
+                    result.command_result.args
+                    if result.command_result is not None
+                    else ()
+                )
                 target_exec_retryable, detail = decision(
-                    result.args[0], containment.target_exec_errno
+                    target_argv[0] if target_argv else "",
+                    containment.target_exec_errno,
                 )
             else:
                 detail = "agent target could not be executed; target exec error"
@@ -2668,9 +2674,15 @@ def _run_validated_agent(
             last_error = f"agent command exited with {result.returncode}"
             classification_text = _agent_failure_classification_text(result, phase="command")
             if target_exec_retryable:
+                target_argv = (
+                    result.command_result.args
+                    if result.command_result is not None
+                    else ()
+                )
                 last_error = str(
                     getattr(runner, "target_exec_retry_decision")(
-                        result.args[0], containment.target_exec_errno
+                        target_argv[0] if target_argv else "",
+                        containment.target_exec_errno,
                     )[1]
                 )
                 classification_text = f"{last_error}\n{classification_text}".strip()

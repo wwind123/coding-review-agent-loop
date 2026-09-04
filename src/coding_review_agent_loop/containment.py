@@ -801,6 +801,7 @@ class InvocationHandle:
     target_exec_errno: int | None = None
     diagnostics: tuple[str, ...] = ()
     _resource_result: str | None = field(default=None, repr=False, compare=False)
+    _resource_result_reset: bool = field(default=False, repr=False, compare=False)
 
     @classmethod
     def prepare(
@@ -911,6 +912,32 @@ class InvocationHandle:
                 self.diagnostics += (diagnostic,)
         return value
 
+    def _reset_failed_resource_unit(self) -> None:
+        """Remove a recorded resource failure from the long-lived user manager."""
+        if self._resource_result_reset or self._resource_result not in {"oom-kill", "resources"}:
+            return
+        self._resource_result_reset = True
+        if not self.managed or shutil.which(self.policy.systemctl) is None:
+            return
+        try:
+            result = subprocess.run(
+                (self.policy.systemctl, "--user", "reset-failed", self.unit_name),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.diagnostics += (f"failed to reset systemd scope result={self._resource_result}: {exc}",)
+            return
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip()
+            self.diagnostics += (
+                f"failed to reset systemd scope result={self._resource_result}"
+                + (f": {detail}" if detail else ""),
+            )
+
     def confirm_empty(self, *, timeout: float = 2.0) -> bool:
         if not self.managed:
             self.cleanup_confirmed = True
@@ -968,6 +995,7 @@ class InvocationHandle:
         return result.returncode != 0
 
     def close(self) -> None:
+        self._reset_failed_resource_unit()
         if self.lease is not None:
             self.lease.close()
             self.lease = None
