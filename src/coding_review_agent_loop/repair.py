@@ -1287,6 +1287,8 @@ def execute_repair(
                 usage_context.add_record(
                     agent="antigravity", session_id=None, returncode=None,
                     usage=estimate_usage(prompt, ""), role="repair", model=model,
+                    turn_role="repair", configured_model=model,
+                    effort_source="repair_backend",
                     outcome="unavailable_model", log_path=None,
                     fallback_planned=fallback_planned,
                 )
@@ -1381,6 +1383,9 @@ def execute_repair(
                 usage=estimate_usage(prompt, output),
                 role="repair",
                 model=model,
+                turn_role="repair",
+                configured_model=model,
+                effort_source="repair_backend",
                 outcome=outcome,
                 log_path=str(log_path) if log_path is not None else None,
                 fallback_planned=fallback_planned,

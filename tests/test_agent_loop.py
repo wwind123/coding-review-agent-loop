@@ -406,6 +406,26 @@ def test_generic_provider_unsupported_model_payload_classifies_separately():
     assert _failure_category(text) == "unsupported_model"
 
 
+def test_provider_cli_effort_rejection_is_classified_without_retry(tmp_path):
+    runner = FakeRunner(claude_outputs=[("unknown option: --effort", 1)])
+    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
+
+    with pytest.raises(AgentInvocationError) as exc_info:
+        _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Review the PR.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: text,
+            role="reviewer",
+        )
+
+    assert exc_info.value.failure_category == "unsupported_effort"
+    assert "provider CLI rejected the explicit --effort setting" in str(exc_info.value)
+    assert not any(command[:1] == ["sleep"] for command, _cwd in runner.commands)
+
+
 @pytest.mark.parametrize(
     ("agent", "expected_config_model"),
     [
@@ -2117,6 +2137,19 @@ def test_implementation_coder_options_require_issue_plan_first(capsys):
     assert main(["issue", "56", "--repo", "OWNER/REPO", "--implementation-coder", "codex"]) == 1
     assert "--implementation-coder options require --plan-first" in capsys.readouterr().err
 
+    assert main([
+        "pr", "77", "--repo", "OWNER/REPO", "--implementation-claude-effort", "high"
+    ]) == 1
+    assert (
+        "--implementation-coder options are only supported with issue --plan-first"
+        in capsys.readouterr().err
+    )
+
+    assert main([
+        "issue", "56", "--repo", "OWNER/REPO", "--implementation-claude-effort", "high"
+    ]) == 1
+    assert "--implementation-coder options require --plan-first" in capsys.readouterr().err
+
 
 def test_plan_first_post_approval_options_require_plan_first(capsys):
     assert main(["issue", "56", "--repo", "OWNER/REPO", "--implement-after-approval"]) == 1
@@ -2164,7 +2197,7 @@ def test_flat_child_limit_cli_is_configurable(tmp_path):
     assert config.flat_child_limit == 23
 
 
-def test_implementation_codex_reasoning_effort_requires_codex_and_model(tmp_path):
+def test_implementation_codex_reasoning_effort_requires_codex_but_not_model(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
         "issue",
@@ -2205,8 +2238,53 @@ def test_implementation_codex_reasoning_effort_requires_codex_and_model(tmp_path
         "--gemini-dir",
         str(tmp_path / "gemini"),
     ])
-    with pytest.raises(AgentLoopError, match="requires --implementation-coder-model or --codex-model"):
+    config = config_from_args(args, FakeRunner())
+    assert config.implementation_codex_reasoning_effort == "high"
+
+
+def test_implementation_claude_effort_requires_claude_but_not_model(tmp_path):
+    parser = build_parser()
+    args = parser.parse_args([
+        "issue",
+        "56",
+        "--repo",
+        "OWNER/REPO",
+        "--plan-first",
+        "--implement-after-approval",
+        "--coder",
+        "codex",
+        "--implementation-claude-effort",
+        "high",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+        "--gemini-dir",
+        str(tmp_path / "gemini"),
+    ])
+    with pytest.raises(AgentLoopError, match="requires --implementation-coder claude"):
         config_from_args(args, FakeRunner())
+
+    args = parser.parse_args([
+        "issue",
+        "56",
+        "--repo",
+        "OWNER/REPO",
+        "--plan-first",
+        "--implement-after-approval",
+        "--coder",
+        "claude",
+        "--implementation-claude-effort",
+        "high",
+        "--claude-dir",
+        str(tmp_path / "claude"),
+        "--codex-dir",
+        str(tmp_path / "codex"),
+        "--gemini-dir",
+        str(tmp_path / "gemini"),
+    ])
+    config = config_from_args(args, FakeRunner())
+    assert config.implementation_claude_effort == "high"
 
 
 def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_path):
@@ -2238,6 +2316,7 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
                 "coder": config.coder,
                 "codex_model": config.codex_model,
                 "codex_reasoning_effort": config.codex_reasoning_effort,
+                "implementation_codex_reasoning_effort": config.implementation_codex_reasoning_effort,
                 "session_id": session_id,
                 "operation": kwargs.get("operation_description"),
             }
@@ -2291,7 +2370,8 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
     implementation_call = calls[2]
     assert implementation_call["coder"] == "codex"
     assert implementation_call["codex_model"] == "gpt-5.5"
-    assert implementation_call["codex_reasoning_effort"] == "high"
+    assert implementation_call["codex_reasoning_effort"] == ""
+    assert implementation_call["implementation_codex_reasoning_effort"] == "high"
     assert implementation_call["session_id"] is None
     assert calls[0]["coder"] == "claude"
 
@@ -5235,6 +5315,20 @@ def test_agent_signature_uses_configured_model(tmp_path):
     from coding_review_agent_loop.agents.registry import agent_signature
     config = make_config(tmp_path, codex_model="gpt-5.2-codex", codex_reasoning_effort="high")
     assert agent_signature("codex", config) == "OpenAI Codex: gpt-5.2-codex (high)"
+    assert (
+        agent_signature("codex", make_config(tmp_path, codex_model="gpt-5.5"))
+        == "OpenAI Codex: gpt-5.5 (medium)"
+    )
+    assert (
+        agent_signature("claude", make_config(tmp_path, claude_model="claude-sonnet"))
+        == "Anthropic Claude: claude-sonnet (medium)"
+    )
+    assert (
+        agent_signature(
+            "codex", make_config(tmp_path, codex_reasoning_effort="high")
+        )
+        == "OpenAI Codex: unknown model (high)"
+    )
     # antigravity model is always declared (effort already embedded).
     assert agent_signature("antigravity", config) == "Google Antigravity: Gemini 3.7 Flash (High)"
     # gemini with no declared model falls back to the generic signature.
@@ -5263,14 +5357,122 @@ def test_config_rejects_model_arg_conflicts(tmp_path):
             make_config(tmp_path, **kwargs)
 
 
-def test_config_rejects_codex_effort_without_model(tmp_path):
-    # Rollout model detection is best-effort, so effort alone cannot be labeled
-    # reliably and requires an explicit --codex-model.
-    with pytest.raises(AgentLoopError, match="requires --codex-model"):
-        make_config(tmp_path, codex_reasoning_effort="high")
-    # With a model it's accepted.
+def test_config_allows_codex_effort_without_model(tmp_path):
+    # Rollout evidence may identify the model later; model omission is valid and
+    # the effort remains independently reportable.
+    config = make_config(tmp_path, codex_reasoning_effort="high")
+    assert config.codex_model == ""
+    from coding_review_agent_loop.config import resolve_invocation
+    assert resolve_invocation(config, provider="codex").resolved_effort == "high"
+    # With a model it's accepted as well.
     config = make_config(tmp_path, codex_model="gpt-5", codex_reasoning_effort="high")
     assert config.codex_reasoning_effort == "high"
+
+
+def test_effort_resolution_preserves_omitted_vs_explicit_and_role_precedence(tmp_path):
+    from coding_review_agent_loop.config import resolve_invocation
+
+    omitted = make_config(tmp_path, coder="claude")
+    resolved = resolve_invocation(omitted, provider="claude", role="coder")
+    assert (resolved.resolved_effort, resolved.effort_source) == ("medium", "tool_default")
+
+    explicit = make_config(tmp_path, codex_reasoning_effort="high")
+    agent_wide = resolve_invocation(explicit, provider="codex", role="reviewer")
+    assert (agent_wide.resolved_effort, agent_wide.effort_source) == ("high", "agent_wide")
+
+    implementation = make_config(
+        tmp_path,
+        coder="codex",
+        codex_reasoning_effort="high",
+        implementation_coder="codex",
+        implementation_codex_reasoning_effort="xhigh",
+    )
+    role_override = resolve_invocation(
+        implementation, provider="codex", role="coder", implementation=True
+    )
+    assert (role_override.resolved_effort, role_override.effort_source) == (
+        "xhigh",
+        "role_override",
+    )
+
+
+def test_provider_switch_does_not_carry_effort_between_claude_and_codex(tmp_path):
+    from coding_review_agent_loop.config import resolve_invocation
+
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        claude_effort="high",
+        codex_reasoning_effort="xhigh",
+        implementation_coder="codex",
+    )
+    assert resolve_invocation(config, provider="claude").resolved_effort == "high"
+    assert resolve_invocation(config, provider="codex", implementation=True).resolved_effort == "xhigh"
+
+
+@pytest.mark.parametrize(
+    ("provider", "effort_option", "agent_effort_option"),
+    [
+        ("codex", "implementation_codex_reasoning_effort", "codex_reasoning_effort"),
+        ("claude", "implementation_claude_effort", "claude_effort"),
+    ],
+)
+def test_approved_implementation_role_override_reaches_real_backend_turn(
+    tmp_path, provider, effort_option, agent_effort_option
+):
+    from coding_review_agent_loop.agents.registry import run_agent_result
+    from coding_review_agent_loop.orchestrator import _approved_implementation_config
+
+    config = make_config(
+        tmp_path,
+        coder=provider,
+        implementation_coder=provider,
+        **{agent_effort_option: "medium"},
+        **{effort_option: "high"},
+    )
+    implementation_config, reuse_session = _approved_implementation_config(config)
+    assert not reuse_session
+
+    runner = FakeRunner(**{f"{provider}_outputs": [("ok", 0), ("ok", 0)]})
+    implementation_result = run_agent_result(
+        runner,
+        agent=provider,
+        config=implementation_config,
+        prompt="Implement the approved plan.",
+        role="coder",
+    )
+    reviewer_result = run_agent_result(
+        runner,
+        agent=provider,
+        config=implementation_config,
+        prompt="Review the implementation.",
+        role="reviewer",
+    )
+
+    assert (implementation_result.configured_effort, implementation_result.effort_source) == (
+        "high",
+        "role_override",
+    )
+    assert (reviewer_result.configured_effort, reviewer_result.effort_source) == (
+        "medium",
+        "agent_wide",
+    )
+    commands = [command for command, _cwd in runner.commands if command[0] == provider]
+    if provider == "codex":
+        assert 'model_reasoning_effort="high"' in commands[0]
+        assert 'model_reasoning_effort="medium"' in commands[1]
+    else:
+        assert commands[0][commands[0].index("--effort") + 1] == "high"
+        assert commands[1][commands[1].index("--effort") + 1] == "medium"
+
+
+@pytest.mark.parametrize("value", ["", "invalid", "MAX"])
+def test_claude_effort_values_are_validated(tmp_path, value):
+    if value == "":
+        assert make_config(tmp_path, claude_effort=value).claude_effort == ""
+    else:
+        with pytest.raises(AgentLoopError, match="--claude-effort"):
+            make_config(tmp_path, claude_effort=value)
 
 
 def test_config_allows_declared_model_without_conflict(tmp_path):
@@ -5313,7 +5515,7 @@ def test_claude_backend_passes_model_when_declared(tmp_path):
 def test_public_reviewer_name_config_aware_no_leakage(tmp_path):
     from coding_review_agent_loop.comment_rendering import _public_reviewer_name
     config = make_config(tmp_path, codex_model="gpt-5", antigravity_model="Gemini 3.1 Pro (High)")
-    assert _public_reviewer_name("Codex", config) == "OpenAI Codex: gpt-5"
+    assert _public_reviewer_name("Codex", config) == "OpenAI Codex: gpt-5 (medium)"
     assert _public_reviewer_name("Antigravity", config) == "Google Antigravity: Gemini 3.1 Pro (High)"
     # No declared model → generic; unknown display name → passthrough.
     assert _public_reviewer_name("Claude", config) == "Anthropic Claude"

@@ -176,6 +176,15 @@ class ClaudeBackend:
     def default_args(self, *, dangerous: bool) -> tuple[str, ...]:
         return ("--dangerously-skip-permissions",) if dangerous else ()
 
+    @staticmethod
+    def _model_label(config: AgentLoopConfig, observed_model: str | None, *, role: str | None) -> str | None:
+        from ..config import resolve_invocation
+
+        invocation = resolve_invocation(config, provider="claude", role=role)
+        if invocation.resolved_effort is None:
+            return observed_model or invocation.configured_model
+        return f"{observed_model or invocation.configured_model or 'unknown model'} ({invocation.resolved_effort})"
+
     def run(
         self,
         runner: Runner,
@@ -188,8 +197,20 @@ class ClaudeBackend:
         timeout_seconds: float | None = None,
         attempt_suffix: str | None = None,
     ) -> AgentResult:
+        from ..config import resolve_invocation
+
         response_path = public_response_path(config, "claude")
-        args = [config.claude_cmd, "--print", "--output-format", "json", *config.claude_args]
+        invocation = resolve_invocation(config, provider="claude", role=role)
+        assert invocation.resolved_effort is not None
+        args = [
+            config.claude_cmd,
+            "--print",
+            "--output-format",
+            "json",
+            *config.claude_args,
+            "--effort",
+            invocation.resolved_effort,
+        ]
         # Pin the model when declared (#332); conflict validation guarantees this is
         # not also passed via --claude-arg --model.
         if config.claude_model:
@@ -226,6 +247,7 @@ class ClaudeBackend:
                 "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                     config.coder_test_command_timeout_seconds
                 ),
+                "CLAUDE_CODE_EFFORT_LEVEL": invocation.resolved_effort,
             },
             input_text=input_text,
             timeout_seconds=timeout_seconds,
@@ -268,9 +290,18 @@ class ClaudeBackend:
             returncode=result.returncode,
             usage=usage,
             raw_usage=raw_usage,
-            # Ground truth from Claude's own output; falls back to config.claude_model
-            # at signature time when detection is unavailable (e.g. non-JSON output).
-            model_used=model_detected,
+            # Claude reports its model in JSON, but not a verified effort field;
+            # the selected effort remains configuration metadata, never an
+            # invented runtime observation.
+            model_used=self._model_label(config, model_detected, role=role),
+            observed_model=model_detected,
+            observed_effort=None,
+            observation_provenance="Claude JSON result" if model_detected else None,
+            provider="claude",
+            role=role,
+            configured_model=invocation.configured_model,
+            configured_effort=invocation.resolved_effort,
+            effort_source=invocation.effort_source,
             command_result=result,
             self_update_reason=candidate.reason if candidate else None,
             self_update_replay_refusal_kind=(

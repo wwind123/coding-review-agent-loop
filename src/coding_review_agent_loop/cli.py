@@ -202,7 +202,16 @@ def build_parser() -> argparse.ArgumentParser:
             default="",
             help=(
                 "Codex reasoning effort to use with --implementation-coder codex during "
-                "approved implementation and PR follow-up."
+                "approved implementation and PR follow-up. Explicit role override wins "
+                "over --codex-reasoning-effort; otherwise agent-loop uses medium."
+            ),
+        )
+        subparser.add_argument(
+            "--implementation-claude-effort",
+            default="",
+            help=(
+                "Claude effort for approved implementation and PR follow-up. Explicit "
+                "role override wins over --claude-effort; otherwise agent-loop uses medium."
             ),
         )
         subparser.add_argument("--claude-cmd", default="claude")
@@ -270,9 +279,11 @@ def build_parser() -> argparse.ArgumentParser:
             "--codex-reasoning-effort",
             default="",
             help=(
-                "Codex reasoning effort (e.g. low/medium/high) to run and stamp in the "
-                "signature. Requires --codex-model because rollout detection is best-effort. "
-                "Mutually exclusive with model_reasoning_effort via --codex-arg."
+                "Codex reasoning effort (minimal/low/medium/high/xhigh) to run and stamp "
+                "in the signature. If omitted, agent-loop explicitly selects medium, so "
+                "CLI config and environment defaults cannot override it. Use xhigh for "
+                "higher-effort Luna runs. Mutually exclusive with model_reasoning_effort "
+                "via --codex-arg."
             ),
         )
         subparser.add_argument(
@@ -286,6 +297,15 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "Claude model to run (CLI mode) / declare for the signature (host mode). "
                 "Mutually exclusive with --claude-arg --model."
+            ),
+        )
+        subparser.add_argument(
+            "--claude-effort",
+            default="",
+            help=(
+                "Claude effort (low/medium/high/xhigh/max). If omitted, agent-loop "
+                "explicitly selects medium rather than inheriting local CLI configuration. "
+                "Role-specific implementation effort takes precedence."
             ),
         )
         subparser.add_argument("--gh-cmd", default="gh")
@@ -1069,6 +1089,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.implementation_coder is not None
             or args.implementation_coder_model
             or args.implementation_codex_reasoning_effort
+            or args.implementation_claude_effort
         )
         if args.command != "issue" and implementation_override_requested:
             raise AgentLoopError("--implementation-coder options are only supported with issue --plan-first.")

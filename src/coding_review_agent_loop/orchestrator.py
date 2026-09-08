@@ -589,8 +589,36 @@ class ValidatedAgentResponse:
     # Model the agent actually ran, for the dynamic signature (#332). Carried from
     # AgentResult.model_used so the orchestrator render sites can stamp it.
     model_used: str | None = None
+    provider: AgentName | None = None
+    role: str | None = None
+    configured_model: str | None = None
+    configured_effort: str | None = None
+    effort_source: str | None = None
+    observed_model: str | None = None
+    observed_effort: str | None = None
+    observation_provenance: str | None = None
     acquisition_outcome: Literal["success", "accepted_nonzero_exit", "accepted_timeout"] = "success"
     acquisition_returncode: int | None = None
+
+
+def _response_identity_fields(result: AgentResult) -> dict[str, object]:
+    return {
+        "provider": result.provider,
+        "role": result.role,
+        "configured_model": result.configured_model,
+        "configured_effort": result.configured_effort,
+        "effort_source": result.effort_source,
+        "observed_model": result.observed_model,
+        "observed_effort": result.observed_effort,
+        "observation_provenance": result.observation_provenance,
+    }
+
+
+def _metadata_identity_fields(response: object) -> dict[str, object]:
+    """Identity fields safe to expand into PostedRoundMetadata."""
+    fields = _response_identity_fields(response)  # type: ignore[arg-type]
+    fields.pop("role", None)
+    return fields
 
 
 class _AgentUnavailableResponse(AgentLoopError):
@@ -867,6 +895,19 @@ def _looks_like_unsupported_model_text(text: str) -> bool:
     )
 
 
+def _looks_like_unsupported_effort_text(text: str) -> bool:
+    """Recognize a CLI rejecting the tool-owned effort flag."""
+    return bool(
+        re.search(
+            r"(?:unknown|unrecognized|invalid|unsupported)\s+"
+            r"(?:option|flag|argument).*--effort|"
+            r"--effort.*(?:unknown|unrecognized|invalid|unsupported|not supported)",
+            text,
+            re.I,
+        )
+    )
+
+
 def _unsupported_model_classification_text(
     text: str,
     *,
@@ -942,6 +983,8 @@ def _failure_category(
     if not text.strip():
         return "empty-response"
     lowered = text.lower()
+    if _looks_like_unsupported_effort_text(text):
+        return "unsupported_effort"
     if "resource-exhausted" in lowered or "resource exhausted" in lowered:
         return "resource-exhausted"
     if "containment-indeterminate" in lowered or "cleanup-failed" in lowered:
@@ -1319,7 +1362,11 @@ def _resolve_requested_model(
     result: AgentResult | None,
     classification_text: str,
 ) -> str | None:
-    result_model = result.model_used.strip() if result is not None and result.model_used else None
+    result_model = (
+        _model_flag_value(result.model_used)
+        if result is not None and result.model_used
+        else None
+    )
     config_model = _configured_requested_model(agent, config)
     parsed_model = _parse_model_from_provider_text(classification_text)
     return result_model or config_model or parsed_model
@@ -1443,6 +1490,12 @@ def _failure_suggestion(
 ) -> str:
     """Return a one-line actionable suggestion to append to an agent failure message."""
     combined = f"{reason} {classification_text}"
+    if category == "unsupported_effort":
+        return (
+            "Suggestion: use the dedicated effort option and upgrade the provider CLI "
+            "to a release that accepts its explicit effort flag; agent-loop will not "
+            "retry without the requested setting."
+        )
     if category == "unsupported_model":
         return _unsupported_model_suggestion(unsupported_model_diagnostic)
     if category == "agent-unavailable":
@@ -1552,6 +1605,11 @@ def _format_invalid_agent_response_error(
         category_hint = f" Failure category: executable-replacement ({agent_name} changed during invocation)."
     elif category == "agent-unavailable":
         category_hint = " Failure category: agent-unavailable (the agent explicitly could not continue)."
+    elif category == "unsupported_effort":
+        category_hint = (
+            " Failure category: unsupported_effort (the provider CLI rejected the "
+            "explicit --effort setting; no retry omitted it)."
+        )
     if not classification_text:
         classification_text = (result.raw_output or result.text or "") if result is not None else ""
     unsupported_model_diagnostic = None
@@ -2103,6 +2161,14 @@ def _attempt_claude_completion_recovery(
                 usage=recovery_usage,
                 raw_backend_usage=recovery_result.raw_usage,
                 role="completion-recovery",
+                turn_role=role,
+                model=recovery_result.model_used,
+                configured_model=recovery_result.configured_model,
+                configured_effort=recovery_result.configured_effort,
+                effort_source=recovery_result.effort_source,
+                observed_model=recovery_result.observed_model,
+                observed_effort=recovery_result.observed_effort,
+                observation_provenance=recovery_result.observation_provenance,
             )
     else:
         recovery_usage = None
@@ -2169,6 +2235,7 @@ def _attempt_claude_completion_recovery(
                     text=recovery_artifact, session_id=recovery_result.session_id,
                     marker_value=marker_value, usage=recovery_usage,
                     model_used=recovery_result.model_used,
+                    **_response_identity_fields(recovery_result),
                     acquisition_outcome=accepted_outcome,
                     acquisition_returncode=recovery_result.returncode,
                 ),
@@ -2273,6 +2340,7 @@ def _attempt_claude_completion_recovery(
             marker_value=marker_value,
             usage=recovery_usage,
             model_used=recovery_result.model_used,
+            **_response_identity_fields(recovery_result),
         ),
         result=recovery_result,
         error="",
@@ -2449,6 +2517,14 @@ def _run_validated_agent(
                 returncode=result.returncode,
                 usage=usage,
                 raw_backend_usage=result.raw_usage,
+                turn_role=role,
+                model=result.model_used,
+                configured_model=result.configured_model,
+                configured_effort=result.configured_effort,
+                effort_source=result.effort_source,
+                observed_model=result.observed_model,
+                observed_effort=result.observed_effort,
+                observation_provenance=result.observation_provenance,
                 containment=(result.containment.to_dict() if result.containment is not None else None),
             )
 
@@ -2490,6 +2566,7 @@ def _run_validated_agent(
                         marker_value=artifact_marker_value,
                         usage=usage,
                         model_used=result.model_used,
+                        **_response_identity_fields(result),
                         acquisition_outcome=acquisition_outcome,
                         acquisition_returncode=result.returncode,
                     )
@@ -2865,6 +2942,7 @@ def _run_validated_agent(
                             marker_value=marker_value,
                             usage=usage,
                             model_used=result.model_used,
+                            **_response_identity_fields(result),
                         )
                 if (
                     not response_failure_is_unsupported
@@ -2903,6 +2981,7 @@ def _run_validated_agent(
                             marker_value=marker_value,
                             usage=usage,
                             model_used=result.model_used,
+                            **_response_identity_fields(result),
                         )
                 normalized: str | None = None
                 if (
@@ -2979,6 +3058,7 @@ def _run_validated_agent(
                                                     marker_value=marker_value,
                                                     usage=usage,
                                                     model_used=result.model_used,
+                                                    **_response_identity_fields(result),
                                                 )
                                     else:
                                         removed = ", ".join(sorted(norm_exc.unknown_ids))
@@ -2998,6 +3078,7 @@ def _run_validated_agent(
                                             marker_value=marker_value,
                                             usage=usage,
                                             model_used=result.model_used,
+                                            **_response_identity_fields(result),
                                         )
                         except AgentLoopError:
                             pass
@@ -3014,6 +3095,7 @@ def _run_validated_agent(
                                 marker_value=marker_value,
                                 usage=usage,
                                 model_used=result.model_used,
+                                **_response_identity_fields(result),
                             )
                 if (
                     use_repair
@@ -3068,6 +3150,7 @@ def _run_validated_agent(
                                         marker_value=marker_value,
                                         usage=usage,
                                         model_used=result.model_used,
+                                        **_response_identity_fields(result),
                                     )
                         else:
                             removed = ", ".join(sorted(exc.unknown_ids))
@@ -3085,6 +3168,7 @@ def _run_validated_agent(
                                 marker_value=marker_value,
                                 usage=usage,
                                 model_used=result.model_used,
+                                **_response_identity_fields(result),
                             )
                 if (
                     use_repair
@@ -3175,6 +3259,7 @@ def _run_validated_agent(
                                 marker_value=marker_value,
                                 usage=usage,
                                 model_used=result.model_used,
+                                **_response_identity_fields(result),
                             )
                     elif repair_attempts:
                         details = "; ".join(
@@ -3192,6 +3277,7 @@ def _run_validated_agent(
                     marker_value=marker_value,
                     usage=usage,
                     model_used=result.model_used,
+                    **_response_identity_fields(result),
                 )
 
         if should_retry:
@@ -4371,7 +4457,12 @@ def _approved_implementation_config(config: AgentLoopConfig) -> tuple[AgentLoopC
     effort = config.implementation_codex_reasoning_effort.strip()
     if effort:
         reuse_session = False
-        updates["codex_reasoning_effort"] = effort
+        updates["implementation_effort_active"] = True
+
+    claude_effort = config.implementation_claude_effort.strip()
+    if claude_effort:
+        reuse_session = False
+        updates["implementation_effort_active"] = True
 
     if updates == {"coder": config.coder}:
         return config, True
@@ -4568,6 +4659,7 @@ def _implement_approved_issue(
             human_requirements=issue_context.human_requirements,
         ),
         usage_context=usage_context,
+        role="coder",
         use_repair=True,
         repair_expected_kind="issue_implementation",
         repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,
@@ -4750,6 +4842,7 @@ def _implement_approved_issue(
             prior_items=(),
             raw_structured_coder_response=coder_output,
             model_used=coder_response.model_used,
+            **_metadata_identity_fields(coder_response),
             acquisition_outcome=coder_response.acquisition_outcome,
             acquisition_returncode=coder_response.acquisition_returncode,
         ),
@@ -5022,6 +5115,7 @@ def _run_plan_first_loop(
                     raw_structured_coder_response=raw_structured_coder_response,
                     compact_prior_summaries=tuple(compact_prior_summaries),
                     model_used=plan_response.model_used,
+                    **_metadata_identity_fields(plan_response),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
                 ),
@@ -5112,6 +5206,7 @@ def _run_plan_first_loop(
             *,
             review_output: str,
             model_used: str | None,
+            identity: ValidatedAgentResponse | None = None,
             acquisition_outcome: str = "success",
             acquisition_returncode: int | None = None,
             new_items: tuple[UnresolvedReviewItem, ...] = (),
@@ -5134,6 +5229,7 @@ def _run_plan_first_loop(
                         new_items=new_items, state=parsed.state,
                         compact_prior_summaries=tuple(compact_prior_summaries),
                         model_used=model_used, phase=phase,
+                        **(_metadata_identity_fields(identity) if identity is not None else {}),
                         acquisition_outcome=acquisition_outcome,
                         acquisition_returncode=acquisition_returncode,
                         canonical_reviewer_response=(review_output if phase == "publication" else None),
@@ -5225,6 +5321,7 @@ def _run_plan_first_loop(
                     _post_plan_reviewer_comment(
                         reviewer_name, parsed, review_output=turn.response.text,
                         model_used=turn.response.model_used,
+                        identity=turn.response,
                         acquisition_outcome=turn.response.acquisition_outcome,
                         acquisition_returncode=turn.response.acquisition_returncode,
                         phase="publication",
@@ -5426,6 +5523,7 @@ def _run_plan_first_loop(
                     _post_plan_reviewer_comment(
                         reviewer_name, parsed_review, review_output=review_output,
                         model_used=review_model_used,
+                        identity=(review_response if resumed_record is None else None),
                         acquisition_outcome=review_acquisition_outcome,
                         acquisition_returncode=review_acquisition_returncode,
                         new_items=tuple(reviewer_new_unresolved_items),
@@ -6126,6 +6224,7 @@ def _run_plan_first_loop(
                     raw_structured_coder_response=raw_structured_coder_response,
                     compact_prior_summaries=tuple(compact_prior_summaries),
                     model_used=plan_response.model_used,
+                    **_metadata_identity_fields(plan_response),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
                 ),
@@ -6554,6 +6653,7 @@ def run_issue_loop(
                 prior_items=(),
                 raw_structured_coder_response=coder_output,
                 model_used=coder_response.model_used,
+                **_metadata_identity_fields(coder_response),
                 acquisition_outcome=coder_response.acquisition_outcome,
                 acquisition_returncode=coder_response.acquisition_returncode,
             ),
@@ -6687,6 +6787,7 @@ def run_task_loop(
                             subject=str(initial_pr_metadata.head_sha or "unknown"),
                             prior_items=(),
                             model_used=coder_response.model_used,
+                            **_metadata_identity_fields(coder_response),
                             acquisition_outcome=coder_response.acquisition_outcome,
                             acquisition_returncode=coder_response.acquisition_returncode,
                         ),
@@ -7521,6 +7622,7 @@ def run_pr_loop(
                 *,
                 review_output: str,
                 model_used: str | None,
+                identity: ValidatedAgentResponse | None = None,
                 acquisition_outcome: str = "success",
                 acquisition_returncode: int | None = None,
                 new_items: tuple[UnresolvedReviewItem, ...] = (),
@@ -7541,6 +7643,7 @@ def run_pr_loop(
                             round_number=round_number, subject=current_pr_subject,
                             prior_items=prior_unresolved_items, dispositions=parsed.dispositions,
                             new_items=new_items, state=parsed.state, model_used=model_used,
+                            **(_metadata_identity_fields(identity) if identity is not None else {}),
                             acquisition_outcome=acquisition_outcome,
                             acquisition_returncode=acquisition_returncode,
                             surfaced_reviewer_requirement_ids=surfaced_reviewer_requirement_ids,
@@ -7715,6 +7818,7 @@ def run_pr_loop(
                             _post_pr_reviewer_comment(
                                 reviewer_name, parsed, review_output=turn.response.text,
                                 model_used=turn.response.model_used,
+                                identity=turn.response,
                                 acquisition_outcome=turn.response.acquisition_outcome,
                                 acquisition_returncode=turn.response.acquisition_returncode,
                                 phase="publication",
@@ -8089,6 +8193,7 @@ def run_pr_loop(
                             _post_pr_reviewer_comment(
                                 reviewer_name, parsed_review, review_output=review_output,
                                 model_used=review_model_used,
+                                identity=(review_response if resumed_record is None else None),
                                 acquisition_outcome=review_acquisition_outcome,
                                 acquisition_returncode=review_acquisition_returncode,
                                 new_items=tuple(reviewer_new_unresolved_items),
@@ -8119,6 +8224,7 @@ def run_pr_loop(
                         _post_pr_reviewer_comment(
                             reviewer_name, parsed_review, review_output=review_output,
                             model_used=review_model_used,
+                            identity=(review_response if resumed_record is None else None),
                             acquisition_outcome=review_acquisition_outcome,
                             acquisition_returncode=review_acquisition_returncode,
                             new_items=tuple(reviewer_new_unresolved_items),
@@ -9104,6 +9210,7 @@ def run_pr_loop(
                     human_requirements=human_requirements,
                 ),
                 usage_context=usage_context,
+                role="coder",
                 use_repair=True,
                 repair_expected_kind="coder_followup",
                 repair_unresolved_item_ids=repair_unresolved_item_ids,
@@ -10687,6 +10794,7 @@ def _post_discuss_debater_comment(
                 subject=subject,
                 raw_structured_coder_response=response.text,
                 model_used=response.model_used,
+                **_metadata_identity_fields(response),
                 research_mode=config.discuss_research,
                 result_mode=config.discuss_result_mode,
             ),

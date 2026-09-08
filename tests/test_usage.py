@@ -40,6 +40,29 @@ def test_completion_recovery_role_survives_record_and_summary(tmp_path):
     assert payload["calls"][0]["role"] == "completion-recovery"
 
 
+def test_usage_record_preserves_configured_and_observed_effort_identity(tmp_path):
+    context = RunUsageContext(run_id="run-identity", summary_path=tmp_path / "usage.json")
+    record = context.add_record(
+        agent="codex",
+        session_id="sess-1",
+        returncode=0,
+        usage=UsageMetadata(mode="estimated", input_tokens=1, output_tokens=1, total_tokens=2),
+        turn_role="reviewer",
+        model="gpt-5.5 (high)",
+        configured_model=None,
+        configured_effort="medium",
+        effort_source="tool_default",
+        observed_model="gpt-5.5",
+        observed_effort="high",
+        observation_provenance="codex rollout record",
+    )
+    payload = record.to_dict()
+    assert payload["turn_role"] == "reviewer"
+    assert payload["configured_effort"] == "medium"
+    assert payload["effort_source"] == "tool_default"
+    assert payload["observed_effort"] == "high"
+
+
 def test_codex_usage_summary_records_exact_tokens_from_jsonl_and_public_response(tmp_path):
     public_response = "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
     runner = FakeRunner(
@@ -70,7 +93,10 @@ def test_codex_usage_summary_records_exact_tokens_from_jsonl_and_public_response
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert runner.comments == [f"**Review verdict:** Approved\n\n{public_response}"]
+    assert runner.comments == [
+        "**Review verdict:** Approved\n\nLGTM.\n"
+        "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex: unknown model (medium)"
+    ]
     summary = read_usage_summary(tmp_path / "logs")
     assert summary["totals"]["exact_calls"] == 1
     assert summary["totals"]["estimated_calls"] == 0

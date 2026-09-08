@@ -1541,7 +1541,7 @@ def test_issue_loop_plan_first_posts_human_readable_item_labels_in_new_and_prior
         "### Same-plan follow-ups\n"
         "- Add one carry-forward plan test.\n"
         "<!-- AGENT_PLAN_STATE: blocking -->\n"
-        "-- OpenAI Codex"
+        "-- OpenAI Codex: unknown model (medium)"
     )
     assert runner.comments[3] == (
         "**Review verdict:** Approved\n\n"
@@ -1550,7 +1550,7 @@ def test_issue_loop_plan_first_posts_human_readable_item_labels_in_new_and_prior
         "- [item-1] Blocking issue from OpenAI Codex, round 1: Keep plan-review wording distinct from PR wording. -> resolved\n"
         "- [item-2] Same-plan follow-up from OpenAI Codex, round 1: Add one carry-forward plan test. -> resolved\n"
         "<!-- AGENT_PLAN_STATE: approved -->\n"
-        "-- OpenAI Codex"
+        "-- OpenAI Codex: unknown model (medium)"
     )
 
 def test_issue_loop_plan_first_does_not_expose_same_round_item_ids_to_later_reviewers(tmp_path):
@@ -3176,7 +3176,7 @@ def test_issue_loop_stops_before_pr_lookup_for_invalid_pr_terminal_result(
         assert "No pull request was accepted for handoff." in runner.comments[0]
     else:
         assert runner.comments == [
-            f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- OpenAI Codex"
+            f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- OpenAI Codex: unknown model (medium)"
         ]
 
 
@@ -3992,7 +3992,7 @@ def test_approved_plan_no_pr_terminal_result_bypasses_human_requirements_and_pr_
         assert "No pull request was accepted for handoff." in runner.comments[0]
     else:
         assert runner.comments == [
-            f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- Anthropic Claude"
+            f"Cannot proceed.\n<!-- AGENT_PR: 0 -->\n{terminal_marker}\n-- Anthropic Claude: unknown model (medium)"
         ]
 
 

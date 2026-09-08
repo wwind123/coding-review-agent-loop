@@ -1240,7 +1240,8 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--repo", "--base", "--claude-dir", "--codex-dir", "--gemini-dir", "--antigravity-dir",
     "--coder", "--reviewer", "--max-rounds", "--managed-ci-trusted-actor",
     "--implementation-coder", "--implementation-coder-model",
-    "--implementation-codex-reasoning-effort", "--claude-cmd", "--codex-cmd",
+    "--implementation-codex-reasoning-effort", "--implementation-claude-effort",
+    "--claude-effort", "--claude-cmd", "--codex-cmd",
     "--gemini-cmd", "--antigravity-cmd", "--antigravity-print-timeout-seconds",
     "--repair-backend", "--repair-model", "--repair-timeout-seconds",
     "--antigravity-model", "--antigravity-models", "--antigravity-quota-signatures",
@@ -1276,6 +1277,7 @@ _ISSUE_ONLY_RECOVERY_OPTIONS = frozenset({
     "--plan-first", "--implement-after-approval", "--plan-execution-mode",
     "--materialize-split-issues", "--split-stage", "--implementation-coder",
     "--implementation-coder-model", "--implementation-codex-reasoning-effort",
+    "--implementation-claude-effort",
 })
 _PR_ONLY_RECOVERY_OPTIONS = frozenset({"--managed-ci-adopt-existing-pr"})
 _MANAGED_PR_ONLY_RECOVERY_OPTIONS = frozenset({"--head", "--title", "--body-file"})

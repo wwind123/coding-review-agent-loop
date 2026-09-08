@@ -90,7 +90,14 @@ class UsageCallRecord:
     validation_status: Literal["validated", "invalid"] = "invalid"
     raw_backend_usage: object | None = None
     role: Literal["repair", "completion-recovery"] | None = None
+    turn_role: str | None = None
     model: str | None = None
+    configured_model: str | None = None
+    configured_effort: str | None = None
+    effort_source: str | None = None
+    observed_model: str | None = None
+    observed_effort: str | None = None
+    observation_provenance: str | None = None
     outcome: Literal[
         "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
         "unavailable_model", "accepted_nonzero_exit", "accepted_timeout", "self_update_interruption",
@@ -112,7 +119,11 @@ class UsageCallRecord:
         }
         if self.raw_backend_usage is not None:
             payload["raw_backend_usage"] = self.raw_backend_usage
-        for key in ("role", "model", "outcome", "log_path", "fallback_planned", "containment"):
+        for key in (
+            "role", "turn_role", "model", "configured_model", "configured_effort",
+            "effort_source", "observed_model", "observed_effort", "observation_provenance",
+            "outcome", "log_path", "fallback_planned", "containment",
+        ):
             value = getattr(self, key)
             if value is not None:
                 payload[key] = value
@@ -202,7 +213,14 @@ class RunUsageContext:
         usage: UsageMetadata,
         raw_backend_usage: object | None = None,
         role: Literal["repair", "completion-recovery"] | None = None,
+        turn_role: str | None = None,
         model: str | None = None,
+        configured_model: str | None = None,
+        configured_effort: str | None = None,
+        effort_source: str | None = None,
+        observed_model: str | None = None,
+        observed_effort: str | None = None,
+        observation_provenance: str | None = None,
         outcome: Literal[
             "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
             "unavailable_model", "accepted_nonzero_exit", "accepted_timeout", "self_update_interruption",
@@ -222,7 +240,14 @@ class RunUsageContext:
                 usage=usage,
                 raw_backend_usage=raw_backend_usage,
                 role=role,
+                turn_role=turn_role,
                 model=model,
+                configured_model=configured_model,
+                configured_effort=configured_effort,
+                effort_source=effort_source,
+                observed_model=observed_model,
+                observed_effort=observed_effort,
+                observation_provenance=observation_provenance,
                 outcome=outcome,
                 log_path=log_path,
                 fallback_planned=fallback_planned,

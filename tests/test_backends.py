@@ -1026,6 +1026,30 @@ def test_codex_backend_dry_run_sets_message_text_without_response_file(tmp_path)
     assert result.text == "dry run stdout"
 
 
+def test_codex_backend_dry_run_honors_implementation_role_effort(tmp_path):
+    from coding_review_agent_loop.orchestrator import _approved_implementation_config
+
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        implementation_coder="codex",
+        implementation_codex_reasoning_effort="xhigh",
+        dry_run=True,
+    )
+    implementation_config, _reuse_session = _approved_implementation_config(config)
+    runner = FakeRunner(codex_outputs=[{"stdout": "dry run stdout"}])
+
+    CODEX_BACKEND.run(
+        runner,
+        implementation_config,
+        "Implement the approved plan.",
+        role="coder",
+    )
+
+    command = runner.commands[-1][0]
+    assert 'model_reasoning_effort="xhigh"' in command
+
+
 @pytest.mark.parametrize(
     ("record", "expected"),
     [
@@ -1252,3 +1276,30 @@ def test_codex_backend_invalid_rollout_falls_back_to_declared_model(tmp_path, mo
     result = CODEX_BACKEND.run(runner, config, "Review this PR.", run_id="run-1")
 
     assert result.model_used == "gpt-5.4"
+
+
+def test_codex_backend_pins_medium_when_effort_is_omitted(tmp_path):
+    runner = FakeRunner(codex_outputs=[("STATE: approved\n\nok", 0)])
+    result = CODEX_BACKEND.run(runner, make_config(tmp_path), "Review", run_id="r")
+    command = runner.commands[-1][0]
+    assert 'model_reasoning_effort="medium"' in command
+    assert result.observed_effort is None
+
+
+def test_claude_backend_pins_effort_and_replaces_inherited_environment(tmp_path):
+    class EnvRunner(FakeRunner):
+        def __init__(self):
+            super().__init__(claude_outputs=['{"result":"ok"}'])
+            self.agent_envs = []
+
+        def run_with_log(self, *args, **kwargs):
+            self.agent_envs.append(dict(kwargs.get("env") or {}))
+            return super().run_with_log(*args, **kwargs)
+
+    runner = EnvRunner()
+    config = make_config(tmp_path, claude_effort="xhigh")
+    CLAUDE_BACKEND.run(runner, config, "Review", session_id="session-1", run_id="r")
+    command = next(command for command, _cwd in runner.commands if command[:1] == ["claude"])
+    assert command[command.index("--effort") + 1] == "xhigh"
+    assert command[command.index("--resume") + 1] == "session-1"
+    assert runner.agent_envs[-1]["CLAUDE_CODE_EFFORT_LEVEL"] == "xhigh"
