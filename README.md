@@ -278,6 +278,17 @@ work. Read
 [Phased decomposition versus split materialization](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization)
 before filing child issues.
 
+### Approved follow-up dedupe
+
+When approved future follow-ups are summarized or filed, semantic reuse is
+enabled by default after deterministic narrowing. Use
+`--no-semantic-followup-dedupe` for deterministic-only operation. The provider
+and its bounds are configurable with `--semantic-followup-backend`,
+`--semantic-followup-model`, `--semantic-followup-timeout-seconds`,
+`--semantic-followup-max-calls`, `--semantic-followup-max-candidates`, and
+`--semantic-followup-prompt-char-limit`. Only high-confidence matches suppress
+or merge work; uncertain matches are filed with a possible-duplicate note.
+
 ## Discuss Mode
 
 Discuss mode asks agents to evaluate an issue without modifying the repository.

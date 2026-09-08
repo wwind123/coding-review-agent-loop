@@ -19,6 +19,11 @@ from .config import (
     DEFAULT_REPAIR_MODELS,
     DEFAULT_FLAT_CHILD_LIMIT,
     DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
+    DEFAULT_SEMANTIC_FOLLOWUP_BACKEND,
+    DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS,
+    DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES,
+    DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT,
+    DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS,
     AgentLoopConfig,
     config_from_args,
     ensure_agent_workdirs,
@@ -561,6 +566,56 @@ def build_parser() -> argparse.ArgumentParser:
                 "('ignore', 'summarize', 'issue', 'fix-and-summarize', or "
                 "'fix-and-issue'; default: ignore)."
             ),
+        )
+        semantic_group = subparser.add_mutually_exclusive_group()
+        semantic_group.add_argument(
+            "--semantic-followup-dedupe",
+            "--followup-semantic-dedupe",
+            dest="semantic_followup_dedupe",
+            action="store_true",
+            default=True,
+            help="Use bounded semantic matching when deterministic follow-up dedupe is ambiguous (default).",
+        )
+        semantic_group.add_argument(
+            "--no-semantic-followup-dedupe",
+            dest="semantic_followup_dedupe",
+            action="store_false",
+            help="Disable semantic follow-up matching; retain deterministic and conservative fallback behavior.",
+        )
+        subparser.add_argument(
+            "--semantic-followup-backend",
+            choices=("claude", "codex", "gemini", "antigravity"),
+            default=DEFAULT_SEMANTIC_FOLLOWUP_BACKEND,
+            help="Cheap isolated provider used for semantic follow-up matching.",
+        )
+        subparser.add_argument(
+            "--semantic-followup-model",
+            default="",
+            help="Optional model override for the semantic follow-up provider.",
+        )
+        subparser.add_argument(
+            "--semantic-followup-timeout-seconds",
+            type=int,
+            default=DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS,
+            help="Per-call semantic follow-up provider timeout (default: 30).",
+        )
+        subparser.add_argument(
+            "--semantic-followup-max-calls",
+            type=int,
+            default=DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS,
+            help="Maximum semantic provider calls per publication (default: 5).",
+        )
+        subparser.add_argument(
+            "--semantic-followup-max-candidates",
+            type=int,
+            default=DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES,
+            help="Maximum existing/batch candidates presented to one semantic call (default: 50).",
+        )
+        subparser.add_argument(
+            "--semantic-followup-prompt-char-limit",
+            type=int,
+            default=DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT,
+            help="Maximum prompt size for one semantic follow-up call (default: 12000).",
         )
         subparser.add_argument(
             "--planning-context-mode",

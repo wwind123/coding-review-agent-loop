@@ -114,6 +114,7 @@ from coding_review_agent_loop.config import (
 )
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
 from coding_review_agent_loop.followups import (
+    FollowupSourceContext,
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
 )
@@ -883,6 +884,7 @@ def _publish_pr_followups(
     pr_comments: list,
     *,
     dry_run: bool,
+    parent_issue_number: int | None = None,
 ) -> dict:
     """Publish approved future follow-ups for a PR via the library logic (#300).
 
@@ -908,14 +910,22 @@ def _publish_pr_followups(
     # (the coder dir). The Codex+Gemini skill flow never creates a Claude checkout,
     # so ensure that directory exists or gh raises FileNotFoundError (#300).
     Path(active_workdir(config)).mkdir(parents=True, exist_ok=True)
-    published = _publish_approved_followups(
-        Runner(dry_run=False),
-        config=config,
-        pr_number=pr,
-        head_sha=head_sha,
-        pr_comments=pr_comments,
-        followups=approved,
-    )
+    publish_kwargs = {
+        "config": config,
+        "pr_number": pr,
+        "head_sha": head_sha,
+        "pr_comments": pr_comments,
+        "followups": approved,
+        "source_context": FollowupSourceContext(
+            repo=repo,
+            source_kind="pr",
+            source_number=pr,
+            source_identity=head_sha,
+            parent_issue_numbers=(parent_issue_number,) if parent_issue_number is not None else (),
+            related_pr_numbers=(pr,),
+        ),
+    }
+    published = _publish_approved_followups(Runner(dry_run=False), **publish_kwargs)
     return {"mode": mode, "published": bool(published), "count": len(approved)}
 
 
@@ -2523,8 +2533,9 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             else:
                 round_approved_reviewers.append(str(record.get("reviewer_name", "")))
 
-    pr_diff = _fetch_pr_diff(repo, pr)
     issue_dict = _fetch_pr_json(repo, pr)
+    parent_issue_number = _linked_issue_number_from_pr(issue_dict)
+    pr_diff = _fetch_pr_diff(repo, pr)
 
     # Repo-scoped agent memory for reviewer orientation (#306), prepared once.
     memory = None
@@ -2699,7 +2710,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         ]
         result_json["approved_followups"] = _publish_pr_followups(
             repo, pr, head_sha, followups_mode, round_future_items, pr_comments,
-            dry_run=dry_run,
+            dry_run=dry_run, parent_issue_number=parent_issue_number,
         )
     usage = _aggregate_reviewer_usage(round_reviewer_records)
     if usage is not None:

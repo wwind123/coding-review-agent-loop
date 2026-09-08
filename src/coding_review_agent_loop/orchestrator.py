@@ -66,6 +66,7 @@ from .expected_closure import (
 from .github import (
     CiWatchOutcome,
     IssueContext,
+    PullRequestMetadata,
     PullRequestChecks,
     PullRequestMergeability,
     PullRequestReviewContext,
@@ -339,19 +340,18 @@ from .followups import (
     _append_approved_followups_marker,
     _approved_followup_from_unresolved_item,
     _approved_followups_marker,
-    _create_approved_followup_issues,
     _dedupe_approved_followups,
     _followup_heading_key,
     _followup_issue_body,
     _followup_issue_title,
     _format_approved_followup_summary,
-    _format_created_followup_issue_summary,
     _format_same_pr_followups,
     _has_approved_followups_marker,
     _plan_followup_source_from_unresolved_item,
     _publish_plan_approved_followups,
     _normalize_followup_key,
     _publish_approved_followups,
+    FollowupSourceContext,
 )
 from .round_state import (
     PostedRoundMetadata,
@@ -5777,7 +5777,15 @@ def _run_plan_first_loop(
                 plan_subject=plan_subject,
                 issue_comments=issue_context.comments,
                 sources=approved_future_followup_sources,
+                source_context=FollowupSourceContext(
+                    repo=config.repo,
+                    source_kind="plan",
+                    source_number=issue_number,
+                    source_identity=plan_hash,
+                    parent_issue_numbers=(issue_number,),
+                ),
                 allow_issue_filing=mode in {"implement-one-shot", "implement-by-phase"},
+                usage_context=usage_context,
             )
             split_scope_materialized = _handle_plan_first_split_scope(
                 runner,
@@ -6980,6 +6988,34 @@ def _stop_on_terminal_without_status(
     return 0
 
 
+def _pr_followup_source_context(
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    pr_metadata: PullRequestMetadata,
+    issue_context: IssueContext | None,
+) -> FollowupSourceContext:
+    linked = parse_linked_issue_numbers(pr_metadata.body, repo=config.repo)
+    parent_numbers = (issue_context.number,) if issue_context is not None else ()
+    related = tuple(number for number in linked if number not in parent_numbers)
+    if issue_context is None and len(linked) > 1:
+        log(
+            config,
+            f"PR #{pr_number} has multiple linked issue references; preserving them as related context instead of inventing a parent",
+        )
+    if issue_context is None and not linked:
+        log(config, f"Unable to resolve a parent issue for PR #{pr_number} follow-up lookup; using PR and topic context")
+    return FollowupSourceContext(
+        repo=config.repo,
+        source_kind="pr",
+        source_number=pr_number,
+        source_identity=pr_metadata.head_sha,
+        parent_issue_numbers=parent_numbers,
+        related_issue_numbers=related,
+        related_pr_numbers=(pr_number,),
+    )
+
+
 def _stop_after_ci_watch_timeout(
     runner: Runner,
     *,
@@ -6991,6 +7027,8 @@ def _stop_after_ci_watch_timeout(
     followups: list[ApprovedFollowup],
     details: list[str],
     reason: Literal["budget_exhausted", "timeout"],
+    source_context: FollowupSourceContext,
+    usage_context: RunUsageContext | None = None,
 ) -> int:
     """Publish resumable guidance for a watch that cannot continue or finish."""
     _publish_approved_followups(
@@ -7000,6 +7038,8 @@ def _stop_after_ci_watch_timeout(
         head_sha=head_sha,
         pr_comments=pr_comments,
         followups=followups,
+        source_context=source_context,
+        usage_context=usage_context,
     )
     post_pr_comment(
         runner,
@@ -7498,6 +7538,12 @@ def run_pr_loop(
             initial_pr_context = pr_context
             pr_metadata = pr_context.metadata
             pr_comments = pr_context.comments
+            followup_source_context = _pr_followup_source_context(
+                config=config,
+                pr_number=pr_number,
+                pr_metadata=pr_metadata,
+                issue_context=issue_context,
+            )
             if closing_contract is not None:
                 validate_pr_expected_closing_issues(
                     runner,
@@ -8518,6 +8564,8 @@ def run_pr_loop(
                         head_sha=pr_metadata.head_sha,
                         pr_comments=pr_comments,
                         followups=future_followups,
+                        source_context=followup_source_context,
+                        usage_context=usage_context,
                     )
                     post_pr_comment(
                         runner,
@@ -8587,6 +8635,8 @@ def run_pr_loop(
                             head_sha=pr_metadata.head_sha,
                             pr_comments=pr_comments,
                             followups=future_followups,
+                            source_context=followup_source_context,
+                            usage_context=usage_context,
                             details=[
                                 "The shared CI watch budget was exhausted by earlier watcher rounds; "
                                 "no fresh CI poll was performed."
@@ -8625,6 +8675,8 @@ def run_pr_loop(
                             head_sha=pr_metadata.head_sha,
                             pr_comments=pr_comments,
                             followups=future_followups,
+                            source_context=followup_source_context,
+                            usage_context=usage_context,
                         )
                         run_optional_tests(runner, config)
                         if config.auto_merge:
@@ -8673,6 +8725,8 @@ def run_pr_loop(
                             head_sha=pr_metadata.head_sha,
                             pr_comments=pr_comments,
                             followups=future_followups,
+                            source_context=followup_source_context,
+                            usage_context=usage_context,
                         )
                         assert watch_outcome.stall is not None
                         post_pr_comment(
@@ -8707,6 +8761,8 @@ def run_pr_loop(
                             head_sha=pr_metadata.head_sha,
                             pr_comments=pr_comments,
                             followups=future_followups,
+                            source_context=followup_source_context,
+                            usage_context=usage_context,
                             details=details,
                             reason="timeout",
                         )
@@ -8773,6 +8829,8 @@ def run_pr_loop(
                                 head_sha=pr_metadata.head_sha,
                                 pr_comments=pr_comments,
                                 followups=future_followups,
+                                source_context=followup_source_context,
+                                usage_context=usage_context,
                             )
                             post_pr_comment(
                                 runner,
@@ -8842,6 +8900,8 @@ def run_pr_loop(
                         head_sha=pr_metadata.head_sha,
                         pr_comments=pr_comments,
                         followups=future_followups,
+                        source_context=followup_source_context,
+                        usage_context=usage_context,
                     )
                     run_optional_tests(runner, config)
                     if config.auto_merge or managed_ci_active(pr_metadata):

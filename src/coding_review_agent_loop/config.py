@@ -54,6 +54,11 @@ DEFAULT_MAX_ROUNDS = 10
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3.7 Flash (Medium)",)
 DEFAULT_REASONING_EFFORT = "medium"
+DEFAULT_SEMANTIC_FOLLOWUP_BACKEND: AgentName = "gemini"
+DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS = 30
+DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS = 5
+DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES = 50
+DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT = 12_000
 CODEX_REASONING_EFFORTS: frozenset[str] = frozenset(
     {"minimal", "low", "medium", "high", "xhigh"}
 )
@@ -119,6 +124,15 @@ class AgentLoopConfig:
     agent_memory_dir: Path
     refresh_test_profile: bool
     approved_followups: str = "ignore"
+    # Approved-follow-up semantic reuse is deliberately bounded and can be
+    # disabled for offline/reproducibility-sensitive invocations.
+    semantic_followup_dedupe: bool = True
+    semantic_followup_backend: AgentName = DEFAULT_SEMANTIC_FOLLOWUP_BACKEND
+    semantic_followup_model: str = ""
+    semantic_followup_timeout_seconds: int = DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS
+    semantic_followup_max_calls: int = DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS
+    semantic_followup_max_candidates: int = DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES
+    semantic_followup_prompt_char_limit: int = DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT
     plan_execution_mode: str = "plan-only"
     planning_context_mode: str = "compact"
     pr_review_context_mode: str = "full"
@@ -317,6 +331,16 @@ class AgentLoopConfig:
             raise AgentLoopError("antigravity_models chain cannot be empty or contain blank entries.")
         if self.antigravity_print_timeout_seconds <= 0:
             raise AgentLoopError("--antigravity-print-timeout-seconds must be greater than zero.")
+        if self.semantic_followup_backend not in {"claude", "codex", "gemini", "antigravity"}:
+            raise AgentLoopError("--semantic-followup-backend must name a supported agent.")
+        for option_name, value in (
+            ("--semantic-followup-timeout-seconds", self.semantic_followup_timeout_seconds),
+            ("--semantic-followup-max-calls", self.semantic_followup_max_calls),
+            ("--semantic-followup-max-candidates", self.semantic_followup_max_candidates),
+            ("--semantic-followup-prompt-char-limit", self.semantic_followup_prompt_char_limit),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise AgentLoopError(f"{option_name} must be a positive integer.")
         timeout = self.coder_test_command_timeout_seconds
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
             raise AgentLoopError(
@@ -1293,6 +1317,23 @@ def config_from_args(
         ),
         refresh_test_profile=args.refresh_test_profile,
         approved_followups=args.approved_followups,
+        semantic_followup_dedupe=getattr(args, "semantic_followup_dedupe", True),
+        semantic_followup_backend=getattr(
+            args, "semantic_followup_backend", DEFAULT_SEMANTIC_FOLLOWUP_BACKEND
+        ),
+        semantic_followup_model=getattr(args, "semantic_followup_model", ""),
+        semantic_followup_timeout_seconds=getattr(
+            args, "semantic_followup_timeout_seconds", DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS
+        ),
+        semantic_followup_max_calls=getattr(
+            args, "semantic_followup_max_calls", DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS
+        ),
+        semantic_followup_max_candidates=getattr(
+            args, "semantic_followup_max_candidates", DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES
+        ),
+        semantic_followup_prompt_char_limit=getattr(
+            args, "semantic_followup_prompt_char_limit", DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT
+        ),
         plan_execution_mode=getattr(args, "plan_execution_mode", None) or "plan-only",
         planning_context_mode=getattr(args, "planning_context_mode", None) or "compact",
         pr_review_context_mode=getattr(args, "pr_review_context_mode", None) or "full",
