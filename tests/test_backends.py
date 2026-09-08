@@ -1026,6 +1026,30 @@ def test_codex_backend_dry_run_sets_message_text_without_response_file(tmp_path)
     assert result.text == "dry run stdout"
 
 
+def test_codex_backend_dry_run_honors_implementation_role_effort(tmp_path):
+    from coding_review_agent_loop.orchestrator import _approved_implementation_config
+
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        implementation_coder="codex",
+        implementation_codex_reasoning_effort="xhigh",
+        dry_run=True,
+    )
+    implementation_config, _reuse_session = _approved_implementation_config(config)
+    runner = FakeRunner(codex_outputs=[{"stdout": "dry run stdout"}])
+
+    CODEX_BACKEND.run(
+        runner,
+        implementation_config,
+        "Implement the approved plan.",
+        role="coder",
+    )
+
+    command = runner.commands[-1][0]
+    assert 'model_reasoning_effort="xhigh"' in command
+
+
 @pytest.mark.parametrize(
     ("record", "expected"),
     [

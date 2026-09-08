@@ -39,26 +39,38 @@ def agent_display_name(agent: AgentName) -> str:
 def _configured_model_label(agent: AgentName, config: AgentLoopConfig | None) -> str | None:
     """The model label declared in config for `agent`, or None if not declared.
 
-    Codex appends its reasoning effort; antigravity's model string already embeds
-    effort (e.g. "Gemini 3.1 Pro (High)"), so it is used verbatim.
+    Codex and Claude append the resolver's selected effort; antigravity's model
+    string already embeds effort (e.g. "Gemini 3.1 Pro (High)"), so it is used
+    verbatim.
     """
     if config is None:
         return None
     if agent == "antigravity":
         return config.antigravity_models[0] if config.antigravity_models else None
     if agent == "codex":
-        model = config.codex_model
-        effort = config.codex_reasoning_effort
-        if not model and not effort:
-            return None
-        return f"{model or 'unknown model'} ({effort})" if effort else model
+        from ..config import resolve_invocation
+
+        invocation = resolve_invocation(config, provider="codex")
+        if not invocation.configured_model:
+            if not config.codex_reasoning_effort:
+                return None
+            model = "unknown model"
+        else:
+            model = invocation.configured_model
+        return f"{model} ({invocation.resolved_effort})"
     if agent == "gemini":
         return config.gemini_model or None
     if agent == "claude":
-        model = config.claude_model
-        if config.claude_effort:
-            return f"{model or 'unknown model'} ({config.claude_effort})"
-        return model or None
+        from ..config import resolve_invocation
+
+        invocation = resolve_invocation(config, provider="claude")
+        if not invocation.configured_model:
+            if not config.claude_effort:
+                return None
+            model = "unknown model"
+        else:
+            model = invocation.configured_model
+        return f"{model} ({invocation.resolved_effort})"
     return None
 
 

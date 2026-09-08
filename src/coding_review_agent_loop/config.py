@@ -669,17 +669,6 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
                 "--claude-arg --model conflicts with --implementation-coder-model; "
                 "use --implementation-coder-model only."
             )
-    if (
-        config.implementation_codex_reasoning_effort
-        and config.implementation_coder == "codex"
-        and _args_have_reasoning_effort(config.codex_args)
-    ):
-        raise AgentLoopError(
-            "--codex-arg model_reasoning_effort conflicts with "
-            "--implementation-codex-reasoning-effort; use --implementation-codex-reasoning-effort only."
-        )
-
-
 def default_agent_workdir(repo: str, agent: AgentName) -> Path:
     repo_slug = repo_cache_slug(repo)
     return Path(tempfile.gettempdir()) / "coding-review-agent-loop" / repo_slug / agent / "repo"

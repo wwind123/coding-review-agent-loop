@@ -1089,6 +1089,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.implementation_coder is not None
             or args.implementation_coder_model
             or args.implementation_codex_reasoning_effort
+            or args.implementation_claude_effort
         )
         if args.command != "issue" and implementation_override_requested:
             raise AgentLoopError("--implementation-coder options are only supported with issue --plan-first.")

@@ -331,7 +331,7 @@ class CodexBackend:
                     "exec",
                     "--cd",
                     str(config.codex_dir),
-                    *_codex_model_args(config),
+                    *_codex_model_args(config, role=role),
                     *config.codex_args,
                     *([] if input_text is not None else [prompt]),
                 ],
