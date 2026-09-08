@@ -92,6 +92,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -114,6 +115,7 @@ from coding_review_agent_loop.config import (
 )
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
 from coding_review_agent_loop.followups import (
+    FollowupSourceContext,
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
 )
@@ -908,14 +910,30 @@ def _publish_pr_followups(
     # (the coder dir). The Codex+Gemini skill flow never creates a Claude checkout,
     # so ensure that directory exists or gh raises FileNotFoundError (#300).
     Path(active_workdir(config)).mkdir(parents=True, exist_ok=True)
-    published = _publish_approved_followups(
-        Runner(dry_run=False),
-        config=config,
-        pr_number=pr,
-        head_sha=head_sha,
-        pr_comments=pr_comments,
-        followups=approved,
-    )
+    publish_kwargs = {
+        "config": config,
+        "pr_number": pr,
+        "head_sha": head_sha,
+        "pr_comments": pr_comments,
+        "followups": approved,
+        "source_context": FollowupSourceContext(
+            repo=repo,
+            source_kind="pr",
+            source_number=pr,
+            source_identity=head_sha,
+            related_pr_numbers=(pr,),
+        ),
+    }
+    # Keep old test/integration adapters that monkeypatch the publisher with
+    # the pre-context signature callable; the production call always carries
+    # explicit source context.
+    signature = inspect.signature(_publish_approved_followups)
+    if "source_context" not in signature.parameters and not any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        publish_kwargs.pop("source_context")
+    published = _publish_approved_followups(Runner(dry_run=False), **publish_kwargs)
     return {"mode": mode, "published": bool(published), "count": len(approved)}
 
 

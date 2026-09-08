@@ -2450,6 +2450,41 @@ be fixed before merge.
 - `fix-and-summarize`: send same-PR follow-ups to the coder for another review round, then summarize future follow-ups after final approval.
 - `fix-and-issue`: send same-PR follow-ups to the coder for another review round, then create issues for future follow-ups after final approval and comment with the created issue links.
 
+Issue-filing modes use a conservative two-stage reconciliation. Deterministic
+normalization, headings, identifiers, paths, and topic overlap run first. The
+publisher then searches open follow-up trackers in the configured repository
+with at most five focused queries, twenty results per query, and fifty unique
+candidates per publication. Parent issue, approved-plan hash, PR, and related
+links are preferred before a bounded repository-wide topic query. Search
+results are repository/identity checked and the selected tracker is
+revalidated as open immediately before reuse; closed or cross-repository
+results never suppress a new issue. Search indexing is eventually consistent,
+and there is no atomic repository-wide lock, so a create-then-interruption
+window is recovered by bounded rediscovery on a later invocation.
+
+For ambiguous in-batch groups and narrowed existing trackers, an optional cheap
+semantic classifier receives only bounded excerpts and must return strict JSON
+with `duplicate_of`, `confidence`, and a non-empty `reason`. Only `high`
+confidence equivalence of the actual deliverable suppresses or merges work.
+Medium/low confidence files normally with a sanitized possible-duplicate note;
+provider failures, invalid output, timeouts, and local budget exhaustion fall
+back to deterministic behavior. A quota-reset exhaustion is different: it is
+propagated so the orchestration run can stop without filing or publishing a
+success audit record. Configure the classifier with
+`--semantic-followup-backend`, `--semantic-followup-model`,
+`--semantic-followup-timeout-seconds`, `--semantic-followup-max-calls`,
+`--semantic-followup-max-candidates`, and
+`--semantic-followup-prompt-char-limit`; use
+`--no-semantic-followup-dedupe` for deterministic-only operation.
+
+Publication summaries distinguish created issues, reused trackers, uncertain
+matches, and cap-skipped work. The three-new-issue cap is applied after all
+groups have been checked for reuse, so reusing an existing tracker does not
+consume a creation slot. Candidate titles, excerpts, retained reviewer/planning
+context, and model reasons are sanitized before entering a GitHub body or
+comment, while the expected publish-once audit record remains the only
+authorized protocol record in those bodies.
+
 For plan-first runs that continue into implementation, issue-filing modes apply
 twice at different lifecycle points: planning-stage future follow-ups are filed
 before implementation begins, while PR-stage approved-review future follow-ups

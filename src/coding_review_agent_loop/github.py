@@ -1823,6 +1823,7 @@ def search_issues(
     config: AgentLoopConfig,
     search: str,
     state: str = "all",
+    limit: int = ISSUE_RECOVERY_SEARCH_LIMIT,
 ) -> tuple[FoundIssue, ...]:
     """Search issues in `config.repo`, used to recover from a create-then-crash window (#476).
 
@@ -1834,7 +1835,9 @@ def search_issues(
     materialization path still previews creations instead of "adopting"
     nothing.
     """
-    log(config, f"Searching GitHub issues in {config.repo}: {search}")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise AgentLoopError("search_issues limit must be a positive integer")
+    log(config, f"Searching GitHub issues in {config.repo}: {search} (limit={limit})")
     if config.dry_run:
         runner.run(
             [
@@ -1848,7 +1851,7 @@ def search_issues(
                 "--state",
                 state,
                 "--limit",
-                str(ISSUE_RECOVERY_SEARCH_LIMIT),
+                str(limit),
                 "--json",
                 "number,title,url,body",
             ],
@@ -1867,7 +1870,7 @@ def search_issues(
             "--state",
             state,
             "--limit",
-            str(ISSUE_RECOVERY_SEARCH_LIMIT),
+            str(limit),
             "--json",
             "number,title,url,body",
         ],
