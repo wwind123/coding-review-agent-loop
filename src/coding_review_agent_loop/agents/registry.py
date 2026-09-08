@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from .base import AgentBackend, AgentName, AgentResult
@@ -11,6 +12,7 @@ from .codex import BACKEND as CODEX_BACKEND
 from .gemini import BACKEND as GEMINI_BACKEND
 from ..errors import AgentLoopError
 from ..runner import Runner
+from ..logging import log
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
@@ -46,14 +48,17 @@ def _configured_model_label(agent: AgentName, config: AgentLoopConfig | None) ->
         return config.antigravity_models[0] if config.antigravity_models else None
     if agent == "codex":
         model = config.codex_model
-        if not model:
-            return None
         effort = config.codex_reasoning_effort
-        return f"{model} ({effort})" if effort else model
+        if not model and not effort:
+            return None
+        return f"{model or 'unknown model'} ({effort})" if effort else model
     if agent == "gemini":
         return config.gemini_model or None
     if agent == "claude":
-        return config.claude_model or None
+        model = config.claude_model
+        if config.claude_effort:
+            return f"{model or 'unknown model'} ({config.claude_effort})"
+        return model or None
     return None
 
 
@@ -102,6 +107,15 @@ def run_agent_result(
     set_role = getattr(runner, "set_containment_role", None)
     if callable(set_role):
         set_role(role)
+    from ..config import resolve_invocation
+
+    invocation = resolve_invocation(config, provider=agent, role=role)
+    log(
+        config,
+        f"Resolved {agent} {role or 'turn'}: model={invocation.configured_model or 'unknown'} "
+        f"effort={invocation.resolved_effort or 'unspecified'} "
+        f"source={invocation.effort_source or 'provider-default'}",
+    )
     kwargs: dict[str, object] = dict(
         session_id=session_id,
         run_id=run_id,
@@ -111,9 +125,51 @@ def run_agent_result(
     )
     if attempt_suffix is not None:
         kwargs["attempt_suffix"] = attempt_suffix
-    return get_backend(agent).run(
+    result = get_backend(agent).run(
         runner,
         config,
         prompt,
         **kwargs,
+    )
+    # Resolve identity at the common backend boundary so direct library calls,
+    # retries, and session resumes carry the same metadata as CLI turns.
+    if (
+        invocation.resolved_effort is not None
+        and result.observed_effort is not None
+        and result.observed_effort != invocation.resolved_effort
+    ):
+        log(
+            config,
+            f"Warning: {agent} observed effort {result.observed_effort!r} differs from "
+            f"configured {invocation.resolved_effort!r}; retaining the completed turn.",
+        )
+    if (
+        invocation.configured_model
+        and result.observed_model
+        and invocation.configured_model != result.observed_model
+    ):
+        log(
+            config,
+            f"Warning: {agent} observed model {result.observed_model!r} differs from "
+            f"configured {invocation.configured_model!r}; retaining the completed turn.",
+        )
+    observed_model = result.observed_model
+    if agent == "antigravity" and observed_model is None and result.model_used:
+        observed_model = result.model_used
+    selected_model = observed_model or invocation.configured_model
+    selected_effort = result.observed_effort or invocation.resolved_effort
+    model_used = result.model_used
+    if agent in {"codex", "claude"} and selected_effort is not None:
+        model_used = f"{selected_model or 'unknown model'} ({selected_effort})"
+    elif observed_model:
+        model_used = observed_model
+    return replace(
+        result,
+        provider=agent,
+        role=role,
+        configured_model=invocation.configured_model,
+        configured_effort=invocation.resolved_effort,
+        effort_source=invocation.effort_source,
+        observed_model=observed_model,
+        model_used=model_used,
     )

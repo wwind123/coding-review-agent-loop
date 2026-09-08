@@ -54,6 +54,13 @@ class PostedRoundMetadata:
     compact_prior_summaries: tuple[str, ...] = ()
     usage: dict | None = None
     model_used: str | None = None
+    provider: str | None = None
+    configured_model: str | None = None
+    configured_effort: str | None = None
+    effort_source: str | None = None
+    observed_model: str | None = None
+    observed_effort: str | None = None
+    observation_provenance: str | None = None
     # How the response was acquired.  Legacy metadata represents ordinary
     # zero-exit success.
     acquisition_outcome: str = "success"
@@ -191,6 +198,13 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "compact_prior_summaries": list(metadata.compact_prior_summaries),
         "usage": metadata.usage,
         "model_used": metadata.model_used,
+        "provider": metadata.provider,
+        "configured_model": metadata.configured_model,
+        "configured_effort": metadata.configured_effort,
+        "effort_source": metadata.effort_source,
+        "observed_model": metadata.observed_model,
+        "observed_effort": metadata.observed_effort,
+        "observation_provenance": metadata.observation_provenance,
         "acquisition_outcome": metadata.acquisition_outcome,
         "acquisition_returncode": metadata.acquisition_returncode,
         "consensus_kind": metadata.consensus_kind,
@@ -246,6 +260,31 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             ),
             usage=payload.get("usage") if isinstance(payload.get("usage"), dict) else None,
             model_used=str(payload["model_used"]) if payload.get("model_used") is not None else None,
+            provider=str(payload["provider"]) if payload.get("provider") is not None else None,
+            configured_model=(
+                str(payload["configured_model"])
+                if payload.get("configured_model") is not None else None
+            ),
+            configured_effort=(
+                str(payload["configured_effort"])
+                if payload.get("configured_effort") is not None else None
+            ),
+            effort_source=(
+                str(payload["effort_source"])
+                if payload.get("effort_source") is not None else None
+            ),
+            observed_model=(
+                str(payload["observed_model"])
+                if payload.get("observed_model") is not None else None
+            ),
+            observed_effort=(
+                str(payload["observed_effort"])
+                if payload.get("observed_effort") is not None else None
+            ),
+            observation_provenance=(
+                str(payload["observation_provenance"])
+                if payload.get("observation_provenance") is not None else None
+            ),
             acquisition_outcome=str(payload.get("acquisition_outcome", "success")),
             acquisition_returncode=(
                 int(payload["acquisition_returncode"])

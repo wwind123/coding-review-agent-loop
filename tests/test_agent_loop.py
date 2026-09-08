@@ -2164,7 +2164,7 @@ def test_flat_child_limit_cli_is_configurable(tmp_path):
     assert config.flat_child_limit == 23
 
 
-def test_implementation_codex_reasoning_effort_requires_codex_and_model(tmp_path):
+def test_implementation_codex_reasoning_effort_requires_codex_but_not_model(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
         "issue",
@@ -2205,8 +2205,8 @@ def test_implementation_codex_reasoning_effort_requires_codex_and_model(tmp_path
         "--gemini-dir",
         str(tmp_path / "gemini"),
     ])
-    with pytest.raises(AgentLoopError, match="requires --implementation-coder-model or --codex-model"):
-        config_from_args(args, FakeRunner())
+    config = config_from_args(args, FakeRunner())
+    assert config.implementation_codex_reasoning_effort == "high"
 
 
 def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_path):
@@ -2238,6 +2238,7 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
                 "coder": config.coder,
                 "codex_model": config.codex_model,
                 "codex_reasoning_effort": config.codex_reasoning_effort,
+                "implementation_codex_reasoning_effort": config.implementation_codex_reasoning_effort,
                 "session_id": session_id,
                 "operation": kwargs.get("operation_description"),
             }
@@ -2291,7 +2292,8 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
     implementation_call = calls[2]
     assert implementation_call["coder"] == "codex"
     assert implementation_call["codex_model"] == "gpt-5.5"
-    assert implementation_call["codex_reasoning_effort"] == "high"
+    assert implementation_call["codex_reasoning_effort"] == ""
+    assert implementation_call["implementation_codex_reasoning_effort"] == "high"
     assert implementation_call["session_id"] is None
     assert calls[0]["coder"] == "claude"
 
@@ -5264,13 +5266,65 @@ def test_config_rejects_model_arg_conflicts(tmp_path):
 
 
 def test_config_rejects_codex_effort_without_model(tmp_path):
-    # Rollout model detection is best-effort, so effort alone cannot be labeled
-    # reliably and requires an explicit --codex-model.
-    with pytest.raises(AgentLoopError, match="requires --codex-model"):
-        make_config(tmp_path, codex_reasoning_effort="high")
-    # With a model it's accepted.
+    # Rollout evidence may identify the model later; model omission is valid and
+    # the effort remains independently reportable.
+    config = make_config(tmp_path, codex_reasoning_effort="high")
+    assert config.codex_model == ""
+    from coding_review_agent_loop.config import resolve_invocation
+    assert resolve_invocation(config, provider="codex").resolved_effort == "high"
+    # With a model it's accepted as well.
     config = make_config(tmp_path, codex_model="gpt-5", codex_reasoning_effort="high")
     assert config.codex_reasoning_effort == "high"
+
+
+def test_effort_resolution_preserves_omitted_vs_explicit_and_role_precedence(tmp_path):
+    from coding_review_agent_loop.config import resolve_invocation
+
+    omitted = make_config(tmp_path, coder="claude")
+    resolved = resolve_invocation(omitted, provider="claude", role="coder")
+    assert (resolved.resolved_effort, resolved.effort_source) == ("medium", "tool_default")
+
+    explicit = make_config(tmp_path, codex_reasoning_effort="high")
+    agent_wide = resolve_invocation(explicit, provider="codex", role="reviewer")
+    assert (agent_wide.resolved_effort, agent_wide.effort_source) == ("high", "agent_wide")
+
+    implementation = make_config(
+        tmp_path,
+        coder="codex",
+        codex_reasoning_effort="high",
+        implementation_coder="codex",
+        implementation_codex_reasoning_effort="xhigh",
+    )
+    role_override = resolve_invocation(
+        implementation, provider="codex", role="coder", implementation=True
+    )
+    assert (role_override.resolved_effort, role_override.effort_source) == (
+        "xhigh",
+        "role_override",
+    )
+
+
+def test_provider_switch_does_not_carry_effort_between_claude_and_codex(tmp_path):
+    from coding_review_agent_loop.config import resolve_invocation
+
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        claude_effort="high",
+        codex_reasoning_effort="xhigh",
+        implementation_coder="codex",
+    )
+    assert resolve_invocation(config, provider="claude").resolved_effort == "high"
+    assert resolve_invocation(config, provider="codex", implementation=True).resolved_effort == "xhigh"
+
+
+@pytest.mark.parametrize("value", ["", "invalid", "MAX"])
+def test_claude_effort_values_are_validated(tmp_path, value):
+    if value == "":
+        assert make_config(tmp_path, claude_effort=value).claude_effort == ""
+    else:
+        with pytest.raises(AgentLoopError, match="--claude-effort"):
+            make_config(tmp_path, claude_effort=value)
 
 
 def test_config_allows_declared_model_without_conflict(tmp_path):

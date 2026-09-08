@@ -94,26 +94,35 @@ def _extract_codex_usage(raw: str) -> tuple[UsageMetadata | None, object | None]
     return None, last_usage
 
 
-def _codex_model_args(config: AgentLoopConfig) -> list[str]:
-    """CLI args to pin codex's model/effort when declared (#332).
+def _codex_model_args(config: AgentLoopConfig, *, role: str | None = None) -> list[str]:
+    """CLI args that explicitly pin Codex's model and effort for every turn.
 
     Conflict validation guarantees these are not also passed via --codex-arg, so
     no duplicate flags. The reasoning-effort value is TOML, hence the quotes.
     """
+    from ..config import resolve_invocation
+
     args: list[str] = []
     if config.codex_model:
         args += ["--model", config.codex_model]
-    if config.codex_reasoning_effort:
-        args += ["-c", f'model_reasoning_effort="{config.codex_reasoning_effort}"']
+    invocation = resolve_invocation(config, provider="codex", role=role)
+    assert invocation.resolved_effort is not None
+    args += ["-c", f'model_reasoning_effort="{invocation.resolved_effort}"']
     return args
 
 
 def _codex_model_label(config: AgentLoopConfig) -> str | None:
-    if not config.codex_model:
-        return None
+    from ..config import resolve_invocation
+
+    invocation = resolve_invocation(config, provider="codex")
+    if not invocation.configured_model:
+        return invocation.configured_model
+    # Preserve the legacy backend field when effort was omitted. The common
+    # registry boundary expands it to the resolved tool-owned effort for
+    # substantive signatures and metadata.
     if config.codex_reasoning_effort:
-        return f"{config.codex_model} ({config.codex_reasoning_effort})"
-    return config.codex_model
+        return f"{invocation.configured_model} ({config.codex_reasoning_effort})"
+    return invocation.configured_model
 
 
 def _extract_codex_thread_id(raw: str) -> str | None:
@@ -169,7 +178,9 @@ def _model_record_containers(record: dict[object, object]) -> tuple[dict[object,
     return tuple(containers)
 
 
-def _read_codex_rollout_model(rollout_path: Path) -> str | None:
+def _read_codex_rollout_model(rollout_path: Path) -> tuple[str | None, str | None]:
+    from ..config import CODEX_REASONING_EFFORTS
+
     model: str | None = None
     effort: str | None = None
     try:
@@ -185,28 +196,30 @@ def _read_codex_rollout_model(rollout_path: Path) -> str | None:
                     candidate = container.get("model")
                     if not isinstance(candidate, str) or not candidate.strip():
                         continue
-                    model = candidate.strip()
-                    effort = None
+                    record_model = candidate.strip()
+                    record_effort: str | None = None
                     for key in _CODEX_REASONING_EFFORT_KEYS:
                         candidate_effort = container.get(key)
-                        if isinstance(candidate_effort, str) and candidate_effort.strip():
-                            effort = candidate_effort.strip()
+                        if (
+                            isinstance(candidate_effort, str)
+                            and candidate_effort.strip() in CODEX_REASONING_EFFORTS
+                        ):
+                            record_effort = candidate_effort.strip()
                             break
+                    model, effort = record_model, record_effort
     except (OSError, UnicodeError):
-        return None
+        return None, None
 
-    if model is None:
-        return None
-    return f"{model} ({effort})" if effort else model
+    return model, effort
 
 
-def _detect_codex_model(raw: str) -> str | None:
+def _detect_codex_model(raw: str) -> tuple[str | None, str | None]:
     thread_id = _extract_codex_thread_id(raw)
     if thread_id is None:
-        return None
+        return None, None
     rollout_path = _find_codex_rollout(thread_id)
     if rollout_path is None:
-        return None
+        return None, None
     return _read_codex_rollout_model(rollout_path)
 
 
@@ -296,6 +309,9 @@ class CodexBackend:
         timeout_seconds: float | None = None,
         attempt_suffix: str | None = None,
     ) -> AgentResult:
+        from ..config import resolve_invocation
+
+        invocation = resolve_invocation(config, provider="codex", role=role)
         log_path = agent_log_path(config, "codex", run_id=run_id, label=label, attempt_suffix=attempt_suffix)
         response_path = public_response_path(config, "codex")
         prompt_with_response_file = with_public_response_file_instruction(prompt, response_path)
@@ -338,6 +354,13 @@ class CodexBackend:
                 log_path=log_path,
                 returncode=result.returncode,
                 model_used=_codex_model_label(config),
+                observed_model=None,
+                observed_effort=None,
+                provider="codex",
+                role=role,
+                configured_model=invocation.configured_model,
+                configured_effort=invocation.resolved_effort,
+                effort_source=invocation.effort_source,
             )
 
         with tempfile.NamedTemporaryFile("r", encoding="utf-8", delete=False) as handle:
@@ -352,7 +375,7 @@ class CodexBackend:
                     "--json",
                     "--output-last-message",
                     output_path,
-                    *_codex_model_args(config),
+                    *_codex_model_args(config, role=role),
                     *config.codex_args,
                     *([] if input_text is not None else [prompt_with_response_file]),
                 ],
@@ -374,7 +397,13 @@ class CodexBackend:
             last_message_artifact = _read_codex_message_file(Path(output_path))
             message_text = last_message_artifact or result.stdout
             usage, raw_usage = _extract_codex_usage(result.stdout)
-            model_used = _codex_model_label(config) or _detect_codex_model(result.stdout)
+            observed_model, observed_effort = _detect_codex_model(result.stdout)
+            observed_label = (
+                f"{observed_model} ({observed_effort})"
+                if observed_model and observed_effort
+                else observed_model
+            )
+            model_used = _codex_model_label(config) or observed_label
             log(config, f"Codex finished; log: {log_path}")
             return AgentResult(
                 text=response_file_text or message_text,
@@ -388,6 +417,14 @@ class CodexBackend:
                 usage=usage,
                 raw_usage=raw_usage,
                 model_used=model_used,
+                observed_model=observed_model,
+                observed_effort=observed_effort,
+                observation_provenance="codex rollout record" if observed_model else None,
+                provider="codex",
+                role=role,
+                configured_model=invocation.configured_model,
+                configured_effort=invocation.resolved_effort,
+                effort_source=invocation.effort_source,
                 command_result=result,
                 self_update_reason=classify_executable_replacement_interruption(
                     result,

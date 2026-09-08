@@ -337,6 +337,20 @@ Backend-specific authentication, model selection, fallback, timeout, and
 executable-replacement behavior are documented under
 [Agent backends](docs/local_agent_loop.md#agent-backends).
 
+### Reasoning-effort defaults
+
+Agent-loop owns the effort setting for Codex and Claude. When no effort option
+is supplied, every invocation explicitly receives `medium`; a local CLI config
+file or inherited environment value cannot silently change that selection.
+The precedence is role-specific implementation override, agent-wide option,
+then the tool default. Use `--codex-reasoning-effort xhigh` (or the matching
+implementation option) for an explicit higher-effort Codex/Luna run. Claude
+accepts `low`, `medium`, `high`, `xhigh`, and `max` through `--claude-effort`.
+Antigravity's selected model already carries its tier, such as
+`Gemini 3.7 Flash (High)`, and is not rewritten by this setting. Startup logs,
+signatures, usage records, and new round metadata distinguish configured effort
+from verified runtime observations; older records retain unknown values.
+
 ## Safety and Permissions
 
 Agents can run commands and change code. Keep their normal permission prompts

@@ -53,6 +53,13 @@ DEFAULT_MAX_ROUNDS = 10
 # complex reviews and causes it to exit with "timeout waiting for response".
 DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_REPAIR_MODELS: tuple[str, ...] = ("Gemini 3.7 Flash (Medium)",)
+DEFAULT_REASONING_EFFORT = "medium"
+CODEX_REASONING_EFFORTS: frozenset[str] = frozenset(
+    {"minimal", "low", "medium", "high", "xhigh"}
+)
+CLAUDE_EFFORTS: frozenset[str] = frozenset(
+    {"low", "medium", "high", "xhigh", "max"}
+)
 # One parent-wide flat topology budget shared by decomposition and split
 # materialization.  Keeping this policy in config prevents each workflow from
 # obtaining a second allowance of children.
@@ -65,6 +72,17 @@ DISCUSS_RESEARCH_MODES: frozenset[str] = frozenset({"none", "required", "auto"})
 DISCUSS_DEBATER_FAILURE_MODES: frozenset[str] = frozenset({"fail", "partial"})
 DISCUSS_RESULT_MODES: frozenset[str] = frozenset({"triage", "answer"})
 BASE_PROVENANCE_VALUES = frozenset({"explicit", "repository-default", "pr-metadata"})
+
+
+@dataclass(frozen=True)
+class ResolvedInvocation:
+    """Provider configuration resolved for one substantive invocation."""
+
+    provider: AgentName
+    role: str | None
+    configured_model: str | None
+    resolved_effort: str | None
+    effort_source: str | None
 
 
 @dataclass(frozen=True)
@@ -110,6 +128,7 @@ class AgentLoopConfig:
     implementation_coder: AgentName | None = None
     implementation_coder_model: str = ""
     implementation_codex_reasoning_effort: str = ""
+    implementation_claude_effort: str = ""
     # Antigravity (`agy`) backend (#215). Defaulted so existing AgentLoopConfig
     # constructions keep working; real values are set when antigravity is used.
     antigravity_dir: Path = Path("antigravity")
@@ -126,6 +145,7 @@ class AgentLoopConfig:
     codex_reasoning_effort: str = ""
     gemini_model: str = ""
     claude_model: str = ""
+    claude_effort: str = ""
     repair_backend: str = "antigravity"
     repair_models: tuple[str, ...] = DEFAULT_REPAIR_MODELS
     repair_timeout_seconds: int = 120
@@ -210,6 +230,10 @@ class AgentLoopConfig:
     # implementation hands off to the PR loop too, but must retain the
     # issue-created activation semantics for that first invocation.
     managed_ci_pr_mode: bool = False
+    # Internal marker used only after an approved-plan coder switch. It keeps
+    # the original agent-wide values intact while allowing the active coder
+    # turn to report a role override as its source.
+    implementation_effort_active: bool = False
     invocation_argv: tuple[str, ...] = ()
     # Optional authoritative issue-closing declaration. ``None`` means that
     # this invocation made no declaration; an empty tuple is explicit and is
@@ -313,18 +337,26 @@ class AgentLoopConfig:
             object.__setattr__(self, "implementation_coder", self.coder)
         if self.implementation_codex_reasoning_effort and self.implementation_coder is None:
             object.__setattr__(self, "implementation_coder", self.coder)
+        if self.implementation_claude_effort and self.implementation_coder is None:
+            object.__setattr__(self, "implementation_coder", self.coder)
         if self.implementation_codex_reasoning_effort and self.implementation_coder != "codex":
             raise AgentLoopError("--implementation-codex-reasoning-effort requires --implementation-coder codex.")
-        if (
-            self.implementation_codex_reasoning_effort
-            and self.implementation_coder == "codex"
-            and not (self.implementation_coder_model or self.codex_model)
-        ):
-            raise AgentLoopError(
-                "--implementation-codex-reasoning-effort requires "
-                "--implementation-coder-model or --codex-model so the implementation "
-                "signature can reliably name the Codex model."
-            )
+        if self.implementation_claude_effort and self.implementation_coder != "claude":
+            raise AgentLoopError("--implementation-claude-effort requires --implementation-coder claude.")
+        _validate_effort_value(
+            "codex", self.codex_reasoning_effort, "--codex-reasoning-effort"
+        )
+        _validate_effort_value("claude", self.claude_effort, "--claude-effort")
+        _validate_effort_value(
+            "codex",
+            self.implementation_codex_reasoning_effort,
+            "--implementation-codex-reasoning-effort",
+        )
+        _validate_effort_value(
+            "claude",
+            self.implementation_claude_effort,
+            "--implementation-claude-effort",
+        )
         ensure_no_model_arg_conflicts(self)
         if self.planning_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--planning-context-mode must be either 'full' or 'compact'.")
@@ -495,6 +527,78 @@ def _args_have_reasoning_effort(args: tuple[str, ...]) -> bool:
     return any("model_reasoning_effort" in a for a in args)
 
 
+def _args_have_claude_effort(args: tuple[str, ...]) -> bool:
+    return any(a == "--effort" or a.startswith("--effort=") for a in args)
+
+
+def _validate_effort_value(provider: AgentName | str, value: str, option: str) -> None:
+    if not value:
+        return
+    allowed = CODEX_REASONING_EFFORTS if provider == "codex" else CLAUDE_EFFORTS
+    if value not in allowed:
+        rendered = ", ".join(sorted(allowed))
+        raise AgentLoopError(
+            f"{option} value {value!r} is unsupported for {provider}; "
+            f"choose one of: {rendered}."
+        )
+
+
+def configured_model_for(config: AgentLoopConfig, provider: AgentName) -> str | None:
+    if provider == "claude":
+        return config.claude_model or None
+    if provider == "codex":
+        return config.codex_model or None
+    if provider == "gemini":
+        return config.gemini_model or None
+    if provider == "antigravity":
+        return config.antigravity_models[0] if config.antigravity_models else None
+    return None
+
+
+def resolve_invocation(
+    config: AgentLoopConfig,
+    *,
+    provider: AgentName | None = None,
+    role: str | None = None,
+    implementation: bool = False,
+) -> ResolvedInvocation:
+    """Resolve provider effort without allowing omitted values to mask overrides."""
+    executing_provider = provider or (
+        config.implementation_coder if implementation and config.implementation_coder else config.coder
+    )
+    role_override = ""
+    agent_effort = ""
+    implementation_role_active = implementation or (
+        config.implementation_effort_active and role == "coder"
+    )
+    if executing_provider == "codex":
+        role_override = (
+            config.implementation_codex_reasoning_effort if implementation_role_active else ""
+        )
+        agent_effort = config.codex_reasoning_effort
+    elif executing_provider == "claude":
+        role_override = (
+            config.implementation_claude_effort if implementation_role_active else ""
+        )
+        agent_effort = config.claude_effort
+    if executing_provider in {"codex", "claude"}:
+        if role_override:
+            effort, source = role_override, "role_override"
+        elif agent_effort:
+            effort, source = agent_effort, "agent_wide"
+        else:
+            effort, source = DEFAULT_REASONING_EFFORT, "tool_default"
+    else:
+        effort, source = None, None
+    return ResolvedInvocation(
+        provider=executing_provider,
+        role=role,
+        configured_model=configured_model_for(config, executing_provider),
+        resolved_effort=effort,
+        effort_source=source,
+    )
+
+
 def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
     """Reject declaring a model/effort both via the dedicated flag and a freeform arg.
 
@@ -514,19 +618,16 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
         raise AgentLoopError(
             "--codex-arg --model conflicts with --codex-model; use --codex-model only."
         )
-    if config.codex_reasoning_effort and _args_have_reasoning_effort(config.codex_args):
-        raise AgentLoopError(
-            "--codex-arg model_reasoning_effort conflicts with --codex-reasoning-effort; "
-            "use --codex-reasoning-effort only."
+    if _args_have_reasoning_effort(config.codex_args):
+        option = (
+            "--implementation-codex-reasoning-effort"
+            if config.implementation_coder == "codex"
+            and config.implementation_codex_reasoning_effort
+            else "--codex-reasoning-effort"
         )
-    if config.codex_reasoning_effort and not config.codex_model:
-        # The declared flags exist to stamp the signature, which needs the model
-        # name. Rollout-file detection is best-effort, so effort alone cannot
-        # reliably be labeled.
         raise AgentLoopError(
-            "--codex-reasoning-effort requires --codex-model so the signature can "
-            "reliably name the model. To set effort without stamping the signature, "
-            "use --codex-arg -c model_reasoning_effort=... instead."
+            "--codex-arg model_reasoning_effort conflicts with agent-loop effort ownership; "
+            f"use {option} only."
         )
     if config.gemini_model and _args_have_model_flag(config.gemini_args):
         raise AgentLoopError(
@@ -535,6 +636,17 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
     if config.claude_model and _args_have_model_flag(config.claude_args):
         raise AgentLoopError(
             "--claude-arg --model conflicts with --claude-model; use --claude-model only."
+        )
+    if _args_have_claude_effort(config.claude_args):
+        option = (
+            "--implementation-claude-effort"
+            if config.implementation_coder == "claude"
+            and config.implementation_claude_effort
+            else "--claude-effort"
+        )
+        raise AgentLoopError(
+            "--claude-arg --effort conflicts with agent-loop effort ownership; "
+            f"use {option} only."
         )
     if config.implementation_coder_model:
         if config.implementation_coder == "antigravity" and _args_have_model_flag(config.antigravity_args):
@@ -1123,9 +1235,11 @@ def config_from_args(
         codex_reasoning_effort=getattr(args, "codex_reasoning_effort", ""),
         gemini_model=getattr(args, "gemini_model", ""),
         claude_model=getattr(args, "claude_model", ""),
+        claude_effort=getattr(args, "claude_effort", ""),
         implementation_coder=getattr(args, "implementation_coder", None),
         implementation_coder_model=getattr(args, "implementation_coder_model", ""),
         implementation_codex_reasoning_effort=getattr(args, "implementation_codex_reasoning_effort", ""),
+        implementation_claude_effort=getattr(args, "implementation_claude_effort", ""),
         repair_backend=getattr(args, "repair_backend", "antigravity"),
         repair_models=tuple(getattr(args, "repair_model", None) or DEFAULT_REPAIR_MODELS),
         repair_timeout_seconds=getattr(args, "repair_timeout_seconds", 120),

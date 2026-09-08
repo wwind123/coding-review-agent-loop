@@ -144,7 +144,7 @@ def test_plain_pr_recovery_accepts_loop_created_managed_pr_body(tmp_path):
     )
 
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
-    assert runner.comments == ["**Review verdict:** Approved\n\nLGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"]
+    assert runner.comments == ["**Review verdict:** Approved\n\nLGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex: unknown model (medium)"]
 
 
 def test_plain_pr_recovery_accepts_managed_pr_head_after_creation_sha_advanced(tmp_path):
@@ -165,7 +165,7 @@ def test_plain_pr_recovery_accepts_managed_pr_head_after_creation_sha_advanced(t
     )
 
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
-    assert runner.comments == ["**Review verdict:** Approved\n\nLGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"]
+    assert runner.comments == ["**Review verdict:** Approved\n\nLGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex: unknown model (medium)"]
 
 
 def test_in_process_managed_pr_handoff_still_requires_creation_sha(tmp_path):
@@ -2727,7 +2727,7 @@ def test_pr_loop_skips_duplicate_approved_followup_issue_creation_when_marker_ex
     assert runner.comments == [
         "**Review verdict:** Approved\n\n"
         "Codex approves.\n\n### Future follow-ups\n- Add cleanup docs.\n"
-        "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex: unknown model (medium)"
     ]
 
 def test_pr_loop_allows_repos_without_github_checks_when_branch_protection_404(tmp_path):
@@ -3066,7 +3066,7 @@ def test_pr_loop_ignores_approved_followups_by_default(tmp_path):
     assert runner.comments == [
         "**Review verdict:** Approved\n\n"
         "LGTM.\n\n### Future follow-ups\n- Add cleanup docs.\n"
-        "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex: unknown model (medium)"
     ]
 
 def test_pr_loop_summarizes_approved_followups_from_multiple_reviewers(tmp_path):
@@ -4248,7 +4248,7 @@ def test_pr_loop_posts_human_readable_item_labels_in_new_and_prior_sections(tmp_
         "### Same-PR follow-ups\n"
         "- Require source issue reference in PR body.\n"
         "<!-- AGENT_STATE: blocking -->\n"
-        "-- OpenAI Codex"
+        "-- OpenAI Codex: unknown model (medium)"
     )
     assert runner.comments[2] == (
         "**Review verdict:** Approved\n\n"
@@ -4256,7 +4256,7 @@ def test_pr_loop_posts_human_readable_item_labels_in_new_and_prior_sections(tmp_
         "### Prior unresolved item dispositions\n"
         "- [item-1] Same-PR follow-up from OpenAI Codex, round 1: Require source issue reference in PR body. -> resolved\n"
         "<!-- AGENT_STATE: approved -->\n"
-        "-- OpenAI Codex"
+        "-- OpenAI Codex: unknown model (medium)"
     )
 
 def test_pr_loop_tracks_blocking_items_text_not_summary_when_they_differ(tmp_path):
@@ -4286,7 +4286,7 @@ def test_pr_loop_tracks_blocking_items_text_not_summary_when_they_differ(tmp_pat
         "### Blocking issues\n"
         "- Add the mixed-history resume case to `tests/test_agent_loop.py`.\n"
         "<!-- AGENT_STATE: blocking -->\n"
-        "-- OpenAI Codex"
+        "-- OpenAI Codex: unknown model (medium)"
     )
     second_review_prompt = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]][1]
     assert "[item-1]" in second_review_prompt
@@ -5686,7 +5686,7 @@ def test_claude_review_loop_accepts_valid_response_file_after_nonzero_exit(tmp_p
     claude_call = next(cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
     assert "PUBLIC RESPONSE FILE:" in claude_call[-1]
     assert "/coding-review-agent-loop/responses/OWNER-REPO/claude/" in claude_call[-1]
-    assert runner.comments == ["**Review verdict:** Approved\n\nLGTM from response file.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"]
+    assert runner.comments == ["**Review verdict:** Approved\n\nLGTM from response file.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude: unknown model (medium)"]
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]) == 1
     metadata_match = re.search(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", runner.pr_payload["comments"][0]["body"])
     assert metadata_match is not None

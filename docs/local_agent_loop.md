@@ -436,9 +436,23 @@ the approved-plan implementation. When `--implementation-coder-model` is set
 without `--implementation-coder`, implementation keeps using `--coder` but with
 the implementation-only model. `--implementation-codex-reasoning-effort` can
 only be used when the implementation coder is Codex, either explicitly via
-`--implementation-coder codex` or implicitly via `--coder codex`; it also
-requires `--implementation-coder-model` or `--codex-model` so the Codex
-implementation signature can name the model reliably.
+`--implementation-coder codex` or implicitly via `--coder codex`. The matching
+`--implementation-claude-effort` option is restricted to Claude. An effort
+override does not require an explicit model: an observed model may be unknown,
+and the signature will report `unknown model` with the selected effort.
+
+Codex and Claude effort are resolved independently for the provider executing
+each turn. The precedence is implementation role override, provider-wide
+option (`--codex-reasoning-effort` or `--claude-effort`), then agent-loop's
+explicit `medium` default. The default is passed to the provider CLI rather
+than inherited from local CLI configuration. Codex accepts `minimal`, `low`,
+`medium`, `high`, and `xhigh`; Claude accepts `low`, `medium`, `high`, `xhigh`,
+and `max`. Use `xhigh` explicitly when a demanding Codex/Luna implementation
+run needs more effort. A Claude invocation receives both `--effort` and the
+matching `CLAUDE_CODE_EFFORT_LEVEL` environment value. If an installed Claude
+CLI rejects the explicit flag, agent-loop reports a non-retryable tooling
+diagnostic and never retries without the requested effort. Antigravity model
+tiers remain embedded in model selection and are not replaced with `medium`.
 
 If the plan narrows scope (via `deferred_stages` or a prior discuss `split`
 consensus), see [Split issue materialization](#split-issue-materialization)

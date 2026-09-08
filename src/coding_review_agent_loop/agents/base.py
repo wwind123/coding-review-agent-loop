@@ -46,6 +46,16 @@ class AgentResult:
     # signature (#332); None when the backend could not determine it. The
     # antigravity fallback chain (#333) sets this to the model that answered.
     model_used: str | None = None
+    # Structured invocation identity.  These fields are optional so persisted
+    # and test-created results from older versions remain valid.
+    provider: AgentName | None = None
+    role: str | None = None
+    configured_model: str | None = None
+    configured_effort: str | None = None
+    effort_source: str | None = None
+    observed_model: str | None = None
+    observed_effort: str | None = None
+    observation_provenance: str | None = None
     command_result: CommandResult | None = None
     # Provider-neutral evidence that the configured executable was replaced or
     # disappeared during this invocation. Claude uses the historical field name;
