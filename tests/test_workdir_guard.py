@@ -53,6 +53,54 @@ def test_malformed_managed_run_tests_never_gets_a_wrapper_exemption(tmp_path):
         )
 
 
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize("wrapper", [
+    ["/outside/bin/agent-loop", "run-tests"],
+    [sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests"],
+])
+def test_managed_run_tests_accepts_leading_shell_assignments(tmp_path, origin, wrapper):
+    command = shlex.join([
+        "DATABASE_URL=postgresql+asyncpg://localhost/example_test",
+        "EXECUTION_MODE=inline", "TEST_LABEL=two words", "EMPTY=",
+        "PYTHONPATH=/outside/interpreter/config",
+        *wrapper, "--memory-dir", "/outside/cache", "--timeout-seconds", "120",
+        "--", ".venv/bin/python", "-m", "pytest", "tests/test_pat_auth.py", "-q",
+    ])
+    validate_test_commands_within_workdir(
+        [command], assigned_workdir=tmp_path, origin=origin
+    )
+
+
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize(("assignments", "inner", "error"), [
+    (["E2E_BASE=https://live.example"], ["python3", "tests/test_api.py"], "live remote target"),
+    (["EXECUTION_MODE=inline", "E2E_BASE=https://live.example"],
+     ["python3", "tests/test_api.py"], "live remote target"),
+    (["EXECUTION_MODE=inline"], ["python3", "/outside/tests/test_api.py"], "outside the assigned checkout"),
+    (["EXECUTION_MODE=inline"], ["curl", "https://live.example"], "live remote target"),
+    (["EXECUTION_MODE=inline"], ["pytest", "--rootdir=/outside/source"], "outside the assigned checkout"),
+])
+def test_managed_run_tests_assignments_do_not_hide_targets(tmp_path, origin, assignments, inner, error):
+    command = shlex.join([
+        *assignments, "/outside/bin/agent-loop", "run-tests",
+        "--memory-dir", "/outside/cache", "--", *inner,
+    ])
+    with pytest.raises(AgentLoopError, match=error):
+        validate_test_commands_within_workdir(
+            [command], assigned_workdir=tmp_path, origin=origin
+        )
+
+
+@pytest.mark.parametrize("prefix", ["EXAMPLE_VAR=1", "INVALID-NAME=1"])
+@pytest.mark.parametrize("options", ["--unknown --", "--timeout-seconds 120"])
+def test_prefixed_malformed_managed_run_tests_has_no_exemption(tmp_path, prefix, options):
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir(
+            [f"{prefix} /outside/bin/agent-loop run-tests {options} python3 tests/test_api.py"],
+            assigned_workdir=tmp_path,
+        )
+
+
 def test_workdir_snapshot_runs_exact_read_only_git_probes_and_accepts_clean_status(tmp_path):
     runner = FakeRunner(
         git_probe_results=[
