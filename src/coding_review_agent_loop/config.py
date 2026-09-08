@@ -669,6 +669,8 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
                 "--claude-arg --model conflicts with --implementation-coder-model; "
                 "use --implementation-coder-model only."
             )
+
+
 def default_agent_workdir(repo: str, agent: AgentName) -> Path:
     repo_slug = repo_cache_slug(repo)
     return Path(tempfile.gettempdir()) / "coding-review-agent-loop" / repo_slug / agent / "repo"
