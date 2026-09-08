@@ -125,56 +125,101 @@ def build_semantic_prompt(
         raise AgentLoopError("semantic dedupe requires at least one candidate")
     if prompt_char_limit <= 0:
         raise AgentLoopError("semantic prompt budget must be positive")
-    candidate_budget = max(256, prompt_char_limit // len(candidates))
-    lines = [
+
+    instruction_lines = [
         "You are a cheap semantic duplicate classifier for approved future follow-up issues.",
         "Do not use tools, browse, execute commands, or infer facts outside this prompt.",
         "Compare the actual deliverable, not merely shared topic words.",
         "Return one strict JSON object and no markdown or explanatory text:",
         '{"duplicate_of": null, "confidence": "low", "reason": "No candidate tracks the same deliverable."}',
         "Use duplicate_of=null when no candidate is equivalent. Only use high confidence when the proposed work is the same deliverable; related or complementary work is not a duplicate.",
-        f"Source context: {_excerpt(source_context, min(1200, prompt_char_limit // 4))}",
-        f"Proposed follow-up: {_excerpt(proposed, min(1600, prompt_char_limit // 3))}",
-        "Candidates:",
     ]
-    for candidate in candidates:
-        lines.extend(
-            [
-                f"- {_identity_label(candidate.identity)}:",
-                f"  title: {_excerpt(candidate.title, candidate_budget // 3)}",
-                f"  body: {_excerpt(candidate.body, candidate_budget)}",
-            ]
+
+    # Reserve the candidate portion explicitly.  The old implementation gave
+    # each candidate a budget before accounting for these instructions and
+    # then sliced the completed prompt, which could remove the tail of a
+    # candidate entry while leaving that identity in the allowed-id set.
+    base_prefix = "\n".join((*instruction_lines, "Source context: ", "Proposed follow-up: ", "Candidates:"))
+    available = prompt_char_limit - len(base_prefix) - 1
+    if available <= 0:
+        raise AgentLoopError("semantic prompt budget is too small for the matcher instructions")
+    source_limit = min(1200, max(0, available // 8))
+    proposed_limit = min(1600, max(0, available // 5))
+    prefix = "\n".join(
+        (
+            *instruction_lines,
+            f"Source context: {_excerpt(source_context, source_limit)}",
+            f"Proposed follow-up: {_excerpt(proposed, proposed_limit)}",
+            "Candidates:",
         )
-    return "\n".join(lines)[:prompt_char_limit]
+    )
+    # ``str.join`` inserts one separator before every candidate entry.
+    remaining = prompt_char_limit - len(prefix) - len(candidates)
+    candidate_budget = remaining // len(candidates)
+    if candidate_budget <= 0:
+        raise AgentLoopError("semantic prompt budget is too small for candidate identities")
+
+    def render_candidate(candidate: SemanticCandidate) -> str:
+        label = _identity_label(candidate.identity)
+        fixed = len(f"- {label}:\n  title: \n  body: ")
+        if fixed > candidate_budget:
+            raise AgentLoopError("semantic prompt budget is too small for candidate identities")
+        text_budget = candidate_budget - fixed
+        title_limit = text_budget // 3
+        body_limit = text_budget - title_limit
+        return "\n".join(
+            (
+                f"- {label}:",
+                f"  title: {_excerpt(candidate.title, title_limit)}",
+                f"  body: {_excerpt(candidate.body, body_limit)}",
+            )
+        )
+
+    candidate_lines: list[str] = []
+    for candidate in candidates:
+        candidate_lines.append(render_candidate(candidate))
+    prompt = "\n".join((prefix, *candidate_lines))
+    if len(prompt) > prompt_char_limit:
+        raise AgentLoopError("semantic prompt candidate packing exceeded its budget")
+    return prompt
 
 
 def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, model: str):
     """Remove configured tool flags and place the provider in an empty temp dir."""
     # No configured checkout or dangerous-agent flag is exposed to this
     # read-only classification turn.
-    isolated = Path(tempfile.mkdtemp(prefix="coding-review-followup-dedupe-"))
-    values: dict[str, object] = {
-        "coder": backend,
-        "reviewer": (backend,),
-        "claude_dir": isolated,
-        "codex_dir": isolated,
-        "gemini_dir": isolated,
-        "antigravity_dir": isolated,
-        "claude_args": (),
-        "codex_args": (),
-        "gemini_args": (),
-        "antigravity_args": (),
-        "dry_run": False,
-    }
-    if backend == "claude":
-        values["claude_model"] = model
-    elif backend == "codex":
-        values["codex_model"] = model
-    elif backend == "gemini":
-        values["gemini_model"] = model
-    elif backend == "antigravity":
-        values["antigravity_model"] = model or config.antigravity_models[0]
-    return replace(config, **values), isolated
+    isolated: Path | None = None
+    try:
+        isolated = Path(tempfile.mkdtemp(prefix="coding-review-followup-dedupe-"))
+        values: dict[str, object] = {
+            "coder": backend,
+            "reviewer": (backend,),
+            "claude_dir": isolated,
+            "codex_dir": isolated,
+            "gemini_dir": isolated,
+            "antigravity_dir": isolated,
+            "claude_args": (),
+            "codex_args": (),
+            "gemini_args": (),
+            "antigravity_args": (),
+            "dry_run": False,
+        }
+        if backend == "claude":
+            values["claude_model"] = model
+        elif backend == "codex":
+            values["codex_model"] = model
+        elif backend == "gemini":
+            values["gemini_model"] = model
+        elif backend == "antigravity":
+            values["antigravity_model"] = None
+            values["antigravity_models"] = (model or config.antigravity_models[0],)
+        return replace(config, **values), isolated
+    except Exception:
+        if isolated is not None:
+            import shutil
+
+            shutil.rmtree(isolated, ignore_errors=True)
+        raise
 
 
 def default_semantic_transport(
@@ -185,8 +230,9 @@ def default_semantic_transport(
 ) -> SemanticProviderResult:
     backend = config.semantic_followup_backend
     model = config.semantic_followup_model.strip()
-    isolated_config, isolated_dir = _isolated_provider_config(config, backend, model)
+    isolated_dir: Path | None = None
     try:
+        isolated_config, isolated_dir = _isolated_provider_config(config, backend, model)
         result = run_agent_result(
             runner,
             agent=backend,
@@ -203,7 +249,8 @@ def default_semantic_transport(
         # from exception handling so provider/control-flow errors propagate.
         import shutil
 
-        shutil.rmtree(isolated_dir, ignore_errors=True)
+        if isolated_dir is not None:
+            shutil.rmtree(isolated_dir, ignore_errors=True)
 
 
 class SemanticDedupeMatcher:
@@ -255,11 +302,12 @@ class SemanticDedupeMatcher:
         else:
             raw = response.text
             provider_result = response.result
+        usage_record = None
         if self.usage_context is not None and provider_result is not None:
             from .usage import estimate_usage
 
             usage = getattr(provider_result, "usage", None) or estimate_usage(prompt, raw)
-            self.usage_context.add_record(
+            usage_record = self.usage_context.add_record(
                 agent=self.config.semantic_followup_backend,
                 session_id=getattr(provider_result, "session_id", None),
                 returncode=getattr(provider_result, "returncode", 0),
@@ -279,9 +327,18 @@ class SemanticDedupeMatcher:
                             if getattr(provider_result, "containment", None) is not None
                             and hasattr(getattr(provider_result, "containment", None), "to_dict")
                             else None),
-            ).validation_status = "validated"
+            )
         allowed = {candidate.identity for candidate in candidates}
-        return parse_semantic_match(raw, allowed_ids=allowed)
+        try:
+            match = parse_semantic_match(raw, allowed_ids=allowed)
+        except Exception:
+            if usage_record is not None:
+                usage_record.outcome = "invalid_output"
+                usage_record.validation_status = "invalid"
+            raise
+        if usage_record is not None:
+            usage_record.validation_status = "validated"
+        return match
 
 
 class BudgetExhausted(AgentLoopError):

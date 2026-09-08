@@ -8,13 +8,24 @@ from types import SimpleNamespace
 import pytest
 
 from agent_loop_helpers import FakeRunner, make_config
-from coding_review_agent_loop.errors import QuotaResetExceededError
+from coding_review_agent_loop.errors import AgentLoopError, QuotaResetExceededError
 from coding_review_agent_loop.followups import (
     FollowupSourceContext,
+    _followup_issue_body,
+    _semantic_batch_matcher,
     _publish_approved_followups,
+    reconcile_approved_followups,
 )
 from coding_review_agent_loop.protocol import ApprovedFollowup
-from coding_review_agent_loop.semantic_dedupe import parse_semantic_match
+from coding_review_agent_loop.semantic_dedupe import (
+    SemanticCandidate,
+    SemanticDedupeMatcher,
+    SemanticProviderResult,
+    _isolated_provider_config,
+    build_semantic_prompt,
+    parse_semantic_match,
+)
+from coding_review_agent_loop.usage import RunUsageContext
 
 
 def _source(*, parent: int) -> FollowupSourceContext:
@@ -175,3 +186,181 @@ def test_replay_skips_search_and_model(tmp_path):
         semantic_transport=transport,
     ) is False
     assert runner.search_issues_calls == []
+
+
+def test_semantic_batch_matcher_merges_high_confidence_group_identity(tmp_path):
+    runner = FakeRunner()
+    config = make_config(tmp_path, approved_followups="issue")
+    calls: list[str] = []
+
+    def transport(prompt, _runner, _config, _timeout):
+        calls.append(prompt)
+        return json.dumps(
+            {
+                "duplicate_of": "group-1",
+                "confidence": "high",
+                "reason": "Both describe preserving worktree-only recovery data.",
+            }
+        )
+
+    matcher = SemanticDedupeMatcher(runner=runner, config=config, transport=transport)
+    reconciliation = reconcile_approved_followups(
+        [
+            ApprovedFollowup(
+                reviewer="Claude",
+                text="Preserve recovery artifacts for files that never enter the index.",
+            ),
+            ApprovedFollowup(
+                reviewer="Gemini",
+                text="Capture worktree-only files in the salvage artifact when the repository diff is empty.",
+            ),
+        ],
+        semantic_matcher=_semantic_batch_matcher(matcher, source_context=_source(parent=473)),
+    )
+
+    assert len(calls) == 1
+    assert len(reconciliation.groups) == 1
+    assert reconciliation.groups[0].reviewers == ("Claude", "Gemini")
+    assert reconciliation.deduplicated_count == 1
+
+
+def test_medium_confidence_files_with_possible_duplicate_note(tmp_path):
+    runner = FakeRunner(
+        search_issues_payload=[
+            {
+                "number": 484,
+                "title": "Follow up future plan-review note: salvage recovery",
+                "url": "https://github.com/OWNER/REPO/issues/484",
+                "body": "Future follow-up from approved planning for issue #473. Preserve salvage artifacts.",
+            }
+        ],
+        issue_urls=["https://github.com/OWNER/REPO/issues/900"],
+    )
+    config = make_config(tmp_path, approved_followups="issue")
+
+    def transport(_prompt, _runner, _config, _timeout):
+        return json.dumps(
+            {
+                "duplicate_of": 484,
+                "confidence": "medium",
+                "reason": "The tracker may cover the same salvage work.",
+            }
+        )
+
+    assert _publish_approved_followups(
+        runner,
+        config=config,
+        pr_number=488,
+        head_sha="head-488",
+        pr_comments=[],
+        followups=[
+            ApprovedFollowup(
+                reviewer="Claude",
+                text="Capture recovery data for files that exist only in the worktree.",
+            )
+        ],
+        source_context=_source(parent=473),
+        semantic_transport=transport,
+    ) is True
+
+    assert len(runner.issues) == 1
+    assert "Possible duplicate (not suppressed because semantic confidence was not high):" in runner.issues[0]["body"]
+    assert "1 filed" in runner.comments[-1]
+    assert "0 reused; 1 uncertain" in runner.comments[-1]
+
+
+def test_pr_followup_body_renders_lookup_context():
+    followup = ApprovedFollowup(reviewer="Claude", text="Track the deferred recovery work.")
+    reconciliation = reconcile_approved_followups([followup])
+
+    body = _followup_issue_body(
+        488,
+        reconciliation.selected_groups[0],
+        source_context=_source(parent=473),
+    )
+
+    assert "Lookup context:" in body
+    assert "parent issue(s)=#473" in body
+
+
+def test_existing_parent_issue_is_not_reused_as_followup_tracker(tmp_path):
+    runner = FakeRunner(
+        search_issues_payload=[
+            {
+                "number": 473,
+                "title": "Follow up future work",
+                "url": "https://github.com/OWNER/REPO/issues/473",
+                "body": "Future follow-up from approved review on PR #472.",
+            }
+        ],
+        issue_urls=["https://github.com/OWNER/REPO/issues/900"],
+    )
+    config = make_config(tmp_path, approved_followups="issue", semantic_followup_dedupe=False)
+
+    assert _publish_approved_followups(
+        runner,
+        config=config,
+        pr_number=488,
+        head_sha="head-488",
+        pr_comments=[],
+        followups=[ApprovedFollowup(reviewer="Claude", text="Track deferred recovery work.")],
+        source_context=_source(parent=473),
+    ) is True
+    assert len(runner.issues) == 1
+
+
+def test_semantic_prompt_keeps_all_candidate_entries_within_budget():
+    candidates = tuple(
+        # Long excerpts make the old post-render slice drop later candidates.
+        SemanticCandidate(
+            identity=f"group-{index}",
+            title="candidate title " * 20,
+            body="candidate body " * 80,
+        )
+        for index in range(1, 51)
+    )
+    prompt = build_semantic_prompt(
+        proposed="proposed follow-up",
+        candidates=candidates,
+        source_context="repository=OWNER/REPO; source=pr#488; parent issue(s)=#473",
+        prompt_char_limit=12_000,
+    )
+
+    assert len(prompt) <= 12_000
+    assert all(f"- group-{index}:" in prompt for index in range(1, 51))
+
+
+def test_antigravity_isolated_config_replaces_the_model_chain(tmp_path):
+    config = make_config(
+        tmp_path,
+        semantic_followup_backend="antigravity",
+        semantic_followup_model="Model X",
+    )
+    isolated_config, isolated_dir = _isolated_provider_config(config, "antigravity", "Model X")
+    try:
+        assert isolated_config.antigravity_model is None
+        assert isolated_config.antigravity_models == ("Model X",)
+    finally:
+        import shutil
+
+        shutil.rmtree(isolated_dir, ignore_errors=True)
+
+
+def test_invalid_semantic_result_is_not_counted_as_validated_usage(tmp_path):
+    usage = RunUsageContext(run_id="semantic-invalid", summary_path=tmp_path / "usage.json")
+    matcher = SemanticDedupeMatcher(
+        runner=FakeRunner(),
+        config=make_config(tmp_path),
+        usage_context=usage,
+        transport=lambda *_args: SemanticProviderResult(text="not-json", result=SimpleNamespace()),
+    )
+
+    with pytest.raises(AgentLoopError):
+        matcher.match(
+            proposed="Track the deferred recovery work.",
+            candidates=(SemanticCandidate(identity=484, title="Existing", body="Recovery"),),
+            source_context=_source(parent=473).render(),
+        )
+
+    assert usage.records[0].outcome == "invalid_output"
+    assert usage.records[0].validation_status == "invalid"

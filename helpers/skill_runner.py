@@ -92,7 +92,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
-import inspect
 import json
 import os
 import re
@@ -885,6 +884,7 @@ def _publish_pr_followups(
     pr_comments: list,
     *,
     dry_run: bool,
+    parent_issue_number: int | None = None,
 ) -> dict:
     """Publish approved future follow-ups for a PR via the library logic (#300).
 
@@ -921,18 +921,10 @@ def _publish_pr_followups(
             source_kind="pr",
             source_number=pr,
             source_identity=head_sha,
+            parent_issue_numbers=(parent_issue_number,) if parent_issue_number is not None else (),
             related_pr_numbers=(pr,),
         ),
     }
-    # Keep old test/integration adapters that monkeypatch the publisher with
-    # the pre-context signature callable; the production call always carries
-    # explicit source context.
-    signature = inspect.signature(_publish_approved_followups)
-    if "source_context" not in signature.parameters and not any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    ):
-        publish_kwargs.pop("source_context")
     published = _publish_approved_followups(Runner(dry_run=False), **publish_kwargs)
     return {"mode": mode, "published": bool(published), "count": len(approved)}
 
@@ -2541,8 +2533,9 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             else:
                 round_approved_reviewers.append(str(record.get("reviewer_name", "")))
 
-    pr_diff = _fetch_pr_diff(repo, pr)
     issue_dict = _fetch_pr_json(repo, pr)
+    parent_issue_number = _linked_issue_number_from_pr(issue_dict)
+    pr_diff = _fetch_pr_diff(repo, pr)
 
     # Repo-scoped agent memory for reviewer orientation (#306), prepared once.
     memory = None
@@ -2717,7 +2710,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         ]
         result_json["approved_followups"] = _publish_pr_followups(
             repo, pr, head_sha, followups_mode, round_future_items, pr_comments,
-            dry_run=dry_run,
+            dry_run=dry_run, parent_issue_number=parent_issue_number,
         )
     usage = _aggregate_reviewer_usage(round_reviewer_records)
     if usage is not None:

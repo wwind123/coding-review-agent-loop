@@ -1836,12 +1836,13 @@ class TestApprovedFollowups:
         import helpers.skill_runner as sr
         captured = {}
 
-        def fake_publish(runner, *, config, pr_number, head_sha, pr_comments, followups):
+        def fake_publish(runner, *, config, pr_number, head_sha, pr_comments, followups, **kwargs):
             captured["mode"] = config.approved_followups
             captured["pr_number"] = pr_number
             captured["head_sha"] = head_sha
             captured["followup_texts"] = [f.text for f in followups]
             captured["reviewers"] = [f.reviewer for f in followups]
+            captured["source_context"] = kwargs["source_context"]
             return True
 
         monkeypatch.setattr(sr, "_publish_approved_followups", fake_publish)
@@ -1854,6 +1855,7 @@ class TestApprovedFollowups:
         assert captured["pr_number"] == 42 and captured["head_sha"] == "deadbeef"
         assert captured["followup_texts"] == ["ship docs"]
         assert captured["reviewers"] == ["Gemini"]
+        assert captured["source_context"].parent_issue_numbers == ()
 
     def test_publish_idempotent_with_existing_marker(self) -> None:
         # Exercises the real _publish_approved_followups: a pre-existing marker for

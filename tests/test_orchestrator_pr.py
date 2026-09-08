@@ -3121,6 +3121,8 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
             "title": "Follow up future review note: Add cleanup docs.",
             "body": (
                 "Future follow-up from approved review on PR #77.\n\n"
+                "Source context:\n"
+                "- Lookup context: repository=OWNER/REPO; source=pr#77; identity=abc123; related PR(s)=#77\n\n"
                 "Reviewer: Codex\n\n"
                 "Follow-up:\n"
                 "- Add cleanup docs.\n\n"
@@ -3133,6 +3135,8 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
             "title": "Follow up future review note: Add regression coverage.",
             "body": (
                 "Future follow-up from approved review on PR #77.\n\n"
+                "Source context:\n"
+                "- Lookup context: repository=OWNER/REPO; source=pr#77; identity=abc123; related PR(s)=#77\n\n"
                 "Reviewer: Claude\n\n"
                 "Follow-up:\n"
                 "- Add regression coverage.\n\n"

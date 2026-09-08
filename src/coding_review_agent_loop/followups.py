@@ -376,12 +376,6 @@ def reconcile_approved_followups(
                         candidate_index = int(suffix) - 1
                         if 0 <= candidate_index < len(grouped):
                             existing_index = candidate_index
-                elif isinstance(target, int) and not isinstance(target, bool):
-                    # Test/in-process matchers may use the natural zero-based
-                    # group identity.  Existing issue numbers are never valid
-                    # here because batch groups carry string identities.
-                    if 0 <= target < len(grouped):
-                        existing_index = target
         if existing_index is None:
             indexes.update((key, len(grouped)) for key in keys)
             grouped.append(GroupedApprovedFollowup(text=followup.text, items=(followup,)))
@@ -722,11 +716,7 @@ def _search_followup_trackers(
         add_query(f'{prefix} "future follow-up"')
 
     found: dict[int, FoundIssue] = {}
-    excluded_numbers = {
-        source_context.source_number
-        if source_context.source_kind == "plan"
-        else -1
-    }
+    excluded_numbers = {source_context.source_number, *source_context.parent_issue_numbers}
     for query in queries:
         try:
             results = search_issues(
@@ -817,6 +807,12 @@ def _format_publication_summary(
     deduplicated_count: int,
     skipped_by_cap: int,
 ) -> str:
+    filed = any(publication.status in {"created", "uncertain"} for publication in publications)
+    if not filed:
+        if any(publication.status == "reused" for publication in publications):
+            heading = f"Reused existing {heading.removeprefix('Created ')}"
+        else:
+            heading = "Approved future follow-up publication results:"
     lines = [heading, ""]
     shown_targets: set[str] = set()
     for publication in publications:
@@ -876,6 +872,8 @@ def _followup_issue_body(
         f"Future follow-up from approved review on PR #{pr_number}.",
         "",
     ]
+    if source_context is not None:
+        lines.extend(["Source context:", f"- Lookup context: {source_context.render()}", ""])
     reviewers = tuple(sanitize_historical_text(reviewer) for reviewer in followup.reviewers)
     if len(reviewers) == 1:
         lines.append(f"Reviewer: {reviewers[0]}")
@@ -994,32 +992,6 @@ def _plan_followup_issue_body(
     return "\n".join(lines)
 
 
-def _create_plan_approved_followup_issues(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    issue_number: int,
-    plan_hash: str,
-    plan_subject: str,
-    reconciliation: PlanApprovedFollowupReconciliation,
-) -> list[str]:
-    issue_urls: list[str] = []
-    for followup in reconciliation.selected_groups:
-        issue_url = create_issue(
-            runner,
-            config=config,
-            title=_plan_followup_issue_title(followup),
-            body=_plan_followup_issue_body(
-                issue_number=issue_number,
-                plan_hash=plan_hash,
-                plan_subject=plan_subject,
-                followup=followup,
-            ),
-        )
-        issue_urls.append(issue_url or "Created issue URL unavailable from GitHub CLI output.")
-    return issue_urls
-
-
 def _validated_created_issue_url(url: str | None, *, repo: str) -> tuple[int | None, str | None]:
     if not url:
         return None, None
@@ -1129,7 +1101,7 @@ def _publish_issue_followup_groups(
     plan_hash: str | None = None,
     semantic_matcher: SemanticDedupeMatcher | None = None,
     semantic_transport: SemanticTransport | None = None,
-) -> tuple[str, tuple[str, ...]]:
+) -> tuple[str, tuple[str, ...], tuple[FollowupPublication, ...]]:
     followups = [ApprovedFollowup(reviewer=group.reviewers[0], text=group.text) for group in groups]
     candidates = _search_followup_trackers(
         runner,
@@ -1287,67 +1259,7 @@ def _publish_issue_followup_groups(
         publication.issue_url
         for publication in publications
         if publication.issue_url
-    )
-
-
-def _create_approved_followup_issues(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    pr_number: int,
-    reconciliation: ApprovedFollowupReconciliation,
-) -> list[str]:
-    issue_urls: list[str] = []
-    for followup in reconciliation.selected_groups:
-        issue_url = create_issue(
-            runner,
-            config=config,
-            title=_followup_issue_title(
-                ApprovedFollowup(reviewer=followup.reviewers[0], text=followup.text)
-            ),
-            body=_followup_issue_body(pr_number, followup),
-        )
-        if issue_url is not None:
-            issue_urls.append(issue_url)
-    return issue_urls
-
-
-def _format_created_followup_issue_summary(
-    pr_number: int,
-    issue_urls: list[str],
-    reconciliation: ApprovedFollowupReconciliation,
-) -> str:
-    unique_issue_urls = list(dict.fromkeys(issue_urls))
-    lines = [
-        f"Created approved-review future follow-up issues for PR #{pr_number}:",
-        "",
-    ]
-    if unique_issue_urls:
-        lines.extend(f"- {issue_url}" for issue_url in unique_issue_urls)
-    else:
-        lines.append("- Created issue URL unavailable from GitHub CLI output.")
-    lines.extend(
-        [
-            "",
-            (
-                f"Reconciliation: {len(unique_issue_urls)} filed, "
-                f"{reconciliation.deduplicated_count} deduplicated, "
-                f"{reconciliation.skipped_by_cap} skipped by cap."
-            ),
-            "",
-            "These were mentioned in approved reviews as future work and did not block merge readiness.",
-        ]
-    )
-    if reconciliation.skipped_by_cap > 0:
-        lines.extend(
-            [
-                "",
-                f"Skipped {reconciliation.skipped_by_cap} additional item(s) to avoid issue noise; reviewers should reserve "
-                "this section for substantial independent follow-up work.",
-            ]
-        )
-    lines.extend(["", "-- coding-review-agent-loop"])
-    return "\n".join(lines)
+    ), tuple(publications)
 
 
 def _publish_approved_followups(
@@ -1436,7 +1348,7 @@ def _publish_approved_followups(
         return True
 
     if mode == "issue":
-        publication_body, _issue_urls = _publish_issue_followup_groups(
+        publication_body, issue_urls, _publications = _publish_issue_followup_groups(
             runner,
             config=config,
             groups=groups,
@@ -1447,11 +1359,9 @@ def _publish_approved_followups(
             semantic_matcher=semantic_provider_matcher,
             semantic_transport=semantic_transport,
         )
-        if not _issue_urls:
+        if not issue_urls:
             # Preserve the historical fail-safe when GitHub did not return a
-            # usable identity for any newly-created issue.  Reused trackers
-            # are included in _issue_urls and therefore still publish the
-            # durable audit record.
+            # usable identity for any newly-created or reused tracker.
             return False
         body = _append_approved_followups_marker(
             publication_body,
@@ -1500,9 +1410,10 @@ def _format_plan_approval_summary_with_followups(
     ]
     if reconciliation is not None and reconciliation.selected_groups:
         if filing_enabled:
-            lines.extend(["", "Filed future follow-up issues:", ""])
             unique_issue_urls = list(dict.fromkeys(issue_urls))
-            lines.extend(f"- {issue_url}" for issue_url in unique_issue_urls)
+            if unique_issue_urls:
+                lines.extend(["", "Filed future follow-up issues:", ""])
+                lines.extend(f"- {issue_url}" for issue_url in unique_issue_urls)
             if publication_details:
                 detail_lines = publication_details.splitlines()
                 if detail_lines and detail_lines[0].endswith(":"):
@@ -1510,16 +1421,6 @@ def _format_plan_approval_summary_with_followups(
                 detail_lines = [line for line in detail_lines if line != "-- coding-review-agent-loop"]
                 if detail_lines:
                     lines.extend(["", "Publication details:", *detail_lines])
-            lines.extend(
-                [
-                    "",
-                    (
-                        f"Reconciliation: {len(reconciliation.selected_groups)} filed, "
-                        f"{reconciliation.deduplicated_count} deduplicated, "
-                        f"{reconciliation.skipped_by_cap} skipped by cap."
-                    ),
-                ]
-            )
         else:
             lines.extend(
                 [
@@ -1631,7 +1532,7 @@ def _publish_plan_approved_followups(
             f"{reconciliation.skipped_by_cap} skipped by cap",
         )
         if filing_enabled:
-            publication_details, created_urls = _publish_issue_followup_groups(
+            publication_details, _issue_urls, publications = _publish_issue_followup_groups(
                 runner,
                 config=config,
                 groups=reconciliation.groups,
@@ -1645,7 +1546,11 @@ def _publish_plan_approved_followups(
                 semantic_matcher=semantic_provider_matcher,
                 semantic_transport=semantic_transport,
             )
-            issue_urls = list(created_urls)
+            issue_urls = [
+                publication.issue_url
+                for publication in publications
+                if publication.status in {"created", "uncertain"} and publication.issue_url
+            ]
 
     # The approved plan is a re-rendered historical GitHub artifact.  Its
     # encoded plan metadata may contain durable records, but those records are
