@@ -1821,6 +1821,17 @@ accepts neither green nor red same-context statuses unless publisher, nonce,
 attached run, and latest attempt all correlate. A failure is reported from the
 validated run's failing jobs, not base-ref PR checks.
 
+The v2 intent lifecycle is deliberately limited to `prepared`,
+`dispatch-requested`, `attached`, and `completed`. `prepared` and
+`dispatch-requested` always serialize `run_id: null` and `run_attempt: null`,
+including when an earlier invocation or round had an attachment. Minting a
+fresh nonce clears all attachment and terminal fields while retaining only the
+authenticated contract and invocation-generation provenance. Same-nonce
+retries retain a non-excluded attachment even when a workflow-runs read is
+temporarily empty; the waiter refreshes that run and no second dispatch is
+issued. Only an explicitly excluded terminal attempt may be cleared for
+replacement.
+
 After correlated success, auto-merge applies the short-lived
 `agent-loop-exact-head-qualified` label, marks the PR ready, rechecks its head,
 and merges with `--match-head-commit`. Explicit `--managed-ci` never applies
@@ -1873,15 +1884,29 @@ action-required, success, neutral, skipped, failure, and unknown values—workfl
 success alone never qualifies the head. A real correlated failure routes back
 to the coder, and a moved head restarts review. A passing aggregate is merged
 with `--match-head-commit`, so a different head cannot inherit the approval or
-CI result. The terminal-without-status stop records
-`state=terminal-no-status` and the exact run attempt in the intent ledger; a
-later higher-attempt rerun is accepted, while an unchanged head can also
-dispatch a fresh same-nonce run. If an adopted PR stops this way, its
+CI result. The terminal-without-status stop records the router-compatible
+`state=completed` plus a separate `terminal_outcome: "no-status"` round field,
+the exact run attempt, and accumulated excluded-attempt history; it never
+publishes the unsupported `terminal-no-status` lifecycle. A later
+higher-attempt rerun is accepted when the excluded attempt is known; if the
+attempt is missing, the entire run ID remains excluded and only a different
+fresh run ID can be correlated. An unchanged head can also dispatch a fresh
+same-nonce run. If an adopted PR stops this way, its
 invocation-owned managed label is released and the next invocation
 re-adopts/reapplies managed mode. A corrected head requires a fresh exact-head
 review. The managed route is selected independently of `--watch-pending-ci`;
 neither that flag nor `--no-watch-pending-ci` replaces exact-head
 qualification with ordinary full-board watching.
+
+Historical authorization records are not rewritten. A pre-existing record
+with an unsupported lifecycle value can still block an older router that
+validates every trusted record before nonce filtering; remediate that consumer
+or preserve its strict validation when rolling out the compatible producer.
+The supported nonce-scoped router validates only the requested nonce's
+lifecycle, so unrelated historical generations cannot deadlock a fresh
+dispatch. Neither behavior infers qualification from `completed` or workflow
+success: only a correlated exact-head status with all required checks passing
+can reach the merge path.
 
 #### Managed-CI GitHub CLI compatibility
 

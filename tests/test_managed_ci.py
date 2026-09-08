@@ -1,4 +1,5 @@
 import ast
+import copy
 import json
 import shlex
 from dataclasses import replace
@@ -30,8 +31,10 @@ from coding_review_agent_loop.managed_ci import (
     assess_exact_head_protection,
     _dispatch_v2_qualification,
     _ensure_v2_intent,
+    _patch_intent,
     _v2_failed_jobs,
     _v2_correlated_status,
+    _v2_terminal_attempt_excluded,
     _api_list,
     activate_managed_ci,
     authenticate_issue_created_handoff,
@@ -64,6 +67,8 @@ from coding_review_agent_loop.orchestrator import (
 from coding_review_agent_loop.runner import CommandResult
 from coding_review_agent_loop.cli import build_parser
 from coding_review_agent_loop.config import resolve_base_branch
+
+from fixtures.managed_ci import current_router, historical_router
 
 from agent_loop_helpers import FakeRunner, make_config
 
@@ -210,6 +215,31 @@ class V2ManagedRunner(ManagedRunner):
         self.issue_events = list(issue_events or [])
         self.unreadable_issue_events_after_label = unreadable_issue_events_after_label
         self.labels_posted = False
+        self.intent_snapshots = []
+        self.dispatch_count = 0
+
+    def _capture_intent_body(self, body):
+        marker = "AGENT_MANAGED_CI_INTENT_V2"
+        if not isinstance(body, str) or marker not in body:
+            return None
+        try:
+            encoded = body.split(marker, 1)[1].split("-->", 1)[0].strip()
+            record = json.loads(encoded)
+        except (IndexError, json.JSONDecodeError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        snapshot = copy.deepcopy(record)
+        self.intent_snapshots.append(snapshot)
+        return snapshot
+
+    @staticmethod
+    def _form_value(cmd, name):
+        prefix = f"{name}="
+        for part in cmd:
+            if isinstance(part, str) and part.startswith(prefix):
+                return part[len(prefix):]
+        return None
 
     def _run_locked(self, args, *, cwd, check):
         cmd = list(args)
@@ -266,10 +296,34 @@ class V2ManagedRunner(ManagedRunner):
             return CommandResult(cmd, cwd_path, json.dumps(self.intent_comments), "", 0)
         if endpoint == "repos/OWNER/REPO/issues/7/comments" and "POST" in cmd:
             cmd, cwd_path = self._record_command(args, cwd)
-            return CommandResult(cmd, cwd_path, json.dumps({"id": 17}), "", 0)
+            body = self._form_value(cmd, "body")
+            record = self._capture_intent_body(body)
+            comment_id = (
+                max((int(item.get("id", 0)) for item in self.intent_comments if isinstance(item, dict)), default=16) + 1
+                if record is not None
+                else 17
+            )
+            if record is not None:
+                self.intent_comments.append({
+                    "id": comment_id,
+                    "user": {"login": self.actor_login, "id": self.actor_id},
+                    "body": body,
+                })
+            return CommandResult(cmd, cwd_path, json.dumps({"id": comment_id}), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/issues/comments/"):
             cmd, cwd_path = self._record_command(args, cwd)
+            body = self._form_value(cmd, "body")
+            record = self._capture_intent_body(body)
+            if record is not None:
+                comment_id = int(endpoint.rsplit("/", 1)[-1])
+                for comment in self.intent_comments:
+                    if isinstance(comment, dict) and comment.get("id") == comment_id:
+                        comment["body"] = body
+                        break
             return CommandResult(cmd, cwd_path, "{}", "", 0)
+        if endpoint.endswith("/actions/workflows/ci.yml/dispatches"):
+            self.dispatch_count += 1
+            return super()._run_locked(args, cwd=cwd, check=check)
         if "/actions/workflows/ci.yml/runs?event=workflow_dispatch" in endpoint:
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, json.dumps({"workflow_runs": self.workflow_runs}), "", 0)
@@ -1583,7 +1637,7 @@ def v2_run(
 def v2_intent_comment(
     *, nonce="nonce-1", run_id=None, run_attempt=None, state=None,
     terminal_run_id=None, terminal_run_attempt=None,
-    terminal_attempts=None,
+    terminal_attempts=None, terminal_outcome=None,
 ):
     payload = {
         "repository": "OWNER/REPO",
@@ -1600,6 +1654,8 @@ def v2_intent_comment(
         payload["terminal_run_id"] = terminal_run_id
     if terminal_run_attempt is not None:
         payload["terminal_run_attempt"] = terminal_run_attempt
+    if terminal_outcome is not None:
+        payload["terminal_outcome"] = terminal_outcome
     if terminal_attempts is not None:
         payload["terminal_attempts"] = [
             {"run_id": run_id, "run_attempt": attempt}
@@ -1971,8 +2027,37 @@ def test_v2_correlated_status_omits_unknown_attempt_token(tmp_path):
         runner, config=config, expected_head="abc123",
         contract=v2_contract(attached_run_id=100, run_attempt=None),
     )
-    assert result is not None
-    assert result.status == "success"
+    assert result is None
+
+
+def test_v2_completed_run_without_attempt_waits_without_terminal_publication(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=2, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(attempt=None, status="completed", conclusion="cancelled")],
+        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_status_payload={"statuses": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract(
+        attached_run_id=100, run_attempt=None, intent_comment_id=17,
+        pr_number=7, expected_head_sha="abc123",
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "timeout"
+    assert contract.terminal_run_id is None
+    assert contract.terminal_run_attempt is None
+    assert contract.terminal_attempts == ()
+    assert contract.terminal_outcome is None
+    assert not any(
+        "/issues/comments/17" in " ".join(command)
+        for command, _cwd in runner.commands
+    )
 
 
 def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_path, monkeypatch):
@@ -2000,9 +2085,11 @@ def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_
     assert outcome.status == "terminal_without_status"
     assert (outcome.run_id, outcome.run_attempt) == (100, 1)
     assert outcome.workflow_conclusion == "cancelled"
-    assert contract.intent_state == "terminal-no-status"
+    assert contract.intent_state == "completed"
+    assert contract.terminal_outcome == "no-status"
     assert any(
-        '"state":"terminal-no-status"' in " ".join(command)
+        '"state":"completed"' in " ".join(command)
+        and '"terminal_outcome":"no-status"' in " ".join(command)
         for command, _cwd in runner.commands
         if "/issues/comments/17" in " ".join(command)
     )
@@ -2616,6 +2703,196 @@ def test_v2_intent_resumes_matching_comment_and_rejects_competing_nonce(tmp_path
         _ensure_v2_intent(
             runner, config=config, pr_number=7, expected_head_sha="abc123", contract=v2_contract()
         )
+
+
+def test_v2_fresh_generation_resets_attachment_terminal_history_and_early_fields(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner()
+    contract = v2_contract(
+        intent_comment_id=99,
+        nonce="old-nonce",
+        created_at=1,
+        attached_run_id=100,
+        run_attempt=2,
+        intent_state="completed",
+        terminal_run_id=100,
+        terminal_run_attempt=1,
+        terminal_attempts=((100, 1),),
+        terminal_outcome="no-status",
+        intent_generation="fresh-generation",
+    )
+
+    _ensure_v2_intent(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    prepared = runner.intent_snapshots[-1]
+    assert prepared["state"] == "prepared"
+    assert prepared["run_id"] is None
+    assert prepared["run_attempt"] is None
+    assert prepared["terminal_run_id"] is None
+    assert prepared["terminal_run_attempt"] is None
+    assert prepared["terminal_attempts"] == []
+    assert prepared["terminal_outcome"] is None
+    assert contract.attached_run_id is None
+    assert contract.terminal_attempts == ()
+
+    _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+    requested = runner.intent_snapshots[-1]
+    assert requested["state"] == "dispatch-requested"
+    assert requested["run_id"] is None
+    assert requested["run_attempt"] is None
+
+
+def test_v2_same_nonce_non_excluded_attachment_survives_discovery_miss_without_redispatch(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(intent_comments=[v2_intent_comment(
+        run_id=100, run_attempt=1, state="attached"
+    )])
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert (contract.attached_run_id, contract.run_attempt) == (100, 1)
+    assert runner.dispatch_count == 0
+    assert runner.intent_snapshots == []
+
+
+def test_v2_excluded_attachment_transitions_to_dispatch_requested_before_replacement(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(run_id=101, status="in_progress", conclusion=None)],
+        intent_comments=[v2_intent_comment(
+            run_id=100, run_attempt=1, state="completed",
+            terminal_run_id=100, terminal_run_attempt=1,
+            terminal_attempts=((100, 1),), terminal_outcome="no-status",
+        )],
+    )
+    contract = v2_contract()
+
+    _dispatch_v2_qualification(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert (contract.attached_run_id, contract.run_attempt) == (101, 1)
+    assert runner.dispatch_count == 0
+    assert [snapshot["state"] for snapshot in runner.intent_snapshots] == [
+        "dispatch-requested", "attached"
+    ]
+    assert runner.intent_snapshots[0]["run_id"] is None
+
+
+def test_v2_emitted_lifecycle_records_are_accepted_by_pinned_consumers(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    revision = "a" * 40
+    expected_head = "b" * 40
+    runner = V2ManagedRunner()
+    contract = v2_contract(workflow_revision=revision)
+
+    _ensure_v2_intent(
+        runner, config=config, pr_number=7, expected_head_sha=expected_head, contract=contract
+    )
+    _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+    contract.attached_run_id, contract.run_attempt = 100, 1
+    _patch_intent(runner, config=config, contract=contract, state="attached")
+    contract.terminal_run_id, contract.terminal_run_attempt = 100, 1
+    contract.terminal_attempts = ((100, 1),)
+    contract.terminal_outcome = "no-status"
+    _patch_intent(runner, config=config, contract=contract, state="completed")
+
+    pr = {
+        "state": "open", "draft": True, "number": 7,
+        "base": {"ref": "main"}, "head": {
+            "sha": expected_head, "ref": "agent-loop/managed-7",
+            "repo": {"full_name": "OWNER/REPO"},
+        }, "user": {"login": "agent-loop"},
+        "labels": [{"name": MANAGED_LABEL}],
+    }
+    for snapshot in runner.intent_snapshots:
+        pages = [[{
+            "user": {"login": "agent-loop"},
+            "body": f"<!-- AGENT_MANAGED_CI_INTENT_V2 {json.dumps(snapshot, separators=(',', ':'))} -->",
+        }]]
+        if snapshot["state"] == "prepared":
+            with pytest.raises(ValueError, match="exactly one distinct qualifying intent"):
+                historical_router.validate(
+                    pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision
+                )
+            with pytest.raises(ValueError, match="exactly one distinct qualifying intent"):
+                current_router.validate(
+                    pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision
+                )
+        else:
+            historical_router.validate(
+                pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision
+            )
+            current_router.validate(
+                pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision
+            )
+
+
+def test_v2_current_pinned_consumer_scopes_lifecycle_validation_to_requested_nonce(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    revision = "a" * 40
+    expected_head = "b" * 40
+    runner = V2ManagedRunner()
+    contract = v2_contract(workflow_revision=revision)
+    _ensure_v2_intent(
+        runner, config=config, pr_number=7, expected_head_sha=expected_head, contract=contract
+    )
+    _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+    current = runner.intent_snapshots[-1]
+    unrelated = dict(current)
+    unrelated.update({"nonce": "C" * 32, "state": "terminal-no-status", "run_id": 100, "run_attempt": 1})
+    def body(record):
+        return {"user": {"login": "agent-loop"}, "body": f"<!-- AGENT_MANAGED_CI_INTENT_V2 {json.dumps(record, separators=(',', ':'))} -->"}
+    pr = {
+        "state": "open", "draft": True, "number": 7,
+        "base": {"ref": "main"}, "head": {
+            "sha": expected_head, "ref": "agent-loop/managed-7",
+            "repo": {"full_name": "OWNER/REPO"},
+        }, "user": {"login": "agent-loop"},
+        "labels": [{"name": MANAGED_LABEL}],
+    }
+    pages = [[body(current), body(unrelated)]]
+    current_router.validate(pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision)
+    with pytest.raises(ValueError, match="invalid state"):
+        historical_router.validate(pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision)
+    invalid_current = dict(current)
+    invalid_current["state"] = "terminal-no-status"
+    with pytest.raises(ValueError, match="invalid state"):
+        current_router.validate(
+            pr, [[body(invalid_current)]], "OWNER/REPO", "7", expected_head,
+            contract.nonce, "agent-loop", revision,
+        )
+
+
+def test_v2_legacy_no_status_restoration_preserves_missing_attempt_exclusion(tmp_path):
+    config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
+    runner = V2ManagedRunner(intent_comments=[v2_intent_comment(
+        run_id=100, run_attempt=None, state="terminal-no-status",
+        terminal_run_id=100, terminal_run_attempt=None,
+    )])
+    contract = v2_contract()
+
+    _ensure_v2_intent(
+        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+    )
+
+    assert contract.intent_state == "terminal-no-status"
+    assert contract.terminal_outcome == "no-status"
+    assert contract.terminal_attempts == ((100, None),)
+    assert contract.attached_run_id is None
+    assert contract.run_attempt is None
+
+
+def test_v2_missing_terminal_attempt_excludes_same_run_but_allows_fresh_run():
+    exclusions = ((100, None),)
+
+    assert _v2_terminal_attempt_excluded(100, 2, exclusions)
+    assert not _v2_terminal_attempt_excluded(101, 2, exclusions)
 
 
 def test_v2_dispatch_discovers_existing_run_before_dispatching(tmp_path):

@@ -137,6 +137,10 @@ class ManagedCiContract:
     terminal_run_id: int | None = None
     terminal_run_attempt: int | None = None
     terminal_attempts: tuple[tuple[int, int | None], ...] = ()
+    # ``completed`` is the only router-compatible terminal lifecycle state.
+    # Keep the no-status result as separate round metadata so older routers do
+    # not have to parse a producer-only lifecycle value.
+    terminal_outcome: Literal["no-status"] | None = None
     activation_path: Literal["managed", "ordinary_fallback"] = "managed"
     ordinary_recovery: "OrdinaryRecoveryCapability | None" = None
     # Derived from the exact base workflow at activation. Retain it for a
@@ -2715,6 +2719,29 @@ def _dispatch_v2_qualification(
         contract.ordinary_recovery = recovery
         log(config, f"PR #{pr_number}: managed resume ledger failed; selected ordinary recovery")
         return
+
+    # A same-nonce attachment is the durable owner of this dispatch.  A
+    # transiently empty workflow-runs response must never turn it into a
+    # second dispatch or an early record with stale run fields.  Only an
+    # attempt explicitly excluded by the terminal-attempt history may be
+    # cleared before discovering a replacement.
+    if contract.attached_run_id is not None:
+        if _v2_attachment_is_excluded(contract):
+            contract.attached_run_id = None
+            contract.run_attempt = None
+            _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
+        else:
+            log(
+                config,
+                f"PR #{pr_number}: retaining managed-CI v2 attachment "
+                f"{contract.attached_run_id}/{contract.run_attempt}; waiter owns refresh",
+            )
+            return
+    elif contract.intent_state == "completed" and contract.terminal_outcome == "no-status":
+        # The restored terminal attempt was excluded.  Publish the legal
+        # early lifecycle transition before looking for a higher attempt or a
+        # fresh same-nonce run.
+        _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
     attached = _discover_v2_run(runner, config=config, contract=contract, retries=3)
     if attached is None:
         _patch_intent(runner, config=config, contract=contract, state="dispatch-requested")
@@ -2747,8 +2774,14 @@ def _dispatch_v2_qualification(
     if attached is not None:
         contract.attached_run_id = attached[0]
         contract.run_attempt = attached[1]
-        _patch_intent(runner, config=config, contract=contract, state="attached")
-        log(config, f"PR #{pr_number}: attached managed-CI v2 run {attached[0]}")
+        contract.terminal_outcome = None
+        if contract.run_attempt is not None:
+            _patch_intent(runner, config=config, contract=contract, state="attached")
+            log(config, f"PR #{pr_number}: attached managed-CI v2 run {attached[0]}")
+        else:
+            # Keep the in-memory correlation key, but do not publish an
+            # attached record that the router would reject without an attempt.
+            log(config, f"PR #{pr_number}: run {attached[0]} is visible without an attempt; waiting for refresh")
     else:
         # Do not guess a run ID. The waiter will continue bounded discovery;
         # an uncorrelated green status is never accepted in the meantime.
@@ -2756,6 +2789,7 @@ def _dispatch_v2_qualification(
 
 
 def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_sha: str, state: str) -> TrustedBody:
+    early_state = state in {"prepared", "dispatch-requested"}
     payload = {
         "version": 2,
         "repository": contract.repository,
@@ -2767,10 +2801,11 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
         "nonce": contract.nonce,
         "created_at": contract.created_at,
         "state": state,
-        "run_id": contract.attached_run_id,
-        "run_attempt": contract.run_attempt,
+        "run_id": None if early_state else contract.attached_run_id,
+        "run_attempt": None if early_state else contract.run_attempt,
         "terminal_run_id": contract.terminal_run_id,
         "terminal_run_attempt": contract.terminal_run_attempt,
+        "terminal_outcome": contract.terminal_outcome,
         "terminal_attempts": [
             {"run_id": run_id, "run_attempt": run_attempt}
             for run_id, run_attempt in contract.terminal_attempts
@@ -2779,6 +2814,120 @@ def _intent_body(contract: ManagedCiContract, *, pr_number: int, expected_head_s
     return TrustedBody.canonical(
         f"<!-- {INTENT_MARKER} {json.dumps(payload, separators=(',', ':'), sort_keys=True)} -->",
         expected_tokens=(INTENT_MARKER,),
+    )
+
+
+def _validate_v2_intent_publication(contract: ManagedCiContract, *, state: str) -> None:
+    if state not in {"prepared", "dispatch-requested", "attached", "completed"}:
+        raise AgentLoopError(f"Unsupported managed-CI v2 lifecycle state: {state}.")
+    if state in {"prepared", "dispatch-requested"} and (
+        contract.attached_run_id is not None or contract.run_attempt is not None
+    ):
+        raise AgentLoopError(
+            f"Cannot publish {state} while a managed-CI v2 run attachment is retained."
+        )
+    if state in {"attached", "completed"} and (
+        not isinstance(contract.attached_run_id, int)
+        or contract.attached_run_id <= 0
+        or not isinstance(contract.run_attempt, int)
+        or contract.run_attempt <= 0
+    ):
+        raise AgentLoopError(
+            f"Cannot publish {state} without a positive run_id/run_attempt pair."
+        )
+
+
+def _reset_v2_intent_generation(contract: ManagedCiContract) -> None:
+    """Clear every nonce-scoped field before minting a fresh intent."""
+    contract.intent_comment_id = None
+    contract.nonce = None
+    contract.created_at = None
+    contract.attached_run_id = None
+    contract.run_attempt = None
+    contract.terminal_run_id = None
+    contract.terminal_run_attempt = None
+    contract.terminal_attempts = ()
+    contract.terminal_outcome = None
+    contract.intent_state = None
+
+
+def _restore_v2_intent_fields(contract: ManagedCiContract, intent: dict[str, object]) -> None:
+    """Restore optional fields with record-local defaults, never old-round state."""
+    contract.intent_comment_id = None
+    contract.nonce = None
+    contract.created_at = None
+    contract.attached_run_id = None
+    contract.run_attempt = None
+    contract.terminal_run_id = None
+    contract.terminal_run_attempt = None
+    contract.terminal_attempts = ()
+    contract.terminal_outcome = None
+    contract.intent_state = None
+
+    nonce = intent.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        raise AgentLoopError("Managed-CI v2 intent comment lacks a nonce.")
+    contract.nonce = nonce
+    contract.created_at = intent.get("created_at") if isinstance(intent.get("created_at"), int) else None
+    contract.attached_run_id = intent.get("run_id") if isinstance(intent.get("run_id"), int) else None
+    contract.run_attempt = intent.get("run_attempt") if isinstance(intent.get("run_attempt"), int) else None
+    contract.intent_state = intent.get("state") if isinstance(intent.get("state"), str) else None
+    terminal_run_id = intent.get("terminal_run_id")
+    terminal_run_attempt = intent.get("terminal_run_attempt")
+    if isinstance(terminal_run_id, int):
+        contract.terminal_run_id = terminal_run_id
+        contract.terminal_run_attempt = (
+            terminal_run_attempt if isinstance(terminal_run_attempt, int) else None
+        )
+    terminal_outcome = intent.get("terminal_outcome")
+    if terminal_outcome == "no-status" or contract.intent_state == "terminal-no-status":
+        contract.terminal_outcome = "no-status"
+    encoded_attempts = intent.get("terminal_attempts")
+    terminal_attempts: list[tuple[int, int | None]] = []
+    if isinstance(encoded_attempts, list):
+        for encoded in encoded_attempts:
+            if not isinstance(encoded, dict) or not isinstance(encoded.get("run_id"), int):
+                continue
+            encoded_attempt = encoded.get("run_attempt")
+            terminal_attempts.append(
+                (encoded["run_id"], encoded_attempt if isinstance(encoded_attempt, int) else None)
+            )
+    # Legacy terminal-no-status records did not have a terminal-attempt list;
+    # their active attachment is the excluded attempt, including an omitted
+    # attempt number.
+    if contract.terminal_outcome == "no-status" and not terminal_attempts:
+        if contract.attached_run_id is not None:
+            terminal_attempts.append((contract.attached_run_id, contract.run_attempt))
+    legacy_key = (contract.terminal_run_id, contract.terminal_run_attempt)
+    if legacy_key[0] is not None and legacy_key not in terminal_attempts:
+        terminal_attempts.append((legacy_key[0], legacy_key[1]))
+    contract.terminal_attempts = tuple(terminal_attempts)
+    if _v2_attachment_is_excluded(contract):
+        contract.attached_run_id = None
+        contract.run_attempt = None
+    elif contract.attached_run_id is not None and contract.terminal_outcome == "no-status":
+        # A record that already carries a different, non-excluded attachment
+        # represents an active retry. Its prior no-status result remains in
+        # terminal_attempts, but is no longer the current outcome.
+        contract.terminal_outcome = None
+
+
+def _v2_excluded_attempts(contract: ManagedCiContract) -> tuple[tuple[int, int | None], ...]:
+    exclusions = list(contract.terminal_attempts)
+    if contract.terminal_run_id is not None:
+        terminal_key = (contract.terminal_run_id, contract.terminal_run_attempt)
+        if terminal_key not in exclusions:
+            exclusions.append(terminal_key)
+    return tuple(exclusions)
+
+
+def _v2_attachment_is_excluded(contract: ManagedCiContract) -> bool:
+    if contract.attached_run_id is None:
+        return False
+    return _v2_terminal_attempt_excluded(
+        contract.attached_run_id,
+        contract.run_attempt,
+        _v2_excluded_attempts(contract),
     )
 
 
@@ -2828,46 +2977,10 @@ def _ensure_v2_intent(
         raise AgentLoopError("Competing managed-CI v2 intent comments exist for this PR head.")
     if matching:
         contract.intent_comment_id, intent = matching[-1]
-        nonce = intent.get("nonce")
-        if not isinstance(nonce, str) or not nonce:
-            raise AgentLoopError("Managed-CI v2 intent comment lacks a nonce.")
-        contract.nonce = nonce
-        contract.created_at = intent.get("created_at") if isinstance(intent.get("created_at"), int) else None
-        contract.attached_run_id = intent.get("run_id") if isinstance(intent.get("run_id"), int) else None
-        contract.run_attempt = intent.get("run_attempt") if isinstance(intent.get("run_attempt"), int) else None
-        contract.intent_state = intent.get("state") if isinstance(intent.get("state"), str) else None
-        terminal_run_id = intent.get("terminal_run_id")
-        terminal_run_attempt = intent.get("terminal_run_attempt")
-        encoded_attempts = intent.get("terminal_attempts")
-        terminal_attempts: list[tuple[int, int | None]] = []
-        if isinstance(encoded_attempts, list):
-            for encoded in encoded_attempts:
-                if not isinstance(encoded, dict) or not isinstance(encoded.get("run_id"), int):
-                    continue
-                encoded_attempt = encoded.get("run_attempt")
-                terminal_attempts.append(
-                    (encoded["run_id"], encoded_attempt if isinstance(encoded_attempt, int) else None)
-                )
-        if isinstance(terminal_run_id, int) and isinstance(terminal_run_attempt, int):
-            contract.terminal_run_id = terminal_run_id
-            contract.terminal_run_attempt = terminal_run_attempt
-        if contract.intent_state == "terminal-no-status" and not terminal_attempts:
-            if contract.attached_run_id is not None:
-                contract.terminal_run_id = contract.attached_run_id
-                contract.terminal_run_attempt = contract.run_attempt
-        legacy_key = (contract.terminal_run_id, contract.terminal_run_attempt)
-        if legacy_key[0] is not None and legacy_key not in terminal_attempts:
-            terminal_attempts.append((legacy_key[0], legacy_key[1]))
-        contract.terminal_attempts = tuple(terminal_attempts)
-        if (
-            contract.intent_state == "terminal-no-status"
-            and (contract.attached_run_id, contract.run_attempt) in contract.terminal_attempts
-        ):
-            # The attached attempt is the one that already stopped. Leave
-            # discovery responsible for finding a rerun or fresh dispatch.
-            contract.attached_run_id = None
-            contract.run_attempt = None
+        _restore_v2_intent_fields(contract, intent)
+        contract.intent_comment_id = matching[-1][0]
         return
+    _reset_v2_intent_generation(contract)
     contract.nonce = secrets.token_urlsafe(24)
     contract.created_at = int(time.time())
     body = _intent_body(contract, pr_number=pr_number, expected_head_sha=expected_head_sha, state="prepared")
@@ -2891,6 +3004,7 @@ def _ensure_v2_intent(
 def _patch_intent(runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract, state: str) -> None:
     if contract.intent_comment_id is None or contract.nonce is None:
         return
+    _validate_v2_intent_publication(contract, state=state)
     body = _intent_body(
         contract,
         pr_number=contract.pr_number or 0,
@@ -3072,13 +3186,20 @@ def wait_for_final_qualification(
         latest = get_pr_checks(runner, config=config, metadata=metadata)
         run_snapshot: ManagedCiRunSnapshot | None = None
         if contract is not None and contract.protocol_version == 2:
+            if _v2_attachment_is_excluded(contract):
+                # Terminal attempts stay diagnostic history, but cannot remain
+                # the active correlation key for a retry.
+                contract.attached_run_id = None
+                contract.run_attempt = None
             if contract.attached_run_id is None:
                 run_snapshot = _discover_v2_snapshot(
                     runner, config=config, contract=contract, retries=1, include_terminal=True
                 )
                 if run_snapshot is not None:
                     contract.attached_run_id, contract.run_attempt = run_snapshot.run_id, run_snapshot.run_attempt
-                    _patch_intent(runner, config=config, contract=contract, state="attached")
+                    contract.terminal_outcome = None
+                    if contract.run_attempt is not None:
+                        _patch_intent(runner, config=config, contract=contract, state="attached")
             else:
                 run_snapshot = _refresh_v2_attached_run(
                     runner, config=config, contract=contract
@@ -3088,10 +3209,17 @@ def wait_for_final_qualification(
                     and run_snapshot.run_attempt != contract.run_attempt
                 ):
                     contract.run_attempt = run_snapshot.run_attempt
+                    contract.terminal_outcome = None
                     _patch_intent(runner, config=config, contract=contract, state="attached")
             final = _v2_correlated_status(
                 runner, config=config, expected_head=expected_head, contract=contract
             )
+            if run_snapshot is not None and not _v2_attempt_is_correlatable(run_snapshot.run_attempt):
+                log(
+                    config,
+                    f"PR #{pr_number}: managed-CI v2 run {run_snapshot.run_id} has no positive "
+                    "run attempt; terminal status correlation is deferred",
+                )
         else:
             final = _find_context(latest, FINAL_CONTEXT)
         status = final.status.lower() if final is not None else "pending"
@@ -3114,6 +3242,7 @@ def wait_for_final_qualification(
             and run_snapshot is not None
             and (run_snapshot.status or "").lower() == "completed"
             and not correlated_terminal
+            and _v2_attempt_is_correlatable(run_snapshot.run_attempt)
         ):
             key = (run_snapshot.run_id, run_snapshot.run_attempt)
             if key != terminal_confirmation:
@@ -3137,7 +3266,8 @@ def wait_for_final_qualification(
                 terminal_key = (run_snapshot.run_id, run_snapshot.run_attempt)
                 if terminal_key not in contract.terminal_attempts:
                     contract.terminal_attempts += (terminal_key,)
-                _patch_intent(runner, config=config, contract=contract, state="terminal-no-status")
+                contract.terminal_outcome = "no-status"
+                _patch_intent(runner, config=config, contract=contract, state="completed")
                 return ManagedCiOutcome(
                     status="terminal_without_status", checks=latest, head_sha=live_head,
                     run_id=run_snapshot.run_id, run_attempt=run_snapshot.run_attempt,
@@ -3173,7 +3303,11 @@ def _v2_correlated_status(
     A context name is deliberately insufficient: an older duplicate or a
     contributor-created status must remain pending, including if it is red.
     """
-    if contract.attached_run_id is None or not contract.nonce:
+    if (
+        contract.attached_run_id is None
+        or not contract.nonce
+        or not _v2_attempt_is_correlatable(contract.run_attempt)
+    ):
         return None
     result = runner.run(
         [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/commits/{expected_head}/statuses?per_page=100"],
@@ -3280,11 +3414,18 @@ def _v2_terminal_attempt_excluded(
         rid, stored_attempt = entry
         if rid != run_id or not isinstance(rid, int):
             continue
+        # An omitted terminal attempt cannot prove that any later attempt of
+        # the same run is a legitimate rerun. Keep the whole run excluded;
+        # only a different fresh run ID can be correlated safely.
+        if stored_attempt is None:
+            return True
         if isinstance(stored_attempt, int) and stored_attempt == attempt:
             return True
-        if stored_attempt is None and attempt is None:
-            return True
     return False
+
+
+def _v2_attempt_is_correlatable(attempt: object) -> bool:
+    return type(attempt) is int and attempt > 0
 
 
 def _v2_failed_jobs(runner: Runner, *, config: AgentLoopConfig, run_id: int | None) -> tuple[str, ...]:

@@ -237,6 +237,17 @@ def test_managed_ci_docs_describe_lifecycle_gated_issue_resume_and_base_provenan
     assert "never asks the operator to delete durable records" in text
 
 
+def test_managed_ci_docs_describe_v2_lifecycle_isolation_and_recovery():
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+    assert "`prepared`, `dispatch-requested`, `attached`, and `completed`" in normalized
+    assert "`run_id: null` and `run_attempt: null`" in normalized
+    assert "terminal_outcome: \"no-status\"" in normalized
+    assert "entire run ID remains excluded" in normalized
+    assert "temporarily empty" in normalized
+    assert "unsupported lifecycle value" in normalized
+
+
 def test_managed_ci_docs_describe_precreation_managed_pr_mode():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert "agent-loop managed-pr" in text
