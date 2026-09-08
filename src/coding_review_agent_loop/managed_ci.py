@@ -3214,6 +3214,12 @@ def wait_for_final_qualification(
             final = _v2_correlated_status(
                 runner, config=config, expected_head=expected_head, contract=contract
             )
+            if run_snapshot is not None and not _v2_attempt_is_correlatable(run_snapshot.run_attempt):
+                log(
+                    config,
+                    f"PR #{pr_number}: managed-CI v2 run {run_snapshot.run_id} has no positive "
+                    "run attempt; terminal status correlation is deferred",
+                )
         else:
             final = _find_context(latest, FINAL_CONTEXT)
         status = final.status.lower() if final is not None else "pending"
@@ -3236,6 +3242,7 @@ def wait_for_final_qualification(
             and run_snapshot is not None
             and (run_snapshot.status or "").lower() == "completed"
             and not correlated_terminal
+            and _v2_attempt_is_correlatable(run_snapshot.run_attempt)
         ):
             key = (run_snapshot.run_id, run_snapshot.run_attempt)
             if key != terminal_confirmation:
@@ -3296,7 +3303,11 @@ def _v2_correlated_status(
     A context name is deliberately insufficient: an older duplicate or a
     contributor-created status must remain pending, including if it is red.
     """
-    if contract.attached_run_id is None or not contract.nonce:
+    if (
+        contract.attached_run_id is None
+        or not contract.nonce
+        or not _v2_attempt_is_correlatable(contract.run_attempt)
+    ):
         return None
     result = runner.run(
         [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/commits/{expected_head}/statuses?per_page=100"],
@@ -3411,6 +3422,10 @@ def _v2_terminal_attempt_excluded(
         if isinstance(stored_attempt, int) and stored_attempt == attempt:
             return True
     return False
+
+
+def _v2_attempt_is_correlatable(attempt: object) -> bool:
+    return type(attempt) is int and attempt > 0
 
 
 def _v2_failed_jobs(runner: Runner, *, config: AgentLoopConfig, run_id: int | None) -> tuple[str, ...]:

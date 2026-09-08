@@ -1888,8 +1888,10 @@ CI result. The terminal-without-status stop records the router-compatible
 `state=completed` plus a separate `terminal_outcome: "no-status"` round field,
 the exact run attempt, and accumulated excluded-attempt history; it never
 publishes the unsupported `terminal-no-status` lifecycle. A later
-higher-attempt rerun is accepted, while an unchanged head can also dispatch a
-fresh same-nonce run. If an adopted PR stops this way, its
+higher-attempt rerun is accepted when the excluded attempt is known; if the
+attempt is missing, the entire run ID remains excluded and only a different
+fresh run ID can be correlated. An unchanged head can also dispatch a fresh
+same-nonce run. If an adopted PR stops this way, its
 invocation-owned managed label is released and the next invocation
 re-adopts/reapplies managed mode. A corrected head requires a fresh exact-head
 review. The managed route is selected independently of `--watch-pending-ci`;

@@ -243,6 +243,7 @@ def test_managed_ci_docs_describe_v2_lifecycle_isolation_and_recovery():
     assert "`prepared`, `dispatch-requested`, `attached`, and `completed`" in normalized
     assert "`run_id: null` and `run_attempt: null`" in normalized
     assert "terminal_outcome: \"no-status\"" in normalized
+    assert "entire run ID remains excluded" in normalized
     assert "temporarily empty" in normalized
     assert "unsupported lifecycle value" in normalized
 

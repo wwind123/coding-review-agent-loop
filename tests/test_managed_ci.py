@@ -34,6 +34,7 @@ from coding_review_agent_loop.managed_ci import (
     _patch_intent,
     _v2_failed_jobs,
     _v2_correlated_status,
+    _v2_terminal_attempt_excluded,
     _api_list,
     activate_managed_ci,
     authenticate_issue_created_handoff,
@@ -2026,8 +2027,37 @@ def test_v2_correlated_status_omits_unknown_attempt_token(tmp_path):
         runner, config=config, expected_head="abc123",
         contract=v2_contract(attached_run_id=100, run_attempt=None),
     )
-    assert result is not None
-    assert result.status == "success"
+    assert result is None
+
+
+def test_v2_completed_run_without_attempt_waits_without_terminal_publication(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, ci_timeout_seconds=2, ci_poll_interval_seconds=1
+    )
+    runner = V2ManagedRunner(
+        workflow_runs=[v2_run(attempt=None, status="completed", conclusion="cancelled")],
+        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_status_payload={"statuses": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
+    )
+    contract = v2_contract(
+        attached_run_id=100, run_attempt=None, intent_comment_id=17,
+        pr_number=7, expected_head_sha="abc123",
+    )
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7, metadata=metadata(), contract=contract
+    )
+
+    assert outcome.status == "timeout"
+    assert contract.terminal_run_id is None
+    assert contract.terminal_run_attempt is None
+    assert contract.terminal_attempts == ()
+    assert contract.terminal_outcome is None
+    assert not any(
+        "/issues/comments/17" in " ".join(command)
+        for command, _cwd in runner.commands
+    )
 
 
 def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_path, monkeypatch):
@@ -2856,6 +2886,13 @@ def test_v2_legacy_no_status_restoration_preserves_missing_attempt_exclusion(tmp
     assert contract.terminal_attempts == ((100, None),)
     assert contract.attached_run_id is None
     assert contract.run_attempt is None
+
+
+def test_v2_missing_terminal_attempt_excludes_same_run_but_allows_fresh_run():
+    exclusions = ((100, None),)
+
+    assert _v2_terminal_attempt_excluded(100, 2, exclusions)
+    assert not _v2_terminal_attempt_excluded(101, 2, exclusions)
 
 
 def test_v2_dispatch_discovers_existing_run_before_dispatching(tmp_path):
