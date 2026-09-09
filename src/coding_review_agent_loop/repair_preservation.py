@@ -19,6 +19,7 @@ _FENCED_JSON_PREFIX_RE = re.compile(
 _FINDING_METADATA_KEYS = {
     "id", "item_id", "severity", "category", "state", "disposition", "verdict",
 }
+_HUMAN_REQUIREMENT_DISPOSITIONS = {"addressed", "blocked", "not-applicable"}
 
 
 def _payload(text: str) -> dict | None:
@@ -123,6 +124,63 @@ def validate_repair_preservation(raw: str, repaired: str) -> None:
                 ]
                 require(any(isinstance(c, str) and _normalized(note) in _normalized(c)
                             for c in candidates), field)
+
+        disputed_items = source.get("disputed_items")
+        if isinstance(disputed_items, list) and all(
+            isinstance(item_id, str) for item_id in disputed_items
+        ):
+            target_disputed_items = target.get("disputed_items", [])
+            require(isinstance(target_disputed_items, list), "disputed_items")
+            for item_id in disputed_items:
+                require(item_id in target_disputed_items, "disputed_items")
+
+        dispute_evidence = source.get("dispute_evidence")
+        if isinstance(dispute_evidence, dict):
+            target_evidence = target.get("dispute_evidence", {})
+            require(isinstance(target_evidence, dict), "dispute_evidence")
+            for item_id, evidence in dispute_evidence.items():
+                if not isinstance(evidence, str) or not _fragments(evidence):
+                    continue
+                candidate = target_evidence.get(item_id)
+                require(
+                    isinstance(candidate, str)
+                    and _normalized(evidence) in _normalized(candidate),
+                    "dispute_evidence",
+                )
+
+    # A format repair must not adjudicate signed requirements. Preserve every
+    # already-valid requirement ID/disposition pair and its substantive
+    # evidence; malformed rows remain available for schema-required repair.
+    dispositions = source.get("human_requirement_dispositions")
+    if isinstance(dispositions, list):
+        target_dispositions = target.get("human_requirement_dispositions", [])
+        require(isinstance(target_dispositions, list), "human_requirement_dispositions")
+        for entry in dispositions:
+            if not isinstance(entry, dict):
+                continue
+            requirement_id = entry.get("requirement_id")
+            disposition = entry.get("disposition")
+            if (not isinstance(requirement_id, str) or not requirement_id.strip()
+                    or disposition not in _HUMAN_REQUIREMENT_DISPOSITIONS):
+                continue
+            match = next(
+                (
+                    candidate for candidate in target_dispositions
+                    if isinstance(candidate, dict)
+                    and candidate.get("requirement_id") == requirement_id
+                    and candidate.get("disposition") == disposition
+                ),
+                None,
+            )
+            require(match is not None, "human_requirement_dispositions")
+            evidence = entry.get("evidence")
+            if isinstance(evidence, str) and _fragments(evidence):
+                candidate_evidence = match.get("evidence")
+                require(
+                    isinstance(candidate_evidence, str)
+                    and _normalized(evidence) in _normalized(candidate_evidence),
+                    "human_requirement_dispositions",
+                )
 
     # A finding may move between current blocking/same-scope buckets, but it
     # must remain a separate finding carrying every original text fragment.

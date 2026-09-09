@@ -96,6 +96,54 @@ def test_note_can_move_between_disposition_buckets():
     check(source, {"kind": "coder_followup", "addressed_item_notes": {"item-1": "Already covered by test_x."}})
 
 
+def test_disputed_item_and_evidence_cannot_be_reclassified_or_dropped():
+    source = {
+        "kind": "coder_followup",
+        "disputed_items": ["item-1"],
+        "dispute_evidence": {"item-1": "Official docs confirm the current price."},
+    }
+    check(source, source)
+    with pytest.raises(AgentLoopError, match="disputed_items"):
+        check(source, {
+            "kind": "coder_followup",
+            "addressed_items": ["item-1"],
+        })
+    with pytest.raises(AgentLoopError, match="dispute_evidence"):
+        check(source, {
+            "kind": "coder_followup",
+            "disputed_items": ["item-1"],
+            "dispute_evidence": {"item-1": "The price is correct."},
+        })
+
+
+def test_human_requirement_disposition_and_evidence_cannot_change():
+    blocked = {
+        "requirement_id": "Requirement 1",
+        "disposition": "blocked",
+        "evidence": "The requested compatibility test is still missing.",
+    }
+    source = {"kind": "coder_followup", "human_requirement_dispositions": [blocked]}
+    check(source, source)
+    with pytest.raises(AgentLoopError, match="human_requirement_dispositions"):
+        check(source, {
+            "kind": "coder_followup",
+            "human_requirement_dispositions": [{
+                "requirement_id": "Requirement 1",
+                "disposition": "addressed",
+                "evidence": blocked["evidence"],
+            }],
+        })
+    with pytest.raises(AgentLoopError, match="human_requirement_dispositions"):
+        check(source, {
+            "kind": "coder_followup",
+            "human_requirement_dispositions": [{
+                "requirement_id": "Requirement 1",
+                "disposition": "blocked",
+                "evidence": "More coverage is needed.",
+            }],
+        })
+
+
 def test_reordered_findings_with_shared_prefix_are_not_combined():
     source = {"kind": "pr_review", "blocking_items": ["Fix A", "Fix A and add test B"]}
     check(source, {"kind": "pr_review", "blocking_items": ["Fix A and add test B", "Fix A"]})

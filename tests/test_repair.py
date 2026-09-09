@@ -839,6 +839,53 @@ def test_execute_repair_rejects_lossy_valid_candidate_and_uses_fallback(tmp_path
     assert "content preservation failed" in attempts[0].diagnostic
 
 
+@pytest.mark.parametrize("mutation", ["dispute", "requirement"])
+def test_execute_repair_rejects_coder_outcome_mutation_and_uses_fallback(
+    tmp_path, monkeypatch, mutation
+):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    source = structured_coder_followup(
+        state="blocking",
+        addressed_items=[],
+        remaining_items=[],
+        disputed_items=["item-1"],
+        dispute_evidence={"item-1": "Official docs confirm the current price."},
+        human_requirement_dispositions=[{
+            "requirement_id": "Requirement 1",
+            "disposition": "blocked",
+            "evidence": "The requested compatibility test is still missing.",
+        }],
+    )
+    lossy = structured_coder_followup(
+        state="blocking",
+        addressed_items=["item-1"] if mutation == "dispute" else [],
+        remaining_items=[],
+        disputed_items=[] if mutation == "dispute" else ["item-1"],
+        dispute_evidence=(
+            {} if mutation == "dispute"
+            else {"item-1": "Official docs confirm the current price."}
+        ),
+        human_requirement_ids=["Requirement 1"] if mutation == "requirement" else [],
+        human_requirement_dispositions=[{
+            "requirement_id": "Requirement 1",
+            "disposition": "addressed" if mutation == "requirement" else "blocked",
+            "evidence": "The requested compatibility test is still missing.",
+        }],
+    )
+    repaired, _, attempts = execute_repair(
+        source + "\nExtra trailing envelope text.",
+        runner=FakeRunner(antigravity_outputs=[(lossy, 0), (source, 0)]),
+        config=make_config(tmp_path, repair_models=("Gemini 3 Flash", "Gemini 3.1 Pro (High)")),
+        run_id=f"coder-{mutation}-preservation", usage_context=None,
+        validate=validate_structured_coder_followup, expected_kind="coder_followup",
+    )
+    assert repaired == source
+    assert [attempt.outcome for attempt in attempts] == ["invalid_output", "succeeded"]
+    assert "content preservation failed" in attempts[0].diagnostic
+
+
 def test_legacy_repair_rejects_lossy_output():
     raw = json.dumps({"kind": "coder_followup", "summary": "An unrelated test FAILED."})
     lossy = json.dumps({"kind": "coder_followup", "summary": "All done."})
