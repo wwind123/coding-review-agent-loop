@@ -815,6 +815,37 @@ def test_execute_repair_explicit_chain_falls_back_after_failure_and_invalid_outp
     assert usage.records[0].fallback_planned is True
     assert usage.records[1].fallback_planned is False
 
+
+def test_execute_repair_rejects_lossy_valid_candidate_and_uses_fallback(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    source = {"kind": "plan_review", "blocking_plan_issues": [
+        {"title": "Test the claim", "detail": "Wire the getter; add a two-round test; no mutation on 503."},
+    ]}
+    lossy = json.dumps({"kind": "plan_review", "blocking_plan_issues": ["Test the claim"]})
+    faithful = json.dumps({"kind": "plan_review", "blocking_plan_issues": [
+        "Test the claim: Wire the getter; add a two-round test; no mutation on 503.",
+    ]})
+    repaired, _, attempts = execute_repair(
+        json.dumps(source),
+        runner=FakeRunner(antigravity_outputs=[(lossy, 0), (faithful, 0)]),
+        config=make_config(tmp_path, repair_models=("Gemini 3 Flash", "Gemini 3.1 Pro (High)")),
+        run_id="preservation-fallback", usage_context=None,
+        validate=json.loads, expected_kind="plan_review",
+    )
+    assert repaired == faithful
+    assert [a.outcome for a in attempts] == ["invalid_output", "succeeded"]
+    assert "content preservation failed" in attempts[0].diagnostic
+
+
+def test_legacy_repair_rejects_lossy_output():
+    raw = json.dumps({"kind": "coder_followup", "summary": "An unrelated test FAILED."})
+    lossy = json.dumps({"kind": "coder_followup", "summary": "All done."})
+    with patch("coding_review_agent_loop.repair.subprocess.run") as run:
+        run.return_value = subprocess.CompletedProcess([], 0, stdout=lossy, stderr="")
+        assert attempt_repair(raw, "gemini", expected_kind="coder_followup") is None
+
 @pytest.mark.parametrize(
     ("output", "returncode", "expected"),
     [
@@ -2231,6 +2262,7 @@ def test_repair_blocking_formerly_future_prior_item_explicit_disposition():
     )
     repaired = structured_pr_review(
         state="blocking",
+        summary="Fix the memory leak.",
         blocking_items=["Fix the memory leak"],
         prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
         reviewer="Reviewer",
