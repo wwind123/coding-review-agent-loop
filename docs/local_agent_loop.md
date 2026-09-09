@@ -2334,6 +2334,25 @@ original response. If the repair CLI fails, returns empty output, or produces
 invalid output, the original validation failure remains local and nothing is
 posted to GitHub.
 
+Repair is lossless formatting, not summarization: findings must retain their full
+evidence, code references, and requested tests; summaries and test reports must
+retain failures, timeouts, skips, and partial-coverage caveats. Object-to-string
+conversion must carry the complete substantive text. Reviewer item IDs must never
+be invented as signed human requirements.
+
+For parseable JSON in review, planning, and coder/implementation responses, a
+local preservation guard additionally rejects dropped/rewritten summaries,
+test-command entries, plan steps, coder evidence notes, and current-scope finding
+text. A rejected candidate follows the existing repair-model fallback chain; it
+is not posted as a successful repair. Whitespace, finding order, and allowed
+current-scope bucket moves are tolerated. Schema-mandated removal of invalid
+fields, forbidden future items, and reserved protocol syntax remains allowed.
+This is a bounded loss check, not semantic-equivalence certification: malformed
+JSON, unsupported response kinds, and individual strings containing reserved
+protocol grammar are not compared by this guard. Those paths still rely on the
+lossless prompt and the ordinary schema/context validators. No repair can certify
+that an agent's underlying code or test claims are true.
+
 Known transient agent/model failures are retried before local failure. The
 default is two retries with bounded backoff; tune this with
 `--agent-max-retries` and `--agent-retry-backoff-seconds`. Retry matching is

@@ -22,6 +22,7 @@ from .agents.base import STDIN_PROMPT_THRESHOLD_BYTES
 from .agents.gemini import _parse_gemini_payload
 from .logging import agent_log_path
 from .runner import strip_ansi
+from .repair_preservation import validate_repair_preservation
 from .usage import RunUsageContext, estimate_usage
 from .protocol import (
     HUMAN_REQUIREMENTS_RESOLVED_RE,
@@ -219,6 +220,34 @@ You are a format-repair assistant. An AI agent produced an initial plan state, c
 
 {prior_item_dispositions_instruction}
 
+## LOSSLESS CONTENT CONTRACT (all response kinds):
+
+This is format repair, not summarization, editing, or a fresh review. Copy original
+summary text, findings, evidence notes, plan steps, and test commands/results
+verbatim where their fields are valid. Retain failure, timeout, skipped-test,
+partial-coverage, and unresolved-work caveats. Do not replace detailed evidence
+with a shorter conclusion, remove code paths or line references, combine distinct
+findings, or invent tests, results, explanations, item IDs, or requirement IDs.
+
+When a finding object must become a string, concatenate its complete title,
+detail, evidence, and other substantive text, in order. Do not keep just the title.
+Example: {"title":"Add regression coverage", "detail":"Wire the capability getter in app.js; add a two-round claim test and assert no mutation on 503."}
+must become "Add regression coverage: Wire the capability getter in app.js; add a two-round claim test and assert no mutation on 503."
+It must NOT become "Add regression coverage for claims."
+
+If a field is forbidden by the expected schema, remove the invalid field, but
+retain its substantive evidence in an appropriate allowed field when possible.
+Schema-specific rules below still govern state/disposition normalization,
+forbidden future items, unknown prior IDs, and reserved protocol syntax. Apply
+only those necessary corrections; they do not authorize unrelated rewriting.
+Never promote reviewer item-N IDs into human requirement dispositions. When no
+signed human requirements are surfaced, BOTH human_requirement_dispositions and
+human_requirements.addressed_ids must be empty (including no not-applicable rows).
+
+Before responding, compare source and output: every retained finding needs its
+full supporting text, every test needs its original status/caveat, and every ID
+must stay in its correct ledger. Do not silently fill gaps with invented facts.
+
 ## Valid Format A — PR Review:
 
 {
@@ -264,8 +293,10 @@ You are a format-repair assistant. An AI agent produced an initial plan state, c
   "summary": "<short summary>",
   "addressed_items": ["item-1"],
   "remaining_items": ["item-2"],
+  "disputed_items": ["item-3"],
   "addressed_item_notes": {"item-1": "<how it was resolved>"},
   "remaining_item_notes": {"item-2": "<why it remains>"},
+  "dispute_evidence": {"item-3": "<verifiable evidence that the finding is incorrect>"},
   "human_requirement_dispositions": [
     {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "<why it cannot be completed>"}
   ],
@@ -1403,6 +1434,13 @@ def execute_repair(
         ):
             try:
                 validation_result = validate(output)
+                validate_repair_preservation(
+                    raw,
+                    output,
+                    unresolved_item_ids=prompt_kwargs.get("unresolved_item_ids"),
+                    surfaced_requirement_ids=prompt_kwargs.get("surfaced_requirement_ids"),
+                    reviewer_requirement_ids=prompt_kwargs.get("reviewer_requirement_ids"),
+                )
             except Exception as exc:
                 if outcome == "succeeded":
                     attempt.outcome = "invalid_output"
@@ -1442,9 +1480,11 @@ def _coder_followup_required_items_instruction(
     return (
         "## Required coder follow-up item IDs:\n"
         "The repaired coder_followup must classify every ID below in exactly one of "
-        "`addressed_items` or `remaining_items`, even if the malformed response does "
+        "`addressed_items`, `remaining_items`, or `disputed_items`, even if the malformed response does "
         "not mention the ID:\n"
         f"{rendered_ids or '- (none)'}\n"
+        "Preserve a source `disputed_items` classification and its complete `dispute_evidence` "
+        "when its ID is listed above. Remove dispute entries for IDs not listed above.\n"
         "Do not put human requirement labels such as `Requirement 1` in these arrays.\n"
     )
 
@@ -1651,4 +1691,16 @@ def attempt_repair(
         _logger.debug("repair pass CLI exited with code %d", result.returncode)
         return None
     text, _, _, _, _ = _parse_gemini_payload(result.stdout.strip())
+    if text:
+        try:
+            validate_repair_preservation(
+                raw,
+                text,
+                unresolved_item_ids=unresolved_item_ids,
+                surfaced_requirement_ids=surfaced_requirement_ids,
+                reviewer_requirement_ids=reviewer_requirement_ids,
+            )
+        except Exception as exc:
+            _logger.debug("repair pass content preservation failed: %s", exc)
+            return None
     return text or None
