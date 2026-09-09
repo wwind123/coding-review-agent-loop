@@ -30,6 +30,30 @@ def test_case06_object_to_string_keeps_every_detail():
         check(source, {"kind": "plan_review", "blocking_plan_issues": ["Add coverage for claims."]})
 
 
+def test_finding_metadata_is_not_required_in_object_to_string_repair():
+    source = {"kind": "pr_review", "blocking_items": [{
+        "title": "Keep the diagnostic",
+        "detail": "The fallback drops the original failure.",
+        "severity": "high",
+        "category": "correctness",
+        "state": "blocking",
+        "disposition": "unresolved",
+        "verdict": "must-fix",
+        "file": "src/repair.py",
+        "line": "1435",
+        "evidence": "The lossy candidate is accepted.",
+    }]}
+    check(source, {"kind": "pr_review", "blocking_items": [
+        "Keep the diagnostic: The fallback drops the original failure. "
+        "src/repair.py:1435 — The lossy candidate is accepted.",
+    ]})
+
+    with pytest.raises(AgentLoopError, match="blocking_items"):
+        check(source, {"kind": "pr_review", "blocking_items": [
+            "Keep the diagnostic: The fallback drops the original failure.",
+        ]})
+
+
 @pytest.mark.parametrize("field", ["summary", "tests_run", "plan_steps",
                                  "addressed_item_notes", "remaining_item_notes"])
 def test_dropped_or_summarized_content_rejected(field):
@@ -97,6 +121,20 @@ def test_leading_marker_and_footer_do_not_disable_checks():
     }) + '\n<!-- AGENT_STATE: blocking -->\n-- Coder'
     with pytest.raises(AgentLoopError, match="summary"):
         validate_repair_preservation(source, '{"kind":"coder_followup","summary":"All done."}')
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~~"])
+def test_fenced_source_does_not_disable_loss_checks(fence):
+    source = json.dumps({
+        "kind": "coder_followup",
+        "summary": "Coverage incomplete. Localization test FAILED.",
+        "tests_run": ["pytest tests/test_localization.py -q"],
+    })
+    fenced = f"{fence}json\n{source}\n{fence}\n"
+    lossy = json.dumps({"kind": "coder_followup", "summary": "Coverage incomplete."})
+
+    with pytest.raises(AgentLoopError, match="summary"):
+        validate_repair_preservation(fenced, lossy)
 
 
 def test_reserved_grammar_safety_correction_is_not_blocked():

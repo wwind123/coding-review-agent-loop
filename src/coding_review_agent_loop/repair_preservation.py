@@ -1,5 +1,7 @@
 """Bounded loss checks for parseable review and implementation repair inputs."""
 
+import re
+
 from .errors import AgentLoopError
 from .protocol import _extract_json_object_prefix, normalize_response_file_structured_text
 from .protocol_markers import scan_reserved_markers
@@ -10,9 +12,31 @@ _KINDS = {
     "coder_followup", "issue_implementation",
 }
 
+_FENCED_JSON_PREFIX_RE = re.compile(
+    r"\A[ \t]{0,3}(?P<fence>`{3,}|~{3,})[ \t]*(?:json)?[ \t]*\r?\n",
+    re.IGNORECASE,
+)
+_FINDING_METADATA_KEYS = {
+    "id", "item_id", "severity", "category", "state", "disposition", "verdict",
+}
+
 
 def _payload(text: str) -> dict | None:
     text, _ = normalize_response_file_structured_text(text)
+    stripped = text.lstrip()
+    fence = _FENCED_JSON_PREFIX_RE.match(stripped)
+    if fence:
+        fence_char = re.escape(fence.group("fence")[0])
+        fence_length = len(fence.group("fence"))
+        closing_fence = re.search(
+            rf"(?m)^[ \t]{{0,3}}{fence_char}{{{fence_length},}}[ \t]*(?:\r?\n|\Z)",
+            stripped[fence.end():],
+        )
+        if closing_fence:
+            stripped = stripped[fence.end():fence.end() + closing_fence.start()]
+        else:
+            stripped = stripped[fence.end():]
+        text = stripped
     try:
         parsed = _extract_json_object_prefix(text)
     except AgentLoopError:
@@ -33,7 +57,7 @@ def _fragments(value: object) -> list[str]:
     if isinstance(value, dict):
         return [
             text for key, child in value.items()
-            if key not in {"id", "item_id"}
+            if key not in _FINDING_METADATA_KEYS
             for text in _fragments(child)
         ]
     return []
