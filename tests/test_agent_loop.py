@@ -2287,7 +2287,11 @@ def test_implementation_claude_effort_requires_claude_but_not_model(tmp_path):
     assert config.implementation_claude_effort == "high"
 
 
-def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_path):
+@pytest.mark.parametrize("reviewer", ["gemini", "codex"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_path, reviewer, parallel):
+    from coding_review_agent_loop.config import resolve_invocation
+
     plan_text = "Approved plan.\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
     plan_review_text = structured_plan_review(summary="Plan approved.")
     pr_review_text = structured_pr_review(state="approved", summary="PR approved.")
@@ -2303,13 +2307,17 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
     config = make_config(
         tmp_path,
         coder="claude",
-        reviewer="gemini",
+        reviewer=reviewer,
+        review_parallel=parallel,
+        reviewer_codex_model="review-model",
+        reviewer_codex_reasoning_effort="medium",
         implementation_coder="codex",
         implementation_coder_model="gpt-5.5",
         implementation_codex_reasoning_effort="high",
     )
 
     def fake_run_validated_agent(runner_arg, *, agent, config, session_id=None, **kwargs):
+        invocation = resolve_invocation(config, provider=agent, role=kwargs.get("role"))
         calls.append(
             {
                 "agent": agent,
@@ -2319,6 +2327,8 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
                 "implementation_codex_reasoning_effort": config.implementation_codex_reasoning_effort,
                 "session_id": session_id,
                 "operation": kwargs.get("operation_description"),
+                "model": invocation.configured_model,
+                "effort": invocation.resolved_effort,
             }
         )
         operation = kwargs.get("operation_description")
@@ -2366,7 +2376,7 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
             == 0
         )
 
-    assert [call["agent"] for call in calls] == ["claude", "gemini", "codex", "gemini"]
+    assert [call["agent"] for call in calls] == ["claude", reviewer, "codex", reviewer]
     implementation_call = calls[2]
     assert implementation_call["coder"] == "codex"
     assert implementation_call["codex_model"] == "gpt-5.5"
@@ -2374,6 +2384,10 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
     assert implementation_call["implementation_codex_reasoning_effort"] == "high"
     assert implementation_call["session_id"] is None
     assert calls[0]["coder"] == "claude"
+    assert (implementation_call["model"], implementation_call["effort"]) == ("gpt-5.5", "high")
+    if reviewer == "codex":
+        for call in (calls[1], calls[3]):
+            assert (call["model"], call["effort"]) == ("review-model", "medium")
 
 
 def test_explicit_agent_dirs_are_preserved_when_others_default(tmp_path):

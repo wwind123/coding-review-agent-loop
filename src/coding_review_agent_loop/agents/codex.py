@@ -103,25 +103,25 @@ def _codex_model_args(config: AgentLoopConfig, *, role: str | None = None) -> li
     from ..config import resolve_invocation
 
     args: list[str] = []
-    if config.codex_model:
-        args += ["--model", config.codex_model]
     invocation = resolve_invocation(config, provider="codex", role=role)
+    if invocation.configured_model:
+        args += ["--model", invocation.configured_model]
     assert invocation.resolved_effort is not None
     args += ["-c", f'model_reasoning_effort="{invocation.resolved_effort}"']
     return args
 
 
-def _codex_model_label(config: AgentLoopConfig) -> str | None:
+def _codex_model_label(config: AgentLoopConfig, *, role: str | None = None) -> str | None:
     from ..config import resolve_invocation
 
-    invocation = resolve_invocation(config, provider="codex")
+    invocation = resolve_invocation(config, provider="codex", role=role)
     if not invocation.configured_model:
         return invocation.configured_model
     # Preserve the legacy backend field when effort was omitted. The common
     # registry boundary expands it to the resolved tool-owned effort for
     # substantive signatures and metadata.
-    if config.codex_reasoning_effort:
-        return f"{invocation.configured_model} ({config.codex_reasoning_effort})"
+    if invocation.effort_source != "tool_default":
+        return f"{invocation.configured_model} ({invocation.resolved_effort})"
     return invocation.configured_model
 
 
@@ -353,7 +353,7 @@ class CodexBackend:
                 response_file_path=response_path,
                 log_path=log_path,
                 returncode=result.returncode,
-                model_used=_codex_model_label(config),
+                model_used=_codex_model_label(config, role=role),
                 observed_model=None,
                 observed_effort=None,
                 provider="codex",
@@ -403,7 +403,7 @@ class CodexBackend:
                 if observed_model and observed_effort
                 else observed_model
             )
-            model_used = _codex_model_label(config) or observed_label
+            model_used = _codex_model_label(config, role=role) or observed_label
             log(config, f"Codex finished; log: {log_path}")
             return AgentResult(
                 text=response_file_text or message_text,

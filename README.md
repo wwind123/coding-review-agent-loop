@@ -353,7 +353,7 @@ executable-replacement behavior are documented under
 Agent-loop owns the effort setting for Codex and Claude. When no effort option
 is supplied, every invocation explicitly receives `medium`; a local CLI config
 file or inherited environment value cannot silently change that selection.
-The precedence is role-specific implementation override, agent-wide option,
+The precedence is the matching role override (reviewer or implementation), agent-wide option,
 then the tool default. Use `--codex-reasoning-effort xhigh` (or the matching
 implementation option) for an explicit higher-effort Codex/Luna run. Claude
 accepts `low`, `medium`, `high`, `xhigh`, and `max` through `--claude-effort`.
@@ -361,6 +361,25 @@ Antigravity's selected model already carries its tier, such as
 `Gemini 3.7 Flash (High)`, and is not rewritten by this setting. Startup logs,
 signatures, usage records, and new round metadata distinguish configured effort
 from verified runtime observations; older records retain unknown values.
+
+### Separate Coder and Reviewer Models
+
+When Codex or Claude occupies both seats, select its reviewer independently:
+
+```bash
+agent-loop pr 123 --repo OWNER/REPO \
+  --coder codex --reviewer claude --reviewer codex \
+  --codex-model gpt-5.6-luna --codex-reasoning-effort xhigh \
+  --reviewer-codex-model gpt-5.6-sol --reviewer-codex-reasoning-effort medium
+```
+
+Claude has matching `--reviewer-claude-model` and `--reviewer-claude-effort`
+options. These overrides apply to plan reviews, PR reviews, and discussion
+participants, not the coder or discussion analyzer. Model and effort are
+independent: omitting either retains that setting's existing fallback.
+Reviewer overrides survive the issue-to-PR implementation handoff; repeat
+them when starting a separate resume command. See the
+[issue-mode example and precedence](docs/local_agent_loop.md#independent-reviewer-selection).
 
 ## Safety and Permissions
 

@@ -21,6 +21,7 @@ from .agents.antigravity import AntigravityAttemptState
 from .agents.registry import agent_display_name, agent_signature, get_backend, run_agent_result
 from .config import (
     AgentLoopConfig,
+    configured_model_for,
     ensure_agent_workdirs,
     github_bootstrap_cwd,
     resolve_base_branch,
@@ -1341,18 +1342,13 @@ def _extract_unsupported_model_reason(text: str) -> str | None:
 def _configured_requested_model(
     agent: AgentName | None,
     config: AgentLoopConfig | None,
+    *,
+    role: str | None = None,
 ) -> str | None:
-    if config is None:
+    if config is None or agent is None:
         return None
-    if agent == "codex":
-        return config.codex_model.strip() if config.codex_model else None
-    if agent == "antigravity":
-        return config.antigravity_models[0].strip() if config.antigravity_models else None
-    if agent == "gemini":
-        return config.gemini_model.strip() if config.gemini_model else None
-    if agent == "claude":
-        return config.claude_model.strip() if config.claude_model else None
-    return None
+    model = configured_model_for(config, agent, role=role)
+    return model.strip() if model else None
 
 
 def _resolve_requested_model(
@@ -1361,13 +1357,14 @@ def _resolve_requested_model(
     config: AgentLoopConfig | None,
     result: AgentResult | None,
     classification_text: str,
+    role: str | None = None,
 ) -> str | None:
     result_model = (
         _model_flag_value(result.model_used)
         if result is not None and result.model_used
         else None
     )
-    config_model = _configured_requested_model(agent, config)
+    config_model = _configured_requested_model(agent, config, role=role)
     parsed_model = _parse_model_from_provider_text(classification_text)
     return result_model or config_model or parsed_model
 
@@ -1409,6 +1406,7 @@ def _build_unsupported_model_diagnostic(
         config=config,
         result=result,
         classification_text=unsupported_text,
+        role=role,
     )
     provider_auth_context = _extract_provider_auth_context(unsupported_text)
     reason = _extract_unsupported_model_reason(unsupported_text)
@@ -1418,6 +1416,13 @@ def _build_unsupported_model_diagnostic(
         provider_auth_context=provider_auth_context,
         reason=reason,
     )
+    if (
+        fallback_flag == "--codex-model"
+        and role == "reviewer"
+        and config is not None
+        and config.reviewer_codex_model
+    ):
+        fallback_flag = "--reviewer-codex-model"
     return _UnsupportedModelDiagnostic(
         agent=agent,
         agent_name=agent_name,

@@ -315,6 +315,22 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.add_argument("--gh-cmd", default="gh")
         subparser.add_argument(
+            "--reviewer-codex-model", default="",
+            help="Codex reviewer model, overriding --codex-model for plan/PR reviews and discussion turns only.",
+        )
+        subparser.add_argument(
+            "--reviewer-codex-reasoning-effort", default="",
+            help="Codex reviewer effort (minimal/low/medium/high/xhigh), overriding the agent-wide effort independently of the model.",
+        )
+        subparser.add_argument(
+            "--reviewer-claude-model", default="",
+            help="Claude reviewer model, overriding --claude-model for plan/PR reviews and discussion turns only.",
+        )
+        subparser.add_argument(
+            "--reviewer-claude-effort", default="",
+            help="Claude reviewer effort (low/medium/high/xhigh/max), overriding the agent-wide effort independently of the model.",
+        )
+        subparser.add_argument(
             "--dangerous-agent-permissions",
             action="store_true",
             help=(

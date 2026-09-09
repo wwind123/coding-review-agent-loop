@@ -431,10 +431,10 @@ agent-loop issue 56 --repo OWNER/REPO --plan-first --implement-after-approval \
 Planning and plan revisions always use `--coder`; the `--implementation-*`
 flags apply only after reviewers approve the plan and the run enters
 implementation. `--implementation-coder` accepts the same values as `--coder`.
-`--implementation-coder-model` sets that implementation coder's model only for
-the approved-plan implementation. When `--implementation-coder-model` is set
+`--implementation-coder-model` sets that implementation coder's model for
+the approved-plan implementation and subsequent PR follow-ups. When `--implementation-coder-model` is set
 without `--implementation-coder`, implementation keeps using `--coder` but with
-the implementation-only model. `--implementation-codex-reasoning-effort` can
+the implementation model. `--implementation-codex-reasoning-effort` can
 only be used when the implementation coder is Codex, either explicitly via
 `--implementation-coder codex` or implicitly via `--coder codex`. The matching
 `--implementation-claude-effort` option is restricted to Claude. An effort
@@ -442,7 +442,7 @@ override does not require an explicit model: an observed model may be unknown,
 and the signature will report `unknown model` with the selected effort.
 
 Codex and Claude effort are resolved independently for the provider executing
-each turn. The precedence is implementation role override, provider-wide
+each turn. The precedence is the matching reviewer or implementation role override, provider-wide
 option (`--codex-reasoning-effort` or `--claude-effort`), then agent-loop's
 explicit `medium` default. The default is passed to the provider CLI rather
 than inherited from local CLI configuration. Codex accepts `minimal`, `low`,
@@ -453,6 +453,44 @@ matching `CLAUDE_CODE_EFFORT_LEVEL` environment value. If an installed Claude
 CLI rejects the explicit flag, agent-loop reports a non-retryable tooling
 diagnostic and never retries without the requested effort. Antigravity model
 tiers remain embedded in model selection and are not replaced with `medium`.
+
+#### Independent Reviewer Selection
+
+Codex and Claude can use different models and efforts as coder and reviewer,
+in both `issue` and `pr` commands. For example, plan with Sol, implement and
+address PR feedback with Luna/xhigh, and review with Sol/medium:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO \
+  --coder codex --reviewer claude --reviewer codex \
+  --plan-first --implement-after-approval \
+  --codex-model gpt-5.6-sol --codex-reasoning-effort medium \
+  --implementation-coder-model gpt-5.6-luna \
+  --implementation-codex-reasoning-effort xhigh \
+  --reviewer-codex-model gpt-5.6-sol \
+  --reviewer-codex-reasoning-effort medium
+```
+
+Use `--reviewer-claude-model` and `--reviewer-claude-effort` for the equivalent
+Claude reviewer overrides. Models and efforts are selected independently:
+
+- Reviewer model: reviewer option, then the current provider-wide model.
+- Reviewer effort: reviewer option, provider-wide effort, then `medium`.
+- Coder: existing provider-wide settings, with implementation overrides activated
+  after plan approval. Reviewer options never change the coder's selection.
+
+Reviewer options also apply to discussion participants, but not the discussion
+analyzer or repair backend. They do not change workdir or permission policy.
+Without reviewer overrides, behavior is unchanged: an implementation model
+switch also becomes that provider's default reviewer model during the handoff.
+Effort-only overrides do not switch models, and model-only overrides do not
+reset efforts. Raw provider model/effort arguments cannot override these options.
+
+The configuration survives an in-process issue-to-PR handoff. A separate `pr`
+resume command must repeat the desired settings (see the README PR example);
+the tool does not reconstruct them from previous signatures. In `pr` mode,
+use the normal provider-wide options for the coder, not issue-only
+`--implementation-*` flags.
 
 If the plan narrows scope (via `deferred_stages` or a prior discuss `split`
 consensus), see [Split issue materialization](#split-issue-materialization)

@@ -157,6 +157,10 @@ class AgentLoopConfig:
     # falls back to the generic provider name). antigravity always has a model.
     codex_model: str = ""
     codex_reasoning_effort: str = ""
+    reviewer_codex_model: str = ""
+    reviewer_codex_reasoning_effort: str = ""
+    reviewer_claude_model: str = ""
+    reviewer_claude_effort: str = ""
     gemini_model: str = ""
     claude_model: str = ""
     claude_effort: str = ""
@@ -372,6 +376,14 @@ class AgentLoopConfig:
         )
         _validate_effort_value("claude", self.claude_effort, "--claude-effort")
         _validate_effort_value(
+            "codex", self.reviewer_codex_reasoning_effort, "--reviewer-codex-reasoning-effort"
+        )
+        _validate_effort_value("claude", self.reviewer_claude_effort, "--reviewer-claude-effort")
+        for option in ("reviewer_codex_model", "reviewer_claude_model"):
+            value = getattr(self, option)
+            if value and not value.strip():
+                raise AgentLoopError(f"--{option.replace('_', '-')} must not be blank.")
+        _validate_effort_value(
             "codex",
             self.implementation_codex_reasoning_effort,
             "--implementation-codex-reasoning-effort",
@@ -567,7 +579,14 @@ def _validate_effort_value(provider: AgentName | str, value: str, option: str) -
         )
 
 
-def configured_model_for(config: AgentLoopConfig, provider: AgentName) -> str | None:
+def configured_model_for(
+    config: AgentLoopConfig, provider: AgentName, *, role: str | None = None
+) -> str | None:
+    if role == "reviewer":
+        if provider == "codex" and config.reviewer_codex_model:
+            return config.reviewer_codex_model
+        if provider == "claude" and config.reviewer_claude_model:
+            return config.reviewer_claude_model
     if provider == "claude":
         return config.claude_model or None
     if provider == "codex":
@@ -605,6 +624,11 @@ def resolve_invocation(
             config.implementation_claude_effort if implementation_role_active else ""
         )
         agent_effort = config.claude_effort
+    if role == "reviewer":
+        if executing_provider == "codex":
+            role_override = config.reviewer_codex_reasoning_effort
+        elif executing_provider == "claude":
+            role_override = config.reviewer_claude_effort
     if executing_provider in {"codex", "claude"}:
         if role_override:
             effort, source = role_override, "role_override"
@@ -617,7 +641,7 @@ def resolve_invocation(
     return ResolvedInvocation(
         provider=executing_provider,
         role=role,
-        configured_model=configured_model_for(config, executing_provider),
+        configured_model=configured_model_for(config, executing_provider, role=role),
         resolved_effort=effort,
         effort_source=source,
     )
@@ -638,9 +662,9 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
             "--antigravity-arg --model conflicts with the always-declared antigravity "
             "model; set the model via --antigravity-models only."
         )
-    if config.codex_model and _args_have_model_flag(config.codex_args):
+    if (config.codex_model or config.reviewer_codex_model) and _args_have_model_flag(config.codex_args):
         raise AgentLoopError(
-            "--codex-arg --model conflicts with --codex-model; use --codex-model only."
+            "--codex-arg --model conflicts with --codex-model/--reviewer-codex-model; use dedicated model options only."
         )
     if _args_have_reasoning_effort(config.codex_args):
         option = (
@@ -657,9 +681,9 @@ def ensure_no_model_arg_conflicts(config: AgentLoopConfig) -> None:
         raise AgentLoopError(
             "--gemini-arg --model conflicts with --gemini-model; use --gemini-model only."
         )
-    if config.claude_model and _args_have_model_flag(config.claude_args):
+    if (config.claude_model or config.reviewer_claude_model) and _args_have_model_flag(config.claude_args):
         raise AgentLoopError(
-            "--claude-arg --model conflicts with --claude-model; use --claude-model only."
+            "--claude-arg --model conflicts with --claude-model/--reviewer-claude-model; use dedicated model options only."
         )
     if _args_have_claude_effort(config.claude_args):
         option = (
@@ -1248,6 +1272,10 @@ def config_from_args(
         ),
         codex_model=getattr(args, "codex_model", ""),
         codex_reasoning_effort=getattr(args, "codex_reasoning_effort", ""),
+        reviewer_codex_model=getattr(args, "reviewer_codex_model", ""),
+        reviewer_codex_reasoning_effort=getattr(args, "reviewer_codex_reasoning_effort", ""),
+        reviewer_claude_model=getattr(args, "reviewer_claude_model", ""),
+        reviewer_claude_effort=getattr(args, "reviewer_claude_effort", ""),
         gemini_model=getattr(args, "gemini_model", ""),
         claude_model=getattr(args, "claude_model", ""),
         claude_effort=getattr(args, "claude_effort", ""),
