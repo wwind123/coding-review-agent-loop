@@ -293,8 +293,10 @@ must stay in its correct ledger. Do not silently fill gaps with invented facts.
   "summary": "<short summary>",
   "addressed_items": ["item-1"],
   "remaining_items": ["item-2"],
+  "disputed_items": ["item-3"],
   "addressed_item_notes": {"item-1": "<how it was resolved>"},
   "remaining_item_notes": {"item-2": "<why it remains>"},
+  "dispute_evidence": {"item-3": "<verifiable evidence that the finding is incorrect>"},
   "human_requirement_dispositions": [
     {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "<why it cannot be completed>"}
   ],
@@ -1432,7 +1434,12 @@ def execute_repair(
         ):
             try:
                 validation_result = validate(output)
-                validate_repair_preservation(raw, output)
+                validate_repair_preservation(
+                    raw,
+                    output,
+                    unresolved_item_ids=prompt_kwargs.get("unresolved_item_ids"),
+                    surfaced_requirement_ids=prompt_kwargs.get("surfaced_requirement_ids"),
+                )
             except Exception as exc:
                 if outcome == "succeeded":
                     attempt.outcome = "invalid_output"
@@ -1472,9 +1479,11 @@ def _coder_followup_required_items_instruction(
     return (
         "## Required coder follow-up item IDs:\n"
         "The repaired coder_followup must classify every ID below in exactly one of "
-        "`addressed_items` or `remaining_items`, even if the malformed response does "
+        "`addressed_items`, `remaining_items`, or `disputed_items`, even if the malformed response does "
         "not mention the ID:\n"
         f"{rendered_ids or '- (none)'}\n"
+        "Preserve a source `disputed_items` classification and its complete `dispute_evidence` "
+        "when its ID is listed above. Remove dispute entries for IDs not listed above.\n"
         "Do not put human requirement labels such as `Requirement 1` in these arrays.\n"
     )
 
@@ -1683,7 +1692,12 @@ def attempt_repair(
     text, _, _, _, _ = _parse_gemini_payload(result.stdout.strip())
     if text:
         try:
-            validate_repair_preservation(raw, text)
+            validate_repair_preservation(
+                raw,
+                text,
+                unresolved_item_ids=unresolved_item_ids,
+                surfaced_requirement_ids=surfaced_requirement_ids,
+            )
         except Exception as exc:
             _logger.debug("repair pass content preservation failed: %s", exc)
             return None

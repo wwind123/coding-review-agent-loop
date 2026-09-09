@@ -1,9 +1,14 @@
 """Bounded loss checks for parseable review and implementation repair inputs."""
 
+from collections.abc import Sequence
 import re
 
 from .errors import AgentLoopError
-from .protocol import _extract_json_object_prefix, normalize_response_file_structured_text
+from .protocol import (
+    _extract_json_object_prefix,
+    _normalize_requirement_label,
+    normalize_response_file_structured_text,
+)
 from .protocol_markers import scan_reserved_markers
 
 
@@ -49,6 +54,13 @@ def _normalized(text: str) -> str:
     return " ".join(text.split())
 
 
+def _normalized_requirement_id(text: str) -> str | None:
+    try:
+        return _normalize_requirement_label(text)
+    except AgentLoopError:
+        return None
+
+
 def _fragments(value: object) -> list[str]:
     if isinstance(value, str):
         # Reserved protocol syntax must be removable; its safety validator wins.
@@ -64,7 +76,13 @@ def _fragments(value: object) -> list[str]:
     return []
 
 
-def validate_repair_preservation(raw: str, repaired: str) -> None:
+def validate_repair_preservation(
+    raw: str,
+    repaired: str,
+    *,
+    unresolved_item_ids: Sequence[str] | None = None,
+    surfaced_requirement_ids: Sequence[str] | None = None,
+) -> None:
     """Reject observable losses, not certify semantic equivalence.
 
     Invalid JSON and unsupported schemas remain on the ordinary repair path.
@@ -109,6 +127,9 @@ def validate_repair_preservation(raw: str, repaired: str) -> None:
                 available.remove(entry)
 
     if source["kind"] == "coder_followup":
+        allowed_item_ids = (
+            set(unresolved_item_ids) if unresolved_item_ids is not None else None
+        )
         for field in ("addressed_item_notes", "remaining_item_notes"):
             notes = source.get(field)
             if not isinstance(notes, dict):
@@ -132,6 +153,8 @@ def validate_repair_preservation(raw: str, repaired: str) -> None:
             target_disputed_items = target.get("disputed_items", [])
             require(isinstance(target_disputed_items, list), "disputed_items")
             for item_id in disputed_items:
+                if allowed_item_ids is not None and item_id not in allowed_item_ids:
+                    continue
                 require(item_id in target_disputed_items, "disputed_items")
 
         dispute_evidence = source.get("dispute_evidence")
@@ -139,6 +162,8 @@ def validate_repair_preservation(raw: str, repaired: str) -> None:
             target_evidence = target.get("dispute_evidence", {})
             require(isinstance(target_evidence, dict), "dispute_evidence")
             for item_id, evidence in dispute_evidence.items():
+                if allowed_item_ids is not None and item_id not in allowed_item_ids:
+                    continue
                 if not isinstance(evidence, str) or not _fragments(evidence):
                     continue
                 candidate = target_evidence.get(item_id)
@@ -153,6 +178,11 @@ def validate_repair_preservation(raw: str, repaired: str) -> None:
     # evidence; malformed rows remain available for schema-required repair.
     dispositions = source.get("human_requirement_dispositions")
     if isinstance(dispositions, list):
+        allowed_requirement_ids = None
+        if surfaced_requirement_ids is not None:
+            allowed_requirement_ids = {
+                _normalize_requirement_label(item) for item in surfaced_requirement_ids
+            }
         target_dispositions = target.get("human_requirement_dispositions", [])
         require(isinstance(target_dispositions, list), "human_requirement_dispositions")
         for entry in dispositions:
@@ -163,11 +193,20 @@ def validate_repair_preservation(raw: str, repaired: str) -> None:
             if (not isinstance(requirement_id, str) or not requirement_id.strip()
                     or disposition not in _HUMAN_REQUIREMENT_DISPOSITIONS):
                 continue
+            normalized_requirement_id = _normalized_requirement_id(requirement_id)
+            if normalized_requirement_id is None:
+                # Reviewer item IDs and arbitrary labels are not signed requirements.
+                continue
+            if (allowed_requirement_ids is not None
+                    and normalized_requirement_id not in allowed_requirement_ids):
+                continue
             match = next(
                 (
                     candidate for candidate in target_dispositions
                     if isinstance(candidate, dict)
-                    and candidate.get("requirement_id") == requirement_id
+                    and isinstance(candidate.get("requirement_id"), str)
+                    and _normalized_requirement_id(candidate["requirement_id"])
+                    == normalized_requirement_id
                     and candidate.get("disposition") == disposition
                 ),
                 None,

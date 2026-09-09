@@ -10,6 +10,7 @@ from coding_review_agent_loop.repair import (
     execute_repair,
 )
 from coding_review_agent_loop.protocol import (
+    validate_human_requirement_dispositions,
     validate_structured_discuss_answer,
     validate_structured_coder_followup,
     validate_structured_plan_state,
@@ -622,7 +623,10 @@ def test_attempt_repair_includes_coder_followup_required_item_ids():
     prompt = cmd[cmd.index("--prompt") + 1]
     assert "Required coder follow-up item IDs" in prompt
     assert "`item-8`" in prompt
-    assert "exactly one of `addressed_items` or `remaining_items`" in prompt
+    assert (
+        "exactly one of `addressed_items`, `remaining_items`, or `disputed_items`"
+        in prompt
+    )
     assert "HUMAN_REQUIREMENTS_ADDRESSED" in prompt
     assert "do not classify regular reviewer or orchestrator-injected item-N records" in prompt
 
@@ -880,10 +884,59 @@ def test_execute_repair_rejects_coder_outcome_mutation_and_uses_fallback(
         config=make_config(tmp_path, repair_models=("Gemini 3 Flash", "Gemini 3.1 Pro (High)")),
         run_id=f"coder-{mutation}-preservation", usage_context=None,
         validate=validate_structured_coder_followup, expected_kind="coder_followup",
+        surfaced_requirement_ids=("Requirement 1",),
     )
     assert repaired == source
     assert [attempt.outcome for attempt in attempts] == ["invalid_output", "succeeded"]
     assert "content preservation failed" in attempts[0].diagnostic
+
+
+def test_execute_repair_can_remove_unknown_requirement_dispositions(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    surfaced = {
+        "requirement_id": "Requirement 1",
+        "disposition": "addressed",
+        "evidence": "The public API remains unchanged.",
+    }
+    source = structured_coder_followup(
+        human_requirement_ids=["Requirement 1"],
+        human_requirement_dispositions=[
+            surfaced,
+            {"requirement_id": "Requirement 2", "disposition": "not-applicable",
+             "evidence": "This requirement was fabricated."},
+        ],
+    )
+    repaired_candidate = structured_coder_followup(
+        human_requirement_ids=["Requirement 1"],
+        human_requirement_dispositions=[surfaced],
+    )
+
+    def validate_with_context(text):
+        parsed = validate_structured_coder_followup(text)
+        validate_human_requirement_dispositions(
+            parsed.human_requirement_dispositions,
+            surfaced_requirement_ids=("Requirement 1",),
+            context="coder_followup.human_requirement_dispositions",
+        )
+        return parsed
+
+    repaired, parsed, attempts = execute_repair(
+        source,
+        runner=FakeRunner(antigravity_outputs=[(repaired_candidate, 0)]),
+        config=make_config(tmp_path, repair_models=("Gemini 3 Flash",)),
+        run_id="remove-unknown-requirement", usage_context=None,
+        validate=validate_with_context,
+        expected_kind="coder_followup",
+        surfaced_requirement_ids=("Requirement 1",),
+    )
+
+    assert repaired == repaired_candidate
+    assert [item.requirement_id for item in parsed.human_requirement_dispositions] == [
+        "Requirement 1"
+    ]
+    assert [attempt.outcome for attempt in attempts] == ["succeeded"]
 
 
 def test_legacy_repair_rejects_lossy_output():

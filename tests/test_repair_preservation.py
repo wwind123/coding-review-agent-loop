@@ -13,11 +13,14 @@ def check(source, target):
 
 def test_prompt_demands_lossless_repair_and_separate_ledgers():
     prompt = _build_repair_prompt("malformed", expected_kind="coder_followup",
+                                  unresolved_item_ids=("item-1",),
                                   surfaced_requirement_ids=())
     assert "This is format repair, not summarization" in prompt
     assert "two-round claim test and assert no mutation on 503" in prompt
     assert "including no not-applicable rows" in prompt
     assert "Retain failure, timeout, skipped-test" in prompt
+    assert "`addressed_items`, `remaining_items`, or `disputed_items`" in prompt
+    assert "Preserve a source `disputed_items` classification" in prompt
 
 
 def test_case06_object_to_string_keeps_every_detail():
@@ -116,6 +119,20 @@ def test_disputed_item_and_evidence_cannot_be_reclassified_or_dropped():
         })
 
 
+def test_unknown_disputed_item_and_evidence_can_be_removed():
+    source = {
+        "kind": "coder_followup",
+        "disputed_items": ["item-unknown"],
+        "dispute_evidence": {"item-unknown": "This ID is not in the round context."},
+    }
+    target = {"kind": "coder_followup", "disputed_items": [], "dispute_evidence": {}}
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(target),
+        unresolved_item_ids=("item-1",),
+    )
+
+
 def test_human_requirement_disposition_and_evidence_cannot_change():
     blocked = {
         "requirement_id": "Requirement 1",
@@ -142,6 +159,54 @@ def test_human_requirement_disposition_and_evidence_cannot_change():
                 "evidence": "More coverage is needed.",
             }],
         })
+
+
+def test_requirement_preservation_uses_surfaced_context_and_normalized_labels():
+    evidence = "The requested compatibility test is still missing."
+    source = {
+        "kind": "coder_followup",
+        "human_requirement_dispositions": [
+            {"requirement_id": "requirement 1", "disposition": "blocked", "evidence": evidence},
+            {"requirement_id": "Requirement 2", "disposition": "not-applicable",
+             "evidence": "This requirement was fabricated."},
+            {"requirement_id": "item-1", "disposition": "not-applicable",
+             "evidence": "Reviewer IDs are not signed requirements."},
+        ],
+    }
+    target = {
+        "kind": "coder_followup",
+        "human_requirement_dispositions": [
+            {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": evidence},
+        ],
+    }
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(target),
+        surfaced_requirement_ids=("Requirement 1",),
+    )
+
+    with pytest.raises(AgentLoopError, match="human_requirement_dispositions"):
+        validate_repair_preservation(
+            json.dumps(source),
+            json.dumps({"kind": "coder_followup", "human_requirement_dispositions": []}),
+            surfaced_requirement_ids=("Requirement 1",),
+        )
+
+
+def test_fabricated_requirement_can_be_removed_with_authoritative_empty_context():
+    source = {
+        "kind": "coder_followup",
+        "human_requirement_dispositions": [{
+            "requirement_id": "item-1",
+            "disposition": "not-applicable",
+            "evidence": "No signed requirements were surfaced.",
+        }],
+    }
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps({"kind": "coder_followup", "human_requirement_dispositions": []}),
+        surfaced_requirement_ids=(),
+    )
 
 
 def test_reordered_findings_with_shared_prefix_are_not_combined():
