@@ -10225,7 +10225,7 @@ def _run_discuss_analyzer(
             usage_context=usage_context,
             use_repair=True,
             repair_expected_kind="discuss_agenda",
-            role="reviewer",
+            role="analyzer",
             label=f"discuss-analyzer-r{round_number}",
             operation_description="discuss analyzer",
         )

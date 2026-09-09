@@ -8,13 +8,16 @@ import pytest
 from agent_loop_helpers import FakeRunner, make_config
 from coding_review_agent_loop.agents.registry import agent_signature, run_agent_result
 from coding_review_agent_loop.cli import build_parser
+from coding_review_agent_loop.comment_rendering import _format_unresolved_item_label
 from coding_review_agent_loop.config import config_from_args, resolve_invocation
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.managed_ci import _render_recovery_command
 from coding_review_agent_loop.orchestrator import (
     _approved_implementation_config,
     _build_unsupported_model_diagnostic,
+    _run_discuss_analyzer,
 )
+from coding_review_agent_loop.protocol import UnresolvedReviewItem
 from coding_review_agent_loop.prompts import (
     build_discuss_review_prompt,
     build_plan_review_prompt,
@@ -144,6 +147,72 @@ def test_observed_model_still_wins_signature(tmp_path):
     assert agent_signature("codex", config, model_used="observed (high)", role="reviewer").endswith(
         "observed (high)"
     )
+
+
+def test_discuss_agenda_uses_analyzer_role(monkeypatch, tmp_path):
+    config = make_config(
+        tmp_path,
+        codex_model="analyzer-model",
+        codex_reasoning_effort="high",
+        reviewer_codex_model="review-model",
+        reviewer_codex_reasoning_effort="medium",
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator.build_discuss_agenda_prompt",
+        lambda *args, **kwargs: "agenda prompt",
+    )
+
+    def reject_after_capturing(*args, **kwargs):
+        captured.update(kwargs)
+        raise AgentLoopError("stop after invocation metadata is captured")
+
+    monkeypatch.setattr(
+        "coding_review_agent_loop.orchestrator._run_validated_agent",
+        reject_after_capturing,
+    )
+
+    result = _run_discuss_analyzer(
+        FakeRunner(),
+        issue_number=1,
+        config=config,
+        analyzer="codex",
+        memory=None,
+        issue_context=None,
+        round_number=1,
+        round_history=(),
+        prior_agenda=None,
+        prior_round_synthesis=None,
+        configured_reviewers=("codex",),
+        usage_context=None,
+    )
+
+    assert result == (None, None, None, None)
+    assert captured["role"] == "analyzer"
+
+
+def test_unresolved_item_label_uses_reviewer_model_identity(tmp_path):
+    config = make_config(
+        tmp_path,
+        codex_model="coder-model",
+        codex_reasoning_effort="high",
+        reviewer_codex_model="review-model",
+        reviewer_codex_reasoning_effort="medium",
+    )
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Codex",
+        source_round=1,
+        text="Reviewer finding.",
+        status="blocking",
+        source_status="blocking",
+    )
+
+    label = _format_unresolved_item_label(item, config)
+
+    assert "OpenAI Codex: review-model (medium)" in label
+    assert "coder-model" not in label
 
 
 @pytest.mark.parametrize("target", ["issue", "pr"])
