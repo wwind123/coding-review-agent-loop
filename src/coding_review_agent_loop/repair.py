@@ -21,6 +21,7 @@ from .agents.antigravity import AntigravityBackend
 from .agents.format_repair import run_cli_repair
 from .agents.base import STDIN_PROMPT_THRESHOLD_BYTES
 from .agents.gemini import _parse_gemini_payload
+from .config import DEFAULT_REASONING_EFFORT
 from .logging import agent_log_path
 from .runner import strip_ansi
 from .repair_preservation import validate_repair_preservation
@@ -1128,7 +1129,7 @@ RepairOutcome = Literal[
 
 @dataclass
 class RepairAttemptResult:
-    backend: Literal["antigravity", "gemini"]
+    backend: Literal["antigravity", "gemini", "codex", "claude"]
     model: str
     prompt: str
     output: str
@@ -1425,7 +1426,7 @@ def execute_repair(
                 model=model,
                 turn_role="repair",
                 configured_model=model,
-                configured_effort=(config.repair_reasoning_effort or "medium")
+                configured_effort=(config.repair_reasoning_effort or DEFAULT_REASONING_EFFORT)
                 if config.repair_backend in {"codex", "claude"} else None,
                 observed_model=cli_result.observed_model if cli_result else None,
                 effort_source="repair_backend",

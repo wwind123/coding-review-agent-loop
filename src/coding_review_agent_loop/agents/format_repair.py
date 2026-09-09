@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from ..config import DEFAULT_REASONING_EFFORT
 from .base import AgentName, AgentResult
 from .claude import _parse_claude_output
 from .codex import _extract_codex_usage
@@ -26,7 +27,7 @@ def run_cli_repair(
     backend = config.repair_backend
     if backend not in {"codex", "claude"}:
         raise ValueError(f"Unsupported format repair backend: {backend}")
-    effort = config.repair_reasoning_effort or "medium"
+    effort = config.repair_reasoning_effort or DEFAULT_REASONING_EFFORT
     root = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"{backend}-", dir=root) as directory:

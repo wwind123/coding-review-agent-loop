@@ -7,7 +7,7 @@ import pytest
 
 from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
 from coding_review_agent_loop.cli import build_parser
-from coding_review_agent_loop.config import config_from_args
+from coding_review_agent_loop.config import DEFAULT_REASONING_EFFORT, config_from_args
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.protocol import parse_structured_pr_review
 from coding_review_agent_loop.repair import execute_repair
@@ -71,7 +71,7 @@ def test_cli_repair_isolated_and_independent(tmp_path, backend, effort):
     assert kwargs["containment_role"] == "repair"
     assert kwargs["timeout_seconds"] == 120
     assert not kwargs["check"]
-    resolved = effort or "medium"
+    resolved = effort or DEFAULT_REASONING_EFFORT
     if backend == "codex":
         assert "--ignore-user-config" in args and "--ephemeral" in args
         assert args[args.index("--sandbox") + 1] == "read-only"
