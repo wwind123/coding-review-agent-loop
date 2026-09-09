@@ -939,6 +939,79 @@ def test_execute_repair_can_remove_unknown_requirement_dispositions(tmp_path, mo
     assert [attempt.outcome for attempt in attempts] == ["succeeded"]
 
 
+def test_execute_repair_can_remove_unknown_coder_item_note(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    source = structured_coder_followup(
+        addressed_items=["item-unknown"],
+        addressed_item_notes={"item-unknown": "This item was fabricated."},
+    )
+    repaired_candidate = structured_coder_followup(
+        addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "Implemented the requested fix."},
+    )
+
+    repaired, _, attempts = execute_repair(
+        source,
+        runner=FakeRunner(antigravity_outputs=[(repaired_candidate, 0)]),
+        config=make_config(tmp_path, repair_models=("Gemini 3 Flash",)),
+        run_id="remove-unknown-note", usage_context=None,
+        validate=validate_structured_coder_followup,
+        expected_kind="coder_followup",
+        unresolved_item_ids=("item-1",),
+        surfaced_requirement_ids=(),
+    )
+
+    assert repaired == repaired_candidate
+    assert [attempt.outcome for attempt in attempts] == ["succeeded"]
+
+
+@pytest.mark.parametrize("review_kind", ["pr_review", "plan_review"])
+def test_execute_repair_removes_fabricated_review_requirement_dispositions(
+    tmp_path, monkeypatch, review_kind
+):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    fabricated = {
+        "requirement_id": "Requirement 1",
+        "disposition": "not-applicable",
+        "evidence": "This requirement was fabricated.",
+    }
+    if review_kind == "pr_review":
+        repaired_candidate = structured_pr_review(reviewer="OpenAI Codex")
+        source_payload = json.loads(repaired_candidate.split("\n", 1)[0])
+        source_payload["human_requirement_dispositions"] = [fabricated]
+        source = json.dumps(source_payload) + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        validate = lambda text: parse_structured_pr_review(text, reviewer="OpenAI Codex")
+    else:
+        source = structured_plan_review(human_requirement_dispositions=[fabricated])
+        repaired_candidate = structured_plan_review(human_requirement_dispositions=[])
+
+        def validate(text):
+            parsed = parse_structured_plan_review(text, reviewer="OpenAI Codex")
+            validate_human_requirement_dispositions(
+                parsed.human_requirement_dispositions,
+                surfaced_requirement_ids=(),
+                context="plan_review.human_requirement_dispositions",
+            )
+            return parsed
+
+    repaired, _, attempts = execute_repair(
+        source,
+        runner=FakeRunner(antigravity_outputs=[(repaired_candidate, 0)]),
+        config=make_config(tmp_path, repair_models=("Gemini 3 Flash",)),
+        run_id=f"remove-{review_kind}-requirement", usage_context=None,
+        validate=validate,
+        expected_kind=review_kind,
+        reviewer_requirement_ids=(),
+    )
+
+    assert repaired == repaired_candidate
+    assert [attempt.outcome for attempt in attempts] == ["succeeded"]
+
+
 def test_legacy_repair_rejects_lossy_output():
     raw = json.dumps({"kind": "coder_followup", "summary": "An unrelated test FAILED."})
     lossy = json.dumps({"kind": "coder_followup", "summary": "All done."})

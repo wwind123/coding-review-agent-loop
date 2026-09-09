@@ -1439,6 +1439,7 @@ def execute_repair(
                     output,
                     unresolved_item_ids=prompt_kwargs.get("unresolved_item_ids"),
                     surfaced_requirement_ids=prompt_kwargs.get("surfaced_requirement_ids"),
+                    reviewer_requirement_ids=prompt_kwargs.get("reviewer_requirement_ids"),
                 )
             except Exception as exc:
                 if outcome == "succeeded":
@@ -1697,6 +1698,7 @@ def attempt_repair(
                 text,
                 unresolved_item_ids=unresolved_item_ids,
                 surfaced_requirement_ids=surfaced_requirement_ids,
+                reviewer_requirement_ids=reviewer_requirement_ids,
             )
         except Exception as exc:
             _logger.debug("repair pass content preservation failed: %s", exc)

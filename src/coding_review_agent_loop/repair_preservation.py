@@ -82,6 +82,7 @@ def validate_repair_preservation(
     *,
     unresolved_item_ids: Sequence[str] | None = None,
     surfaced_requirement_ids: Sequence[str] | None = None,
+    reviewer_requirement_ids: Sequence[str] | None = None,
 ) -> None:
     """Reject observable losses, not certify semantic equivalence.
 
@@ -135,6 +136,8 @@ def validate_repair_preservation(
             if not isinstance(notes, dict):
                 continue
             for item_id, note in notes.items():
+                if allowed_item_ids is not None and item_id not in allowed_item_ids:
+                    continue
                 if not isinstance(note, str) or not _fragments(note):
                     continue
                 # Disposition normalization may move a note to the other bucket.
@@ -173,15 +176,21 @@ def validate_repair_preservation(
                     "dispute_evidence",
                 )
 
-    # A format repair must not adjudicate signed requirements. Preserve every
-    # already-valid requirement ID/disposition pair and its substantive
-    # evidence; malformed rows remain available for schema-required repair.
+    # A format repair must not adjudicate surfaced signed requirements. Preserve
+    # their already-valid disposition/evidence while allowing the authoritative
+    # context validator to remove fabricated rows. PR reviews prohibit this
+    # field entirely, so no source row is authoritative for that kind.
     dispositions = source.get("human_requirement_dispositions")
     if isinstance(dispositions, list):
+        requirement_context = surfaced_requirement_ids
+        if source["kind"] == "pr_review":
+            requirement_context = ()
+        elif source["kind"] == "plan_review":
+            requirement_context = reviewer_requirement_ids
         allowed_requirement_ids = None
-        if surfaced_requirement_ids is not None:
+        if requirement_context is not None:
             allowed_requirement_ids = {
-                _normalize_requirement_label(item) for item in surfaced_requirement_ids
+                _normalize_requirement_label(item) for item in requirement_context
             }
         target_dispositions = target.get("human_requirement_dispositions", [])
         require(isinstance(target_dispositions, list), "human_requirement_dispositions")

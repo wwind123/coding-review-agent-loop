@@ -99,6 +99,19 @@ def test_note_can_move_between_disposition_buckets():
     check(source, {"kind": "coder_followup", "addressed_item_notes": {"item-1": "Already covered by test_x."}})
 
 
+def test_unknown_item_note_can_be_removed_with_authoritative_context():
+    source = {
+        "kind": "coder_followup",
+        "remaining_item_notes": {"item-unknown": "This ID is not in the round context."},
+    }
+    target = {"kind": "coder_followup", "remaining_item_notes": {}}
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(target),
+        unresolved_item_ids=("item-1",),
+    )
+
+
 def test_disputed_item_and_evidence_cannot_be_reclassified_or_dropped():
     source = {
         "kind": "coder_followup",
@@ -207,6 +220,32 @@ def test_fabricated_requirement_can_be_removed_with_authoritative_empty_context(
         json.dumps({"kind": "coder_followup", "human_requirement_dispositions": []}),
         surfaced_requirement_ids=(),
     )
+
+
+def test_review_requirement_preservation_uses_kind_specific_context():
+    disposition = {
+        "requirement_id": "Requirement 1",
+        "disposition": "addressed",
+        "evidence": "The public API remains unchanged.",
+    }
+    empty = {"human_requirement_dispositions": []}
+
+    validate_repair_preservation(
+        json.dumps({"kind": "pr_review", "human_requirement_dispositions": [disposition]}),
+        json.dumps({"kind": "pr_review", **empty}),
+        reviewer_requirement_ids=("Requirement 1",),
+    )
+    validate_repair_preservation(
+        json.dumps({"kind": "plan_review", "human_requirement_dispositions": [disposition]}),
+        json.dumps({"kind": "plan_review", **empty}),
+        reviewer_requirement_ids=(),
+    )
+    with pytest.raises(AgentLoopError, match="human_requirement_dispositions"):
+        validate_repair_preservation(
+            json.dumps({"kind": "plan_review", "human_requirement_dispositions": [disposition]}),
+            json.dumps({"kind": "plan_review", **empty}),
+            reviewer_requirement_ids=("Requirement 1",),
+        )
 
 
 def test_reordered_findings_with_shared_prefix_are_not_combined():
