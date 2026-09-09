@@ -1243,7 +1243,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--implementation-codex-reasoning-effort", "--implementation-claude-effort",
     "--claude-effort", "--claude-cmd", "--codex-cmd",
     "--gemini-cmd", "--antigravity-cmd", "--antigravity-print-timeout-seconds",
-    "--repair-backend", "--repair-model", "--repair-timeout-seconds",
+    "--repair-backend", "--repair-model", "--repair-timeout-seconds", "--repair-reasoning-effort",
     "--antigravity-model", "--antigravity-models", "--antigravity-quota-signatures",
     "--codex-model", "--codex-reasoning-effort", "--gemini-model", "--claude-model",
     "--reviewer-codex-model", "--reviewer-codex-reasoning-effort",

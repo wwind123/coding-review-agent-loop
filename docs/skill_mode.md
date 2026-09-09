@@ -215,7 +215,10 @@ complete carried ledger, and then model format repair. Local-loop repair now
 defaults to isolated Antigravity with `Gemini 3.7 Flash (Medium)`; explicit repeatable
 repair models are tried first, followed by the configured Antigravity chain. Legacy
 Gemini CLI repair requires
-`--repair-backend gemini` and suitable non-interactive authentication. The
+`--repair-backend gemini` and suitable non-interactive authentication.
+Alternatively, select `--repair-backend codex` or `--repair-backend claude` with
+an explicit `--repair-model`; see [repair configuration](local_agent_loop.md#logs)
+for their isolated execution and independent effort settings. The
 classifier is conservative: only known tooling-failure signatures or
 truly-empty output count as unavailable.
 

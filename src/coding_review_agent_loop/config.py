@@ -166,6 +166,7 @@ class AgentLoopConfig:
     claude_effort: str = ""
     repair_backend: str = "antigravity"
     repair_models: tuple[str, ...] = DEFAULT_REPAIR_MODELS
+    repair_reasoning_effort: str = ""
     repair_timeout_seconds: int = 120
     # Active subprocess capture is kept outside mutable agent checkouts.  The
     # legacy log_dir remains the home for salvage and usage artifacts.
@@ -355,8 +356,16 @@ class AgentLoopConfig:
                 "--coder-test-command-timeout-seconds must be a positive finite integer."
             )
         object.__setattr__(self, "coder_test_command_timeout_seconds", int(timeout))
-        if self.repair_backend not in {"antigravity", "gemini"}:
-            raise AgentLoopError("--repair-backend must be either 'antigravity' or 'gemini'.")
+        if self.repair_backend not in {"antigravity", "gemini", "codex", "claude"}:
+            raise AgentLoopError("--repair-backend must be antigravity, gemini, codex, or claude.")
+        if self.repair_backend in {"codex", "claude"}:
+            if self.repair_models == DEFAULT_REPAIR_MODELS:
+                raise AgentLoopError("Codex/Claude repair requires an explicit --repair-model.")
+            _validate_effort_value(
+                self.repair_backend, self.repair_reasoning_effort, "--repair-reasoning-effort"
+            )
+        elif self.repair_reasoning_effort:
+            raise AgentLoopError("--repair-reasoning-effort requires --repair-backend codex or claude.")
         if not self.repair_models or any(not model.strip() for model in self.repair_models):
             raise AgentLoopError("--repair-model must contain at least one nonblank model.")
         if self.repair_timeout_seconds <= 0:
@@ -1285,6 +1294,7 @@ def config_from_args(
         implementation_claude_effort=getattr(args, "implementation_claude_effort", ""),
         repair_backend=getattr(args, "repair_backend", "antigravity"),
         repair_models=tuple(getattr(args, "repair_model", None) or DEFAULT_REPAIR_MODELS),
+        repair_reasoning_effort=getattr(args, "repair_reasoning_effort", ""),
         repair_timeout_seconds=getattr(args, "repair_timeout_seconds", 120),
         discuss_analyzer=getattr(args, "discuss_analyzer", None),
         discuss_research=getattr(args, "discuss_research", "none") or "none",

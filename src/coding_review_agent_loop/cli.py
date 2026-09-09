@@ -235,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.add_argument(
             "--repair-backend",
-            choices=("antigravity", "gemini"),
+            choices=("antigravity", "gemini", "codex", "claude"),
             default="antigravity",
             help="Malformed-response repair backend (default: antigravity).",
         )
@@ -245,8 +245,13 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help=(
                 "Repair model to try. Repeat to configure an explicit fallback chain "
-                f"(default: {DEFAULT_REPAIR_MODELS[0]} only)."
+                f"(default: {DEFAULT_REPAIR_MODELS[0]} only; required for Codex/Claude)."
             ),
+        )
+        subparser.add_argument(
+            "--repair-reasoning-effort",
+            default="",
+            help="Codex/Claude repair effort (default: medium, independent of coder/reviewer effort).",
         )
         subparser.add_argument(
             "--repair-timeout-seconds",

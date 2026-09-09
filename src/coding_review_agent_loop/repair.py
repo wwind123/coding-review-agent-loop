@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal
 
 from .agents.antigravity import AntigravityBackend
+from .agents.format_repair import run_cli_repair
 from .agents.base import STDIN_PROMPT_THRESHOLD_BYTES
 from .agents.gemini import _parse_gemini_payload
 from .logging import agent_log_path
@@ -1302,6 +1303,7 @@ def execute_repair(
         output = ""
         returncode: int | None = None
         diagnostic = ""
+        cli_result = None
         outcome: RepairOutcome
         if catalog is not None and model not in catalog:
             choices = ", ".join(sorted(catalog))
@@ -1339,6 +1341,12 @@ def execute_repair(
                 returncode = result.returncode
                 log_path = result.log_path
                 diagnostic_source = result.raw_output
+            elif config.repair_backend in {"codex", "claude"}:
+                log_path = agent_log_path(config, f"{config.repair_backend}-repair", run_id=run_id)
+                cli_result = run_cli_repair(runner, config, prompt, model=model, log_path=log_path)
+                output = cli_result.text.strip()
+                returncode = cli_result.returncode
+                diagnostic_source = cli_result.raw_output
             else:
                 log_path = agent_log_path(config, "gemini-repair", run_id=run_id)
                 oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
@@ -1411,11 +1419,15 @@ def execute_repair(
                 agent=config.repair_backend,
                 session_id=None,
                 returncode=returncode,
-                usage=estimate_usage(prompt, output),
+                usage=(cli_result.usage if cli_result and cli_result.usage else estimate_usage(prompt, output)),
+                raw_backend_usage=cli_result.raw_usage if cli_result else None,
                 role="repair",
                 model=model,
                 turn_role="repair",
                 configured_model=model,
+                configured_effort=(config.repair_reasoning_effort or "medium")
+                if config.repair_backend in {"codex", "claude"} else None,
+                observed_model=cli_result.observed_model if cli_result else None,
                 effort_source="repair_backend",
                 outcome=outcome,
                 log_path=str(log_path) if log_path is not None else None,

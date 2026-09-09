@@ -2677,7 +2677,7 @@ output`. A recovered response is still revalidated before posting; a failed
 repair leaves the run in local failure just like any other protocol error.
 
 Use `--repair-backend`, repeatable `--repair-model`, and
-`--repair-timeout-seconds` to configure this path. The repair chain is the explicit
+`--repair-timeout-seconds` to configure this path. For Antigravity, the repair chain is the explicit
 prefix followed by `antigravity_models`, with duplicates removed. It queries `agy
 models` once through the same PTY-safe runner as `agy --print`, rejects stale names
 with available-choice guidance, and attempts candidates directly when discovery is
@@ -2686,8 +2686,34 @@ enterprise/API-key/Vertex authentication; personal OAuth may require an
 interactive authorization and is not the default. Normal diagnostics include
 backend, model, return code, a sanitized bounded combined-PTY diagnostic, log
 path, and whether another configured model will run. Usage summaries record
-estimated prompt/output usage plus repair outcome and validation status for
+prompt/output usage (provider-reported when available, otherwise estimated), repair outcome, and validation status for
 every attempt, including failed attempts, so repair consumes visible quota.
+
+Codex and Claude can also repair responses, independently of the original agent:
+
+```bash
+--repair-backend codex --repair-model gpt-5.6-luna --repair-reasoning-effort medium
+```
+
+Or select `--repair-backend claude --repair-model claude-sonnet-5`.
+Both require an explicit model; repeat `--repair-model` for a same-backend fallback
+chain. They do not append reviewer models or query Antigravity's catalog.
+`--repair-reasoning-effort` defaults independently to `medium`, accepts the selected
+provider's effort values, and is only valid with these two backends. It does not
+inherit coder/reviewer effort. The configured `--codex-cmd` or `--claude-cmd` selects
+the executable, but ordinary agent arguments and dangerous permission flags are
+not forwarded. Selecting a repair backend does not change coder/reviewer models.
+
+Each attempt uses stdin, a fresh temporary directory, and no resumed session.
+Codex runs ephemeral with user config/rules ignored, a read-only sandbox, and
+shell/web search/subagents disabled. Claude runs safe mode with tools and MCP
+disabled and no session persistence. These paths require CLIs supporting those
+flags; unsupported flags fail the attempt rather than weakening its restrictions.
+CLI authentication remains available. Each attempt is bounded by
+`--repair-timeout-seconds` (default 120). Nonzero exits and timeouts are not accepted
+for Codex/Claude repairs. All successful output still passes schema validation and
+the same content-preservation guard; repairs cannot drop findings or plan steps
+just to make validation pass. The default backend remains Antigravity.
 
 Long reset or quota responses can exit early with guidance to rerun after the
 reset or switch keys/models. Narrower transient stream, tool-call, network
