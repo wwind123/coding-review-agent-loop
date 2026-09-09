@@ -67,6 +67,7 @@ _AGENT_BY_DISPLAY_NAME = {
     agent_display_name(agent): agent
     for agent in ("claude", "codex", "gemini", "antigravity")
 }
+_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def _render_test_command_for_comment(
@@ -76,7 +77,14 @@ def _render_test_command_for_comment(
 ) -> str:
     """Hide managed wrapper plumbing while preserving ordinary reports exactly."""
     try:
-        parsed = parse_managed_test_invocation(shlex.split(command))
+        tokens = shlex.split(command)
+        prefix_len = 0
+        while (
+            prefix_len < len(tokens)
+            and _SHELL_ASSIGNMENT_RE.match(tokens[prefix_len])
+        ):
+            prefix_len += 1
+        parsed = parse_managed_test_invocation(tokens[prefix_len:])
     except (ValueError, TestRuntimeConfigurationError):
         return command
     if parsed is None:
@@ -98,7 +106,7 @@ def _render_test_command_for_comment(
     else:
         timeout = f"{chosen:g}"
     return (
-        f"{shlex.join(parsed.inner_argv)} "
+        f"{shlex.join([*tokens[:prefix_len], *parsed.inner_argv])} "
         f"(agent-loop instrumented; whole-command timeout {timeout}s)"
     )
 

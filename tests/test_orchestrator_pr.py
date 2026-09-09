@@ -5579,6 +5579,7 @@ def test_pr_loop_refreshes_pr_head_without_just_in_time_base_sync(tmp_path):
     assert ["git", "switch", "main"] not in commands
     assert ["git", "pull", "--ff-only", "origin", "main"] not in commands
 
+
 def test_pr_loop_posts_followup_with_env_prefixed_managed_tests(tmp_path):
     runner = FakeRunner(
         claude_outputs=[
@@ -5612,8 +5613,20 @@ def test_pr_loop_posts_followup_with_env_prefixed_managed_tests(tmp_path):
     config = make_config(tmp_path, coder="codex", reviewer="claude")
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert any("Added the managed regression test." in comment for comment in runner.comments)
-    assert any("The regression test resolves the finding." in comment for comment in runner.comments)
+    followup = next(
+        comment
+        for comment in runner.comments
+        if "Added the managed regression test." in comment
+    )
+    assert "DATABASE_URL=postgresql+asyncpg://localhost/example_test" in followup
+    assert ".venv/bin/python -m pytest tests/test_pat_auth.py -q" in followup
+    assert "agent-loop instrumented; whole-command timeout 120s" in followup
+    assert "/outside/bin/agent-loop" not in followup
+    assert "/outside/cache" not in followup
+    assert any(
+        "The regression test resolves the finding." in comment
+        for comment in runner.comments
+    )
 
 
 def test_pr_loop_rejects_structured_followup_outside_workdir_tests_before_posting(tmp_path):

@@ -1061,27 +1061,7 @@ def _url_targets_in_clause(clause: _Clause) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _validate_single_command(command: str, *, assigned: Path, origin: Origin) -> None:
-    # The managed wrapper itself is an absolute executable outside the checkout
-    # by design, and its memory directory is an output location.  Once the
-    # exact contract is recognized, validate leading shell assignments and the
-    # inner executable/targets so the wrapper cannot hide an escape.
-    try:
-        tokens = shlex.split(command)
-        prefix_len = 0
-        while prefix_len < len(tokens) and VAR_ASSIGNMENT_RE.match(tokens[prefix_len]):
-            prefix_len += 1
-        managed = parse_managed_test_invocation(tokens[prefix_len:])
-    except (ValueError, TestRuntimeConfigurationError):
-        managed = None
-    if managed is not None:
-        # A recognized wrapper is a command even in a prose response field.
-        _validate_single_command(
-            shlex.join([*tokens[:prefix_len], *managed.inner_argv]),
-            assigned=assigned,
-            origin="structured",
-        )
-        return
+def _validate_command_contents(command: str, *, assigned: Path, origin: Origin) -> None:
     for raw_windows in WINDOWS_PATH_RE.findall(command):
         if _windows_path_is_exempt(command, raw_windows, origin):
             continue
@@ -1118,6 +1098,33 @@ def _validate_single_command(command: str, *, assigned: Path, origin: Origin) ->
                     "Coder reported tests run against a live remote target: "
                     f"{url!r} in command {command!r}. Assigned checkout: {assigned}"
                 )
+
+
+def _validate_single_command(command: str, *, assigned: Path, origin: Origin) -> None:
+    # The managed wrapper itself is an absolute executable outside the checkout
+    # by design, and its memory directory is an output location.  Once the
+    # exact contract is recognized, validate leading shell assignments and the
+    # inner executable/targets so the wrapper cannot hide an escape.
+    try:
+        tokens = shlex.split(command)
+        prefix_len = 0
+        while prefix_len < len(tokens) and VAR_ASSIGNMENT_RE.match(tokens[prefix_len]):
+            prefix_len += 1
+        managed = parse_managed_test_invocation(tokens[prefix_len:])
+    except (ValueError, TestRuntimeConfigurationError):
+        managed = None
+    if managed is not None:
+        # Leading assignments are command syntax even when extracted from a
+        # prose response; the inner report retains its original source mode.
+        if prefix_len:
+            _validate_command_contents(
+                shlex.join(tokens[:prefix_len]), assigned=assigned, origin="structured"
+            )
+        _validate_single_command(
+            shlex.join(managed.inner_argv), assigned=assigned, origin=origin
+        )
+        return
+    _validate_command_contents(command, assigned=assigned, origin=origin)
 
 
 def validate_test_commands_within_workdir(

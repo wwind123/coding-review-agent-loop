@@ -91,6 +91,46 @@ def test_managed_test_comment_hides_wrapper_plumbing_and_keeps_inner_command():
     assert "/private/cache" not in rendered
 
 
+def test_env_prefixed_managed_comment_keeps_assignments_and_hides_wrapper():
+    command = shlex.join(
+        [
+            "DATABASE_URL=postgresql+asyncpg://localhost/example_test",
+            "TEST_LABEL=two words",
+            "/outside/bin/agent-loop",
+            "run-tests",
+            "--timeout-seconds",
+            "120",
+            "--memory-dir",
+            "/outside/cache",
+            "--",
+            ".venv/bin/python",
+            "-m",
+            "pytest",
+            "tests/test_pat_auth.py",
+            "-q",
+        ]
+    )
+
+    rendered = _render_test_command_for_comment(command)
+
+    assert rendered == (
+        shlex.join(
+            [
+                "DATABASE_URL=postgresql+asyncpg://localhost/example_test",
+                "TEST_LABEL=two words",
+                ".venv/bin/python",
+                "-m",
+                "pytest",
+                "tests/test_pat_auth.py",
+                "-q",
+            ]
+        )
+        + " (agent-loop instrumented; whole-command timeout 120s)"
+    )
+    assert "/outside/bin/agent-loop" not in rendered
+    assert "/outside/cache" not in rendered
+
+
 def test_render_issue_implementation_no_pr_keeps_summary_tests_and_result_identity():
     parsed = validate_structured_issue_implementation(
         structured_issue_implementation(
