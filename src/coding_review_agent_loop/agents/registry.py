@@ -36,7 +36,9 @@ def agent_display_name(agent: AgentName) -> str:
     return get_backend(agent).display_name
 
 
-def _configured_model_label(agent: AgentName, config: AgentLoopConfig | None) -> str | None:
+def _configured_model_label(
+    agent: AgentName, config: AgentLoopConfig | None, *, role: str | None = None
+) -> str | None:
     """The model label declared in config for `agent`, or None if not declared.
 
     Codex and Claude append the resolver's selected effort; antigravity's model
@@ -50,9 +52,9 @@ def _configured_model_label(agent: AgentName, config: AgentLoopConfig | None) ->
     if agent == "codex":
         from ..config import resolve_invocation
 
-        invocation = resolve_invocation(config, provider="codex")
+        invocation = resolve_invocation(config, provider="codex", role=role)
         if not invocation.configured_model:
-            if not config.codex_reasoning_effort:
+            if invocation.effort_source == "tool_default":
                 return None
             model = "unknown model"
         else:
@@ -63,9 +65,9 @@ def _configured_model_label(agent: AgentName, config: AgentLoopConfig | None) ->
     if agent == "claude":
         from ..config import resolve_invocation
 
-        invocation = resolve_invocation(config, provider="claude")
+        invocation = resolve_invocation(config, provider="claude", role=role)
         if not invocation.configured_model:
-            if not config.claude_effort:
+            if invocation.effort_source == "tool_default":
                 return None
             model = "unknown model"
         else:
@@ -78,6 +80,8 @@ def agent_signature(
     agent: AgentName,
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
+    *,
+    role: str | None = None,
 ) -> str:
     """Build the `-- {signature}` label for `agent`.
 
@@ -86,7 +90,7 @@ def agent_signature(
     known, returns the generic signature unchanged so existing output is stable.
     """
     base = get_backend(agent).signature
-    label = model_used or _configured_model_label(agent, config)
+    label = model_used or _configured_model_label(agent, config, role=role)
     if not label:
         return base
     return f"{base}: {label}"

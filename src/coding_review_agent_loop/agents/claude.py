@@ -213,8 +213,8 @@ class ClaudeBackend:
         ]
         # Pin the model when declared (#332); conflict validation guarantees this is
         # not also passed via --claude-arg --model.
-        if config.claude_model:
-            args += ["--model", config.claude_model]
+        if invocation.configured_model:
+            args += ["--model", invocation.configured_model]
         if session_id:
             args += ["--resume", session_id]
         prompt_with_response_instruction = with_public_response_file_instruction(prompt, response_path)

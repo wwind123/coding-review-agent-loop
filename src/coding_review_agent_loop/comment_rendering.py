@@ -169,16 +169,18 @@ def _public_reviewer_name(
     name: str,
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
+    *,
+    role: str | None = None,
 ) -> str:
     agent = _AGENT_BY_DISPLAY_NAME.get(name)
     if agent is None and name in {"claude", "codex", "gemini", "antigravity"}:
         agent = name  # type: ignore[assignment]
     if agent is None:
         return name
-    # `model_used` is the producing agent's actual model (footers). Prior-item
-    # attributions pass model_used=None and use the configured model (or the
-    # generic signature when nothing is declared) — no cross-agent leakage.
-    return agent_signature(agent, config, model_used)
+    # `model_used` is the producing agent's actual model (footers). Historical
+    # attributions pass the producing role so configured role overrides remain
+    # accurate when no observed model is available.
+    return agent_signature(agent, config, model_used, role=role)
 
 
 def _comment_signature(
@@ -205,7 +207,7 @@ def _format_unresolved_item_label(
         "future": "Future follow-up",
     }
     phrase = phrases.get(status, "Unresolved item")
-    reviewer_name = _public_reviewer_name(item.reviewer, config)
+    reviewer_name = _public_reviewer_name(item.reviewer, config, role="reviewer")
     return f"{phrase} from {reviewer_name}, round {item.source_round}: {summary}"
 
 
