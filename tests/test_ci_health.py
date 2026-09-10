@@ -1,5 +1,6 @@
 import datetime
 import json
+import pytest
 
 from coding_review_agent_loop.ci_health import (
     CiInfrastructureStall,
@@ -9,6 +10,7 @@ from coding_review_agent_loop.ci_health import (
     _extract_run_id,
     classify_ci_infrastructure_stall,
     is_canonical_stall_only_text,
+    is_canonical_pending_only_text,
     is_wholly_infrastructure_blocked,
 )
 import coding_review_agent_loop.github as github_module
@@ -23,6 +25,34 @@ from coding_review_agent_loop.runner import CommandResult, Runner
 from agent_loop_helpers import make_config
 
 NOW = datetime.datetime(2026, 5, 23, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+
+@pytest.mark.parametrize("text", [
+    "GitHub check `test` is still pending/in_progress.",
+    "CI is pending.",
+    "The GitHub PR checks are currently running.",
+    "GitHub check status is unavailable.",
+    "test is queued",
+    "GitHub check `build (linux)` is not yet reporting.",
+])
+def test_canonical_pending_status_statements(text):
+    assert is_canonical_pending_only_text(text, check_names=("test", "status", "build (linux)"))
+
+
+@pytest.mark.parametrize("text", [
+    "Add a regression test for incorrect plan recovery.",
+    "The pending queue loses jobs. Add a regression test.",
+    "GitHub check `test` is pending, but authorization is broken.",
+    "CI is pending. Fix the missing validation.",
+    "The test is still running because the implementation deadlocks.",
+    "test", "", "   ",
+    "GitHub check `test` is unavailable. The fallback accepts forged approvals.",
+    "Review could not be completed because CI is unavailable.",
+    "GitHub check `other` is pending.",
+    "GitHub check build linux is pending.",
+])
+def test_pending_filter_preserves_ambiguous_or_substantive_text(text):
+    assert not is_canonical_pending_only_text(text, check_names=("test", "build (linux)"))
 
 
 def _check(**overrides):

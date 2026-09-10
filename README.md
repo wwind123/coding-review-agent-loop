@@ -450,6 +450,11 @@ reviewer findings. It does not wait for queued or running checks at this handoff
 Missing checks and recognized runner-infrastructure stalls are not added as
 code defects. Managed CI still defers its final qualification until approval.
 
+A blocking review is treated as CI-wait-only only when its findings and summary
+are unambiguously simple CI-status statements (or the summary is boilerplate).
+Mentioning a check name such as `test` is not sufficient. Mixed or ambiguous
+findings remain blocking; the tool must not erase code concerns to avoid a CI wait.
+
 Use `--auto-merge` only when the repository's CI and branch protections are
 appropriate for unattended merging:
 

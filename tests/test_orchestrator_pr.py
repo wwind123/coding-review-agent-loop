@@ -2,6 +2,7 @@ import base64
 import datetime
 import json
 import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -2250,7 +2251,7 @@ def test_pr_loop_downgrades_pending_ci_only_blocking_review_without_auto_merge(t
         codex_outputs=[
             structured_pr_review(
                 state="blocking",
-                summary="Model-default consistency gaps are fixed.",
+                summary="Review complete.",
                 blocking_items=["GitHub check `test` is still pending/in_progress."],
             )
         ],
@@ -2271,13 +2272,75 @@ def test_pr_loop_downgrades_pending_ci_only_blocking_review_without_auto_merge(t
     _assert_pending_ci_stop_guidance(stop_comment)
     assert "Required checks not yet reporting: test" in stop_comment
 
+
+# Verbatim Sol payloads from PR #757 rounds 1 and 3, previously stripped by
+# the pending-CI filter because each real finding mentioned a regression test.
+_SUPPRESSED_REVIEWS = json.loads(
+    (Path(__file__).parent / "fixtures" / "pending_ci_real_reviews.json").read_text()
+)
+
+
+@pytest.mark.parametrize("payload", _SUPPRESSED_REVIEWS, ids=["round-1", "round-3"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_real_findings_survive_publication_and_reconciliation(tmp_path, monkeypatch, payload, parallel):
+    # Replay as a fresh round; historical item dispositions need their original
+    # ledger, but the summary and every blocking finding remain verbatim.
+    response = (json.dumps({**payload, "prior_item_dispositions": []})
+                + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex")
+    runner = FakeRunner(
+        codex_outputs=[response],
+        gemini_outputs=[structured_pr_review(state="approved", summary="Review complete.")],
+        pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress"}]},
+    )
+    original = orchestrator._run_validated_agent
+    captured = {}
+
+    class CoderReached(Exception):
+        pass
+
+    def capture(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            captured.update(kwargs)
+            raise CoderReached
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", capture)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel)
+    with pytest.raises(CoderReached):
+        run_pr_loop(runner, pr_number=77, config=config)
+    reviews = [comment for comment in runner.comments if payload["summary"] in comment]
+    assert len(reviews) == 1
+    assert reviews[0].startswith("**Review verdict:** Blocking")
+    for finding in payload["blocking_items"]:
+        assert finding in reviews[0]
+        assert finding in captured["prompt"]
+    assert len(captured["repair_unresolved_item_ids"]) == len(payload["blocking_items"])
+
+
+@pytest.mark.parametrize("summary", [
+    "Authorization is broken. Add a regression test.",
+    "CI is pending but the new resume path loses requirements.",
+    "The approval reuse implementation is incorrect.",
+])
+def test_pending_only_items_do_not_override_substantive_summary(summary):
+    review = parse_pr_review(
+        structured_pr_review(state="blocking", summary=summary,
+                             blocking_items=["GitHub check `test` is pending."]),
+        reviewer="OpenAI Codex",
+    )
+    assert not orchestrator._is_pending_ci_only_review(
+        review, _watch_check_board("pending", missing_required=("test",))
+    )
+
+
 def test_pr_loop_downgrades_pending_ci_only_blocking_review_with_auto_merge(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
             structured_pr_review(
                 state="blocking",
-                summary="Model-default consistency gaps are fixed.",
-                blocking_items=["GitHub check `test` is still pending/in_progress."],
+                summary="Review complete.",
+                blocking_items=["GitHub check `lint` is still pending/in_progress."],
             )
         ],
         # "test" (the configured auto-merge check) is already green; "lint" is

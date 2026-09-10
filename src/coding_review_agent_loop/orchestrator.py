@@ -307,6 +307,7 @@ from .ci_health import (
     CiInfrastructureStall,
     StalledCheck,
     is_canonical_stall_only_text,
+    is_canonical_pending_only_text,
     is_wholly_infrastructure_blocked,
 )
 from .comment_rendering import (
@@ -3684,20 +3685,6 @@ def _validate_plan_revision_response(
     raise AgentLoopError("Plan revision did not use the required structured format.")
 
 
-_PENDING_CI_TEXT_KEYWORDS = (
-    "pending",
-    "in progress",
-    "in_progress",
-    "queued",
-    "still running",
-    "not yet report",
-    "unavailable",
-    "check status",
-    "github check",
-    "ci check",
-)
-
-
 def _drop_repeated_carried_future_followups(
     followups: ApprovedFollowups,
     *,
@@ -3763,7 +3750,9 @@ def _is_pending_ci_only_review(parsed_review: ParsedReview, pr_checks: PullReque
     reviewers not to use pending/unavailable checks as the sole reason to
     block, but a reviewer may still do so. Any other content (a distinct
     blocking item, or a Same-PR follow-up) causes this to return False so
-    mixed responses still route back to the coder normally.
+    mixed responses still route back to the coder normally. Whole-statement
+    matching is deliberately conservative: an unfamiliar phrasing must not
+    silently turn a blocking code review into an approval.
     """
     if pr_checks.state not in {"pending", "unavailable"}:
         return False
@@ -3778,15 +3767,15 @@ def _is_pending_ci_only_review(parsed_review: ParsedReview, pr_checks: PullReque
         candidate_texts = [parsed_review.summary]
     if not candidate_texts:
         return False
-    check_names = {check.name.lower() for check in pr_checks.pending}
-    check_names.update(name.lower() for name in pr_checks.missing_required)
-    for text in candidate_texts:
-        lowered = text.lower()
-        mentions_check_name = any(name in lowered for name in check_names)
-        mentions_ci_keyword = any(keyword in lowered for keyword in _PENDING_CI_TEXT_KEYWORDS)
-        if not (mentions_check_name or mentions_ci_keyword):
-            return False
-    return True
+    check_names = tuple(check.name for check in pr_checks.pending) + pr_checks.missing_required
+    if not all(is_canonical_pending_only_text(text, check_names=check_names) for text in candidate_texts):
+        return False
+    summary = (parsed_review.summary or "").strip()
+    return (
+        not summary
+        or summary in _BOILERPLATE_REVIEW_SUMMARIES
+        or is_canonical_pending_only_text(summary, check_names=check_names)
+    )
 
 
 def _coder_infrastructure_stall_notice(stalls: Sequence[StalledCheck]) -> str:
@@ -3817,7 +3806,7 @@ def _is_infrastructure_ci_only_review(parsed_review: ParsedReview, pr_checks: Pu
     job, or one cancelled before execution because a hosted runner was
     unavailable), rather than an actionable code-level finding.
 
-    Unlike `_is_pending_ci_only_review`'s keyword heuristic, this requires the
+    Like the pending-only filter, this fails closed on ambiguous prose. It requires the
     whole check board to already be classified `is_wholly_infrastructure_blocked`
     and every blocking item (and non-boilerplate summary) to pass the closed-
     vocabulary `is_canonical_stall_only_text` check. Any failure aborts the
