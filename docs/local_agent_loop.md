@@ -2598,6 +2598,16 @@ replace original claims, or become another reviewer's item-specific evidence.
 Repair may copy clearly attributed explanations from the original response,
 but must not invent missing rationale or discard the original summary.
 
+In the other direction, CLI reviewers receive the latest structured coder
+summary, reported tests (including caveats), addressed/remaining item notes,
+and dispute evidence as a separate block. It is labeled with the saved coder,
+review round, and PR head, and is included in full and compact prompts for
+serial, parallel, and resumed rounds. Compact prompts put this changing block
+in the volatile tail. Old-head explanations are omitted with an explicit
+notice; missing legacy structured details are not invented. These are coder
+claims to verify, not resolutions or proof that tests passed. The original
+item ledger and reviewer disposition requirements remain unchanged.
+
 Reconciliation remains conservative for a genuine same-claim disagreement: a
 valid active disposition still outweighs another reviewer's `resolved` vote.
 An active carried disposition is actionable even without a new-finding array,

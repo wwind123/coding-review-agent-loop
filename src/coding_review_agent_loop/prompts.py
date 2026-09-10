@@ -2436,6 +2436,7 @@ def _build_compact_pr_review_prompt(
     compact_coder_summary: str | None,
     compact_coder_tests_run: Sequence[str] | None,
     compact_tail: CompactPrReviewTailContext | None,
+    coder_followup_context: str = "",
 ) -> str:
     reviewer_name = agent_display_name(reviewer)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
@@ -2486,7 +2487,8 @@ match, report a blocking tooling mismatch instead of changing the checkout. Do
 not report findings based on untracked files unless those files are present in
 the PR diff.
 
-{checks_block}Suggested commands:
+{checks_block}{coder_followup_context}
+Suggested commands:
 - Read the verified checkout and local base-to-head diff first.
 - Use `{config.gh_cmd} pr view {pr_metadata.number} --repo {pr_metadata.repo} --json comments,reviews` only if existing PR discussion is not already present in this prompt.
 
@@ -2658,6 +2660,7 @@ def build_review_prompt(
     compact_tail: CompactPrReviewTailContext | None = None,
     compact_coder_summary: str | None = None,
     compact_coder_tests_run: Sequence[str] | None = None,
+    coder_followup_context: str = "",
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
@@ -2687,6 +2690,7 @@ def build_review_prompt(
             compact_coder_summary=compact_coder_summary,
             compact_coder_tests_run=compact_coder_tests_run,
             compact_tail=compact_tail,
+            coder_followup_context=sanitize_historical_text(coder_followup_context),
         )
     title = metadata.title or "(unknown)"
     head_branch = metadata.head_branch or "(unknown)"
@@ -2722,7 +2726,8 @@ are present in the PR diff.
 {_review_command_policy(config, metadata)}
 {checks_block}{_issue_context_block(issue_context)}
 {_human_requirements_block(human_requirements)}
-{unresolved_items_block}{_memory_block(memory, config)}
+{unresolved_items_block}{sanitize_historical_text(coder_followup_context)}
+{_memory_block(memory, config)}
 
 Suggested commands:
 - Read the verified checkout and local base-to-head diff first.

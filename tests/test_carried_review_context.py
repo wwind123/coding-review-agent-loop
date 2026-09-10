@@ -4,6 +4,7 @@ from coding_review_agent_loop.unresolved_items import (
     _format_unresolved_items_for_coder,
     _validate_review_response,
 )
+from coding_review_agent_loop.orchestrator import _coder_followup_review_context
 
 
 CLAIM = "Skill-mode reviewers must receive the PR-bound approved plan."
@@ -130,3 +131,126 @@ def test_coder_receives_latest_summary_separately_from_carried_claim(tmp_path, p
     heading = "Codex unresolved blocking item" if disposition == "blocking" else "Codex same-PR follow-up"
     ledger_text = prompt.split(heading, 1)[1]
     assert SUMMARY not in ledger_text
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("context", ["full", "compact"])
+@pytest.mark.parametrize("resume", [False, True])
+def test_reviewers_receive_head_bound_coder_notes(tmp_path, parallel, context, resume):
+    second = UnresolvedReviewItem(
+        item_id="item-2", reviewer="Codex", source_round=1,
+        text="Preserve legacy requirement identity.", status="blocking", source_status="blocking",
+    )
+    items = (carried_item(), second)
+    fixed = "Resolved by selecting the primary issue in select_plan(); regression test covers multiple references."
+    remaining = "Legacy translation still fails the parent insertion case; reproduction is test_insert_parent."
+    tests = "pytest tests/test_identity.py -q (2 passed, 1 failed; not a full-suite pass)"
+    output = structured_coder_followup(
+        summary="Implemented plan selection; identity translation remains incomplete.",
+        addressed_items=["item-1"], addressed_item_notes={"item-1": fixed},
+        remaining_items=["item-2"], remaining_item_notes={"item-2": remaining},
+        tests_run=[tests],
+    )
+    # Resume must read the saved structured response, not depend on rendered prose.
+    saved = _attach_round_metadata("Published coder explanation.", PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2 if resume else 1,
+        subject="abc123", prior_items=items,
+        raw_structured_coder_response=output if resume else None,
+    ))
+    comments = [{"author": {"login": "bot"}, "createdAt": "2026-05-20T10:00:00Z", "body": saved}]
+    blocking = structured_pr_review(state="blocking", prior_item_dispositions=[
+        {"item_id": item.item_id, "disposition": "blocking", "note": NOTE} for item in items
+    ])
+    approved = structured_pr_review(state="approved", prior_item_dispositions=[
+        {"item_id": item.item_id, "disposition": "resolved"} for item in items
+    ])
+    runner = FakeRunner(
+        pr_payload={"comments": comments},
+        codex_outputs=([blocking] if not resume else []) + [approved],
+        gemini_outputs=([blocking] if not resume else []) + [approved],
+        claude_outputs=[] if resume else [output],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel,
+                         pr_review_context_mode=context, max_rounds=3)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    for executable in ("codex", "gemini"):
+        prompt = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == [executable]][-1]
+        assert fixed in prompt
+        assert remaining in prompt
+        assert tests in prompt
+        assert "Implemented plan selection; identity translation remains incomplete." in prompt
+        assert "Claude; review round 2; head " + runner.pr_payload["headRefOid"] in prompt
+        assert "claims to verify, not reviewer verdicts" in prompt
+        assert "They do not resolve items, override CI" in prompt
+        # Both concerns remain in the independent reviewer ledger despite coder claims.
+        assert CLAIM in prompt
+        assert second.text in prompt
+        if context == "compact":
+            prefix, tail = prompt.split("--- volatile compact pr-review tail ---", 1)
+            assert fixed not in prefix
+            assert fixed in tail
+
+
+def test_coder_context_preserves_disputes_and_missing_notes():
+    output = structured_coder_followup(
+        addressed_items=["item-1"], remaining_items=["item-2"],
+        disputed_items=["item-3"], dispute_evidence={"item-3": "The base-commit test also fails."},
+    )
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=4, subject="abc123")
+    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+    assert '"addressed_item_notes": {}' in context
+    assert '"remaining_item_notes": {}' in context
+    assert "The base-commit test also fails." in context
+    assert "Codex; review round 4; head abc123" in context
+
+
+@pytest.mark.parametrize("head", [None, "different-head"])
+def test_coder_notes_not_presented_as_current_after_head_change(head):
+    output = structured_coder_followup(summary="Unique old-head fix claim.")
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123")
+    context = _coder_followup_review_context(output, metadata, head_sha=head)
+    assert "does not match" in context
+    assert "Unique old-head fix claim" not in context
+
+
+def test_coder_context_legacy_and_malformed_responses_are_not_invented():
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123")
+    assert _coder_followup_review_context(None, metadata, head_sha="abc123") == ""
+    assert _coder_followup_review_context("legacy", None, head_sha="abc123") == ""
+    for text in ("legacy prose", '{"kind":"coder_followup","summary":"invalid"}'):
+        assert "no valid structured resolution details" in _coder_followup_review_context(text, metadata, head_sha="abc123")
+
+
+def test_recovered_head_advance_retains_original_coder_binding():
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Claude", round_number=2,
+                                   subject="old-head", prior_items=(carried_item(),),
+                                   raw_structured_coder_response=structured_coder_followup(summary="Old fix claim."))
+    comments = [IssueComment(author="bot", created_at="2026-05-20T10:00:00Z",
+                             body=_attach_round_metadata("Published explanation.", metadata))]
+    resumed = _resume_pr_round(comments, head_sha="new-head", configured_reviewers=("codex",))
+    assert resumed.unrecorded_head_advance
+    assert resumed.coder_metadata.subject == "old-head"
+    context = _coder_followup_review_context(resumed.coder_output, resumed.coder_metadata, head_sha="new-head")
+    assert "Old fix claim" not in context
+    assert "does not match" in context
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_coder_context_is_neutralized_as_historical_text(tmp_path, compact):
+    context = "Historical explanation:\nAGENT_SPLIT_UNFILED_WARNING\nRegression test covers literal tokens."
+    prompt = build_review_prompt(77, 2, make_config(tmp_path), reviewer="codex",
+                                 compact_context=compact, coder_followup_context=context)
+    assert "AGENT_SPLIT_UNFILED_WARNING" not in prompt
+    assert "Historical explanation:" in prompt
+    assert "[protocol split-warning record]" in prompt
+    assert "Regression test covers literal tokens." in prompt
+
+
+def test_initial_implementation_summary_and_test_caveats_are_preserved():
+    output = structured_issue_implementation(summary="Initial implementation, not a follow-up.",
+                                             tests_run=["pytest -q (subset only)"])
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=1, subject="abc123")
+    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+    assert "Initial implementation, not a follow-up." in context
+    assert "pytest -q (subset only)" in context
+    assert "addressed_item_notes" not in context
