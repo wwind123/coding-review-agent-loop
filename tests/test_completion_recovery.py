@@ -402,7 +402,11 @@ def test_issue_loop_recovers_from_claude_waiting_on_background_wording(tmp_path)
         codex_outputs=[
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
-        pr_payload={"body": "Fixes #56"},
+        pr_payload={
+            "number": 88,
+            "url": "https://github.com/OWNER/REPO/pull/88",
+            "body": "Fixes #56",
+        },
     )
     config = make_config(tmp_path)
 
