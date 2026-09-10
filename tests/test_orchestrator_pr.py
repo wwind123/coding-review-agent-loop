@@ -2,6 +2,7 @@ import base64
 import datetime
 import json
 import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1264,6 +1265,102 @@ def _watch_check_board(
     )
 
 
+@pytest.mark.parametrize("board_state", ["failing", "mixed", "pending", "missing", "unavailable", "stall"])
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_blocking_review_handoff_includes_available_ci_without_waiting(
+    tmp_path, monkeypatch, board_state, auto_merge
+):
+    failure = PullRequestCheck(
+        name="test", kind="check_run", status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/555",
+    )
+    pending = PullRequestCheck(name="slow", kind="check_run", status="in_progress")
+    board = _watch_check_board(
+        "failing" if board_state in {"failing", "mixed", "stall"} else
+        "pending" if board_state in {"pending", "missing"} else "unavailable",
+        failing=(failure,) if board_state in {"failing", "mixed", "stall"} else (),
+        pending=(pending,) if board_state in {"mixed", "pending"} else (),
+        missing_required=("test",) if board_state == "missing" else (),
+        errors=("API unavailable",) if board_state == "unavailable" else (),
+    )
+    if board_state == "stall":
+        board = orchestrator.dataclasses_replace(board, infrastructure_stalls=(
+            StalledCheck(
+                name="test", kind="check_run", reason="runner_unavailable",
+                check_id=None, run_id="555", url=failure.url, age_seconds=None,
+            ),
+        ))
+    runner = FakeRunner(codex_outputs=[
+        "Fix the application bug.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    ])
+    snapshots = []
+
+    def snapshot(*args, **kwargs):
+        snapshots.append(kwargs["metadata"].head_sha)
+        # CI finishes while the reviewer is working, not before the review.
+        return _watch_check_board("pending", pending=(pending,)) if len(snapshots) == 1 else board
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", snapshot)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
+    original = orchestrator._run_validated_agent
+    captured = {}
+
+    class CoderReached(Exception):
+        pass
+
+    def capture(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            captured.update(kwargs)
+            raise CoderReached
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", capture)
+    with pytest.raises(CoderReached):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge))
+    assert snapshots == ["abc123", "abc123"]
+    prompt = captured["prompt"]
+    assert "Fix the application bug." in prompt
+    if board_state in {"failing", "mixed"}:
+        assert "Failing checks: test (failure)" in prompt
+        assert failure.url in prompt
+        assert "Reviewed head: abc123" in prompt
+        assert "Do not wait for queued or running CI" in prompt
+        assert "item-2" in captured["repair_unresolved_item_ids"]
+        assert "Pending checks:" not in prompt
+    else:
+        assert "Failing checks:" not in prompt
+        assert "item-2" not in captured["repair_unresolved_item_ids"]
+
+
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_round_ci_failure_is_tracked_and_resolved_with_reviewer_findings(tmp_path, monkeypatch, auto_merge):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Fix the application bug.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Both fixes verified."
+            + prior_item_dispositions("[item-1] resolved", "[item-2] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=["Fixed the application and CI.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+    )
+    failed = PullRequestCheck(name="test", kind="check_run", status="failure", url="https://example.test/555")
+    snapshots = iter([
+        _watch_check_board("pending"),
+        _watch_check_board("failing", failing=(failed,)),
+        _watch_check_board("passing"),
+        _watch_check_board("passing"),
+    ])
+    monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: next(snapshots))
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge)) == 0
+    second_review = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ["codex"]][-1]
+    assert "item-2" in second_review
+    assert "Failing checks: test (failure)" in second_review
+    assert sum(comment.startswith("GitHub PR checks are failing") for comment in runner.comments) == 1
+
+
 @pytest.mark.parametrize("auto_merge", [False, True])
 def test_watch_mode_success_uses_full_board_without_second_wait(
     tmp_path, monkeypatch, auto_merge
@@ -2244,7 +2341,7 @@ def test_pr_loop_downgrades_pending_ci_only_blocking_review_without_auto_merge(t
         codex_outputs=[
             structured_pr_review(
                 state="blocking",
-                summary="Model-default consistency gaps are fixed.",
+                summary="Review complete.",
                 blocking_items=["GitHub check `test` is still pending/in_progress."],
             )
         ],
@@ -2265,13 +2362,75 @@ def test_pr_loop_downgrades_pending_ci_only_blocking_review_without_auto_merge(t
     _assert_pending_ci_stop_guidance(stop_comment)
     assert "Required checks not yet reporting: test" in stop_comment
 
+
+# Verbatim Sol payloads from PR #757 rounds 1 and 3, previously stripped by
+# the pending-CI filter because each real finding mentioned a regression test.
+_SUPPRESSED_REVIEWS = json.loads(
+    (Path(__file__).parent / "fixtures" / "pending_ci_real_reviews.json").read_text()
+)
+
+
+@pytest.mark.parametrize("payload", _SUPPRESSED_REVIEWS, ids=["round-1", "round-3"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_real_findings_survive_publication_and_reconciliation(tmp_path, monkeypatch, payload, parallel):
+    # Replay as a fresh round; historical item dispositions need their original
+    # ledger, but the summary and every blocking finding remain verbatim.
+    response = (json.dumps({**payload, "prior_item_dispositions": []})
+                + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex")
+    runner = FakeRunner(
+        codex_outputs=[response],
+        gemini_outputs=[structured_pr_review(state="approved", summary="Review complete.")],
+        pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress"}]},
+    )
+    original = orchestrator._run_validated_agent
+    captured = {}
+
+    class CoderReached(Exception):
+        pass
+
+    def capture(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            captured.update(kwargs)
+            raise CoderReached
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", capture)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel)
+    with pytest.raises(CoderReached):
+        run_pr_loop(runner, pr_number=77, config=config)
+    reviews = [comment for comment in runner.comments if payload["summary"] in comment]
+    assert len(reviews) == 1
+    assert reviews[0].startswith("**Review verdict:** Blocking")
+    for finding in payload["blocking_items"]:
+        assert finding in reviews[0]
+        assert finding in captured["prompt"]
+    assert len(captured["repair_unresolved_item_ids"]) == len(payload["blocking_items"])
+
+
+@pytest.mark.parametrize("summary", [
+    "Authorization is broken. Add a regression test.",
+    "CI is pending but the new resume path loses requirements.",
+    "The approval reuse implementation is incorrect.",
+])
+def test_pending_only_items_do_not_override_substantive_summary(summary):
+    review = parse_pr_review(
+        structured_pr_review(state="blocking", summary=summary,
+                             blocking_items=["GitHub check `test` is pending."]),
+        reviewer="OpenAI Codex",
+    )
+    assert not orchestrator._is_pending_ci_only_review(
+        review, _watch_check_board("pending", missing_required=("test",))
+    )
+
+
 def test_pr_loop_downgrades_pending_ci_only_blocking_review_with_auto_merge(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
             structured_pr_review(
                 state="blocking",
-                summary="Model-default consistency gaps are fixed.",
-                blocking_items=["GitHub check `test` is still pending/in_progress."],
+                summary="Review complete.",
+                blocking_items=["GitHub check `lint` is still pending/in_progress."],
             )
         ],
         # "test" (the configured auto-merge check) is already green; "lint" is

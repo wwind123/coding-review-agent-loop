@@ -1,0 +1,36 @@
+[
+  {
+    "schema_version": 1,
+    "kind": "pr_review",
+    "state": "blocking",
+    "summary": "Issue-mode canonical-PR resume does not yet recover the plan selected by the handoff when a later planning round exists. GitHub CI is still pending (test in progress).",
+    "blocking_items": [
+      "Issue-mode plan-first resume selects the newest planning round before consulting the canonical handoff (`orchestrator.py:6419-6435`), then treats a different handoff plan hash as a fatal mismatch (`orchestrator.py:6477-6489`). Thus, if an issue receives a later unrelated plan after PR creation, `agent-loop issue ... --plan-first` cannot resume the existing PR with its bound older plan, even though `recover_approved_plan_context()` can select that exact hash. Resolve the canonical handoff first and recover plan text/additional-closing declarations by its recorded plan identity; add an orchestration-level regression test covering issue-mode resume with a newer unrelated plan."
+    ],
+    "same_pr_followups": [],
+    "future_followups": [],
+    "prior_item_dispositions": []
+  },
+  {
+    "schema_version": 1,
+    "kind": "pr_review",
+    "state": "blocking",
+    "summary": "The two carried blockers are resolved, but approved-plan recovery still drops legacy freeform plans and unchanged-head approval reuse does not use the new stable signed-requirement identities. GitHub CI is still pending (test in progress).",
+    "blocking_items": [
+      "[src/coding_review_agent_loop/round_state.py:825] Recover legacy freeform plan text from the metadata-stripped round body. The new recovery helper says the visible body is its fallback, but when both `canonical_plan` and `raw_structured_coder_response` are absent it currently skips the record instead of trying `record.body`. Freeform planning rounds intentionally persist both sidecars as null, while the handoff hash was computed from that freeform text. Consequently an existing approved-plan PR resumed after this upgrade gets an unavailable plan context; because old handoff records are exempted from the hard failure at orchestrator.py:7717, review can proceed without the approved plan. This breaks lossless issue/direct-PR resume for previously supported freeform plans. Add a regression test using a metadata-backed freeform plan with null sidecars and its bound handoff.",
+      "[src/coding_review_agent_loop/orchestrator.py:8148] Persist and compare stable signed-requirement identities when deciding whether to carry an unchanged-head approval. The new digest ID changes when a signed comment is edited, but `surfaced_reviewer_requirement_ids` still stores only positional labels such as `Requirement 1`; the subset check at lines 8148-8150 (and the duplicate check at 8353-8355) therefore carries an old approval when one signed requirement is edited or replaced by another while the requirement count stays the same. That lets a later human instruction bypass fresh reviewer evaluation despite the new identity mechanism. Keep positional labels for public/legacy acknowledgement compatibility, but store digest identities alongside them for approval coverage, with an edit/replacement regression test."
+    ],
+    "same_pr_followups": [],
+    "future_followups": [],
+    "prior_item_dispositions": [
+      {
+        "item_id": "item-3",
+        "disposition": "resolved"
+      },
+      {
+        "item_id": "item-7",
+        "disposition": "resolved"
+      }
+    ]
+  }
+]

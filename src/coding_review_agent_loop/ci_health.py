@@ -91,6 +91,28 @@ class CiInfrastructureStall:
 _RUN_ID_RE = re.compile(r"/actions/runs/(\d+)")
 
 
+def is_canonical_pending_only_text(text: str, *, check_names: Sequence[str]) -> bool:
+    """Recognize only whole, simple CI-status statements, never keyword hits.
+
+    Check names are allowed only in the subject slot. Substituting them across
+    arbitrary prose would erase meaningful words such as ``test`` in findings.
+    Unrecognized wording is intentionally left blocking for normal review.
+    """
+    if not text or len(text) > 400:
+        return False
+    names = "|".join(re.escape(name) for name in check_names if name.strip())
+    subject = r"(?:GitHub(?: PR)? (?:checks?|check status)|CI(?: checks?)?)"
+    if names:
+        name = rf"(?:`(?:{names})`|(?:{names}))"
+        subject = rf"(?:{subject}(?: {name})?|check {name}|{name})"
+    status = r"(?:pending(?:/in_progress)?|in[_ ]progress|queued|running|unavailable|not yet reporting)"
+    return re.fullmatch(
+        rf"(?:The )?{subject} (?:is|are|remains?) (?:still |currently )?{status}[.!]?",
+        text.strip(),
+        flags=re.IGNORECASE,
+    ) is not None
+
+
 def _extract_run_id(url: str | None) -> str | None:
     if not url:
         return None
