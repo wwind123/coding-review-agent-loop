@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -1094,16 +1095,43 @@ def main(argv: Sequence[str] | None = None) -> int:
             chosen = resolve_timeout_seconds(args.timeout_seconds, policy_ceiling=policy)
             broker = broker_client_from_environment()
             if broker is not None:
-                broker_result = broker.run(raw_inner, timeout_seconds=chosen, cwd=Path.cwd())
-                # The receipt is the only durable citation handle exposed to
-                # the coder. The parent owns the observation journal.
-                print(
-                    f"agent-loop test observation receipt: {broker_result.receipt_id}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return int(broker_result.returncode if broker_result.returncode is not None else 1)
+                try:
+                    broker_result = broker.run(raw_inner, timeout_seconds=chosen, cwd=Path.cwd())
+                except (AgentLoopError, OSError, ValueError) as exc:
+                    print(
+                        f"agent-loop: broker telemetry unavailable ({exc}); running locally with unverified telemetry",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    # The receipt is the only durable citation handle exposed to
+                    # the coder. The parent owns the observation journal.
+                    print(
+                        f"agent-loop test observation receipt: {broker_result.receipt_id}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    record_test_observation(
+                        args.memory_dir,
+                        argv=raw_inner,
+                        cwd=Path.cwd(),
+                        outcome=broker_result.outcome,
+                        elapsed_seconds=broker_result.elapsed_seconds,
+                        attempted_timeout_seconds=chosen,
+                        policy_ceiling_seconds=policy,
+                        returncode=broker_result.returncode,
+                        containment=None,
+                        lane="broker",
+                    )
+                    return int(broker_result.returncode if broker_result.returncode is not None else 1)
             containment_policy = policy_from_values(vars(args))
+            fallback_environment = dict(os.environ)
+            for name in (
+                "AGENT_LOOP_TEST_BROKER_ENDPOINT",
+                "AGENT_LOOP_TEST_BROKER_CAPABILITY",
+                "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+            ):
+                fallback_environment.pop(name, None)
             result = run_foreground_test(
                 raw_inner,
                 cwd=Path.cwd(),
@@ -1111,6 +1139,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dry_run=False,
                 containment_policy=containment_policy,
                 containment_role="test-gate",
+                env=fallback_environment,
+                environment_is_complete=True,
             )
             record_test_observation(
                 args.memory_dir,

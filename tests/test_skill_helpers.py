@@ -1673,6 +1673,27 @@ class TestPromptCheckoutPath:
         assert "Preserve the API." in prompt
         assert "Redesign later." in prompt
 
+    def test_pr_prompt_carries_restart_degraded_local_test_evidence(self) -> None:
+        from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+        from helpers.prompt_builders import build_review_prompt_for_skill
+
+        evidence = bounded_evidence_for_round({
+            "observations": [{
+                "command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"],
+                "outcome": "failed", "provenance": "parent-observed",
+                "receipt_id": "receipt-1", "environment": "not-compared",
+                "attribution": {"state": "current-head", "head": "old-head"},
+            }]
+        })
+        issue = {**self._ISSUE, "headRefOid": "new-head"}
+        prompt = build_review_prompt_for_skill(
+            issue, "diff", [], 2, "codex", repo="owner/repo", pr_number=7,
+            local_test_evidence=evidence,
+        )
+        assert "Local test evidence history" in prompt
+        assert "identity-unknown" in prompt
+        assert '"state": "stale"' in prompt
+
     def test_pr_prompt_includes_labeled_parent_primary_and_effective_requirements(self) -> None:
         from coding_review_agent_loop.github import IssueContext
         from helpers.prompt_builders import build_review_prompt_for_skill

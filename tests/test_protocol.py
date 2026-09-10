@@ -2219,6 +2219,29 @@ def test_validate_structured_coder_followup_accepts_v1_payload():
     assert parsed.remaining_item_notes == {}
 
 
+def test_validate_structured_coder_followup_accepts_exact_test_observation_shape():
+    payload = json.dumps({
+        "schema_version": 1, "kind": "coder_followup", "state": "blocking",
+        "summary": "Ran a focused check.", "addressed_items": [], "remaining_items": [],
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "test_observations": [{
+            "command": "python -m pytest tests/test_protocol.py -q",
+            "receipt_id": "opaque-receipt", "claim": "current-result",
+        }],
+    }) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    parsed = validate_structured_coder_followup(payload)
+    assert parsed is not None
+    assert parsed.test_observations[0].receipt_id == "opaque-receipt"
+
+    invalid = payload.replace(
+        '"claim": "current-result"',
+        '"claim": "current-result", "unexpected": true',
+    )
+    with pytest.raises(AgentLoopError, match="unknown field"):
+        validate_structured_coder_followup(invalid)
+
+
 def test_validate_structured_coder_followup_accepts_optional_item_notes():
     payload = (
         json.dumps(

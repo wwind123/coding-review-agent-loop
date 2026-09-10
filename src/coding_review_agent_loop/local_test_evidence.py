@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import signal
 import shlex
 import socket
 import struct
@@ -1351,12 +1352,29 @@ class TestBrokerServer:
         self._runtime_dir: Path | None = None
         self._socket: socket.socket | None = None
         self._thread: Thread | None = None
+        self._handler_threads: set[Thread] = set()
         self._stop = False
         self._send_lock = Lock()
         self._journal: list[LocalTestObservation] = []
         self._receipts: dict[str, tuple[str, dict[str, object]]] = {}
         self._journal_lock = Lock()
         self._environment_registry = environment_registry or EnvironmentIdentityRegistry()
+        self._parent_containment_handle: Any | None = None
+        self._process_started: Any | None = None
+        self._process_finished: Any | None = None
+        self._active_processes: dict[int, Any] = {}
+
+    def set_execution_context(
+        self,
+        *,
+        containment_handle: Any | None,
+        process_started: Any,
+        process_finished: Any,
+    ) -> None:
+        """Bind broker children to the live requesting turn before requests run."""
+        self._parent_containment_handle = containment_handle
+        self._process_started = process_started
+        self._process_finished = process_finished
 
     @property
     def endpoint(self) -> str:
@@ -1402,9 +1420,29 @@ class TestBrokerServer:
         server, self._socket = self._socket, None
         if server is not None:
             server.close()
+        with self._journal_lock:
+            active = list(self._active_processes.values())
+        for proc in active:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=2)
+                except ProcessLookupError:
+                    pass
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait()
         if self._thread is not None and self._thread is not current_thread():
             self._thread.join(timeout=2)
         self._thread = None
+        with self._journal_lock:
+            handlers = list(self._handler_threads)
+        for handler in handlers:
+            if handler is not current_thread():
+                handler.join(timeout=5)
         if self._runtime_dir is not None:
             try:
                 for item in self._runtime_dir.iterdir():
@@ -1428,40 +1466,47 @@ class TestBrokerServer:
                 continue
             except OSError:
                 break
-            Thread(target=self._handle, args=(connection,), daemon=True).start()
+            handler = Thread(target=self._handle, args=(connection,), daemon=True)
+            with self._journal_lock:
+                self._handler_threads.add(handler)
+            handler.start()
 
     def _handle(self, connection: socket.socket) -> None:
-        with connection:
-            try:
-                request = _recv_frame(connection)
-                validated = _validate_broker_request(
-                    request,
-                    turn_id=self.turn_id,
-                    capability=self.capability,
-                    root=self.root,
-                    ceiling=self.timeout_ceiling,
-                )
-                nonce = str(validated["nonce"])
-                digest = hashlib.sha256(json.dumps(validated, sort_keys=True, default=str).encode()).hexdigest()
-                with self._journal_lock:
-                    cached = self._receipts.get(nonce)
-                if cached is not None:
-                    if cached[0] != digest:
-                        raise BrokerProtocolError("conflicting replay for nonce")
-                    _send_frame(connection, cached[1])
-                    return
-                response = self._execute_request(validated, connection)
-                with self._journal_lock:
-                    self._receipts[nonce] = (digest, response)
-                    if len(self._receipts) > MAX_PRIVATE_OBSERVATIONS:
-                        oldest = next(iter(self._receipts))
-                        self._receipts.pop(oldest, None)
-                _send_frame(connection, response)
-            except (BrokerProtocolError, OSError, ValueError) as exc:
+        try:
+            with connection:
                 try:
-                    _send_frame(connection, {"type": "error", "error": _safe_text(exc)})
-                except OSError:
-                    pass
+                    request = _recv_frame(connection)
+                    validated = _validate_broker_request(
+                        request,
+                        turn_id=self.turn_id,
+                        capability=self.capability,
+                        root=self.root,
+                        ceiling=self.timeout_ceiling,
+                    )
+                    nonce = str(validated["nonce"])
+                    digest = hashlib.sha256(json.dumps(validated, sort_keys=True, default=str).encode()).hexdigest()
+                    with self._journal_lock:
+                        cached = self._receipts.get(nonce)
+                    if cached is not None:
+                        if cached[0] != digest:
+                            raise BrokerProtocolError("conflicting replay for nonce")
+                        _send_frame(connection, cached[1])
+                        return
+                    response = self._execute_request(validated, connection)
+                    with self._journal_lock:
+                        self._receipts[nonce] = (digest, response)
+                        if len(self._receipts) > MAX_PRIVATE_OBSERVATIONS:
+                            oldest = next(iter(self._receipts))
+                            self._receipts.pop(oldest, None)
+                    _send_frame(connection, response)
+                except (BrokerProtocolError, OSError, ValueError) as exc:
+                    try:
+                        _send_frame(connection, {"type": "error", "error": _safe_text(exc)})
+                    except OSError:
+                        pass
+        finally:
+            with self._journal_lock:
+                self._handler_threads.discard(current_thread())
 
     def _execute_request(self, request: Mapping[str, object], connection: socket.socket) -> dict[str, object]:
         from .containment import open_confined_cwd
@@ -1498,17 +1543,44 @@ class TestBrokerServer:
             else:
                 from .runner import run_foreground_test
 
+                parent_cgroup = None
+                handle = self._parent_containment_handle
+                if handle is not None and getattr(handle, "managed", False):
+                    report = handle.refresh_report()
+                    if report is None or not report.target_started or handle.cgroup_path is None:
+                        raise BrokerProtocolError("coder containment scope is not ready for broker tests")
+                    parent_cgroup = handle.cgroup_path
+
+                def started(proc: Any) -> None:
+                    with self._journal_lock:
+                        self._active_processes[proc.pid] = proc
+                    if self._process_started is not None:
+                        self._process_started(proc)
+
+                def finished(proc: Any) -> None:
+                    with self._journal_lock:
+                        self._active_processes.pop(proc.pid, None)
+                    if self._process_finished is not None:
+                        self._process_finished(proc)
+
                 result = run_foreground_test(
                     argv,
                     cwd=cwd,
                     cwd_fd=confined.fd,
                     timeout_seconds=float(request["timeout_seconds"]),
                     env=environment,
-                    containment_policy=self.containment_policy,
+                    # Broker children either attach to the requesting managed
+                    # coder scope above or use their registered process group.
+                    # They must never infer containment from the broker
+                    # parent's own cgroup.
+                    containment_policy=None,
                     containment_role="test-gate",
                     environment_is_complete=True,
                     output_callback=stream,
                     echo_output=False,
+                    parent_cgroup_path=parent_cgroup,
+                    process_started=started,
+                    process_finished=finished,
                 )
             after = stable_tracked_tree_snapshot(
                 self.root,

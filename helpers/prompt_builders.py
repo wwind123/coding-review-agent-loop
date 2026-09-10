@@ -52,11 +52,14 @@ def _with_containment_guidance(prompt: str, config: AgentLoopConfig) -> str:
     return prompt if guidance.strip() in prompt else f"{prompt}\n{guidance}"
 
 
-def _local_test_evidence_guidance(value: object) -> str:
+def _local_test_evidence_guidance(value: object, *, current_head: str | None = None) -> str:
     """Carry only the already-sanitized advisory history into skill prompts."""
     if not isinstance(value, str) or not value.strip():
         return ""
-    from coding_review_agent_loop.local_test_evidence import decode_bounded_evidence
+    from coding_review_agent_loop.local_test_evidence import (
+        decode_bounded_evidence,
+        reconcile_test_observations,
+    )
 
     parsed = decode_bounded_evidence(value)
     if parsed is None:
@@ -64,6 +67,7 @@ def _local_test_evidence_guidance(value: object) -> str:
             "\n\nLocal test evidence history is present but malformed after restart; "
             "treat prior local claims as identity-unknown and advisory.\n"
         )
+    parsed = reconcile_test_observations(parsed.observations, current_head=current_head)
     return (
         "\n\nLocal test evidence history (advisory; do not override GitHub CI):\n"
         + json.dumps(parsed.to_dict(), ensure_ascii=False, sort_keys=True)
@@ -217,6 +221,7 @@ def build_review_prompt_for_skill(
     parent_issue_context: IssueContext | None = None,
     human_requirements: Sequence | None = None,
     approved_plan_max_chars: int | None = None,
+    local_test_evidence: str | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
@@ -273,6 +278,9 @@ def build_review_prompt_for_skill(
         unresolved_items=unresolved,
         approved_plan_context=approved_plan_context,
         approved_plan_max_chars=approved_plan_max_chars,
+        coder_followup_context=_local_test_evidence_guidance(
+            local_test_evidence, current_head=issue_dict.get("headRefOid")
+        ),
     )
     if pr_diff:
         prompt += f"\n\n## PR diff\n\n```diff\n{pr_diff}\n```\n"

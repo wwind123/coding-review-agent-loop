@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import os
 import re
+import select
 import secrets
 import shutil
 import subprocess
@@ -29,10 +30,12 @@ from .containment import (
 from .errors import AgentLoopError
 from .test_runtime import OVERLAP_REJECTED_EXIT_CODE, OVERLAP_REJECTED_MESSAGE, acquire_command_lane
 from .local_test_evidence import (
+    EvidenceScope,
     TestBrokerServer,
     LocalTestObservation,
     EnvironmentIdentityRegistry,
     reconcile_test_observations,
+    TreeAttribution,
 )
 
 
@@ -145,6 +148,9 @@ def run_foreground_test(
     output_callback: Callable[[str], None] | None = None,
     echo_output: bool = True,
     cwd_fd: int | None = None,
+    parent_cgroup_path: Path | None = None,
+    process_started: Callable[[subprocess.Popen], None] | None = None,
+    process_finished: Callable[[subprocess.Popen], None] | None = None,
 ) -> ForegroundTestResult:
     """Run a command in the foreground, teeing output and bounding its process group."""
     cmd = [str(value) for value in args]
@@ -168,9 +174,33 @@ def run_foreground_test(
     before_cgroup: dict[str, object] = {}
     last_cgroup: dict[str, object] = {}
     target_exec_error = False
+    proc: subprocess.Popen[bytes] | None = None
     try:
-        if containment_policy is not None and containment_policy.mode != "off":
-            invocation_values = env if env is not None else os.environ
+        held_fds: tuple[int, int, int, int] | None = None
+        pass_fds: tuple[int, ...] = ()
+        if parent_cgroup_path is not None:
+            ready_read, ready_write = os.pipe()
+            release_read, release_write = os.pipe()
+            held_fds = (ready_read, ready_write, release_read, release_write)
+            pass_fds = (ready_write, release_read)
+            spawn_cmd = [
+                sys.executable,
+                "-m",
+                "coding_review_agent_loop.containment",
+                "--held-exec",
+                "--ready-fd",
+                str(ready_write),
+                "--release-fd",
+                str(release_read),
+                "--",
+                *cmd,
+            ]
+        elif containment_policy is not None and containment_policy.mode != "off":
+            # Only an explicit, complete caller context proves that this
+            # subprocess is a descendant wrapper. Ambient orchestration
+            # variables must not make unrelated in-process test calls claim
+            # inherited containment.
+            invocation_values = env if env is not None else {}
             if invocation_values.get("AGENT_LOOP_INVOCATION_ID"):
                 # A test wrapper launched from an already-contained agent is a
                 # descendant of that scope.  Keep it in the inherited cgroup
@@ -213,14 +243,44 @@ def run_foreground_test(
                 else ({**os.environ, **env} if env is not None else None)
             ),
             preexec_fn=spawn_preexec,
+            pass_fds=pass_fds,
         )
+        if process_started is not None:
+            process_started(proc)
+        if held_fds is not None:
+            ready_read, ready_write, release_read, release_write = held_fds
+            os.close(ready_write)
+            os.close(release_read)
+            try:
+                ready, _, _ = select.select([ready_read], [], [], 5.0)
+                if not ready or os.read(ready_read, 1) != b"1":
+                    raise AgentLoopError("broker test child did not reach the containment handshake")
+                (parent_cgroup_path / "cgroup.procs").write_text(str(proc.pid), encoding="ascii")
+                attached = cgroup_path_for_pid(proc.pid)
+                if attached is None or attached.resolve() != parent_cgroup_path.resolve():
+                    raise AgentLoopError("broker test child could not be verified in the coder cgroup")
+                os.write(release_write, b"1")
+            except BaseException:
+                _terminate_process_group(proc)
+                raise
+            finally:
+                os.close(ready_read)
+                os.close(release_write)
         if handle is not None and handle.managed:
             handle.refresh_report()
             before_cgroup = sample_cgroup(handle.cgroup_path, handle.capabilities)
             last_cgroup = dict(before_cgroup)
-    except OSError as exc:
+    except (OSError, AgentLoopError) as exc:
         if handle is not None:
             handle.close()
+        if held_fds is not None:
+            for fd in held_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if proc is not None and process_finished is not None:
+            process_finished(proc)
         lane_lock.close()
         raise AgentLoopError(f"Could not start test command: {exc}") from exc
 
@@ -324,6 +384,8 @@ def run_foreground_test(
         _terminate_process_group(proc)
         returncode = proc.wait()
     finally:
+        if process_finished is not None:
+            process_finished(proc)
         if selector is not None:
             selector.close()
         if proc.stdout is not None:
@@ -628,13 +690,31 @@ class Runner:
     def _finish_test_broker(self, broker: TestBrokerServer | None, turn_id: str | None) -> None:
         if broker is None:
             return
-        observations = broker.snapshot_journal()
+        try:
+            broker.stop()
+            observations = broker.snapshot_journal()
+        except BaseException as exc:
+            observations = (
+                LocalTestObservation(
+                    command=(),
+                    outcome="incomplete",
+                    provenance="telemetry-unverified",
+                    scope=EvidenceScope(),
+                    receipt_id=None,
+                    turn_id=turn_id,
+                    timestamp=datetime.now().astimezone().isoformat(),
+                    attribution=TreeAttribution(
+                        state="unknown", caveats=("broker journal snapshot failed",)
+                    ),
+                    environment_state="identity-unknown",
+                    caveats=(f"broker journal snapshot failed: {type(exc).__name__}",),
+                ),
+            )
         with self._active_procs_lock:
             self._local_test_observations.extend(observations)
             self._local_test_observations[:] = self._local_test_observations[-64:]
             if turn_id is not None:
                 self._active_test_brokers.pop(turn_id, None)
-        broker.stop()
 
     def _cleanup_new_test_brokers(self, existing: set[str]) -> None:
         with self._active_procs_lock:
@@ -643,10 +723,8 @@ class Runner:
                 for turn_id, broker in self._active_test_brokers.items()
                 if turn_id not in existing
             ]
-            for turn_id, _broker in candidates:
-                self._active_test_brokers.pop(turn_id, None)
-        for _turn_id, broker in candidates:
-            broker.stop()
+        for turn_id, broker in candidates:
+            self._finish_test_broker(broker, turn_id)
 
     def local_test_observations(self) -> tuple[LocalTestObservation, ...]:
         with self._active_procs_lock:
@@ -711,13 +789,13 @@ class Runner:
             procs = list(self._active_procs.values())
             handles = list(self._active_handles.values())
             brokers = list(self._active_test_brokers.items())
-        for _turn_id, broker in brokers:
-            broker.stop()
         for handle in handles:
             handle.terminate()
         for proc in procs:
             if proc.poll() is None:
                 self._terminate_process_group(proc)
+        for turn_id, broker in brokers:
+            self._finish_test_broker(broker, turn_id)
         # Do not let an interrupt return while a scope still owns descendants.
         # Escalate once after the bounded TERM confirmation window; ordinary
         # invocation cleanup will finish unregistering the handle.
@@ -974,8 +1052,6 @@ class Runner:
         use_pty: bool = False,
         timeout_seconds: float | None = None,
         containment_role: str | None = None,
-        broker: TestBrokerServer | None = None,
-        turn_id: str | None = None,
     ) -> CommandResult:
         cmd = [str(a) for a in args]
         if self.dry_run:
@@ -1038,8 +1114,12 @@ class Runner:
                     launch_env.update(broker.environment)
                 handle = self._prepare_containment(cmd, role=inferred_role, env=launch_env)
                 launch_cmd = list(handle.launcher_argv) if handle is not None and handle.managed else cmd
-                if handle is not None:
-                    launch_env["AGENT_LOOP_INVOCATION_ID"] = handle.invocation_id
+                if broker is not None:
+                    broker.set_execution_context(
+                        containment_handle=handle,
+                        process_started=self._register_active_process,
+                        process_finished=self._unregister_active_process,
+                    )
 
                 def spawn() -> subprocess.Popen[str]:
                     if input_text is not None:
@@ -1272,8 +1352,12 @@ class Runner:
                 role=containment_role or self._containment_role or self._role_from_label(label),
                 env=launch_env,
             )
-            if handle is not None:
-                launch_env["AGENT_LOOP_INVOCATION_ID"] = handle.invocation_id
+            if broker is not None:
+                broker.set_execution_context(
+                    containment_handle=handle,
+                    process_started=self._register_active_process,
+                    process_finished=self._unregister_active_process,
+                )
             if handle is not None and handle.managed:
                 # The closure reads this merged environment when the launcher
                 # is spawned.  Keep the PTY slave and regular descriptors

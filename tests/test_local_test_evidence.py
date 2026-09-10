@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -288,6 +289,52 @@ def test_broker_authenticates_turn_and_forwards_only_snapshot_environment(tmp_pa
         server.stop()
 
 
+def test_runner_broker_preserves_turn_binding_and_collects_receipt(tmp_path):
+    from coding_review_agent_loop.containment import default_policy
+    from coding_review_agent_loop.runner import Runner
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "initial"], check=True)
+    runner = Runner(containment_policy=default_policy(mode="off", cache_dir=tmp_path / ".runtime"))
+    script = (
+        "from coding_review_agent_loop.cli import main; import sys; "
+        "raise SystemExit(main(['run-tests','--timeout-seconds','5','--',"
+        "sys.executable,'-c','print(123)']))"
+    )
+    result = runner.run_with_log(
+        [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / "coder.log",
+        label="coder", progress_interval_seconds=1,
+    )
+    assert result.returncode == 0
+    observations = runner.local_test_observations()
+    assert len(observations) == 1
+    assert observations[0].outcome == "passed"
+    assert observations[0].turn_id
+
+
+def test_runner_exceptional_teardown_preserves_broker_journal(tmp_path):
+    from coding_review_agent_loop.containment import default_policy
+    from coding_review_agent_loop.runner import Runner
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    runner = Runner(containment_policy=default_policy(mode="off", cache_dir=tmp_path / ".runtime"))
+    script = (
+        "from coding_review_agent_loop.cli import main; import sys; "
+        "assert main(['run-tests','--timeout-seconds','5','--',sys.executable,'-c','print(1)']) == 0; "
+        "raise SystemExit(9)"
+    )
+    with pytest.raises(Exception, match="Command failed"):
+        runner.run_with_log(
+            [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / "coder.log",
+            label="coder", progress_interval_seconds=1,
+        )
+    assert [item.outcome for item in runner.local_test_observations()] == ["passed"]
+
+
 def test_confined_cwd_rejects_final_symlink_and_outside_escape(tmp_path):
     root = tmp_path / "checkout"
     root.mkdir()
@@ -312,6 +359,15 @@ def test_confined_cwd_rejects_final_symlink_and_outside_escape(tmp_path):
         open_confined_cwd(root, root / "final-link")
     with pytest.raises(Exception):
         open_confined_cwd(root, root / "escape" / "missing")
+
+
+def test_confined_cwd_repeated_name_does_not_treat_intermediate_as_final(tmp_path):
+    root = tmp_path / "checkout"
+    final = root / "target" / "b" / "a"
+    final.mkdir(parents=True)
+    (root / "a").symlink_to(root / "target", target_is_directory=True)
+    with open_confined_cwd(root, root / "a" / "b" / "a") as confined:
+        assert confined.path == final
 
 
 def test_base_reproduction_requires_clean_complete_stable_snapshots():

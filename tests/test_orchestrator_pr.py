@@ -3961,6 +3961,24 @@ def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rerevie
     assert "Do not take on\nlarger redesigns or unrelated future work" in followup_prompt
     assert "Add broader integration coverage later." in runner.comments[-1]
 
+
+def test_blocking_same_pr_followup_reaches_coder_even_when_approved_followups_ignored(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[
+            "### Same-PR follow-ups\n- Rename the helper before merge.\n"
+            "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Codex approves.\n" + prior_item_dispositions("[item-1] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=["Renamed helper.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+    )
+    config = make_config(tmp_path, approved_followups="ignore")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Rename the helper before merge." in followup_prompt
+    assert "does not enable a same-pr fix path" not in followup_prompt
+
 def test_pr_loop_fix_and_issue_uses_final_round_future_followups_after_same_pr_cleanup(tmp_path):
     runner = FakeRunner(
         codex_outputs=[

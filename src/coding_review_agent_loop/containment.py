@@ -319,7 +319,8 @@ class ConfinedCwd:
             current_fd = os.dup(root_fd)
             os.set_inheritable(current_fd, False)
             if relative != ".":
-                for component in Path(relative).parts:
+                parts = Path(relative).parts
+                for index, component in enumerate(parts):
                     if component in {"", "."}:
                         continue
                     if component == "..":
@@ -329,7 +330,7 @@ class ConfinedCwd:
                         | getattr(os, "O_DIRECTORY", 0)
                         | getattr(os, "O_CLOEXEC", 0)
                     )
-                    if component == Path(relative).parts[-1]:
+                    if index == len(parts) - 1:
                         component_flags |= os.O_NOFOLLOW
                     next_fd = os.open(
                         component,
@@ -894,6 +895,28 @@ def _shim(argv: Sequence[str]) -> int:
     return int(code if code >= 0 else 128 + (-code))
 
 
+def _held_exec(argv: Sequence[str]) -> int:
+    """Wait for the broker parent to attach this process before target exec."""
+    tokens = list(argv)
+    try:
+        ready_fd = int(tokens[tokens.index("--ready-fd") + 1])
+        release_fd = int(tokens[tokens.index("--release-fd") + 1])
+        remainder = tokens[tokens.index("--") + 1 :]
+    except (ValueError, IndexError):
+        return 2
+    if not remainder:
+        return 2
+    try:
+        os.write(ready_fd, b"1")
+        os.close(ready_fd)
+        if os.read(release_fd, 1) != b"1":
+            return 125
+        os.close(release_fd)
+        os.execvpe(remainder[0], remainder, os.environ)
+    except OSError:
+        return 126
+
+
 @dataclass
 class InvocationHandle:
     policy: ContainmentPolicy
@@ -1258,6 +1281,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
     if args[:1] == ["--shim"]:
         return _shim(args)
+    if args[:1] == ["--held-exec"]:
+        return _held_exec(args)
     return 2
 
 

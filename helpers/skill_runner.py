@@ -3399,6 +3399,11 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                     issue_context=primary_issue_context,
                     parent_issue_context=parent_issue_context,
                     human_requirements=human_requirements,
+                    local_test_evidence=(
+                        str(resume.get("local_test_evidence"))
+                        if resume.get("local_test_evidence")
+                        else None
+                    ),
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
                 )
             except Exception as exc:  # noqa: BLE001

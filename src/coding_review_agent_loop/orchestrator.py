@@ -4946,6 +4946,11 @@ def _implement_approved_issue(
             pr_number=pr_number,
             pr_head_sha=initial_pr_context.metadata.head_sha,
         )
+    initial_local_test_evidence = runner.render_local_test_evidence(
+        current_head=initial_pr_context.metadata.head_sha,
+        legacy_tests_run=implementation_result.tests_run,
+        cwd=active_workdir(implementation_config),
+    )
     initial_coder_body = _attach_round_metadata(
         render_public_agent_comment(
             kind="issue_implementation",
@@ -4953,6 +4958,7 @@ def _implement_approved_issue(
             agent=implementation_config.coder,
             config=implementation_config,
             model_used=coder_response.model_used,
+            local_test_evidence=initial_local_test_evidence,
         ),
         PostedRoundMetadata(
             flow="pr",
@@ -4962,11 +4968,7 @@ def _implement_approved_issue(
             subject=str(initial_pr_context.metadata.head_sha or "unknown"),
             prior_items=(),
             raw_structured_coder_response=coder_output,
-            local_test_evidence=runner.render_local_test_evidence(
-                current_head=initial_pr_context.metadata.head_sha,
-                legacy_tests_run=implementation_result.tests_run,
-                cwd=active_workdir(implementation_config),
-            ),
+            local_test_evidence=initial_local_test_evidence,
             model_used=coder_response.model_used,
             **_metadata_identity_fields(coder_response),
             acquisition_outcome=coder_response.acquisition_outcome,
@@ -6920,6 +6922,11 @@ def run_issue_loop(
             plan_hash=None,
             expected_closing_issue_ids=closing_contract.issue_ids,
         )
+        initial_local_test_evidence = runner.render_local_test_evidence(
+            current_head=initial_pr_metadata.head_sha,
+            legacy_tests_run=implementation_result.tests_run,
+            cwd=active_workdir(config),
+        )
         initial_coder_body = _attach_round_metadata(
             render_public_agent_comment(
                 kind="issue_implementation",
@@ -6927,6 +6934,7 @@ def run_issue_loop(
                 agent=config.coder,
                 config=config,
                 model_used=coder_response.model_used,
+                local_test_evidence=initial_local_test_evidence,
             ),
             PostedRoundMetadata(
                 flow="pr",
@@ -6936,11 +6944,7 @@ def run_issue_loop(
                 subject=str(initial_pr_metadata.head_sha or "unknown"),
                 prior_items=(),
                 raw_structured_coder_response=coder_output,
-                local_test_evidence=runner.render_local_test_evidence(
-                    current_head=initial_pr_metadata.head_sha,
-                    legacy_tests_run=implementation_result.tests_run,
-                    cwd=active_workdir(config),
-                ),
+                local_test_evidence=initial_local_test_evidence,
                 model_used=coder_response.model_used,
                 **_metadata_identity_fields(coder_response),
                 acquisition_outcome=coder_response.acquisition_outcome,
@@ -8833,33 +8837,18 @@ def run_pr_loop(
                             reviewer_new_unresolved_items.append(tracked_item)
                             next_unresolved_item_number += 1
                         if parsed_review.followups.same_pr:
-                            if config.approved_followups.startswith("fix-and-"):
-                                for followup in parsed_review.followups.same_pr:
-                                    tracked_item = _next_unresolved_item(
-                                        item_number=next_unresolved_item_number,
-                                        reviewer=followup.reviewer,
-                                        source_round=round_number,
-                                        text=followup.text,
-                                        status="same-pr",
-                                    )
-                                    round_new_unresolved_items.append(tracked_item)
-                                    reviewer_new_unresolved_items.append(tracked_item)
-                                    next_unresolved_item_number += 1
-                            else:
+                            # Once a review is blocking, its same-PR findings
+                            # belong in the mandatory fix round regardless of
+                            # the policy for optional follow-ups on an approved
+                            # review. The mode only controls publication of the
+                            # latter.
+                            for followup in parsed_review.followups.same_pr:
                                 tracked_item = _next_unresolved_item(
                                     item_number=next_unresolved_item_number,
-                                    reviewer=reviewer_name,
+                                    reviewer=followup.reviewer,
                                     source_round=round_number,
-                                    text="\n".join(
-                                        [
-                                            "Blocking review included Same-PR follow-ups, "
-                                            f"but --approved-followups={config.approved_followups} "
-                                            "does not enable a same-PR fix path.",
-                                            "",
-                                            _format_same_pr_followups(parsed_review.followups.same_pr),
-                                        ]
-                                    ),
-                                    status="blocking",
+                                    text=followup.text,
+                                    status="same-pr",
                                 )
                                 round_new_unresolved_items.append(tracked_item)
                                 reviewer_new_unresolved_items.append(tracked_item)
@@ -10016,6 +10005,25 @@ def run_pr_loop(
                 source_round=round_number,
             )
             updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+            local_test_evidence = runner.render_local_test_evidence(
+                current_head=updated_pr_context.metadata.head_sha,
+                legacy_tests_run=(
+                    coder_response.marker_value.tests_run
+                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                    else None
+                ),
+                cwd=active_workdir(config),
+            )
+            if isinstance(coder_response.marker_value, StructuredCoderFollowup):
+                public_comment = render_public_agent_comment(
+                    kind="coder_followup",
+                    parsed=coder_response.marker_value,
+                    agent=config.coder,
+                    prior_items=tuple(unresolved_items),
+                    config=config,
+                    model_used=coder_response.model_used,
+                    local_test_evidence=local_test_evidence,
+                )
 
             latest_coder_metadata = PostedRoundMetadata(
                 flow="pr",
@@ -10025,15 +10033,7 @@ def run_pr_loop(
                 subject=str(updated_pr_context.metadata.head_sha or "unknown"),
                 prior_items=tuple(unresolved_items),
                 raw_structured_coder_response=raw_structured_coder_response,
-                local_test_evidence=runner.render_local_test_evidence(
-                    current_head=updated_pr_context.metadata.head_sha,
-                    legacy_tests_run=(
-                        coder_response.marker_value.tests_run
-                        if isinstance(coder_response.marker_value, StructuredCoderFollowup)
-                        else None
-                    ),
-                    cwd=active_workdir(config),
-                ),
+                local_test_evidence=local_test_evidence,
                 compact_prior_summaries=tuple(pr_compact_prior_summaries),
                 model_used=coder_response.model_used,
                 acquisition_outcome=coder_response.acquisition_outcome,

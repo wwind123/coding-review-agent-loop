@@ -282,10 +282,9 @@ replayed nonces with different requests are rejected. Raw requests,
 capabilities, and environments are not logged.
 
 The client snapshots its actual cwd and environment after startup. The broker
-removes exactly the control variables
+removes exactly the transport control variables
 `AGENT_LOOP_TEST_BROKER_ENDPOINT`, `AGENT_LOOP_TEST_BROKER_CAPABILITY`,
-`AGENT_LOOP_TEST_BROKER_PROTOCOL`, and the other documented invocation
-metadata exclusions before launching the target, then supplies the
+and `AGENT_LOOP_TEST_BROKER_PROTOCOL` before launching the target, then supplies the
 authenticated `AGENT_LOOP_INVOCATION_ID`. All other variables, including
 `PATH`, virtual-environment, locale, inline-assignment, and test variables,
 remain comparison-bearing. Environment identity bytes are retained only in
@@ -303,6 +302,11 @@ containment-off mode still tears down the process group but makes no cgroup
 claim. Target output is streamed live, only the evidence copy is bounded, and
 the target exit code is preserved; wrapper statuses are reserved for
 infrastructure or context failures.
+
+If the broker channel is unavailable or rejects a request, `run-tests` reports
+that telemetry is unverified and executes the command locally in the coder's
+inherited scope. Both broker and fallback executions continue feeding the
+bounded runtime-timing sidecar when `--memory-dir` is supplied.
 
 Each observation records a typed outcome (`passed`, `failed`, `timed_out`,
 `interrupted`, `incomplete`, or overlap rejection), provenance, scope, opaque
