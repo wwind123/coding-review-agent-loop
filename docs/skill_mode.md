@@ -88,7 +88,11 @@ planning comment, so compact context and long comment histories cannot replace
 scope or deferred-work declarations. Issue and direct-PR resume validates the
 PR contract, issue-side handoff, and staged parent/child topology; absent or
 conflicting planning provenance is reported as an actionable recovery error.
-Ordinary direct PRs with no planning history continue without a plan context.
+Skill-mode implementation also records the PR-side primary-issue contract;
+resume uses that contract instead of guessing from the first issue reference in
+PR prose. Required issue-history reads fail closed when the plan handoff cannot
+be validated. Ordinary direct PRs with no planning history continue without a
+plan context.
 
 Signed human requirements use the surfaced positional `Requirement N` labels.
 The digest-backed internal identity detects insertion, reordering, and edits;

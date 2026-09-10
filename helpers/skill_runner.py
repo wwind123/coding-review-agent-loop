@@ -128,6 +128,7 @@ from coding_review_agent_loop.followups import (
 )
 from coding_review_agent_loop.memory import AgentMemoryContext, prepare_agent_memory
 from coding_review_agent_loop.issue_pr_handoff import find_latest_issue_pr_handoff
+from coding_review_agent_loop.pr_contract import find_latest_pr_contract
 from coding_review_agent_loop.runner import Runner, run_foreground_test, tail_text
 from coding_review_agent_loop.containment import default_policy
 from coding_review_agent_loop.test_runtime import (
@@ -956,7 +957,7 @@ def _fetch_issue_json(repo: str, issue: int, gh_cmd: str = "gh") -> dict:
 def _fetch_pr_json(repo: str, pr: int, gh_cmd: str = "gh") -> dict:
     result = subprocess.run(
         [gh_cmd, "pr", "view", str(pr), "--repo", repo,
-         "--json", "number,title,body,url,headRefOid,headRefName,baseRefName,state"],
+         "--json", "number,title,body,url,headRefOid,headRefName,baseRefName,state,comments"],
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
@@ -965,13 +966,82 @@ def _fetch_pr_json(repo: str, pr: int, gh_cmd: str = "gh") -> dict:
     return json.loads(result.stdout)
 
 
-_ISSUE_REFERENCE_RE = re.compile(r"(?:^|\s)(?:#|https://github\.com/[^/\s]+/[^/\s]+/issues/)(\d+)\b")
+def _pr_comments_from_info(repo: str, pr: int, pr_info: dict) -> list[types.SimpleNamespace]:
+    """Return PR conversation comments from the already-fetched PR record.
+
+    ``_fetch_pr_json`` requests comments in the same authenticated GitHub
+    response as the PR contract fields.  Treat a malformed comments field as a
+    handoff error; otherwise a plan-bound PR could be mistaken for an ordinary
+    direct PR and reviewed without its provenance.
+    """
+    raw_comments = pr_info.get("comments", [])
+    if raw_comments is None:
+        return []
+    if not isinstance(raw_comments, list):
+        raise AgentLoopError(
+            f"GitHub returned malformed comments for {repo} PR #{pr}; "
+            "cannot validate the PR handoff contract."
+        )
+    comments: list[types.SimpleNamespace] = []
+    for comment in raw_comments:
+        if not isinstance(comment, dict):
+            raise AgentLoopError(
+                f"GitHub returned malformed comments for {repo} PR #{pr}; "
+                "cannot validate the PR handoff contract."
+            )
+        body = comment.get("body")
+        if body is not None and not isinstance(body, str):
+            raise AgentLoopError(
+                f"GitHub returned a malformed PR comment body for {repo} PR #{pr}; "
+                "cannot validate the PR handoff contract."
+            )
+        if isinstance(body, str):
+            comments.append(types.SimpleNamespace(body=body))
+    return comments
 
 
-def _linked_issue_number_from_pr(pr_info: dict) -> int | None:
-    body = str(pr_info.get("body") or "")
-    match = _ISSUE_REFERENCE_RE.search(body)
-    return int(match.group(1)) if match else None
+def _pr_contract_from_info(repo: str, pr: int, pr_info: dict):
+    return find_latest_pr_contract(
+        _pr_comments_from_info(repo, pr, pr_info),
+        repository=repo,
+        pr_number=pr,
+    )
+
+
+def _authoritative_issue_number_from_pr(repo: str, pr: int, pr_info: dict) -> int | None:
+    """Resolve a skill PR's primary issue without trusting incidental prose.
+
+    A PR-side contract is authoritative whenever present.  Only an unplanned
+    direct PR may use one unique strong closing reference as a convenience for
+    issue-context enrichment; multiple references intentionally produce no
+    inferred issue rather than guessing.
+    """
+    pr_contract = _pr_contract_from_info(repo, pr, pr_info)
+    if pr_contract is not None:
+        if pr_contract.origin_flow == "approved-plan-implementation":
+            if pr_contract.primary_issue_number is None:
+                raise AgentLoopError(
+                    f"{repo} PR #{pr} declares approved-plan provenance but its PR contract "
+                    "has no primary issue. Repair the PR contract before reviewing."
+                )
+            return pr_contract.primary_issue_number
+        if pr_contract.primary_issue_number is not None:
+            return pr_contract.primary_issue_number
+
+    from coding_review_agent_loop.github import parse_issue_reference_evidence
+
+    issue_numbers = {
+        evidence.issue_number
+        for evidence in parse_issue_reference_evidence(
+            str(pr_info.get("body") or ""),
+            repo=repo,
+            include_non_closing=False,
+        )
+        if evidence.closing and evidence.target_repo.casefold() == repo.casefold()
+    }
+    if len(issue_numbers) == 1:
+        return next(iter(issue_numbers))
+    return None
 
 
 def _noop_pr_fix_result(pr: int, reason: str, **fields: object) -> dict:
@@ -999,12 +1069,32 @@ def _fetch_issue_comments_raw(repo: str, issue: int, gh_cmd: str = "gh") -> list
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
-        return []
+        raise AgentLoopError(
+            f"Unable to read issue #{issue} comments in {repo}: "
+            f"{result.stderr.strip() or 'gh issue view failed'}. "
+            "The approved-plan handoff cannot be validated; repair access or retry."
+        )
     try:
         data = json.loads(result.stdout)
-        return [c["body"] for c in data.get("comments", []) if isinstance(c, dict) and "body" in c]
-    except (json.JSONDecodeError, KeyError):
-        return []
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(
+            f"Unable to parse issue #{issue} comments in {repo}; "
+            "the approved-plan handoff cannot be validated. Retry after GitHub returns valid JSON."
+        ) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("comments"), list):
+        raise AgentLoopError(
+            f"GitHub returned malformed comments for issue #{issue} in {repo}; "
+            "the approved-plan handoff cannot be validated."
+        )
+    bodies: list[str] = []
+    for comment in data["comments"]:
+        if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+            raise AgentLoopError(
+                f"GitHub returned malformed comments for issue #{issue} in {repo}; "
+                "the approved-plan handoff cannot be validated."
+            )
+        bodies.append(comment["body"])
+    return bodies
 
 
 def _recover_skill_pr_plan_context(
@@ -1019,14 +1109,30 @@ def _recover_skill_pr_plan_context(
     handoff.  Both are validated before the plan is exposed to a reviewer or
     coder.  A plain direct PR with no approved-plan handoff returns ``None``.
     """
-    issue_number = _linked_issue_number_from_pr(pr_info)
+    pr_contract = _pr_contract_from_info(repo, pr, pr_info)
+    if pr_contract is not None and pr_contract.origin_flow != "approved-plan-implementation":
+        # A direct/managed PR contract is explicit provenance for an ordinary
+        # PR, not evidence that an approved plan must be recovered.
+        return None
+
+    issue_number = _authoritative_issue_number_from_pr(repo, pr, pr_info)
     if issue_number is None:
         return None
 
-    comments = [
-        types.SimpleNamespace(body=body)
-        for body in _fetch_issue_comments_raw(repo, issue_number)
-    ]
+    try:
+        comments = [
+            types.SimpleNamespace(body=body)
+            for body in _fetch_issue_comments_raw(repo, issue_number)
+        ]
+    except AgentLoopError:
+        # Without a PR-side approved-plan contract this may be an ordinary
+        # direct PR whose body happens to contain one closing reference. Such
+        # a PR remains supported without issue-history enrichment. A contract
+        # explicitly declaring approved-plan provenance, however, must fail
+        # closed when its issue history cannot be read.
+        if pr_contract is None:
+            return None
+        raise
 
     issue_handoff = find_latest_issue_pr_handoff(
         comments,
@@ -1176,6 +1282,15 @@ def _recover_skill_pr_plan_context(
             return context
 
     if expected_hash is None:
+        if (
+            pr_contract is not None
+            and pr_contract.origin_flow == "approved-plan-implementation"
+        ):
+            raise AgentLoopError(
+                f"PR #{pr} declares approved-plan provenance, but issue #{issue_number} "
+                "has no validated approved-plan handoff. Restore the issue handoff or "
+                "repair the PR contract before reviewing."
+            )
         return None
 
     context = recover_approved_plan_context(
@@ -2817,7 +2932,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
 
     issue_dict = _fetch_pr_json(repo, pr)
     approved_plan_context = _recover_skill_pr_plan_context(repo, pr, issue_dict)
-    parent_issue_number = _linked_issue_number_from_pr(issue_dict)
+    parent_issue_number = _authoritative_issue_number_from_pr(repo, pr, issue_dict)
     pr_diff = _fetch_pr_diff(repo, pr)
 
     # Repo-scoped agent memory for reviewer orientation (#306), prepared once.
@@ -3386,6 +3501,7 @@ def _run_child_or_one_shot_implementation(
         validate_open_pr,
         validate_pr_references_issue,
     )
+    from coding_review_agent_loop.pr_contract import make_pr_contract, render_pr_contract_marker
     from coding_review_agent_loop.orchestrator import (
         _TerminalIssueImplementationConflict,
         _TerminalNoPrImplementation,
@@ -3519,6 +3635,17 @@ def _run_child_or_one_shot_implementation(
                 runner, config=config, pr_number=pr_number,
             ).metadata.head_sha or "unknown"
 
+        # Persist the PR-side provenance that selects the primary issue. Skill
+        # mode otherwise has only an issue-side one-shot marker, leaving later
+        # review/fix resumes to guess from arbitrary PR prose (especially when
+        # the PR mentions several issues).
+        pr_contract = make_pr_contract(
+            repository=repo,
+            pr_number=pr_number,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=issue,
+            expected_closing_issue_ids=(issue,),
+        )
         rendered_output = tmpdir / "impl-rendered.md"
         _write_text(
             rendered_output,
@@ -3543,10 +3670,18 @@ def _run_child_or_one_shot_implementation(
             "--state", "approved",
             "--raw-structured-coder-response-file", str(raw_output),
         )
+        tagged_with_contract = tmpdir / "impl-tagged-with-contract.md"
+        _write_text(
+            tagged_with_contract,
+            tagged.read_text(encoding="utf-8").rstrip()
+            + "\n\n"
+            + render_pr_contract_marker(pr_contract)
+            + "\n",
+        )
         if not dry_run:
             _run_helper(
                 "helpers.gh_ops", "post-issue-comment",
-                "--issue", str(pr_number), "--file", str(tagged), "--repo", repo,
+                "--issue", str(pr_number), "--file", str(tagged_with_contract), "--repo", repo,
             )
             if post_one_shot_handoff:
                 handoff = tmpdir / "impl-handoff.md"
@@ -3756,7 +3891,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         auto_agent_dirs=(),
     )
     runner = Runner(dry_run=dry_run)
-    linked_issue = _linked_issue_number_from_pr(pr_info)
+    linked_issue = _authoritative_issue_number_from_pr(repo, pr, pr_info)
     issue_context = (
         get_issue_context(runner, config=config, issue_number=linked_issue)
         if linked_issue is not None and not dry_run

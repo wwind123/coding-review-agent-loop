@@ -1783,6 +1783,87 @@ class TestSkillApprovedPlanRecovery:
         assert context.canonical_text == plan
         assert context.plan_hash == approved_plan_hash(plan)
 
+    def test_pr_contract_primary_issue_wins_over_multiple_body_references(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.decomposition import (
+            approved_plan_hash,
+            format_one_shot_impl_handoff_comment,
+        )
+        from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+        from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+
+        plan = "Approved contract-selected plan.\n\n### Scope\n- Preserve the API."
+        issue_comments = [
+            _attach_round_metadata(
+                plan,
+                PostedRoundMetadata(
+                    flow="plan",
+                    role="coder",
+                    agent="Claude",
+                    round_number=1,
+                    subject=_plan_subject(plan),
+                    canonical_plan=plan,
+                    raw_structured_coder_response=plan,
+                ),
+            ),
+            format_one_shot_impl_handoff_comment(
+                parent_issue=42,
+                mode="implement-one-shot",
+                plan_hash=approved_plan_hash(plan),
+                plan_subject=_plan_subject(plan),
+                pr_number=7,
+                pr_head_sha="head-7",
+            ),
+        ]
+        contract = make_pr_contract(
+            repository="owner/repo",
+            pr_number=7,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=42,
+            expected_closing_issue_ids=(42,),
+        )
+        monkeypatch.setattr(sr, "_fetch_issue_comments_raw", lambda repo, issue: issue_comments)
+
+        context = sr._recover_skill_pr_plan_context(
+            "owner/repo",
+            7,
+            {
+                "body": "Fixes #99\nFixes #42",
+                "comments": [{"body": format_pr_contract_comment(contract)}],
+            },
+        )
+
+        assert context is not None and context.is_available
+        assert context.canonical_text == plan
+
+    def test_plan_bound_recovery_reports_issue_comment_read_failure(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+
+        contract = make_pr_contract(
+            repository="owner/repo",
+            pr_number=7,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=42,
+            expected_closing_issue_ids=(42,),
+        )
+
+        def fail_to_read(repo, issue):
+            raise AgentLoopError("GitHub issue comments unavailable")
+
+        monkeypatch.setattr(sr, "_fetch_issue_comments_raw", fail_to_read)
+
+        with pytest.raises(AgentLoopError, match="GitHub issue comments unavailable"):
+            sr._recover_skill_pr_plan_context(
+                "owner/repo",
+                7,
+                {
+                    "body": "Fixes #99\nFixes #42",
+                    "comments": [{"body": format_pr_contract_comment(contract)}],
+                },
+            )
+
     def test_unplanned_direct_pr_does_not_require_plan(self) -> None:
         import helpers.skill_runner as sr
 
