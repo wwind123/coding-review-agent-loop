@@ -2782,7 +2782,9 @@ def _write_host_review_request(
     _write_text(request_dir / material_filename, review_material)
     _write_json(request_dir / "prior_items.json", next_prior_items_raw)
     stale_plan_file = request_dir / "approved-plan.md"
+    stale_requirements_file = request_dir / "signed-human-requirements.md"
     approved_plan_file: str | None = None
+    human_requirements_file: str | None = None
     approved_plan_metadata: dict[str, object] | None = None
     if approved_plan_context is not None:
         if not approved_plan_context.is_available:
@@ -2811,6 +2813,28 @@ def _write_host_review_request(
         # plan-bound.
         try:
             stale_plan_file.unlink()
+        except FileNotFoundError:
+            pass
+    if human_requirements:
+        from coding_review_agent_loop.prompts import (
+            _human_requirements_review_guidance,
+            format_human_requirements,
+        )
+
+        human_requirements_file = "signed-human-requirements.md"
+        rendered_requirements = "\n\n".join((
+            # This is a local handoff artifact rather than a provider-bounded
+            # prompt. Render every requirement so validation never expects an
+            # ID that the host could not inspect.
+            format_human_requirements(human_requirements, max_chars=sys.maxsize),
+            _human_requirements_review_guidance(human_requirements),
+        ))
+        _write_text(stale_requirements_file, rendered_requirements.rstrip() + "\n")
+    else:
+        # Request directories are reused across retries. Never leave a stale
+        # signed-requirements contract in a later handoff with no requirements.
+        try:
+            stale_requirements_file.unlink()
         except FileNotFoundError:
             pass
     context_payload: dict[str, object] = {
@@ -2861,6 +2885,8 @@ def _write_host_review_request(
         manifest["approved_plan_file"] = approved_plan_file
         manifest["approved_plan_hash"] = approved_plan_context.plan_hash
         manifest["approved_plan_subject"] = approved_plan_context.plan_subject
+    if human_requirements_file is not None:
+        manifest["human_requirements_file"] = human_requirements_file
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return request_dir
 
@@ -3442,7 +3468,9 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         print(
             f"skill_runner: host review pending — read the PR-bound approved plan in "
             f"{request_dir}/approved-plan.md when present, the labeled issue context "
-            f"artifacts when present, then read the PR diff in "
+            f"artifacts when present, and the signed requirement contract in "
+            f"{request_dir}/signed-human-requirements.md when present; then read the "
+            f"PR diff in "
             f"{request_dir}/pr-diff.diff, "
             f"write your pr_review JSON to {request_dir}/host-review.md, then run: "
             f"python -m helpers.skill_runner complete-host-review --dir {request_dir}{dry_run_flag}",

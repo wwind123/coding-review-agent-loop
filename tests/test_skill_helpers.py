@@ -3326,6 +3326,50 @@ class TestHostReviewerPR:
         with pytest.raises(AgentLoopError, match="identity validation"):
             sr._validate_host_review_plan_artifact(request_dir, manifest)
 
+    def test_pr_host_handoff_renders_signed_requirement_contract(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import helpers.skill_runner as sr
+
+        monkeypatch.setattr(sr, "_REPAIR_BASE", tmp_path)
+        requirement = HumanReviewRequirement(
+            source_type="PR comment",
+            author="owner",
+            created_at="2026-09-10T01:00:00Z",
+            url="https://github.com/owner/repo/pull/7#issuecomment-2",
+            body="Preserve the legacy command alias.",
+        )
+        request_dir = sr._write_host_review_request(
+            flow="pr",
+            validate_kind="pr_review",
+            issue=7,
+            repo="owner/repo",
+            new_round_number=1,
+            round_subject="head-7",
+            review_material="diff --git a/x b/x",
+            material_filename="pr-diff.diff",
+            next_prior_items_raw=[],
+            current_round_items=[],
+            item_id_offset=0,
+            dry_run=True,
+            human_requirements=(requirement,),
+        )
+
+        rendered = (request_dir / "signed-human-requirements.md").read_text(
+            encoding="utf-8"
+        )
+        assert f"Requirement {requirement.requirement_id}:" in rendered
+        assert requirement.body in rendered
+        assert "HUMAN_REQUIREMENTS_RESOLVED" in rendered
+        assert (
+            "If any signed human requirement in this set is unresolved, return blocking."
+            in rendered
+        )
+        manifest = json.loads((request_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["human_requirements_file"] == "signed-human-requirements.md"
+        context = json.loads((request_dir / "context.json").read_text(encoding="utf-8"))
+        assert context["human_requirements"][0]["body"] == requirement.body
+
     def test_pr_round_with_claude_reviewer_is_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
@@ -3409,6 +3453,59 @@ class TestHostReviewerPR:
             # Flow-aware hint must point at run-pr-round, not run-plan-round.
             assert "run-pr-round" in result.stderr
             assert "run-plan-round" not in result.stderr
+
+    def test_complete_host_review_pr_enforces_surfaced_signed_requirement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            request_dir = self._make_pr_host_review_dir(tmppath)
+            requirement = HumanReviewRequirement(
+                source_type="PR comment",
+                author="owner",
+                created_at="2026-09-10T01:00:00Z",
+                url="https://github.com/owner/repo/pull/9994#issuecomment-2",
+                body="Preserve the legacy command alias.",
+            )
+            (request_dir / "context.json").write_text(
+                json.dumps({
+                    "reviewer": "Claude",
+                    "prior_items": [],
+                    "current_round_items": [],
+                    "human_requirements": [{
+                        "source_type": requirement.source_type,
+                        "author": requirement.author,
+                        "created_at": requirement.created_at,
+                        "url": requirement.url,
+                        "body": requirement.body,
+                    }],
+                }),
+                encoding="utf-8",
+            )
+
+            rejected = _run(
+                "helpers.skill_runner", "complete-host-review",
+                "--dir", str(request_dir),
+                "--dry-run",
+                env=env,
+                check=False,
+            )
+            assert rejected.returncode != 0
+            assert "HUMAN_REQUIREMENTS_RESOLVED" in rejected.stderr
+
+            approved = _VALID_PR_REVIEW_DRY.replace(
+                "<!-- AGENT_STATE: approved -->",
+                "<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n<!-- AGENT_STATE: approved -->",
+            )
+            (request_dir / "host-review.md").write_text(approved, encoding="utf-8")
+            accepted = _run(
+                "helpers.skill_runner", "complete-host-review",
+                "--dir", str(request_dir),
+                "--dry-run",
+                env=env,
+                check=False,
+            )
+            assert accepted.returncode == 0, f"{accepted.stdout}\n{accepted.stderr}"
 
     def test_complete_host_review_pr_missing_file_references_pr_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -121,10 +121,15 @@ mirroring the CLI's `--coder` / `--reviewer` reversal — so an external agent
   plan and PR rounds); re-running the round then recomputes the final state.
   For a plan-bound PR, the request dir contains the complete canonical
   `approved-plan.md` plus its hash, subject, scope, and deferred-work metadata;
-  read that artifact alongside `pr-diff.diff`. `complete-host-review` validates
-  the artifact identity before posting the review, so a changed or missing plan
-  is an actionable handoff error rather than a diff-only review. Direct PRs with
-  no planning provenance have no plan artifact.
+  read that artifact alongside `pr-diff.diff`. When signed human requirements
+  are surfaced from the authoritative parent, primary issue, or PR, the request
+  also contains `signed-human-requirements.md`. The host must read that rendered
+  contract, verify every stable `hr-…` ID, and include the documented resolution
+  marker before approving. The serialized context remains the validation source;
+  it is not a substitute for reading the rendered artifact.
+  `complete-host-review` validates the plan artifact identity before posting the
+  review, so a changed or missing plan is an actionable handoff error rather than
+  a diff-only review. Direct PRs with no planning provenance have no plan artifact.
 - **Implement, reversed**: after a plan is approved, an external coder emits the
   typed `issue_implementation` result and may open a PR — see [Approved-plan
   execution helpers](#approved-plan-execution-helpers) — which the host then
