@@ -105,12 +105,16 @@ def test_validate_coder_followup_response_accepts_structured_item_partition():
     [("blocking", "blocked"), ("approved", "not-applicable")],
 )
 def test_validate_coder_followup_response_uses_disposition_aware_requirement_ledger(state, disposition):
+    requirement = HumanReviewRequirement(
+        source_type="PR comment", author="reviewer", created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1", body="Please use the absolute URL.",
+    )
     response = structured_coder_followup(
         state=state,
         addressed_items=["item-1"],
         human_requirement_ids=[],
         human_requirement_dispositions=[{
-            "requirement_id": "Requirement 1", "disposition": disposition,
+            "requirement_id": requirement.requirement_id, "disposition": disposition,
             "evidence": "The dependency is unavailable." if disposition == "blocked" else "Requirement does not apply.",
         }],
     )
@@ -120,20 +124,21 @@ def test_validate_coder_followup_response_uses_disposition_aware_requirement_led
             item_id="item-1", reviewer="OpenAI Codex", source_round=1,
             text="Add a regression test.", status="blocking",
         ),),
-        human_requirements=(HumanReviewRequirement(
-            source_type="PR comment", author="reviewer", created_at="2026-05-18T10:00:00Z",
-            url="https://github.com/OWNER/REPO/pull/77#issuecomment-1", body="Please use the absolute URL.",
-        ),),
+        human_requirements=(requirement,),
     )
     assert parsed.human_requirements.addressed_ids == ()
 
 
 def test_validate_coder_followup_response_rejects_mismatched_requirement_ledger():
+    requirement = HumanReviewRequirement(
+        source_type="PR comment", author="reviewer", created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1", body="Please use the absolute URL.",
+    )
     response = structured_coder_followup(
         addressed_items=["item-1"],
         human_requirement_ids=[],
         human_requirement_dispositions=[{
-            "requirement_id": "Requirement 1", "disposition": "addressed",
+            "requirement_id": requirement.requirement_id, "disposition": "addressed",
             "evidence": "Implemented the requested change.",
         }],
     )
@@ -144,10 +149,7 @@ def test_validate_coder_followup_response_rejects_mismatched_requirement_ledger(
                 item_id="item-1", reviewer="OpenAI Codex", source_round=1,
                 text="Add a regression test.", status="blocking",
             ),),
-            human_requirements=(HumanReviewRequirement(
-                source_type="PR comment", author="reviewer", created_at="2026-05-18T10:00:00Z",
-                url="https://github.com/OWNER/REPO/pull/77#issuecomment-1", body="Please use the absolute URL.",
-            ),),
+            human_requirements=(requirement,),
         )
 
 def test_validate_coder_followup_response_rejects_issue_acceptance_criteria_as_human_requirement():
@@ -200,11 +202,18 @@ def test_validate_coder_followup_response_rejects_requirement_label_when_none_su
         )
 
 def test_validate_coder_followup_response_accepts_surfaced_requirement_label():
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-06-02T12:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/1#issuecomment-1",
+        body="Add coverage for the rejected label case.",
+    )
     response = structured_coder_followup(
         state="blocking",
         addressed_items=["item-1"],
         remaining_items=[],
-        human_requirement_ids=["Requirement 1"],
+        human_requirement_ids=[requirement.requirement_id],
         reviewer="OpenAI Codex",
     )
 
@@ -219,18 +228,10 @@ def test_validate_coder_followup_response_accepts_surfaced_requirement_label():
                 status="blocking",
             ),
         ),
-        human_requirements=(
-            HumanReviewRequirement(
-                source_type="PR comment",
-                author="maintainer",
-                created_at="2026-06-02T12:00:00Z",
-                url="https://github.com/OWNER/REPO/pull/1#issuecomment-1",
-                body="Add coverage for the rejected label case.",
-            ),
-        ),
+        human_requirements=(requirement,),
     )
 
-    assert parsed.human_requirements.addressed_ids == ("Requirement 1",)
+    assert parsed.human_requirements.addressed_ids == (requirement.requirement_id,)
 
 def test_validate_coder_followup_response_rejects_mixed_valid_and_invalid_requirement_labels():
     response = structured_coder_followup(

@@ -202,6 +202,11 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                             for item in record.metadata.new_items
                         ],
                         "usage": record.metadata.usage,
+                        "approved_plan_hash": record.metadata.approved_plan_hash,
+                        "approved_plan_subject": record.metadata.approved_plan_subject,
+                        "surfaced_reviewer_requirement_ids": list(
+                            record.metadata.surfaced_reviewer_requirement_ids
+                        ),
                     }
                     for record in resumed.completed_reviews
                 ]
@@ -241,6 +246,11 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                             for item in record.metadata.new_items
                         ],
                         "usage": record.metadata.usage,
+                        "approved_plan_hash": record.metadata.approved_plan_hash,
+                        "approved_plan_subject": record.metadata.approved_plan_subject,
+                        "surfaced_reviewer_requirement_ids": list(
+                            record.metadata.surfaced_reviewer_requirement_ids
+                        ),
                     }
                     for record in result.completed_reviews
                 ]
@@ -346,6 +356,11 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         usage=usage,
         raw_structured_coder_response=raw_structured_coder_response,
         compact_prior_summaries=compact_prior_summaries,
+        approved_plan_hash=getattr(args, "approved_plan_hash", None),
+        approved_plan_subject=getattr(args, "approved_plan_subject", None),
+        surfaced_reviewer_requirement_ids=tuple(
+            getattr(args, "surfaced_reviewer_requirement_ids", ()) or ()
+        ),
     )
     augmented = _attach_round_metadata(body, metadata)
 
@@ -425,6 +440,12 @@ def main() -> None:
                         help="JSON array of compact prior summaries to persist in AGENT_LOOP_META.")
     p_meta.add_argument("--canonical-plan-file", default=None,
                         help="Plan text file (written as canonical_plan for coder turns).")
+    p_meta.add_argument("--approved-plan-hash", default=None,
+                        help="Hash of the approved plan surfaced to a PR reviewer.")
+    p_meta.add_argument("--approved-plan-subject", default=None,
+                        help="Full subject hash of the approved plan surfaced to a PR reviewer.")
+    p_meta.add_argument("--surfaced-reviewer-requirement-ids", nargs="*", default=(),
+                        help="Stable signed-requirement IDs surfaced to a PR reviewer.")
 
     # build-resume
     p_resume = subparsers.add_parser("build-resume", help="Build a resume descriptor from GitHub comments.")

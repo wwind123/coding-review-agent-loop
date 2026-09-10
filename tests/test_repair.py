@@ -17,15 +17,30 @@ from coding_review_agent_loop.protocol import (
 )
 from coding_review_agent_loop.orchestrator import _new_usage_context, _structured_response_candidates
 
+_PLAN_REQUIREMENT = HumanReviewRequirement(
+    source_type="Issue body",
+    author="maintainer",
+    created_at="2026-05-17T08:00:00Z",
+    url="https://github.com/OWNER/REPO/issues/56",
+    body="Keep the public API unchanged.",
+)
+_PR_REQUIREMENT = HumanReviewRequirement(
+    source_type="PR comment",
+    author="maintainer",
+    created_at="2026-05-18T10:00:00Z",
+    url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+    body="Please use the absolute URL.",
+)
+
 
 def _initial_plan_with_human_requirements() -> str:
     acknowledgement = (
         f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
         "### Human requirements\n"
-        "- Requirement 1: keep the public API unchanged."
+        f"- Requirement {_PLAN_REQUIREMENT.requirement_id}: keep the public API unchanged."
     )
     return structured_plan_state(human_requirement_dispositions=[
-        {"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The plan preserves the public API."}
+        {"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "addressed", "evidence": "The plan preserves the public API."}
     ]).replace(
         "\n<!-- AGENT_PLAN_STATE: blocking -->",
         acknowledgement + "\n<!-- AGENT_PLAN_STATE: blocking -->",
@@ -1491,15 +1506,22 @@ def test_recover_plan_revision_ack_text_override_uses_stripped_as_base(tmp_path)
     ack = (
         "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
         "### Human requirements\n"
-        "- Requirement 1: The revised plan covers the stripped-base case.\n"
+        f"- Requirement {human_requirements[0].requirement_id}: The revised plan covers the stripped-base case.\n"
     )
     dirty_text = structured_plan_revision(
         prior_plan_item_dispositions=[{"item_id": "unknown-prior-item-1", "disposition": "resolved"}],
     )
     stripped_text = structured_plan_revision(human_requirement_dispositions=[
-        {"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The revised plan covers the stripped-base case."}
+        {"requirement_id": human_requirements[0].requirement_id, "disposition": "addressed", "evidence": "The revised plan covers the stripped-base case."}
     ])
-    message_text = structured_plan_revision(human_requirements=ack)
+    message_text = structured_plan_revision(
+        human_requirements=ack,
+        human_requirement_dispositions=[{
+            "requirement_id": human_requirements[0].requirement_id,
+            "disposition": "addressed",
+            "evidence": "The revised plan covers the stripped-base case.",
+        }],
+    )
 
     result = AgentResult(
         text=dirty_text,
@@ -1850,7 +1872,7 @@ def test_repair_prompt_contains_coder_followup_format():
 
 def test_repair_prompt_distinguishes_item_ids_from_requirement_labels():
     """Repair prompt must warn that addressed_items uses item IDs, not requirement labels."""
-    assert "Requirement 1" in _REPAIR_PROMPT
+    assert "hr-0000000000000000000000000000000000000000000000000000000000000000" in _REPAIR_PROMPT
     assert "addressed_ids" in _REPAIR_PROMPT
     # The prompt must explicitly state item IDs cannot contain spaces
     assert "spaces" in _REPAIR_PROMPT or "DO NOT CONFUSE" in _REPAIR_PROMPT or "NEVER put" in _REPAIR_PROMPT
@@ -2091,7 +2113,7 @@ def test_surfaced_reviewer_requirement_ids_pr_uses_merged_requirements():
         ),
     )
     ids = _surfaced_reviewer_requirement_ids(hr, requirement_scope="PR requirements")
-    assert ids == ("Requirement 1",)
+    assert ids == (hr[0].requirement_id,)
 
 def test_surfaced_reviewer_requirement_ids_plan_uses_issue_requirements():
     """Plan loop helper returns IDs using planning requirements scope."""
@@ -2112,8 +2134,7 @@ def test_surfaced_reviewer_requirement_ids_plan_uses_issue_requirements():
         ),
     )
     ids = _surfaced_reviewer_requirement_ids(hr, requirement_scope="planning requirements")
-    assert "Requirement 1" in ids
-    assert "Requirement 2" in ids
+    assert ids == (hr[0].requirement_id, hr[1].requirement_id)
 
 def test_surfaced_reviewer_requirement_ids_empty_for_no_requirements():
     ids = _surfaced_reviewer_requirement_ids([], requirement_scope="PR requirements")
@@ -2159,7 +2180,7 @@ def test_pr_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
 
     def fake_repair(raw, gemini_cmd, *, expected_kind=None, reviewer_requirement_ids=None, **kwargs):
         assert expected_kind == "pr_review"
-        assert reviewer_requirement_ids == ("Requirement 1",)
+        assert reviewer_requirement_ids == (_PR_REQUIREMENT.requirement_id,)
         return repaired_with_marker
 
     with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
@@ -2266,7 +2287,7 @@ def test_plan_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
         state="approved",
         reviewer="OpenAI Codex",
         human_requirements_resolved=True,
-        human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
+        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "addressed", "evidence": "The canonical plan preserves the API."}],
     )
     runner = FakeRunner(
         issue_payload=_issue_with_human_requirement(),
@@ -2277,7 +2298,7 @@ def test_plan_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
 
     def fake_repair(raw, gemini_cmd, *, expected_kind=None, reviewer_requirement_ids=None, **kwargs):
         assert expected_kind == "plan_review"
-        assert reviewer_requirement_ids == ("Requirement 1",)
+        assert reviewer_requirement_ids == (_PLAN_REQUIREMENT.requirement_id,)
         return repaired_with_marker
 
     with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
@@ -2306,7 +2327,7 @@ def test_plan_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_p
         summary="Requirement 1 not satisfied: plan changes the public API.",
         blocking_plan_issues=["Requirement 1 not satisfied: plan changes the public API."],
         reviewer="OpenAI Codex",
-        human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "The plan changes the public API."}],
+        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "blocked", "evidence": "The plan changes the public API."}],
     )
     revision = structured_plan_revision(
         summary="Revised plan preserving the public API.",
@@ -2560,7 +2581,7 @@ def test_plan_loop_repair_blocking_records_same_plan_followups(tmp_path):
         state="blocking",
         same_plan_followups=["Add a regression test for the parser edge case."],
         reviewer="OpenAI Codex",
-        human_requirement_dispositions=[{"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "A parser regression test is required."}],
+        human_requirement_dispositions=[{"requirement_id": _PLAN_REQUIREMENT.requirement_id, "disposition": "blocked", "evidence": "A parser regression test is required."}],
     )
     revision = structured_plan_revision(
         summary="Revised plan with regression test.",
@@ -2990,11 +3011,16 @@ def test_run_validated_agent_recovers_plan_revision_human_ack_from_message_text(
     acknowledgement = (
         "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
         "### Human requirements\n"
-        "- Requirement 1: The revised plan covers stdout acknowledgement recovery.\n"
+        f"- Requirement {human_requirements[0].requirement_id}: The revised plan covers stdout acknowledgement recovery.\n"
     )
     message_text = structured_plan_revision(
         reviewer="Anthropic Claude",
         human_requirements=acknowledgement,
+        human_requirement_dispositions=[{
+            "requirement_id": human_requirements[0].requirement_id,
+            "disposition": "addressed",
+            "evidence": "The revised plan covers stdout acknowledgement recovery.",
+        }],
     )
     runner = FakeRunner(
         claude_outputs=[(message_text, 0)],
@@ -3091,11 +3117,11 @@ def test_run_validated_agent_refuses_plan_revision_missing_direct_discussion_ack
     )
     runner = FakeRunner(
         claude_outputs=[
-            (
-                structured_plan_revision(
-                    reviewer="Anthropic Claude",
-                    human_requirements=acknowledgement,
-                ),
+                (
+                    structured_plan_revision(
+                        reviewer="Anthropic Claude",
+                        human_requirements=acknowledgement,
+                    ),
                 0,
             )
         ],
@@ -3199,7 +3225,7 @@ def test_run_validated_agent_strip_unknown_disposition_then_ack_recovery_succeed
     )
     acknowledgement = (
         "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
-        "### Human requirements\n- Requirement 1: Covered.\n"
+        f"### Human requirements\n- Requirement {human_requirements[0].requirement_id}: Covered.\n"
     )
     response_file = structured_plan_revision(
         reviewer="Anthropic Claude",
@@ -3213,6 +3239,11 @@ def test_run_validated_agent_strip_unknown_disposition_then_ack_recovery_succeed
                 structured_plan_revision(
                     reviewer="Anthropic Claude",
                     human_requirements=acknowledgement,
+                    human_requirement_dispositions=[{
+                        "requirement_id": human_requirements[0].requirement_id,
+                        "disposition": "addressed",
+                        "evidence": "Covered.",
+                    }],
                 ),
                 0,
             )

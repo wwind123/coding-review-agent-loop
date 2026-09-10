@@ -77,24 +77,23 @@ def test_no_signed_requirements_requires_empty_collection():
 
 
 def test_initial_plan_validator_checks_coder_dispositions():
+    requirement = HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at=None,
+        url=None,
+        body="Provide Grafana.",
+    )
     with pytest.raises(AgentLoopError, match="missing requirement ID"):
         orchestrator._validate_response_with_human_requirements(
             _plan([]).replace(
                 "\n<!-- AGENT_PLAN_STATE: blocking -->",
                 "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n### Human requirements\n"
-                "- Requirement 1: Grafana is planned.\n"
+                f"- Requirement {requirement.requirement_id}: Grafana is planned.\n"
                 "<!-- AGENT_PLAN_STATE: blocking -->",
             ),
             marker_validator=orchestrator._require_plan_state_or_clarification,
-            human_requirements=(
-                HumanReviewRequirement(
-                    source_type="Issue body",
-                    author="maintainer",
-                    created_at=None,
-                    url=None,
-                    body="Provide Grafana.",
-                ),
-            ),
+            human_requirements=(requirement,),
             requirement_scope="planning requirements",
             full_omission_fallback="Fetch the discussion.",
         )

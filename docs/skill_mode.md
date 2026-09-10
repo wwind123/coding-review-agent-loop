@@ -82,6 +82,27 @@ GitHub comment metadata markers (`AGENT_LOOP_META`) written by the skill are
 identical to those written by the headless CLI, so mixed-mode operation (start
 headless, resume in skill, or vice versa) is supported.
 
+Approved-plan PR review uses the same lossless plan-bound context in both
+modes. A handoff hash selects the canonical plan record rather than the newest
+planning comment, so compact context and long comment histories cannot replace
+scope or deferred-work declarations. Issue and direct-PR resume validates the
+PR contract, issue-side handoff, and staged parent/child topology; absent or
+conflicting planning provenance is reported as an actionable recovery error.
+Skill-mode implementation also records the PR-side primary-issue contract;
+resume uses that contract instead of guessing from the first issue reference in
+PR prose. Required issue-history reads fail closed when the plan handoff cannot
+be validated. Ordinary direct PRs with no planning history continue without a
+plan context.
+
+Signed human requirements are surfaced as `Requirement hr-<digest>` and retain
+that content-derived ID through acknowledgement, repair, metadata, and resume.
+Insertion and chronological reordering leave existing IDs unchanged; an edited
+body receives a new ID. Legacy positional acknowledgements require a fresh
+acknowledgement against the stable IDs, and later parent instructions still take
+precedence.
+Later valid human instructions and safety constraints outrank an approved
+plan, which cannot silently narrow the original issue requirements.
+
 ## Reversed roles (external coder / host reviewer)
 
 Skill mode supports running the loop with the coder/reviewer roles reversed —
@@ -98,6 +119,17 @@ mirroring the CLI's `--coder` / `--reviewer` reversal — so an external agent
   `pending`. The host reads the posted plan/PR, writes its structured review
   there, and finalizes it with `complete-host-review --dir <dir>` (works for both
   plan and PR rounds); re-running the round then recomputes the final state.
+  For a plan-bound PR, the request dir contains the complete canonical
+  `approved-plan.md` plus its hash, subject, scope, and deferred-work metadata;
+  read that artifact alongside `pr-diff.diff`. When signed human requirements
+  are surfaced from the authoritative parent, primary issue, or PR, the request
+  also contains `signed-human-requirements.md`. The host must read that rendered
+  contract, verify every stable `hr-…` ID, and include the documented resolution
+  marker before approving. The serialized context remains the validation source;
+  it is not a substitute for reading the rendered artifact.
+  `complete-host-review` validates the plan artifact identity before posting the
+  review, so a changed or missing plan is an actionable handoff error rather than
+  a diff-only review. Direct PRs with no planning provenance have no plan artifact.
 - **Implement, reversed**: after a plan is approved, an external coder emits the
   typed `issue_implementation` result and may open a PR — see [Approved-plan
   execution helpers](#approved-plan-execution-helpers) — which the host then
