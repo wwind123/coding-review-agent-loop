@@ -389,7 +389,7 @@ from .round_state import (
     _strip_round_metadata,
 )
 from .round_transport import is_round_transport_sidecar
-from .protocol_markers import TrustedBody, scan_reserved_markers
+from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
     CODER_DISPUTE_NOTE_PREFIX,
@@ -7138,6 +7138,22 @@ def _coder_followup_review_context(
     )
 
 
+def _reviewer_summary_context(
+    reviewer_name: str,
+    summary: str,
+    *,
+    round_number: int,
+    head_sha: str,
+) -> str:
+    safe_summary = sanitize_historical_text(summary)
+    if not safe_summary.strip():
+        return ""
+    return (
+        f"{reviewer_name} (round {round_number}, head {head_sha}):\n"
+        + safe_summary
+    )
+
+
 def _extract_structured_coder_summary(text: str | None) -> str | None:
     if not text:
         return None
@@ -8165,12 +8181,16 @@ def run_pr_loop(
             # Summaries are review-level context, not new findings or substitutes
             # for an item's immutable claim. Seed from saved reviews for recovery.
             reviewer_summaries = {
-                name: (
-                    f"{name} (round {record.metadata.round_number}, head {record.metadata.subject}):\n"
-                    + review_freeform_summary_text(record.body)
-                )
+                name: context
                 for name, record in resumed_by_name.items()
-                if review_freeform_summary_text(record.body).strip()
+                if (
+                    context := _reviewer_summary_context(
+                        name,
+                        review_freeform_summary_text(record.body),
+                        round_number=record.metadata.round_number,
+                        head_sha=record.metadata.subject,
+                    )
+                )
             }
             unchanged_head_approvals = _latest_pr_approved_reviews_for_head(
                 pr_comments,
@@ -8706,9 +8726,11 @@ def run_pr_loop(
                     summary_record = resumed_record or carried_approval_record
                     summary_round = summary_record.metadata.round_number if summary_record else round_number
                     summary_head = summary_record.metadata.subject if summary_record else current_pr_subject
-                    reviewer_summaries[reviewer_name] = (
-                        f"{reviewer_name} (round {summary_round}, head {summary_head}):\n"
-                        + parsed_review.summary
+                    reviewer_summaries[reviewer_name] = _reviewer_summary_context(
+                        reviewer_name,
+                        parsed_review.summary,
+                        round_number=summary_round,
+                        head_sha=summary_head,
                     )
                 for disposition in parsed_review.dispositions:
                     _record_prior_item_disposition(
@@ -8971,9 +8993,11 @@ def run_pr_loop(
                             if repaired_validated is not None:
                                 repaired_parsed = repaired_validated
                                 if repaired_parsed.summary.strip():
-                                    reviewer_summaries[reviewer_name] = (
-                                        f"{reviewer_name} (round {round_number}, head {current_pr_subject}):\n"
-                                        + repaired_parsed.summary
+                                    reviewer_summaries[reviewer_name] = _reviewer_summary_context(
+                                        reviewer_name,
+                                        repaired_parsed.summary,
+                                        round_number=round_number,
+                                        head_sha=current_pr_subject,
                                     )
                                 if (
                                     repaired_parsed.state == "approved"

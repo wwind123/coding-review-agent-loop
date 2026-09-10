@@ -951,8 +951,10 @@ def test_compact_pr_review_prompt_preserves_context_and_omits_raw_history(tmp_pa
         ),
         compact_context=True,
         compact_prior=CompactPriorContext(("[item-4] resolved: old resolved item",)),
-        compact_coder_summary="Coder says the compact mode wiring is complete.",
-        compact_coder_tests_run=("python -m pytest tests/test_agent_loop.py -k compact_pr",),
+        coder_followup_context=(
+            "Latest coder explanation:\nCoder says the compact mode wiring is complete.\n"
+            "Tests: python -m pytest tests/test_agent_loop.py -k compact_pr\n"
+        ),
         compact_tail=CompactPrReviewTailContext(
             head_sha="abc123",
             round_number=2,
@@ -970,8 +972,8 @@ def test_compact_pr_review_prompt_preserves_context_and_omits_raw_history(tmp_pa
     assert "Unrelated future-only item should not stay active" not in prefix
     assert "UNRELATED RAW PRIOR PR REVIEW HISTORY" not in prompt
     assert "[item-4] resolved: old resolved item" in prefix
-    assert "Coder says the compact mode wiring is complete." in prefix
-    assert "python -m pytest tests/test_agent_loop.py -k compact_pr" in prefix
+    assert "Coder says the compact mode wiring is complete." in tail
+    assert "python -m pytest tests/test_agent_loop.py -k compact_pr" in tail
     assert "Use Future follow-ups only for independent later work" in prefix
     assert "broader scaling or performance refinement\nfor very large histories" in prefix
     assert "indentation or\nstyle cleanup in touched code" in prefix
@@ -1005,8 +1007,7 @@ def test_compact_pr_review_prompt_stable_prefix_is_byte_identical_across_rounds(
         unresolved_items=(unresolved_item,),
         compact_context=True,
         compact_prior=CompactPriorContext(("[item-9] resolved: unchanged",)),
-        compact_coder_summary="Stable coder summary.",
-        compact_coder_tests_run=("pytest -k stable",),
+        coder_followup_context="Stable coder summary.\nTests: pytest -k stable\n",
         compact_tail=CompactPrReviewTailContext(head_sha="abc123", round_number=2, action="Review A."),
     )
     second = build_review_prompt(
@@ -1021,8 +1022,7 @@ def test_compact_pr_review_prompt_stable_prefix_is_byte_identical_across_rounds(
         unresolved_items=(unresolved_item,),
         compact_context=True,
         compact_prior=CompactPriorContext(("[item-9] resolved: unchanged",)),
-        compact_coder_summary="Stable coder summary.",
-        compact_coder_tests_run=("pytest -k stable",),
+        coder_followup_context="Stable coder summary.\nTests: pytest -k stable\n",
         compact_tail=CompactPrReviewTailContext(head_sha="def456", round_number=3, action="Review B."),
     )
 
@@ -1031,7 +1031,8 @@ def test_compact_pr_review_prompt_stable_prefix_is_byte_identical_across_rounds(
     assert first_prefix.encode() == second_prefix.encode()
     assert first_tail != second_tail
     assert "Active PR item remains approval-critical." in first_prefix
-    assert "Stable coder summary." in first_prefix
+    assert "Stable coder summary." not in first_prefix
+    assert "Stable coder summary." in first_tail
     assert "PR body with author intent and scope." in first_prefix
     for volatile in ("round 2", "Head SHA: abc123", "Review A."):
         assert volatile not in first_prefix

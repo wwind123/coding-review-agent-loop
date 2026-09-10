@@ -2390,21 +2390,6 @@ def _canonical_pr_review_ledger_rules() -> str:
 """
 
 
-def _compact_coder_followup_block(
-    summary: str | None,
-    tests_run: Sequence[str] | None,
-) -> str:
-    if not summary and not tests_run:
-        return ""
-    lines = ["Latest coder follow-up summary"]
-    if summary:
-        lines.extend(["", summary])
-    if tests_run:
-        lines.extend(["", "Tests run:"] + [f"- {t}" for t in tests_run])
-    lines.append("")
-    return "\n".join(lines)
-
-
 def _compact_pr_review_stable_prefix(
     *,
     config: AgentLoopConfig,
@@ -2415,8 +2400,6 @@ def _compact_pr_review_stable_prefix(
     human_requirements: Sequence[HumanReviewRequirement] | None,
     unresolved_items: Sequence[UnresolvedReviewItem],
     compact_prior: CompactPriorContext | None,
-    compact_coder_summary: str | None,
-    compact_coder_tests_run: Sequence[str] | None,
     unresolved_items_guidance: str,
     followup_guidance: str,
     human_requirements_guidance: str,
@@ -2516,7 +2499,6 @@ adds a merge migration.
             _canonical_pr_review_ledger_rules(),
             _format_unresolved_review_items(non_future_items)
             or "Prior unresolved review items from earlier rounds\n\n(none)\n",
-            _compact_coder_followup_block(compact_coder_summary, compact_coder_tests_run),
             _compact_prior_ledger_block(compact_prior),
         )
         if part
@@ -2536,8 +2518,6 @@ def _build_compact_pr_review_prompt(
     human_requirements: Sequence[HumanReviewRequirement] | None,
     unresolved_items: Sequence[UnresolvedReviewItem],
     compact_prior: CompactPriorContext | None,
-    compact_coder_summary: str | None,
-    compact_coder_tests_run: Sequence[str] | None,
     compact_tail: CompactPrReviewTailContext | None,
     approved_plan_context: ApprovedPlanContext | None,
     parent_issue_context: IssueContext | None,
@@ -2562,8 +2542,6 @@ def _build_compact_pr_review_prompt(
         human_requirements=human_requirements,
         unresolved_items=unresolved_items,
         compact_prior=compact_prior,
-        compact_coder_summary=compact_coder_summary,
-        compact_coder_tests_run=compact_coder_tests_run,
         unresolved_items_guidance=unresolved_items_guidance,
         followup_guidance=followup_guidance,
         human_requirements_guidance=human_requirements_guidance,
@@ -2765,8 +2743,6 @@ def build_review_prompt(
     compact_context: bool = False,
     compact_prior: CompactPriorContext | None = None,
     compact_tail: CompactPrReviewTailContext | None = None,
-    compact_coder_summary: str | None = None,
-    compact_coder_tests_run: Sequence[str] | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
     parent_issue_context: IssueContext | None = None,
     coder_followup_context: str = "",
@@ -2796,8 +2772,6 @@ def build_review_prompt(
             human_requirements=human_requirements,
             unresolved_items=unresolved_items or [],
             compact_prior=compact_prior,
-            compact_coder_summary=compact_coder_summary,
-            compact_coder_tests_run=compact_coder_tests_run,
             compact_tail=compact_tail,
             approved_plan_context=approved_plan_context,
             parent_issue_context=parent_issue_context,
