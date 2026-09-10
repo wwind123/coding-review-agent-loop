@@ -2830,7 +2830,7 @@ are present in the PR diff.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
 {_scratch_file_guidance()}
 {_review_command_policy(config, metadata)}
-{checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_issue_context_block(issue_context)}
+{checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_labeled_issue_context_block(issue_context, label="Primary/child issue context")}
 {format_approved_plan_context(approved_plan_context)}
 {_human_requirements_block(human_requirements)}
 {unresolved_items_block}{_memory_block(memory, config)}

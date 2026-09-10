@@ -174,6 +174,14 @@ def test_legacy_positional_acknowledgement_requires_fresh_stable_acknowledgement
         surfaced_requirement_ids=context.surfaced_requirement_ids,
         requires_direct_discussion_ack=False,
     )
+    # The coder guidance surfaces the stable ID itself, so the same bare token
+    # must be accepted in a markdown bullet as in structured JSON fields.
+    validate_human_requirements_acknowledgement(
+        "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+        f"### Human requirements\n- `{requirement.requirement_id}`: done",
+        surfaced_requirement_ids=context.surfaced_requirement_ids,
+        requires_direct_discussion_ack=False,
+    )
 
     reconciled = _reconcile_human_requirements_ack_item(
         (),

@@ -836,7 +836,7 @@ def parse_human_requirements_acknowledgement(text: str) -> ParsedHumanRequiremen
         if not bullet:
             continue
         for match in re.finditer(
-            r"\bRequirement\s+(?:hr-[0-9a-f]{64}|\d+)\b",
+            r"\b(?:Requirement\s+)?hr-[0-9a-f]{64}\b|\bRequirement\s+\d+\b",
             bullet.group("text"),
             re.I,
         ):

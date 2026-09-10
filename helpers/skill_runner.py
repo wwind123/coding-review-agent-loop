@@ -126,6 +126,15 @@ from coding_review_agent_loop.followups import (
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
 )
+from coding_review_agent_loop.github import (
+    HumanReviewRequirement,
+    IssueContext,
+    PullRequestReviewContext,
+    _parse_issue_comments,
+    _parse_issue_human_requirements,
+    _parse_pr_human_requirements,
+    deduplicate_human_requirements,
+)
 from coding_review_agent_loop.memory import AgentMemoryContext, prepare_agent_memory
 from coding_review_agent_loop.issue_pr_handoff import find_latest_issue_pr_handoff
 from coding_review_agent_loop.pr_contract import find_latest_pr_contract
@@ -965,16 +974,82 @@ def _fetch_issue_json(repo: str, issue: int, gh_cmd: str = "gh") -> dict:
     return json.loads(result.stdout)
 
 
+def _fetch_issue_context(repo: str, issue: int, gh_cmd: str = "gh") -> IssueContext:
+    """Fetch the complete issue context used by a skill-mode PR review."""
+    result = subprocess.run(
+        [gh_cmd, "issue", "view", str(issue), "--repo", repo, "--comments",
+         "--json", "number,title,body,url,author,createdAt,comments"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError(
+            f"Unable to read authoritative issue #{issue} in {repo}: "
+            f"{result.stderr.strip() or 'gh issue view failed'}."
+        )
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(
+            f"Unable to parse authoritative issue #{issue} in {repo}."
+        ) from exc
+    if not isinstance(data, dict):
+        raise AgentLoopError(f"GitHub returned malformed context for issue #{issue} in {repo}.")
+    return IssueContext(
+        number=int(data.get("number") or issue),
+        repo=repo,
+        title=str(data["title"]) if data.get("title") is not None else None,
+        body=str(data["body"]) if data.get("body") is not None else None,
+        url=str(data["url"]) if data.get("url") is not None else None,
+        comments=_parse_issue_comments(data.get("comments")),
+        human_requirements=_parse_issue_human_requirements(data),
+    )
+
+
 def _fetch_pr_json(repo: str, pr: int, gh_cmd: str = "gh") -> dict:
     result = subprocess.run(
         [gh_cmd, "pr", "view", str(pr), "--repo", repo,
-         "--json", "number,title,body,url,headRefOid,headRefName,baseRefName,state,comments"],
+         "--json", "number,title,body,url,headRefOid,headRefName,baseRefName,state,comments,reviews"],
         capture_output=True, text=True, check=False,
     )
     if result.returncode != 0:
         print(f"skill_runner: gh pr view failed: {result.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
     return json.loads(result.stdout)
+
+
+def _skill_pr_review_context(repo: str, pr: int, pr_info: dict) -> PullRequestReviewContext:
+    """Build PR signed-instruction context from the same snapshot as provenance."""
+    from coding_review_agent_loop.github import PullRequestMetadata
+
+    return PullRequestReviewContext(
+        metadata=PullRequestMetadata(
+            number=pr,
+            repo=repo,
+            title=str(pr_info["title"]) if pr_info.get("title") is not None else None,
+            head_branch=str(pr_info["headRefName"]) if pr_info.get("headRefName") is not None else None,
+            base_branch=str(pr_info["baseRefName"]) if pr_info.get("baseRefName") is not None else None,
+            head_sha=str(pr_info["headRefOid"]) if pr_info.get("headRefOid") is not None else None,
+            url=str(pr_info["url"]) if pr_info.get("url") is not None else None,
+            body=str(pr_info["body"]) if pr_info.get("body") is not None else None,
+        ),
+        comments=_parse_issue_comments(pr_info.get("comments")),
+        human_requirements=_parse_pr_human_requirements(pr_info),
+    )
+
+
+def _serialize_human_requirements(
+    requirements: Sequence[HumanReviewRequirement],
+) -> list[dict[str, str | None]]:
+    return [
+        {
+            "source_type": requirement.source_type,
+            "author": requirement.author,
+            "created_at": requirement.created_at,
+            "url": requirement.url,
+            "body": requirement.body,
+        }
+        for requirement in requirements
+    ]
 
 
 def _pr_comments_from_info(repo: str, pr: int, pr_info: dict) -> list[types.SimpleNamespace]:
@@ -1112,6 +1187,8 @@ def _recover_skill_pr_plan_context(
     repo: str,
     pr: int,
     pr_info: dict,
+    *,
+    authoritative_parent_out: list[int] | None = None,
 ) -> ApprovedPlanContext | None:
     """Recover the exact plan handoff for a skill-mode PR, if one exists.
 
@@ -1261,6 +1338,8 @@ def _recover_skill_pr_plan_context(
             raise AgentLoopError(
                 f"PR #{pr} has an invalid staged phase identity; repair the child issue handoff."
             )
+        if authoritative_parent_out is not None:
+            authoritative_parent_out.append(parent_issue)
         if expected_hash is not None and expected_hash != plan_hash:
             raise AgentLoopError(
                 f"PR #{pr} child issue handoff has plan hash {expected_hash}, but its "
@@ -1346,6 +1425,8 @@ def _recover_skill_pr_plan_context(
                 "identities; repair the child issue provenance before reviewing."
             )
         parent_issue = next(iter(split_parents))
+        if authoritative_parent_out is not None:
+            authoritative_parent_out.append(parent_issue)
         split_key = next(iter(split_keys))
         parent_comments = [
             types.SimpleNamespace(body=body)
@@ -1439,13 +1520,53 @@ def _recover_skill_pr_plan_context(
     return context
 
 
+def _recover_skill_pr_review_contexts(
+    repo: str,
+    pr: int,
+    pr_info: dict,
+) -> tuple[
+    ApprovedPlanContext | None,
+    IssueContext | None,
+    IssueContext | None,
+    PullRequestReviewContext,
+    tuple[HumanReviewRequirement, ...],
+]:
+    """Recover every authoritative context consumed by skill-mode reviewers."""
+    parent_numbers: list[int] = []
+    approved_plan = _recover_skill_pr_plan_context(
+        repo,
+        pr,
+        pr_info,
+        authoritative_parent_out=parent_numbers,
+    )
+    primary_number = _authoritative_issue_number_from_pr(repo, pr, pr_info)
+    primary_context = (
+        _fetch_issue_context(repo, primary_number)
+        if primary_number is not None
+        else None
+    )
+    parent_context = (
+        _fetch_issue_context(repo, parent_numbers[0])
+        if parent_numbers
+        else None
+    )
+    pr_context = _skill_pr_review_context(repo, pr, pr_info)
+    human_requirements = deduplicate_human_requirements((
+        *(parent_context.human_requirements if parent_context is not None else ()),
+        *(primary_context.human_requirements if primary_context is not None else ()),
+        *pr_context.human_requirements,
+    ))
+    return approved_plan, primary_context, parent_context, pr_context, human_requirements
+
+
 def _filter_resume_for_approved_plan(
     resume: dict,
     *,
     head_sha: str,
     approved_plan_context: ApprovedPlanContext | None,
+    human_requirements: Sequence[HumanReviewRequirement] = (),
 ) -> dict:
-    """Drop same-head reviewer approvals that did not receive this plan.
+    """Drop same-head approvals that did not receive the current review contract.
 
     ``build-resume`` intentionally remains a transport-only operation and can
     recover legacy reviewer records before the PR's issue provenance is known.
@@ -1453,17 +1574,23 @@ def _filter_resume_for_approved_plan(
     only records carrying both plan identity fields. This preserves partial
     progress while forcing missing or stale reviewers through the current plan.
     """
-    if approved_plan_context is None:
-        return resume
     if str(resume.get("current_plan_subject") or "") != head_sha:
         return resume
-    expected_hash = approved_plan_context.plan_hash
-    expected_subject = approved_plan_context.plan_subject
+    expected_ids = {requirement.requirement_id for requirement in human_requirements}
     matching_data = [
         record
         for record in resume.get("completed_reviewer_data", [])
-        if record.get("approved_plan_hash") == expected_hash
-        and record.get("approved_plan_subject") == expected_subject
+        if (
+            approved_plan_context is None
+            or (
+                record.get("approved_plan_hash") == approved_plan_context.plan_hash
+                and record.get("approved_plan_subject") == approved_plan_context.plan_subject
+            )
+        )
+        and {
+            str(item)
+            for item in record.get("surfaced_reviewer_requirement_ids", [])
+        } == expected_ids
     ]
     matching_names = {
         str(record.get("reviewer_name", "")) for record in matching_data
@@ -1763,6 +1890,17 @@ def _complete_reviewer_turn(
         approved_plan_args.extend(["--approved-plan-hash", approved_plan_hash])
     if approved_plan_subject is not None:
         approved_plan_args.extend(["--approved-plan-subject", approved_plan_subject])
+    surfaced_requirement_ids = [
+        requirement.requirement_id
+        for requirement in _deserialize_human_requirements(
+            list(context.get("human_requirements", []))
+        )
+    ]
+    requirement_args = (
+        ["--surfaced-reviewer-requirement-ids", *surfaced_requirement_ids]
+        if surfaced_requirement_ids
+        else []
+    )
 
     # --- Attach metadata ---
     _run_helper(
@@ -1780,6 +1918,7 @@ def _complete_reviewer_turn(
         "--subject", round_subject,
         *usage_args,
         *approved_plan_args,
+        *requirement_args,
     )
 
     # --- Post ---
@@ -2626,6 +2765,9 @@ def _write_host_review_request(
     item_id_offset: int,
     dry_run: bool,
     approved_plan_context: ApprovedPlanContext | None = None,
+    primary_issue_context: IssueContext | None = None,
+    parent_issue_context: IssueContext | None = None,
+    human_requirements: Sequence[HumanReviewRequirement] = (),
 ) -> Path:
     """Write a review-request dir for the host (Claude) reviewer turn.
 
@@ -2675,10 +2817,36 @@ def _write_host_review_request(
         "reviewer": "Claude",
         "prior_items": next_prior_items_raw,
         "current_round_items": current_round_items,
+        "human_requirements": _serialize_human_requirements(human_requirements),
     }
     if approved_plan_metadata is not None:
         context_payload["approved_plan"] = approved_plan_metadata
     _write_json(request_dir / "context.json", context_payload)
+    issue_artifacts: dict[str, str] = {}
+    for label, issue_context in (
+        ("primary_issue", primary_issue_context),
+        ("authoritative_parent_issue", parent_issue_context),
+    ):
+        artifact = request_dir / f"{label.replace('_', '-')}.json"
+        if issue_context is None:
+            try:
+                artifact.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+        _write_json(artifact, {
+            "label": label,
+            "number": issue_context.number,
+            "repo": issue_context.repo,
+            "title": issue_context.title,
+            "body": issue_context.body,
+            "url": issue_context.url,
+            "comments": [dataclasses.asdict(comment) for comment in issue_context.comments],
+            "human_requirements": _serialize_human_requirements(
+                issue_context.human_requirements
+            ),
+        })
+        issue_artifacts[label] = artifact.name
     manifest = {
         "role": "reviewer",
         "agent": "claude", "agent_cap": "Claude", "flow": flow,
@@ -2687,6 +2855,7 @@ def _write_host_review_request(
         "item_id_offset": item_id_offset, "validate_kind": validate_kind,
         "material_filename": material_filename,
         "dry_run": dry_run,
+        "issue_context_files": issue_artifacts,
     }
     if approved_plan_file is not None:
         manifest["approved_plan_file"] = approved_plan_file
@@ -3080,13 +3249,20 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         # approval is considered reusable.
         pr_info = _fetch_pr_json(repo, pr)
 
-    approved_plan_context = _recover_skill_pr_plan_context(repo, pr, pr_info)
+    (
+        approved_plan_context,
+        primary_issue_context,
+        parent_issue_context,
+        _pr_review_context,
+        human_requirements,
+    ) = _recover_skill_pr_review_contexts(repo, pr, pr_info)
 
     resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=head_sha, pr=pr)
     resume = _filter_resume_for_approved_plan(
         resume,
         head_sha=head_sha,
         approved_plan_context=approved_plan_context,
+        human_requirements=human_requirements,
     )
 
     # Step 2 — pending-comment reconciliation
@@ -3177,13 +3353,21 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                     approved_followups=getattr(args, "approved_followups", "ignore"),
                     memory=memory,
                     approved_plan_context=approved_plan_context,
+                    issue_context=primary_issue_context,
+                    parent_issue_context=parent_issue_context,
+                    human_requirements=human_requirements,
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
                 )
             except Exception as exc:  # noqa: BLE001
-                if approved_plan_context is not None:
+                if (
+                    approved_plan_context is not None
+                    or primary_issue_context is not None
+                    or parent_issue_context is not None
+                    or human_requirements
+                ):
                     raise AgentLoopError(
                         "skill-mode PR reviewer prompt construction failed after recovering "
-                        "a bound approved plan; refusing to fall back to diff-only context: "
+                        "authoritative review context; refusing to fall back to diff-only context: "
                         f"{exc}"
                     ) from exc
                 prompt_text = (
@@ -3196,6 +3380,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 "reviewer": reviewer_cap,
                 "prior_items": next_prior_items_raw,
                 "current_round_items": current_round_items,
+                "human_requirements": _serialize_human_requirements(human_requirements),
             }
 
             item_id_offset = _max_item_number([next_prior_items_raw, current_round_items])
@@ -3248,12 +3433,16 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             current_round_items=current_round_items,
             item_id_offset=item_id_offset, dry_run=dry_run,
             approved_plan_context=approved_plan_context,
+            primary_issue_context=primary_issue_context,
+            parent_issue_context=parent_issue_context,
+            human_requirements=human_requirements,
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
         print(
             f"skill_runner: host review pending — read the PR-bound approved plan in "
-            f"{request_dir}/approved-plan.md when present, then read the PR diff in "
+            f"{request_dir}/approved-plan.md when present, the labeled issue context "
+            f"artifacts when present, then read the PR diff in "
             f"{request_dir}/pr-diff.diff, "
             f"write your pr_review JSON to {request_dir}/host-review.md, then run: "
             f"python -m helpers.skill_runner complete-host-review --dir {request_dir}{dry_run_flag}",
@@ -4064,7 +4253,13 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
 
     current_head = str(pr_info.get("headRefOid") or "")
     pr_branch = str(pr_info.get("headRefName") or "")
-    approved_plan_context = _recover_skill_pr_plan_context(repo, pr, pr_info)
+    (
+        approved_plan_context,
+        issue_context,
+        parent_issue_context,
+        _pr_review_context,
+        human_requirements,
+    ) = _recover_skill_pr_review_contexts(repo, pr, pr_info)
     resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=current_head, pr=pr)
     _reconcile_pending_comment(resume, pr, repo, dry_run)
     resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=current_head, pr=pr)
@@ -4072,6 +4267,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         resume,
         head_sha=current_head,
         approved_plan_context=approved_plan_context,
+        human_requirements=human_requirements,
     )
 
     allowed, reason = _pr_fix_gate(resume, reviewers, current_head)
@@ -4095,9 +4291,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         return
 
     from coding_review_agent_loop.comment_rendering import render_public_agent_comment
-    from coding_review_agent_loop.github import get_issue_context, get_pr_review_context
     from coding_review_agent_loop.orchestrator import (
-        _merge_human_requirements,
         _reconcile_human_requirements_ack_item,
         _validate_coder_followup_response,
     )
@@ -4120,14 +4314,6 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         auto_agent_dirs=(),
     )
     runner = Runner(dry_run=dry_run)
-    linked_issue = _authoritative_issue_number_from_pr(repo, pr, pr_info)
-    issue_context = (
-        get_issue_context(runner, config=config, issue_number=linked_issue)
-        if linked_issue is not None and not dry_run
-        else None
-    )
-    pr_context = get_pr_review_context(runner, config=config, pr_number=pr)
-    human_requirements = _merge_human_requirements(issue_context, pr_context)
 
     same_pr_only = all(item.get("status") == "same-pr" for item in active_items_raw)
     review_round_number = int(resume.get("round_number") or resume.get("completed_round_number") or 1)
@@ -4140,6 +4326,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         reviewers=reviewers,  # type: ignore[arg-type]
         workdir=workdir,
         issue_context=issue_context,
+        parent_issue_context=parent_issue_context,
         human_requirements=human_requirements,
         same_pr_only=same_pr_only,
         approved_plan_context=approved_plan_context,

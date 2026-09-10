@@ -490,6 +490,28 @@ class TestStateManager:
             _plan_text, resumed = result
             assert resumed.round_number == 1
 
+    def test_attach_metadata_persists_surfaced_reviewer_requirement_ids(self) -> None:
+        requirement_id = "hr-" + "a" * 64
+        with tempfile.TemporaryDirectory() as tmpdir:
+            body_file = Path(tmpdir) / "review.md"
+            body_file.write_text(_VALID_PR_REVIEW_DRY, encoding="utf-8")
+            output_file = Path(tmpdir) / "review-tagged.md"
+
+            _run(
+                "helpers.state_manager", "attach-metadata",
+                "--body-file", str(body_file),
+                "--output", str(output_file),
+                "--flow", "pr", "--role", "reviewer", "--agent", "Codex",
+                "--round-number", "1", "--state", "approved", "--subject", "head-1",
+                "--surfaced-reviewer-requirement-ids", requirement_id,
+            )
+
+            from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+            comment = types.SimpleNamespace(body=output_file.read_text(encoding="utf-8"))
+            records = _extract_round_metadata_records([comment], flow="pr")
+            assert records[0].metadata.surfaced_reviewer_requirement_ids == (requirement_id,)
+
     def test_attach_metadata_persists_compact_prior_summaries(self) -> None:
         body = _VALID_PLAN_STATE
 
@@ -1651,6 +1673,42 @@ class TestPromptCheckoutPath:
         assert "Preserve the API." in prompt
         assert "Redesign later." in prompt
 
+    def test_pr_prompt_includes_labeled_parent_primary_and_effective_requirements(self) -> None:
+        from coding_review_agent_loop.github import IssueContext
+        from helpers.prompt_builders import build_review_prompt_for_skill
+
+        parent_requirement = HumanReviewRequirement(
+            source_type="Issue comment", author="owner",
+            created_at="2026-09-10T00:00:00Z", url="https://example/parent",
+            body="Retain the parent compatibility contract.",
+        )
+        child_requirement = HumanReviewRequirement(
+            source_type="Issue comment", author="owner",
+            created_at="2026-09-10T01:00:00Z", url="https://example/child",
+            body="Apply the child-specific migration rule.",
+        )
+        parent = IssueContext(
+            number=42, repo="owner/repo", title="Parent title", body="Parent body",
+            url="https://example/42", comments=(), human_requirements=(parent_requirement,),
+        )
+        primary = IssueContext(
+            number=43, repo="owner/repo", title="Child title", body="Child body",
+            url="https://example/43", comments=(), human_requirements=(child_requirement,),
+        )
+
+        prompt = build_review_prompt_for_skill(
+            self._ISSUE, "diff", [], 2, "codex",
+            repo="owner/repo", pr_number=7,
+            issue_context=primary,
+            parent_issue_context=parent,
+            human_requirements=(parent_requirement, child_requirement),
+        )
+
+        assert "Authoritative parent issue context" in prompt
+        assert "Primary/child issue context" in prompt
+        assert parent_requirement.requirement_id in prompt
+        assert child_requirement.requirement_id in prompt
+
     def test_pr_fix_prompt_includes_bound_approved_plan_context(self) -> None:
         from coding_review_agent_loop.round_state import make_approved_plan_context
         from helpers.prompt_builders import build_pr_fix_prompt_for_skill
@@ -2140,6 +2198,88 @@ class TestSkillApprovedPlanRecovery:
 
         assert filtered["completed_reviewer_names"] == ["Codex"]
         assert [r["reviewer_name"] for r in filtered["completed_reviewer_data"]] == ["Codex"]
+
+    def test_same_head_resume_invalidates_review_when_signed_instruction_is_added(self) -> None:
+        import helpers.skill_runner as sr
+
+        original = HumanReviewRequirement(
+            source_type="Issue comment",
+            author="owner",
+            created_at="2026-09-10T00:00:00Z",
+            url="https://github.com/owner/repo/issues/42#issuecomment-1",
+            body="Keep the API backward compatible.",
+        )
+        added = HumanReviewRequirement(
+            source_type="PR comment",
+            author="owner",
+            created_at="2026-09-10T01:00:00Z",
+            url="https://github.com/owner/repo/pull/7#issuecomment-2",
+            body="Also preserve the legacy command alias.",
+        )
+        resume = {
+            "current_plan_subject": "head-7",
+            "completed_reviewer_names": ["Codex", "Gemini"],
+            "completed_reviewer_data": [
+                {
+                    "reviewer_name": "Codex",
+                    "state": "approved",
+                    "surfaced_reviewer_requirement_ids": [original.requirement_id],
+                },
+                {
+                    "reviewer_name": "Gemini",
+                    "state": "approved",
+                    "surfaced_reviewer_requirement_ids": [
+                        original.requirement_id,
+                        added.requirement_id,
+                    ],
+                },
+            ],
+        }
+
+        filtered = sr._filter_resume_for_approved_plan(
+            resume,
+            head_sha="head-7",
+            approved_plan_context=None,
+            human_requirements=(original, added),
+        )
+
+        assert filtered["completed_reviewer_names"] == ["Gemini"]
+        assert [record["reviewer_name"] for record in filtered["completed_reviewer_data"]] == ["Gemini"]
+
+    def test_skill_pr_review_validation_requires_signed_requirement_resolution_marker(self) -> None:
+        from coding_review_agent_loop.errors import AgentLoopError
+        from helpers.validate_response import validate_response_text
+
+        requirement = HumanReviewRequirement(
+            source_type="PR comment", author="owner",
+            created_at="2026-09-10T01:00:00Z", url="https://example/pr-comment",
+            body="Preserve the legacy command alias.",
+        )
+        payload = json.dumps({
+            "schema_version": 1,
+            "kind": "pr_review",
+            "state": "approved",
+            "summary": "The requirement is implemented.",
+            "blocking_items": [],
+            "same_pr_followups": [],
+            "future_followups": [],
+            "prior_item_dispositions": [],
+        })
+        response = f"{payload}\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+
+        with pytest.raises(AgentLoopError, match="HUMAN_REQUIREMENTS_RESOLVED"):
+            validate_response_text(
+                response,
+                kind="pr_review",
+                human_requirements=(requirement,),
+            )
+
+        validate_response_text(
+            f"{payload}\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n"
+            "<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            kind="pr_review",
+            human_requirements=(requirement,),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3625,6 +3765,7 @@ class TestRunPrFix:
         # is readable; provide that readable empty history in this unit test.
         monkeypatch.setattr(sr, "_fetch_issue_comments_raw", lambda repo, issue: [])
         monkeypatch.setattr(sr, "_build_resume", lambda *a, **k: _pr_fix_resume())
+        monkeypatch.setattr(sr, "_filter_resume_for_approved_plan", lambda resume, **kwargs: resume)
         monkeypatch.setattr(sr, "_reconcile_pending_comment", lambda *a, **k: None)
         monkeypatch.setattr(sr, "_position_pr_fix_workdir", lambda **kwargs: None)
         monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
@@ -3635,19 +3776,19 @@ class TestRunPrFix:
             return "head-old" if seen["count"] == 1 else "head-new"
         monkeypatch.setattr(sr, "_git_head", fake_git_head)
 
-        import coding_review_agent_loop.github as gh
-        monkeypatch.setattr(gh, "get_issue_context", lambda runner, config, issue_number: IssueContext(
-            number=issue_number,
+        requirement = _human_req()
+        issue_context = IssueContext(
+            number=338,
             repo="o/r",
             title="Issue",
             body="Body",
             url=None,
             comments=(),
-            human_requirements=(_human_req(),),
-        ))
-        monkeypatch.setattr(gh, "get_pr_review_context", lambda runner, config, pr_number: PullRequestReviewContext(
+            human_requirements=(requirement,),
+        )
+        pr_context = PullRequestReviewContext(
             metadata=PullRequestMetadata(
-                number=pr_number,
+                number=7,
                 repo="o/r",
                 title="PR",
                 head_branch="feature/pr",
@@ -3657,7 +3798,14 @@ class TestRunPrFix:
             ),
             comments=(),
             human_requirements=(),
-        ))
+        )
+        monkeypatch.setattr(
+            sr,
+            "_recover_skill_pr_review_contexts",
+            lambda repo, pr, pr_info: (
+                None, issue_context, None, pr_context, (requirement,)
+            ),
+        )
 
         args = types.SimpleNamespace(
             pr=7,

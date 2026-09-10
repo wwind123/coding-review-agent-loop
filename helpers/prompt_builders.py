@@ -193,6 +193,9 @@ def build_review_prompt_for_skill(
     approved_followups: str = "ignore",
     memory: AgentMemoryContext | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
+    issue_context: IssueContext | None = None,
+    parent_issue_context: IssueContext | None = None,
+    human_requirements: Sequence | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
@@ -225,7 +228,7 @@ def build_review_prompt_for_skill(
         approved_followups=approved_followups,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
     )
-    issue_context = _make_issue_context(issue_dict)
+    primary_issue_context = issue_context
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
     pr_metadata = PullRequestMetadata(
         number=pr_number,
@@ -243,7 +246,9 @@ def build_review_prompt_for_skill(
         reviewer=reviewer,
         memory=memory,
         pr_metadata=pr_metadata,
-        issue_context=issue_context,
+        issue_context=primary_issue_context,
+        parent_issue_context=parent_issue_context,
+        human_requirements=human_requirements,
         unresolved_items=unresolved,
         approved_plan_context=approved_plan_context,
     )
@@ -262,6 +267,7 @@ def build_pr_fix_prompt_for_skill(
     reviewers: Sequence[AgentName],
     workdir: str,
     issue_context: IssueContext | None = None,
+    parent_issue_context: IssueContext | None = None,
     human_requirements: Sequence | None = None,
     same_pr_only: bool = False,
     memory: AgentMemoryContext | None = None,
@@ -290,6 +296,7 @@ def build_pr_fix_prompt_for_skill(
             config,
             memory,
             issue_context=issue_context,
+            parent_issue_context=parent_issue_context,
             human_requirements=human_requirements,
             human_requirements_context=human_requirements_context,
             approved_plan_context=approved_plan_context,
@@ -302,6 +309,7 @@ def build_pr_fix_prompt_for_skill(
         config,
         memory,
         issue_context=issue_context,
+        parent_issue_context=parent_issue_context,
         human_requirements=human_requirements,
         human_requirements_context=human_requirements_context,
         approved_plan_context=approved_plan_context,

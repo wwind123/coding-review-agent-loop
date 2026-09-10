@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
 from coding_review_agent_loop.protocol import (
+    HUMAN_REQUIREMENTS_RESOLVED_RE,
     parse_plan_state,
     validate_structured_plan_revision,
 )
@@ -145,12 +146,25 @@ def validate_response_text(
             current_round_items=deserialized_current,
         )
     if kind == "pr_review":
-        return _validate_review_response(
+        parsed = _validate_review_response(
             text,
             reviewer=reviewer,
             unresolved_items=deserialized_prior,
             current_round_items=deserialized_current,
         )
+        marker_present = HUMAN_REQUIREMENTS_RESOLVED_RE.search(text) is not None
+        if deserialized_requirements and parsed.state == "approved" and not marker_present:
+            raise AgentLoopError(
+                "Approved PR review omitted HUMAN_REQUIREMENTS_RESOLVED "
+                "after signed human requirements were surfaced. Verify every surfaced "
+                "stable ID and include the required resolution marker."
+            )
+        if not deserialized_requirements and marker_present:
+            raise AgentLoopError(
+                "PR review emitted HUMAN_REQUIREMENTS_RESOLVED when no signed human "
+                "requirements were surfaced."
+            )
+        return parsed
     if kind == "coder_followup":
         return _validate_coder_followup_response(
             text,
