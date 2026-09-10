@@ -193,6 +193,23 @@ def _validate_review_response(
             raise AgentLoopError(
                 "Review did not evaluate all prior unresolved items: " + ", ".join(missing)
             )
+    # This is the live-response boundary. Historical comments still use the
+    # permissive protocol parser so a resume does not invalidate older reviews.
+    for disposition in dispositions:
+        if disposition.disposition not in {"blocking", "same-pr"}:
+            continue
+        note = " ".join((disposition.note or "").strip().split())
+        if not note or re.fullmatch(
+            r"(?:(?:still|remains?)\s+)?(?:blocking|same[- ]pr|unresolved|not resolved|needs work)[.!]?",
+            note,
+            flags=re.I,
+        ):
+            raise AgentLoopError(
+                f"Carried item {disposition.item_id} kept {disposition.disposition} requires "
+                "an actionable note: explain the remaining defect on the reviewed head, "
+                "relevant evidence, and the change or test needed. A status alone or a "
+                "review-level summary is not an item-specific explanation."
+            )
     return ParsedReview(
         state=parsed.state,
         summary=parsed.summary,
@@ -483,6 +500,14 @@ def _apply_unresolved_item_dispositions(
         for disposition in dispositions:
             if disposition.note:
                 note_text = f"{disposition.reviewer}: {disposition.note}"
+                if note_text not in notes:
+                    notes.append(note_text)
+            elif same_status == "same-pr" and disposition.disposition in {"blocking", "same-pr"}:
+                note_text = (
+                    f"{disposition.reviewer}: saved review kept this item "
+                    f"{disposition.disposition} without an item-specific explanation. "
+                    "Consult the review summary; do not infer a new claim."
+                )
                 if note_text not in notes:
                     notes.append(note_text)
         if "blocking" in outcomes:

@@ -3122,7 +3122,8 @@ def test_pr_loop_keeps_blocking_review_when_future_followups_are_misclassified(t
         if cmd[:1] == ["claude"] and "Tighten the reset helper." in cmd[-1]
     )
     assert "Address the follow-up items below" in followup_prompt
-    assert "Still blocked." not in followup_prompt
+    assert "Still blocked." in followup_prompt
+    assert "Latest reviewer summaries (review-level context):" in followup_prompt
 
 def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
     runner = FakeRunner(
@@ -4190,7 +4191,8 @@ def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):
         cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"] and "Address the review below" in cmd[-1]
     )
     assert "Needs a regression test." in followup_prompt
-    assert "Codex approves first pass." not in followup_prompt
+    assert "Codex approves first pass." in followup_prompt
+    assert "Latest reviewer summaries (review-level context):" in followup_prompt
     commands = [cmd for cmd, _cwd in runner.commands]
     metadata_fetches = [
         cmd
@@ -4605,7 +4607,8 @@ def test_pr_loop_tracks_blocking_items_text_not_summary_when_they_differ(tmp_pat
 
     second_coder_prompt = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]][0]
     assert "Add the mixed-history resume case to `tests/test_agent_loop.py`." in second_coder_prompt
-    assert "Needs one more regression test before merge." not in second_coder_prompt
+    assert "Needs one more regression test before merge." in second_coder_prompt
+    assert "Needs one more regression test before merge." not in second_coder_prompt.split("Codex unresolved blocking item", 1)[1]
     assert runner.comments[0] == (
         "**Review verdict:** Blocking\n\n"
         "Needs one more regression test before merge.\n\n"
@@ -4662,7 +4665,8 @@ def test_pr_loop_same_pr_only_review_does_not_duplicate_summary_as_blocking_item
         "Update docs/SECURITY_FINDINGS.md references to docs/audit/SECURITY_FINDINGS.md."
         in followup_prompt
     )
-    assert "The PR is docs-only" not in followup_prompt
+    assert "The PR is docs-only" in followup_prompt
+    assert "The PR is docs-only" not in followup_prompt.split("Codex same-PR follow-up", 1)[1]
     # Routed through the lean same-PR-only prompt, confirming no separate blocking
     # item was created alongside the same-PR item.
     assert "Address the follow-up items below" in followup_prompt
@@ -4707,7 +4711,8 @@ def test_pr_loop_creates_one_tracked_item_per_blocking_items_entry(tmp_path):
     assert "[item-2]" in followup_prompt
     assert "Fix the null pointer dereference in parser.py." in followup_prompt
     assert "Add missing docstring to the public API." in followup_prompt
-    assert "Two separate problems found." not in followup_prompt
+    assert "Two separate problems found." in followup_prompt
+    assert "Two separate problems found." not in followup_prompt.split("Codex unresolved blocking item", 1)[1]
 
 def test_pr_loop_falls_back_to_summary_item_when_no_structured_fields_present(tmp_path):
     """When a blocking review has neither blocking_items nor same_pr_followups, the
@@ -5647,7 +5652,7 @@ def test_pr_loop_same_pr_items_remain_blocking_until_explicitly_resolved(tmp_pat
             "- Rename the helper before merge.\n"
             "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
             "Codex still wants the rename."
-            + prior_item_dispositions("[item-1] same-pr")
+            + prior_item_dispositions("[item-1] same-pr: The caller still uses the old helper name; rename that call site too.")
             + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
         ],
         claude_outputs=["Tried a partial fix.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],

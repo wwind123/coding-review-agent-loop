@@ -214,6 +214,7 @@ class ResumedReviewRound:
     compact_prior_summaries: tuple[str, ...] = ()
     unrecorded_head_advance: bool = False
     reconciled: bool = False
+    coder_metadata: PostedRoundMetadata | None = None
 
 
 def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
@@ -736,6 +737,7 @@ def _recover_unrecorded_pr_head_advance(
         ledger_may_be_incomplete=True,
         compact_prior_summaries=compact_prior_summaries,
         unrecorded_head_advance=True,
+        coder_metadata=latest_coder_record.metadata if latest_coder_record else None,
     )
 
 
@@ -1059,6 +1061,7 @@ def _resume_pr_round(
             if latest_coder_record is not None
             else None
         ),
+        coder_metadata=latest_coder_record.metadata if latest_coder_record else None,
         completed_reviews=tuple(reviewer_records[agent_display_name(agent)] for agent in configured_reviewers if agent_display_name(agent) in reviewer_records),
         next_unresolved_item_number=_max_unresolved_item_number_from_records(
             [record for record in records if record.metadata.subject == head_sha]

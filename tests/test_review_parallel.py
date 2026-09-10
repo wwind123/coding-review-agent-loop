@@ -360,6 +360,12 @@ def test_pr_parallel_resume_after_publication_does_not_duplicate_or_lose_items(t
     assert codex_publications() == 1
     coder_prompt = next("\n".join(cmd) for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
     assert "[item-1]" in coder_prompt
+    summary_block = coder_prompt.split(
+        "Latest reviewer summaries (review-level context):", 1
+    )[1].split("Codex unresolved blocking item", 1)[0]
+    assert "Codex found a blocker." in summary_block
+    assert "blocking_items" not in summary_block
+    assert "Persist this item." not in summary_block
 
 
 # ---------------------------------------------------------------------------

@@ -240,6 +240,7 @@ from .protocol import (
     parse_plan_review_items,
     parse_plan_state,
     parse_structured_plan_review,
+    parse_structured_pr_review,
     parse_pr_number,
     review_freeform_summary_text,
     normalize_response_file_structured_text,
@@ -389,7 +390,7 @@ from .round_state import (
     _strip_round_metadata,
 )
 from .round_transport import is_round_transport_sidecar
-from .protocol_markers import TrustedBody, scan_reserved_markers
+from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
     CODER_DISPUTE_NOTE_PREFIX,
@@ -7096,6 +7097,64 @@ def run_task_loop(
             _persist_usage_summary(config, usage_context)
 
 
+def _coder_followup_review_context(
+    text: str | None,
+    metadata: PostedRoundMetadata | None,
+    *,
+    head_sha: str | None,
+) -> str:
+    if not text or metadata is None:
+        return ""
+    if not head_sha or metadata.subject != head_sha:
+        return (
+            "Latest coder explanation omitted: its recorded head does not match "
+            "the current PR head. Do not treat earlier fix claims as current evidence.\n"
+        )
+    summary = _extract_structured_coder_summary(text)
+    tests = _extract_structured_coder_tests_run(text)
+    try:
+        parsed = validate_structured_coder_followup(text)
+    except AgentLoopError:
+        parsed = None
+    payload: dict[str, object] = {"summary": summary, "tests_run": tests}
+    if isinstance(parsed, StructuredCoderFollowup):
+        payload.update(
+            addressed_items=parsed.addressed_items,
+            addressed_item_notes=parsed.addressed_item_notes,
+            remaining_items=parsed.remaining_items,
+            remaining_item_notes=parsed.remaining_item_notes,
+            disputed_items=parsed.disputed_items,
+            dispute_evidence=parsed.dispute_evidence,
+        )
+    elif summary is None and tests is None:
+        return "Latest coder explanation: no valid structured resolution details are available.\n"
+    return (
+        "Latest coder explanation (claims to verify, not reviewer verdicts):\n"
+        f"{metadata.agent}; review round {metadata.round_number}; head {metadata.subject}\n"
+        "Independently verify these claims against the current diff and tests. "
+        "They do not resolve items, override CI, or change the original claims. "
+        "Only IDs in the active prior unresolved review ledger are eligible for dispositions.\n"
+        + json.dumps(payload, ensure_ascii=True, indent=2)
+        + "\n"
+    )
+
+
+def _reviewer_summary_context(
+    reviewer_name: str,
+    summary: str,
+    *,
+    round_number: int,
+    head_sha: str,
+) -> str:
+    safe_summary = sanitize_historical_text(summary)
+    if not safe_summary.strip():
+        return ""
+    return (
+        f"{reviewer_name} (round {round_number}, head {head_sha}):\n"
+        + safe_summary
+    )
+
+
 def _extract_structured_coder_summary(text: str | None) -> str | None:
     if not text:
         return None
@@ -7946,6 +8005,7 @@ def run_pr_loop(
         unresolved_items: list[UnresolvedReviewItem] = []
         pr_compact_prior_summaries: list[str] = []
         latest_coder_output: str | None = None
+        latest_coder_metadata: PostedRoundMetadata | None = None
         next_unresolved_item_number = 1
         start_round_number = 1
         resumed_round: ResumedReviewRound | None = None
@@ -7969,6 +8029,7 @@ def run_pr_loop(
             unresolved_items = list(resumed_round.prior_items)
             pr_compact_prior_summaries = list(resumed_round.compact_prior_summaries)
             latest_coder_output = resumed_round.coder_output
+            latest_coder_metadata = resumed_round.coder_metadata
             next_unresolved_item_number = resumed_round.next_unresolved_item_number
             start_round_number = resumed_round.round_number
             log(config, f"PR #{pr_number}: resuming round {start_round_number}")
@@ -8102,15 +8163,8 @@ def run_pr_loop(
                 and round_number >= 2
                 and not round_ledger_incomplete
             )
-            compact_coder_summary = (
-                _extract_structured_coder_summary(latest_coder_output)
-                if use_compact_pr_context
-                else None
-            )
-            compact_coder_tests_run = (
-                _extract_structured_coder_tests_run(latest_coder_output)
-                if use_compact_pr_context
-                else None
+            coder_followup_context = _coder_followup_review_context(
+                latest_coder_output, latest_coder_metadata, head_sha=pr_metadata.head_sha,
             )
             # Persist the same digest identities surfaced in reviewer prompts.
             # An edited signed comment must not inherit the old approval.
@@ -8123,6 +8177,20 @@ def run_pr_loop(
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
                 if _resumed_pr_reviewer_matches_requirements(
                     record, human_requirements, approved_plan_context
+                )
+            }
+            # Summaries are review-level context, not new findings or substitutes
+            # for an item's immutable claim. Seed from saved reviews for recovery.
+            reviewer_summaries = {
+                name: context
+                for name, record in resumed_by_name.items()
+                if (
+                    context := _reviewer_summary_context(
+                        name,
+                        review_freeform_summary_text(record.body),
+                        round_number=record.metadata.round_number,
+                        head_sha=record.metadata.subject,
+                    )
                 )
             }
             unchanged_head_approvals = _latest_pr_approved_reviews_for_head(
@@ -8290,8 +8358,7 @@ def run_pr_loop(
                                     else None
                                 ),
                                 compact_tail=pr_parallel_compact_tail,
-                                compact_coder_summary=compact_coder_summary,
-                                compact_coder_tests_run=compact_coder_tests_run,
+                                coder_followup_context=coder_followup_context,
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
                             )
@@ -8404,14 +8471,22 @@ def run_pr_loop(
                 resumed_record = resumed_by_name.get(reviewer_name)
                 carried_approval_record: PostedRoundRecord | None = None
                 if resumed_record is not None:
-                    review_output = resumed_record.metadata.canonical_reviewer_response or resumed_record.body
+                    canonical_review_output = resumed_record.metadata.canonical_reviewer_response
+                    review_output = canonical_review_output or resumed_record.body
                     review_model_used = resumed_record.metadata.model_used
                     review_acquisition_outcome = resumed_record.metadata.acquisition_outcome
                     review_acquisition_returncode = resumed_record.metadata.acquisition_returncode
-                    reparsed_review = parse_review(review_output, reviewer=reviewer_name)
+                    structured_review = (
+                        parse_structured_pr_review(review_output, reviewer=reviewer_name)
+                        if canonical_review_output is not None
+                        else None
+                    )
+                    reparsed_review = structured_review or parse_review(
+                        review_output, reviewer=reviewer_name
+                    )
                     parsed_review = ParsedReview(
                         state=resumed_record.metadata.state or parse_agent_state(review_output),
-                        summary=review_freeform_summary_text(review_output),
+                        summary=reparsed_review.summary,
                         blocking_items=reparsed_review.blocking_items,
                         followups=reparsed_review.followups,
                         dispositions=resumed_record.metadata.dispositions,
@@ -8539,8 +8614,7 @@ def run_pr_loop(
                                     else None
                                 ),
                                 compact_tail=compact_tail,
-                                compact_coder_summary=compact_coder_summary,
-                                compact_coder_tests_run=compact_coder_tests_run,
+                                coder_followup_context=coder_followup_context,
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
                             ),
@@ -8657,6 +8731,16 @@ def run_pr_loop(
                     )
                     continue
 
+                if parsed_review.summary.strip():
+                    summary_record = resumed_record or carried_approval_record
+                    summary_round = summary_record.metadata.round_number if summary_record else round_number
+                    summary_head = summary_record.metadata.subject if summary_record else current_pr_subject
+                    reviewer_summaries[reviewer_name] = _reviewer_summary_context(
+                        reviewer_name,
+                        parsed_review.summary,
+                        round_number=summary_round,
+                        head_sha=summary_head,
+                    )
                 for disposition in parsed_review.dispositions:
                     _record_prior_item_disposition(
                         prior_dispositions,
@@ -8917,6 +9001,13 @@ def run_pr_loop(
                             )
                             if repaired_validated is not None:
                                 repaired_parsed = repaired_validated
+                                if repaired_parsed.summary.strip():
+                                    reviewer_summaries[reviewer_name] = _reviewer_summary_context(
+                                        reviewer_name,
+                                        repaired_parsed.summary,
+                                        round_number=round_number,
+                                        head_sha=current_pr_subject,
+                                    )
                                 if (
                                     repaired_parsed.state == "approved"
                                     and human_requirements_resolved(repaired_text)
@@ -9740,11 +9831,19 @@ def run_pr_loop(
 
             same_pr_items = [item for item in unresolved_items if item.status == "same-pr"]
             blocking_items = [item for item in unresolved_items if item.status == "blocking"]
+            summary_context = (
+                "Latest reviewer summaries (review-level context):\n"
+                "These summaries supplement the item ledger; they do not create new item IDs "
+                "or replace Original claims. Do not treat one reviewer's summary as another's "
+                "item-specific evidence.\n\n"
+                + "\n\n".join(reviewer_summaries.values()) + "\n\n"
+                if reviewer_summaries else ""
+            )
             if has_merge_conflict_item:
                 other_items = [
                     item for item in unresolved_items if item.item_id != MERGE_CONFLICT_ITEM_ID
                 ]
-                combined_review = _format_unresolved_items_for_coder(other_items)
+                combined_review = summary_context + _format_unresolved_items_for_coder(other_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )
@@ -9780,7 +9879,7 @@ def run_pr_loop(
                 )
                 log(config, f"Round {round_number}: {coder_name} resolving merge conflict")
             elif same_pr_items and not blocking_items:
-                combined_review = stall_context + _format_same_pr_unresolved_items(same_pr_items)
+                combined_review = stall_context + summary_context + _format_same_pr_unresolved_items(same_pr_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )
@@ -9798,7 +9897,7 @@ def run_pr_loop(
                 )
                 log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
             else:
-                combined_review = stall_context + _format_unresolved_items_for_coder(unresolved_items)
+                combined_review = stall_context + summary_context + _format_unresolved_items_for_coder(unresolved_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )
@@ -9896,25 +9995,26 @@ def run_pr_loop(
             )
             updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
 
+            latest_coder_metadata = PostedRoundMetadata(
+                flow="pr",
+                role="coder",
+                agent=coder_name,
+                round_number=round_number + 1,
+                subject=str(updated_pr_context.metadata.head_sha or "unknown"),
+                prior_items=tuple(unresolved_items),
+                raw_structured_coder_response=raw_structured_coder_response,
+                compact_prior_summaries=tuple(pr_compact_prior_summaries),
+                model_used=coder_response.model_used,
+                acquisition_outcome=coder_response.acquisition_outcome,
+                acquisition_returncode=coder_response.acquisition_returncode,
+            )
             post_pr_comment(
                 runner,
                 config=config,
                 pr_number=pr_number,
                 body=_attach_round_metadata(
                     public_comment,
-                    PostedRoundMetadata(
-                        flow="pr",
-                        role="coder",
-                        agent=coder_name,
-                        round_number=round_number + 1,
-                        subject=str(updated_pr_context.metadata.head_sha or "unknown"),
-                        prior_items=tuple(unresolved_items),
-                        raw_structured_coder_response=raw_structured_coder_response,
-                        compact_prior_summaries=tuple(pr_compact_prior_summaries),
-                        model_used=coder_response.model_used,
-                        acquisition_outcome=coder_response.acquisition_outcome,
-                        acquisition_returncode=coder_response.acquisition_returncode,
-                    ),
+                    latest_coder_metadata,
                 ),
             )
             log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")

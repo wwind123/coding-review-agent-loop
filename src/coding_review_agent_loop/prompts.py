@@ -973,6 +973,7 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
         "",
         "Explicitly evaluate every item below before approving. Use the item IDs exactly as written.",
         "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge.",
+        "Every `blocking` or `same-pr` prior-item disposition requires an actionable `note`: explain what remains wrong on this head, cite relevant code or test evidence, and say what change or test would resolve it. A bare status or summary alone is insufficient. A different defect needs a new item, not a repurposed ID. Resolved dispositions may omit the note.",
         "",
     ]
     for item in unresolved_items:
@@ -2389,21 +2390,6 @@ def _canonical_pr_review_ledger_rules() -> str:
 """
 
 
-def _compact_coder_followup_block(
-    summary: str | None,
-    tests_run: Sequence[str] | None,
-) -> str:
-    if not summary and not tests_run:
-        return ""
-    lines = ["Latest coder follow-up summary"]
-    if summary:
-        lines.extend(["", summary])
-    if tests_run:
-        lines.extend(["", "Tests run:"] + [f"- {t}" for t in tests_run])
-    lines.append("")
-    return "\n".join(lines)
-
-
 def _compact_pr_review_stable_prefix(
     *,
     config: AgentLoopConfig,
@@ -2414,8 +2400,6 @@ def _compact_pr_review_stable_prefix(
     human_requirements: Sequence[HumanReviewRequirement] | None,
     unresolved_items: Sequence[UnresolvedReviewItem],
     compact_prior: CompactPriorContext | None,
-    compact_coder_summary: str | None,
-    compact_coder_tests_run: Sequence[str] | None,
     unresolved_items_guidance: str,
     followup_guidance: str,
     human_requirements_guidance: str,
@@ -2515,7 +2499,6 @@ adds a merge migration.
             _canonical_pr_review_ledger_rules(),
             _format_unresolved_review_items(non_future_items)
             or "Prior unresolved review items from earlier rounds\n\n(none)\n",
-            _compact_coder_followup_block(compact_coder_summary, compact_coder_tests_run),
             _compact_prior_ledger_block(compact_prior),
         )
         if part
@@ -2535,11 +2518,10 @@ def _build_compact_pr_review_prompt(
     human_requirements: Sequence[HumanReviewRequirement] | None,
     unresolved_items: Sequence[UnresolvedReviewItem],
     compact_prior: CompactPriorContext | None,
-    compact_coder_summary: str | None,
-    compact_coder_tests_run: Sequence[str] | None,
     compact_tail: CompactPrReviewTailContext | None,
     approved_plan_context: ApprovedPlanContext | None,
     parent_issue_context: IssueContext | None,
+    coder_followup_context: str = "",
 ) -> str:
     reviewer_name = agent_display_name(reviewer)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
@@ -2560,8 +2542,6 @@ def _build_compact_pr_review_prompt(
         human_requirements=human_requirements,
         unresolved_items=unresolved_items,
         compact_prior=compact_prior,
-        compact_coder_summary=compact_coder_summary,
-        compact_coder_tests_run=compact_coder_tests_run,
         unresolved_items_guidance=unresolved_items_guidance,
         followup_guidance=followup_guidance,
         human_requirements_guidance=human_requirements_guidance,
@@ -2592,7 +2572,8 @@ match, report a blocking tooling mismatch instead of changing the checkout. Do
 not report findings based on untracked files unless those files are present in
 the PR diff.
 
-{checks_block}Suggested commands:
+{checks_block}{coder_followup_context}
+Suggested commands:
 - Read the verified checkout and local base-to-head diff first.
 - Use `{config.gh_cmd} pr view {pr_metadata.number} --repo {pr_metadata.repo} --json comments,reviews` only if existing PR discussion is not already present in this prompt.
 
@@ -2762,10 +2743,9 @@ def build_review_prompt(
     compact_context: bool = False,
     compact_prior: CompactPriorContext | None = None,
     compact_tail: CompactPrReviewTailContext | None = None,
-    compact_coder_summary: str | None = None,
-    compact_coder_tests_run: Sequence[str] | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
     parent_issue_context: IssueContext | None = None,
+    coder_followup_context: str = "",
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
@@ -2792,11 +2772,10 @@ def build_review_prompt(
             human_requirements=human_requirements,
             unresolved_items=unresolved_items or [],
             compact_prior=compact_prior,
-            compact_coder_summary=compact_coder_summary,
-            compact_coder_tests_run=compact_coder_tests_run,
             compact_tail=compact_tail,
             approved_plan_context=approved_plan_context,
             parent_issue_context=parent_issue_context,
+            coder_followup_context=sanitize_historical_text(coder_followup_context),
         )
     title = metadata.title or "(unknown)"
     head_branch = metadata.head_branch or "(unknown)"
@@ -2833,7 +2812,8 @@ are present in the PR diff.
 {checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_labeled_issue_context_block(issue_context, label="Primary/child issue context")}
 {format_approved_plan_context(approved_plan_context)}
 {_human_requirements_block(human_requirements)}
-{unresolved_items_block}{_memory_block(memory, config)}
+{unresolved_items_block}{sanitize_historical_text(coder_followup_context)}
+{_memory_block(memory, config)}
 
 Suggested commands:
 - Read the verified checkout and local base-to-head diff first.
