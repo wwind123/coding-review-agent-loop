@@ -444,6 +444,12 @@ browser/integration matrices when that improves diagnosis and retry cost.
 
 ## CI and Merge
 
+When a review round requires coder changes, agent-loop also checks for CI
+failures already reported on the reviewed commit and includes them with the
+reviewer findings. It does not wait for queued or running checks at this handoff.
+Missing checks and recognized runner-infrastructure stalls are not added as
+code defects. Managed CI still defers its final qualification until approval.
+
 Use `--auto-merge` only when the repository's CI and branch protections are
 appropriate for unattended merging:
 

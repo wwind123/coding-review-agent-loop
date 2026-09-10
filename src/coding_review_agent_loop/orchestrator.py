@@ -9180,6 +9180,53 @@ def run_pr_loop(
             # check-run, commit-status, or branch-protection API calls.
             if pr_checks is None and not has_merge_conflict_item:
                 pr_checks = get_pr_checks(runner, config=config, metadata=pr_metadata)
+                if managed_ci_active(pr_metadata):
+                    pr_checks = intermediate_managed_checks(pr_checks)
+            if pr_checks is not None and not has_merge_conflict_item:
+                stalled = {(check.kind, check.name) for check in pr_checks.infrastructure_stalls}
+                failures = tuple(
+                    check for check in pr_checks.failing
+                    if (check.kind, check.name) not in stalled
+                )
+                # This is a single post-review snapshot, not a CI wait. Only
+                # observed failures become work; missing/pending checks do not.
+                if failures and not any(
+                    item.reviewer == "GitHub PR checks" and item.source_round == round_number
+                    for item in unresolved_items
+                ):
+                    failure_snapshot = dataclasses_replace(
+                        pr_checks, state="failing", failing=failures,
+                        pending=(), missing_required=(), infrastructure_stalls=(),
+                        required_checks=(), branch_protection_note=None,
+                    )
+                    details = _pr_check_details(failure_snapshot)
+                    details.append(f"Reviewed head: {pr_metadata.head_sha}")
+                    text = _pr_check_blocking_review(pr_number, "failing", details) + (
+                        "\nInspect the linked failure logs and address these failures alongside "
+                        "the reviewer findings. Run relevant local regression tests. Do not wait "
+                        "for queued or running CI checks before returning your follow-up."
+                    )
+                    existing = next(
+                        (item for item in unresolved_items if item.reviewer == "GitHub PR checks"),
+                        None,
+                    )
+                    if existing is not None:
+                        unresolved_items = [
+                            dataclasses_replace(item, text=text, source_round=round_number, status="blocking")
+                            if item is existing else item for item in unresolved_items
+                        ]
+                    else:
+                        unresolved_items.append(_next_unresolved_item(
+                            item_number=next_unresolved_item_number,
+                            reviewer="GitHub PR checks", source_round=round_number,
+                            text=text, status="blocking",
+                        ))
+                        next_unresolved_item_number += 1
+                    log(config, f"Round {round_number}: including available CI failures in coder follow-up")
+                    post_pr_comment(
+                        runner, config=config, pr_number=pr_number,
+                        body=_format_pr_checks_comment(pr_number, "failing", details),
+                    )
             stall_context = (
                 _coder_infrastructure_stall_notice(pr_checks.infrastructure_stalls)
                 if pr_checks is not None and is_wholly_infrastructure_blocked(pr_checks)

@@ -1174,6 +1174,102 @@ def _watch_check_board(
     )
 
 
+@pytest.mark.parametrize("board_state", ["failing", "mixed", "pending", "missing", "unavailable", "stall"])
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_blocking_review_handoff_includes_available_ci_without_waiting(
+    tmp_path, monkeypatch, board_state, auto_merge
+):
+    failure = PullRequestCheck(
+        name="test", kind="check_run", status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/555",
+    )
+    pending = PullRequestCheck(name="slow", kind="check_run", status="in_progress")
+    board = _watch_check_board(
+        "failing" if board_state in {"failing", "mixed", "stall"} else
+        "pending" if board_state in {"pending", "missing"} else "unavailable",
+        failing=(failure,) if board_state in {"failing", "mixed", "stall"} else (),
+        pending=(pending,) if board_state in {"mixed", "pending"} else (),
+        missing_required=("test",) if board_state == "missing" else (),
+        errors=("API unavailable",) if board_state == "unavailable" else (),
+    )
+    if board_state == "stall":
+        board = orchestrator.dataclasses_replace(board, infrastructure_stalls=(
+            StalledCheck(
+                name="test", kind="check_run", reason="runner_unavailable",
+                check_id=None, run_id="555", url=failure.url, age_seconds=None,
+            ),
+        ))
+    runner = FakeRunner(codex_outputs=[
+        "Fix the application bug.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    ])
+    snapshots = []
+
+    def snapshot(*args, **kwargs):
+        snapshots.append(kwargs["metadata"].head_sha)
+        # CI finishes while the reviewer is working, not before the review.
+        return _watch_check_board("pending", pending=(pending,)) if len(snapshots) == 1 else board
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", snapshot)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
+    original = orchestrator._run_validated_agent
+    captured = {}
+
+    class CoderReached(Exception):
+        pass
+
+    def capture(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            captured.update(kwargs)
+            raise CoderReached
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", capture)
+    with pytest.raises(CoderReached):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge))
+    assert snapshots == ["abc123", "abc123"]
+    prompt = captured["prompt"]
+    assert "Fix the application bug." in prompt
+    if board_state in {"failing", "mixed"}:
+        assert "Failing checks: test (failure)" in prompt
+        assert failure.url in prompt
+        assert "Reviewed head: abc123" in prompt
+        assert "Do not wait for queued or running CI" in prompt
+        assert "item-2" in captured["repair_unresolved_item_ids"]
+        assert "Pending checks:" not in prompt
+    else:
+        assert "Failing checks:" not in prompt
+        assert "item-2" not in captured["repair_unresolved_item_ids"]
+
+
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_round_ci_failure_is_tracked_and_resolved_with_reviewer_findings(tmp_path, monkeypatch, auto_merge):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Fix the application bug.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Both fixes verified."
+            + prior_item_dispositions("[item-1] resolved", "[item-2] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=["Fixed the application and CI.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+    )
+    failed = PullRequestCheck(name="test", kind="check_run", status="failure", url="https://example.test/555")
+    snapshots = iter([
+        _watch_check_board("pending"),
+        _watch_check_board("failing", failing=(failed,)),
+        _watch_check_board("passing"),
+        _watch_check_board("passing"),
+    ])
+    monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: next(snapshots))
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge)) == 0
+    second_review = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ["codex"]][-1]
+    assert "item-2" in second_review
+    assert "Failing checks: test (failure)" in second_review
+    assert sum(comment.startswith("GitHub PR checks are failing") for comment in runner.comments) == 1
+
+
 @pytest.mark.parametrize("auto_merge", [False, True])
 def test_watch_mode_success_uses_full_board_without_second_wait(
     tmp_path, monkeypatch, auto_merge
