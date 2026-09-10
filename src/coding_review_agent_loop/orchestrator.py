@@ -7803,7 +7803,10 @@ def run_pr_loop(
             elif (
                 recorded_pr_contract is not None
                 and recorded_pr_contract.origin_flow == "approved-plan-implementation"
-                and approved_plan_context is None
+                and (
+                    approved_plan_context is None
+                    or not approved_plan_context.is_available
+                )
             ):
                 raise AgentLoopError(
                     f"PR #{pr_number} declares approved-plan provenance but issue #{issue_context.number} "
