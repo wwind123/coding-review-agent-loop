@@ -583,7 +583,7 @@ def format_human_requirements(
         "\n".join(
             [
                 "",
-                f"Requirement {requirement.requirement_id}:",
+                f"Requirement {index}:",
                 f"- Source: {requirement.source_type}",
                 f"- Author: {requirement.author or '(unknown)'}",
                 f"- Created: {requirement.created_at or '(unknown time)'}",
@@ -592,7 +592,7 @@ def format_human_requirements(
                 requirement.body,
             ]
         )
-        for requirement in human_requirements
+        for index, requirement in enumerate(human_requirements, start=1)
     ]
     full_text = header + "\n".join(entries)
     if len(full_text) <= max_chars:
@@ -682,7 +682,7 @@ def render_coder_human_requirements_prompt_context(
     )
     surfaced_requirement_ids = tuple(
         f"Requirement {match.group(1)}"
-        for match in re.finditer(r"(?m)^Requirement (hr-[0-9a-f]{64}):$", block, re.I)
+        for match in re.finditer(r"(?m)^Requirement (\d+):$", block)
     )
     requires_direct_discussion_ack = (
         not surfaced_requirement_ids
@@ -726,7 +726,7 @@ def _coder_human_requirements_guidance(
     ])
     if include_disposition_json:
         lines.append(
-            "In the structured JSON, also include `human_requirement_dispositions`: one object for every surfaced stable requirement ID, with `requirement_id`, `disposition` (`addressed`, `blocked`, or `not-applicable`), and a concise non-empty `evidence` note."
+            "In the structured JSON, also include `human_requirement_dispositions`: one object for every surfaced requirement label, with `requirement_id`, `disposition` (`addressed`, `blocked`, or `not-applicable`), and a concise non-empty `evidence` note."
         )
     if context.surfaced_requirement_ids:
         surfaced = ", ".join(f"`{item}`" for item in context.surfaced_requirement_ids)
@@ -766,7 +766,7 @@ include exactly:
 
 If any signed human requirement in this set is unresolved, return blocking.
 """ + ("""For every surfaced requirement, the JSON must include exactly one
-`human_requirement_dispositions` object with its exact stable requirement ID, an
+`human_requirement_dispositions` object with its exact surfaced requirement label, an
 `addressed`, `blocked`, or `not-applicable` disposition, and non-empty evidence.
 For an `addressed` disposition, compare the evidence to the canonical plan and
 return blocking when it lacks concrete coverage. A named external integration
@@ -877,7 +877,7 @@ def _structured_coder_followup_guidance(
         surfaced = ", ".join(f"`{item}`" for item in human_requirements_context.surfaced_requirement_ids)
         lines.append(
             "In structured replies, `human_requirement_dispositions` must cover exactly these surfaced signed labels: "
-            f"{surfaced}. Only those exact stable labels are valid; never renumber them as the requirement set changes."
+            f"{surfaced}. Only those exact surfaced labels are valid."
         )
         lines.append(
             "Set `human_requirement_dispositions` to exactly one object per surfaced label, using the exact `requirement_id`, disposition `addressed`, `blocked`, or `not-applicable`, and non-blank evidence. Put only `addressed` dispositions in `human_requirements.addressed_ids`; omit `blocked` and `not-applicable` dispositions. A `blocked` disposition requires `state: blocking`, while `not-applicable` may be used with `state: approved`."
@@ -1103,7 +1103,7 @@ def _labeled_issue_context_block(
         return ""
     return (
         f"{label} (ordinary unsigned context; not signed human requirements):\n"
-        f"{format_issue_context(issue_context)}\n"
+        f"{_issue_context_block(issue_context)}"
     )
 
 
@@ -1598,7 +1598,7 @@ PR. Do not include ordinary mentions, `Refs` links, related issues, external
 dependencies, staged parents, unselected stages, deferred work, or plan actions.
 Absence means no declaration; an explicit empty array means no additional issue.
 When signed requirements are surfaced, the disposition array must contain every
-generated stable requirement ID exactly once; when none are surfaced, it must be empty.
+generated surfaced requirement label exactly once; when none are surfaced, it must be empty.
 Use the optional typed `child_stages`, `external_dependencies`, `deferred_work`,
 and `plan_actions` arrays (each has non-empty `title` and `summary` strings).
 Only `child_stages` may be materialized; existing issue references belong in

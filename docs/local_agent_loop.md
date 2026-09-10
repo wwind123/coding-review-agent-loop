@@ -2324,7 +2324,7 @@ include:
 <!-- HUMAN_REQUIREMENTS_ADDRESSED -->
 
 ### Human requirements
-- Requirement hr-<content-digest>: explain how it was addressed or why it cannot be satisfied safely.
+- Requirement N: explain how it was addressed or why it cannot be satisfied safely.
 ```
 
 Structured coder follow-ups carry the same acknowledgement in

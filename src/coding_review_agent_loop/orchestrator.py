@@ -4541,6 +4541,13 @@ def _implement_approved_issue(
         if approved_plan_context is not None and approved_plan_context.plan_hash
         else approved_plan_hash(approved_plan)
     )
+    if approved_plan_context is None:
+        approved_plan_context = make_approved_plan_context(
+            approved_plan,
+            source_locator=f"issue #{issue_number} approved-plan implementation",
+            expected_hash=plan_hash,
+            expected_subject=plan_subject,
+        )
     plan_additions = _extract_current_expected_closing_issue_ids(approved_plan)
     implementation_requirements = deduplicate_human_requirements(
         [
@@ -4676,7 +4683,6 @@ def _implement_approved_issue(
             issue_context=issue_context,
             approved_plan_context=approved_plan_context,
             parent_issue_context=parent_issue_context,
-            human_requirements=implementation_requirements,
             usage_context=usage_context,
             managed_ci_issue_number=issue_number,
         )
@@ -4743,6 +4749,7 @@ def _implement_approved_issue(
             issue_context=issue_context,
             approved_plan_context=approved_plan_context,
             parent_issue_context=parent_issue_context,
+            human_requirements=implementation_requirements,
         ),
     )
     coder_output = coder_response.text
@@ -5837,7 +5844,7 @@ def _run_plan_first_loop(
             if not refreshed_requirement_ids.issubset(previous_requirement_ids):
                 raise AgentLoopError(
                     f"Issue #{issue_number} gained signed human requirement(s) after plan approval. "
-                    "Re-run planning so the new stable requirement IDs receive explicit acknowledgement."
+                    "Re-run planning so the new signed requirements receive explicit acknowledgement."
                 )
             issue_context = refreshed_issue_context
             if parent_issue_context is not None:
@@ -5856,7 +5863,7 @@ def _run_plan_first_loop(
                     raise AgentLoopError(
                         f"Authoritative parent issue #{parent_issue_context.number} gained signed "
                         "human requirement(s) after plan approval. Re-run planning so the new "
-                        "stable parent requirement IDs receive explicit acknowledgement."
+                        "signed parent requirements receive explicit acknowledgement."
                     )
                 parent_issue_context = refreshed_parent_context
             approved_future_followup_sources = [
@@ -6417,22 +6424,47 @@ def run_issue_loop(
         recovered_plan_additions: tuple[int, ...] | None = None
         recovered_plan_context: ApprovedPlanContext | None = None
         if plan_first:
-            # This is a comment-only reconstruction.  It must happen before
-            # memory preparation or any agent invocation so an existing
-            # approved-plan handoff can be checked without re-planning.
-            recovered_plan_state = _resume_plan_round(
-                issue_context.comments, configured_reviewers=reviewers(config)
+            # Prefer the plan hash recorded by the issue-side handoff. A later
+            # planning round may be unrelated to the PR already handed off, so
+            # resuming the newest plan would silently change the implementation
+            # contract. Fall back to the latest reconstructable round only when
+            # no approved-plan handoff has selected a plan yet.
+            recorded_plan_handoff = find_latest_issue_pr_handoff(
+                issue_context.comments,
+                issue_number=issue_number,
+                repo=config.repo,
             )
-            if recovered_plan_state is not None:
-                recovered_plan_hash = approved_plan_hash(recovered_plan_state[0])
-                recovered_plan_context = make_approved_plan_context(
-                    recovered_plan_state[0],
-                    source_locator=f"issue #{issue_number} reconstructed plan round",
+            if (
+                recorded_plan_handoff is not None
+                and recorded_plan_handoff.flow == "approved-plan-implementation"
+                and recorded_plan_handoff.plan_hash
+            ):
+                recovered_plan_hash = recorded_plan_handoff.plan_hash
+                recovered_plan_context = recover_approved_plan_context(
+                    issue_context.comments,
                     expected_hash=recovered_plan_hash,
                 )
-                recovered_plan_additions = _extract_current_expected_closing_issue_ids(
-                    recovered_plan_state[0]
+                if recovered_plan_context.is_available:
+                    recovered_plan_additions = _extract_current_expected_closing_issue_ids(
+                        recovered_plan_context.canonical_text or ""
+                    )
+            else:
+                # This is a comment-only reconstruction. It must happen before
+                # memory preparation or any agent invocation so an existing
+                # plan can be checked without re-planning.
+                recovered_plan_state = _resume_plan_round(
+                    issue_context.comments, configured_reviewers=reviewers(config)
                 )
+                if recovered_plan_state is not None:
+                    recovered_plan_hash = approved_plan_hash(recovered_plan_state[0])
+                    recovered_plan_context = make_approved_plan_context(
+                        recovered_plan_state[0],
+                        source_locator=f"issue #{issue_number} reconstructed plan round",
+                        expected_hash=recovered_plan_hash,
+                    )
+                    recovered_plan_additions = _extract_current_expected_closing_issue_ids(
+                        recovered_plan_state[0]
+                    )
 
         # Resolve the canonical AGENT_ISSUE_PR_HANDOFF record (or, failing
         # that, the legacy exactly-one-open-PR search) before invoking a
@@ -7551,6 +7583,27 @@ def run_pr_loop(
                 issue_number=issue_context.number,
                 repo=config.repo,
             )
+            if issue_handoff is not None and issue_handoff.pr_number != pr_number:
+                plan_bound_handoff = (
+                    issue_handoff.flow == "approved-plan-implementation"
+                    or (
+                        recorded_pr_contract is not None
+                        and recorded_pr_contract.origin_flow == "approved-plan-implementation"
+                    )
+                    or approved_plan_context is not None
+                )
+                if plan_bound_handoff:
+                    raise AgentLoopError(
+                        f"Issue #{issue_context.number} handoff selects PR #{issue_handoff.pr_number}, "
+                        f"not PR #{pr_number}; review the recorded PR directly or repair the handoff."
+                    )
+                log(
+                    config,
+                    f"Issue #{issue_context.number} has an older direct implementation handoff "
+                    f"for PR #{issue_handoff.pr_number}; it is unrelated to PR #{pr_number} "
+                    "and will not gate this ordinary direct review.",
+                )
+                issue_handoff = None
             if issue_handoff is not None:
                 if issue_handoff.pr_number != pr_number:
                     raise AgentLoopError(

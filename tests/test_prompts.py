@@ -2214,6 +2214,14 @@ def test_blocking_followup_prompt_reinjects_issue_context(tmp_path):
                 reviewer="Anthropic Claude",
             )
         ],
+        issue_payload={"title": "Support issue comments", "body": "Original request."},
+        issue_comments=[
+            {
+                "author": {"login": "commenter"},
+                "createdAt": "2026-05-17T10:00:00Z",
+                "body": "Clarifying issue comment.",
+            }
+        ],
     )
     config = make_config(tmp_path)
     issue_context = IssueContext(

@@ -37,6 +37,7 @@ from coding_review_agent_loop.github import (
     PullRequestReviewContext,
     get_pr_checks,
 )
+from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.migrations import MigrationValidationResult
 from coding_review_agent_loop.managed_ci import (
     ManagedCiContract,
@@ -288,6 +289,7 @@ def test_direct_pr_linked_issue_resolution_handles_urls_absence_and_ambiguity(
 def test_issue_mode_context_is_not_replaced_by_pr_link(tmp_path):
     runner = FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_payload={"title": "Fresh issue", "body": "Fresh issue body."},
         pr_payload={"body": "Fixes #99"},
     )
     config = make_config(tmp_path)
@@ -297,9 +299,97 @@ def test_issue_mode_context_is_not_replaced_by_pr_link(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config, issue_context=supplied_context) == 0
 
-    assert not _issue_view_commands(runner)
+    assert len(_issue_view_commands(runner)) == 1
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
-    assert "Caller issue" in prompt
+    assert "Fresh issue" in prompt
+    assert "Caller issue" not in prompt
+
+
+def test_direct_pr_ignores_unrelated_older_issue_handoff(tmp_path):
+    older_handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=66,
+        pr_url="https://github.com/OWNER/REPO/pull/66",
+        pr_head_sha="older-head",
+        flow="issue-implementation",
+        plan_hash=None,
+    )
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_comments=[
+            {
+                "author": {"login": "coding-review-agent-loop"},
+                "createdAt": "2026-05-01T00:00:00Z",
+                "body": older_handoff,
+            }
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+
+    assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert not any("handoff selects PR #66" in comment for comment in runner.comments)
+
+
+def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_path):
+    old_plan = "Approved old plan.\n\n### Scope\n- Preserve the old API."
+    later_plan = "Unrelated later plan.\n\n### Scope\n- Replace the old API."
+    old_plan_comment = _attach_round_metadata(
+        old_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="old-plan",
+            canonical_plan=old_plan,
+            raw_structured_coder_response=old_plan,
+        ),
+    )
+    later_plan_comment = _attach_round_metadata(
+        later_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=2,
+            subject="later-plan",
+            canonical_plan=later_plan,
+            raw_structured_coder_response=later_plan,
+        ),
+    )
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=orchestrator.approved_plan_hash(old_plan),
+    )
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-01T00:00:00Z", "body": old_plan_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-01T00:01:00Z", "body": handoff},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-01T00:02:00Z", "body": later_plan_comment},
+        ],
+        issue_payload={"number": 56, "title": "Issue", "body": "Original issue."},
+        pr_payload={
+            "number": 77,
+            "url": "https://github.com/OWNER/REPO/pull/77",
+            "body": "Fixes #56",
+        },
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    plan_block = prompt.split("Approved implementation plan context", 1)[1].split(
+        "Target child/primary issue context", 1
+    )[0]
+    assert "Preserve the old API." in plan_block
+    assert "Replace the old API." not in plan_block
 
 
 def test_pr_loop_runs_tests_and_merge_only_after_codex_approval(tmp_path):
@@ -2782,7 +2872,15 @@ def test_pr_loop_combines_issue_and_pr_signed_human_requirements(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
             "LGTM.\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
-        ],
+            ],
+        issue_payload={
+            "number": 56,
+            "title": "Support issue comments",
+            "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
+            "author": {"login": "issue-author"},
+            "createdAt": "2026-05-17T08:00:00Z",
+            "url": "https://github.com/OWNER/REPO/issues/56",
+        },
         pr_payload={
             "comments": [
                 {
@@ -3603,6 +3701,14 @@ def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rerevie
             + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         claude_outputs=["Renamed helper.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+        issue_payload={"title": "Support issue comments", "body": "Original request."},
+        issue_comments=[
+            {
+                "author": {"login": "commenter"},
+                "createdAt": "2026-05-17T10:00:00Z",
+                "body": "Clarifying issue comment.",
+            }
+        ],
     )
     config = make_config(tmp_path, approved_followups="fix-and-summarize")
     issue_context = IssueContext(

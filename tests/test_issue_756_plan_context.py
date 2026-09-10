@@ -1,9 +1,6 @@
 from dataclasses import replace
 
-import pytest
-
 from agent_loop_helpers import make_config
-from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
     IssueComment,
@@ -61,25 +58,26 @@ def test_signed_requirement_ids_survive_insertion_and_body_edits():
     )
     edited = replace(first, body="Change the public API.")
     assert first.requirement_id != edited.requirement_id
-    assert first.requirement_id in format_human_requirements((first, inserted))
-    assert inserted.requirement_id in format_human_requirements((inserted, first))
+    # The digest-backed identity is internal. Public acknowledgement labels
+    # remain positional so transcripts from older runs can resume.
+    assert "Requirement 1:" in format_human_requirements((first, inserted))
+    assert "Requirement 1:" in format_human_requirements((inserted, first))
 
 
-def test_legacy_positional_acknowledgement_is_not_reinterpreted():
+def test_legacy_positional_acknowledgement_remains_resumable():
     requirement = _requirement(
         body="Keep the public API stable.",
         created_at="2026-01-01T00:00:00Z",
         url="https://github.com/OWNER/REPO/issues/1#issuecomment-1",
     )
     context = render_coder_human_requirements_prompt_context((requirement,))
-    assert context.surfaced_requirement_ids == (f"Requirement {requirement.requirement_id}",)
-    with pytest.raises(AgentLoopError, match="unknown signed human requirement"):
-        validate_human_requirements_acknowledgement(
-            "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
-            "### Human requirements\n- Requirement 1: done",
-            surfaced_requirement_ids=context.surfaced_requirement_ids,
-            requires_direct_discussion_ack=False,
-        )
+    assert context.surfaced_requirement_ids == ("Requirement 1",)
+    validate_human_requirements_acknowledgement(
+        "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+        "### Human requirements\n- Requirement 1: done",
+        surfaced_requirement_ids=context.surfaced_requirement_ids,
+        requires_direct_discussion_ack=False,
+    )
 
 
 def test_duplicate_same_source_is_deduplicated_but_divergent_body_is_not():
@@ -91,7 +89,7 @@ def test_duplicate_same_source_is_deduplicated_but_divergent_body_is_not():
     assert deduplicate_human_requirements((requirement, requirement)) == (requirement,)
 
 
-def test_requirement_truncation_keeps_stable_ids_without_renumbering():
+def test_requirement_truncation_preserves_positional_acknowledgement_labels():
     requirements = tuple(
         _requirement(
             body=f"Requirement body {index}.",
@@ -102,11 +100,9 @@ def test_requirement_truncation_keeps_stable_ids_without_renumbering():
     )
     full = format_human_requirements(requirements)
     bounded = format_human_requirements(requirements, max_chars=len(full) - 1)
-    assert requirements[0].requirement_id not in bounded
-    assert requirements[1].requirement_id in bounded
-    assert requirements[2].requirement_id in bounded
-    assert "Requirement 2" not in bounded
-    assert "Requirement 3" not in bounded
+    assert "Requirement 1:" not in bounded
+    assert "Requirement 2:" in bounded
+    assert "Requirement 3:" in bounded
 
 
 def test_duplicate_url_body_with_api_metadata_differences_is_deduplicated():

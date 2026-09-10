@@ -776,14 +776,11 @@ def human_requirements_resolved(text: str) -> bool:
 
 
 def _normalize_requirement_label(text: str) -> str:
-    stable = re.fullmatch(r"\s*(?:Requirement\s+)?(hr-[0-9a-f]{64})\s*", text, re.I)
-    if stable:
-        return stable.group(1).lower()
     legacy = re.fullmatch(r"\s*Requirement\s+(\d+)\s*", text, re.I)
     if not legacy:
         raise AgentLoopError(
             f"Invalid human requirement label: {text}. Only exact surfaced signed labels like "
-            "`Requirement hr-<digest>` are valid; issue acceptance criteria, reviewer item IDs, reviewer "
+            "`Requirement 1` are valid; issue acceptance criteria, reviewer item IDs, reviewer "
             "comments, and arbitrary labels are not signed human requirements."
         )
     return f"Requirement {legacy.group(1)}"
@@ -811,7 +808,7 @@ def parse_human_requirements_acknowledgement(text: str) -> ParsedHumanRequiremen
         if not bullet:
             continue
         for match in re.finditer(
-            r"\bRequirement\s+(?:\d+|hr-[0-9a-f]{64})\b",
+            r"\bRequirement\s+\d+\b",
             bullet.group("text"),
             re.I,
         ):
@@ -895,20 +892,6 @@ def validate_structured_human_requirements_acknowledgement(
     expected_ids = tuple(_normalize_requirement_label(item_id) for item_id in surfaced_requirement_ids)
     unknown = sorted(set(normalized_addressed_ids) - set(expected_ids))
     if unknown:
-        legacy_unknown = [
-            item for item in unknown if re.fullmatch(r"Requirement\s+\d+", item)
-        ]
-        if legacy_unknown and any(
-            re.fullmatch(r"(?:Requirement\s+)?hr-[0-9a-f]{64}", item, re.I)
-            for item in expected_ids
-        ):
-            raise AgentLoopError(
-                "Legacy positional human requirement label(s) are not mapped to the current "
-                "stable IDs; fresh acknowledgement is required because the response is missing "
-                "the current requirement ID(s). This is a missing requirement ID acknowledgement "
-                "for unknown signed human requirement ID(s): "
-                + ", ".join(legacy_unknown)
-            )
         raise AgentLoopError(
             "Coder response referenced unknown signed human requirement IDs: "
             + ", ".join(unknown)

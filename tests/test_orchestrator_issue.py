@@ -37,6 +37,7 @@ from coding_review_agent_loop.orchestrator import (
     _strip_round_metadata,
 )
 from coding_review_agent_loop.prompts import (
+    build_completion_recovery_prompt,
     COMPACT_PLANNING_VOLATILE_TAIL_MARKER,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
 )
@@ -844,6 +845,156 @@ def test_issue_loop_plan_first_accepts_initial_plan_human_requirements_acknowled
     config = make_config(tmp_path)
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+
+def test_issue_loop_plan_first_fails_closed_when_requirements_change_after_approval(
+    tmp_path, monkeypatch
+):
+    requirement_1 = HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Keep the public API unchanged.",
+    )
+    requirement_2 = HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-05-17T08:10:00Z",
+        url="https://github.com/OWNER/REPO/issues/56#issuecomment-2",
+        body="Also preserve the audit trail.",
+    )
+    initial = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+        human_requirements=(requirement_1,),
+    )
+    refreshed = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+        human_requirements=(requirement_1, requirement_2),
+    )
+    contexts = iter((initial, refreshed))
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_issue_context",
+        lambda *args, **kwargs: next(contexts),
+    )
+    plan_output = structured_plan_state(summary="Plan the compatibility fix.").replace(
+        '"human_requirement_dispositions": []',
+        '"human_requirement_dispositions": [{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The plan preserves the public API."}]',
+        1,
+    ).replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        "\n"
+        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+        "### Human requirements\n"
+        "- Requirement 1: the plan preserves the public API.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+    runner = FakeRunner(
+        claude_outputs=[plan_output],
+        codex_outputs=[
+            structured_plan_review(
+                state="approved",
+                summary="Plan approved.",
+                human_requirements_resolved=True,
+                human_requirement_dispositions=[
+                    {
+                        "requirement_id": "Requirement 1",
+                        "disposition": "addressed",
+                        "evidence": "The plan preserves the public API.",
+                    }
+                ],
+            )
+        ],
+    )
+
+    with pytest.raises(AgentLoopError, match="Issue #56 gained signed human requirement"):
+        run_issue_loop(runner, issue_number=56, config=make_config(tmp_path), plan_first=True)
+
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+
+
+def test_approved_plan_completion_recovery_carries_parent_and_child_requirements(
+    tmp_path, monkeypatch
+):
+    parent_requirement = HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/55",
+        body="Preserve the parent audit trail.",
+    )
+    child_requirement = HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-05-17T08:10:00Z",
+        url="https://github.com/OWNER/REPO/issues/56#issuecomment-2",
+        body="Preserve the child API.",
+    )
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Child issue",
+        body="Child issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+        human_requirements=(child_requirement,),
+    )
+    parent_context = IssueContext(
+        number=55,
+        repo="OWNER/REPO",
+        title="Parent issue",
+        body="Parent issue body",
+        url="https://github.com/OWNER/REPO/issues/55",
+        comments=(),
+        human_requirements=(parent_requirement,),
+    )
+    captured = {}
+
+    class _StopAfterCapture(Exception):
+        pass
+
+    def capture_policy(*args, **kwargs):
+        captured["policy"] = kwargs["completion_recovery"]
+        raise _StopAfterCapture
+
+    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", capture_policy)
+    config = make_config(tmp_path)
+
+    with pytest.raises(_StopAfterCapture):
+        orchestrator_module._implement_approved_issue(
+            FakeRunner(),
+            issue_number=56,
+            approved_plan="Approved plan.\n\n### Scope\n- Preserve both APIs.",
+            config=config,
+            memory=None,
+            issue_context=issue_context,
+            parent_issue_context=parent_context,
+            coder_session_id=None,
+            usage_context=orchestrator_module._new_usage_context(config),
+        )
+
+    policy = captured["policy"]
+    assert policy.human_requirements == (parent_requirement, child_requirement)
+    recovery_prompt = build_completion_recovery_prompt(
+        config,
+        approved_plan_context=policy.approved_plan_context,
+        human_requirements=policy.human_requirements,
+    )
+    assert "Preserve the parent audit trail." in recovery_prompt
+    assert "Preserve the child API." in recovery_prompt
+
 
 def test_issue_loop_plan_first_revises_until_all_reviewers_approve(tmp_path):
     runner = FakeRunner(
@@ -2240,7 +2391,8 @@ def test_issue_loop_plan_first_ignore_mode_keeps_pr_prior_ledger_clean(tmp_path)
         if cmd[:2] == ["codex", "exec"] and '"kind": "pr_review"' in cmd[-1]
     ][0]
     assert "Only items listed under `Prior unresolved review items from earlier rounds`" in pr_review_prompt
-    assert "Track a separate planning cleanup later." not in pr_review_prompt
+    ledger_start = pr_review_prompt.index("Prior unresolved review items from earlier rounds")
+    assert "Track a separate planning cleanup later." not in pr_review_prompt[ledger_start:]
     assert "planning-stage `item-*` IDs and approved\nplan future follow-ups" in pr_review_prompt
     assert "prior_plan_item_dispositions" in pr_review_prompt
 
@@ -2571,6 +2723,67 @@ def test_issue_loop_plan_first_one_shot_posts_handoff_after_pr_creation(tmp_path
     assert "Plan subject:" in handoff_comments[0]
     assert "PR #77" in handoff_comments[0]
 
+
+def test_issue_loop_plan_first_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_path):
+    old_plan = "Approved old plan.\n\n### Scope\n- Preserve the old API."
+    later_plan = "Unrelated later plan.\n\n### Scope\n- Replace the old API."
+    old_plan_comment = _attach_round_metadata(
+        old_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="old-plan",
+            canonical_plan=old_plan,
+            raw_structured_coder_response=old_plan,
+        ),
+    )
+    later_plan_comment = _attach_round_metadata(
+        later_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=2,
+            subject="later-plan",
+            canonical_plan=later_plan,
+            raw_structured_coder_response=later_plan,
+        ),
+    )
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=approved_plan_hash(old_plan),
+    )
+    runner = _FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-01T00:00:00Z", "body": old_plan_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-01T00:01:00Z", "body": handoff},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-01T00:02:00Z", "body": later_plan_comment},
+        ],
+        pr_payload={
+            "number": 77,
+            "url": "https://github.com/OWNER/REPO/pull/77",
+            "body": "Fixes #56",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path), plan_first=True) == 0
+
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    plan_block = prompt.split("Approved implementation plan context", 1)[1].split(
+        "Target child/primary issue context", 1
+    )[0]
+    assert "Preserve the old API." in plan_block
+    assert "Replace the old API." not in plan_block
+
+
 def test_issue_loop_plan_first_one_shot_rerun_with_closed_pr_stops(tmp_path, capsys):
     plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     handoff = format_one_shot_impl_handoff_comment(
@@ -2840,6 +3053,11 @@ def test_issue_loop_plan_first_one_shot_resume_existing_pr_logs_clear_message(tm
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         open_prs_payload=[{"number": 492, "body": "Fixes #56"}],
+        pr_payload={
+            "number": 492,
+            "url": "https://github.com/OWNER/REPO/pull/492",
+            "body": "Fixes #56",
+        },
         pr_commit_pages=_provenance_pages(
             "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=approved "
             f"plan={approved_plan_hash(plan)}"
