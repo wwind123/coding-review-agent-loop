@@ -547,6 +547,7 @@ The active planning human-requirements context above is authoritative. Do not us
 ## ARRAY FIELD TYPES (Format A/B/D):
 - blocking_items, same_pr_followups, future_followups, blocking_plan_issues, same_plan_followups, plan_steps -> STRINGS
 - prior_item_dispositions, prior_plan_item_dispositions -> OBJECTS {"item_id":..., "disposition":..., "note":...}
+- For PR reviews, carried `blocking`/`same-pr` dispositions require an actionable note explaining the remaining defect, evidence, and needed change. Copy an explanation only when the original response clearly ties it to that item; preserve the summary too. Never invent evidence, assign an ambiguous summary to an item, or change a status just to satisfy this requirement. If the original contains no such explanation, leave it missing so validation fails actionably.
 - disposition values: "resolved", "blocking", "same-pr"/"same-plan", or "future" ONLY
 
 ## ARRAY FIELD TYPES (Format C) — TWO DIFFERENT ID TYPES, DO NOT CONFUSE THEM:

@@ -969,6 +969,7 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
         "",
         "Explicitly evaluate every item below before approving. Use the item IDs exactly as written.",
         "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge.",
+        "Every `blocking` or `same-pr` prior-item disposition requires an actionable `note`: explain what remains wrong on this head, cite relevant code or test evidence, and say what change or test would resolve it. A bare status or summary alone is insufficient. A different defect needs a new item, not a repurposed ID. Resolved dispositions may omit the note.",
         "",
     ]
     for item in unresolved_items:

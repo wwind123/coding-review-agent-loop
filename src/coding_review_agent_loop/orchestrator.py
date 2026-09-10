@@ -7637,6 +7637,16 @@ def run_pr_loop(
             resumed_by_name = {
                 record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
             }
+            # Summaries are review-level context, not new findings or substitutes
+            # for an item's immutable claim. Seed from saved reviews for recovery.
+            reviewer_summaries = {
+                name: (
+                    f"{name} (round {record.metadata.round_number}, head {record.metadata.subject}):\n"
+                    + review_freeform_summary_text(record.body)
+                )
+                for name, record in resumed_by_name.items()
+                if review_freeform_summary_text(record.body).strip()
+            }
             unchanged_head_approvals = _latest_pr_approved_reviews_for_head(
                 pr_comments,
                 head_sha=pr_metadata.head_sha,
@@ -8152,6 +8162,14 @@ def run_pr_loop(
                     )
                     continue
 
+                if parsed_review.summary.strip():
+                    summary_record = resumed_record or carried_approval_record
+                    summary_round = summary_record.metadata.round_number if summary_record else round_number
+                    summary_head = summary_record.metadata.subject if summary_record else current_pr_subject
+                    reviewer_summaries[reviewer_name] = (
+                        f"{reviewer_name} (round {summary_round}, head {summary_head}):\n"
+                        + parsed_review.summary
+                    )
                 for disposition in parsed_review.dispositions:
                     _record_prior_item_disposition(
                         prior_dispositions,
@@ -8412,6 +8430,11 @@ def run_pr_loop(
                             )
                             if repaired_validated is not None:
                                 repaired_parsed = repaired_validated
+                                if repaired_parsed.summary.strip():
+                                    reviewer_summaries[reviewer_name] = (
+                                        f"{reviewer_name} (round {round_number}, head {current_pr_subject}):\n"
+                                        + repaired_parsed.summary
+                                    )
                                 if (
                                     repaired_parsed.state == "approved"
                                     and human_requirements_resolved(repaired_text)
@@ -9188,11 +9211,19 @@ def run_pr_loop(
 
             same_pr_items = [item for item in unresolved_items if item.status == "same-pr"]
             blocking_items = [item for item in unresolved_items if item.status == "blocking"]
+            summary_context = (
+                "Latest reviewer summaries (review-level context):\n"
+                "These summaries supplement the item ledger; they do not create new item IDs "
+                "or replace Original claims. Do not treat one reviewer's summary as another's "
+                "item-specific evidence.\n\n"
+                + "\n\n".join(reviewer_summaries.values()) + "\n\n"
+                if reviewer_summaries else ""
+            )
             if has_merge_conflict_item:
                 other_items = [
                     item for item in unresolved_items if item.item_id != MERGE_CONFLICT_ITEM_ID
                 ]
-                combined_review = _format_unresolved_items_for_coder(other_items)
+                combined_review = summary_context + _format_unresolved_items_for_coder(other_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )
@@ -9226,7 +9257,7 @@ def run_pr_loop(
                 )
                 log(config, f"Round {round_number}: {coder_name} resolving merge conflict")
             elif same_pr_items and not blocking_items:
-                combined_review = stall_context + _format_same_pr_unresolved_items(same_pr_items)
+                combined_review = stall_context + summary_context + _format_same_pr_unresolved_items(same_pr_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )
@@ -9242,7 +9273,7 @@ def run_pr_loop(
                 )
                 log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
             else:
-                combined_review = stall_context + _format_unresolved_items_for_coder(unresolved_items)
+                combined_review = stall_context + summary_context + _format_unresolved_items_for_coder(unresolved_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )

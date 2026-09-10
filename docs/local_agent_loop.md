@@ -2583,6 +2583,21 @@ only; an active carried claim appears only as a `blocking`, `same-pr`, or
 `same-plan` disposition plus its note. Each explicit new finding receives a
 fresh stable ID.
 
+New PR review responses must supply a non-empty, actionable `note` for every
+carried `blocking` or `same-pr` disposition. Explain what remains wrong on the
+reviewed head, the relevant evidence, and the change or test needed. Missing
+notes and bare status restatements are rejected; this structural check cannot
+guarantee the quality of the explanation. Resolved dispositions may omit notes.
+Older saved reviews still parse and resume; a missing active-item explanation
+is explicitly labeled in the ledger rather than invented.
+
+The CLI coder follow-up also includes the latest available reviewer summaries
+as separate, attributed review-level context, including on resumed rounds and
+when compact PR review prompts are used. Summaries do not receive item IDs,
+replace original claims, or become another reviewer's item-specific evidence.
+Repair may copy clearly attributed explanations from the original response,
+but must not invent missing rationale or discard the original summary.
+
 Reconciliation remains conservative for a genuine same-claim disagreement: a
 valid active disposition still outweighs another reviewer's `resolved` vote.
 An active carried disposition is actionable even without a new-finding array,
