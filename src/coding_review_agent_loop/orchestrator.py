@@ -7605,11 +7605,6 @@ def run_pr_loop(
                 )
                 issue_handoff = None
             if issue_handoff is not None:
-                if issue_handoff.pr_number != pr_number:
-                    raise AgentLoopError(
-                        f"Issue #{issue_context.number} handoff selects PR #{issue_handoff.pr_number}, "
-                        f"not PR #{pr_number}; review the recorded PR directly or repair the handoff."
-                    )
                 if recorded_pr_contract is not None and (
                     recorded_pr_contract.primary_issue_number != issue_handoff.issue_number
                     or recorded_pr_contract.origin_flow != issue_handoff.flow
@@ -7693,7 +7688,7 @@ def run_pr_loop(
                                 raise AgentLoopError(
                                     "Decomposition child phase identity does not match the parent topology checkpoint."
                                 )
-                    if approved_plan_context is None:
+                    if approved_plan_context is None or approved_plan_context.availability == "unavailable":
                         expected_plan_subject = None
                         one_shot_record = find_latest_one_shot_impl_handoff(
                             issue_context.comments,
@@ -7705,12 +7700,13 @@ def run_pr_loop(
                             and one_shot_record.plan_hash == issue_handoff.plan_hash
                         ):
                             expected_plan_subject = one_shot_record.plan_subject or None
-                        approved_plan_context = recover_approved_plan_context(
-                            issue_context.comments,
-                            expected_hash=issue_handoff.plan_hash,
-                            expected_subject=expected_plan_subject,
-                        )
-                        if not approved_plan_context.is_available and parent_issue_context is not None:
+                        if approved_plan_context is None:
+                            approved_plan_context = recover_approved_plan_context(
+                                issue_context.comments,
+                                expected_hash=issue_handoff.plan_hash,
+                                expected_subject=expected_plan_subject,
+                            )
+                        if approved_plan_context.availability == "unavailable" and parent_issue_context is not None:
                             parent_candidate = recover_approved_plan_context(
                                 parent_issue_context.comments,
                                 expected_hash=issue_handoff.plan_hash,

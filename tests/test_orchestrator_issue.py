@@ -2784,6 +2784,80 @@ def test_issue_loop_plan_first_resume_uses_handoff_bound_plan_when_later_plan_ex
     assert "Replace the old API." not in plan_block
 
 
+def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path, monkeypatch):
+    parent_plan = "Approved parent plan.\n\n### Scope\n- Preserve the child API."
+    parent_plan_comment = _attach_round_metadata(
+        parent_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="parent-plan",
+            canonical_plan=parent_plan,
+            raw_structured_coder_response=parent_plan,
+        ),
+    )
+    child = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Child issue",
+        body="Child phase issue for parent #55: staged implementation.",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(
+            IssueComment(
+                author="coding-review-agent-loop",
+                created_at="2026-05-01T00:01:00Z",
+                body=format_issue_pr_handoff_comment(
+                    issue_number=56,
+                    pr_number=77,
+                    pr_url="https://github.com/OWNER/REPO/pull/77",
+                    pr_head_sha="abc123",
+                    flow="approved-plan-implementation",
+                    plan_hash=approved_plan_hash(parent_plan),
+                ),
+            ),
+        ),
+    )
+    parent = IssueContext(
+        number=55,
+        repo="OWNER/REPO",
+        title="Parent issue",
+        body="Parent issue body.",
+        url="https://github.com/OWNER/REPO/issues/55",
+        comments=(
+            IssueComment(
+                author="coding-review-agent-loop",
+                created_at="2026-05-01T00:00:00Z",
+                body=parent_plan_comment,
+            ),
+        ),
+    )
+
+    def issue_context_for(_runner, *, config, issue_number):
+        assert config.repo == "OWNER/REPO"
+        return child if issue_number == 56 else parent
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", issue_context_for)
+    runner = _FakeRunner(
+        pr_payload={
+            "number": 77,
+            "url": "https://github.com/OWNER/REPO/pull/77",
+            "body": "Fixes #56",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path), plan_first=True) == 0
+
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    plan_block = prompt.split("Approved implementation plan context", 1)[1].split(
+        "Target child/primary issue context", 1
+    )[0]
+    assert "Preserve the child API." in plan_block
+
+
 def test_issue_loop_plan_first_one_shot_rerun_with_closed_pr_stops(tmp_path, capsys):
     plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     handoff = format_one_shot_impl_handoff_comment(
