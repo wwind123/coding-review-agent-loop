@@ -382,6 +382,30 @@ diagnostic instead of silently reviewing stale prose. Direct `agent-loop pr`
 resume uses the PR contract's primary issue and requires the matching
 issue-side handoff; ordinary PRs without planning provenance remain supported.
 
+Approved-plan reconciliation is explicit in both full and compact PR review
+prompts. Reviewers classify a concern as implementation noncompliance or an
+ordinary defect to fix within the plan, an evidence-backed correctness,
+security, compatibility, or test defect in an approved decision that may block
+and proposes a plan correction, or a discretionary scope/policy request that
+names the incompatible approved decision, evidence, and proposed change. The
+existing finding text and carried-item disposition notes carry the explanation;
+no protocol fields, model call, semantic classifier, or automatic arbitration
+is added. Plan conformance never defeats a legitimate defect, signed human
+instruction, original issue authority, or safety constraint.
+
+Coder follow-ups use `disputed_items` and `dispute_evidence` for a factually
+incorrect claim or a verified plan conflict, with decision-bearing evidence for
+the latter. They must fix ordinary defects and evidence-backed defects, and may
+not park a verified plan conflict in `remaining_items`. The existing behavior
+re-reviews a disputed item once and terminates visibly for human resolution if
+the reviewer maintains it as blocking. When canonical plan text is omitted for
+provider budget, the source locator must be fetched and verified before a plan
+decision is enforced or challenged; if that fails, no approved decision is
+enforceable or disputable, but ordinary defects remain reviewable. Unavailable,
+mismatched, legacy, and direct-PR contexts must not cause a decision to be
+invented. Host skill review requests include the same reconciliation guidance
+artifact as external reviewer prompts.
+
 For staged work, child and authoritative parent issue contexts are labeled
 separately. Resume validates the generated split/decomposition identity and
 the parent handoff selecting the exact child before recovering the plan. Parent

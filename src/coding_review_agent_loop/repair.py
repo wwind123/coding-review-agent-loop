@@ -250,6 +250,23 @@ Before responding, compare source and output: every retained finding needs its
 full supporting text, every test needs its original status/caveat, and every ID
 must stay in its correct ledger. Do not silently fill gaps with invented facts.
 
+## APPROVED-PLAN RECONCILIATION (coder follow-ups):
+
+When the source is a coder follow-up, preserve the distinction between an
+ordinary implementation defect and a conflict with a verified approved-plan
+decision. Ordinary implementation defects, and evidence-backed correctness,
+security, compatibility, or test defects, belong in `addressed_items` or
+`remaining_items` according to their actual status; they must never be
+disputed merely because the implementation followed the plan. Use
+`disputed_items` only for a factually incorrect reviewer claim with verifiable
+counter-evidence or for a reviewer request mutually incompatible with a
+verified approved-plan decision. In the latter case, preserve a
+`dispute_evidence` entry that names the conflicting decision, concrete
+counter-evidence, and the proposed-change conflict. Never move that conflict
+to `remaining_items`, because retry semantics would silently recycle it. The
+existing orchestrator gives a maintained dispute one reconsideration and then
+terminates for human resolution; do not invent a new escalation field or state.
+
 ## Valid Format A — PR Review:
 
 {

@@ -403,13 +403,13 @@ from .unresolved_items import (
     _clear_merge_conflict_item,
     _format_same_pr_unresolved_items,
     _format_unresolved_items_for_coder,
-    _is_disputed_item,
     _maybe_fill_resolved_dispositions_from_prose,
     _next_unresolved_item,
     _normalize_disposition_section_prose,
     _reconcile_merge_conflict_item,
     _record_prior_item_disposition,
     _reconcile_human_requirements_ack_item,
+    _raise_if_maintained_disputed_items,
     _upsert_human_requirements_ack_item,
     _validate_coder_followup_response,
     _validate_plan_review_response,
@@ -8933,27 +8933,10 @@ def run_pr_loop(
             must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-pr"}]
 
             if must_fix_items:
-                prior_item_ids = {item.item_id for item in prior_unresolved_items}
-                disputed_still_blocking = [
-                    item for item in must_fix_items
-                    if item.item_id in prior_item_ids
-                    and _is_disputed_item(item)
-                ]
-                if disputed_still_blocking:
-                    item_summaries = "\n".join(
-                        "\n".join(
-                            [
-                                f"- [{item.item_id}] from {item.reviewer}: {item.text[:300]}",
-                                *[f"  Update/evidence: {note}" for note in item.notes],
-                            ]
-                        )
-                        for item in disputed_still_blocking
-                    )
-                    raise AgentLoopError(
-                        f"Reviewer did not resolve {len(disputed_still_blocking)} disputed item(s) "
-                        "after seeing coder counter-evidence. Human review required to resolve the "
-                        f"disagreement.\n\nDisputed items still unresolved:\n{item_summaries}"
-                    )
+                _raise_if_maintained_disputed_items(
+                    must_fix_items,
+                    prior_items=prior_unresolved_items,
+                )
 
             pr_checks: PullRequestChecks | None = None
             if not must_fix_items:

@@ -196,6 +196,7 @@ def build_review_prompt_for_skill(
     issue_context: IssueContext | None = None,
     parent_issue_context: IssueContext | None = None,
     human_requirements: Sequence | None = None,
+    approved_plan_max_chars: int | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
@@ -251,6 +252,7 @@ def build_review_prompt_for_skill(
         human_requirements=human_requirements,
         unresolved_items=unresolved,
         approved_plan_context=approved_plan_context,
+        approved_plan_max_chars=approved_plan_max_chars,
     )
     if pr_diff:
         prompt += f"\n\n## PR diff\n\n```diff\n{pr_diff}\n```\n"
@@ -272,6 +274,7 @@ def build_pr_fix_prompt_for_skill(
     same_pr_only: bool = False,
     memory: AgentMemoryContext | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
+    approved_plan_max_chars: int | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build the external-coder PR-fix prompt from skill-mode ledger items.
@@ -300,6 +303,7 @@ def build_pr_fix_prompt_for_skill(
             human_requirements=human_requirements,
             human_requirements_context=human_requirements_context,
             approved_plan_context=approved_plan_context,
+            approved_plan_max_chars=approved_plan_max_chars,
         ), config)
     review_text = _format_unresolved_items_for_coder(unresolved)
     return _with_containment_guidance(build_followup_prompt(
@@ -313,6 +317,7 @@ def build_pr_fix_prompt_for_skill(
         human_requirements=human_requirements,
         human_requirements_context=human_requirements_context,
         approved_plan_context=approved_plan_context,
+        approved_plan_max_chars=approved_plan_max_chars,
     ), config)
 
 

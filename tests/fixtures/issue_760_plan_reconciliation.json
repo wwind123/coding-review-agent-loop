@@ -1,0 +1,214 @@
+{
+  "scenarios": [
+    {
+      "name": "stable_id_discretionary_positional_labels",
+      "plan_context": {
+        "availability": "available",
+        "canonical_text": "Approved migration decision: use digest-backed stable public labels; do not restore positional labels.",
+        "source_locator": "issue #760 approved-plan round"
+      },
+      "pr_review": {
+        "state": "blocking",
+        "blocking_items": [
+          "Restore positional public labels for compatibility. This is a discretionary request that conflicts with the stable-ID migration decision; evidence: existing callers expect the old labels; proposed change: revert to positional labels."
+        ]
+      },
+      "coder_followup": {
+        "state": "blocking",
+        "disputed_items": ["item-1"],
+        "dispute_evidence": {
+          "item-1": "The verified approved decision is digest-backed stable public labels. The request is discretionary and incompatible with that decision; the issue evidence does not demonstrate a correctness, security, compatibility, or test defect in stable IDs. Proposed positional-label restoration is therefore a plan change."
+        }
+      },
+      "expected": {
+        "classification": "discretionary_plan_conflict",
+        "orchestration": "maintained_dispute_requires_human"
+      }
+    },
+    {
+      "name": "stable_id_evidence_backed_compatibility_defect",
+      "plan_context": {
+        "availability": "available",
+        "canonical_text": "Approved migration decision: use digest-backed stable public labels.",
+        "source_locator": "issue #760 approved-plan round"
+      },
+      "pr_review": {
+        "state": "blocking",
+        "blocking_items": [
+          "The stable-ID decision truncates digests to a collision-prone length, evidenced by two generated labels colliding in the regression fixture; proposed change: lengthen the digest and add collision coverage."
+        ]
+      },
+      "coder_followup": {
+        "state": "blocking",
+        "addressed_items": ["item-1"],
+        "addressed_item_notes": {
+          "item-1": "Lengthened the digest and added the collision regression test."
+        }
+      },
+      "expected": {
+        "classification": "evidence_backed_plan_defect",
+        "orchestration": "actionable_and_resolvable"
+      }
+    },
+    {
+      "name": "stable_id_implementation_noncompliance",
+      "plan_context": {
+        "availability": "available",
+        "canonical_text": "Approved migration decision: use digest-backed stable public labels.",
+        "source_locator": "issue #760 approved-plan round"
+      },
+      "pr_review": {
+        "state": "blocking",
+        "blocking_items": [
+          "The implementation still emits positional public labels instead of the approved digest-backed stable labels."
+        ]
+      },
+      "coder_followup": {
+        "state": "blocking",
+        "addressed_items": ["item-1"],
+        "addressed_item_notes": {
+          "item-1": "Updated the emitter to use the approved stable labels and added regression coverage."
+        }
+      },
+      "expected": {
+        "classification": "implementation_noncompliance",
+        "orchestration": "actionable_and_resolvable"
+      }
+    },
+    {
+      "name": "legacy_notice_discretionary_removal",
+      "plan_context": {
+        "availability": "available",
+        "canonical_text": "Approved absence policy: retain a visible unavailable-plan notice for valid legacy handoffs with no reachable plan.",
+        "source_locator": "issue #760 approved-plan round"
+      },
+      "pr_review": {
+        "state": "blocking",
+        "blocking_items": [
+          "Remove the expressly approved legacy unavailable-plan notice exception. This is a discretionary policy change; evidence: the notice is visible in legacy output; proposed change: never review a plan-bound PR without a plan."
+        ]
+      },
+      "coder_followup": {
+        "state": "blocking",
+        "disputed_items": ["item-1"],
+        "dispute_evidence": {
+          "item-1": "The verified approved decision for the absence policy expressly retains the visible notice for valid legacy handoffs with no reachable plan. Removing it is incompatible with that decision and is a discretionary policy change, not an implementation defect."
+        }
+      },
+      "expected": {
+        "classification": "discretionary_plan_conflict",
+        "orchestration": "maintained_dispute_requires_human"
+      }
+    },
+    {
+      "name": "legacy_recovery_failure_is_correctable",
+      "plan_context": {
+        "availability": "unavailable",
+        "plan_hash": "fd8029a78e94aba0",
+        "source_locator": "issue #760 approved-plan round",
+        "diagnostic": "A matching canonical plan exists at the source locator, but recovery failed."
+      },
+      "pr_review": {
+        "state": "blocking",
+        "blocking_items": [
+          "The existing matching approved plan was reachable but recovery failed; repair the issue-history lookup and verify the exact hash before review."
+        ]
+      },
+      "coder_followup": {
+        "state": "blocking",
+        "addressed_items": ["item-1"],
+        "addressed_item_notes": {
+          "item-1": "Fixed the ordinary recovery path and added exact issue-history and staged-parent recovery coverage."
+        }
+      },
+      "expected": {
+        "classification": "ordinary_recovery_defect",
+        "orchestration": "actionable_and_resolvable"
+      }
+    },
+    {
+      "name": "legacy_unavailable_notice_validation_bug",
+      "plan_context": {
+        "availability": "unavailable",
+        "plan_hash": "fd8029a78e94aba0",
+        "source_locator": "issue #760 approved-plan round",
+        "diagnostic": "No matching plan text is reachable for this legacy handoff."
+      },
+      "pr_review": {
+        "state": "blocking",
+        "blocking_items": [
+          "The unavailable-plan notice drops the handoff identity and incorrectly approves a malformed legacy context; fix the notice/validation path."
+        ]
+      },
+      "coder_followup": {
+        "state": "blocking",
+        "addressed_items": ["item-1"],
+        "addressed_item_notes": {
+          "item-1": "Preserved the unavailable notice and corrected its identity validation without changing the approved absence policy."
+        }
+      },
+      "expected": {
+        "classification": "ordinary_implementation_defect",
+        "orchestration": "actionable_and_resolvable"
+      }
+    },
+    {
+      "name": "budget_omitted_plan_text",
+      "plan_context": {
+        "availability": "omitted",
+        "plan_hash": "fd8029a78e94aba0",
+        "plan_subject": "verified subject",
+        "source_locator": "issue #760 approved-plan round"
+      },
+      "pr_review": {
+        "state": "blocking",
+        "blocking_items": ["Fetch the canonical decision before asserting that the PR violates the plan."]
+      },
+      "coder_followup": {
+        "state": "blocking",
+        "addressed_items": ["item-1"]
+      },
+      "expected": {
+        "classification": "no_enforceable_decision_until_fetched",
+        "orchestration": "ordinary_defects_remain_reviewable"
+      }
+    },
+    {
+      "name": "mismatched_plan_identity",
+      "plan_context": {
+        "availability": "mismatched",
+        "plan_hash": "wrong-hash",
+        "source_locator": "issue #760 approved-plan round",
+        "diagnostic": "Recovered text does not match the handoff hash."
+      },
+      "pr_review": {
+        "state": "blocking",
+        "blocking_items": ["Repair the plan handoff identity before enforcing a plan decision."]
+      },
+      "coder_followup": {
+        "state": "blocking",
+        "addressed_items": ["item-1"]
+      },
+      "expected": {
+        "classification": "no_invented_decision",
+        "orchestration": "recovery_remediation"
+      }
+    },
+    {
+      "name": "direct_pr_without_plan",
+      "plan_context": null,
+      "pr_review": {
+        "state": "blocking",
+        "blocking_items": ["Fix the ordinary parser regression in the direct PR."]
+      },
+      "coder_followup": {
+        "state": "blocking",
+        "addressed_items": ["item-1"]
+      },
+      "expected": {
+        "classification": "ordinary_defect_without_plan",
+        "orchestration": "normal_review_path"
+      }
+    }
+  ]
+}
