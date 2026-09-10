@@ -372,6 +372,23 @@ unresolvable fails safely with an actionable message rather than falling back
 to a fresh implementation; fix or select the correct PR and rerun
 `agent-loop pr <number>` directly.
 
+Approved-plan propagation is a separate PR-bound channel. The implementation
+handoff's plan hash selects the canonical raw plan record (including its
+subject, source locator, current scope, and deferred work); it is never
+reconstructed from bounded issue history or compact PR context. Full and
+compact reviewer prompts, merge-conflict prompts, and coder follow-ups receive
+the same plan context. A missing, ambiguous, or mismatched record stops with a
+diagnostic instead of silently reviewing stale prose. Direct `agent-loop pr`
+resume uses the PR contract's primary issue and requires the matching
+issue-side handoff; ordinary PRs without planning provenance remain supported.
+
+For staged work, child and authoritative parent issue contexts are labeled
+separately. Resume validates the generated split/decomposition identity and
+the parent handoff selecting the exact child before recovering the plan. Parent
+and child signed instructions are merged by chronological precedence under
+stable IDs; planning `item-*` records and plan future-work entries never enter
+the PR unresolved-item ledger.
+
 ### Durable marker trust boundary
 
 All durable protocol records are registered in
@@ -2307,7 +2324,7 @@ include:
 <!-- HUMAN_REQUIREMENTS_ADDRESSED -->
 
 ### Human requirements
-- Requirement 1: explain how it was addressed or why it cannot be satisfied safely.
+- Requirement hr-<content-digest>: explain how it was addressed or why it cannot be satisfied safely.
 ```
 
 Structured coder follow-ups carry the same acknowledgement in

@@ -82,6 +82,20 @@ GitHub comment metadata markers (`AGENT_LOOP_META`) written by the skill are
 identical to those written by the headless CLI, so mixed-mode operation (start
 headless, resume in skill, or vice versa) is supported.
 
+Approved-plan PR review uses the same lossless plan-bound context in both
+modes. A handoff hash selects the canonical plan record rather than the newest
+planning comment, so compact context and long comment histories cannot replace
+scope or deferred-work declarations. Issue and direct-PR resume validates the
+PR contract, issue-side handoff, and staged parent/child topology; absent or
+conflicting planning provenance is reported as an actionable recovery error.
+Ordinary direct PRs with no planning history continue without a plan context.
+
+Signed human requirements use stable `Requirement hr-<content-digest>` IDs.
+Insertion, reordering, and later parent instructions do not renumber prior
+IDs; legacy positional acknowledgements require a fresh acknowledgement.
+Later valid human instructions and safety constraints outrank an approved
+plan, which cannot silently narrow the original issue requirements.
+
 ## Reversed roles (external coder / host reviewer)
 
 Skill mode supports running the loop with the coder/reviewer roles reversed —

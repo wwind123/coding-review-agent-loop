@@ -80,6 +80,7 @@ BULLET_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(?P<text>.+?)\s*$")
 HEADING_LEVEL_RE = re.compile(r"^\s*(#{1,6})\s+\S")
 THEMATIC_BREAK_RE = re.compile(r"^\s*(?:([-*_])\s*){3,}\s*$")
 ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+HUMAN_REQUIREMENT_STABLE_ID_RE = re.compile(r"^hr-[0-9a-f]{64}$", re.I)
 
 
 def _empty_placeholder_re(*phrases: str) -> re.Pattern[str]:
@@ -775,14 +776,17 @@ def human_requirements_resolved(text: str) -> bool:
 
 
 def _normalize_requirement_label(text: str) -> str:
-    match = re.fullmatch(r"\s*Requirement\s+(\d+)\s*", text, re.I)
-    if not match:
+    stable = re.fullmatch(r"\s*(?:Requirement\s+)?(hr-[0-9a-f]{64})\s*", text, re.I)
+    if stable:
+        return stable.group(1).lower()
+    legacy = re.fullmatch(r"\s*Requirement\s+(\d+)\s*", text, re.I)
+    if not legacy:
         raise AgentLoopError(
             f"Invalid human requirement label: {text}. Only exact surfaced signed labels like "
-            "`Requirement 1` are valid; issue acceptance criteria, reviewer item IDs, reviewer "
+            "`Requirement hr-<digest>` are valid; issue acceptance criteria, reviewer item IDs, reviewer "
             "comments, and arbitrary labels are not signed human requirements."
         )
-    return f"Requirement {match.group(1)}"
+    return f"Requirement {legacy.group(1)}"
 
 
 def parse_human_requirements_acknowledgement(text: str) -> ParsedHumanRequirementsAcknowledgement:
@@ -806,7 +810,11 @@ def parse_human_requirements_acknowledgement(text: str) -> ParsedHumanRequiremen
         bullet = BULLET_RE.match(line)
         if not bullet:
             continue
-        for match in re.finditer(r"\bRequirement\s+\d+\b", bullet.group("text"), re.I):
+        for match in re.finditer(
+            r"\bRequirement\s+(?:\d+|hr-[0-9a-f]{64})\b",
+            bullet.group("text"),
+            re.I,
+        ):
             addressed_ids.append(_normalize_requirement_label(match.group(0)))
 
     return ParsedHumanRequirementsAcknowledgement(
@@ -887,6 +895,20 @@ def validate_structured_human_requirements_acknowledgement(
     expected_ids = tuple(_normalize_requirement_label(item_id) for item_id in surfaced_requirement_ids)
     unknown = sorted(set(normalized_addressed_ids) - set(expected_ids))
     if unknown:
+        legacy_unknown = [
+            item for item in unknown if re.fullmatch(r"Requirement\s+\d+", item)
+        ]
+        if legacy_unknown and any(
+            re.fullmatch(r"(?:Requirement\s+)?hr-[0-9a-f]{64}", item, re.I)
+            for item in expected_ids
+        ):
+            raise AgentLoopError(
+                "Legacy positional human requirement label(s) are not mapped to the current "
+                "stable IDs; fresh acknowledgement is required because the response is missing "
+                "the current requirement ID(s). This is a missing requirement ID acknowledgement "
+                "for unknown signed human requirement ID(s): "
+                + ", ".join(legacy_unknown)
+            )
         raise AgentLoopError(
             "Coder response referenced unknown signed human requirement IDs: "
             + ", ".join(unknown)

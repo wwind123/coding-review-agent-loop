@@ -8,6 +8,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
@@ -106,6 +107,78 @@ class PostedRoundMetadata:
     final_synthesis: str | None = None
     raw_synthesis_response: str | None = None
     synthesis_provenance: dict | None = None
+
+
+@dataclass(frozen=True)
+class ApprovedPlanContext:
+    """Lossless, PR-bound context for the approved implementation plan.
+
+    This is deliberately separate from :class:`IssueContext`: issue comments
+    are a bounded discussion history, while this record is an immutable
+    contract selected by the handoff's expected plan hash.
+    """
+
+    canonical_text: str | None = None
+    plan_hash: str | None = None
+    plan_subject: str | None = None
+    source_locator: str | None = None
+    scope: tuple[str, ...] = ()
+    deferred_work: tuple[str, ...] = ()
+    availability: Literal[
+        "available", "unavailable", "mismatched", "omitted", "not-planned"
+    ] = "unavailable"
+    diagnostic: str | None = None
+
+    @property
+    def raw_canonical_text(self) -> str | None:
+        return self.canonical_text
+
+    @property
+    def raw_text(self) -> str | None:
+        return self.canonical_text
+
+    @property
+    def subject(self) -> str | None:
+        return self.plan_subject
+
+    @property
+    def identity(self) -> str | None:
+        return self.plan_hash
+
+    @property
+    def approved_plan_hash(self) -> str | None:
+        return self.plan_hash
+
+    @property
+    def availability_state(self) -> str:
+        return self.availability
+
+    @property
+    def is_available(self) -> bool:
+        return self.availability == "available" and bool(self.canonical_text)
+
+
+@dataclass(frozen=True)
+class RequirementsContext:
+    """Labeled issue sources and the effective stable signed requirements."""
+
+    target_child: object | None = None
+    primary_issue: object | None = None
+    authoritative_parent: object | None = None
+    pr_sources: tuple[object, ...] = ()
+    effective_requirements: tuple[object, ...] = ()
+
+    @property
+    def child_context(self) -> object | None:
+        return self.target_child
+
+    @property
+    def parent_context(self) -> object | None:
+        return self.authoritative_parent
+
+    @property
+    def human_requirements(self) -> tuple[object, ...]:
+        return self.effective_requirements
 
 
 @dataclass(frozen=True)
@@ -653,6 +726,141 @@ def _latest_prior_pr_subject_is_coherent(records: Sequence[PostedRoundRecord], *
 
 def _plan_subject(text: str) -> str:
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+
+def _approved_plan_hash(text: str) -> str:
+    # Keep this local to avoid coupling the transport layer to decomposition.
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _plan_declarations(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Extract bounded scope/deferred declarations without rewriting plan text."""
+    sections: dict[str, list[str]] = {"scope": [], "deferred": []}
+    active: str | None = None
+    for line in text.splitlines():
+        heading = re.match(r"^\s{0,3}#{2,6}\s+(.+?)\s*$", line)
+        if heading:
+            title = heading.group(1).strip().casefold()
+            if any(token in title for token in ("deferred", "future", "out of scope", "non-goal")):
+                active = "deferred"
+            elif any(token in title for token in ("scope", "in scope", "current work")):
+                active = "scope"
+            else:
+                active = None
+            continue
+        if active is not None and line.strip():
+            sections[active].append(line.strip())
+    return tuple(sections["scope"]), tuple(sections["deferred"])
+
+
+def make_approved_plan_context(
+    text: str | None,
+    *,
+    source_locator: str | None = None,
+    expected_hash: str | None = None,
+    expected_subject: str | None = None,
+) -> ApprovedPlanContext:
+    """Build and validate a plan context from raw canonical text.
+
+    Hash and subject validation happen before any historical-text sanitizing or
+    prompt truncation.  Callers can therefore safely pass the returned context
+    through compact and full prompt builders.
+    """
+    if not text or not text.strip():
+        return ApprovedPlanContext(
+            plan_hash=expected_hash,
+            plan_subject=expected_subject,
+            source_locator=source_locator,
+            availability="unavailable",
+            diagnostic="The approved plan text is unavailable; recover the canonical plan record before reviewing.",
+        )
+    raw = text.strip()
+    actual_hash = _approved_plan_hash(raw)
+    actual_subject = _plan_subject(raw)
+    if expected_hash is not None and actual_hash != expected_hash:
+        return ApprovedPlanContext(
+            canonical_text=raw,
+            plan_hash=actual_hash,
+            plan_subject=actual_subject,
+            source_locator=source_locator,
+            availability="mismatched",
+            diagnostic=(
+                f"Recovered plan hash {actual_hash} does not match handoff hash {expected_hash}."
+            ),
+        )
+    if expected_subject is not None and actual_subject != expected_subject:
+        return ApprovedPlanContext(
+            canonical_text=raw,
+            plan_hash=actual_hash,
+            plan_subject=actual_subject,
+            source_locator=source_locator,
+            availability="mismatched",
+            diagnostic=(
+                f"Recovered plan subject {actual_subject} does not match handoff subject {expected_subject}."
+            ),
+        )
+    scope, deferred = _plan_declarations(raw)
+    return ApprovedPlanContext(
+        canonical_text=raw,
+        plan_hash=actual_hash,
+        plan_subject=actual_subject,
+        source_locator=source_locator,
+        scope=scope,
+        deferred_work=deferred,
+        availability="available",
+    )
+
+
+def recover_approved_plan_context(
+    comments: Sequence[object],
+    *,
+    expected_hash: str,
+    expected_subject: str | None = None,
+) -> ApprovedPlanContext:
+    """Recover exactly the plan selected by a durable implementation handoff."""
+    records = _extract_round_metadata_records(comments, flow="plan")
+    candidates: list[tuple[int, str]] = []
+    observed_hashes: set[str] = set()
+    for record in records:
+        raw = record.metadata.canonical_plan
+        if raw is None:
+            # Legacy freeform plan records have no canonical sidecar. Their
+            # visible body is only a safe fallback when its raw hash matches.
+            raw = record.metadata.raw_structured_coder_response
+        if raw is None:
+            continue
+        actual_hash = _approved_plan_hash(raw)
+        observed_hashes.add(actual_hash)
+        if actual_hash == expected_hash:
+            candidates.append((record.index, raw))
+    if not candidates:
+        available = ", ".join(sorted(observed_hashes)) or "none"
+        return ApprovedPlanContext(
+            plan_hash=expected_hash,
+            plan_subject=expected_subject,
+            availability="mismatched" if observed_hashes else "unavailable",
+            diagnostic=(
+                f"No canonical approved plan matches handoff hash {expected_hash}; "
+                f"recovered plan hashes: {available}."
+            ),
+        )
+    unique_texts = {raw for _index, raw in candidates}
+    if len(unique_texts) != 1:
+        return ApprovedPlanContext(
+            plan_hash=expected_hash,
+            plan_subject=expected_subject,
+            availability="mismatched",
+            diagnostic=(
+                f"Multiple divergent canonical plan records match handoff hash {expected_hash}."
+            ),
+        )
+    index, raw = candidates[-1]
+    return make_approved_plan_context(
+        raw,
+        source_locator=f"issue comment index {index}",
+        expected_hash=expected_hash,
+        expected_subject=expected_subject,
+    )
 
 
 def _resume_pr_round(

@@ -144,6 +144,21 @@ agent-loop issue 123 \
 
 Without `--plan-first`, issue mode asks the coder to implement immediately.
 
+Plan-first implementation carries the approved plan through a dedicated,
+lossless PR-bound context. The PR handoff binds reviewers and coder follow-ups
+to the recorded plan hash and subject, independently of truncated issue
+comments or compact PR history. Issue/PR resume validates that handoff (and any
+staged parent/child topology) before invoking an agent; an ordinary PR with no
+planning provenance continues through the normal no-plan path.
+
+Signed human instructions are rendered with stable content-derived
+`Requirement hr-<digest>` IDs. IDs do not change when a newer instruction is
+inserted, and legacy positional acknowledgements require fresh acknowledgement
+instead of being mapped onto the current requirement set. Original issue
+requirements, later valid human instructions, and safety constraints outrank
+an approved plan; a defective plan must be raised as a scope/plan decision,
+not silently replaced by review prose.
+
 ### Review a plan, then implement it
 
 Use plan-first mode for work whose design should be challenged before files are

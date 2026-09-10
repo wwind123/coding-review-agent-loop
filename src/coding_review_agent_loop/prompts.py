@@ -7,7 +7,7 @@ import re
 import shlex
 from dataclasses import dataclass
 from textwrap import indent
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
@@ -35,6 +35,9 @@ from .protocol import (
 from .protocol_markers import sanitize_historical_text
 from .workdirs import agent_workdir
 from .test_runtime import recommend_timeout, render_runtime_context, render_test_wrapper
+
+if TYPE_CHECKING:
+    from .round_state import ApprovedPlanContext
 
 
 @dataclass(frozen=True)
@@ -580,7 +583,7 @@ def format_human_requirements(
         "\n".join(
             [
                 "",
-                f"Requirement {index}:",
+                f"Requirement {requirement.requirement_id}:",
                 f"- Source: {requirement.source_type}",
                 f"- Author: {requirement.author or '(unknown)'}",
                 f"- Created: {requirement.created_at or '(unknown time)'}",
@@ -589,7 +592,7 @@ def format_human_requirements(
                 requirement.body,
             ]
         )
-        for index, requirement in enumerate(human_requirements, start=1)
+        for requirement in human_requirements
     ]
     full_text = header + "\n".join(entries)
     if len(full_text) <= max_chars:
@@ -679,7 +682,7 @@ def render_coder_human_requirements_prompt_context(
     )
     surfaced_requirement_ids = tuple(
         f"Requirement {match.group(1)}"
-        for match in re.finditer(r"(?m)^Requirement (\d+):$", block)
+        for match in re.finditer(r"(?m)^Requirement (hr-[0-9a-f]{64}):$", block, re.I)
     )
     requires_direct_discussion_ack = (
         not surfaced_requirement_ids
@@ -723,7 +726,7 @@ def _coder_human_requirements_guidance(
     ])
     if include_disposition_json:
         lines.append(
-            "In the structured JSON, also include `human_requirement_dispositions`: one object for every surfaced `Requirement N`, with `requirement_id`, `disposition` (`addressed`, `blocked`, or `not-applicable`), and a concise non-empty `evidence` note."
+            "In the structured JSON, also include `human_requirement_dispositions`: one object for every surfaced stable requirement ID, with `requirement_id`, `disposition` (`addressed`, `blocked`, or `not-applicable`), and a concise non-empty `evidence` note."
         )
     if context.surfaced_requirement_ids:
         surfaced = ", ".join(f"`{item}`" for item in context.surfaced_requirement_ids)
@@ -763,7 +766,7 @@ include exactly:
 
 If any signed human requirement in this set is unresolved, return blocking.
 """ + ("""For every surfaced requirement, the JSON must include exactly one
-`human_requirement_dispositions` object with its `Requirement N` ID, an
+`human_requirement_dispositions` object with its exact stable requirement ID, an
 `addressed`, `blocked`, or `not-applicable` disposition, and non-empty evidence.
 For an `addressed` disposition, compare the evidence to the canonical plan and
 return blocking when it lacks concrete coverage. A named external integration
@@ -874,7 +877,7 @@ def _structured_coder_followup_guidance(
         surfaced = ", ".join(f"`{item}`" for item in human_requirements_context.surfaced_requirement_ids)
         lines.append(
             "In structured replies, `human_requirement_dispositions` must cover exactly these surfaced signed labels: "
-            f"{surfaced}. Only exact surfaced labels such as `Requirement 1` are valid."
+            f"{surfaced}. Only those exact stable labels are valid; never renumber them as the requirement set changes."
         )
         lines.append(
             "Set `human_requirement_dispositions` to exactly one object per surfaced label, using the exact `requirement_id`, disposition `addressed`, `blocked`, or `not-applicable`, and non-blank evidence. Put only `addressed` dispositions in `human_requirements.addressed_ids`; omit `blocked` and `not-applicable` dispositions. A `blocked` disposition requires `state: blocking`, while `not-applicable` may be used with `state: approved`."
@@ -1089,6 +1092,67 @@ def _issue_context_block(issue_context: IssueContext | None) -> str:
         "original issue body:\n"
         f"{format_issue_context(issue_context)}\n"
     )
+
+
+def _labeled_issue_context_block(
+    issue_context: IssueContext | None,
+    *,
+    label: str,
+) -> str:
+    if issue_context is None:
+        return ""
+    return (
+        f"{label} (ordinary unsigned context; not signed human requirements):\n"
+        f"{format_issue_context(issue_context)}\n"
+    )
+
+
+def format_approved_plan_context(
+    plan_context: ApprovedPlanContext | None,
+    *,
+    max_chars: int = 24_000,
+) -> str:
+    """Render the lossless plan channel independently of issue history."""
+    if plan_context is None:
+        return "Approved implementation plan context\n\nNo approved plan is bound to this PR.\n"
+    lines = [
+        "Approved implementation plan context (PR-bound; separate from issue history)",
+        f"- Availability: {plan_context.availability}",
+        f"- Plan hash: {plan_context.plan_hash or '(unavailable)'}",
+        f"- Plan subject: {plan_context.plan_subject or '(unavailable)'}",
+        f"- Source locator: {plan_context.source_locator or '(unavailable)'}",
+        "- Authority: original issue requirements, later valid signed human instructions, and safety constraints outrank this plan",
+    ]
+    if plan_context.scope:
+        lines.extend(["", "Declared current scope:", *[f"- {item}" for item in plan_context.scope]])
+    else:
+        lines.extend(["", "Declared current scope:", "- (not separately declared)"])
+    if plan_context.deferred_work:
+        lines.extend(["", "Declared deferred work / non-goals:", *[f"- {item}" for item in plan_context.deferred_work]])
+    else:
+        lines.extend(["", "Declared deferred work / non-goals:", "- (none separately declared)"])
+    if plan_context.diagnostic:
+        lines.extend(["", f"Plan recovery diagnostic: {plan_context.diagnostic}"])
+    if not plan_context.is_available:
+        lines.extend([
+            "",
+            "The canonical plan text is unavailable or mismatched. Do not silently substitute issue prose; request plan/handoff remediation before approving.",
+            "A reviewer who finds the plan defective must identify the conflict and request a scope/plan decision; do not silently replace the agreed contract.",
+        ])
+        return "\n".join(lines) + "\n"
+    prefix = "\n".join(lines) + "\n\nCanonical approved plan text:\n"
+    text = plan_context.canonical_text or ""
+    if len(prefix) + len(text) <= max_chars:
+        return prefix + text + "\n"
+    # Keep all identity and declarations above.  If the canonical text cannot
+    # fit, make the omission explicit rather than truncating scope silently.
+    omission = (
+        "[Canonical approved plan text omitted because it exceeds the final provider prompt budget. "
+        "Use the source locator to fetch and verify the exact plan before proceeding.]"
+    )
+    if len(prefix) + len(omission) <= max_chars:
+        return prefix + omission + "\n"
+    return "\n".join(lines[:6] + ["", "Canonical approved plan text omitted: provider budget is too small to retain the required plan identity and scope metadata."]) + "\n"
 
 
 def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
@@ -1449,6 +1513,7 @@ def build_issue_prompt(
     salvage_summary: str | None = None,
     staged_parent_issue: int | None = None,
     managed_ci_creation_intent: ManagedCiCreationIntent | None = None,
+    parent_issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -1487,7 +1552,8 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
 )}
-{_issue_context_block(issue_context)}
+{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
+{_labeled_issue_context_block(issue_context, label="Target child/primary issue context")}
 {_memory_block(memory, config, include_runtime=True)}
 {_salvage_summary_block(salvage_summary)}
 
@@ -1532,7 +1598,7 @@ PR. Do not include ordinary mentions, `Refs` links, related issues, external
 dependencies, staged parents, unselected stages, deferred work, or plan actions.
 Absence means no declaration; an explicit empty array means no additional issue.
 When signed requirements are surfaced, the disposition array must contain every
-generated `Requirement N` exactly once; when none are surfaced, it must be empty.
+generated stable requirement ID exactly once; when none are surfaced, it must be empty.
 Use the optional typed `child_stages`, `external_dependencies`, `deferred_work`,
 and `plan_actions` arrays (each has non-empty `title` and `summary` strings).
 Only `child_stages` may be materialized; existing issue references belong in
@@ -2043,9 +2109,14 @@ def build_issue_implementation_prompt(
     salvage_summary: str | None = None,
     staged_parent_issue: int | None = None,
     managed_ci_creation_intent: ManagedCiCreationIntent | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+    parent_issue_context: IssueContext | None = None,
 ) -> str:
+    from .round_state import make_approved_plan_context
+
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
+    plan_context = approved_plan_context or make_approved_plan_context(approved_plan)
     human_requirements_context = _issue_human_requirements_prompt_context(
         issue_context,
         requirement_scope="implementation requirements",
@@ -2068,10 +2139,17 @@ def build_issue_implementation_prompt(
             repository=config.repo,
             issue_number=issue_number,
             flow="approved",
-            approved_plan_hash=approved_plan_hash(approved_plan),
+            approved_plan_hash=plan_context.plan_hash or approved_plan_hash(approved_plan),
         )
     )
     managed_creation_guidance = _managed_ci_creation_guidance(managed_ci_creation_intent)
+    phase_slice = ""
+    if plan_context.canonical_text and plan_context.canonical_text.strip() != approved_plan.strip():
+        phase_slice = (
+            "\nImplementation slice selected from the approved plan:\n\n"
+            + approved_plan
+            + "\n"
+        )
     return f"""Implement the approved plan for GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout as your workspace. Create a branch, implement the
@@ -2087,13 +2165,13 @@ approved plan, run relevant tests, commit, push, and open a pull request against
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
 )}
-{_issue_context_block(issue_context)}
+{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
+{_labeled_issue_context_block(issue_context, label="Target child/primary issue context")}
 {_memory_block(memory, config, include_runtime=True)}
 {_salvage_summary_block(salvage_summary)}
 
-Approved implementation plan:
-
-{approved_plan}
+{format_approved_plan_context(plan_context)}
+{phase_slice}
 
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
 
@@ -2102,6 +2180,9 @@ def build_completion_recovery_prompt(
     config: AgentLoopConfig,
     *,
     issue_context: IssueContext | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+    parent_issue_context: IssueContext | None = None,
+    human_requirements: Sequence[HumanReviewRequirement] | None = None,
 ) -> str:
     """One bounded same-session continuation for a stalled implementation turn (#588).
 
@@ -2113,11 +2194,18 @@ def build_completion_recovery_prompt(
     """
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
-    human_requirements_context = _issue_human_requirements_prompt_context(
-        issue_context,
-        requirement_scope="implementation requirements",
-        full_omission_fallback="Fetch the issue discussion directly before implementing.",
-    )
+    if human_requirements is None:
+        human_requirements_context = _issue_human_requirements_prompt_context(
+            issue_context,
+            requirement_scope="implementation requirements",
+            full_omission_fallback="Fetch the issue discussion directly before implementing.",
+        )
+    else:
+        human_requirements_context = render_coder_human_requirements_prompt_context(
+            human_requirements,
+            requirement_scope="implementation requirements",
+            full_omission_fallback="Fetch the issue discussion directly before implementing.",
+        )
     implementation_contract = _structured_issue_implementation_guidance(
         human_requirements_context=human_requirements_context,
         coder_signature=coder_signature,
@@ -2141,6 +2229,9 @@ nothing new in the background. Then commit, push, and open the pull request if
 that is not already done, or continue exactly where you left off.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {human_requirements_context.block}
+{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
+{_labeled_issue_context_block(issue_context, label="Target child/primary issue context")}
+{format_approved_plan_context(approved_plan_context)}
 {implementation_contract}
 {_issue_implementation_terminal_marker_guidance(reviewer_name=reviewer_name, coder_signature=coder_signature)}"""
 
@@ -2320,6 +2411,8 @@ def _compact_pr_review_stable_prefix(
     unresolved_items_guidance: str,
     followup_guidance: str,
     human_requirements_guidance: str,
+    approved_plan_context: ApprovedPlanContext | None,
+    parent_issue_context: IssueContext | None,
 ) -> str:
     reviewer_group = format_agent_list(reviewers(config))
     coder_name = agent_display_name(config.coder)
@@ -2407,6 +2500,8 @@ adds a merge migration.
             followup_guidance,
             human_requirements_guidance,
             _memory_block(memory, config),
+            format_approved_plan_context(approved_plan_context),
+            _labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context"),
             _compact_pr_review_issue_context_block(issue_context, pr_metadata.body),
             _human_requirements_block(human_requirements),
             _canonical_pr_review_ledger_rules(),
@@ -2435,6 +2530,8 @@ def _build_compact_pr_review_prompt(
     compact_coder_summary: str | None,
     compact_coder_tests_run: Sequence[str] | None,
     compact_tail: CompactPrReviewTailContext | None,
+    approved_plan_context: ApprovedPlanContext | None,
+    parent_issue_context: IssueContext | None,
 ) -> str:
     reviewer_name = agent_display_name(reviewer)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
@@ -2460,6 +2557,8 @@ def _build_compact_pr_review_prompt(
         unresolved_items_guidance=unresolved_items_guidance,
         followup_guidance=followup_guidance,
         human_requirements_guidance=human_requirements_guidance,
+        approved_plan_context=approved_plan_context,
+        parent_issue_context=parent_issue_context,
     )
     head_sha = (compact_tail.head_sha if compact_tail else None) or pr_metadata.head_sha or "(unknown)"
     volatile_round = (compact_tail.round_number if compact_tail else None) or round_number
@@ -2657,6 +2756,8 @@ def build_review_prompt(
     compact_tail: CompactPrReviewTailContext | None = None,
     compact_coder_summary: str | None = None,
     compact_coder_tests_run: Sequence[str] | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+    parent_issue_context: IssueContext | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
@@ -2686,6 +2787,8 @@ def build_review_prompt(
             compact_coder_summary=compact_coder_summary,
             compact_coder_tests_run=compact_coder_tests_run,
             compact_tail=compact_tail,
+            approved_plan_context=approved_plan_context,
+            parent_issue_context=parent_issue_context,
         )
     title = metadata.title or "(unknown)"
     head_branch = metadata.head_branch or "(unknown)"
@@ -2719,7 +2822,8 @@ are present in the PR diff.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
 {_scratch_file_guidance()}
 {_review_command_policy(config, metadata)}
-{checks_block}{_issue_context_block(issue_context)}
+{checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_issue_context_block(issue_context)}
+{format_approved_plan_context(approved_plan_context)}
 {_human_requirements_block(human_requirements)}
 {unresolved_items_block}{_memory_block(memory, config)}
 
@@ -2827,6 +2931,8 @@ def build_followup_prompt(
     human_requirements: Sequence[HumanReviewRequirement] | None = None,
     *,
     human_requirements_context: CoderHumanRequirementsPromptContext | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+    parent_issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2840,7 +2946,9 @@ Do not create a new PR.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
+{format_approved_plan_context(approved_plan_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -2872,6 +2980,8 @@ def build_same_pr_followup_prompt(
     human_requirements: Sequence[HumanReviewRequirement] | None = None,
     *,
     human_requirements_context: CoderHumanRequirementsPromptContext | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+    parent_issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2889,7 +2999,9 @@ larger redesigns or unrelated future work; call that out instead. The PR
 remains blocked pending another review round after this cleanup.
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
+{format_approved_plan_context(approved_plan_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -2924,6 +3036,8 @@ def build_merge_conflict_prompt(
     head_sha: str | None,
     merge_state_detail: str,
     human_requirements_context: CoderHumanRequirementsPromptContext | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+    parent_issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2943,7 +3057,9 @@ against the new head after your push.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
+{format_approved_plan_context(approved_plan_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
 

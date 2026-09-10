@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -100,6 +101,26 @@ class HumanReviewRequirement:
     created_at: str | None
     url: str | None
     body: str
+
+    @property
+    def requirement_id(self) -> str:
+        """Stable identity for this exact signed instruction.
+
+        The ID intentionally includes the signed body as well as source
+        metadata.  A comment edit therefore creates a new requirement rather
+        than silently inheriting an acknowledgement for the old meaning.
+        """
+        return human_requirement_id(self)
+
+    @property
+    def canonical_key(self) -> str:
+        return canonical_human_requirement_key(self)
+
+    # ``id`` is a convenient compatibility alias for callers that model the
+    # requirement as an identified record.
+    @property
+    def id(self) -> str:
+        return self.requirement_id
 
 
 @dataclass(frozen=True)
@@ -972,8 +993,93 @@ def _author_id(raw: object) -> int | None:
     return None
 
 
-def _human_requirement_sort_key(requirement: HumanReviewRequirement) -> str:
-    return requirement.created_at or ""
+def _normalize_requirement_body(body: str) -> str:
+    lines = [re.sub(r"[ \t]+", " ", line).rstrip() for line in body.replace("\r\n", "\n").split("\n")]
+    return "\n".join(lines).strip()
+
+
+def _normalize_requirement_field(value: str | None) -> str:
+    return " ".join((value or "").replace("\r", "").split())
+
+
+def canonical_human_requirement_key(requirement: HumanReviewRequirement) -> str:
+    """Return the canonical content used to identify one signed instruction."""
+    fields = (
+        _normalize_requirement_field(requirement.source_type).casefold(),
+        _normalize_requirement_field(requirement.url),
+        _normalize_requirement_field(requirement.author).casefold(),
+        _normalize_requirement_field(requirement.created_at),
+        _normalize_requirement_body(requirement.body),
+    )
+    return "\x1f".join(fields)
+
+
+def human_requirement_id(requirement: HumanReviewRequirement) -> str:
+    """Return the full digest-backed stable ID for a signed requirement."""
+    return "hr-" + hashlib.sha256(canonical_human_requirement_key(requirement).encode("utf-8")).hexdigest()
+
+
+def human_requirement_deduplication_key(requirement: HumanReviewRequirement) -> str:
+    """Return a source-aware key used when the same signed record is surfaced twice.
+
+    GitHub can expose one comment through more than one API surface.  A URL is
+    the strongest cross-surface identity; body/source metadata is retained for
+    older fixtures and providers that omit comment URLs.
+    """
+    body = _normalize_requirement_body(requirement.body)
+    if requirement.url:
+        return "url\x1f" + _normalize_requirement_field(requirement.url).casefold() + "\x1f" + body
+    return "record\x1f" + canonical_human_requirement_key(requirement)
+
+
+def deduplicate_human_requirements(
+    requirements: Sequence[HumanReviewRequirement],
+) -> tuple[HumanReviewRequirement, ...]:
+    """Deduplicate identical signed records without changing their IDs."""
+    found: dict[str, HumanReviewRequirement] = {}
+    identity_content: dict[str, str] = {}
+    for requirement in requirements:
+        key = human_requirement_deduplication_key(requirement)
+        identity = requirement.requirement_id
+        canonical = requirement.canonical_key
+        previous_canonical = identity_content.get(identity)
+        if previous_canonical is not None and previous_canonical != canonical:
+            raise AgentLoopError(
+                "A stable signed human requirement ID maps to divergent canonical content "
+                f"({identity})."
+            )
+        identity_content[identity] = canonical
+        previous = found.get(key)
+        if previous is None:
+            found[key] = requirement
+            continue
+        # The same URL/body can be surfaced by issue and PR API payloads with
+        # slightly different metadata. Keep the deterministic earliest record;
+        # its body and source locator remain the cross-surface identity.
+        if _human_requirement_sort_key(requirement) < _human_requirement_sort_key(previous):
+            found[key] = requirement
+    return tuple(sorted(found.values(), key=_human_requirement_sort_key))
+
+
+def _human_requirement_sort_key(requirement: HumanReviewRequirement) -> tuple[float, str, str, str, str]:
+    # GitHub normally returns RFC3339 timestamps.  Parse offsets instead of
+    # relying on lexical order so chronological precedence is correct across
+    # timezone representations.
+    raw_created = _normalize_requirement_field(requirement.created_at)
+    try:
+        parsed = datetime.datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        created_sort = parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        created_sort = float("inf")
+    return (
+        created_sort,
+        _normalize_requirement_field(requirement.source_type).casefold(),
+        _normalize_requirement_field(requirement.url).casefold(),
+        _normalize_requirement_field(requirement.author).casefold(),
+        requirement.requirement_id,
+    )
 
 
 def _optional_str(raw: object) -> str | None:
@@ -1490,7 +1596,7 @@ def _parse_pr_human_requirements(data: dict[str, object]) -> tuple[HumanReviewRe
                 body=body,
             )
         )
-    return tuple(sorted(requirements, key=_human_requirement_sort_key))
+    return deduplicate_human_requirements(requirements)
 
 
 def validate_open_issue(runner: Runner, *, config: AgentLoopConfig, issue_number: int) -> None:
@@ -1589,7 +1695,7 @@ def _parse_issue_human_requirements(data: dict[str, object]) -> tuple[HumanRevie
                 body=body,
             )
         )
-    return tuple(sorted(requirements, key=_human_requirement_sort_key))
+    return deduplicate_human_requirements(requirements)
 
 
 def post_pr_comment(
