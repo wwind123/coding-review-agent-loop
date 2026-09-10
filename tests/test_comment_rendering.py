@@ -154,12 +154,19 @@ def test_render_issue_implementation_no_pr_keeps_summary_tests_and_result_identi
 
 
 def test_render_issue_implementation_conflict_explains_rejected_pr_handoff():
+    requirement = HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-01-01T00:00:00Z",
+        url="https://example.test/issue-comment",
+        body="Preserve the integration.",
+    )
     text = structured_issue_implementation(
         pr_number=77,
         summary="PR #77 was opened, but Requirement 1 is blocked.",
         human_requirement_dispositions=[
             {
-                "requirement_id": "Requirement 1",
+                "requirement_id": requirement.requirement_id,
                 "disposition": "blocked",
                 "evidence": "The required integration is unavailable.",
             }
@@ -167,15 +174,7 @@ def test_render_issue_implementation_conflict_explains_rejected_pr_handoff():
     )
     result = _validate_issue_implementation_response(
         text,
-        human_requirements=(
-            HumanReviewRequirement(
-                source_type="Issue comment",
-                author="maintainer",
-                created_at="2026-01-01T00:00:00Z",
-                url="https://example.test/issue-comment",
-                body="Preserve the integration.",
-            ),
-        ),
+        human_requirements=(requirement,),
     )
 
     assert isinstance(result, _TerminalIssueImplementationConflict)

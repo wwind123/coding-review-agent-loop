@@ -300,7 +300,7 @@ must stay in its correct ledger. Do not silently fill gaps with invented facts.
   "remaining_item_notes": {"item-2": "<why it remains>"},
   "dispute_evidence": {"item-3": "<verifiable evidence that the finding is incorrect>"},
   "human_requirement_dispositions": [
-    {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "<why it cannot be completed>"}
+    {"requirement_id": "hr-0000000000000000000000000000000000000000000000000000000000000000", "disposition": "blocked", "evidence": "<why it cannot be completed>"}
   ],
   "human_requirements": {
     "addressed_ids": [],
@@ -533,14 +533,14 @@ The active planning human-requirements context above is authoritative. Do not us
   ],
   "plan_steps": ["Update the parser.", "Add regression tests."],
   "human_requirement_dispositions": [
-    {"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "Covered by the revised plan."}
+    {"requirement_id": "hr-0000000000000000000000000000000000000000000000000000000000000000", "disposition": "addressed", "evidence": "Covered by the revised plan."}
   ]
 }
 <!-- HUMAN_REQUIREMENTS_ADDRESSED -->
 
 ### Human requirements
 
-- Requirement 1: <how the revised plan addresses this signed human requirement, if present in the original>
+- Requirement hr-0000000000000000000000000000000000000000000000000000000000000000: <how the revised plan addresses this signed human requirement, if present in the original>
 <!-- AGENT_PLAN_STATE: blocking -->
 -- <Coder Name>
 
@@ -552,9 +552,9 @@ The active planning human-requirements context above is authoritative. Do not us
 ## ARRAY FIELD TYPES (Format C) — TWO DIFFERENT ID TYPES, DO NOT CONFUSE THEM:
 - addressed_items, remaining_items -> reviewer ITEM IDs only: short slugs matching [A-Za-z0-9][A-Za-z0-9._-]*
   Examples: "item-1", "item-2"
-  NEVER put invented human requirement labels here — use only exact surfaced `Requirement N` labels.
-- human_requirements.addressed_ids -> exact surfaced human requirement labels like "Requirement 1"
-  These are different from item IDs and may contain spaces.
+  NEVER put invented human requirement IDs here — use only exact surfaced `hr-...` IDs.
+- human_requirements.addressed_ids -> exact surfaced stable IDs like "hr-0000000000000000000000000000000000000000000000000000000000000000"
+  These are different from reviewer item IDs.
 - human_requirements.addressed_ids may contain only exact signed labels surfaced in the original prompt/response context.
 - If no signed human requirement labels are surfaced in the repair context, use "addressed_ids": [].
 - Never convert issue numbers, issue acceptance criteria, reviewer item IDs, reviewer comments, summaries, or arbitrary labels into signed human requirements.
@@ -674,7 +674,7 @@ section and missing <!-- HUMAN_REQUIREMENTS_ADDRESSED --> marker.
   "addressed_items": ["item-1"],
   "remaining_items": [],
   "human_requirement_dispositions": [
-    {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "The required service is unavailable."}
+    {"requirement_id": "hr-0000000000000000000000000000000000000000000000000000000000000000", "disposition": "blocked", "evidence": "The required service is unavailable."}
   ],
   "human_requirements": {
     "addressed_ids": [],
@@ -687,7 +687,7 @@ section and missing <!-- HUMAN_REQUIREMENTS_ADDRESSED --> marker.
 
 ### Human requirements
 
-- **Requirement 1**: Implemented.
+- **Requirement hr-0000000000000000000000000000000000000000000000000000000000000000**: Implemented.
 
 -- Anthropic Claude
 
@@ -700,7 +700,7 @@ CORRECT repair — strip the fences, remove the prose, output bare JSON + footer
   "addressed_items": ["item-1"],
   "remaining_items": [],
   "human_requirement_dispositions": [
-    {"requirement_id": "Requirement 1", "disposition": "blocked", "evidence": "The required service is unavailable."}
+    {"requirement_id": "hr-0000000000000000000000000000000000000000000000000000000000000000", "disposition": "blocked", "evidence": "The required service is unavailable."}
   ],
   "human_requirements": {
     "addressed_ids": [],
@@ -733,7 +733,7 @@ Original (malformed): markdown revised plan, with a signed human-requirements ac
 
 ### Human requirements
 
-- Requirement 1: The revised plan preserves backward compatibility.
+- Requirement hr-0000000000000000000000000000000000000000000000000000000000000000: The revised plan preserves backward compatibility.
 
 <!-- AGENT_PLAN_STATE: blocking -->
 -- Anthropic Claude
@@ -753,7 +753,7 @@ CORRECT repair — output plan_revision JSON first, preserve the human requireme
 
 ### Human requirements
 
-- Requirement 1: The revised plan preserves backward compatibility.
+- Requirement hr-0000000000000000000000000000000000000000000000000000000000000000: The revised plan preserves backward compatibility.
 <!-- AGENT_PLAN_STATE: blocking -->
 -- Anthropic Claude
 
@@ -786,7 +786,7 @@ CORRECT repair — keep reviewer items separate and rewrite human_requirements.a
 Notes:
 - Issue acceptance criteria are not signed human requirements.
 - Reviewer items belong in addressed_items / remaining_items, never in human_requirements.addressed_ids.
-- If surfaced signed labels include a `Requirement N` label, include one evidenced disposition for it and put it in addressed_ids only when that disposition is `addressed`; blocked dispositions require blocking state.
+- If surfaced signed requirements include an `hr-...` ID, include one evidenced disposition for it and put it in addressed_ids only when that disposition is `addressed`; blocked dispositions require blocking state.
 
 ## WORKED EXAMPLE 6 — approved plan_review with same-plan disposition whose note says plan covers it:
 
@@ -869,7 +869,7 @@ Only the enum value is changed; no other items are dropped.
 ## WORKED EXAMPLE 10 — approved review missing HUMAN_REQUIREMENTS_RESOLVED, requirements satisfied:
 
 Original (malformed): approved pr_review with all requirements satisfied but missing the marker.
-The repair context surfaced: Requirement 1.
+The repair context surfaced: hr-0000000000000000000000000000000000000000000000000000000000000000.
 
 CORRECT repair: keep state "approved", add <!-- HUMAN_REQUIREMENTS_RESOLVED --> after the JSON.
 {
@@ -885,7 +885,7 @@ CORRECT repair: keep state "approved", add <!-- HUMAN_REQUIREMENTS_RESOLVED --> 
 ## WORKED EXAMPLE 11 — approved review missing HUMAN_REQUIREMENTS_RESOLVED, requirement unresolved:
 
 Original (malformed): approved pr_review but a surfaced stable human requirement is not satisfied by the current PR.
-The repair context surfaced: Requirement 1.
+The repair context surfaced: hr-0000000000000000000000000000000000000000000000000000000000000000.
 
 CORRECT repair: change state to "blocking", add a concrete blocking_item naming the requirement.
 {
@@ -1498,7 +1498,7 @@ def _coder_followup_required_items_instruction(
         f"{rendered_ids or '- (none)'}\n"
         "Preserve a source `disputed_items` classification and its complete `dispute_evidence` "
         "when its ID is listed above. Remove dispute entries for IDs not listed above.\n"
-        "Do not put human requirement labels such as `Requirement 1` in these arrays.\n"
+        "Do not put human requirement IDs such as `hr-...` in these arrays.\n"
     )
 
 

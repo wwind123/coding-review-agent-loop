@@ -166,7 +166,7 @@ from coding_review_agent_loop.repair import (
     attempt_repair,
     strip_unknown_prior_item_dispositions,
 )
-from helpers.validate_response import validate_response_text
+from helpers.validate_response import _deserialize_human_requirements, validate_response_text
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1674,8 +1674,10 @@ def _complete_reviewer_turn(
                     if isinstance(item, dict) and item.get("item_id")
                 ],
                 reviewer_requirement_ids=[
-                    f"Requirement {index}"
-                    for index, _ in enumerate(context.get("human_requirements", []), start=1)
+                    requirement.requirement_id
+                    for requirement in _deserialize_human_requirements(
+                        list(context.get("human_requirements", []))
+                    )
                 ],
                 response_evidence=response_evidence,
                 gemini_cmd=gemini_cmd,

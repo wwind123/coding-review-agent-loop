@@ -776,14 +776,42 @@ def human_requirements_resolved(text: str) -> bool:
 
 
 def _normalize_requirement_label(text: str) -> str:
+    stable = HUMAN_REQUIREMENT_STABLE_ID_RE.fullmatch(text.strip())
+    if stable:
+        return stable.group(0).lower()
     legacy = re.fullmatch(r"\s*Requirement\s+(\d+)\s*", text, re.I)
     if not legacy:
         raise AgentLoopError(
             f"Invalid human requirement label: {text}. Only exact surfaced signed labels like "
-            "`Requirement 1` are valid; issue acceptance criteria, reviewer item IDs, reviewer "
+            "`hr-<64 hexadecimal characters>` are valid; issue acceptance criteria, reviewer item IDs, reviewer "
             "comments, and arbitrary labels are not signed human requirements."
         )
     return f"Requirement {legacy.group(1)}"
+
+
+def _reject_legacy_requirement_labels(
+    labels: Sequence[str],
+    *,
+    surfaced_requirement_ids: Sequence[str],
+) -> None:
+    """Require a fresh acknowledgement when current prompts use stable IDs.
+
+    Positional labels remain parseable solely so historical records can produce
+    this actionable migration diagnostic. They are never mapped onto the
+    currently surfaced requirement tuple.
+    """
+    if not any(
+        HUMAN_REQUIREMENT_STABLE_ID_RE.fullmatch(item.strip())
+        for item in surfaced_requirement_ids
+    ):
+        return
+    legacy = sorted({item for item in labels if re.fullmatch(r"Requirement \d+", item)})
+    if legacy:
+        raise AgentLoopError(
+            "Coder response uses legacy positional signed-requirement label(s) "
+            f"{', '.join(legacy)}. Their meaning cannot be inferred from the current requirement "
+            "set; provide a fresh acknowledgement using the exact surfaced stable hr-... IDs."
+        )
 
 
 def parse_human_requirements_acknowledgement(text: str) -> ParsedHumanRequirementsAcknowledgement:
@@ -808,11 +836,15 @@ def parse_human_requirements_acknowledgement(text: str) -> ParsedHumanRequiremen
         if not bullet:
             continue
         for match in re.finditer(
-            r"\bRequirement\s+\d+\b",
+            r"\bRequirement\s+(?:hr-[0-9a-f]{64}|\d+)\b",
             bullet.group("text"),
             re.I,
         ):
-            addressed_ids.append(_normalize_requirement_label(match.group(0)))
+            label = match.group(0)
+            stable = re.search(r"hr-[0-9a-f]{64}", label, re.I)
+            addressed_ids.append(
+                _normalize_requirement_label(stable.group(0) if stable else label)
+            )
 
     return ParsedHumanRequirementsAcknowledgement(
         marker_present=marker_present,
@@ -876,6 +908,10 @@ def validate_structured_human_requirements_acknowledgement(
         raise AgentLoopError("Coder response missing required `### Human requirements` section.")
 
     normalized_addressed_ids = [_normalize_requirement_label(item_id) for item_id in addressed_ids]
+    _reject_legacy_requirement_labels(
+        normalized_addressed_ids,
+        surfaced_requirement_ids=surfaced_requirement_ids,
+    )
     duplicates = sorted(
         {
             item_id
@@ -1267,6 +1303,7 @@ def validate_human_requirement_dispositions(
 ) -> None:
     expected = tuple(_normalize_requirement_label(item) for item in surfaced_requirement_ids)
     actual = [item.requirement_id for item in dispositions]
+    _reject_legacy_requirement_labels(actual, surfaced_requirement_ids=surfaced_requirement_ids)
     duplicates = sorted({item for item in actual if actual.count(item) > 1})
     if duplicates:
         raise AgentLoopError(f"{context} contains duplicate requirement ID(s): {', '.join(duplicates)}")

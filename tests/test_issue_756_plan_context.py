@@ -1,7 +1,10 @@
 from dataclasses import replace
 
+import pytest
+
 from agent_loop_helpers import make_config
 from coding_review_agent_loop.orchestrator import (
+    _reconcile_human_requirements_ack_item,
     _reviewer_requirement_coverage_matches,
     _reviewer_requirement_identity_ids,
     _resumed_pr_reviewer_matches_requirements,
@@ -14,6 +17,7 @@ from coding_review_agent_loop.github import (
     PullRequestReviewContext,
     deduplicate_human_requirements,
 )
+from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.comment_rendering import normalize_freeform_signature
 from coding_review_agent_loop.prompts import (
     build_review_prompt,
@@ -66,10 +70,8 @@ def test_signed_requirement_ids_survive_insertion_and_body_edits():
     )
     edited = replace(first, body="Change the public API.")
     assert first.requirement_id != edited.requirement_id
-    # The digest-backed identity is internal. Public acknowledgement labels
-    # remain positional so transcripts from older runs can resume.
-    assert "Requirement 1:" in format_human_requirements((first, inserted))
-    assert "Requirement 1:" in format_human_requirements((inserted, first))
+    assert f"Requirement {first.requirement_id}:" in format_human_requirements((first, inserted))
+    assert f"Requirement {first.requirement_id}:" in format_human_requirements((inserted, first))
 
 
 def test_reviewer_coverage_uses_digest_identity_and_rejects_legacy_labels():
@@ -150,20 +152,42 @@ def test_latest_same_head_approval_does_not_fall_back_past_plan_mismatch():
     ) == {}
 
 
-def test_legacy_positional_acknowledgement_remains_resumable():
+def test_legacy_positional_acknowledgement_requires_fresh_stable_acknowledgement():
     requirement = _requirement(
         body="Keep the public API stable.",
         created_at="2026-01-01T00:00:00Z",
         url="https://github.com/OWNER/REPO/issues/1#issuecomment-1",
     )
     context = render_coder_human_requirements_prompt_context((requirement,))
-    assert context.surfaced_requirement_ids == ("Requirement 1",)
+    assert context.surfaced_requirement_ids == (requirement.requirement_id,)
+    with pytest.raises(AgentLoopError, match="fresh acknowledgement"):
+        validate_human_requirements_acknowledgement(
+            "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+            "### Human requirements\n- Requirement 1: done",
+            surfaced_requirement_ids=context.surfaced_requirement_ids,
+            requires_direct_discussion_ack=False,
+        )
+
     validate_human_requirements_acknowledgement(
         "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
-        "### Human requirements\n- Requirement 1: done",
+        f"### Human requirements\n- Requirement {requirement.requirement_id}: done",
         surfaced_requirement_ids=context.surfaced_requirement_ids,
         requires_direct_discussion_ack=False,
     )
+
+    reconciled = _reconcile_human_requirements_ack_item(
+        (),
+        coder_output=(
+            "Implemented the change.\n"
+            "<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n"
+            "### Human requirements\n- Requirement 1: done\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+        ),
+        human_requirements=(requirement,),
+        source_round=2,
+    )
+    assert len(reconciled) == 1
+    assert "fresh acknowledgement" in reconciled[0].text
 
 
 def test_duplicate_same_source_is_deduplicated_but_divergent_body_is_not():
@@ -175,7 +199,7 @@ def test_duplicate_same_source_is_deduplicated_but_divergent_body_is_not():
     assert deduplicate_human_requirements((requirement, requirement)) == (requirement,)
 
 
-def test_requirement_truncation_preserves_positional_acknowledgement_labels():
+def test_requirement_truncation_preserves_stable_acknowledgement_ids():
     requirements = tuple(
         _requirement(
             body=f"Requirement body {index}.",
@@ -186,9 +210,9 @@ def test_requirement_truncation_preserves_positional_acknowledgement_labels():
     )
     full = format_human_requirements(requirements)
     bounded = format_human_requirements(requirements, max_chars=len(full) - 1)
-    assert "Requirement 1:" not in bounded
-    assert "Requirement 2:" in bounded
-    assert "Requirement 3:" in bounded
+    assert f"Requirement {requirements[0].requirement_id}:" not in bounded
+    assert f"Requirement {requirements[1].requirement_id}:" in bounded
+    assert f"Requirement {requirements[2].requirement_id}:" in bounded
 
 
 def test_duplicate_url_body_with_api_metadata_differences_is_deduplicated():
@@ -292,16 +316,21 @@ def test_plan_identity_mismatch_is_explicit_and_raw_text_is_not_silently_used():
     assert not context.is_available
 
 
-def test_oversized_plan_is_omitted_explicitly_but_identity_and_scope_remain():
+def test_oversized_plan_uses_real_limit_and_never_drops_identity_or_declarations():
     from coding_review_agent_loop.prompts import format_approved_plan_context
 
     plan = make_approved_plan_context(
-        "Approved plan\n\n### Scope\n- Preserve the API.\n\n" + "x" * 5000
+        "Approved plan\n\n### Scope\n- Preserve the API.\n\n### Implementation\n" + "x" * 5000
     )
-    rendered = format_approved_plan_context(plan, max_chars=300)
+    assert plan.canonical_text in format_approved_plan_context(plan)
+
+    rendered = format_approved_plan_context(plan, max_chars=1000)
     assert plan.plan_hash in rendered
-    assert "required plan identity and scope metadata" in rendered
+    assert "Preserve the API." in rendered
     assert "omitted" in rendered
+
+    with pytest.raises(AgentLoopError, match="cannot fit the final provider prompt limit"):
+        format_approved_plan_context(plan, max_chars=300)
 
 
 def test_unplanned_review_has_explicit_no_plan_path(tmp_path):

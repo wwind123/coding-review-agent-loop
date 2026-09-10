@@ -3705,12 +3705,7 @@ def _surfaced_reviewer_requirement_ids(
 def _reviewer_requirement_identity_ids(
     human_requirements: Sequence[HumanReviewRequirement],
 ) -> tuple[str, ...]:
-    """Return immutable identities for PR-review coverage metadata.
-
-    Reviewer prompts retain positional labels (``Requirement N``) for response
-    compatibility. Those labels are presentation-only and must not be used to
-    decide whether an approval covered the current signed instruction.
-    """
+    """Return the stable IDs used by prompts, responses, and coverage metadata."""
     return tuple(requirement.requirement_id for requirement in human_requirements)
 
 
@@ -8128,9 +8123,8 @@ def run_pr_loop(
                 if use_compact_pr_context
                 else None
             )
-            # Persist digest identities, not the positional labels used in the
-            # reviewer prompt. The latter would let an edited signed comment
-            # inherit approval when its requirement count stayed unchanged.
+            # Persist the same digest identities surfaced in reviewer prompts.
+            # An edited signed comment must not inherit the old approval.
             surfaced_reviewer_requirement_ids = _reviewer_requirement_identity_ids(
                 human_requirements
             )

@@ -1325,7 +1325,7 @@ def test_format_human_requirements_preserves_entry_spacing_when_truncated():
 
     assert "Older signed human requirement(s) omitted: 1." in text
     assert "Oldest requirement." not in text
-    assert "Middle requirement.\n\nRequirement 3:" in text
+    assert f"Middle requirement.\n\nRequirement {requirements[2].requirement_id}:" in text
     assert "Newest requirement." in text
 
 def test_render_coder_human_requirements_prompt_context_tracks_surfaced_ids_after_truncation():
@@ -1361,7 +1361,10 @@ def test_render_coder_human_requirements_prompt_context_tracks_surfaced_ids_afte
 
     assert context.block.endswith("\n")
     assert "Older signed human requirement(s) omitted: 1." in context.block
-    assert context.surfaced_requirement_ids == ("Requirement 2", "Requirement 3")
+    assert context.surfaced_requirement_ids == (
+        requirements[1].requirement_id,
+        requirements[2].requirement_id,
+    )
     assert context.requires_direct_discussion_ack is False
 
 def test_render_coder_human_requirements_prompt_context_handles_full_omission_fallback():
@@ -1527,7 +1530,7 @@ def test_coder_followup_guidance_renders_valid_blocked_requirement_example(tmp_p
         parsed.human_requirements.addressed_ids,
         dispositions=parsed.human_requirement_dispositions,
         checked_discussion_directly=False,
-        surfaced_requirement_ids=("Requirement 1",),
+        surfaced_requirement_ids=(requirements[0].requirement_id,),
         requires_direct_discussion_ack=False,
     )
 
@@ -1608,29 +1611,28 @@ def test_coder_followup_prompts_require_human_requirements_acknowledgement_only_
     tmp_path, builder
 ):
     config = make_config(tmp_path)
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="reviewer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Please use the absolute URL.",
+    )
     with_requirements = builder(
         77,
         2,
         "Fix the bug.",
         config,
-        human_requirements=(
-            HumanReviewRequirement(
-                source_type="PR comment",
-                author="reviewer",
-                created_at="2026-05-18T10:00:00Z",
-                url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
-                body="Please use the absolute URL.",
-            ),
-        ),
+        human_requirements=(requirement,),
     )
     without_requirements = builder(77, 2, "Fix the bug.", config)
 
     assert "mandatory next-revision requirements" in with_requirements
     assert HUMAN_REQUIREMENTS_ADDRESSED_MARKER in with_requirements
     assert "### Human requirements" in with_requirements
-    assert "`Requirement 1`" in with_requirements
+    assert f"`{requirement.requirement_id}`" in with_requirements
     assert "mandatory next-revision requirements" not in without_requirements
-    assert "`Requirement 1`" not in without_requirements
+    assert f"`{requirement.requirement_id}`" not in without_requirements
 
 @pytest.mark.parametrize("builder", [build_followup_prompt, build_same_pr_followup_prompt])
 def test_coder_followup_prompts_accept_precomputed_human_requirements_context(tmp_path, builder):
@@ -1657,7 +1659,7 @@ def test_coder_followup_prompts_accept_precomputed_human_requirements_context(tm
 
     assert context.block in prompt
     assert HUMAN_REQUIREMENTS_ADDRESSED_MARKER in prompt
-    assert "`Requirement 1`" in prompt
+    assert f"`{requirements[0].requirement_id}`" in prompt
 
 @pytest.mark.parametrize("builder", [build_followup_prompt, build_same_pr_followup_prompt])
 def test_coder_followup_prompts_require_structured_json(tmp_path, builder):
@@ -2250,6 +2252,13 @@ def test_blocking_followup_prompt_reinjects_issue_context(tmp_path):
     assert "Needs a fix." in followup_prompt
 
 def test_blocking_followup_prompt_includes_human_requirements_before_ai_feedback(tmp_path):
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Please use the absolute URL.",
+    )
     runner = FakeRunner(
         codex_outputs=[
             "Needs a fix.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
@@ -2258,11 +2267,11 @@ def test_blocking_followup_prompt_includes_human_requirements_before_ai_feedback
             + "\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         claude_outputs=[
-            "Fixed review.\n"
-            f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
-            "### Human requirements\n"
-            "- Requirement 1: used the absolute URL.\n"
-            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+            structured_coder_followup(
+                addressed_items=["item-1"],
+                addressed_item_notes={"item-1": "Used the absolute URL."},
+                human_requirement_ids=[requirement.requirement_id],
+            )
         ],
         pr_payload={
             "number": 77,

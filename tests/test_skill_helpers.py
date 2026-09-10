@@ -18,6 +18,8 @@ SRC = Path(__file__).parent.parent / "src"
 # Make library importable for direct calls in this test file
 sys.path.insert(0, str(SRC))
 
+from coding_review_agent_loop.github import HumanReviewRequirement
+
 
 def _run(*args: str, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
@@ -3307,6 +3309,14 @@ _IMPL_WITH_PR = json.dumps({
     "human_requirement_dispositions": [],
 }) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
 
+_HUMAN_REQUIREMENT = HumanReviewRequirement(
+    source_type="Issue comment",
+    author="wwind123",
+    created_at="2026-06-14T00:00:00Z",
+    url="https://example/1",
+    body="Must keep the public API backward compatible.",
+)
+
 _IMPL_WITH_BLOCKED_REQUIREMENT = json.dumps({
     "schema_version": 1,
     "kind": "issue_implementation",
@@ -3315,7 +3325,7 @@ _IMPL_WITH_BLOCKED_REQUIREMENT = json.dumps({
     "pr_number": 5,
     "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
     "human_requirement_dispositions": [{
-        "requirement_id": "Requirement 1",
+        "requirement_id": _HUMAN_REQUIREMENT.requirement_id,
         "disposition": "blocked",
         "evidence": "The required integration is unavailable.",
     }],
@@ -3323,12 +3333,7 @@ _IMPL_WITH_BLOCKED_REQUIREMENT = json.dumps({
 
 
 def _human_req():
-    from coding_review_agent_loop.github import HumanReviewRequirement
-    return HumanReviewRequirement(
-        source_type="Issue comment", author="wwind123",
-        created_at="2026-06-14T00:00:00Z", url="https://example/1",
-        body="Must keep the public API backward compatible.",
-    )
+    return _HUMAN_REQUIREMENT
 
 
 class TestRunExternalImplStub:
@@ -3505,7 +3510,7 @@ def _structured_pr_fix_output() -> str:
             "remaining_items": [],
             "human_requirement_dispositions": [
                 {
-                    "requirement_id": "Requirement 1",
+                    "requirement_id": _HUMAN_REQUIREMENT.requirement_id,
                     "disposition": "addressed",
                     "evidence": "The requested fix is implemented.",
                 }
@@ -3514,7 +3519,7 @@ def _structured_pr_fix_output() -> str:
             "remaining_item_notes": {},
             "tests_run": ["python3 -m pytest tests/test_skill_helpers.py -k run_pr_fix"],
             "human_requirements": {
-                "addressed_ids": ["Requirement 1"],
+                "addressed_ids": [_HUMAN_REQUIREMENT.requirement_id],
                 "checked_discussion_directly": False,
             },
         }
@@ -3705,13 +3710,11 @@ class TestRunPrFix:
         def fake_run_helper(*args: str, check: bool = True):
             if args[:1] == ("helpers.run_external",):
                 out = Path(args[args.index("--output") + 1])
-                recovered_output = _structured_pr_fix_output().replace(
-                    '"addressed_ids": ["Requirement 1"]',
-                    '"addressed_ids": []',
-                ).replace(
-                    '"human_requirement_dispositions": [{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The requested fix is implemented."}]',
-                    '"human_requirement_dispositions": []',
-                )
+                original = _structured_pr_fix_output()
+                payload, end = json.JSONDecoder().raw_decode(original)
+                payload["human_requirements"]["addressed_ids"] = []
+                payload["human_requirement_dispositions"] = []
+                recovered_output = json.dumps(payload) + original[end:]
                 out.write_text(recovered_output + "trailing prose", encoding="utf-8")
             elif args[:2] == ("helpers.state_manager", "attach-metadata"):
                 body = Path(args[args.index("--body-file") + 1]).read_text(encoding="utf-8")

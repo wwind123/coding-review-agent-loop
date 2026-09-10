@@ -431,16 +431,37 @@ class FakeRunner(_FakeRunner):
         # markers for the tests that reject those.
         issue_body = str((kwargs.get("issue_payload") or {}).get("body") or "")
         if "-- Human Reviewer" in issue_body:
+            issue_payload = kwargs.get("issue_payload") or {}
+            requirement = HumanReviewRequirement(
+                source_type="Issue body",
+                author=str((issue_payload.get("author") or {}).get("login") or "") or None,
+                created_at=issue_payload.get("createdAt"),
+                url=issue_payload.get("url") or "https://github.com/OWNER/REPO/issues/56",
+                body=issue_body.split("-- Human Reviewer", 1)[0].strip(),
+            )
             for output_key in ("claude_outputs", "codex_outputs", "gemini_outputs", "antigravity_outputs"):
                 outputs = kwargs.get(output_key)
                 if outputs is None:
                     continue
-                kwargs[output_key] = [_add_default_requirement_disposition(output) for output in outputs]
+                kwargs[output_key] = [
+                    _add_default_requirement_disposition(
+                        output,
+                        requirement_id=requirement.requirement_id,
+                    )
+                    for output in outputs
+                ]
         kwargs.setdefault("pr_payload", {"body": "Fixes #56"})
         super().__init__(**kwargs)
 
 
-def _add_default_requirement_disposition(output: str) -> str:
+def _add_default_requirement_disposition(
+    output: str,
+    *,
+    requirement_id: str = "Requirement 1",
+) -> str:
+    if requirement_id.startswith("hr-"):
+        output = output.replace("Requirement 1", f"Requirement {requirement_id}")
+        output = output.replace(f'"Requirement {requirement_id}"', f'"{requirement_id}"')
     try:
         payload, end = json.JSONDecoder().raw_decode(output.lstrip())
     except (json.JSONDecodeError, ValueError):
@@ -452,7 +473,7 @@ def _add_default_requirement_disposition(output: str) -> str:
     if payload.get("human_requirement_dispositions"):
         return output
     payload["human_requirement_dispositions"] = [{
-        "requirement_id": "Requirement 1",
+        "requirement_id": requirement_id,
         "disposition": "addressed",
         "evidence": "The structured plan covers the signed requirement.",
     }]
@@ -1434,6 +1455,13 @@ def test_issue_loop_plan_revision_accepts_human_requirements_acknowledgement(tmp
     assert runner.comments[2].startswith("## Revised plan")
 
 def test_issue_loop_plan_revision_repair_preserves_signed_human_requirements(tmp_path):
+    requirement = HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Preserve backward compatibility.",
+    )
     malformed_revision = (
         "### Prior plan review item dispositions\n"
         "- item-1: resolved by adding compatibility tests.\n\n"
@@ -1460,7 +1488,7 @@ def test_issue_loop_plan_revision_repair_preserves_signed_human_requirements(tmp
             "### Human requirements\n"
             "- Requirement 1: the revised plan preserves backward compatibility.\n"
         ),
-    ))
+    ), requirement_id=requirement.requirement_id)
     runner = FakeRunner(
         issue_payload={
             "author": {"login": "maintainer"},

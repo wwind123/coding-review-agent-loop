@@ -104,30 +104,29 @@ def test_issue_implementation_protocol_accepts_null_pr_and_nullable_tests():
 
 
 def test_issue_implementation_protocol_preserves_positive_pr_blocked_conflict():
+    from coding_review_agent_loop.github import HumanReviewRequirement
+
+    requirement = HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-01-01T00:00:00Z",
+        url="https://example.test/issue-comment",
+        body="Preserve the integration.",
+    )
     text = _issue_implementation_text(
         summary="PR 77 exists, but the signed requirement is blocked.",
         pr_number=77,
         human_requirement_dispositions=[
             {
-                "requirement_id": "Requirement 1",
+                "requirement_id": requirement.requirement_id,
                 "disposition": "blocked",
                 "evidence": "The required integration is unavailable.",
             }
         ],
     )
-    from coding_review_agent_loop.github import HumanReviewRequirement
-
     result = _validate_issue_implementation_response(
         text,
-        human_requirements=(
-            HumanReviewRequirement(
-                source_type="Issue comment",
-                author="maintainer",
-                created_at="2026-01-01T00:00:00Z",
-                url="https://example.test/issue-comment",
-                body="Preserve the integration."
-            ),
-        ),
+        human_requirements=(requirement,),
     )
 
     assert isinstance(result, _TerminalIssueImplementationConflict)

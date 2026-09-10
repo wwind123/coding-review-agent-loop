@@ -13,6 +13,7 @@ from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .config import AgentLoopConfig, reviewers
 from .decomposition import approved_plan_hash
+from .errors import AgentLoopError
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provenance
 from .memory import AgentMemoryContext, format_agent_memory_context
@@ -583,7 +584,7 @@ def format_human_requirements(
         "\n".join(
             [
                 "",
-                f"Requirement {index}:",
+                f"Requirement {requirement.requirement_id}:",
                 f"- Source: {requirement.source_type}",
                 f"- Author: {requirement.author or '(unknown)'}",
                 f"- Created: {requirement.created_at or '(unknown time)'}",
@@ -592,7 +593,7 @@ def format_human_requirements(
                 requirement.body,
             ]
         )
-        for index, requirement in enumerate(human_requirements, start=1)
+        for requirement in human_requirements
     ]
     full_text = header + "\n".join(entries)
     if len(full_text) <= max_chars:
@@ -681,8 +682,8 @@ def render_coder_human_requirements_prompt_context(
         )}\n"
     )
     surfaced_requirement_ids = tuple(
-        f"Requirement {match.group(1)}"
-        for match in re.finditer(r"(?m)^Requirement (\d+):$", block)
+        match.group(1).lower()
+        for match in re.finditer(r"(?m)^Requirement (hr-[0-9a-f]{64}):$", block, re.I)
     )
     requires_direct_discussion_ack = (
         not surfaced_requirement_ids
@@ -1110,7 +1111,7 @@ def _labeled_issue_context_block(
 def format_approved_plan_context(
     plan_context: ApprovedPlanContext | None,
     *,
-    max_chars: int = 24_000,
+    max_chars: int | None = None,
 ) -> str:
     """Render the lossless plan channel independently of issue history."""
     if plan_context is None:
@@ -1142,17 +1143,24 @@ def format_approved_plan_context(
         return "\n".join(lines) + "\n"
     prefix = "\n".join(lines) + "\n\nCanonical approved plan text:\n"
     text = plan_context.canonical_text or ""
-    if len(prefix) + len(text) <= max_chars:
-        return prefix + text + "\n"
+    complete = prefix + text + "\n"
+    if max_chars is None or len(complete) <= max_chars:
+        return complete
     # Keep all identity and declarations above.  If the canonical text cannot
     # fit, make the omission explicit rather than truncating scope silently.
     omission = (
         "[Canonical approved plan text omitted because it exceeds the final provider prompt budget. "
         "Use the source locator to fetch and verify the exact plan before proceeding.]"
     )
-    if len(prefix) + len(omission) <= max_chars:
-        return prefix + omission + "\n"
-    return "\n".join(lines[:6] + ["", "Canonical approved plan text omitted: provider budget is too small to retain the required plan identity and scope metadata."]) + "\n"
+    minimum = prefix + omission + "\n"
+    if len(minimum) <= max_chars:
+        return minimum
+    raise AgentLoopError(
+        "Approved-plan context cannot fit the final provider prompt limit without dropping "
+        "required plan identity, scope, or deferred-work declarations. Increase the provider "
+        f"prompt limit (minimum {len(minimum)} characters; configured {max_chars}) or shorten "
+        "the approved plan declarations and create a newly approved handoff."
+    )
 
 
 def _compact_issue_context_block(issue_context: IssueContext | None) -> str:

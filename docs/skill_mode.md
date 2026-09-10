@@ -94,10 +94,12 @@ PR prose. Required issue-history reads fail closed when the plan handoff cannot
 be validated. Ordinary direct PRs with no planning history continue without a
 plan context.
 
-Signed human requirements use the surfaced positional `Requirement N` labels.
-The digest-backed internal identity detects insertion, reordering, and edits;
-older acknowledgements using positional labels remain valid on resume, and later
-parent instructions still take precedence.
+Signed human requirements are surfaced as `Requirement hr-<digest>` and retain
+that content-derived ID through acknowledgement, repair, metadata, and resume.
+Insertion and chronological reordering leave existing IDs unchanged; an edited
+body receives a new ID. Legacy positional acknowledgements require a fresh
+acknowledgement against the stable IDs, and later parent instructions still take
+precedence.
 Later valid human instructions and safety constraints outrank an approved
 plan, which cannot silently narrow the original issue requirements.
 

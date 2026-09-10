@@ -2324,7 +2324,7 @@ include:
 <!-- HUMAN_REQUIREMENTS_ADDRESSED -->
 
 ### Human requirements
-- Requirement N: explain how it was addressed or why it cannot be satisfied safely.
+- Requirement hr-<digest>: explain how it was addressed or why it cannot be satisfied safely.
 ```
 
 Structured coder follow-ups carry the same acknowledgement in
@@ -2332,7 +2332,10 @@ Structured coder follow-ups carry the same acknowledgement in
 `human_requirements.checked_discussion_directly`. If the prompt says detailed
 requirements were omitted to stay bounded, the coder must check the GitHub
 discussion directly and acknowledge that fact instead of listing requirement
-IDs. The orchestrator injects a synthetic
+IDs. Stable IDs are content-derived and survive insertion or reordering; edited
+instructions receive new IDs, and legacy positional replies require a fresh
+acknowledgement instead of being mapped onto the current set. The orchestrator
+injects a synthetic
 `item-human-requirements-acknowledgement` item when coder acknowledgement is
 missing or invalid, then reconciles that item after a valid structured or
 markdown acknowledgement. Reviewers must include

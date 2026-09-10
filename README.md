@@ -151,11 +151,12 @@ comments or compact PR history. Issue/PR resume validates that handoff (and any
 staged parent/child topology) before invoking an agent; an ordinary PR with no
 planning provenance continues through the normal no-plan path.
 
-Signed human instructions are rendered with surfaced positional `Requirement N`
-labels. A digest-backed identity is kept internally so edits are treated as new
-instructions, while acknowledgements posted by older runs using the same
-positional labels remain resumable. The labels follow the current rendered
-requirement order; they do not override later signed instructions.
+Signed human instructions are rendered as `Requirement hr-<digest>` and use the
+same content-derived ID in acknowledgements, repair, round metadata, and resume.
+Insertion or chronological reordering cannot change an existing instruction's
+ID, while an edited body receives a new ID. Historical positional
+acknowledgements require a fresh acknowledgement against the currently surfaced
+stable IDs rather than being reinterpreted by current ordering.
 Original issue requirements, later valid human instructions, and safety
 constraints outrank an approved plan; a defective plan must be raised as a
 scope/plan decision, not silently replaced by review prose.

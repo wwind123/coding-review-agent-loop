@@ -1043,7 +1043,7 @@ def test_reconcile_human_requirements_ack_item_clears_markdown_ack_blocker():
             "Implemented follow-up.\n"
             f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
             "### Human requirements\n"
-            "- Requirement 1: updated the URL handling.\n"
+            f"- Requirement {human_requirements[0].requirement_id}: updated the URL handling.\n"
             "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
         ),
         human_requirements=human_requirements,
@@ -3058,7 +3058,7 @@ def test_pr_loop_skips_prior_approval_when_pr_head_is_unchanged(tmp_path):
             "Also preserve the reviewer attribution.",
             "2026-05-18T10:10:00Z",
             "https://github.com/OWNER/REPO/pull/77#issuecomment-2",
-            "Requirement 2",
+            "stable-id",
         ),
         (
             "The edited instruction changes the required audit trail.",
@@ -3090,6 +3090,8 @@ def test_pr_loop_rereviews_unchanged_head_when_human_requirement_changes(
         url=second_requirement_url,
         body=second_requirement_body,
     )
+    if expected_second_prompt_text == "stable-id":
+        expected_second_prompt_text = f"Requirement {requirement_2.requirement_id}"
     runner = FakeRunner(
         codex_outputs=[
             structured_pr_review(
@@ -5417,13 +5419,13 @@ def test_reconcile_human_requirements_ack_item_accepts_stored_structured_coder_f
                 "remaining_items": [],
                 "human_requirement_dispositions": [
                     {
-                        "requirement_id": "Requirement 1",
+                        "requirement_id": human_requirements[0].requirement_id,
                         "disposition": "addressed",
                         "evidence": "The URL fix is implemented.",
                     }
                 ],
                 "human_requirements": {
-                    "addressed_ids": ["Requirement 1"],
+                    "addressed_ids": [human_requirements[0].requirement_id],
                     "checked_discussion_directly": False,
                 },
             }

@@ -388,6 +388,34 @@ class FakeRunner(Runner):
         self._scripted_lock = threading.RLock()
 
     def _normalize_legacy_agent_output(self, output: str, prompt: str) -> str:
+        # Most orchestration fixtures predate content-derived signed-requirement
+        # IDs. Translate their positional shorthand to the exact IDs surfaced by
+        # the prompt so the fake agent models a current response. Direct protocol
+        # migration tests deliberately bypass this compatibility fixture.
+        surfaced_requirement_ids = re.findall(
+            r"(?m)^Requirement (hr-[0-9a-f]{64}):$", prompt, re.I
+        )
+        if surfaced_requirement_ids:
+            def replace_legacy_requirement(match: re.Match[str]) -> str:
+                position = int(match.group(1)) - 1
+                if 0 <= position < len(surfaced_requirement_ids):
+                    return f"Requirement {surfaced_requirement_ids[position].lower()}"
+                return match.group(0)
+
+            output = re.sub(
+                r"\bRequirement\s+(\d+)\b",
+                replace_legacy_requirement,
+                output,
+                flags=re.I,
+            )
+            # Structured ledgers carry the bare stable ID; only the surrounding
+            # human-readable markdown label retains the ``Requirement`` prefix.
+            output = re.sub(
+                r'"Requirement (hr-[0-9a-f]{64})"',
+                lambda match: f'"{match.group(1).lower()}"',
+                output,
+                flags=re.I,
+            )
         stripped = output.lstrip()
         if stripped.startswith("{"):
             try:
@@ -484,11 +512,7 @@ class FakeRunner(Runner):
         ):
             pr_number = parse_pr_number(output)
             summary = _review_freeform_summary_text(output) or "Implementation completed."
-            labels = sorted(
-                set(re.findall(r"\bRequirement\s+\d+\b", output, re.I)),
-                key=lambda value: int(value.split()[-1]),
-            )
-            labels = [f"Requirement {value.split()[-1]}" for value in labels]
+            labels = sorted(set(re.findall(r"hr-[0-9a-f]{64}", output, re.I)))
             blocked = {
                 label
                 for label in labels
@@ -523,8 +547,7 @@ class FakeRunner(Runner):
         if '"kind": "coder_followup"' in prompt and "<!-- AGENT_STATE:" in output:
             item_ids = sorted(set(re.findall(r"\[(item-[A-Za-z0-9._-]+)\]", prompt)))
             item_ids = [item_id for item_id in item_ids if item_id != HUMAN_REQUIREMENTS_ACK_ITEM_ID]
-            human_ids = sorted(set(re.findall(r"`(Requirement \d+)`|(?:^|\s)(Requirement \d+):", output)))
-            flattened_human_ids = [first or second for first, second in human_ids]
+            flattened_human_ids = sorted(set(re.findall(r"hr-[0-9a-f]{64}", output, re.I)))
             return structured_coder_followup(
                 state=parse_agent_state(output),
                 summary=_review_freeform_summary_text(output) or "Updated the PR.",
