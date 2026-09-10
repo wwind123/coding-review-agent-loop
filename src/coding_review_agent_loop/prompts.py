@@ -1253,6 +1253,31 @@ def approved_plan_reconciliation_guidance(
     )
 
 
+def _approved_plan_review_context_block(
+    plan_context: ApprovedPlanContext | None,
+    *,
+    max_chars: int | None = None,
+) -> str:
+    """Render plan context and reconciliation guidance from one budget decision.
+
+    The canonical text may be omitted by ``format_approved_plan_context`` while
+    the validated context still carries ``available`` identity metadata.  Keep
+    the guidance coupled to the resulting text so reviewers and coders never
+    receive decision-bearing instructions for a body that was omitted.
+    """
+    rendered = format_approved_plan_context(plan_context, max_chars=max_chars)
+    canonical_text_rendered = bool(
+        plan_context is not None
+        and plan_context.is_available
+        and plan_context.canonical_text
+        and f"Canonical approved plan text:\n{plan_context.canonical_text}\n" in rendered
+    )
+    return rendered + approved_plan_reconciliation_guidance(
+        plan_context,
+        canonical_text_rendered=canonical_text_rendered,
+    )
+
+
 def _compact_issue_context_block(issue_context: IssueContext | None) -> str:
     if issue_context is None:
         return ""
@@ -2493,6 +2518,7 @@ def _compact_pr_review_stable_prefix(
     followup_guidance: str,
     human_requirements_guidance: str,
     approved_plan_context: ApprovedPlanContext | None,
+    approved_plan_max_chars: int | None,
     parent_issue_context: IssueContext | None,
 ) -> str:
     reviewer_group = format_agent_list(reviewers(config))
@@ -2581,8 +2607,10 @@ adds a merge migration.
             followup_guidance,
             human_requirements_guidance,
             _memory_block(memory, config),
-            format_approved_plan_context(approved_plan_context),
-            approved_plan_reconciliation_guidance(approved_plan_context),
+            _approved_plan_review_context_block(
+                approved_plan_context,
+                max_chars=approved_plan_max_chars,
+            ),
             _labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context"),
             _compact_pr_review_issue_context_block(issue_context, pr_metadata.body),
             _human_requirements_block(human_requirements),
@@ -2610,6 +2638,7 @@ def _build_compact_pr_review_prompt(
     compact_prior: CompactPriorContext | None,
     compact_tail: CompactPrReviewTailContext | None,
     approved_plan_context: ApprovedPlanContext | None,
+    approved_plan_max_chars: int | None,
     parent_issue_context: IssueContext | None,
     coder_followup_context: str = "",
 ) -> str:
@@ -2636,6 +2665,7 @@ def _build_compact_pr_review_prompt(
         followup_guidance=followup_guidance,
         human_requirements_guidance=human_requirements_guidance,
         approved_plan_context=approved_plan_context,
+        approved_plan_max_chars=approved_plan_max_chars,
         parent_issue_context=parent_issue_context,
     )
     head_sha = (compact_tail.head_sha if compact_tail else None) or pr_metadata.head_sha or "(unknown)"
@@ -2834,6 +2864,7 @@ def build_review_prompt(
     compact_prior: CompactPriorContext | None = None,
     compact_tail: CompactPrReviewTailContext | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
+    approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
     coder_followup_context: str = "",
 ) -> str:
@@ -2864,6 +2895,7 @@ def build_review_prompt(
             compact_prior=compact_prior,
             compact_tail=compact_tail,
             approved_plan_context=approved_plan_context,
+            approved_plan_max_chars=approved_plan_max_chars,
             parent_issue_context=parent_issue_context,
             coder_followup_context=sanitize_historical_text(coder_followup_context),
         )
@@ -2900,8 +2932,7 @@ are present in the PR diff.
 {_scratch_file_guidance()}
 {_review_command_policy(config, metadata)}
 {checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_labeled_issue_context_block(issue_context, label="Primary/child issue context")}
-{format_approved_plan_context(approved_plan_context)}
-{approved_plan_reconciliation_guidance(approved_plan_context)}
+{_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {_human_requirements_block(human_requirements)}
 {unresolved_items_block}{sanitize_historical_text(coder_followup_context)}
 {_memory_block(memory, config)}
@@ -3011,6 +3042,7 @@ def build_followup_prompt(
     *,
     human_requirements_context: CoderHumanRequirementsPromptContext | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
+    approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
@@ -3027,8 +3059,7 @@ Do not create a new PR.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
-{format_approved_plan_context(approved_plan_context)}
-{approved_plan_reconciliation_guidance(approved_plan_context)}
+{_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -3061,6 +3092,7 @@ def build_same_pr_followup_prompt(
     *,
     human_requirements_context: CoderHumanRequirementsPromptContext | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
+    approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
@@ -3081,8 +3113,7 @@ remains blocked pending another review round after this cleanup.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
-{format_approved_plan_context(approved_plan_context)}
-{approved_plan_reconciliation_guidance(approved_plan_context)}
+{_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -3118,6 +3149,7 @@ def build_merge_conflict_prompt(
     merge_state_detail: str,
     human_requirements_context: CoderHumanRequirementsPromptContext | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
+    approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
@@ -3140,8 +3172,7 @@ against the new head after your push.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
-{format_approved_plan_context(approved_plan_context)}
-{approved_plan_reconciliation_guidance(approved_plan_context)}
+{_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
 

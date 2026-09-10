@@ -122,6 +122,38 @@ def _is_disputed_item(item: UnresolvedReviewItem) -> bool:
     return any(note.startswith(CODER_DISPUTE_NOTE_PREFIX) for note in item.notes)
 
 
+def _raise_if_maintained_disputed_items(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    *,
+    prior_items: Sequence[UnresolvedReviewItem],
+) -> None:
+    """Stop after one reconsideration when a disputed blocker remains active."""
+    prior_item_ids = {item.item_id for item in prior_items}
+    disputed_still_blocking = [
+        item
+        for item in unresolved_items
+        if item.item_id in prior_item_ids
+        and item.status in {"blocking", "same-pr"}
+        and _is_disputed_item(item)
+    ]
+    if not disputed_still_blocking:
+        return
+    item_summaries = "\n".join(
+        "\n".join(
+            [
+                f"- [{item.item_id}] from {item.reviewer}: {item.text[:300]}",
+                *[f"  Update/evidence: {note}" for note in item.notes],
+            ]
+        )
+        for item in disputed_still_blocking
+    )
+    raise AgentLoopError(
+        f"Reviewer did not resolve {len(disputed_still_blocking)} disputed item(s) "
+        "after seeing coder counter-evidence. Human review required to resolve the "
+        f"disagreement.\n\nDisputed items still unresolved:\n{item_summaries}"
+    )
+
+
 def _same_round_prior_disposition_description(
     unknown: Sequence[str],
     current_round_items: Sequence[UnresolvedReviewItem],

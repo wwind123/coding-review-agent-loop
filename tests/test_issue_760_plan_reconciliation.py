@@ -21,7 +21,10 @@ from coding_review_agent_loop.round_state import ApprovedPlanContext, make_appro
 from coding_review_agent_loop.unresolved_items import (
     _apply_dispute_evidence,
     _is_disputed_item,
+    _next_unresolved_item,
+    _raise_if_maintained_disputed_items,
     _validate_coder_followup_response,
+    _validate_review_response,
     apply_item_dispositions,
 )
 from coding_review_agent_loop.repair import _build_repair_prompt
@@ -53,7 +56,13 @@ def _plan_context(raw: dict | None) -> ApprovedPlanContext | None:
     )
 
 
-def _review_prompt(tmp_path: Path, context: ApprovedPlanContext | None, *, compact: bool) -> str:
+def _review_prompt(
+    tmp_path: Path,
+    context: ApprovedPlanContext | None,
+    *,
+    compact: bool,
+    approved_plan_max_chars: int | None = None,
+) -> str:
     config = make_config(tmp_path, reviewer=("codex",))
     metadata = PullRequestMetadata(
         number=760,
@@ -73,6 +82,7 @@ def _review_prompt(tmp_path: Path, context: ApprovedPlanContext | None, *, compa
         pr_metadata=metadata,
         compact_context=compact,
         approved_plan_context=context,
+        approved_plan_max_chars=approved_plan_max_chars,
     )
 
 
@@ -95,6 +105,39 @@ def _coder_response(payload: dict) -> str:
         "human_requirement_dispositions": [],
     }
     return json.dumps(body) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+
+
+def _review_response(payload: dict) -> str:
+    state = payload.get("state", "blocking")
+    body = {
+        "schema_version": 1,
+        "kind": "pr_review",
+        "state": state,
+        "summary": payload.get("summary", "The scenario review found one blocking item."),
+        "blocking_items": payload.get("blocking_items", []),
+        "same_pr_followups": payload.get("same_pr_followups", []),
+        "future_followups": payload.get("future_followups", []),
+        "prior_item_dispositions": payload.get("prior_item_dispositions", []),
+    }
+    return json.dumps(body) + f"\n<!-- AGENT_STATE: {state} -->\n-- OpenAI Codex"
+
+
+def _scenario_review_item(scenario: dict) -> UnresolvedReviewItem:
+    parsed = _validate_review_response(
+        _review_response(scenario["pr_review"]),
+        reviewer="OpenAI Codex",
+        unresolved_items=(),
+    )
+    assert parsed.state == "blocking"
+    assert len(parsed.blocking_items) == 1
+    finding = parsed.blocking_items[0]
+    return _next_unresolved_item(
+        item_number=1,
+        reviewer=finding.reviewer,
+        source_round=1,
+        text=finding.text,
+        status="blocking",
+    )
 
 
 def test_fixture_contains_the_six_required_examples_and_context_guardrails():
@@ -168,6 +211,37 @@ def test_budget_omitted_context_preserves_identity_and_has_no_enforceable_decisi
         format_approved_plan_context(context, max_chars=100)
 
 
+def test_real_review_and_followup_renderers_couple_budget_omission_to_guidance(tmp_path):
+    context = make_approved_plan_context(
+        "Approved migration decision: use digest-backed stable public labels.\n" + "x" * 5000,
+        source_locator="issue #760 approved-plan round",
+    )
+    for compact in (False, True):
+        prompt = _review_prompt(
+            tmp_path,
+            context,
+            compact=compact,
+            approved_plan_max_chars=1000,
+        )
+        assert "Availability: available" in prompt
+        assert "Canonical approved plan text omitted" in prompt
+        assert "Use the source locator to fetch and verify the exact canonical decision" in prompt
+        assert "no enforceable decision" in prompt
+        assert "For each concern against a verified canonical plan" not in prompt
+
+    followup = build_followup_prompt(
+        760,
+        2,
+        "[item-1] Verify the plan decision before enforcing it.",
+        make_config(tmp_path, reviewer=("codex",)),
+        approved_plan_context=context,
+        approved_plan_max_chars=1000,
+    )
+    assert "Canonical approved plan text omitted" in followup
+    assert "no enforceable decision" in followup
+    assert "For each concern against a verified canonical plan" not in followup
+
+
 def test_coder_followup_and_repair_guidance_separate_plan_conflicts_from_fixes(tmp_path):
     context = _plan_context(_scenarios()[0]["plan_context"])
     config = make_config(tmp_path, reviewer=("codex",))
@@ -195,53 +269,109 @@ def test_coder_followup_and_repair_guidance_separate_plan_conflicts_from_fixes(t
         )
 
 
-def test_named_scenarios_use_existing_followup_partition_and_dispute_annotation():
-    scenarios = _scenarios()
-    item = UnresolvedReviewItem(
-        item_id="item-1",
-        reviewer="OpenAI Codex",
-        source_round=1,
-        text="Scenario reviewer finding.",
-        status="blocking",
+@pytest.mark.parametrize(
+    "scenario_name",
+    [
+        "stable_id_discretionary_positional_labels",
+        "stable_id_evidence_backed_compatibility_defect",
+        "stable_id_implementation_noncompliance",
+        "legacy_notice_discretionary_removal",
+        "legacy_recovery_failure_is_correctable",
+        "legacy_unavailable_notice_validation_bug",
+        "budget_omitted_plan_text",
+        "mismatched_plan_identity",
+        "direct_pr_without_plan",
+    ],
+)
+def test_fixture_scenarios_use_their_review_finding_and_existing_orchestration_routes(scenario_name):
+    scenario = next(item for item in _scenarios() if item["name"] == scenario_name)
+    item = _scenario_review_item(scenario)
+    assert item.text == scenario["pr_review"]["blocking_items"][0]
+    parsed = _validate_coder_followup_response(
+        _coder_response(scenario["coder_followup"]),
+        unresolved_items=(item,),
+        human_requirements=(),
     )
-    for scenario in scenarios[:6]:
-        parsed = _validate_coder_followup_response(
-            _coder_response(scenario["coder_followup"]),
-            unresolved_items=(item,),
-            human_requirements=(),
+    expected = scenario["expected"]
+    classification = expected["classification"]
+    if classification == "discretionary_plan_conflict":
+        assert parsed.disputed_items == ("item-1",)
+        evidence = parsed.dispute_evidence["item-1"].lower()
+        assert "approved decision" in evidence
+        assert "incompatible" in evidence
+        annotated = _apply_dispute_evidence(
+            (item,),
+            disputed_items=parsed.disputed_items,
+            dispute_evidence=parsed.dispute_evidence,
         )
-        expected = scenario["expected"]["classification"]
-        if expected == "discretionary_plan_conflict":
-            assert parsed.disputed_items == ("item-1",)
-            evidence = parsed.dispute_evidence["item-1"].lower()
-            assert "approved decision" in evidence
-            assert "incompatible" in evidence
-            annotated = _apply_dispute_evidence(
-                (item,),
-                disputed_items=parsed.disputed_items,
-                dispute_evidence=parsed.dispute_evidence,
-            )
-            assert _is_disputed_item(annotated[0])
-            assert parsed.remaining_items == ()
-        else:
-            assert parsed.addressed_items == ("item-1",)
-            remaining, future = apply_item_dispositions(
-                (item,),
+        assert _is_disputed_item(annotated[0])
+        assert parsed.remaining_items == ()
+
+        maintained_review = _validate_review_response(
+            _review_response(
                 {
-                    "item-1": [
-                        ReviewItemDisposition(
-                            item_id="item-1",
-                            reviewer="OpenAI Codex",
-                            disposition="resolved",
-                            note=parsed.addressed_item_notes.get("item-1"),
-                        )
-                    ]
-                },
-                same_status="same-pr",
-                retain_future=False,
-            )
-            assert remaining == []
-            assert future == []
+                    "state": "blocking",
+                    "summary": "The reviewer maintains the policy request.",
+                    "prior_item_dispositions": [
+                        {
+                            "item_id": "item-1",
+                            "disposition": "blocking",
+                            "note": "The requested policy change remains required after reviewing the counter-evidence.",
+                        }
+                    ],
+                }
+            ),
+            reviewer="OpenAI Codex",
+            unresolved_items=tuple(annotated),
+        )
+        remaining, future = apply_item_dispositions(
+            tuple(annotated),
+            {"item-1": list(maintained_review.dispositions)},
+            same_status="same-pr",
+            retain_future=False,
+        )
+        assert future == []
+        with pytest.raises(AgentLoopError, match="Human review required"):
+            _raise_if_maintained_disputed_items(remaining, prior_items=(item,))
+        assert expected["orchestration"] == "maintained_dispute_requires_human"
+        return
+
+    assert parsed.addressed_items == ("item-1",)
+    resolved_review = _validate_review_response(
+        _review_response(
+            {
+                "state": "approved",
+                "summary": "The addressed scenario item is resolved on the next review.",
+                "prior_item_dispositions": [
+                    {
+                        "item_id": "item-1",
+                        "disposition": "resolved",
+                        "note": "Verified the fix and its regression coverage on the current head.",
+                    }
+                ],
+            }
+        ),
+        reviewer="OpenAI Codex",
+        unresolved_items=(item,),
+    )
+    remaining, future = apply_item_dispositions(
+        (item,),
+        {"item-1": list(resolved_review.dispositions)},
+        same_status="same-pr",
+        retain_future=False,
+    )
+    assert remaining == []
+    assert future == []
+    actual_orchestration = {
+        "evidence_backed_plan_defect": "actionable_and_resolvable",
+        "implementation_noncompliance": "actionable_and_resolvable",
+        "ordinary_recovery_defect": "actionable_and_resolvable",
+        "ordinary_implementation_defect": "actionable_and_resolvable",
+        "no_enforceable_decision_until_fetched": "ordinary_defects_remain_reviewable",
+        "no_invented_decision": "recovery_remediation",
+        "ordinary_defect_without_plan": "normal_review_path",
+    }[classification]
+    assert expected["orchestration"] == actual_orchestration
 
 
 def test_dispute_evidence_is_preserved_as_the_existing_plan_conflict_channel():
