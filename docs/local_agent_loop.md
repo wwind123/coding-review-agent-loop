@@ -2829,6 +2829,15 @@ clauses still undergo the existing path and live-target checks. Malformed
 wrapper options receive no special exemption. This validates reported command
 text; it does not execute the report or provide a shell sandbox.
 
+Explicit `sh`, `bash`, and `zsh` command-string invocations (`-c`, including
+simple combinations such as `-lc`) are validated as nested commands. An
+external virtualenv interpreter is checked separately from its test paths;
+the quoted command string is not treated as one filesystem path. Launcher
+arguments, inner test targets, working directories, and live URLs remain
+subject to the existing checks. Nested shells are bounded to eight levels;
+unsupported option forms receive no special command-string handling. This
+does not evaluate shell substitutions or certify arbitrary shell programs.
+
 With writable agent memory, measured wrapper/gate outcomes are stored in the
 versioned `test-runtime.json` sidecar. It records elapsed time, attempted cap,
 outcome, commit, input hashes, and a privacy-preserving local environment

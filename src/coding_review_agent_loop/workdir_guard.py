@@ -649,8 +649,50 @@ def _segments_for_entry(command: str, origin: Origin) -> list[tuple[str, ClauseM
 def _clauses_for_entry(command: str, origin: Origin) -> list[_Clause]:
     clauses: list[_Clause] = []
     for text, mode in _segments_for_entry(command, origin):
-        clauses.extend(_split_into_clauses(text, mode))
+        for clause in _split_into_clauses(text, mode):
+            clauses.extend(_expand_shell_clause(clause))
     return clauses
+
+
+def _shell_command_index(tokens: Sequence[str]) -> int | None:
+    head = _effective_head_index(tokens)
+    if head is None or _program_basename(tokens[head]) not in {"sh", "bash", "zsh"}:
+        return None
+    for index in range(head + 1, len(tokens)):
+        option = tokens[index]
+        # Only options with no operands: do not confuse an rcfile/script path
+        # or the operand of -o with the executable command string.
+        if option in {"--noprofile", "--norc"}:
+            continue
+        if not re.fullmatch(r"-[celux]+", option):
+            return None
+        if "c" in option:
+            return index + 1 if index + 1 < len(tokens) else None
+    return None
+
+
+def _expand_shell_clause(clause: _Clause, depth: int = 0) -> list[_Clause]:
+    index = _shell_command_index(clause.tokens)
+    if index is None:
+        return [clause]
+    if depth >= 8:
+        raise AgentLoopError("Test report shell-command nesting exceeds the validation limit.")
+    script = clause.tokens[index]
+    try:
+        shlex.split(script)
+    except ValueError as exc:
+        raise AgentLoopError("Cannot validate malformed quoted shell command in test report.") from exc
+    # Keep the launcher, environment, and positional arguments under the normal
+    # checks. Only the -c operand is executable text rather than a path argument.
+    outer = _Clause(
+        tokens=clause.tokens[:index] + clause.tokens[index + 1 :],
+        mode=clause.mode,
+        command_by_contract=clause.command_by_contract,
+    )
+    expanded = [outer]
+    for inner in _split_into_clauses(script, "structured"):
+        expanded.extend(_expand_shell_clause(inner, depth + 1))
+    return expanded
 
 
 # ---------------------------------------------------------------------------
