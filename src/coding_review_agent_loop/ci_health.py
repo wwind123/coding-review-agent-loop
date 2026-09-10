@@ -101,7 +101,7 @@ def is_canonical_pending_only_text(text: str, *, check_names: Sequence[str]) -> 
     if not text or len(text) > 400:
         return False
     names = "|".join(re.escape(name) for name in check_names if name.strip())
-    subject = r"(?:GitHub(?: PR)? checks?|CI(?: checks?)?)"
+    subject = r"(?:GitHub(?: PR)? (?:checks?|check status)|CI(?: checks?)?)"
     if names:
         name = rf"(?:`(?:{names})`|(?:{names}))"
         subject = rf"(?:{subject}(?: {name})?|check {name}|{name})"

@@ -36,7 +36,15 @@ NOW = datetime.datetime(2026, 5, 23, 12, 0, 0, tzinfo=datetime.timezone.utc)
     "GitHub check `build (linux)` is not yet reporting.",
 ])
 def test_canonical_pending_status_statements(text):
-    assert is_canonical_pending_only_text(text, check_names=("test", "status", "build (linux)"))
+    assert is_canonical_pending_only_text(text, check_names=("test", "build (linux)"))
+
+
+@pytest.mark.parametrize("text", [
+    "GitHub check status is unavailable.",
+    "GitHub PR check status is unavailable.",
+])
+def test_canonical_unavailable_status_without_check_names(text):
+    assert is_canonical_pending_only_text(text, check_names=())
 
 
 @pytest.mark.parametrize("text", [
