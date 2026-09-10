@@ -520,7 +520,8 @@ posted plan/PR, so a configured `claude` reviewer becomes a **pending handoff**:
 the round returns `{"state": "pending", "pending_reviewers": ["Claude"], ...}`
 (never `approved`/`blocking` while it's outstanding) and prints a review-request
 dir. Read the material there (`{dir}/plan.md` for a plan, `{dir}/pr-diff.diff` for
-a PR). For a PR handoff, also read `{dir}/approved-plan.md` and the labeled issue
+a PR). For a PR handoff, also read `{dir}/approved-plan.md`, the
+`{dir}/approved-plan-reconciliation.md` guidance artifact, and the labeled issue
 artifacts when present. If `{dir}/signed-human-requirements.md` exists, it is the
 rendered signed-requirement contract: verify every stable ID and follow its
 approval-marker instructions. Then write your `plan_review`/`pr_review` JSON to
@@ -534,6 +535,19 @@ That validates, renders, attaches `--agent Claude --role reviewer`, and posts yo
 review. Re-run the same round command to recompute the round (it advances to
 `approved`, or — for a plan — revises via the coder when there are blocking /
 same-plan findings).
+
+When an approved-plan reconciliation artifact is present, classify every review
+concern as one of three things: implementation noncompliance or an ordinary
+defect to fix within the approved contract; an evidence-backed correctness,
+security, compatibility, or test defect in an approved decision that may block
+and proposes a plan correction; or a discretionary scope/policy request that
+names the incompatible approved decision, evidence, and proposed change. Plan
+conformance never defeats a real defect, signed human instruction, original
+issue authority, or safety constraint. A direct PR or an unavailable/mismatched
+plan handoff supplies no approved decision to invent. If canonical plan text is
+omitted for provider budget, fetch and verify it through the source locator
+before enforcing or challenging a decision; otherwise review ordinary defects
+but do not enforce or dispute an unverified decision.
 
 ### Reverse implementation (external coder opens the PR)
 

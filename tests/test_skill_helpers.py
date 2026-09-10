@@ -3294,9 +3294,57 @@ class TestHostReviewerPR:
         manifest = json.loads((request_dir / "manifest.json").read_text(encoding="utf-8"))
         assert manifest["approved_plan_file"] == "approved-plan.md"
         assert manifest["approved_plan_hash"] == make_approved_plan_context(plan).plan_hash
+        assert manifest["approved_plan_reconciliation_guidance_file"] == "approved-plan-reconciliation.md"
+        guidance = (request_dir / "approved-plan-reconciliation.md").read_text(encoding="utf-8")
+        assert "Approved-plan reconciliation guidance" in guidance
+        assert "discretionary scope or policy request incompatible" in guidance
         context = json.loads((request_dir / "context.json").read_text(encoding="utf-8"))
         assert context["approved_plan"]["file"] == "approved-plan.md"
         assert context["approved_plan"]["deferred_work"] == ["- Keep the migration deferred."]
+        assert context["approved_plan_reconciliation_guidance_file"] == "approved-plan-reconciliation.md"
+
+    def test_host_handoff_removes_stale_plan_guidance_for_direct_pr(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.round_state import make_approved_plan_context
+
+        monkeypatch.setattr(sr, "_REPAIR_BASE", tmp_path)
+        plan = "Approved host-review plan."
+        request_dir = sr._write_host_review_request(
+            flow="pr",
+            validate_kind="pr_review",
+            issue=7,
+            repo="owner/repo",
+            new_round_number=1,
+            round_subject="head-7",
+            review_material="diff --git a/x b/x",
+            material_filename="pr-diff.diff",
+            next_prior_items_raw=[],
+            current_round_items=[],
+            item_id_offset=0,
+            dry_run=True,
+            approved_plan_context=make_approved_plan_context(plan),
+        )
+        assert (request_dir / "approved-plan-reconciliation.md").exists()
+
+        sr._write_host_review_request(
+            flow="pr",
+            validate_kind="pr_review",
+            issue=7,
+            repo="owner/repo",
+            new_round_number=1,
+            round_subject="head-7",
+            review_material="diff --git a/x b/x",
+            material_filename="pr-diff.diff",
+            next_prior_items_raw=[],
+            current_round_items=[],
+            item_id_offset=0,
+            dry_run=True,
+            approved_plan_context=None,
+        )
+        assert not (request_dir / "approved-plan.md").exists()
+        assert not (request_dir / "approved-plan-reconciliation.md").exists()
+        manifest = json.loads((request_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert "approved_plan_reconciliation_guidance_file" not in manifest
 
     def test_host_handoff_rejects_changed_approved_plan_artifact(self, monkeypatch, tmp_path) -> None:
         import helpers.skill_runner as sr

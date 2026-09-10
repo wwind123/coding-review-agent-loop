@@ -871,7 +871,7 @@ def _structured_coder_followup_guidance(
         "After the JSON object, add exactly one footer `<!-- AGENT_STATE: approved|blocking -->`, then only your standalone signature. The JSON `state` must match the `AGENT_STATE` footer exactly.",
         "Use `addressed_items`, `remaining_items`, and `disputed_items` to classify every unresolved reviewer item ID shown in this prompt. Do not omit any listed reviewer item ID and do not list any item ID more than once.",
         "Use `addressed_item_notes` to summarize how each addressed item was resolved, and use `remaining_item_notes` to give a visible reason for each intentionally deferred remaining item.",
-        "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) and you have verifiable counter-evidence. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`, and record your evidence in `dispute_evidence`. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
+        "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) or when the reviewer requests a change that is mutually incompatible with a verified approved-plan decision and you have counter-evidence. For a plan conflict, `dispute_evidence` must name the conflicting approved decision, concrete counter-evidence, and why the requested change is incompatible. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`; never park a verified plan conflict in `remaining_items`, whose retry semantics would silently recycle it. Ordinary implementation defects and evidence-backed correctness, security, compatibility, or test defects must be fixed and classified as addressed or genuinely remaining, never disputed merely because the implementation followed the plan. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
         _agent_unavailable_guidance(coder_signature),
     ]
     if human_requirements_context.surfaced_requirement_ids:
@@ -1135,6 +1135,21 @@ def format_approved_plan_context(
         lines.extend(["", "Declared deferred work / non-goals:", "- (none separately declared)"])
     if plan_context.diagnostic:
         lines.extend(["", f"Plan recovery diagnostic: {plan_context.diagnostic}"])
+    if plan_context.availability == "omitted":
+        omission = (
+            "[Canonical approved plan text omitted because it exceeds the final provider prompt budget. "
+            "Use the source locator to fetch and verify the exact plan before proceeding.]"
+        )
+        prefix = "\n".join(lines) + "\n\nCanonical approved plan text:\n"
+        complete = prefix + omission + "\n"
+        if max_chars is None or len(complete) <= max_chars:
+            return complete
+        raise AgentLoopError(
+            "Approved-plan context cannot fit the final provider prompt limit without dropping "
+            "required plan identity, scope, or deferred-work declarations. Increase the provider "
+            f"prompt limit (minimum {len(complete)} characters; configured {max_chars}) or shorten "
+            "the approved plan declarations and create a newly approved handoff."
+        )
     if not plan_context.is_available:
         lines.extend([
             "",
@@ -1161,6 +1176,80 @@ def format_approved_plan_context(
         "required plan identity, scope, or deferred-work declarations. Increase the provider "
         f"prompt limit (minimum {len(minimum)} characters; configured {max_chars}) or shorten "
         "the approved plan declarations and create a newly approved handoff."
+    )
+
+
+def approved_plan_reconciliation_guidance(
+    plan_context: ApprovedPlanContext | None,
+    *,
+    canonical_text_rendered: bool | None = None,
+) -> str:
+    """Render the shared reviewer/coder guidance for reconciling plan concerns.
+
+    ``format_approved_plan_context`` keeps the canonical text lossless, while
+    this renderer explains how to classify a concern without introducing a
+    second protocol or semantic arbitration layer.  ``canonical_text_rendered``
+    lets callers representing a provider-budget omission distinguish metadata
+    from a decision-bearing plan body.
+    """
+    if plan_context is None or plan_context.availability == "not-planned":
+        return (
+            "Approved-plan reconciliation guidance\n\n"
+            "No approved plan is bound to this PR. Do not invent an approved decision "
+            "from issue prose, PR text, historical comments, or the absence of a plan. "
+            "Review ordinary correctness, security, compatibility, and test defects "
+            "through the normal review path.\n"
+        )
+
+    text_rendered = (
+        plan_context.is_available
+        if canonical_text_rendered is None
+        else canonical_text_rendered
+    )
+    if plan_context.availability == "omitted" or (
+        plan_context.availability == "available" and not text_rendered
+    ):
+        return (
+            "Approved-plan reconciliation guidance\n\n"
+            "The canonical approved-plan text is omitted for provider budget. The "
+            "identity, scope, deferred-work metadata, and source locator do not supply "
+            "a decision by themselves. Use the source locator to fetch and verify the "
+            "exact canonical decision before enforcing it or challenging it. If that "
+            "read cannot be completed, the omitted text supplies no enforceable decision "
+            "to enforce or dispute; ordinary correctness, security, compatibility, and "
+            "test defects remain reviewable. Do not invent a decision.\n"
+        )
+    if plan_context.is_available and text_rendered:
+        return (
+            "Approved-plan reconciliation guidance\n\n"
+            "For each concern against a verified canonical plan, classify it as exactly "
+            "one of these three categories:\n"
+            "1. Implementation noncompliance or an ordinary defect: fix it within the "
+            "approved contract and report it through the normal blocking or same-PR "
+            "finding path. Do not dispute it merely because the implementation followed "
+            "some other part of the plan.\n"
+            "2. An evidence-backed correctness, security, compatibility, or test defect "
+            "in an approved decision: it may block and must propose a plan correction. "
+            "The existing `pr_review` finding text or carried-item disposition note must "
+            "name the approved decision, concrete evidence, and proposed change.\n"
+            "3. A discretionary scope or policy request incompatible with an identified "
+            "approved decision: the reviewer must name that decision, provide concrete "
+            "evidence or rationale, and state the proposed change. It is a plan conflict, "
+            "not an ordinary implementation defect.\n"
+            "Plan conformance never defeats category 1 or 2, signed human instructions, "
+            "the original issue authority, or safety constraints. Do not add protocol "
+            "fields, call another model, or silently arbitrate incompatible requirements.\n"
+        )
+
+    # Keep the existing unavailable/mismatched policy in
+    # format_approved_plan_context and add only the complementary guardrail.
+    return (
+        "Approved-plan reconciliation guidance\n\n"
+        "No verified canonical approved-plan decision is available in this context. "
+        "Do not invent one, enforce one, or dispute one. Follow the recovery/remediation "
+        "guidance above; ordinary correctness, security, compatibility, and test defects "
+        "remain reviewable, and any plan correction must be based on a plan record that "
+        "can actually be verified.\n"
     )
 
 
@@ -2493,6 +2582,7 @@ adds a merge migration.
             human_requirements_guidance,
             _memory_block(memory, config),
             format_approved_plan_context(approved_plan_context),
+            approved_plan_reconciliation_guidance(approved_plan_context),
             _labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context"),
             _compact_pr_review_issue_context_block(issue_context, pr_metadata.body),
             _human_requirements_block(human_requirements),
@@ -2811,6 +2901,7 @@ are present in the PR diff.
 {_review_command_policy(config, metadata)}
 {checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_labeled_issue_context_block(issue_context, label="Primary/child issue context")}
 {format_approved_plan_context(approved_plan_context)}
+{approved_plan_reconciliation_guidance(approved_plan_context)}
 {_human_requirements_block(human_requirements)}
 {unresolved_items_block}{sanitize_historical_text(coder_followup_context)}
 {_memory_block(memory, config)}
@@ -2937,6 +3028,7 @@ Do not create a new PR.
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {format_approved_plan_context(approved_plan_context)}
+{approved_plan_reconciliation_guidance(approved_plan_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -2990,6 +3082,7 @@ remains blocked pending another review round after this cleanup.
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {format_approved_plan_context(approved_plan_context)}
+{approved_plan_reconciliation_guidance(approved_plan_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -3048,6 +3141,7 @@ against the new head after your push.
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {format_approved_plan_context(approved_plan_context)}
+{approved_plan_reconciliation_guidance(approved_plan_context)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_memory_block(memory, config, include_runtime=True)}
 

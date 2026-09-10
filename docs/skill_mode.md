@@ -121,7 +121,8 @@ mirroring the CLI's `--coder` / `--reviewer` reversal — so an external agent
   plan and PR rounds); re-running the round then recomputes the final state.
   For a plan-bound PR, the request dir contains the complete canonical
   `approved-plan.md` plus its hash, subject, scope, and deferred-work metadata;
-  read that artifact alongside `pr-diff.diff`. When signed human requirements
+  read that artifact and the shared `approved-plan-reconciliation.md` guidance
+  alongside `pr-diff.diff`. When signed human requirements
   are surfaced from the authoritative parent, primary issue, or PR, the request
   also contains `signed-human-requirements.md`. The host must read that rendered
   contract, verify every stable `hr-…` ID, and include the documented resolution
@@ -130,6 +131,26 @@ mirroring the CLI's `--coder` / `--reviewer` reversal — so an external agent
   `complete-host-review` validates the plan artifact identity before posting the
   review, so a changed or missing plan is an actionable handoff error rather than
   a diff-only review. Direct PRs with no planning provenance have no plan artifact.
+
+Approved-plan PR reviews use three explicit reconciliation categories. Ordinary
+implementation noncompliance and ordinary defects are fixed within the approved
+contract. Evidence-backed correctness, security, compatibility, or test defects
+in an approved decision may block and must name the decision, evidence, and
+proposed plan correction. A discretionary scope or policy request incompatible
+with the plan must name that decision, evidence or rationale, and proposed
+change. The existing finding text, carried-item note, `disputed_items`, and
+`dispute_evidence` fields carry this distinction; no protocol field or classifier
+is added. A coder must never dispute an ordinary or evidence-backed defect merely
+because the implementation followed the plan, and must not park a verified plan
+conflict in `remaining_items`. A maintained dispute is re-reviewed once, then
+terminates for human resolution.
+
+If canonical plan text is omitted for provider budget, identity and scope metadata
+remain visible but the source locator must be fetched and verified before a
+decision is enforced or challenged. A failed fetch supplies no enforceable
+decision, while ordinary defects remain reviewable. Unavailable, mismatched,
+legacy, and direct-PR contexts do not authorize inventing an approved decision;
+the existing recovery/remediation guidance remains authoritative.
 - **Implement, reversed**: after a plan is approved, an external coder emits the
   typed `issue_implementation` result and may open a PR — see [Approved-plan
   execution helpers](#approved-plan-execution-helpers) — which the host then

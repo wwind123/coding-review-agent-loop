@@ -2782,8 +2782,10 @@ def _write_host_review_request(
     _write_text(request_dir / material_filename, review_material)
     _write_json(request_dir / "prior_items.json", next_prior_items_raw)
     stale_plan_file = request_dir / "approved-plan.md"
+    stale_reconciliation_file = request_dir / "approved-plan-reconciliation.md"
     stale_requirements_file = request_dir / "signed-human-requirements.md"
     approved_plan_file: str | None = None
+    reconciliation_guidance_file: str | None = None
     human_requirements_file: str | None = None
     approved_plan_metadata: dict[str, object] | None = None
     if approved_plan_context is not None:
@@ -2807,12 +2809,23 @@ def _write_host_review_request(
             "scope": list(approved_plan_context.scope),
             "deferred_work": list(approved_plan_context.deferred_work),
         }
+        from coding_review_agent_loop.prompts import approved_plan_reconciliation_guidance
+
+        reconciliation_guidance_file = "approved-plan-reconciliation.md"
+        _write_text(
+            stale_reconciliation_file,
+            approved_plan_reconciliation_guidance(approved_plan_context),
+        )
     else:
         # The request directory is reused across retries. Do not leave an older
         # plan artifact that could make an ordinary direct-PR handoff appear
         # plan-bound.
         try:
             stale_plan_file.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            stale_reconciliation_file.unlink()
         except FileNotFoundError:
             pass
     if human_requirements:
@@ -2845,6 +2858,8 @@ def _write_host_review_request(
     }
     if approved_plan_metadata is not None:
         context_payload["approved_plan"] = approved_plan_metadata
+    if reconciliation_guidance_file is not None:
+        context_payload["approved_plan_reconciliation_guidance_file"] = reconciliation_guidance_file
     _write_json(request_dir / "context.json", context_payload)
     issue_artifacts: dict[str, str] = {}
     for label, issue_context in (
@@ -2885,6 +2900,8 @@ def _write_host_review_request(
         manifest["approved_plan_file"] = approved_plan_file
         manifest["approved_plan_hash"] = approved_plan_context.plan_hash
         manifest["approved_plan_subject"] = approved_plan_context.plan_subject
+    if reconciliation_guidance_file is not None:
+        manifest["approved_plan_reconciliation_guidance_file"] = reconciliation_guidance_file
     if human_requirements_file is not None:
         manifest["human_requirements_file"] = human_requirements_file
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -3468,7 +3485,9 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         print(
             f"skill_runner: host review pending — read the PR-bound approved plan in "
             f"{request_dir}/approved-plan.md when present, the labeled issue context "
-            f"artifacts when present, and the signed requirement contract in "
+            f"artifacts, the approved-plan reconciliation guidance in "
+            f"{request_dir}/approved-plan-reconciliation.md when present, and the "
+            f"signed requirement contract in "
             f"{request_dir}/signed-human-requirements.md when present; then read the "
             f"PR diff in "
             f"{request_dir}/pr-diff.diff, "
