@@ -473,8 +473,19 @@ _WRAPPER_VALUE_OPTIONS = {
     "sudo": {"-u", "-g"},
     "nice": {"-n"},
     "stdbuf": {"-i", "-o", "-e"},
-    "env": {"-u", "-C"},
+    "env": {"-u", "--unset", "-C", "--chdir"},
     "xargs": {"-n", "-P", "-I"},
+}
+# Only transparent execution prefixes can receive the managed-wrapper exemption.
+# In particular, do not infer argv through env -S, xargs, sudo, or command -v.
+_MANAGED_PREFIX_OPTIONS = {
+    "env": ({"-u", "--unset"}, {"-i", "--ignore-environment"}),
+    "timeout": (_WRAPPER_VALUE_OPTIONS["timeout"], {"--foreground", "--preserve-status", "-v", "--verbose"}),
+    "nice": ({"-n", "--adjustment"}, set()),
+    "stdbuf": ({"-i", "-o", "-e", "--input", "--output", "--error"}, set()),
+    "nohup": (set(), set()),
+    "time": (set(), {"-p"}),
+    "command": (set(), {"-p"}),
 }
 _TIMEOUT_DURATION_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?$")
 
@@ -493,10 +504,16 @@ def _program_basename(token: str) -> str:
     return _strip_wrap(token).rstrip(".,;:!?").replace("\\", "/").rsplit("/", 1)[-1].lower()
 
 
-def _consume_wrapper_options(tokens: Sequence[str], start: int, wrapper: str) -> int | None:
+def _consume_wrapper_options(
+    tokens: Sequence[str], start: int, wrapper: str, *, managed: bool = False,
+) -> int | None:
     """Consume GNU-style wrapper options, preserving unknown options as valueless."""
     i = start
     value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, set())
+    if managed:
+        if wrapper not in _MANAGED_PREFIX_OPTIONS:
+            return None
+        value_options, flag_options = _MANAGED_PREFIX_OPTIONS[wrapper]
     while i < len(tokens):
         token = tokens[i]
         if token == "--":
@@ -507,13 +524,15 @@ def _consume_wrapper_options(tokens: Sequence[str], start: int, wrapper: str) ->
         option, sep, _value = token.partition("=")
         if option in value_options:
             if sep:
+                if managed and (not option.startswith("--") or not _value):
+                    return None
                 i += 1
                 continue
             # Attached short values, such as -k10s or -n10, are valid.
             if option.startswith("-") and not option.startswith("--") and len(token) > len(option):
                 i += 1
                 continue
-            if i + 1 >= len(tokens):
+            if i + 1 >= len(tokens) or (managed and not tokens[i + 1]):
                 return None
             i += 2
             continue
@@ -525,13 +544,17 @@ def _consume_wrapper_options(tokens: Sequence[str], start: int, wrapper: str) ->
             if attached_option is not None:
                 i += 1
                 continue
-        # Every other dash-prefixed option remains a no-value option.
+        if managed and token not in flag_options:
+            return None
+        # Ordinary classification retains its historical permissive traversal.
         i += 1
     return i
 
 
-def _parse_wrapper(tokens: Sequence[str], index: int, wrapper: str) -> int | None:
-    next_index = _consume_wrapper_options(tokens, index + 1, wrapper)
+def _parse_wrapper(
+    tokens: Sequence[str], index: int, wrapper: str, *, managed: bool = False,
+) -> int | None:
+    next_index = _consume_wrapper_options(tokens, index + 1, wrapper, managed=managed)
     if next_index is None:
         return None
     if wrapper == "timeout":
@@ -543,7 +566,7 @@ def _parse_wrapper(tokens: Sequence[str], index: int, wrapper: str) -> int | Non
     return next_index
 
 
-def _wrapper_traversal(tokens: Sequence[str]) -> _WrapperTraversal:
+def _wrapper_traversal(tokens: Sequence[str], *, managed: bool = False) -> _WrapperTraversal:
     positions: set[int] = set()
     i = 0
     recognized_prefix = False
@@ -557,7 +580,7 @@ def _wrapper_traversal(tokens: Sequence[str]) -> _WrapperTraversal:
             return _WrapperTraversal(recognized_prefix, positions, i)
         recognized_prefix = True
         positions.add(i)
-        next_index = _parse_wrapper(tokens, i, wrapper)
+        next_index = _parse_wrapper(tokens, i, wrapper, managed=managed)
         if next_index is None:
             return _WrapperTraversal(True, positions, None)
         i = next_index
@@ -622,7 +645,7 @@ def _split_into_clauses(text: str, mode: ClauseMode) -> list[_Clause]:
         if not token:
             continue
         last_char = token[-1]
-        if last_char in ".!?;" and not _is_path_like_token(token):
+        if last_char in ".!?;" and token not in {".", ".."} and not _is_path_like_token(token):
             flush(False)
         elif mode == "narrative" and last_char == "," and not _is_path_like_token(token):
             flush(False)
@@ -1116,9 +1139,9 @@ def _validate_managed_command(command: str, *, assigned: Path, origin: Origin) -
     # inner executable/targets so the wrapper cannot hide an escape.
     try:
         tokens = shlex.split(command)
-        prefix_len = 0
-        while prefix_len < len(tokens) and VAR_ASSIGNMENT_RE.match(tokens[prefix_len]):
-            prefix_len += 1
+        prefix_len = _wrapper_traversal(tokens, managed=True).effective_head_index
+        if prefix_len is None:
+            return False
         managed = parse_managed_test_invocation(tokens[prefix_len:])
     except (ValueError, TestRuntimeConfigurationError):
         managed = None

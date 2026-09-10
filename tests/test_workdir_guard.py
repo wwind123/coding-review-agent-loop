@@ -29,6 +29,100 @@ def test_managed_run_tests_wrapper_exempts_only_wrapper_and_memory_output(tmp_pa
     )
 
 
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize("launcher", [
+    "/home/wwind123/.local/bin/agent-loop run-tests",
+    shlex.join([sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests"]),
+])
+@pytest.mark.parametrize("prefix", [
+    "env -u AGENT_LOOP_INVOCATION_ID",
+    "env --unset AGENT_LOOP_INVOCATION_ID",
+    "env --unset=AGENT_LOOP_INVOCATION_ID",
+    "env -uAGENT_LOOP_INVOCATION_ID -i MODE=inline",
+    "env --ignore-environment -- MODE=inline",
+    "MODE=inline /usr/bin/env -u FIRST -u SECOND LABEL='two words'",
+    "timeout --kill-after=10s --signal TERM --foreground 1800s env -u AGENT_LOOP_INVOCATION_ID",
+    "env -u AGENT_LOOP_INVOCATION_ID timeout -k10s 1800",
+    "nice -n 5 stdbuf -oL -eL nohup",
+    "nice --adjustment=5 stdbuf --output=L --error=L",
+    "time -p command -p env -u AGENT_LOOP_INVOCATION_ID",
+])
+@pytest.mark.parametrize("template", [
+    "{cmd}",
+    "pwd && git status --branch --short && {cmd} ; pwd",
+    "false || {cmd}",
+])
+def test_managed_prefix_combinations(tmp_path, origin, launcher, prefix, template):
+    command = (
+        f"{prefix} {launcher} --timeout-seconds 1800 "
+        "--memory-dir '/outside/cache with spaces' -- python3 -m pytest tests/test_protocol.py -q"
+    )
+    validate_test_commands_within_workdir(
+        [template.format(cmd=command)], assigned_workdir=tmp_path, origin=origin,
+    )
+
+
+def test_prefixed_wrapper_in_backticked_report(tmp_path):
+    validate_test_commands_within_workdir(
+        ["Tests: `pwd && env -u AGENT_LOOP_INVOCATION_ID /outside/agent-loop run-tests "
+         "--memory-dir /outside/cache -- python3 -m pytest tests/test_protocol.py -q` (975 passed)."],
+        assigned_workdir=tmp_path, origin="response",
+    )
+
+
+@pytest.mark.parametrize("prefix", [
+    "env -u AGENT_LOOP_INVOCATION_ID", "timeout 1800 env -u FIRST MODE=inline",
+])
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize("template", [
+    "{prefix} {wrapper} /outside/test.py",
+    "{prefix} {wrapper} --rootdir=/outside",
+    "{prefix} {wrapper} https://live.example",
+    "E2E_BASE=https://live.example {prefix} {wrapper}",
+    "{prefix} E2E_BASE=https://live.example {wrapper}",
+    "cd /outside && {prefix} {wrapper}",
+    "{prefix} {wrapper} && cd /outside && pytest",
+    "{prefix} {wrapper} && curl https://live.example",
+    "curl https://live.example ; {prefix} {wrapper}",
+    "{prefix} {wrapper} && /outside/unknown-script tests/test_api.py",
+    "echo {prefix} {wrapper}",
+])
+def test_managed_prefix_retains_other_checks(tmp_path, prefix, origin, template):
+    wrapper = "/outside/agent-loop run-tests --memory-dir /outside/cache -- python3 -m pytest"
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir(
+            [template.format(prefix=prefix, wrapper=wrapper)], assigned_workdir=tmp_path, origin=origin,
+        )
+
+
+@pytest.mark.parametrize("prefix", [
+    "env --unknown", "env --help", "env -u", "env --unset=", "env -u ''",
+    "env -S 'python3 /outside/test.py'", "env --split-string='python3 /outside/test.py'",
+    "env -C /outside", "env -C../outside", "env --chdir=/outside",
+    "env -C .", "env --chdir .",
+    "timeout --unknown 1800", "timeout invalid", "timeout -k",
+    "command -v", "command -V", "xargs -I{}", "sudo -u root",
+    "env -u FIRST /outside/unknown-script",
+])
+def test_unsupported_prefix_cannot_grant_managed_exemption(tmp_path, prefix):
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir(
+            [f"{prefix} /outside/agent-loop run-tests -- python3 -m pytest tests/test_api.py"],
+            assigned_workdir=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("options", [
+    "--unknown --", "--timeout-seconds 120", "--memory-dir /a --memory-dir /b --",
+])
+def test_env_prefix_preserves_managed_contract_validation(tmp_path, options):
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir(
+            [f"pwd && env -u FIRST /outside/agent-loop run-tests {options} python3 -m pytest"],
+            assigned_workdir=tmp_path,
+        )
+
+
 def test_managed_run_tests_wrapper_still_rejects_inner_outside_target(tmp_path):
     checkout = tmp_path / "checkout"
     checkout.mkdir()
