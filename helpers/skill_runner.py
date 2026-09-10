@@ -129,6 +129,13 @@ from coding_review_agent_loop.followups import (
 from coding_review_agent_loop.memory import AgentMemoryContext, prepare_agent_memory
 from coding_review_agent_loop.issue_pr_handoff import find_latest_issue_pr_handoff
 from coding_review_agent_loop.pr_contract import find_latest_pr_contract
+from coding_review_agent_loop.split_materialization import (
+    SPLIT_CHILD_MARKER_RE,
+    SPLIT_STAGE_HANDOFF_MARKER_RE,
+    _decode_stage_handoff_metadata,
+    find_existing_split_materialization,
+    find_existing_split_stage_handoff,
+)
 from coding_review_agent_loop.runner import Runner, run_foreground_test, tail_text
 from coding_review_agent_loop.containment import default_policy
 from coding_review_agent_loop.test_runtime import (
@@ -1170,118 +1177,240 @@ def _recover_skill_pr_plan_context(
         expected_hash = one_shot.plan_hash
         expected_subject = one_shot.plan_subject or None
 
-    if expected_hash is None:
-        # Phase implementations bind the child PR through the parent-side phase
-        # handoff and the child issue's validated phase identity rather than a
-        # one-shot PR marker. Recover the full canonical plan from the parent;
-        # the child excerpt is intentionally not treated as the plan itself.
-        phase_match = next(
-            (match for comment in comments if (match := PHASE_IDENTITY_MARKER_RE.search(comment.body))),
-            None,
-        )
-        if phase_match is None:
-            try:
-                child_info = _fetch_issue_json(repo, issue_number)
-            except SystemExit:
-                # A linked ordinary PR may not be readable from this helper's
-                # credentials. Without a phase marker in fetched comments,
-                # there is no plan provenance to validate or require.
-                return None
-            phase_match = PHASE_IDENTITY_MARKER_RE.search(str(child_info.get("body") or ""))
-        if phase_match is None:
-            return None
-        if phase_match is not None:
-            payload = _decode_json_payload(
-                phase_match.group("payload"),
-                marker_name="AGENT_PLAN_PHASE_IDENTITY",
-            )
-            parent_issue = payload.get("parent_issue")
-            plan_hash = payload.get("plan_hash")
-            stage_id = payload.get("stage_id")
-            source = payload.get("source")
-            identity = payload.get("identity")
-            if (
-                not isinstance(parent_issue, int)
-                or isinstance(parent_issue, bool)
-                or not isinstance(plan_hash, str)
-                or not plan_hash.strip()
-                or not isinstance(stage_id, int)
-                or isinstance(stage_id, bool)
-                or not isinstance(source, str)
-                or not isinstance(identity, str)
+    # A staged implementation records its canonical PR handoff on the child
+    # issue.  The lossless plan, however, remains on the parent issue.  Resolve
+    # the child marker before falling back to the child issue's comments so a
+    # populated ``expected_hash`` cannot bypass parent/topology validation.
+    child_info: dict | None = None
+    child_bodies = [comment.body for comment in comments]
+    should_read_child = expected_hash is None or issue_handoff is not None
+    if should_read_child:
+        try:
+            child_info = _fetch_issue_json(repo, issue_number)
+        except SystemExit as exc:
+            if expected_hash is not None or (
+                pr_contract is not None
+                and pr_contract.origin_flow == "approved-plan-implementation"
             ):
                 raise AgentLoopError(
-                    f"PR #{pr} has an invalid staged phase identity; repair the child issue handoff."
-                )
-            parent_comments = [
-                types.SimpleNamespace(body=body)
-                for body in _fetch_issue_comments_raw(repo, parent_issue)
-            ]
-            matching_mode: str | None = None
-            matching_checkpoint = None
-            for mode in ("decompose-only", "implement-by-phase"):
-                checkpoint = find_existing_topology_checkpoint(
-                    parent_comments,
-                    parent_issue=parent_issue,
-                    plan_hash=plan_hash,
-                    mode=mode,
-                )
-                if checkpoint is None:
-                    continue
-                if not 1 <= stage_id <= len(checkpoint.phases):
-                    raise AgentLoopError(
-                        f"PR #{pr} references staged phase {stage_id}, but the matching "
-                        "parent topology has no such phase."
-                    )
-                expected_identity = phase_identity(
-                    parent_issue=parent_issue,
-                    plan_hash=plan_hash,
-                    topology_source=checkpoint.topology_source,
-                    phase_index=stage_id,
-                    phase=checkpoint.phases[stage_id - 1],
-                )
-                if source != checkpoint.topology_source or identity != expected_identity:
-                    raise AgentLoopError(
-                        f"PR #{pr} staged phase identity does not match the authoritative parent topology."
-                    )
-                phase_handoff = find_existing_phase_implementation_handoff(
-                    parent_comments,
-                    parent_issue=parent_issue,
-                    plan_hash=plan_hash,
-                    mode=mode,
-                    phase_index=stage_id,
-                    child_issue_number=issue_number,
-                )
-                if phase_handoff is None:
-                    continue
-                phase = checkpoint.phases[stage_id - 1]
-                if (
-                    phase_handoff.phase_title != phase.title
-                    or phase_handoff.automation != phase.automation
-                ):
-                    raise AgentLoopError(
-                        f"PR #{pr} staged phase handoff disagrees with the authoritative parent topology."
-                    )
-                matching_mode = mode
-                matching_checkpoint = checkpoint
-                break
-            if matching_mode is None or matching_checkpoint is None:
+                    f"PR #{pr} is plan-bound to issue #{issue_number}, but the child issue "
+                    "could not be read to validate staged-parent provenance. Repair access "
+                    "or the child issue handoff before reviewing."
+                ) from exc
+            # A linked ordinary PR may not be readable from this helper's
+            # credentials. Without a plan-bound handoff, it remains an
+            # ordinary direct PR and may proceed without a staged marker.
+            child_info = None
+        if child_info is not None:
+            child_body = child_info.get("body")
+            if child_body is not None and not isinstance(child_body, str):
                 raise AgentLoopError(
-                    f"PR #{pr} has a staged phase identity but no matching parent phase handoff; "
-                    "repair the decomposition provenance before reviewing."
+                    f"GitHub returned a malformed body for issue #{issue_number}; "
+                    "cannot validate staged-parent provenance."
                 )
-            expected_hash = plan_hash
-            context = recover_approved_plan_context(
-                parent_comments,
-                expected_hash=expected_hash,
+            if isinstance(child_body, str):
+                child_bodies.append(child_body)
+
+    phase_matches = [
+        match
+        for body in child_bodies
+        for match in PHASE_IDENTITY_MARKER_RE.finditer(body)
+    ]
+    split_matches = [
+        match
+        for body in child_bodies
+        for match in SPLIT_CHILD_MARKER_RE.finditer(body)
+    ]
+    if phase_matches and split_matches:
+        raise AgentLoopError(
+            f"PR #{pr} child issue #{issue_number} carries both decomposition and split "
+            "staged-parent identities; repair the child issue provenance before reviewing."
+        )
+
+    if phase_matches:
+        phase_payloads = [
+            _decode_json_payload(
+                match.group("payload"),
+                marker_name="AGENT_PLAN_PHASE_IDENTITY",
             )
-            if not context.is_available:
+            for match in phase_matches
+        ]
+        if any(payload != phase_payloads[0] for payload in phase_payloads[1:]):
+            raise AgentLoopError(
+                f"PR #{pr} child issue #{issue_number} carries conflicting staged phase "
+                "identities; repair the child issue provenance before reviewing."
+            )
+        payload = phase_payloads[0]
+        parent_issue = payload.get("parent_issue")
+        plan_hash = payload.get("plan_hash")
+        stage_id = payload.get("stage_id")
+        source = payload.get("source")
+        identity = payload.get("identity")
+        if (
+            not isinstance(parent_issue, int)
+            or isinstance(parent_issue, bool)
+            or not isinstance(plan_hash, str)
+            or not plan_hash.strip()
+            or not isinstance(stage_id, int)
+            or isinstance(stage_id, bool)
+            or not isinstance(source, str)
+            or not source.strip()
+            or not isinstance(identity, str)
+            or not identity.strip()
+        ):
+            raise AgentLoopError(
+                f"PR #{pr} has an invalid staged phase identity; repair the child issue handoff."
+            )
+        if expected_hash is not None and expected_hash != plan_hash:
+            raise AgentLoopError(
+                f"PR #{pr} child issue handoff has plan hash {expected_hash}, but its "
+                f"staged phase identity names {plan_hash}; repair the handoff provenance."
+            )
+
+        parent_comments = [
+            types.SimpleNamespace(body=body)
+            for body in _fetch_issue_comments_raw(repo, parent_issue)
+        ]
+        matching_mode: str | None = None
+        matching_checkpoint = None
+        for mode in ("decompose-only", "implement-by-phase"):
+            checkpoint = find_existing_topology_checkpoint(
+                parent_comments,
+                parent_issue=parent_issue,
+                plan_hash=plan_hash,
+                mode=mode,
+            )
+            if checkpoint is None:
+                continue
+            if not 1 <= stage_id <= len(checkpoint.phases):
                 raise AgentLoopError(
-                    f"PR #{pr} is bound to approved plan {expected_hash}, but the canonical "
-                    f"parent plan could not be recovered: "
-                    f"{context.diagnostic or 'no diagnostic available'}."
+                    f"PR #{pr} references staged phase {stage_id}, but the matching "
+                    "parent topology has no such phase."
                 )
-            return context
+            expected_identity = phase_identity(
+                parent_issue=parent_issue,
+                plan_hash=plan_hash,
+                topology_source=checkpoint.topology_source,
+                phase_index=stage_id,
+                phase=checkpoint.phases[stage_id - 1],
+            )
+            if source != checkpoint.topology_source or identity != expected_identity:
+                raise AgentLoopError(
+                    f"PR #{pr} staged phase identity does not match the authoritative parent topology."
+                )
+            phase_handoff = find_existing_phase_implementation_handoff(
+                parent_comments,
+                parent_issue=parent_issue,
+                plan_hash=plan_hash,
+                mode=mode,
+                phase_index=stage_id,
+                child_issue_number=issue_number,
+            )
+            if phase_handoff is None:
+                continue
+            phase = checkpoint.phases[stage_id - 1]
+            if (
+                phase_handoff.phase_title != phase.title
+                or phase_handoff.automation != phase.automation
+            ):
+                raise AgentLoopError(
+                    f"PR #{pr} staged phase handoff disagrees with the authoritative parent topology."
+                )
+            matching_mode = mode
+            matching_checkpoint = checkpoint
+            break
+        if matching_mode is None or matching_checkpoint is None:
+            raise AgentLoopError(
+                f"PR #{pr} has a staged phase identity but no matching parent phase handoff; "
+                "repair the decomposition provenance before reviewing."
+            )
+        context = recover_approved_plan_context(
+            parent_comments,
+            expected_hash=plan_hash,
+            expected_subject=expected_subject,
+        )
+        if not context.is_available:
+            raise AgentLoopError(
+                f"PR #{pr} is bound to approved plan {plan_hash}, but the canonical "
+                f"parent plan could not be recovered: "
+                f"{context.diagnostic or 'no diagnostic available'}."
+            )
+        return context
+
+    if split_matches:
+        split_parents = {int(match.group("parent")) for match in split_matches}
+        split_keys = {match.group("key").lower() for match in split_matches}
+        if len(split_parents) != 1 or len(split_keys) != 1:
+            raise AgentLoopError(
+                f"PR #{pr} child issue #{issue_number} carries conflicting split-child "
+                "identities; repair the child issue provenance before reviewing."
+            )
+        parent_issue = next(iter(split_parents))
+        split_key = next(iter(split_keys))
+        parent_comments = [
+            types.SimpleNamespace(body=body)
+            for body in _fetch_issue_comments_raw(repo, parent_issue)
+        ]
+        materialized = find_existing_split_materialization(
+            parent_comments,
+            parent_issue=parent_issue,
+        )
+        if materialized is None:
+            raise AgentLoopError(
+                f"PR #{pr} split child issue #{issue_number} has no matching materialized "
+                f"split topology on parent issue #{parent_issue}; repair the staged-parent "
+                "provenance before reviewing."
+            )
+        materialized_child = [
+            child for child in materialized.children if child.number == issue_number
+        ]
+        if len(materialized_child) != 1 or materialized_child[0].key.lower() != split_key:
+            raise AgentLoopError(
+                f"PR #{pr} split child issue #{issue_number} does not match the authoritative "
+                f"materialized stage on parent issue #{parent_issue}; repair the staged-parent "
+                "provenance before reviewing."
+            )
+
+        if expected_hash is None:
+            candidate_hashes: set[str] = set()
+            for comment in parent_comments:
+                for match in SPLIT_STAGE_HANDOFF_MARKER_RE.finditer(comment.body):
+                    handoff = _decode_stage_handoff_metadata(match.group("payload"))
+                    if (
+                        handoff.parent_issue == parent_issue
+                        and handoff.child_issue_number == issue_number
+                    ):
+                        candidate_hashes.add(handoff.plan_hash)
+            if len(candidate_hashes) != 1:
+                raise AgentLoopError(
+                    f"PR #{pr} split child issue #{issue_number} has a missing or ambiguous "
+                    "approved-plan stage handoff on its parent; repair the handoff before reviewing."
+                )
+            expected_hash = next(iter(candidate_hashes))
+
+        stage_handoff = find_existing_split_stage_handoff(
+            parent_comments,
+            parent_issue=parent_issue,
+            plan_hash=expected_hash,
+        )
+        if stage_handoff is None or stage_handoff.child_issue_number != issue_number:
+            raise AgentLoopError(
+                f"PR #{pr} split child issue #{issue_number} has no matching parent stage "
+                f"handoff for approved plan {expected_hash}; repair the staged-parent "
+                "provenance before reviewing."
+            )
+        context = recover_approved_plan_context(
+            parent_comments,
+            expected_hash=expected_hash,
+            expected_subject=expected_subject,
+        )
+        if not context.is_available:
+            raise AgentLoopError(
+                f"PR #{pr} is bound to approved plan {expected_hash}, but the canonical "
+                f"parent plan could not be recovered: "
+                f"{context.diagnostic or 'no diagnostic available'}."
+            )
+        return context
 
     if expected_hash is None:
         if (

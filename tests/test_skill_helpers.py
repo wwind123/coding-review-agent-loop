@@ -1836,6 +1836,229 @@ class TestSkillApprovedPlanRecovery:
         assert context is not None and context.is_available
         assert context.canonical_text == plan
 
+    @pytest.mark.parametrize("fault", [None, "missing_handoff", "wrong_identity", "missing_plan"])
+    def test_decomposition_child_handoff_recovers_plan_from_parent(self, monkeypatch, fault) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.decomposition import (
+            CreatedPhaseIssue,
+            PlanPhase,
+            TopologyCheckpoint,
+            approved_plan_hash,
+            format_phase_issue_body,
+            format_phase_implementation_handoff_comment,
+            format_topology_checkpoint,
+            phase_identity,
+        )
+        from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+        from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+        from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+
+        plan = "Approved parent plan.\n\n## Scope\n- Preserve the complete contract."
+        phase = PlanPhase(
+            title="Schema helpers",
+            scope="Add the child implementation.",
+            non_goals="No unrelated changes.",
+            dependency_notes="No dependencies.",
+            rollout_risk="low.",
+            validation="Run focused tests.",
+            parent_context="Approved parent-plan excerpt.",
+            automation="agent-pr",
+            depends_on=(),
+        )
+        plan_hash = approved_plan_hash(plan)
+        child = CreatedPhaseIssue(
+            phase=phase,
+            issue_url="https://github.com/owner/repo/issues/99",
+            issue_number=99,
+        )
+        identity = phase_identity(
+            parent_issue=56,
+            plan_hash=plan_hash,
+            topology_source="model",
+            phase_index=1,
+            phase=phase,
+        )
+        child_body = format_phase_issue_body(
+            repo="owner/repo",
+            parent_issue=56,
+            approved_plan=plan,
+            phase=phase,
+            created_so_far=(),
+            phase_identity_value=identity,
+            topology_source="model",
+            phase_index=1,
+            phase_plan_hash=plan_hash,
+        )
+        parent_comments = [
+            _attach_round_metadata(
+                plan,
+                PostedRoundMetadata(
+                    flow="plan",
+                    role="coder",
+                    agent="Claude",
+                    round_number=1,
+                    subject=_plan_subject(plan),
+                    canonical_plan=plan,
+                    raw_structured_coder_response=plan,
+                ),
+            ),
+            format_topology_checkpoint(
+                TopologyCheckpoint(
+                    parent_issue=56,
+                    plan_hash=plan_hash,
+                    mode="implement-by-phase",
+                    topology_source="model",
+                    phases=(phase,),
+                )
+            ),
+            format_phase_implementation_handoff_comment(
+                parent_issue=56,
+                mode="implement-by-phase",
+                plan_hash=plan_hash,
+                phase_index=1,
+                created=child,
+            ),
+        ]
+        child_comments = [
+            format_issue_pr_handoff_comment(
+                issue_number=99,
+                pr_number=7,
+                pr_url="https://github.com/owner/repo/pull/7",
+                pr_head_sha="head-7",
+                flow="approved-plan-implementation",
+                plan_hash=plan_hash,
+            )
+        ]
+        if fault == "missing_handoff":
+            parent_comments.pop()
+        elif fault == "wrong_identity":
+            child_body = format_phase_issue_body(
+                repo="owner/repo", parent_issue=56, approved_plan=plan, phase=phase,
+                created_so_far=(), phase_identity_value="wrong-identity",
+                topology_source="model", phase_index=1, phase_plan_hash=plan_hash,
+            )
+        elif fault == "missing_plan":
+            parent_comments.pop(0)
+        monkeypatch.setattr(
+            sr,
+            "_fetch_issue_comments_raw",
+            lambda repo, issue: child_comments if issue == 99 else parent_comments,
+        )
+        monkeypatch.setattr(sr, "_fetch_issue_json", lambda repo, issue: {"body": child_body})
+        contract = make_pr_contract(
+            repository="owner/repo",
+            pr_number=7,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=99,
+            expected_closing_issue_ids=(99,),
+        )
+
+        pr_info = {"body": "Fixes #99", "comments": [{"body": format_pr_contract_comment(contract)}]}
+        if fault:
+            from coding_review_agent_loop.errors import AgentLoopError
+            with pytest.raises(AgentLoopError, match="parent|topology"):
+                sr._recover_skill_pr_plan_context("owner/repo", 7, pr_info)
+            return
+        context = sr._recover_skill_pr_plan_context("owner/repo", 7, pr_info)
+
+        assert context is not None and context.is_available
+        assert context.canonical_text == plan
+        assert context.plan_hash == plan_hash
+
+    @pytest.mark.parametrize("fault", [None, "missing_handoff", "wrong_key", "missing_plan", "missing_topology"])
+    def test_materialized_split_child_handoff_recovers_plan_from_parent(self, monkeypatch, fault) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+        from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+        from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+        from coding_review_agent_loop.split_materialization import (
+            MaterializedSplitChild,
+            SplitMaterializationMetadata,
+            format_split_materialization_summary,
+            format_split_stage_handoff_comment,
+            split_stage_proposal_from_text,
+        )
+
+        plan = "Approved split parent plan.\n\n## Scope\n- Preserve the selected stage contract."
+        from coding_review_agent_loop.decomposition import approved_plan_hash
+
+        plan_hash = approved_plan_hash(plan)
+        proposal = split_stage_proposal_from_text("Schema helpers")
+        child = MaterializedSplitChild(
+            title="Schema helpers",
+            key=proposal.key,
+            url="https://github.com/owner/repo/issues/99",
+            number=99,
+            origin="created",
+        )
+        metadata = SplitMaterializationMetadata(
+            parent_issue=56,
+            subject="Parent split",
+            children=(child,),
+            selected_stage=None,
+        )
+        parent_comments = [
+            _attach_round_metadata(
+                plan,
+                PostedRoundMetadata(
+                    flow="plan",
+                    role="coder",
+                    agent="Claude",
+                    round_number=1,
+                    subject=_plan_subject(plan),
+                    canonical_plan=plan,
+                    raw_structured_coder_response=plan,
+                ),
+            ),
+            format_split_materialization_summary(parent_issue=56, metadata=metadata),
+            format_split_stage_handoff_comment(parent_issue=56, plan_hash=plan_hash, child=child),
+        ]
+        child_comments = [
+            format_issue_pr_handoff_comment(
+                issue_number=99,
+                pr_number=7,
+                pr_url="https://github.com/owner/repo/pull/7",
+                pr_head_sha="head-7",
+                flow="approved-plan-implementation",
+                plan_hash=plan_hash,
+            )
+        ]
+        child_body = f"Part of #56\n<!-- AGENT_SPLIT_CHILD: parent=56 key={proposal.key} -->"
+        if fault == "missing_handoff":
+            parent_comments.pop()
+        elif fault == "wrong_key":
+            other = split_stage_proposal_from_text("Different stage")
+            child_body = f"Part of #56\n<!-- AGENT_SPLIT_CHILD: parent=56 key={other.key} -->"
+        elif fault == "missing_plan":
+            parent_comments.pop(0)
+        elif fault == "missing_topology":
+            parent_comments.pop(1)
+        monkeypatch.setattr(
+            sr,
+            "_fetch_issue_comments_raw",
+            lambda repo, issue: child_comments if issue == 99 else parent_comments,
+        )
+        monkeypatch.setattr(sr, "_fetch_issue_json", lambda repo, issue: {"body": child_body})
+        contract = make_pr_contract(
+            repository="owner/repo",
+            pr_number=7,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=99,
+            expected_closing_issue_ids=(99,),
+        )
+
+        pr_info = {"body": "Fixes #99", "comments": [{"body": format_pr_contract_comment(contract)}]}
+        if fault:
+            from coding_review_agent_loop.errors import AgentLoopError
+            with pytest.raises(AgentLoopError, match="parent|topology"):
+                sr._recover_skill_pr_plan_context("owner/repo", 7, pr_info)
+            return
+        context = sr._recover_skill_pr_plan_context("owner/repo", 7, pr_info)
+
+        assert context is not None and context.is_available
+        assert context.canonical_text == plan
+        assert context.plan_hash == plan_hash
+
     def test_plan_bound_recovery_reports_issue_comment_read_failure(self, monkeypatch) -> None:
         import helpers.skill_runner as sr
         from coding_review_agent_loop.errors import AgentLoopError
