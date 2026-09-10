@@ -144,6 +144,7 @@ from coding_review_agent_loop.round_state import (
     _deserialize_disposition,
     _deserialize_unresolved_item,
     _plan_subject,
+    make_approved_plan_context,
     recover_approved_plan_context,
     _serialize_unresolved_item,
     _serialize_disposition,
@@ -2330,24 +2331,46 @@ def _write_host_review_request(
     request_dir.mkdir(parents=True, exist_ok=True)
     _write_text(request_dir / material_filename, review_material)
     _write_json(request_dir / "prior_items.json", next_prior_items_raw)
-    _write_json(request_dir / "context.json", {
+    stale_plan_file = request_dir / "approved-plan.md"
+    approved_plan_file: str | None = None
+    approved_plan_metadata: dict[str, object] | None = None
+    if approved_plan_context is not None:
+        if not approved_plan_context.is_available:
+            raise AgentLoopError(
+                "Cannot create a host review handoff with unavailable approved-plan "
+                f"context: {approved_plan_context.diagnostic or 'unknown recovery error'}."
+            )
+        # Keep the canonical plan in its own lossless artifact. The manifest and
+        # context carry its identity and declarations so the host can validate the
+        # artifact before completing the review instead of relying on the PR diff.
+        approved_plan_file = "approved-plan.md"
+        _write_text(
+            stale_plan_file,
+            f"{approved_plan_context.canonical_text or ''}\n",
+        )
+        approved_plan_metadata = {
+            "file": approved_plan_file,
+            "hash": approved_plan_context.plan_hash,
+            "subject": approved_plan_context.plan_subject,
+            "scope": list(approved_plan_context.scope),
+            "deferred_work": list(approved_plan_context.deferred_work),
+        }
+    else:
+        # The request directory is reused across retries. Do not leave an older
+        # plan artifact that could make an ordinary direct-PR handoff appear
+        # plan-bound.
+        try:
+            stale_plan_file.unlink()
+        except FileNotFoundError:
+            pass
+    context_payload: dict[str, object] = {
         "reviewer": "Claude",
         "prior_items": next_prior_items_raw,
         "current_round_items": current_round_items,
-    })
-    approved_plan_file: str | None = None
-    if approved_plan_context is not None and approved_plan_context.is_available:
-        # The host reviewer is a manual handoff rather than a shared prompt
-        # builder. Preserve the complete canonical text in a separate file so
-        # the request cannot degrade to diff-only context.
-        approved_plan_file = "approved-plan.md"
-        _write_text(
-            request_dir / approved_plan_file,
-            "Approved implementation plan context (PR-bound)\n"
-            f"Plan hash: {approved_plan_context.plan_hash or '(unavailable)'}\n"
-            f"Plan subject: {approved_plan_context.plan_subject or '(unavailable)'}\n\n"
-            f"{approved_plan_context.canonical_text or ''}\n",
-        )
+    }
+    if approved_plan_metadata is not None:
+        context_payload["approved_plan"] = approved_plan_metadata
+    _write_json(request_dir / "context.json", context_payload)
     manifest = {
         "role": "reviewer",
         "agent": "claude", "agent_cap": "Claude", "flow": flow,
@@ -2360,8 +2383,53 @@ def _write_host_review_request(
     if approved_plan_file is not None:
         manifest["approved_plan_file"] = approved_plan_file
         manifest["approved_plan_hash"] = approved_plan_context.plan_hash
+        manifest["approved_plan_subject"] = approved_plan_context.plan_subject
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return request_dir
+
+
+def _validate_host_review_plan_artifact(
+    request_dir: Path,
+    manifest: dict,
+) -> ApprovedPlanContext | None:
+    """Validate the lossless plan artifact before completing a host PR review."""
+    expected_hash = manifest.get("approved_plan_hash")
+    if expected_hash is None:
+        return None
+    if not isinstance(expected_hash, str) or not expected_hash.strip():
+        raise AgentLoopError(
+            "Host review handoff has an invalid approved-plan hash; regenerate the handoff."
+        )
+    plan_file = manifest.get("approved_plan_file")
+    if not isinstance(plan_file, str) or not plan_file.strip():
+        raise AgentLoopError(
+            "Host review handoff has a plan hash but no approved-plan file; regenerate the handoff."
+        )
+    request_root = request_dir.resolve()
+    plan_path = (request_dir / plan_file).resolve()
+    if request_root not in plan_path.parents:
+        raise AgentLoopError(
+            "Host review handoff approved-plan file must remain inside its request directory."
+        )
+    try:
+        plan_text = plan_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AgentLoopError(
+            f"Host review handoff is missing its approved plan artifact: {plan_path}."
+        ) from exc
+    expected_subject = manifest.get("approved_plan_subject")
+    context = make_approved_plan_context(
+        plan_text,
+        expected_hash=expected_hash,
+        expected_subject=expected_subject if isinstance(expected_subject, str) else None,
+        source_locator=str(plan_path),
+    )
+    if not context.is_available:
+        raise AgentLoopError(
+            "Host review handoff approved-plan artifact failed identity validation: "
+            f"{context.diagnostic or 'unknown validation error'}. Regenerate the handoff."
+        )
+    return context
 
 
 # ---------------------------------------------------------------------------
@@ -2794,6 +2862,12 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
                 )
             except Exception as exc:  # noqa: BLE001
+                if approved_plan_context is not None:
+                    raise AgentLoopError(
+                        "skill-mode PR reviewer prompt construction failed after recovering "
+                        "a bound approved plan; refusing to fall back to diff-only context: "
+                        f"{exc}"
+                    ) from exc
                 prompt_text = (
                     f"Review the following PR #{pr} in {repo}.\n\n"
                     f"Round: {new_round_number}\n\n"
@@ -2859,7 +2933,9 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
         print(
-            f"skill_runner: host review pending — read the PR diff in {request_dir}/pr-diff.diff, "
+            f"skill_runner: host review pending — read the PR-bound approved plan in "
+            f"{request_dir}/approved-plan.md when present, then read the PR diff in "
+            f"{request_dir}/pr-diff.diff, "
             f"write your pr_review JSON to {request_dir}/host-review.md, then run: "
             f"python -m helpers.skill_runner complete-host-review --dir {request_dir}{dry_run_flag}",
             file=sys.stderr,
@@ -3068,6 +3144,7 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
     new_round_number = manifest["new_round_number"]
     dry_run          = args.dry_run
     prior_items_raw  = json.loads((request_dir / "prior_items.json").read_text(encoding="utf-8"))
+    _validate_host_review_plan_artifact(request_dir, manifest)
 
     try:
         result = _complete_reviewer_turn(

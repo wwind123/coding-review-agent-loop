@@ -213,6 +213,9 @@ def build_review_prompt_for_skill(
             instructs the reviewer to surface future follow-ups so they can be
             published on approval (#300).
         memory: Repo-scoped agent memory to include for reviewer orientation (#306).
+        approved_plan_context: Validated, PR-bound approved-plan context. This is
+            independent of the bounded issue/comment history and is included in
+            both full and compact review prompts.
     """
     from coding_review_agent_loop.github import PullRequestMetadata
 
@@ -265,7 +268,11 @@ def build_pr_fix_prompt_for_skill(
     approved_plan_context: ApprovedPlanContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
-    """Build the external-coder PR-fix prompt from skill-mode ledger items."""
+    """Build the external-coder PR-fix prompt from skill-mode ledger items.
+
+    ``approved_plan_context`` remains separate from the lossy review ledger so
+    follow-up coders retain the exact handoff-bound scope and deferred work.
+    """
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,

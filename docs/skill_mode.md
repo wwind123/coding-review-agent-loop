@@ -113,6 +113,12 @@ mirroring the CLI's `--coder` / `--reviewer` reversal — so an external agent
   `pending`. The host reads the posted plan/PR, writes its structured review
   there, and finalizes it with `complete-host-review --dir <dir>` (works for both
   plan and PR rounds); re-running the round then recomputes the final state.
+  For a plan-bound PR, the request dir contains the complete canonical
+  `approved-plan.md` plus its hash, subject, scope, and deferred-work metadata;
+  read that artifact alongside `pr-diff.diff`. `complete-host-review` validates
+  the artifact identity before posting the review, so a changed or missing plan
+  is an actionable handoff error rather than a diff-only review. Direct PRs with
+  no planning provenance have no plan artifact.
 - **Implement, reversed**: after a plan is approved, an external coder emits the
   typed `issue_implementation` result and may open a PR — see [Approved-plan
   execution helpers](#approved-plan-execution-helpers) — which the host then

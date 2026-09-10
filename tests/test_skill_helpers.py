@@ -2795,8 +2795,41 @@ class TestHostReviewerPR:
         assert (request_dir / "approved-plan.md").read_text(encoding="utf-8").endswith(
             plan + "\n"
         )
+        assert (request_dir / "approved-plan.md").read_text(encoding="utf-8") == plan + "\n"
         manifest = json.loads((request_dir / "manifest.json").read_text(encoding="utf-8"))
         assert manifest["approved_plan_file"] == "approved-plan.md"
+        assert manifest["approved_plan_hash"] == make_approved_plan_context(plan).plan_hash
+        context = json.loads((request_dir / "context.json").read_text(encoding="utf-8"))
+        assert context["approved_plan"]["file"] == "approved-plan.md"
+        assert context["approved_plan"]["deferred_work"] == ["- Keep the migration deferred."]
+
+    def test_host_handoff_rejects_changed_approved_plan_artifact(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.round_state import make_approved_plan_context
+
+        monkeypatch.setattr(sr, "_REPAIR_BASE", tmp_path)
+        plan = "Approved host-review plan.\n\n### Scope\n- Keep the API."
+        request_dir = sr._write_host_review_request(
+            flow="pr",
+            validate_kind="pr_review",
+            issue=7,
+            repo="owner/repo",
+            new_round_number=1,
+            round_subject="head-7",
+            review_material="diff --git a/x b/x",
+            material_filename="pr-diff.diff",
+            next_prior_items_raw=[],
+            current_round_items=[],
+            item_id_offset=0,
+            dry_run=True,
+            approved_plan_context=make_approved_plan_context(plan),
+        )
+        (request_dir / "approved-plan.md").write_text("Unrelated plan\n", encoding="utf-8")
+        manifest = json.loads((request_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        with pytest.raises(AgentLoopError, match="identity validation"):
+            sr._validate_host_review_plan_artifact(request_dir, manifest)
 
     def test_pr_round_with_claude_reviewer_is_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
