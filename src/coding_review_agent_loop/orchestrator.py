@@ -240,6 +240,7 @@ from .protocol import (
     parse_plan_review_items,
     parse_plan_state,
     parse_structured_plan_review,
+    parse_structured_pr_review,
     parse_pr_number,
     review_freeform_summary_text,
     normalize_response_file_structured_text,
@@ -8470,14 +8471,22 @@ def run_pr_loop(
                 resumed_record = resumed_by_name.get(reviewer_name)
                 carried_approval_record: PostedRoundRecord | None = None
                 if resumed_record is not None:
-                    review_output = resumed_record.metadata.canonical_reviewer_response or resumed_record.body
+                    canonical_review_output = resumed_record.metadata.canonical_reviewer_response
+                    review_output = canonical_review_output or resumed_record.body
                     review_model_used = resumed_record.metadata.model_used
                     review_acquisition_outcome = resumed_record.metadata.acquisition_outcome
                     review_acquisition_returncode = resumed_record.metadata.acquisition_returncode
-                    reparsed_review = parse_review(review_output, reviewer=reviewer_name)
+                    structured_review = (
+                        parse_structured_pr_review(review_output, reviewer=reviewer_name)
+                        if canonical_review_output is not None
+                        else None
+                    )
+                    reparsed_review = structured_review or parse_review(
+                        review_output, reviewer=reviewer_name
+                    )
                     parsed_review = ParsedReview(
                         state=resumed_record.metadata.state or parse_agent_state(review_output),
-                        summary=review_freeform_summary_text(review_output),
+                        summary=reparsed_review.summary,
                         blocking_items=reparsed_review.blocking_items,
                         followups=reparsed_review.followups,
                         dispositions=resumed_record.metadata.dispositions,
