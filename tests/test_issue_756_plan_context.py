@@ -1,6 +1,10 @@
 from dataclasses import replace
 
 from agent_loop_helpers import make_config
+from coding_review_agent_loop.orchestrator import (
+    _reviewer_requirement_coverage_matches,
+    _reviewer_requirement_identity_ids,
+)
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
     IssueComment,
@@ -62,6 +66,20 @@ def test_signed_requirement_ids_survive_insertion_and_body_edits():
     # remain positional so transcripts from older runs can resume.
     assert "Requirement 1:" in format_human_requirements((first, inserted))
     assert "Requirement 1:" in format_human_requirements((inserted, first))
+
+
+def test_reviewer_coverage_uses_digest_identity_and_rejects_legacy_labels():
+    original = _requirement(
+        body="Keep the public API stable.",
+        created_at="2026-01-01T00:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/1#issuecomment-1",
+    )
+    edited = replace(original, body="Change the public API.")
+
+    assert _reviewer_requirement_identity_ids((original,)) == (original.requirement_id,)
+    assert _reviewer_requirement_coverage_matches((original,), (original.requirement_id,))
+    assert not _reviewer_requirement_coverage_matches((edited,), (original.requirement_id,))
+    assert not _reviewer_requirement_coverage_matches((original,), ("Requirement 1",))
 
 
 def test_legacy_positional_acknowledgement_remains_resumable():

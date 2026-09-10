@@ -3702,6 +3702,38 @@ def _surfaced_reviewer_requirement_ids(
     ).surfaced_requirement_ids
 
 
+def _reviewer_requirement_identity_ids(
+    human_requirements: Sequence[HumanReviewRequirement],
+) -> tuple[str, ...]:
+    """Return immutable identities for PR-review coverage metadata.
+
+    Reviewer prompts retain positional labels (``Requirement N``) for response
+    compatibility. Those labels are presentation-only and must not be used to
+    decide whether an approval covered the current signed instruction.
+    """
+    return tuple(requirement.requirement_id for requirement in human_requirements)
+
+
+def _reviewer_requirement_coverage_matches(
+    human_requirements: Sequence[HumanReviewRequirement],
+    persisted_ids: Sequence[str],
+) -> bool:
+    """Return whether persisted reviewer coverage applies to these requirements.
+
+    Metadata written before digest-backed identities were introduced contains
+    positional labels. It is intentionally treated as legacy and never carries
+    approval across a non-empty signed-requirement set; the reviewer must run
+    again once current identities are available.
+    """
+    expected_ids = set(_reviewer_requirement_identity_ids(human_requirements))
+    if not expected_ids:
+        return True
+    persisted = {str(item) for item in persisted_ids}
+    if any(not re.fullmatch(r"hr-[0-9a-f]{64}", item) for item in persisted):
+        return False
+    return expected_ids.issubset(persisted)
+
+
 def _validate_plan_revision_response(
     text: str,
     *,
@@ -8053,9 +8085,11 @@ def run_pr_loop(
                 if use_compact_pr_context
                 else None
             )
-            surfaced_reviewer_requirement_ids = _surfaced_reviewer_requirement_ids(
-                human_requirements,
-                requirement_scope="PR requirements",
+            # Persist digest identities, not the positional labels used in the
+            # reviewer prompt. The latter would let an edited signed comment
+            # inherit approval when its requirement count stayed unchanged.
+            surfaced_reviewer_requirement_ids = _reviewer_requirement_identity_ids(
+                human_requirements
             )
             approved_review_outputs: list[tuple[str, str]] = []
             resumed_by_name = {
@@ -8145,8 +8179,9 @@ def run_pr_loop(
                         not human_requirements
                         or (
                             human_requirements_resolved(prior_approval.body)
-                            and set(surfaced_reviewer_requirement_ids).issubset(
-                                prior_approval.metadata.surfaced_reviewer_requirement_ids
+                            and _reviewer_requirement_coverage_matches(
+                                human_requirements,
+                                prior_approval.metadata.surfaced_reviewer_requirement_ids,
                             )
                         )
                     )
@@ -8350,8 +8385,9 @@ def run_pr_loop(
                         not human_requirements
                         or (
                             human_requirements_resolved(prior_approval.body)
-                            and set(surfaced_reviewer_requirement_ids).issubset(
-                                prior_approval.metadata.surfaced_reviewer_requirement_ids
+                            and _reviewer_requirement_coverage_matches(
+                                human_requirements,
+                                prior_approval.metadata.surfaced_reviewer_requirement_ids,
                             )
                         )
                     )

@@ -3046,8 +3046,35 @@ def test_pr_loop_skips_prior_approval_when_pr_head_is_unchanged(tmp_path):
     assert "round 1" in codex_reviews[0][-1]
 
 
-def test_pr_loop_rereviews_unchanged_head_when_new_human_requirement_is_surfaced(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    (
+        "second_requirement_body",
+        "second_requirement_created_at",
+        "second_requirement_url",
+        "expected_second_prompt_text",
+    ),
+    [
+        (
+            "Also preserve the reviewer attribution.",
+            "2026-05-18T10:10:00Z",
+            "https://github.com/OWNER/REPO/pull/77#issuecomment-2",
+            "Requirement 2",
+        ),
+        (
+            "The edited instruction changes the required audit trail.",
+            "2026-05-18T10:00:00Z",
+            "https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+            "The edited instruction changes the required audit trail.",
+        ),
+    ],
+)
+def test_pr_loop_rereviews_unchanged_head_when_human_requirement_changes(
+    tmp_path,
+    monkeypatch,
+    second_requirement_body,
+    second_requirement_created_at,
+    second_requirement_url,
+    expected_second_prompt_text,
 ):
     requirement_1 = HumanReviewRequirement(
         source_type="PR comment",
@@ -3059,9 +3086,9 @@ def test_pr_loop_rereviews_unchanged_head_when_new_human_requirement_is_surfaced
     requirement_2 = HumanReviewRequirement(
         source_type="PR comment",
         author="maintainer",
-        created_at="2026-05-18T10:10:00Z",
-        url="https://github.com/OWNER/REPO/pull/77#issuecomment-2",
-        body="Also preserve the reviewer attribution.",
+        created_at=second_requirement_created_at,
+        url=second_requirement_url,
+        body=second_requirement_body,
     )
     runner = FakeRunner(
         codex_outputs=[
@@ -3118,23 +3145,51 @@ def test_pr_loop_rereviews_unchanged_head_when_new_human_requirement_is_surfaced
         head_sha="abc123",
         url="https://github.com/OWNER/REPO/pull/77",
     )
-    contexts = iter(
-        [
-            PullRequestReviewContext(
-                metadata=metadata,
-                comments=(),
-                human_requirements=(requirement_1,),
-            ),
-            PullRequestReviewContext(
-                metadata=metadata,
-                comments=(),
-                human_requirements=(requirement_1, requirement_2),
-            ),
-        ]
+    prior_codex_review = _attach_round_metadata(
+        structured_pr_review(
+            state="approved",
+            summary="Codex approves the initial requirement.",
+            human_requirements_resolved=True,
+            reviewer="OpenAI Codex",
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="OpenAI Codex",
+            round_number=1,
+            subject="abc123",
+            state="approved",
+            surfaced_reviewer_requirement_ids=("Requirement 1",),
+        ),
     )
+    context_calls = 0
+
+    def next_context(*args, **kwargs):
+        nonlocal context_calls
+        context_calls += 1
+        return PullRequestReviewContext(
+            metadata=metadata,
+            comments=(
+                IssueComment(
+                    author="coding-review-agent-loop",
+                    created_at="2026-05-18T11:00:00Z",
+                    body=str(prior_codex_review),
+                ),
+            )
+            if context_calls > 1
+            else (),
+            human_requirements=(
+                (requirement_2,)
+                if second_requirement_url.endswith("issuecomment-1")
+                else (requirement_1, requirement_2)
+            )
+            if context_calls > 1
+            else (requirement_1,),
+        )
+
     monkeypatch.setattr(
         "coding_review_agent_loop.orchestrator.get_pr_review_context",
-        lambda *args, **kwargs: next(contexts),
+        next_context,
     )
     config = make_config(
         tmp_path,
@@ -3147,7 +3202,7 @@ def test_pr_loop_rereviews_unchanged_head_when_new_human_requirement_is_surfaced
 
     codex_reviews = [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
     assert len(codex_reviews) == 2
-    assert "Requirement 2" in codex_reviews[1][-1]
+    assert expected_second_prompt_text in codex_reviews[1][-1]
 
 
 def test_pr_loop_ignores_approved_followups_by_default(tmp_path):
