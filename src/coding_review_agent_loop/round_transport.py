@@ -30,6 +30,7 @@ _SPILL_FIELDS = (
     "analyzer_response",
     "final_analyzer_response",
     "raw_synthesis_response",
+    "local_test_evidence",
 )
 _MAX_COMPRESSED = 8_000_000
 _MAX_DECOMPRESSED = 16_000_000

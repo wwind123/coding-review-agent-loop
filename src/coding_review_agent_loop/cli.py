@@ -82,6 +82,7 @@ from .test_runtime import (
     record_test_observation,
     resolve_timeout_seconds,
 )
+from .local_test_evidence import broker_client_from_environment
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1091,6 +1092,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             policy = inherited_timeout_ceiling()
             chosen = resolve_timeout_seconds(args.timeout_seconds, policy_ceiling=policy)
+            broker = broker_client_from_environment()
+            if broker is not None:
+                broker_result = broker.run(raw_inner, timeout_seconds=chosen, cwd=Path.cwd())
+                # The receipt is the only durable citation handle exposed to
+                # the coder. The parent owns the observation journal.
+                print(
+                    f"agent-loop test observation receipt: {broker_result.receipt_id}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return int(broker_result.returncode if broker_result.returncode is not None else 1)
             containment_policy = policy_from_values(vars(args))
             result = run_foreground_test(
                 raw_inner,

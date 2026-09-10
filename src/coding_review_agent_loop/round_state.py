@@ -14,6 +14,7 @@ from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .errors import AgentLoopError
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, encode_mapping, hydrate_mapping
+from .local_test_evidence import canonicalize_bounded_evidence
 from .protocol_markers import TrustedBody, scan_reserved_markers
 from .workdir_guard import validate_checkout_inspected_evidence
 from .protocol import (
@@ -112,6 +113,9 @@ class PostedRoundMetadata:
     final_synthesis: str | None = None
     raw_synthesis_response: str | None = None
     synthesis_provenance: dict | None = None
+    # Canonical bounded local-test evidence. Raw environments and identity
+    # bytes are never persisted in this field.
+    local_test_evidence: str | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +219,7 @@ class ResumedReviewRound:
     unrecorded_head_advance: bool = False
     reconciled: bool = False
     coder_metadata: PostedRoundMetadata | None = None
+    local_test_evidence: str | None = None
 
 
 def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
@@ -305,6 +310,10 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "surfaced_reviewer_requirement_ids": list(metadata.surfaced_reviewer_requirement_ids),
         "phase": metadata.phase,
         "canonical_reviewer_response": metadata.canonical_reviewer_response,
+        "local_test_evidence": (
+            canonicalize_bounded_evidence(metadata.local_test_evidence)
+            if metadata.local_test_evidence is not None else None
+        ),
     }
     if metadata.result_mode == "answer":
         payload.update(
@@ -422,6 +431,9 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             canonical_reviewer_response=(
                 str(payload["canonical_reviewer_response"])
                 if payload.get("canonical_reviewer_response") is not None else None
+            ),
+            local_test_evidence=(
+                canonicalize_bounded_evidence(payload.get("local_test_evidence"))
             ),
             round_synthesis=(
                 str(payload["round_synthesis"])
@@ -738,6 +750,11 @@ def _recover_unrecorded_pr_head_advance(
         compact_prior_summaries=compact_prior_summaries,
         unrecorded_head_advance=True,
         coder_metadata=latest_coder_record.metadata if latest_coder_record else None,
+        local_test_evidence=(
+            latest_coder_record.metadata.local_test_evidence
+            if latest_coder_record is not None
+            else None
+        ),
     )
 
 
@@ -1074,6 +1091,11 @@ def _resume_pr_round(
             else ()
         ),
         reconciled=any(record.metadata.role == "summary" for record in current_round_records),
+        local_test_evidence=(
+            latest_coder_record.metadata.local_test_evidence
+            if latest_coder_record is not None
+            else None
+        ),
     )
 
 
@@ -1125,6 +1147,7 @@ def _resume_plan_round(
             ledger_may_be_incomplete=ledger_may_be_incomplete,
             compact_prior_summaries=latest_coder_record.metadata.compact_prior_summaries,
             reconciled=any(record.metadata.role == "summary" for record in current_round_records),
+            local_test_evidence=latest_coder_record.metadata.local_test_evidence,
         ),
     )
 

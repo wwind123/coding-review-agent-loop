@@ -49,6 +49,7 @@ from .test_runtime import (
     parse_managed_test_invocation,
     resolve_timeout_seconds,
 )
+from .local_test_evidence import redact_test_command
 
 if TYPE_CHECKING:
     from .agents.base import AgentName
@@ -115,6 +116,20 @@ def _render_test_commands_for_comment(
     commands: Sequence[str], *, config: AgentLoopConfig | None = None
 ) -> list[str]:
     return [_render_test_command_for_comment(command, config=config) for command in commands]
+
+
+def _render_test_observation_citations(citations: Sequence[object]) -> str:
+    """Render only bounded receipt references; the receipt remains advisory."""
+    lines = ["### Test observation receipts"]
+    for citation in citations:
+        command = getattr(citation, "command", "")
+        receipt_id = str(getattr(citation, "receipt_id", ""))
+        claim = str(getattr(citation, "claim", ""))
+        safe_command, _identifiers, _caveats = redact_test_command(command)
+        lines.append(
+            f"- `{safe_command}` — receipt `{receipt_id[:256]}` — `{claim}` (verify against local evidence and CI)"
+        )
+    return "\n".join(lines)
 
 
 def render_agent_unavailable_comment(unavailable: AgentUnavailable, *, signature: str) -> str:
@@ -728,6 +743,8 @@ def _render_public_coder_followup_comment(
                 ]]
             )
         )
+    if parsed_followup.test_observations:
+        sections.append(_render_test_observation_citations(parsed_followup.test_observations))
     if parsed_followup.human_requirement_dispositions:
         sections.append(
             "\n".join(
@@ -778,6 +795,8 @@ def _render_public_issue_implementation_comment(
                 ]]
             )
         )
+    if parsed.test_observations:
+        sections.append(_render_test_observation_citations(parsed.test_observations))
     human_section = render_human_requirement_dispositions(
         parsed.human_requirement_dispositions
     )

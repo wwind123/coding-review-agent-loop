@@ -219,6 +219,15 @@ HUMAN_REQUIREMENT_DISPOSITION_VALUES = frozenset(
 
 
 @dataclass(frozen=True)
+class TestObservationCitation:
+    """A coder-authored citation for a broker or parent test receipt."""
+
+    command: str
+    receipt_id: str
+    claim: str
+
+
+@dataclass(frozen=True)
 class StructuredCoderFollowup:
     schema_version: int
     kind: str
@@ -233,6 +242,7 @@ class StructuredCoderFollowup:
     disputed_items: tuple[str, ...] = ()
     dispute_evidence: dict[str, str] = field(default_factory=dict)
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
+    test_observations: tuple[TestObservationCitation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -247,6 +257,7 @@ class StructuredIssueImplementation:
     human_requirements: StructuredHumanRequirementsPayload
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...]
     tests_run: tuple[str, ...] | None = None
+    test_observations: tuple[TestObservationCitation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1066,6 +1077,35 @@ def _expect_string_list(
     if len(rendered) < min_length:
         raise AgentLoopError(f"{context} must contain at least {min_length} item(s).")
     return rendered
+
+
+def _expect_test_observations(
+    value: object, *, context: str
+) -> tuple[TestObservationCitation, ...]:
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    result: list[TestObservationCitation] = []
+    for index, item in enumerate(value):
+        item_context = f"{context}[{index}]"
+        payload = _expect_object(item, context=item_context)
+        _expect_exact_keys(
+            payload,
+            context=item_context,
+            required={"command", "receipt_id", "claim"},
+        )
+        claim = _expect_non_empty_string(payload["claim"], context=f"{item_context}.claim")
+        if claim not in {"current-result", "base-reproduction"}:
+            raise AgentLoopError(
+                f"{item_context}.claim must be `current-result` or `base-reproduction`."
+            )
+        result.append(
+            TestObservationCitation(
+                command=_expect_non_empty_string(payload["command"], context=f"{item_context}.command"),
+                receipt_id=_expect_non_empty_string(payload["receipt_id"], context=f"{item_context}.receipt_id"),
+                claim=claim,
+            )
+        )
+    return tuple(result)
 
 
 def _expect_optional_string_list(
@@ -1991,6 +2031,7 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
             "addressed_item_notes",
             "remaining_item_notes",
             "tests_run",
+            "test_observations",
             "disputed_items",
             "dispute_evidence",
         },
@@ -2017,6 +2058,10 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
         )
         if tests_run_value is not None
         else None
+    )
+    test_observations = _expect_test_observations(
+        payload.get("test_observations", []),
+        context="coder_followup.test_observations",
     )
     addressed_items = _expect_item_id_list(
         payload["addressed_items"],
@@ -2091,6 +2136,7 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
         tests_run=tests_run,
         disputed_items=disputed_items,
         dispute_evidence=dispute_evidence,
+        test_observations=test_observations,
     )
 
 
@@ -2123,7 +2169,7 @@ def validate_structured_issue_implementation(
             "human_requirements",
             "human_requirement_dispositions",
         },
-        optional={"tests_run"},
+        optional={"tests_run", "test_observations"},
     )
     state = _expect_non_empty_string(payload["state"], context="issue_implementation.state")
     if state != "blocking":
@@ -2162,6 +2208,10 @@ def validate_structured_issue_implementation(
         if tests_value is not None
         else None
     )
+    test_observations = _expect_test_observations(
+        payload.get("test_observations", []),
+        context="issue_implementation.test_observations",
+    )
     parsed = StructuredIssueImplementation(
         schema_version=1,
         kind="issue_implementation",
@@ -2180,6 +2230,7 @@ def validate_structured_issue_implementation(
         ),
         human_requirement_dispositions=dispositions,
         tests_run=tests_run,
+        test_observations=test_observations,
     )
     # Keep this semantic contradiction visible to callers as a dedicated error
     # with the typed payload attached.  The orchestration adapter first

@@ -268,6 +268,64 @@ descendants remain part of the host session and receive prompt guidance plus
 the managed wrapper when used. The aggregate is per user manager, not a
 cross-user host isolation boundary.
 
+### Local test evidence
+
+Coder and repair turns start an invocation-local test broker when the managed
+wrapper is available. The broker uses a fresh mode-0700 runtime directory and
+an authenticated Unix socket. Requests use the `local-test-broker-v1` schema
+with a bound turn ID, fresh nonce, argv, timeout, absolute cwd, and complete
+environment snapshot. Frames are capped at 128 KiB; argv is capped at 256
+entries/32 KiB total/8 KiB per entry, cwd at 4 KiB, and the environment at 256
+entries/64 KiB total/128 bytes per name/8 KiB per value. Invalid UTF-8, NULs,
+duplicate JSON keys, unknown fields, unsafe timeouts, bad capabilities, and
+replayed nonces with different requests are rejected. Raw requests,
+capabilities, and environments are not logged.
+
+The client snapshots its actual cwd and environment after startup. The broker
+removes exactly the control variables
+`AGENT_LOOP_TEST_BROKER_ENDPOINT`, `AGENT_LOOP_TEST_BROKER_CAPABILITY`,
+`AGENT_LOOP_TEST_BROKER_PROTOCOL`, and the other documented invocation
+metadata exclusions before launching the target, then supplies the
+authenticated `AGENT_LOOP_INVOCATION_ID`. All other variables, including
+`PATH`, virtual-environment, locale, inline-assignment, and test variables,
+remain comparison-bearing. Environment identity bytes are retained only in
+trusted memory within one orchestrator process. A restart therefore renders
+old observations `identity-unknown`; protected cross-process environment
+comparison is intentionally not supported by this same-user implementation.
+
+The broker pins the assigned checkout, opens a validated directory handle, and
+uses handle-based `fchdir` confinement. Traversal, outside paths, final
+symlinks, root replacement, and intermediate symlink escapes are context
+failures. Safe subdirectories and intermediate symlinks that remain inside
+the checkout are permitted. Managed process groups and cgroup handles are
+registered to the requesting turn for timeout, interruption, and teardown;
+containment-off mode still tears down the process group but makes no cgroup
+claim. Target output is streamed live, only the evidence copy is bounded, and
+the target exit code is preserved; wrapper statuses are reserved for
+infrastructure or context failures.
+
+Each observation records a typed outcome (`passed`, `failed`, `timed_out`,
+`interrupted`, `incomplete`, or overlap rejection), provenance, scope, opaque
+receipt/turn identities, and tracked-tree attribution. A later pass supersedes
+a failure only when it is parent-observed and has the same normalized command,
+scope, stable tracked tree, and live in-process environment. A passing subset,
+superset mismatch, changed head, environment difference, unknown identity,
+partial output, and unsupported or unverified baseline remain visible. Legacy
+`tests_run` entries are parsed with shell-aware tokenization and labeled
+self-reported/capture-limited; direct shell execution cannot claim complete
+capture. Base reproduction requires a clean, stable checkout at the base
+commit and never performs a dangerous checkout mutation or live-service test.
+
+Durable metadata contains only bounded, sanitized projections: at most 32
+detailed observations and 16 KiB, with unresolved failures retained longest.
+Paths, credentials, DSNs, environment-assignment values, unknown positional
+arguments, parametrized identifiers, ANSI/control data, and diagnostics are
+redacted or hashed before persistence. Oversized or failed journal/sidecar
+capture degrades to explicit incomplete-capture caveats. Evidence is advisory
+history for coders and reviewers, including same-head and changed-head resume;
+it cannot replace GitHub CI, override configured gates, or turn every
+historical intermediate failure into a permanent blocker.
+
 Fix a GitHub issue:
 
 ```bash

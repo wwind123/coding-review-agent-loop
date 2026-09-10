@@ -863,15 +863,17 @@ def _structured_coder_followup_guidance(
         '    "addressed_ids": [],',
         '    "checked_discussion_directly": false',
         "  },",
-        '  "tests_run": ["python -m pytest tests/test_agent_loop.py -k followup"]',
+        '  "tests_run": ["python -m pytest tests/test_agent_loop.py -k followup"],',
+        '  "test_observations": [{"command": "python -m pytest tests/test_agent_loop.py -k followup", "receipt_id": "<opaque receipt from agent-loop run-tests>", "claim": "current-result"}]',
         "}",
         "",
-        "Required structured fields: `schema_version`, `kind`, `state`, `summary`, `addressed_items`, `remaining_items`, `human_requirements`, and `human_requirement_dispositions`. `addressed_item_notes`, `remaining_item_notes`, `disputed_items`, `dispute_evidence`, and `tests_run` are optional.",
+        "Required structured fields: `schema_version`, `kind`, `state`, `summary`, `addressed_items`, `remaining_items`, `human_requirements`, and `human_requirement_dispositions`. `addressed_item_notes`, `remaining_item_notes`, `disputed_items`, `dispute_evidence`, `tests_run`, and `test_observations` are optional.",
         "Your response and public response file must start directly with `{`, contain exactly one top-level JSON object, and must not include stdout filtering markers, prose, headings, or code fences before or between the JSON and footer.",
         "After the JSON object, add exactly one footer `<!-- AGENT_STATE: approved|blocking -->`, then only your standalone signature. The JSON `state` must match the `AGENT_STATE` footer exactly.",
         "Use `addressed_items`, `remaining_items`, and `disputed_items` to classify every unresolved reviewer item ID shown in this prompt. Do not omit any listed reviewer item ID and do not list any item ID more than once.",
         "Use `addressed_item_notes` to summarize how each addressed item was resolved, and use `remaining_item_notes` to give a visible reason for each intentionally deferred remaining item.",
         "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) or when the reviewer requests a change that is mutually incompatible with a verified approved-plan decision and you have counter-evidence. For a plan conflict, `dispute_evidence` must name the conflicting approved decision, concrete counter-evidence, and why the requested change is incompatible. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`; never park a verified plan conflict in `remaining_items`, whose retry semantics would silently recycle it. Ordinary implementation defects and evidence-backed correctness, security, compatibility, or test defects must be fixed and classified as addressed or genuinely remaining, never disputed merely because the implementation followed the plan. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
+        "When you use the managed `agent-loop run-tests` wrapper, cite each returned opaque receipt in `test_observations` with the exact command and claim `current-result` or `base-reproduction`. A passing subset does not supersede a broader failed suite; leave both observations visible. Unknown, stale, cross-turn, or command-disagreeing receipts are rendered as unverified.",
         _agent_unavailable_guidance(coder_signature),
     ]
     if human_requirements_context.surfaced_requirement_ids:
@@ -947,6 +949,7 @@ def _structured_issue_implementation_guidance(
         },
         "human_requirement_dispositions": disposition_example,
         "tests_run": ["python -m pytest tests/test_protocol.py -q"],
+        "test_observations": [{"command": "python -m pytest tests/test_protocol.py -q", "receipt_id": "<opaque receipt from agent-loop run-tests>", "claim": "current-result"}],
     }
     return f"""Use this mandatory structured `issue_implementation` result so the orchestrator can validate the implementation deterministically:
 
@@ -959,6 +962,7 @@ Rules:
 - A created-PR result may not contain a `blocked` signed-requirement disposition. If a signed requirement is discovered to be blocked after a PR was opened, set `pr_number` to `null`, keep the real PR number or URL in the summary or disposition evidence so the operator can locate it, and describe the conflict.
 - A null-PR blocker unrelated to signed requirements is valid with the empty ledger required by the rules above.
 - `tests_run` is optional and may be absent, `null`, or an empty array when no tests ran. When supplied, it contains only exact command strings; report why tests could not run in `summary`.
+- `test_observations` is optional; when supplied, each entry must contain exactly `command`, `receipt_id`, and `claim`, where `claim` is `current-result` or `base-reproduction`. Cite only receipts printed by the managed wrapper and use the exact command. A legacy or direct-shell test report remains capture-limited.
 - Start directly with exactly one top-level JSON object. Put the `<!-- AGENT_STATE: blocking -->` footer immediately after it and only your standalone signature after the footer.
 
 The structured result is the public implementation record. Do not add prose,

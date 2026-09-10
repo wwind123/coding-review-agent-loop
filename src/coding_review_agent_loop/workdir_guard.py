@@ -1154,6 +1154,21 @@ def validate_test_commands_within_workdir(
         _validate_single_command(command, assigned=assigned, origin=origin)
 
 
+def validate_test_observation_citations_within_workdir(
+    citations: Sequence[object] | None,
+    *,
+    assigned_workdir: Path,
+) -> None:
+    """Apply the same checkout guard to structured receipt citations."""
+    if not citations:
+        return
+    commands = tuple(
+        str(getattr(citation, "command", ""))
+        for citation in citations
+    )
+    validate_test_commands_within_workdir(commands, assigned_workdir=assigned_workdir)
+
+
 def extract_reported_tests_from_response(text: str) -> tuple[str, ...]:
     """Return the coder's public test-report lines, avoiding quoted issue context."""
     lines = text.splitlines()

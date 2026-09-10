@@ -294,6 +294,7 @@ from .workdir_guard import (
     validate_checkout_inspected_evidence,
     validate_response_tests_within_workdir,
     validate_test_commands_within_workdir,
+    validate_test_observation_citations_within_workdir,
 )
 from .checks import (
     _ci_infrastructure_details,
@@ -4961,6 +4962,11 @@ def _implement_approved_issue(
             subject=str(initial_pr_context.metadata.head_sha or "unknown"),
             prior_items=(),
             raw_structured_coder_response=coder_output,
+            local_test_evidence=runner.render_local_test_evidence(
+                current_head=initial_pr_context.metadata.head_sha,
+                legacy_tests_run=implementation_result.tests_run,
+                cwd=active_workdir(implementation_config),
+            ),
             model_used=coder_response.model_used,
             **_metadata_identity_fields(coder_response),
             acquisition_outcome=coder_response.acquisition_outcome,
@@ -6774,6 +6780,10 @@ def run_issue_loop(
                 implementation_result.parsed.tests_run,
                 assigned_workdir=active_workdir(config),
             )
+            validate_test_observation_citations_within_workdir(
+                implementation_result.parsed.test_observations,
+                assigned_workdir=active_workdir(config),
+            )
             _post_structured_issue_implementation_terminal_comment(
                 runner,
                 config=config,
@@ -6791,6 +6801,10 @@ def run_issue_loop(
                     implementation_result.tests_run,
                     assigned_workdir=active_workdir(config),
                 )
+                validate_test_observation_citations_within_workdir(
+                    implementation_result.test_observations,
+                    assigned_workdir=active_workdir(config),
+                )
                 _post_structured_issue_implementation_terminal_comment(
                     runner,
                     config=config,
@@ -6806,6 +6820,10 @@ def run_issue_loop(
                 runner=runner,
                 config=config,
                 pr_number=implementation_result.pr_number,
+            )
+            validate_test_observation_citations_within_workdir(
+                implementation_result.test_observations,
+                assigned_workdir=active_workdir(config),
             )
             pr_number = implementation_result.pr_number
         else:
@@ -6918,6 +6936,11 @@ def run_issue_loop(
                 subject=str(initial_pr_metadata.head_sha or "unknown"),
                 prior_items=(),
                 raw_structured_coder_response=coder_output,
+                local_test_evidence=runner.render_local_test_evidence(
+                    current_head=initial_pr_metadata.head_sha,
+                    legacy_tests_run=implementation_result.tests_run,
+                    cwd=active_workdir(config),
+                ),
                 model_used=coder_response.model_used,
                 **_metadata_identity_fields(coder_response),
                 acquisition_outcome=coder_response.acquisition_outcome,
@@ -7116,7 +7139,11 @@ def _coder_followup_review_context(
         parsed = validate_structured_coder_followup(text)
     except AgentLoopError:
         parsed = None
-    payload: dict[str, object] = {"summary": summary, "tests_run": tests}
+    payload: dict[str, object] = {
+        "summary": summary,
+        "tests_run": tests,
+        "local_test_evidence": metadata.local_test_evidence,
+    }
     if isinstance(parsed, StructuredCoderFollowup):
         payload.update(
             addressed_items=parsed.addressed_items,
@@ -7125,6 +7152,14 @@ def _coder_followup_review_context(
             remaining_item_notes=parsed.remaining_item_notes,
             disputed_items=parsed.disputed_items,
             dispute_evidence=parsed.dispute_evidence,
+            test_observations=[
+                {
+                    "command": item.command,
+                    "receipt_id": item.receipt_id,
+                    "claim": item.claim,
+                }
+                for item in parsed.test_observations
+            ],
         )
     elif summary is None and tests is None:
         return "Latest coder explanation: no valid structured resolution details are available.\n"
@@ -9940,6 +9975,10 @@ def run_pr_loop(
                     coder_response.marker_value.tests_run,
                     assigned_workdir=active_workdir(config),
                 )
+                validate_test_observation_citations_within_workdir(
+                    coder_response.marker_value.test_observations,
+                    assigned_workdir=active_workdir(config),
+                )
                 raw_structured_coder_response = coder_output
                 if coder_response.marker_value.disputed_items:
                     unresolved_items = _apply_dispute_evidence(
@@ -9986,6 +10025,15 @@ def run_pr_loop(
                 subject=str(updated_pr_context.metadata.head_sha or "unknown"),
                 prior_items=tuple(unresolved_items),
                 raw_structured_coder_response=raw_structured_coder_response,
+                local_test_evidence=runner.render_local_test_evidence(
+                    current_head=updated_pr_context.metadata.head_sha,
+                    legacy_tests_run=(
+                        coder_response.marker_value.tests_run
+                        if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                        else None
+                    ),
+                    cwd=active_workdir(config),
+                ),
                 compact_prior_summaries=tuple(pr_compact_prior_summaries),
                 model_used=coder_response.model_used,
                 acquisition_outcome=coder_response.acquisition_outcome,

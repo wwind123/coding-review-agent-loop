@@ -274,6 +274,119 @@ class ContainmentPolicy:
         }
 
 
+@dataclass
+class ConfinedCwd:
+    """A handle-pinned directory inside an assigned checkout."""
+
+    root: Path
+    path: Path
+    fd: int
+    _root_fd: int = field(repr=False)
+
+    @classmethod
+    def open(cls, root: Path, requested: Path) -> "ConfinedCwd":
+        if (
+            os.name == "nt"
+            or not hasattr(os, "open")
+            or not hasattr(os, "fchdir")
+            or not hasattr(os, "O_NOFOLLOW")
+        ):
+            raise AgentLoopError("handle-pinned cwd confinement is unsupported on this platform")
+        if not requested.is_absolute():
+            raise AgentLoopError("broker cwd must be absolute")
+        try:
+            if root.is_symlink():
+                raise AgentLoopError("assigned checkout root may not be a symlink")
+            root_path = root.resolve(strict=True)
+            if not root_path.is_dir() or root_path.is_symlink():
+                raise AgentLoopError("assigned checkout root is not a pinned directory")
+            root_fd = os.open(
+                root_path,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | os.O_NOFOLLOW,
+            )
+            root_stat = os.fstat(root_fd)
+            requested_path = requested.resolve(strict=True)
+            if not requested_path.is_dir():
+                raise AgentLoopError("broker cwd is not an existing directory")
+            if os.path.commonpath((str(root_path), str(requested_path))) != str(root_path):
+                raise AgentLoopError("broker cwd is outside the assigned checkout")
+            if requested.is_symlink():
+                raise AgentLoopError("broker cwd may not be a final symlink")
+            relative = os.path.relpath(str(requested), str(root_path))
+            current_fd = os.dup(root_fd)
+            os.set_inheritable(current_fd, False)
+            if relative != ".":
+                for component in Path(relative).parts:
+                    if component in {"", "."}:
+                        continue
+                    if component == "..":
+                        raise AgentLoopError("broker cwd contains traversal")
+                    component_flags = (
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_CLOEXEC", 0)
+                    )
+                    if component == Path(relative).parts[-1]:
+                        component_flags |= os.O_NOFOLLOW
+                    next_fd = os.open(
+                        component,
+                        component_flags,
+                        dir_fd=current_fd,
+                    )
+                    os.set_inheritable(next_fd, False)
+                    resolved_fd = Path(f"/proc/self/fd/{next_fd}").resolve(strict=True)
+                    if os.path.commonpath((str(root_path), str(resolved_fd))) != str(root_path):
+                        os.close(next_fd)
+                        raise AgentLoopError("broker cwd intermediate symlink escapes checkout")
+                    os.close(current_fd)
+                    current_fd = next_fd
+            current_root_stat = os.stat(root_path, follow_symlinks=False)
+            if (current_root_stat.st_dev, current_root_stat.st_ino) != (
+                root_stat.st_dev,
+                root_stat.st_ino,
+            ):
+                raise AgentLoopError("assigned checkout root changed while opening broker cwd")
+            canonical = Path(f"/proc/self/fd/{current_fd}").resolve(strict=True)
+            return cls(root_path, canonical, current_fd, root_fd)
+        except BaseException:
+            try:
+                os.close(current_fd)  # type: ignore[possibly-undefined]
+            except (NameError, OSError):
+                pass
+            try:
+                os.close(root_fd)  # type: ignore[possibly-undefined]
+            except (NameError, OSError):
+                pass
+            raise
+
+    def fchdir(self) -> None:
+        os.fchdir(self.fd)
+
+    def close(self) -> None:
+        for descriptor in (self.fd, self._root_fd):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def __enter__(self) -> "ConfinedCwd":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+def open_confined_cwd(root: Path, requested: Path) -> ConfinedCwd:
+    """Open and pin a broker-requested cwd below the server-owned root."""
+    return ConfinedCwd.open(root, requested)
+
+
+resolve_confined_cwd = open_confined_cwd
+
+
 def _validate_child_limits(role: str, child: ResourceLimits, aggregate: ResourceLimits) -> None:
     for field_name in ("memory_high", "memory_max", "memory_swap_max", "tasks_max"):
         child_value = getattr(child, field_name)

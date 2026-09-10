@@ -127,6 +127,15 @@ def validate_repair_preservation(
                 require(entry in available, field)
                 available.remove(entry)
 
+    if source["kind"] in {"coder_followup", "issue_implementation"}:
+        source_observations = source.get("test_observations")
+        if isinstance(source_observations, list):
+            target_observations = target.get("test_observations", [])
+            require(isinstance(target_observations, list), "test_observations")
+            for entry in source_observations:
+                if isinstance(entry, dict):
+                    require(entry in target_observations, "test_observations")
+
     if source["kind"] == "coder_followup":
         allowed_item_ids = (
             set(unresolved_item_ids) if unresolved_item_ids is not None else None
