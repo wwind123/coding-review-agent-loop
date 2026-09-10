@@ -1634,6 +1634,45 @@ class TestPromptCheckoutPath:
         assert wd in prompt
         assert self._no_bare_skill_runner(prompt) == 0
 
+    def test_pr_prompt_includes_bound_approved_plan_context(self) -> None:
+        from coding_review_agent_loop.round_state import make_approved_plan_context
+        from helpers.prompt_builders import build_review_prompt_for_skill
+
+        plan = "Approved skill-mode plan.\n\n### Scope\n- Preserve the API.\n\n### Deferred work\n- Redesign later."
+        prompt = build_review_prompt_for_skill(
+            self._ISSUE, "diff --git a b", [], 1, "codex",
+            repo="wwind123/coding-review-agent-loop", pr_number=295,
+            all_reviewers=["codex", "gemini"],
+            approved_plan_context=make_approved_plan_context(plan),
+        )
+        assert "Approved skill-mode plan." in prompt
+        assert "Preserve the API." in prompt
+        assert "Redesign later." in prompt
+
+    def test_pr_fix_prompt_includes_bound_approved_plan_context(self) -> None:
+        from coding_review_agent_loop.round_state import make_approved_plan_context
+        from helpers.prompt_builders import build_pr_fix_prompt_for_skill
+
+        plan = "Approved fix plan.\n\n### Scope\n- Keep compatibility."
+        prompt = build_pr_fix_prompt_for_skill(
+            295,
+            [{
+                "item_id": "item-1",
+                "reviewer": "codex",
+                "source_round": 1,
+                "text": "Fix the bug.",
+                "status": "blocking",
+            }],
+            1,
+            repo="wwind123/coding-review-agent-loop",
+            coder="codex",
+            reviewers=["gemini"],
+            workdir="/tmp/coding-review-agent-loop/skill-runner-codex",
+            approved_plan_context=make_approved_plan_context(plan),
+        )
+        assert "Approved fix plan." in prompt
+        assert "Keep compatibility." in prompt
+
     def test_pr_fix_prompt_carries_no_unbounded_ci_wait_guidance(self) -> None:
         # #602: helpers/prompt_builders.py's run-pr-fix prompt delegates to
         # coding_review_agent_loop.prompts.build_followup_prompt, which must
@@ -1691,6 +1730,65 @@ class TestPromptCheckoutPath:
         assert "poll process IDs" in prompt
         assert "`tests_run` as machine-readable strings only" in prompt
         assert "include a short `Tests:` line" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# helpers/skill_runner.py  approved-plan PR provenance
+# ---------------------------------------------------------------------------
+
+class TestSkillApprovedPlanRecovery:
+    def test_one_shot_handoff_recovers_bound_plan(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.decomposition import (
+            approved_plan_hash,
+            format_one_shot_impl_handoff_comment,
+        )
+        from coding_review_agent_loop.round_state import (
+            PostedRoundMetadata,
+            _attach_round_metadata,
+            _plan_subject,
+        )
+
+        plan = "Approved skill plan.\n\n### Scope\n- Preserve the API."
+        comments = [
+            _attach_round_metadata(
+                plan,
+                PostedRoundMetadata(
+                    flow="plan",
+                    role="coder",
+                    agent="Claude",
+                    round_number=1,
+                    subject=_plan_subject(plan),
+                    canonical_plan=plan,
+                    raw_structured_coder_response=plan,
+                ),
+            ),
+            format_one_shot_impl_handoff_comment(
+                parent_issue=42,
+                mode="implement-one-shot",
+                plan_hash=approved_plan_hash(plan),
+                plan_subject=_plan_subject(plan),
+                pr_number=7,
+                pr_head_sha="head-7",
+            ),
+        ]
+        monkeypatch.setattr(sr, "_fetch_issue_comments_raw", lambda repo, issue: comments)
+
+        context = sr._recover_skill_pr_plan_context(
+            "owner/repo", 7, {"body": "Fixes #42"}
+        )
+
+        assert context is not None
+        assert context.is_available
+        assert context.canonical_text == plan
+        assert context.plan_hash == approved_plan_hash(plan)
+
+    def test_unplanned_direct_pr_does_not_require_plan(self) -> None:
+        import helpers.skill_runner as sr
+
+        assert sr._recover_skill_pr_plan_context(
+            "owner/repo", 7, {"body": "A direct PR without a linked issue."}
+        ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2671,6 +2769,34 @@ class TestHostReviewerPR:
         if start < 0:
             start = stdout.find("{")
         return json.loads(stdout[start:].strip())
+
+    def test_pr_host_handoff_includes_bound_approved_plan(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.round_state import make_approved_plan_context
+
+        monkeypatch.setattr(sr, "_REPAIR_BASE", tmp_path)
+        plan = "Approved host-review plan.\n\n### Deferred work\n- Keep the migration deferred."
+        request_dir = sr._write_host_review_request(
+            flow="pr",
+            validate_kind="pr_review",
+            issue=7,
+            repo="owner/repo",
+            new_round_number=1,
+            round_subject="head-7",
+            review_material="diff --git a/x b/x",
+            material_filename="pr-diff.diff",
+            next_prior_items_raw=[],
+            current_round_items=[],
+            item_id_offset=0,
+            dry_run=True,
+            approved_plan_context=make_approved_plan_context(plan),
+        )
+
+        assert (request_dir / "approved-plan.md").read_text(encoding="utf-8").endswith(
+            plan + "\n"
+        )
+        manifest = json.loads((request_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["approved_plan_file"] == "approved-plan.md"
 
     def test_pr_round_with_claude_reviewer_is_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

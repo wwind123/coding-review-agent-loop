@@ -113,12 +113,21 @@ from coding_review_agent_loop.config import (
     ensure_temp_checkout,
 )
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
+from coding_review_agent_loop.decomposition import (
+    PHASE_IDENTITY_MARKER_RE,
+    _decode_json_payload,
+    find_existing_phase_implementation_handoff,
+    find_existing_topology_checkpoint,
+    find_latest_one_shot_impl_handoff,
+    phase_identity,
+)
 from coding_review_agent_loop.followups import (
     FollowupSourceContext,
     _approved_followup_from_unresolved_item,
     _publish_approved_followups,
 )
 from coding_review_agent_loop.memory import AgentMemoryContext, prepare_agent_memory
+from coding_review_agent_loop.issue_pr_handoff import find_latest_issue_pr_handoff
 from coding_review_agent_loop.runner import Runner, run_foreground_test, tail_text
 from coding_review_agent_loop.containment import default_policy
 from coding_review_agent_loop.test_runtime import (
@@ -129,11 +138,13 @@ from coding_review_agent_loop.test_runtime import (
 from coding_review_agent_loop.usage import RunUsageContext, UsageMetadata
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
 from coding_review_agent_loop.round_state import (
+    ApprovedPlanContext,
     PostedRoundMetadata,
     _attach_round_metadata,
     _deserialize_disposition,
     _deserialize_unresolved_item,
     _plan_subject,
+    recover_approved_plan_context,
     _serialize_unresolved_item,
     _serialize_disposition,
 )
@@ -993,6 +1004,192 @@ def _fetch_issue_comments_raw(repo: str, issue: int, gh_cmd: str = "gh") -> list
         return [c["body"] for c in data.get("comments", []) if isinstance(c, dict) and "body" in c]
     except (json.JSONDecodeError, KeyError):
         return []
+
+
+def _recover_skill_pr_plan_context(
+    repo: str,
+    pr: int,
+    pr_info: dict,
+) -> ApprovedPlanContext | None:
+    """Recover the exact plan handoff for a skill-mode PR, if one exists.
+
+    Skill-mode implementations record the one-shot handoff on the linked issue;
+    headless implementations may instead record the canonical issue-to-PR
+    handoff.  Both are validated before the plan is exposed to a reviewer or
+    coder.  A plain direct PR with no approved-plan handoff returns ``None``.
+    """
+    issue_number = _linked_issue_number_from_pr(pr_info)
+    if issue_number is None:
+        return None
+
+    comments = [
+        types.SimpleNamespace(body=body)
+        for body in _fetch_issue_comments_raw(repo, issue_number)
+    ]
+
+    issue_handoff = find_latest_issue_pr_handoff(
+        comments,
+        issue_number=issue_number,
+        repo=repo,
+    )
+    expected_hash: str | None = None
+    expected_subject: str | None = None
+    if issue_handoff is not None and issue_handoff.flow == "approved-plan-implementation":
+        if issue_handoff.pr_number != pr:
+            raise AgentLoopError(
+                f"Issue #{issue_number} approved-plan handoff selects PR #{issue_handoff.pr_number}, "
+                f"not PR #{pr}; review the recorded PR directly or repair the handoff."
+            )
+        expected_hash = issue_handoff.plan_hash
+
+    one_shot = find_latest_one_shot_impl_handoff(
+        comments,
+        parent_issue=issue_number,
+        mode="implement-one-shot",
+    )
+    if one_shot is not None:
+        if one_shot.pr_number != pr:
+            raise AgentLoopError(
+                f"Issue #{issue_number} one-shot plan handoff selects PR #{one_shot.pr_number}, "
+                f"not PR #{pr}; review the recorded PR directly or repair the handoff."
+            )
+        if expected_hash is not None and expected_hash != one_shot.plan_hash:
+            raise AgentLoopError(
+                f"PR #{pr} has conflicting approved-plan handoff identities: "
+                f"{expected_hash} and {one_shot.plan_hash}."
+            )
+        expected_hash = one_shot.plan_hash
+        expected_subject = one_shot.plan_subject or None
+
+    if expected_hash is None:
+        # Phase implementations bind the child PR through the parent-side phase
+        # handoff and the child issue's validated phase identity rather than a
+        # one-shot PR marker. Recover the full canonical plan from the parent;
+        # the child excerpt is intentionally not treated as the plan itself.
+        phase_match = next(
+            (match for comment in comments if (match := PHASE_IDENTITY_MARKER_RE.search(comment.body))),
+            None,
+        )
+        if phase_match is None:
+            try:
+                child_info = _fetch_issue_json(repo, issue_number)
+            except SystemExit:
+                # A linked ordinary PR may not be readable from this helper's
+                # credentials. Without a phase marker in fetched comments,
+                # there is no plan provenance to validate or require.
+                return None
+            phase_match = PHASE_IDENTITY_MARKER_RE.search(str(child_info.get("body") or ""))
+        if phase_match is None:
+            return None
+        if phase_match is not None:
+            payload = _decode_json_payload(
+                phase_match.group("payload"),
+                marker_name="AGENT_PLAN_PHASE_IDENTITY",
+            )
+            parent_issue = payload.get("parent_issue")
+            plan_hash = payload.get("plan_hash")
+            stage_id = payload.get("stage_id")
+            source = payload.get("source")
+            identity = payload.get("identity")
+            if (
+                not isinstance(parent_issue, int)
+                or isinstance(parent_issue, bool)
+                or not isinstance(plan_hash, str)
+                or not plan_hash.strip()
+                or not isinstance(stage_id, int)
+                or isinstance(stage_id, bool)
+                or not isinstance(source, str)
+                or not isinstance(identity, str)
+            ):
+                raise AgentLoopError(
+                    f"PR #{pr} has an invalid staged phase identity; repair the child issue handoff."
+                )
+            parent_comments = [
+                types.SimpleNamespace(body=body)
+                for body in _fetch_issue_comments_raw(repo, parent_issue)
+            ]
+            matching_mode: str | None = None
+            matching_checkpoint = None
+            for mode in ("decompose-only", "implement-by-phase"):
+                checkpoint = find_existing_topology_checkpoint(
+                    parent_comments,
+                    parent_issue=parent_issue,
+                    plan_hash=plan_hash,
+                    mode=mode,
+                )
+                if checkpoint is None:
+                    continue
+                if not 1 <= stage_id <= len(checkpoint.phases):
+                    raise AgentLoopError(
+                        f"PR #{pr} references staged phase {stage_id}, but the matching "
+                        "parent topology has no such phase."
+                    )
+                expected_identity = phase_identity(
+                    parent_issue=parent_issue,
+                    plan_hash=plan_hash,
+                    topology_source=checkpoint.topology_source,
+                    phase_index=stage_id,
+                    phase=checkpoint.phases[stage_id - 1],
+                )
+                if source != checkpoint.topology_source or identity != expected_identity:
+                    raise AgentLoopError(
+                        f"PR #{pr} staged phase identity does not match the authoritative parent topology."
+                    )
+                phase_handoff = find_existing_phase_implementation_handoff(
+                    parent_comments,
+                    parent_issue=parent_issue,
+                    plan_hash=plan_hash,
+                    mode=mode,
+                    phase_index=stage_id,
+                    child_issue_number=issue_number,
+                )
+                if phase_handoff is None:
+                    continue
+                phase = checkpoint.phases[stage_id - 1]
+                if (
+                    phase_handoff.phase_title != phase.title
+                    or phase_handoff.automation != phase.automation
+                ):
+                    raise AgentLoopError(
+                        f"PR #{pr} staged phase handoff disagrees with the authoritative parent topology."
+                    )
+                matching_mode = mode
+                matching_checkpoint = checkpoint
+                break
+            if matching_mode is None or matching_checkpoint is None:
+                raise AgentLoopError(
+                    f"PR #{pr} has a staged phase identity but no matching parent phase handoff; "
+                    "repair the decomposition provenance before reviewing."
+                )
+            expected_hash = plan_hash
+            context = recover_approved_plan_context(
+                parent_comments,
+                expected_hash=expected_hash,
+            )
+            if not context.is_available:
+                raise AgentLoopError(
+                    f"PR #{pr} is bound to approved plan {expected_hash}, but the canonical "
+                    f"parent plan could not be recovered: "
+                    f"{context.diagnostic or 'no diagnostic available'}."
+                )
+            return context
+
+    if expected_hash is None:
+        return None
+
+    context = recover_approved_plan_context(
+        comments,
+        expected_hash=expected_hash,
+        expected_subject=expected_subject,
+    )
+    if not context.is_available:
+        raise AgentLoopError(
+            f"PR #{pr} is bound to approved plan {expected_hash}, but skill-mode "
+            f"could not recover the canonical plan: "
+            f"{context.diagnostic or 'no diagnostic available'}. "
+            "Restore the plan round metadata or repair the issue handoff."
+        )
+    return context
 
 
 def _fetch_pr_comments_raw(repo: str, pr: int, gh_cmd: str = "gh") -> list[str]:
@@ -2119,6 +2316,7 @@ def _write_host_review_request(
     current_round_items: list[dict],
     item_id_offset: int,
     dry_run: bool,
+    approved_plan_context: ApprovedPlanContext | None = None,
 ) -> Path:
     """Write a review-request dir for the host (Claude) reviewer turn.
 
@@ -2137,6 +2335,19 @@ def _write_host_review_request(
         "prior_items": next_prior_items_raw,
         "current_round_items": current_round_items,
     })
+    approved_plan_file: str | None = None
+    if approved_plan_context is not None and approved_plan_context.is_available:
+        # The host reviewer is a manual handoff rather than a shared prompt
+        # builder. Preserve the complete canonical text in a separate file so
+        # the request cannot degrade to diff-only context.
+        approved_plan_file = "approved-plan.md"
+        _write_text(
+            request_dir / approved_plan_file,
+            "Approved implementation plan context (PR-bound)\n"
+            f"Plan hash: {approved_plan_context.plan_hash or '(unavailable)'}\n"
+            f"Plan subject: {approved_plan_context.plan_subject or '(unavailable)'}\n\n"
+            f"{approved_plan_context.canonical_text or ''}\n",
+        )
     manifest = {
         "role": "reviewer",
         "agent": "claude", "agent_cap": "Claude", "flow": flow,
@@ -2146,6 +2357,9 @@ def _write_host_review_request(
         "material_filename": material_filename,
         "dry_run": dry_run,
     }
+    if approved_plan_file is not None:
+        manifest["approved_plan_file"] = approved_plan_file
+        manifest["approved_plan_hash"] = approved_plan_context.plan_hash
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return request_dir
 
@@ -2534,6 +2748,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 round_approved_reviewers.append(str(record.get("reviewer_name", "")))
 
     issue_dict = _fetch_pr_json(repo, pr)
+    approved_plan_context = _recover_skill_pr_plan_context(repo, pr, issue_dict)
     parent_issue_number = _linked_issue_number_from_pr(issue_dict)
     pr_diff = _fetch_pr_diff(repo, pr)
 
@@ -2575,6 +2790,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                     workdir=workdir,
                     approved_followups=getattr(args, "approved_followups", "ignore"),
                     memory=memory,
+                    approved_plan_context=approved_plan_context,
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -2638,6 +2854,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             next_prior_items_raw=next_prior_items_raw,
             current_round_items=current_round_items,
             item_id_offset=item_id_offset, dry_run=dry_run,
+            approved_plan_context=approved_plan_context,
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
@@ -3411,6 +3628,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
 
     current_head = str(pr_info.get("headRefOid") or "")
     pr_branch = str(pr_info.get("headRefName") or "")
+    approved_plan_context = _recover_skill_pr_plan_context(repo, pr, pr_info)
     resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=current_head, pr=pr)
     _reconcile_pending_comment(resume, pr, repo, dry_run)
     resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=current_head, pr=pr)
@@ -3483,6 +3701,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         issue_context=issue_context,
         human_requirements=human_requirements,
         same_pr_only=same_pr_only,
+        approved_plan_context=approved_plan_context,
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
     )
 

@@ -3734,6 +3734,30 @@ def _reviewer_requirement_coverage_matches(
     return expected_ids.issubset(persisted)
 
 
+def _resumed_pr_reviewer_matches_requirements(
+    record: PostedRoundRecord,
+    human_requirements: Sequence[HumanReviewRequirement],
+) -> bool:
+    """Return whether a same-head resumed review still covers current requirements.
+
+    A reviewer comment can be posted before the process is interrupted and then
+    resumed after signed requirements are added or edited.  Apply the same
+    explicit legacy policy as carried approvals: empty requirements remain
+    resumable, while a non-empty current set requires both the resolution marker
+    and digest-backed identities from the persisted metadata.
+    """
+    return (
+        not human_requirements
+        or (
+            human_requirements_resolved(record.body)
+            and _reviewer_requirement_coverage_matches(
+                human_requirements,
+                record.metadata.surfaced_reviewer_requirement_ids,
+            )
+        )
+    )
+
+
 def _validate_plan_revision_response(
     text: str,
     *,
@@ -7720,7 +7744,7 @@ def run_pr_loop(
                                 raise AgentLoopError(
                                     "Decomposition child phase identity does not match the parent topology checkpoint."
                                 )
-                    if approved_plan_context is None or approved_plan_context.availability == "unavailable":
+                    if approved_plan_context is None or not approved_plan_context.is_available:
                         expected_plan_subject = None
                         one_shot_record = find_latest_one_shot_impl_handoff(
                             issue_context.comments,
@@ -7732,20 +7756,24 @@ def run_pr_loop(
                             and one_shot_record.plan_hash == issue_handoff.plan_hash
                         ):
                             expected_plan_subject = one_shot_record.plan_subject or None
-                        if approved_plan_context is None:
+                        if approved_plan_context is None or not approved_plan_context.is_available:
                             approved_plan_context = recover_approved_plan_context(
                                 issue_context.comments,
                                 expected_hash=issue_handoff.plan_hash,
                                 expected_subject=expected_plan_subject,
                             )
-                        if approved_plan_context.availability == "unavailable" and parent_issue_context is not None:
-                            parent_candidate = recover_approved_plan_context(
-                                parent_issue_context.comments,
-                                expected_hash=issue_handoff.plan_hash,
-                                expected_subject=expected_plan_subject,
-                            )
-                            if parent_candidate.is_available:
-                                approved_plan_context = parent_candidate
+                            if (
+                                not approved_plan_context.is_available
+                                and not approved_plan_context.has_matching_candidate
+                                and parent_issue_context is not None
+                            ):
+                                parent_candidate = recover_approved_plan_context(
+                                    parent_issue_context.comments,
+                                    expected_hash=issue_handoff.plan_hash,
+                                    expected_subject=expected_plan_subject,
+                                )
+                                if parent_candidate.is_available:
+                                    approved_plan_context = parent_candidate
                     if not approved_plan_context.is_available and not issue_handoff.legacy_contract:
                         raise AgentLoopError(
                             f"PR #{pr_number} is bound to approved plan {issue_handoff.plan_hash}, "
@@ -8093,7 +8121,9 @@ def run_pr_loop(
             )
             approved_review_outputs: list[tuple[str, str]] = []
             resumed_by_name = {
-                record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
+                record.metadata.agent: record
+                for record in (current_resume.completed_reviews if current_resume is not None else ())
+                if _resumed_pr_reviewer_matches_requirements(record, human_requirements)
             }
             unchanged_head_approvals = _latest_pr_approved_reviews_for_head(
                 pr_comments,

@@ -4,6 +4,7 @@ from agent_loop_helpers import make_config
 from coding_review_agent_loop.orchestrator import (
     _reviewer_requirement_coverage_matches,
     _reviewer_requirement_identity_ids,
+    _resumed_pr_reviewer_matches_requirements,
 )
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
@@ -21,6 +22,7 @@ from coding_review_agent_loop.prompts import (
 from coding_review_agent_loop.protocol import validate_human_requirements_acknowledgement
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
+    PostedRoundRecord,
     _attach_round_metadata,
     make_approved_plan_context,
     recover_approved_plan_context,
@@ -80,6 +82,31 @@ def test_reviewer_coverage_uses_digest_identity_and_rejects_legacy_labels():
     assert _reviewer_requirement_coverage_matches((original,), (original.requirement_id,))
     assert not _reviewer_requirement_coverage_matches((edited,), (original.requirement_id,))
     assert not _reviewer_requirement_coverage_matches((original,), ("Requirement 1",))
+
+
+def test_interrupted_current_round_rechecks_resumed_reviewer_requirement_coverage():
+    original = _requirement(
+        body="Keep the public API stable.",
+        created_at="2026-01-01T00:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/1#issuecomment-1",
+    )
+    edited = replace(original, body="Change the public API.")
+    record = PostedRoundRecord(
+        index=0,
+        metadata=PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="same-head",
+            state="approved",
+            surfaced_reviewer_requirement_ids=(original.requirement_id,),
+        ),
+        body="Approved.\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->",
+    )
+
+    assert _resumed_pr_reviewer_matches_requirements(record, (original,))
+    assert not _resumed_pr_reviewer_matches_requirements(record, (edited,))
 
 
 def test_legacy_positional_acknowledgement_remains_resumable():

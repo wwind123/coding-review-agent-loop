@@ -2786,6 +2786,19 @@ def test_issue_loop_plan_first_resume_uses_handoff_bound_plan_when_later_plan_ex
 
 def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path, monkeypatch):
     parent_plan = "Approved parent plan.\n\n### Scope\n- Preserve the child API."
+    unrelated_child_plan = "Unrelated child plan.\n\n### Scope\n- Change a different API."
+    unrelated_child_plan_comment = _attach_round_metadata(
+        unrelated_child_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="unrelated-child-plan",
+            canonical_plan=unrelated_child_plan,
+            raw_structured_coder_response=unrelated_child_plan,
+        ),
+    )
     parent_plan_comment = _attach_round_metadata(
         parent_plan,
         PostedRoundMetadata(
@@ -2805,6 +2818,11 @@ def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path,
         body="Child phase issue for parent #55: staged implementation.",
         url="https://github.com/OWNER/REPO/issues/56",
         comments=(
+            IssueComment(
+                author="coding-review-agent-loop",
+                created_at="2026-05-01T00:00:00Z",
+                body=unrelated_child_plan_comment,
+            ),
             IssueComment(
                 author="coding-review-agent-loop",
                 created_at="2026-05-01T00:01:00Z",

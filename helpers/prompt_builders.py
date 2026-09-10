@@ -34,7 +34,10 @@ from coding_review_agent_loop.prompts import (
     render_coder_human_requirements_prompt_context,
     containment_prompt_guidance,
 )
-from coding_review_agent_loop.round_state import _deserialize_unresolved_item
+from coding_review_agent_loop.round_state import (
+    ApprovedPlanContext,
+    _deserialize_unresolved_item,
+)
 from coding_review_agent_loop.test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from coding_review_agent_loop.unresolved_items import (
     _format_same_pr_unresolved_items,
@@ -189,6 +192,7 @@ def build_review_prompt_for_skill(
     workdir: str | None = None,
     approved_followups: str = "ignore",
     memory: AgentMemoryContext | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
@@ -238,6 +242,7 @@ def build_review_prompt_for_skill(
         pr_metadata=pr_metadata,
         issue_context=issue_context,
         unresolved_items=unresolved,
+        approved_plan_context=approved_plan_context,
     )
     if pr_diff:
         prompt += f"\n\n## PR diff\n\n```diff\n{pr_diff}\n```\n"
@@ -257,6 +262,7 @@ def build_pr_fix_prompt_for_skill(
     human_requirements: Sequence | None = None,
     same_pr_only: bool = False,
     memory: AgentMemoryContext | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build the external-coder PR-fix prompt from skill-mode ledger items."""
@@ -279,6 +285,7 @@ def build_pr_fix_prompt_for_skill(
             issue_context=issue_context,
             human_requirements=human_requirements,
             human_requirements_context=human_requirements_context,
+            approved_plan_context=approved_plan_context,
         ), config)
     review_text = _format_unresolved_items_for_coder(unresolved)
     return _with_containment_guidance(build_followup_prompt(
@@ -290,6 +297,7 @@ def build_pr_fix_prompt_for_skill(
         issue_context=issue_context,
         human_requirements=human_requirements,
         human_requirements_context=human_requirements_context,
+        approved_plan_context=approved_plan_context,
     ), config)
 
 

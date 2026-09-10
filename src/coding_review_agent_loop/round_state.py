@@ -128,6 +128,10 @@ class ApprovedPlanContext:
         "available", "unavailable", "mismatched", "omitted", "not-planned"
     ] = "unavailable"
     diagnostic: str | None = None
+    # ``mismatched`` is used both when no record has the expected hash and when
+    # a record with that hash is internally conflicting (or has the wrong
+    # subject).  Parent fallback is safe only in the former case.
+    has_matching_candidate: bool = False
 
     @property
     def raw_canonical_text(self) -> str | None:
@@ -784,6 +788,7 @@ def make_approved_plan_context(
             plan_subject=actual_subject,
             source_locator=source_locator,
             availability="mismatched",
+            has_matching_candidate=False,
             diagnostic=(
                 f"Recovered plan hash {actual_hash} does not match handoff hash {expected_hash}."
             ),
@@ -795,6 +800,7 @@ def make_approved_plan_context(
             plan_subject=actual_subject,
             source_locator=source_locator,
             availability="mismatched",
+            has_matching_candidate=True,
             diagnostic=(
                 f"Recovered plan subject {actual_subject} does not match handoff subject {expected_subject}."
             ),
@@ -808,6 +814,7 @@ def make_approved_plan_context(
         scope=scope,
         deferred_work=deferred,
         availability="available",
+        has_matching_candidate=True,
     )
 
 
@@ -839,6 +846,7 @@ def recover_approved_plan_context(
             plan_hash=expected_hash,
             plan_subject=expected_subject,
             availability="mismatched" if observed_hashes else "unavailable",
+            has_matching_candidate=False,
             diagnostic=(
                 f"No canonical approved plan matches handoff hash {expected_hash}; "
                 f"recovered plan hashes: {available}."
@@ -850,6 +858,7 @@ def recover_approved_plan_context(
             plan_hash=expected_hash,
             plan_subject=expected_subject,
             availability="mismatched",
+            has_matching_candidate=True,
             diagnostic=(
                 f"Multiple divergent canonical plan records match handoff hash {expected_hash}."
             ),
