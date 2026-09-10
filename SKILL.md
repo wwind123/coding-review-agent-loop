@@ -520,7 +520,11 @@ posted plan/PR, so a configured `claude` reviewer becomes a **pending handoff**:
 the round returns `{"state": "pending", "pending_reviewers": ["Claude"], ...}`
 (never `approved`/`blocking` while it's outstanding) and prints a review-request
 dir. Read the material there (`{dir}/plan.md` for a plan, `{dir}/pr-diff.diff` for
-a PR), write your `plan_review`/`pr_review` JSON to `{dir}/host-review.md`, then:
+a PR). For a PR handoff, also read `{dir}/approved-plan.md` and the labeled issue
+artifacts when present. If `{dir}/signed-human-requirements.md` exists, it is the
+rendered signed-requirement contract: verify every stable ID and follow its
+approval-marker instructions. Then write your `plan_review`/`pr_review` JSON to
+`{dir}/host-review.md` and run:
 
 ```bash
 python -m helpers.skill_runner complete-host-review --dir <dir>

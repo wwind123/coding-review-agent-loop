@@ -144,6 +144,23 @@ agent-loop issue 123 \
 
 Without `--plan-first`, issue mode asks the coder to implement immediately.
 
+Plan-first implementation carries the approved plan through a dedicated,
+lossless PR-bound context. The PR handoff binds reviewers and coder follow-ups
+to the recorded plan hash and subject, independently of truncated issue
+comments or compact PR history. Issue/PR resume validates that handoff (and any
+staged parent/child topology) before invoking an agent; an ordinary PR with no
+planning provenance continues through the normal no-plan path.
+
+Signed human instructions are rendered as `Requirement hr-<digest>` and use the
+same content-derived ID in acknowledgements, repair, round metadata, and resume.
+Insertion or chronological reordering cannot change an existing instruction's
+ID, while an edited body receives a new ID. Historical positional
+acknowledgements require a fresh acknowledgement against the currently surfaced
+stable IDs rather than being reinterpreted by current ordering.
+Original issue requirements, later valid human instructions, and safety
+constraints outrank an approved plan; a defective plan must be raised as a
+scope/plan decision, not silently replaced by review prose.
+
 ### Review a plan, then implement it
 
 Use plan-first mode for work whose design should be challenged before files are
@@ -443,6 +460,17 @@ must leave headroom for analysis, edits, and reporting; split or shard healthy
 browser/integration matrices when that improves diagnosis and retry cost.
 
 ## CI and Merge
+
+When a review round requires coder changes, agent-loop also checks for CI
+failures already reported on the reviewed commit and includes them with the
+reviewer findings. It does not wait for queued or running checks at this handoff.
+Missing checks and recognized runner-infrastructure stalls are not added as
+code defects. Managed CI still defers its final qualification until approval.
+
+A blocking review is treated as CI-wait-only only when its findings and summary
+are unambiguously simple CI-status statements (or the summary is boilerplate).
+Mentioning a check name such as `test` is not sufficient. Mixed or ambiguous
+findings remain blocking; the tool must not erase code concerns to avoid a CI wait.
 
 Use `--auto-merge` only when the repository's CI and branch protections are
 appropriate for unattended merging:

@@ -34,7 +34,10 @@ from coding_review_agent_loop.prompts import (
     render_coder_human_requirements_prompt_context,
     containment_prompt_guidance,
 )
-from coding_review_agent_loop.round_state import _deserialize_unresolved_item
+from coding_review_agent_loop.round_state import (
+    ApprovedPlanContext,
+    _deserialize_unresolved_item,
+)
 from coding_review_agent_loop.test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from coding_review_agent_loop.unresolved_items import (
     _format_same_pr_unresolved_items,
@@ -189,6 +192,10 @@ def build_review_prompt_for_skill(
     workdir: str | None = None,
     approved_followups: str = "ignore",
     memory: AgentMemoryContext | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+    issue_context: IssueContext | None = None,
+    parent_issue_context: IssueContext | None = None,
+    human_requirements: Sequence | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
@@ -209,6 +216,9 @@ def build_review_prompt_for_skill(
             instructs the reviewer to surface future follow-ups so they can be
             published on approval (#300).
         memory: Repo-scoped agent memory to include for reviewer orientation (#306).
+        approved_plan_context: Validated, PR-bound approved-plan context. This is
+            independent of the bounded issue/comment history and is included in
+            both full and compact review prompts.
     """
     from coding_review_agent_loop.github import PullRequestMetadata
 
@@ -218,7 +228,7 @@ def build_review_prompt_for_skill(
         approved_followups=approved_followups,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
     )
-    issue_context = _make_issue_context(issue_dict)
+    primary_issue_context = issue_context
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
     pr_metadata = PullRequestMetadata(
         number=pr_number,
@@ -236,8 +246,11 @@ def build_review_prompt_for_skill(
         reviewer=reviewer,
         memory=memory,
         pr_metadata=pr_metadata,
-        issue_context=issue_context,
+        issue_context=primary_issue_context,
+        parent_issue_context=parent_issue_context,
+        human_requirements=human_requirements,
         unresolved_items=unresolved,
+        approved_plan_context=approved_plan_context,
     )
     if pr_diff:
         prompt += f"\n\n## PR diff\n\n```diff\n{pr_diff}\n```\n"
@@ -254,12 +267,18 @@ def build_pr_fix_prompt_for_skill(
     reviewers: Sequence[AgentName],
     workdir: str,
     issue_context: IssueContext | None = None,
+    parent_issue_context: IssueContext | None = None,
     human_requirements: Sequence | None = None,
     same_pr_only: bool = False,
     memory: AgentMemoryContext | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
-    """Build the external-coder PR-fix prompt from skill-mode ledger items."""
+    """Build the external-coder PR-fix prompt from skill-mode ledger items.
+
+    ``approved_plan_context`` remains separate from the lossy review ledger so
+    follow-up coders retain the exact handoff-bound scope and deferred work.
+    """
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
@@ -277,8 +296,10 @@ def build_pr_fix_prompt_for_skill(
             config,
             memory,
             issue_context=issue_context,
+            parent_issue_context=parent_issue_context,
             human_requirements=human_requirements,
             human_requirements_context=human_requirements_context,
+            approved_plan_context=approved_plan_context,
         ), config)
     review_text = _format_unresolved_items_for_coder(unresolved)
     return _with_containment_guidance(build_followup_prompt(
@@ -288,8 +309,10 @@ def build_pr_fix_prompt_for_skill(
         config,
         memory,
         issue_context=issue_context,
+        parent_issue_context=parent_issue_context,
         human_requirements=human_requirements,
         human_requirements_context=human_requirements_context,
+        approved_plan_context=approved_plan_context,
     ), config)
 
 

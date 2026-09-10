@@ -2,6 +2,7 @@ import base64
 import datetime
 import json
 import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -37,6 +38,7 @@ from coding_review_agent_loop.github import (
     PullRequestReviewContext,
     get_pr_checks,
 )
+from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.migrations import MigrationValidationResult
 from coding_review_agent_loop.managed_ci import (
     ManagedCiContract,
@@ -288,6 +290,7 @@ def test_direct_pr_linked_issue_resolution_handles_urls_absence_and_ambiguity(
 def test_issue_mode_context_is_not_replaced_by_pr_link(tmp_path):
     runner = FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_payload={"title": "Fresh issue", "body": "Fresh issue body."},
         pr_payload={"body": "Fixes #99"},
     )
     config = make_config(tmp_path)
@@ -297,9 +300,97 @@ def test_issue_mode_context_is_not_replaced_by_pr_link(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config, issue_context=supplied_context) == 0
 
-    assert not _issue_view_commands(runner)
+    assert len(_issue_view_commands(runner)) == 1
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
-    assert "Caller issue" in prompt
+    assert "Fresh issue" in prompt
+    assert "Caller issue" not in prompt
+
+
+def test_direct_pr_ignores_unrelated_older_issue_handoff(tmp_path):
+    older_handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=66,
+        pr_url="https://github.com/OWNER/REPO/pull/66",
+        pr_head_sha="older-head",
+        flow="issue-implementation",
+        plan_hash=None,
+    )
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_comments=[
+            {
+                "author": {"login": "coding-review-agent-loop"},
+                "createdAt": "2026-05-01T00:00:00Z",
+                "body": older_handoff,
+            }
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+
+    assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert not any("handoff selects PR #66" in comment for comment in runner.comments)
+
+
+def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_path):
+    old_plan = "Approved old plan.\n\n### Scope\n- Preserve the old API."
+    later_plan = "Unrelated later plan.\n\n### Scope\n- Replace the old API."
+    old_plan_comment = _attach_round_metadata(
+        old_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="old-plan",
+            canonical_plan=old_plan,
+            raw_structured_coder_response=old_plan,
+        ),
+    )
+    later_plan_comment = _attach_round_metadata(
+        later_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=2,
+            subject="later-plan",
+            canonical_plan=later_plan,
+            raw_structured_coder_response=later_plan,
+        ),
+    )
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=orchestrator.approved_plan_hash(old_plan),
+    )
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-01T00:00:00Z", "body": old_plan_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-01T00:01:00Z", "body": handoff},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-01T00:02:00Z", "body": later_plan_comment},
+        ],
+        issue_payload={"number": 56, "title": "Issue", "body": "Original issue."},
+        pr_payload={
+            "number": 77,
+            "url": "https://github.com/OWNER/REPO/pull/77",
+            "body": "Fixes #56",
+        },
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    plan_block = prompt.split("Approved implementation plan context", 1)[1].split(
+        "Target child/primary issue context", 1
+    )[0]
+    assert "Preserve the old API." in plan_block
+    assert "Replace the old API." not in plan_block
 
 
 def test_pr_loop_runs_tests_and_merge_only_after_codex_approval(tmp_path):
@@ -953,7 +1044,7 @@ def test_reconcile_human_requirements_ack_item_clears_markdown_ack_blocker():
             "Implemented follow-up.\n"
             f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
             "### Human requirements\n"
-            "- Requirement 1: updated the URL handling.\n"
+            f"- Requirement {human_requirements[0].requirement_id}: updated the URL handling.\n"
             "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
         ),
         human_requirements=human_requirements,
@@ -1172,6 +1263,102 @@ def _watch_check_board(
         check_query_status="partial" if errors else "ok",
         check_query_errors=tuple(errors),
     )
+
+
+@pytest.mark.parametrize("board_state", ["failing", "mixed", "pending", "missing", "unavailable", "stall"])
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_blocking_review_handoff_includes_available_ci_without_waiting(
+    tmp_path, monkeypatch, board_state, auto_merge
+):
+    failure = PullRequestCheck(
+        name="test", kind="check_run", status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/555",
+    )
+    pending = PullRequestCheck(name="slow", kind="check_run", status="in_progress")
+    board = _watch_check_board(
+        "failing" if board_state in {"failing", "mixed", "stall"} else
+        "pending" if board_state in {"pending", "missing"} else "unavailable",
+        failing=(failure,) if board_state in {"failing", "mixed", "stall"} else (),
+        pending=(pending,) if board_state in {"mixed", "pending"} else (),
+        missing_required=("test",) if board_state == "missing" else (),
+        errors=("API unavailable",) if board_state == "unavailable" else (),
+    )
+    if board_state == "stall":
+        board = orchestrator.dataclasses_replace(board, infrastructure_stalls=(
+            StalledCheck(
+                name="test", kind="check_run", reason="runner_unavailable",
+                check_id=None, run_id="555", url=failure.url, age_seconds=None,
+            ),
+        ))
+    runner = FakeRunner(codex_outputs=[
+        "Fix the application bug.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    ])
+    snapshots = []
+
+    def snapshot(*args, **kwargs):
+        snapshots.append(kwargs["metadata"].head_sha)
+        # CI finishes while the reviewer is working, not before the review.
+        return _watch_check_board("pending", pending=(pending,)) if len(snapshots) == 1 else board
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", snapshot)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
+    original = orchestrator._run_validated_agent
+    captured = {}
+
+    class CoderReached(Exception):
+        pass
+
+    def capture(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            captured.update(kwargs)
+            raise CoderReached
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", capture)
+    with pytest.raises(CoderReached):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge))
+    assert snapshots == ["abc123", "abc123"]
+    prompt = captured["prompt"]
+    assert "Fix the application bug." in prompt
+    if board_state in {"failing", "mixed"}:
+        assert "Failing checks: test (failure)" in prompt
+        assert failure.url in prompt
+        assert "Reviewed head: abc123" in prompt
+        assert "Do not wait for queued or running CI" in prompt
+        assert "item-2" in captured["repair_unresolved_item_ids"]
+        assert "Pending checks:" not in prompt
+    else:
+        assert "Failing checks:" not in prompt
+        assert "item-2" not in captured["repair_unresolved_item_ids"]
+
+
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_round_ci_failure_is_tracked_and_resolved_with_reviewer_findings(tmp_path, monkeypatch, auto_merge):
+    runner = FakeRunner(
+        codex_outputs=[
+            "Fix the application bug.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Both fixes verified."
+            + prior_item_dispositions("[item-1] resolved", "[item-2] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=["Fixed the application and CI.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+    )
+    failed = PullRequestCheck(name="test", kind="check_run", status="failure", url="https://example.test/555")
+    snapshots = iter([
+        _watch_check_board("pending"),
+        _watch_check_board("failing", failing=(failed,)),
+        _watch_check_board("passing"),
+        _watch_check_board("passing"),
+    ])
+    monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: next(snapshots))
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge)) == 0
+    second_review = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ["codex"]][-1]
+    assert "item-2" in second_review
+    assert "Failing checks: test (failure)" in second_review
+    assert sum(comment.startswith("GitHub PR checks are failing") for comment in runner.comments) == 1
 
 
 @pytest.mark.parametrize("auto_merge", [False, True])
@@ -2154,7 +2341,7 @@ def test_pr_loop_downgrades_pending_ci_only_blocking_review_without_auto_merge(t
         codex_outputs=[
             structured_pr_review(
                 state="blocking",
-                summary="Model-default consistency gaps are fixed.",
+                summary="Review complete.",
                 blocking_items=["GitHub check `test` is still pending/in_progress."],
             )
         ],
@@ -2175,13 +2362,75 @@ def test_pr_loop_downgrades_pending_ci_only_blocking_review_without_auto_merge(t
     _assert_pending_ci_stop_guidance(stop_comment)
     assert "Required checks not yet reporting: test" in stop_comment
 
+
+# Verbatim Sol payloads from PR #757 rounds 1 and 3, previously stripped by
+# the pending-CI filter because each real finding mentioned a regression test.
+_SUPPRESSED_REVIEWS = json.loads(
+    (Path(__file__).parent / "fixtures" / "pending_ci_real_reviews.json").read_text()
+)
+
+
+@pytest.mark.parametrize("payload", _SUPPRESSED_REVIEWS, ids=["round-1", "round-3"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_real_findings_survive_publication_and_reconciliation(tmp_path, monkeypatch, payload, parallel):
+    # Replay as a fresh round; historical item dispositions need their original
+    # ledger, but the summary and every blocking finding remain verbatim.
+    response = (json.dumps({**payload, "prior_item_dispositions": []})
+                + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex")
+    runner = FakeRunner(
+        codex_outputs=[response],
+        gemini_outputs=[structured_pr_review(state="approved", summary="Review complete.")],
+        pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress"}]},
+    )
+    original = orchestrator._run_validated_agent
+    captured = {}
+
+    class CoderReached(Exception):
+        pass
+
+    def capture(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            captured.update(kwargs)
+            raise CoderReached
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", capture)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel)
+    with pytest.raises(CoderReached):
+        run_pr_loop(runner, pr_number=77, config=config)
+    reviews = [comment for comment in runner.comments if payload["summary"] in comment]
+    assert len(reviews) == 1
+    assert reviews[0].startswith("**Review verdict:** Blocking")
+    for finding in payload["blocking_items"]:
+        assert finding in reviews[0]
+        assert finding in captured["prompt"]
+    assert len(captured["repair_unresolved_item_ids"]) == len(payload["blocking_items"])
+
+
+@pytest.mark.parametrize("summary", [
+    "Authorization is broken. Add a regression test.",
+    "CI is pending but the new resume path loses requirements.",
+    "The approval reuse implementation is incorrect.",
+])
+def test_pending_only_items_do_not_override_substantive_summary(summary):
+    review = parse_pr_review(
+        structured_pr_review(state="blocking", summary=summary,
+                             blocking_items=["GitHub check `test` is pending."]),
+        reviewer="OpenAI Codex",
+    )
+    assert not orchestrator._is_pending_ci_only_review(
+        review, _watch_check_board("pending", missing_required=("test",))
+    )
+
+
 def test_pr_loop_downgrades_pending_ci_only_blocking_review_with_auto_merge(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
             structured_pr_review(
                 state="blocking",
-                summary="Model-default consistency gaps are fixed.",
-                blocking_items=["GitHub check `test` is still pending/in_progress."],
+                summary="Review complete.",
+                blocking_items=["GitHub check `lint` is still pending/in_progress."],
             )
         ],
         # "test" (the configured auto-merge check) is already green; "lint" is
@@ -2782,7 +3031,15 @@ def test_pr_loop_combines_issue_and_pr_signed_human_requirements(tmp_path):
     runner = FakeRunner(
         codex_outputs=[
             "LGTM.\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
-        ],
+            ],
+        issue_payload={
+            "number": 56,
+            "title": "Support issue comments",
+            "body": "Preserve backward compatibility.\n\n-- Human Reviewer",
+            "author": {"login": "issue-author"},
+            "createdAt": "2026-05-17T08:00:00Z",
+            "url": "https://github.com/OWNER/REPO/issues/56",
+        },
         pr_payload={
             "comments": [
                 {
@@ -2949,8 +3206,35 @@ def test_pr_loop_skips_prior_approval_when_pr_head_is_unchanged(tmp_path):
     assert "round 1" in codex_reviews[0][-1]
 
 
-def test_pr_loop_rereviews_unchanged_head_when_new_human_requirement_is_surfaced(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    (
+        "second_requirement_body",
+        "second_requirement_created_at",
+        "second_requirement_url",
+        "expected_second_prompt_text",
+    ),
+    [
+        (
+            "Also preserve the reviewer attribution.",
+            "2026-05-18T10:10:00Z",
+            "https://github.com/OWNER/REPO/pull/77#issuecomment-2",
+            "stable-id",
+        ),
+        (
+            "The edited instruction changes the required audit trail.",
+            "2026-05-18T10:00:00Z",
+            "https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+            "The edited instruction changes the required audit trail.",
+        ),
+    ],
+)
+def test_pr_loop_rereviews_unchanged_head_when_human_requirement_changes(
+    tmp_path,
+    monkeypatch,
+    second_requirement_body,
+    second_requirement_created_at,
+    second_requirement_url,
+    expected_second_prompt_text,
 ):
     requirement_1 = HumanReviewRequirement(
         source_type="PR comment",
@@ -2962,10 +3246,12 @@ def test_pr_loop_rereviews_unchanged_head_when_new_human_requirement_is_surfaced
     requirement_2 = HumanReviewRequirement(
         source_type="PR comment",
         author="maintainer",
-        created_at="2026-05-18T10:10:00Z",
-        url="https://github.com/OWNER/REPO/pull/77#issuecomment-2",
-        body="Also preserve the reviewer attribution.",
+        created_at=second_requirement_created_at,
+        url=second_requirement_url,
+        body=second_requirement_body,
     )
+    if expected_second_prompt_text == "stable-id":
+        expected_second_prompt_text = f"Requirement {requirement_2.requirement_id}"
     runner = FakeRunner(
         codex_outputs=[
             structured_pr_review(
@@ -3021,23 +3307,51 @@ def test_pr_loop_rereviews_unchanged_head_when_new_human_requirement_is_surfaced
         head_sha="abc123",
         url="https://github.com/OWNER/REPO/pull/77",
     )
-    contexts = iter(
-        [
-            PullRequestReviewContext(
-                metadata=metadata,
-                comments=(),
-                human_requirements=(requirement_1,),
-            ),
-            PullRequestReviewContext(
-                metadata=metadata,
-                comments=(),
-                human_requirements=(requirement_1, requirement_2),
-            ),
-        ]
+    prior_codex_review = _attach_round_metadata(
+        structured_pr_review(
+            state="approved",
+            summary="Codex approves the initial requirement.",
+            human_requirements_resolved=True,
+            reviewer="OpenAI Codex",
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="OpenAI Codex",
+            round_number=1,
+            subject="abc123",
+            state="approved",
+            surfaced_reviewer_requirement_ids=("Requirement 1",),
+        ),
     )
+    context_calls = 0
+
+    def next_context(*args, **kwargs):
+        nonlocal context_calls
+        context_calls += 1
+        return PullRequestReviewContext(
+            metadata=metadata,
+            comments=(
+                IssueComment(
+                    author="coding-review-agent-loop",
+                    created_at="2026-05-18T11:00:00Z",
+                    body=str(prior_codex_review),
+                ),
+            )
+            if context_calls > 1
+            else (),
+            human_requirements=(
+                (requirement_2,)
+                if second_requirement_url.endswith("issuecomment-1")
+                else (requirement_1, requirement_2)
+            )
+            if context_calls > 1
+            else (requirement_1,),
+        )
+
     monkeypatch.setattr(
         "coding_review_agent_loop.orchestrator.get_pr_review_context",
-        lambda *args, **kwargs: next(contexts),
+        next_context,
     )
     config = make_config(
         tmp_path,
@@ -3050,7 +3364,7 @@ def test_pr_loop_rereviews_unchanged_head_when_new_human_requirement_is_surfaced
 
     codex_reviews = [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
     assert len(codex_reviews) == 2
-    assert "Requirement 2" in codex_reviews[1][-1]
+    assert expected_second_prompt_text in codex_reviews[1][-1]
 
 
 def test_pr_loop_ignores_approved_followups_by_default(tmp_path):
@@ -3604,6 +3918,14 @@ def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rerevie
             + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         claude_outputs=["Renamed helper.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+        issue_payload={"title": "Support issue comments", "body": "Original request."},
+        issue_comments=[
+            {
+                "author": {"login": "commenter"},
+                "createdAt": "2026-05-17T10:00:00Z",
+                "body": "Clarifying issue comment.",
+            }
+        ],
     )
     config = make_config(tmp_path, approved_followups="fix-and-summarize")
     issue_context = IssueContext(
@@ -5261,13 +5583,13 @@ def test_reconcile_human_requirements_ack_item_accepts_stored_structured_coder_f
                 "remaining_items": [],
                 "human_requirement_dispositions": [
                     {
-                        "requirement_id": "Requirement 1",
+                        "requirement_id": human_requirements[0].requirement_id,
                         "disposition": "addressed",
                         "evidence": "The URL fix is implemented.",
                     }
                 ],
                 "human_requirements": {
-                    "addressed_ids": ["Requirement 1"],
+                    "addressed_ids": [human_requirements[0].requirement_id],
                     "checked_discussion_directly": False,
                 },
             }

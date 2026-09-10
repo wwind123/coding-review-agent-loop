@@ -61,6 +61,7 @@ class IssuePrHandoffMetadata:
     expected_closing_issue_ids: tuple[int, ...] = ()
     contract_hash: str | None = None
     supersedes_hash: str | None = None
+    legacy_contract: bool = False
 
     def __post_init__(self) -> None:
         # Handoff records are issue-origin records, so the primary issue is
@@ -204,6 +205,7 @@ def _decode_issue_pr_handoff_metadata(encoded: str) -> IssuePrHandoffMetadata:
             "issue-implementation flow."
         )
     raw_expected = payload.get("expected_closing_issue_ids")
+    legacy_contract = raw_expected is None and payload.get("contract_hash") is None
     if raw_expected is None:
         expected_ids = (issue_number,)
     else:
@@ -245,6 +247,7 @@ def _decode_issue_pr_handoff_metadata(encoded: str) -> IssuePrHandoffMetadata:
         expected_closing_issue_ids=expected_ids,
         contract_hash=handoff_contract_hash,
         supersedes_hash=supersedes_hash if isinstance(supersedes_hash, str) else None,
+        legacy_contract=legacy_contract,
     )
 
 

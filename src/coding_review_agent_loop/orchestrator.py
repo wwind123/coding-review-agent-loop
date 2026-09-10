@@ -47,6 +47,8 @@ from .decomposition import (
     post_phase_implementation_handoff_comment,
     adapt_typed_child_stages,
     find_existing_topology_checkpoint,
+    PHASE_IDENTITY_MARKER_RE,
+    phase_identity,
     post_topology_checkpoint,
     TopologyCheckpoint,
 )
@@ -71,6 +73,8 @@ from .github import (
     PullRequestChecks,
     PullRequestMergeability,
     PullRequestReviewContext,
+    HumanReviewRequirement,
+    deduplicate_human_requirements,
     get_pr_head_sha,
     get_issue_context,
     get_pr_mergeability,
@@ -307,6 +311,7 @@ from .ci_health import (
     CiInfrastructureStall,
     StalledCheck,
     is_canonical_stall_only_text,
+    is_canonical_pending_only_text,
     is_wholly_infrastructure_blocked,
 )
 from .comment_rendering import (
@@ -355,6 +360,7 @@ from .followups import (
     FollowupSourceContext,
 )
 from .round_state import (
+    ApprovedPlanContext,
     PostedRoundMetadata,
     PostedRoundRecord,
     ROUND_RESUME_MARKER_RE,
@@ -373,6 +379,9 @@ from .round_state import (
     _prior_item_ledger_signature,
     _resume_discuss_round,
     _resume_plan_round,
+    make_approved_plan_context,
+    recover_approved_plan_context,
+    RequirementsContext,
     _resume_pr_round,
     _select_current_round_records,
     _serialize_disposition,
@@ -2051,6 +2060,9 @@ class CompletionRecoveryPolicy:
 
     issue_number: int
     issue_context: IssueContext | None = None
+    approved_plan_context: ApprovedPlanContext | None = None
+    parent_issue_context: IssueContext | None = None
+    human_requirements: tuple[HumanReviewRequirement, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -2141,6 +2153,9 @@ def _attempt_claude_completion_recovery(
     recovery_prompt = build_completion_recovery_prompt(
         config,
         issue_context=completion_recovery.issue_context,
+        approved_plan_context=completion_recovery.approved_plan_context,
+        parent_issue_context=completion_recovery.parent_issue_context,
+        human_requirements=completion_recovery.human_requirements,
     )
     recovery_result = run_agent_result(
         runner,
@@ -3642,10 +3657,39 @@ def _current_plan_has_complete_human_requirement_dispositions(
 def _merge_human_requirements(
     issue_context: IssueContext | None,
     pr_context: PullRequestReviewContext,
-):
-    combined = list(issue_context.human_requirements if issue_context is not None else ())
+    *,
+    parent_issue_context: IssueContext | None = None,
+    primary_issue_context: IssueContext | None = None,
+) -> tuple[HumanReviewRequirement, ...]:
+    """Merge only signed requirements from explicitly labeled sources."""
+    target = primary_issue_context or issue_context
+    combined: list[HumanReviewRequirement] = []
+    if parent_issue_context is not None:
+        combined.extend(parent_issue_context.human_requirements)
+    if target is not None:
+        combined.extend(target.human_requirements)
     combined.extend(pr_context.human_requirements)
-    return tuple(sorted(combined, key=lambda requirement: requirement.created_at or ""))
+    return deduplicate_human_requirements(combined)
+
+
+def _build_requirements_context(
+    *,
+    target_issue_context: IssueContext | None,
+    pr_context: PullRequestReviewContext,
+    parent_issue_context: IssueContext | None = None,
+) -> RequirementsContext:
+    effective = _merge_human_requirements(
+        target_issue_context,
+        pr_context,
+        parent_issue_context=parent_issue_context,
+    )
+    return RequirementsContext(
+        target_child=target_issue_context,
+        primary_issue=target_issue_context,
+        authoritative_parent=parent_issue_context,
+        pr_sources=tuple(pr_context.human_requirements),
+        effective_requirements=tuple(effective),
+    )
 
 
 def _surfaced_reviewer_requirement_ids(
@@ -3657,6 +3701,62 @@ def _surfaced_reviewer_requirement_ids(
         human_requirements,
         requirement_scope=requirement_scope,
     ).surfaced_requirement_ids
+
+
+def _reviewer_requirement_identity_ids(
+    human_requirements: Sequence[HumanReviewRequirement],
+) -> tuple[str, ...]:
+    """Return the stable IDs used by prompts, responses, and coverage metadata."""
+    return tuple(requirement.requirement_id for requirement in human_requirements)
+
+
+def _reviewer_requirement_coverage_matches(
+    human_requirements: Sequence[HumanReviewRequirement],
+    persisted_ids: Sequence[str],
+) -> bool:
+    """Return whether persisted reviewer coverage applies to these requirements.
+
+    Metadata written before digest-backed identities were introduced contains
+    positional labels. It is intentionally treated as legacy and never carries
+    approval across a non-empty signed-requirement set; the reviewer must run
+    again once current identities are available.
+    """
+    expected_ids = set(_reviewer_requirement_identity_ids(human_requirements))
+    if not expected_ids:
+        return True
+    persisted = {str(item) for item in persisted_ids}
+    if any(not re.fullmatch(r"hr-[0-9a-f]{64}", item) for item in persisted):
+        return False
+    return expected_ids.issubset(persisted)
+
+
+def _resumed_pr_reviewer_matches_requirements(
+    record: PostedRoundRecord,
+    human_requirements: Sequence[HumanReviewRequirement],
+    approved_plan_context: ApprovedPlanContext | None = None,
+) -> bool:
+    """Return whether a same-head resumed review still covers current requirements.
+
+    A reviewer comment can be posted before the process is interrupted and then
+    resumed after signed requirements are added or edited.  Apply the same
+    explicit legacy policy as carried approvals: empty requirements remain
+    resumable, while a non-empty current set requires both the resolution marker
+    and digest-backed identities from the persisted metadata.
+    """
+    plan_matches = approved_plan_context is None or (
+        record.metadata.approved_plan_hash == approved_plan_context.plan_hash
+        and record.metadata.approved_plan_subject == approved_plan_context.plan_subject
+    )
+    return plan_matches and (
+        not human_requirements
+        or (
+            human_requirements_resolved(record.body)
+            and _reviewer_requirement_coverage_matches(
+                human_requirements,
+                record.metadata.surfaced_reviewer_requirement_ids,
+            )
+        )
+    )
 
 
 def _validate_plan_revision_response(
@@ -3682,20 +3782,6 @@ def _validate_plan_revision_response(
             )
         return parsed
     raise AgentLoopError("Plan revision did not use the required structured format.")
-
-
-_PENDING_CI_TEXT_KEYWORDS = (
-    "pending",
-    "in progress",
-    "in_progress",
-    "queued",
-    "still running",
-    "not yet report",
-    "unavailable",
-    "check status",
-    "github check",
-    "ci check",
-)
 
 
 def _drop_repeated_carried_future_followups(
@@ -3763,7 +3849,9 @@ def _is_pending_ci_only_review(parsed_review: ParsedReview, pr_checks: PullReque
     reviewers not to use pending/unavailable checks as the sole reason to
     block, but a reviewer may still do so. Any other content (a distinct
     blocking item, or a Same-PR follow-up) causes this to return False so
-    mixed responses still route back to the coder normally.
+    mixed responses still route back to the coder normally. Whole-statement
+    matching is deliberately conservative: an unfamiliar phrasing must not
+    silently turn a blocking code review into an approval.
     """
     if pr_checks.state not in {"pending", "unavailable"}:
         return False
@@ -3778,15 +3866,15 @@ def _is_pending_ci_only_review(parsed_review: ParsedReview, pr_checks: PullReque
         candidate_texts = [parsed_review.summary]
     if not candidate_texts:
         return False
-    check_names = {check.name.lower() for check in pr_checks.pending}
-    check_names.update(name.lower() for name in pr_checks.missing_required)
-    for text in candidate_texts:
-        lowered = text.lower()
-        mentions_check_name = any(name in lowered for name in check_names)
-        mentions_ci_keyword = any(keyword in lowered for keyword in _PENDING_CI_TEXT_KEYWORDS)
-        if not (mentions_check_name or mentions_ci_keyword):
-            return False
-    return True
+    check_names = tuple(check.name for check in pr_checks.pending) + pr_checks.missing_required
+    if not all(is_canonical_pending_only_text(text, check_names=check_names) for text in candidate_texts):
+        return False
+    summary = (parsed_review.summary or "").strip()
+    return (
+        not summary
+        or summary in _BOILERPLATE_REVIEW_SUMMARIES
+        or is_canonical_pending_only_text(summary, check_names=check_names)
+    )
 
 
 def _coder_infrastructure_stall_notice(stalls: Sequence[StalledCheck]) -> str:
@@ -3817,7 +3905,7 @@ def _is_infrastructure_ci_only_review(parsed_review: ParsedReview, pr_checks: Pu
     job, or one cancelled before execution because a hosted runner was
     unavailable), rather than an actionable code-level finding.
 
-    Unlike `_is_pending_ci_only_review`'s keyword heuristic, this requires the
+    Like the pending-only filter, this fails closed on ambiguous prose. It requires the
     whole check board to already be classified `is_wholly_infrastructure_blocked`
     and every blocking item (and non-boilerplate summary) to pass the closed-
     vocabulary `is_canonical_stall_only_text` check. Any failure aborts the
@@ -4487,14 +4575,33 @@ def _implement_approved_issue(
     one_shot_parent_issue: int | None = None,
     plan_subject: str | None = None,
     staged_parent_issue: int | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+    parent_issue_context: IssueContext | None = None,
 ) -> int:
     implementation_config, reuse_planning_session = _approved_implementation_config(config)
     coder_name = agent_display_name(implementation_config.coder)
     implementation_session_id = coder_session_id if reuse_planning_session else None
-    plan_hash = approved_plan_hash(approved_plan)
+    plan_hash = (
+        approved_plan_context.plan_hash
+        if approved_plan_context is not None and approved_plan_context.plan_hash
+        else approved_plan_hash(approved_plan)
+    )
+    if approved_plan_context is None:
+        approved_plan_context = make_approved_plan_context(
+            approved_plan,
+            source_locator=f"issue #{issue_number} approved-plan implementation",
+            expected_hash=plan_hash,
+            expected_subject=plan_subject,
+        )
     plan_additions = _extract_current_expected_closing_issue_ids(approved_plan)
+    implementation_requirements = deduplicate_human_requirements(
+        [
+            *(parent_issue_context.human_requirements if parent_issue_context is not None else ()),
+            *issue_context.human_requirements,
+        ]
+    )
     implementation_human_requirements_context = render_coder_human_requirements_prompt_context(
-        issue_context.human_requirements,
+        implementation_requirements,
     )
 
     # A prior implementation attempt may have created a PR and then aborted
@@ -4619,6 +4726,8 @@ def _implement_approved_issue(
             pr_number=existing_pr_number,
             config=implementation_config,
             issue_context=issue_context,
+            approved_plan_context=approved_plan_context,
+            parent_issue_context=parent_issue_context,
             usage_context=usage_context,
             managed_ci_issue_number=issue_number,
         )
@@ -4656,12 +4765,14 @@ def _implement_approved_issue(
             salvage_summary=salvage_summary,
             staged_parent_issue=staged_parent_issue,
             managed_ci_creation_intent=managed_ci_creation_intent,
+            approved_plan_context=approved_plan_context,
+            parent_issue_context=parent_issue_context,
         ),
         session_id=implementation_session_id,
         marker_description="structured issue_implementation result, blocking, or clarification",
         validate=lambda text: _validate_issue_implementation_response(
             text,
-            human_requirements=issue_context.human_requirements,
+            human_requirements=implementation_requirements,
         ),
         usage_context=usage_context,
         role="coder",
@@ -4681,6 +4792,9 @@ def _implement_approved_issue(
         completion_recovery=CompletionRecoveryPolicy(
             issue_number=issue_number,
             issue_context=issue_context,
+            approved_plan_context=approved_plan_context,
+            parent_issue_context=parent_issue_context,
+            human_requirements=implementation_requirements,
         ),
     )
     coder_output = coder_response.text
@@ -4864,6 +4978,8 @@ def _implement_approved_issue(
         config=implementation_config,
         coder_session_id=coder_response.session_id,
         issue_context=issue_context,
+        approved_plan_context=approved_plan_context,
+        parent_issue_context=parent_issue_context,
         workdirs_ready=True,
         usage_context=usage_context,
         pre_review_test_pending=True,
@@ -5042,6 +5158,12 @@ def _run_plan_first_loop(
 ) -> int:
     if config.review_parallel:
         _ensure_parallel_reviewer_workdirs(config, flag_name="--review-parallel", role_label="reviewer")
+    staged_parent_number = _infer_staged_parent_issue(issue_context)
+    parent_issue_context = (
+        get_issue_context(runner, config=config, issue_number=staged_parent_number)
+        if staged_parent_number is not None
+        else None
+    )
     coder_name = agent_display_name(config.coder)
     configured_reviewers = reviewers(config)
     coder_session_id: str | None = None
@@ -5100,6 +5222,10 @@ def _run_plan_first_loop(
                 model_used=plan_response.model_used,
             )
         else:
+            # Preserve the exact free-form response as the canonical plan.
+            # The public comment may have a normalized signature, but plan
+            # recovery must hash the raw text selected by the handoff.
+            canonical_plan = current_plan
             public_plan_output = normalize_freeform_signature(
                 plan_output, agent=config.coder, config=config, model_used=plan_response.model_used
             )
@@ -5750,6 +5876,45 @@ def _run_plan_first_loop(
                     all_approved = False
 
         if all_approved and not must_fix_items:
+            # Re-read both sides at the approval-to-implementation boundary so
+            # a human instruction posted during planning cannot be hidden by
+            # the original snapshot. New signed IDs require a fresh planning
+            # acknowledgement rather than being silently folded into the plan.
+            refreshed_issue_context = get_issue_context(
+                runner, config=config, issue_number=issue_number
+            )
+            previous_requirement_ids = {
+                requirement.requirement_id for requirement in issue_context.human_requirements
+            }
+            refreshed_requirement_ids = {
+                requirement.requirement_id
+                for requirement in refreshed_issue_context.human_requirements
+            }
+            if not refreshed_requirement_ids.issubset(previous_requirement_ids):
+                raise AgentLoopError(
+                    f"Issue #{issue_number} gained signed human requirement(s) after plan approval. "
+                    "Re-run planning so the new signed requirements receive explicit acknowledgement."
+                )
+            issue_context = refreshed_issue_context
+            if parent_issue_context is not None:
+                previous_parent_requirement_ids = {
+                    requirement.requirement_id
+                    for requirement in parent_issue_context.human_requirements
+                }
+                refreshed_parent_context = get_issue_context(
+                    runner, config=config, issue_number=parent_issue_context.number
+                )
+                refreshed_parent_requirement_ids = {
+                    requirement.requirement_id
+                    for requirement in refreshed_parent_context.human_requirements
+                }
+                if not refreshed_parent_requirement_ids.issubset(previous_parent_requirement_ids):
+                    raise AgentLoopError(
+                        f"Authoritative parent issue #{parent_issue_context.number} gained signed "
+                        "human requirement(s) after plan approval. Re-run planning so the new "
+                        "signed parent requirements receive explicit acknowledgement."
+                    )
+                parent_issue_context = refreshed_parent_context
             approved_future_followup_sources = [
                 _plan_followup_source_from_unresolved_item(item)
                 for item in unresolved_items
@@ -5757,6 +5922,12 @@ def _run_plan_first_loop(
             ]
             plan_hash = approved_plan_hash(current_plan)
             plan_subject = _plan_subject(current_plan)
+            approved_plan_context = make_approved_plan_context(
+                current_plan,
+                source_locator=f"issue #{issue_number} approved-plan round",
+                expected_hash=plan_hash,
+                expected_subject=plan_subject,
+            )
             mode = config.plan_execution_mode
             if implement_after_approval:
                 mode = "implement-one-shot"
@@ -5857,6 +6028,9 @@ def _run_plan_first_loop(
                         "Cannot implement first decomposed phase because its child issue number "
                         "was not available from GitHub CLI output."
                     )
+                parent_issue_context = get_issue_context(
+                    runner, config=config, issue_number=issue_number
+                )
                 plan_hash = approved_plan_hash(current_plan)
                 handoff = find_existing_phase_implementation_handoff(
                     issue_context.comments,
@@ -5886,6 +6060,11 @@ def _run_plan_first_loop(
                     config=config,
                     memory=memory,
                     issue_context=child_issue_context,
+                    approved_plan_context=make_approved_plan_context(
+                        current_plan,
+                        source_locator=f"issue #{issue_number} topology checkpoint phase 1",
+                    ),
+                    parent_issue_context=parent_issue_context,
                     coder_session_id=coder_session_id,
                     usage_context=usage_context,
                 )
@@ -5973,6 +6152,9 @@ def _run_plan_first_loop(
                         runner, config=config, issue_number=target_issue_number
                     )
                     staged_parent_issue = issue_number
+                    parent_issue_context = get_issue_context(
+                        runner, config=config, issue_number=issue_number
+                    )
 
                 # Canonical handoff resolution runs before the (older,
                 # plan-hash-scoped) one-shot handoff lookup below, so a stale
@@ -6038,6 +6220,10 @@ def _run_plan_first_loop(
                         pr_number=resolved_pr.pr_number,
                         config=config,
                         issue_context=target_issue_context,
+                        approved_plan_context=approved_plan_context,
+                        parent_issue_context=(
+                            parent_issue_context if staged_parent_issue is not None else None
+                        ),
                         usage_context=usage_context,
                         managed_ci_issue_number=target_issue_number,
                     )
@@ -6107,6 +6293,10 @@ def _run_plan_first_loop(
                             pr_number=existing_handoff.pr_number,
                             config=config,
                             issue_context=target_issue_context,
+                            approved_plan_context=approved_plan_context,
+                            parent_issue_context=(
+                                parent_issue_context if staged_parent_issue is not None else None
+                            ),
                             usage_context=usage_context,
                             managed_ci_issue_number=target_issue_number,
                         )
@@ -6124,6 +6314,10 @@ def _run_plan_first_loop(
                     config=config,
                     memory=memory,
                     issue_context=target_issue_context,
+                    approved_plan_context=approved_plan_context,
+                    parent_issue_context=(
+                        parent_issue_context if staged_parent_issue is not None else None
+                    ),
                     coder_session_id=coder_session_id,
                     usage_context=usage_context,
                     one_shot_parent_issue=target_issue_number,
@@ -6216,6 +6410,9 @@ def _run_plan_first_loop(
         else:
             current_plan = plan_response.text
             current_coder_output = plan_response.text
+            # Free-form revisions also need a lossless canonical sidecar. The
+            # rendered signature is presentation only and is not plan identity.
+            canonical_plan = current_plan
             public_comment = normalize_freeform_signature(
                 plan_response.text, agent=config.coder, config=config, model_used=plan_response.model_used
             )
@@ -6269,21 +6466,57 @@ def run_issue_loop(
         validate_open_issue(runner, config=config, issue_number=issue_number)
         issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
         staged_parent_issue = _infer_staged_parent_issue(issue_context)
+        parent_issue_context = (
+            get_issue_context(runner, config=config, issue_number=staged_parent_issue)
+            if staged_parent_issue is not None
+            else None
+        )
 
         recovered_plan_hash: str | None = None
         recovered_plan_additions: tuple[int, ...] | None = None
+        recovered_plan_context: ApprovedPlanContext | None = None
         if plan_first:
-            # This is a comment-only reconstruction.  It must happen before
-            # memory preparation or any agent invocation so an existing
-            # approved-plan handoff can be checked without re-planning.
-            recovered_plan_state = _resume_plan_round(
-                issue_context.comments, configured_reviewers=reviewers(config)
+            # Prefer the plan hash recorded by the issue-side handoff. A later
+            # planning round may be unrelated to the PR already handed off, so
+            # resuming the newest plan would silently change the implementation
+            # contract. Fall back to the latest reconstructable round only when
+            # no approved-plan handoff has selected a plan yet.
+            recorded_plan_handoff = find_latest_issue_pr_handoff(
+                issue_context.comments,
+                issue_number=issue_number,
+                repo=config.repo,
             )
-            if recovered_plan_state is not None:
-                recovered_plan_hash = approved_plan_hash(recovered_plan_state[0])
-                recovered_plan_additions = _extract_current_expected_closing_issue_ids(
-                    recovered_plan_state[0]
+            if (
+                recorded_plan_handoff is not None
+                and recorded_plan_handoff.flow == "approved-plan-implementation"
+                and recorded_plan_handoff.plan_hash
+            ):
+                recovered_plan_hash = recorded_plan_handoff.plan_hash
+                recovered_plan_context = recover_approved_plan_context(
+                    issue_context.comments,
+                    expected_hash=recovered_plan_hash,
                 )
+                if recovered_plan_context.is_available:
+                    recovered_plan_additions = _extract_current_expected_closing_issue_ids(
+                        recovered_plan_context.canonical_text or ""
+                    )
+            else:
+                # This is a comment-only reconstruction. It must happen before
+                # memory preparation or any agent invocation so an existing
+                # plan can be checked without re-planning.
+                recovered_plan_state = _resume_plan_round(
+                    issue_context.comments, configured_reviewers=reviewers(config)
+                )
+                if recovered_plan_state is not None:
+                    recovered_plan_hash = approved_plan_hash(recovered_plan_state[0])
+                    recovered_plan_context = make_approved_plan_context(
+                        recovered_plan_state[0],
+                        source_locator=f"issue #{issue_number} reconstructed plan round",
+                        expected_hash=recovered_plan_hash,
+                    )
+                    recovered_plan_additions = _extract_current_expected_closing_issue_ids(
+                        recovered_plan_state[0]
+                    )
 
         # Resolve the canonical AGENT_ISSUE_PR_HANDOFF record (or, failing
         # that, the legacy exactly-one-open-PR search) before invoking a
@@ -6421,6 +6654,8 @@ def run_issue_loop(
                 pr_number=resolved_pr.pr_number,
                 config=config,
                 issue_context=issue_context,
+                approved_plan_context=recovered_plan_context,
+                parent_issue_context=parent_issue_context,
                 usage_context=usage_context,
                 managed_ci_issue_number=issue_number,
             )
@@ -6451,8 +6686,21 @@ def run_issue_loop(
             expected_closing_contract_resolved=True,
         )
 
+        # The first issue snapshot was used for validation and provenance; the
+        # implementation handoff must use fresh target and parent snapshots.
+        issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
+        if parent_issue_context is not None:
+            parent_issue_context = get_issue_context(
+                runner, config=config, issue_number=parent_issue_context.number
+            )
+        implementation_requirements = deduplicate_human_requirements(
+            [
+                *(parent_issue_context.human_requirements if parent_issue_context is not None else ()),
+                *issue_context.human_requirements,
+            ]
+        )
         implementation_human_requirements_context = render_coder_human_requirements_prompt_context(
-            issue_context.human_requirements,
+            implementation_requirements,
         )
         sync_coder_base_before_implementation(config, runner)
         managed_ci_creation_intent = None
@@ -6489,11 +6737,12 @@ def run_issue_loop(
                 salvage_summary=salvage_summary,
                 staged_parent_issue=staged_parent_issue,
                 managed_ci_creation_intent=managed_ci_creation_intent,
+                parent_issue_context=parent_issue_context,
             ),
             marker_description="structured issue_implementation result, blocking, or clarification",
             validate=lambda text: _validate_issue_implementation_response(
                 text,
-                human_requirements=issue_context.human_requirements,
+                human_requirements=implementation_requirements,
             ),
             usage_context=usage_context,
             use_repair=True,
@@ -6511,6 +6760,9 @@ def run_issue_loop(
             completion_recovery=CompletionRecoveryPolicy(
                 issue_number=issue_number,
                 issue_context=issue_context,
+                approved_plan_context=None,
+                parent_issue_context=parent_issue_context,
+                human_requirements=implementation_requirements,
             ),
         )
         coder_output = coder_response.text
@@ -7137,6 +7389,8 @@ def run_pr_loop(
     coder_session_id: str | None = None,
     reviewer_session_id: str | None = None,
     issue_context: IssueContext | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+    parent_issue_context: IssueContext | None = None,
     workdirs_ready: bool = False,
     usage_context: RunUsageContext | None = None,
     pre_review_test_pending: bool = False,
@@ -7236,6 +7490,20 @@ def run_pr_loop(
             repository=config.repo,
             pr_number=pr_number,
         )
+        issue_context_refreshed = False
+        parent_issue_context_refreshed = False
+        # A caller-provided issue snapshot may predate plan approval. Refresh
+        # it before deriving requirements or handoff provenance.
+        if issue_context is not None and not issue_context_refreshed:
+            issue_context = get_issue_context(
+                runner, config=config, issue_number=issue_context.number
+            )
+            issue_context_refreshed = True
+        if parent_issue_context is not None:
+            parent_issue_context = get_issue_context(
+                runner, config=config, issue_number=parent_issue_context.number
+            )
+            parent_issue_context_refreshed = True
         if config.expected_closing_contract_resolved:
             assert config.expected_closing_issue_ids is not None
             closing_contract = make_pr_contract(
@@ -7353,11 +7621,27 @@ def run_pr_loop(
                     "supersession; no durable metadata changed."
                 )
         if issue_context is None:
+            contract_primary_issue = (
+                recorded_pr_contract.primary_issue_number
+                if recorded_pr_contract is not None
+                else None
+            )
             linked_issue_numbers = parse_linked_issue_numbers(
                 initial_pr_context.metadata.body,
                 repo=config.repo,
             )
-            if len(linked_issue_numbers) == 1:
+            if contract_primary_issue is not None:
+                linked_issue_number = contract_primary_issue
+                log(
+                    config,
+                    f"PR #{pr_number} contract selects primary issue #{linked_issue_number}; "
+                    "using it for approved-plan provenance even if the PR body references other issues",
+                )
+                issue_context = get_issue_context(
+                    runner, config=config, issue_number=linked_issue_number
+                )
+                issue_context_refreshed = True
+            elif len(linked_issue_numbers) == 1:
                 linked_issue_number = linked_issue_numbers[0]
                 log(
                     config,
@@ -7367,6 +7651,7 @@ def run_pr_loop(
                 issue_context = get_issue_context(
                     runner, config=config, issue_number=linked_issue_number
                 )
+                issue_context_refreshed = True
             elif linked_issue_numbers:
                 candidates = ", ".join(f"#{number}" for number in linked_issue_numbers)
                 log(
@@ -7376,6 +7661,183 @@ def run_pr_loop(
                 )
             else:
                 log(config, f"PR #{pr_number} has no linked issue context to include in review prompts")
+
+        # Recover an approved plan only from the exact issue-side handoff that
+        # names this PR.  Newer planning comments cannot replace that binding.
+        if issue_context is not None:
+            staged_parent_number = _infer_staged_parent_issue(issue_context)
+            if staged_parent_number is not None and staged_parent_number != issue_context.number:
+                if parent_issue_context is None:
+                    parent_issue_context = get_issue_context(
+                        runner, config=config, issue_number=staged_parent_number
+                    )
+                    parent_issue_context_refreshed = True
+            issue_handoff = find_latest_issue_pr_handoff(
+                issue_context.comments,
+                issue_number=issue_context.number,
+                repo=config.repo,
+            )
+            if issue_handoff is not None and issue_handoff.pr_number != pr_number:
+                plan_bound_handoff = (
+                    issue_handoff.flow == "approved-plan-implementation"
+                    or (
+                        recorded_pr_contract is not None
+                        and recorded_pr_contract.origin_flow == "approved-plan-implementation"
+                    )
+                    or approved_plan_context is not None
+                )
+                if plan_bound_handoff:
+                    raise AgentLoopError(
+                        f"Issue #{issue_context.number} handoff selects PR #{issue_handoff.pr_number}, "
+                        f"not PR #{pr_number}; review the recorded PR directly or repair the handoff."
+                    )
+                log(
+                    config,
+                    f"Issue #{issue_context.number} has an older direct implementation handoff "
+                    f"for PR #{issue_handoff.pr_number}; it is unrelated to PR #{pr_number} "
+                    "and will not gate this ordinary direct review.",
+                )
+                issue_handoff = None
+            if issue_handoff is not None:
+                if recorded_pr_contract is not None and (
+                    recorded_pr_contract.primary_issue_number != issue_handoff.issue_number
+                    or recorded_pr_contract.origin_flow != issue_handoff.flow
+                ):
+                    raise AgentLoopError(
+                        "Issue-side and PR-side handoff provenance disagree on primary issue or flow."
+                    )
+                if issue_handoff.flow == "approved-plan-implementation":
+                    if not issue_handoff.plan_hash:
+                        raise AgentLoopError(
+                            f"Approved-plan handoff for issue #{issue_context.number} has no plan hash."
+                        )
+                    if approved_plan_context is not None and approved_plan_context.plan_hash != issue_handoff.plan_hash:
+                        raise AgentLoopError(
+                            f"PR #{pr_number} received approved plan {approved_plan_context.plan_hash}, "
+                            f"but the issue-side handoff requires {issue_handoff.plan_hash}."
+                        )
+                    if parent_issue_context is not None:
+                        child_bodies = [issue_context.body or ""] + [
+                            comment.body or "" for comment in issue_context.comments
+                        ]
+                        split_child = next(
+                            (SPLIT_CHILD_MARKER_RE.search(body) for body in child_bodies if SPLIT_CHILD_MARKER_RE.search(body)),
+                            None,
+                        )
+                        if split_child is not None:
+                            split_parent = int(split_child.group("parent"))
+                            if split_parent != parent_issue_context.number:
+                                raise AgentLoopError(
+                                    "Validated split-child marker names a different parent issue."
+                                )
+                            stage_handoff = find_existing_split_stage_handoff(
+                                parent_issue_context.comments,
+                                parent_issue=parent_issue_context.number,
+                                plan_hash=issue_handoff.plan_hash,
+                            )
+                            if stage_handoff is None or stage_handoff.child_issue_number != issue_context.number:
+                                raise AgentLoopError(
+                                    "Split child has no matching parent handoff selecting this exact child."
+                                )
+                        phase_marker = next(
+                            (PHASE_IDENTITY_MARKER_RE.search(body) for body in child_bodies if PHASE_IDENTITY_MARKER_RE.search(body)),
+                            None,
+                        )
+                        if phase_marker is not None:
+                            phase_payload = _decode_json_payload(
+                                phase_marker.group("payload"),
+                                marker_name="AGENT_PLAN_PHASE_IDENTITY",
+                            )
+                            if (
+                                phase_payload.get("parent_issue") != parent_issue_context.number
+                                or phase_payload.get("plan_hash") != issue_handoff.plan_hash
+                                or not isinstance(phase_payload.get("stage_id"), int)
+                            ):
+                                raise AgentLoopError(
+                                    "Decomposition child phase identity does not match the PR handoff or parent."
+                                )
+                            checkpoint = None
+                            for topology_mode in ("decompose-only", "implement-by-phase"):
+                                checkpoint = find_existing_topology_checkpoint(
+                                    parent_issue_context.comments,
+                                    parent_issue=parent_issue_context.number,
+                                    plan_hash=issue_handoff.plan_hash,
+                                    mode=topology_mode,
+                                )
+                                if checkpoint is not None:
+                                    break
+                            stage_id = phase_payload["stage_id"]
+                            if checkpoint is None or not 1 <= stage_id <= len(checkpoint.phases):
+                                raise AgentLoopError(
+                                    "Decomposition child phase is not covered by a matching parent topology checkpoint."
+                                )
+                            expected_identity = phase_identity(
+                                parent_issue=checkpoint.parent_issue,
+                                plan_hash=checkpoint.plan_hash,
+                                topology_source=checkpoint.topology_source,
+                                phase_index=stage_id,
+                                phase=checkpoint.phases[stage_id - 1],
+                            )
+                            if phase_payload.get("identity") != expected_identity:
+                                raise AgentLoopError(
+                                    "Decomposition child phase identity does not match the parent topology checkpoint."
+                                )
+                    if approved_plan_context is None or not approved_plan_context.is_available:
+                        expected_plan_subject = None
+                        one_shot_record = find_latest_one_shot_impl_handoff(
+                            issue_context.comments,
+                            parent_issue=issue_context.number,
+                            mode="implement-one-shot",
+                        )
+                        if (
+                            one_shot_record is not None
+                            and one_shot_record.plan_hash == issue_handoff.plan_hash
+                        ):
+                            expected_plan_subject = one_shot_record.plan_subject or None
+                        if approved_plan_context is None or not approved_plan_context.is_available:
+                            approved_plan_context = recover_approved_plan_context(
+                                issue_context.comments,
+                                expected_hash=issue_handoff.plan_hash,
+                                expected_subject=expected_plan_subject,
+                            )
+                            if (
+                                not approved_plan_context.is_available
+                                and not approved_plan_context.has_matching_candidate
+                                and parent_issue_context is not None
+                            ):
+                                parent_candidate = recover_approved_plan_context(
+                                    parent_issue_context.comments,
+                                    expected_hash=issue_handoff.plan_hash,
+                                    expected_subject=expected_plan_subject,
+                                )
+                                if parent_candidate.is_available:
+                                    approved_plan_context = parent_candidate
+                    if not approved_plan_context.is_available:
+                        raise AgentLoopError(
+                            f"PR #{pr_number} is bound to approved plan {issue_handoff.plan_hash}, "
+                            f"but the canonical plan could not be recovered: "
+                            f"{approved_plan_context.diagnostic or 'no diagnostic available'} "
+                            "Restore the plan round metadata or resume after repairing the issue handoff."
+                        )
+                    if (
+                        approved_plan_context.is_available
+                        and approved_plan_context.plan_hash != issue_handoff.plan_hash
+                    ):
+                        raise AgentLoopError(
+                            "Recovered approved plan hash does not match the issue-side handoff."
+                        )
+            elif (
+                recorded_pr_contract is not None
+                and recorded_pr_contract.origin_flow == "approved-plan-implementation"
+                and (
+                    approved_plan_context is None
+                    or not approved_plan_context.is_available
+                )
+            ):
+                raise AgentLoopError(
+                    f"PR #{pr_number} declares approved-plan provenance but issue #{issue_context.number} "
+                    "has no matching issue-side handoff. Reconcile the handoff before reviewing."
+                )
         if (
             closing_contract is not None
             and contract_needs_persisting
@@ -7586,6 +8048,22 @@ def run_pr_loop(
                 pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
             initial_pr_context = pr_context
             pr_metadata = pr_context.metadata
+            if issue_context is not None and not (
+                round_number == start_round_number and issue_context_refreshed
+            ):
+                issue_context = get_issue_context(
+                    runner, config=config, issue_number=issue_context.number
+                )
+            if issue_context is not None:
+                issue_context_refreshed = True
+            if parent_issue_context is not None and not (
+                round_number == start_round_number and parent_issue_context_refreshed
+            ):
+                parent_issue_context = get_issue_context(
+                    runner, config=config, issue_number=parent_issue_context.number
+                )
+            if parent_issue_context is not None:
+                parent_issue_context_refreshed = True
             pr_comments = pr_context.comments
             followup_source_context = _pr_followup_source_context(
                 config=config,
@@ -7607,7 +8085,12 @@ def run_pr_loop(
                     config=config,
                     head_sha=pr_metadata.head_sha,
                 )
-            human_requirements = _merge_human_requirements(issue_context, pr_context)
+            requirements_context = _build_requirements_context(
+                target_issue_context=issue_context,
+                pr_context=pr_context,
+                parent_issue_context=parent_issue_context,
+            )
+            human_requirements = requirements_context.effective_requirements
             current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
             unresolved_items = _reconcile_human_requirements_ack_item(
                 current_resume.prior_items if current_resume is not None else unresolved_items,
@@ -7666,13 +8149,18 @@ def run_pr_loop(
             coder_followup_context = _coder_followup_review_context(
                 latest_coder_output, latest_coder_metadata, head_sha=pr_metadata.head_sha,
             )
-            surfaced_reviewer_requirement_ids = _surfaced_reviewer_requirement_ids(
-                human_requirements,
-                requirement_scope="PR requirements",
+            # Persist the same digest identities surfaced in reviewer prompts.
+            # An edited signed comment must not inherit the old approval.
+            surfaced_reviewer_requirement_ids = _reviewer_requirement_identity_ids(
+                human_requirements
             )
             approved_review_outputs: list[tuple[str, str]] = []
             resumed_by_name = {
-                record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
+                record.metadata.agent: record
+                for record in (current_resume.completed_reviews if current_resume is not None else ())
+                if _resumed_pr_reviewer_matches_requirements(
+                    record, human_requirements, approved_plan_context
+                )
             }
             # Summaries are review-level context, not new findings or substitutes
             # for an item's immutable claim. Seed from saved reviews for recovery.
@@ -7688,6 +8176,7 @@ def run_pr_loop(
                 pr_comments,
                 head_sha=pr_metadata.head_sha,
                 configured_reviewers=configured_reviewers,
+                approved_plan_context=approved_plan_context,
             )
             skip_reviewers_for_recovery = bool(
                 current_resume is not None and current_resume.unrecorded_head_advance
@@ -7745,6 +8234,16 @@ def run_pr_loop(
                             acquisition_outcome=acquisition_outcome,
                             acquisition_returncode=acquisition_returncode,
                             surfaced_reviewer_requirement_ids=surfaced_reviewer_requirement_ids,
+                            approved_plan_hash=(
+                                approved_plan_context.plan_hash
+                                if approved_plan_context is not None
+                                else None
+                            ),
+                            approved_plan_subject=(
+                                approved_plan_context.plan_subject
+                                if approved_plan_context is not None
+                                else None
+                            ),
                             phase=phase,
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
                         ),
@@ -7768,8 +8267,9 @@ def run_pr_loop(
                         not human_requirements
                         or (
                             human_requirements_resolved(prior_approval.body)
-                            and set(surfaced_reviewer_requirement_ids).issubset(
-                                prior_approval.metadata.surfaced_reviewer_requirement_ids
+                            and _reviewer_requirement_coverage_matches(
+                                human_requirements,
+                                prior_approval.metadata.surfaced_reviewer_requirement_ids,
                             )
                         )
                     )
@@ -7838,6 +8338,8 @@ def run_pr_loop(
                                 ),
                                 compact_tail=pr_parallel_compact_tail,
                                 coder_followup_context=coder_followup_context,
+                                approved_plan_context=approved_plan_context,
+                                parent_issue_context=parent_issue_context,
                             )
                             for reviewer in launchable_pr_reviewers
                         }
@@ -7970,8 +8472,9 @@ def run_pr_loop(
                         not human_requirements
                         or (
                             human_requirements_resolved(prior_approval.body)
-                            and set(surfaced_reviewer_requirement_ids).issubset(
-                                prior_approval.metadata.surfaced_reviewer_requirement_ids
+                            and _reviewer_requirement_coverage_matches(
+                                human_requirements,
+                                prior_approval.metadata.surfaced_reviewer_requirement_ids,
                             )
                         )
                     )
@@ -8083,6 +8586,8 @@ def run_pr_loop(
                                 ),
                                 compact_tail=compact_tail,
                                 coder_followup_context=coder_followup_context,
+                                approved_plan_context=approved_plan_context,
+                                parent_issue_context=parent_issue_context,
                             ),
                             session_id=(
                                 None
@@ -9238,6 +9743,53 @@ def run_pr_loop(
             # check-run, commit-status, or branch-protection API calls.
             if pr_checks is None and not has_merge_conflict_item:
                 pr_checks = get_pr_checks(runner, config=config, metadata=pr_metadata)
+                if managed_ci_active(pr_metadata):
+                    pr_checks = intermediate_managed_checks(pr_checks)
+            if pr_checks is not None and not has_merge_conflict_item:
+                stalled = {(check.kind, check.name) for check in pr_checks.infrastructure_stalls}
+                failures = tuple(
+                    check for check in pr_checks.failing
+                    if (check.kind, check.name) not in stalled
+                )
+                # This is a single post-review snapshot, not a CI wait. Only
+                # observed failures become work; missing/pending checks do not.
+                if failures and not any(
+                    item.reviewer == "GitHub PR checks" and item.source_round == round_number
+                    for item in unresolved_items
+                ):
+                    failure_snapshot = dataclasses_replace(
+                        pr_checks, state="failing", failing=failures,
+                        pending=(), missing_required=(), infrastructure_stalls=(),
+                        required_checks=(), branch_protection_note=None,
+                    )
+                    details = _pr_check_details(failure_snapshot)
+                    details.append(f"Reviewed head: {pr_metadata.head_sha}")
+                    text = _pr_check_blocking_review(pr_number, "failing", details) + (
+                        "\nInspect the linked failure logs and address these failures alongside "
+                        "the reviewer findings. Run relevant local regression tests. Do not wait "
+                        "for queued or running CI checks before returning your follow-up."
+                    )
+                    existing = next(
+                        (item for item in unresolved_items if item.reviewer == "GitHub PR checks"),
+                        None,
+                    )
+                    if existing is not None:
+                        unresolved_items = [
+                            dataclasses_replace(item, text=text, source_round=round_number, status="blocking")
+                            if item is existing else item for item in unresolved_items
+                        ]
+                    else:
+                        unresolved_items.append(_next_unresolved_item(
+                            item_number=next_unresolved_item_number,
+                            reviewer="GitHub PR checks", source_round=round_number,
+                            text=text, status="blocking",
+                        ))
+                        next_unresolved_item_number += 1
+                    log(config, f"Round {round_number}: including available CI failures in coder follow-up")
+                    post_pr_comment(
+                        runner, config=config, pr_number=pr_number,
+                        body=_format_pr_checks_comment(pr_number, "failing", details),
+                    )
             stall_context = (
                 _coder_infrastructure_stall_notice(pr_checks.infrastructure_stalls)
                 if pr_checks is not None and is_wholly_infrastructure_blocked(pr_checks)
@@ -9289,6 +9841,8 @@ def run_pr_loop(
                     head_sha=resolved_head_sha,
                     merge_state_detail=merge_state_detail,
                     human_requirements_context=coder_human_requirements_context,
+                    approved_plan_context=approved_plan_context,
+                    parent_issue_context=parent_issue_context,
                 )
                 log(config, f"Round {round_number}: {coder_name} resolving merge conflict")
             elif same_pr_items and not blocking_items:
@@ -9305,6 +9859,8 @@ def run_pr_loop(
                     issue_context=issue_context,
                     human_requirements=human_requirements,
                     human_requirements_context=coder_human_requirements_context,
+                    approved_plan_context=approved_plan_context,
+                    parent_issue_context=parent_issue_context,
                 )
                 log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
             else:
@@ -9321,6 +9877,8 @@ def run_pr_loop(
                     issue_context=issue_context,
                     human_requirements=human_requirements,
                     human_requirements_context=coder_human_requirements_context,
+                    approved_plan_context=approved_plan_context,
+                    parent_issue_context=parent_issue_context,
                 )
                 log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
             repair_unresolved_item_ids = tuple(
