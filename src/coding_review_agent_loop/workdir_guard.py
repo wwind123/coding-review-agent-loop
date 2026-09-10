@@ -1072,12 +1072,21 @@ def _validate_command_contents(command: str, *, assigned: Path, origin: Origin) 
         )
 
     clauses = _clauses_for_entry(command, origin)
-
+    # A preflight (pwd/git status) can precede a managed test command. Apply
+    # the exact wrapper contract per clause, not just to the whole report.
+    ordinary_clauses: list[_Clause] = []
     for clause in clauses:
+        if not _validate_managed_command(
+            shlex.join(clause.tokens), assigned=assigned,
+            origin="structured" if clause.mode in {"structured", "code"} else "response",
+        ):
+            ordinary_clauses.append(clause)
+
+    for clause in ordinary_clauses:
         for raw_path, role in _path_roles(clause):
             _check_path_role(raw_path, role, command=command, assigned=assigned)
 
-    for clause in clauses:
+    for clause in ordinary_clauses:
         for target in _url_targets_in_clause(clause):
             if _has_unmatched_url_scheme(target):
                 # A scheme occurrence that produced no (or the wrong)
@@ -1100,7 +1109,7 @@ def _validate_command_contents(command: str, *, assigned: Path, origin: Origin) 
                 )
 
 
-def _validate_single_command(command: str, *, assigned: Path, origin: Origin) -> None:
+def _validate_managed_command(command: str, *, assigned: Path, origin: Origin) -> bool:
     # The managed wrapper itself is an absolute executable outside the checkout
     # by design, and its memory directory is an output location.  Once the
     # exact contract is recognized, validate leading shell assignments and the
@@ -1123,8 +1132,13 @@ def _validate_single_command(command: str, *, assigned: Path, origin: Origin) ->
         _validate_single_command(
             shlex.join(managed.inner_argv), assigned=assigned, origin=origin
         )
-        return
-    _validate_command_contents(command, assigned=assigned, origin=origin)
+        return True
+    return False
+
+
+def _validate_single_command(command: str, *, assigned: Path, origin: Origin) -> None:
+    if not _validate_managed_command(command, assigned=assigned, origin=origin):
+        _validate_command_contents(command, assigned=assigned, origin=origin)
 
 
 def validate_test_commands_within_workdir(

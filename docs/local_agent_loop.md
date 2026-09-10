@@ -2751,6 +2751,15 @@ Agents may use a learned sub-ceiling recommendation when rendered, but must
 continue to select focused tests and may split or shard long browser,
 integration, or end-to-end matrices.
 
+Test-report location validation recognizes the managed wrapper both as a
+standalone invocation and in parsed shell clauses such as
+`pwd && git status --branch --short && /absolute/path/agent-loop run-tests -- python3 -m pytest tests/test_api.py`.
+Only the exact wrapper executable and its memory-output option receive the
+special exemption. The inner command, leading assignments, and surrounding
+clauses still undergo the existing path and live-target checks. Malformed
+wrapper options receive no special exemption. This validates reported command
+text; it does not execute the report or provide a shell sandbox.
+
 With writable agent memory, measured wrapper/gate outcomes are stored in the
 versioned `test-runtime.json` sidecar. It records elapsed time, attempted cap,
 outcome, commit, input hashes, and a privacy-preserving local environment

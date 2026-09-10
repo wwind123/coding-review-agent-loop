@@ -55,6 +55,68 @@ def test_malformed_managed_run_tests_never_gets_a_wrapper_exemption(tmp_path):
 
 @pytest.mark.parametrize("origin", ["structured", "response"])
 @pytest.mark.parametrize("wrapper", [
+    "/home/wwind123/.local/bin/agent-loop run-tests",
+    shlex.join([sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests"]),
+])
+@pytest.mark.parametrize("chain", [
+    "pwd && git status --branch --short && {wrapper}",
+    "pwd ; {wrapper} ; git status --short",
+    "false || {wrapper}",
+    "{wrapper} && pwd && {wrapper}",
+])
+def test_chained_managed_tests_preserve_wrapper_exemption(tmp_path, origin, wrapper, chain):
+    wrapped = (
+        f"EXECUTION_MODE=inline {wrapper} --timeout-seconds 120 "
+        "--memory-dir '/outside/cache with spaces' -- python3 -m pytest "
+        "tests/test_skill_helpers.py tests/test_decomposition.py tests/test_split_materialization.py -q"
+    )
+    validate_test_commands_within_workdir(
+        [chain.format(wrapper=wrapped)], assigned_workdir=tmp_path, origin=origin,
+    )
+
+
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize("chain,error", [
+    ("cd /outside && {wrapper}", "outside the assigned checkout"),
+    ("{wrapper} && cd /outside && pytest", "outside the assigned checkout"),
+    ("pwd && {wrapper} /outside/tests/test_api.py", "outside the assigned checkout"),
+    ("pwd && {wrapper} --rootdir=/outside", "outside the assigned checkout"),
+    ("curl https://live.example && {wrapper}", "live remote target"),
+    ("{wrapper} && curl https://live.example", "live remote target"),
+    ("pwd && E2E_BASE=https://live.example {wrapper}", "live remote target"),
+    ("pwd && {wrapper} https://live.example", "live remote target"),
+    ("{wrapper} && /outside/agent-loop run-tests -- python3 /outside/test.py", "outside the assigned checkout"),
+    ("echo /outside/agent-loop run-tests -- python3 tests/test_api.py && {wrapper}", "outside the assigned checkout"),
+])
+def test_chained_managed_tests_do_not_hide_other_targets(tmp_path, origin, chain, error):
+    wrapped = "/outside/agent-loop run-tests --memory-dir /outside/cache -- python3 -m pytest tests/test_api.py"
+    with pytest.raises(AgentLoopError, match=error):
+        validate_test_commands_within_workdir(
+            [chain.format(wrapper=wrapped)], assigned_workdir=tmp_path, origin=origin,
+        )
+
+
+@pytest.mark.parametrize("options", [
+    "--unknown --", "--timeout-seconds 120", "--timeout-seconds invalid --",
+    "--memory-dir /outside/cache --memory-dir /another/cache --",
+])
+def test_chained_malformed_wrapper_is_not_exempt(tmp_path, options):
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir(
+            [f"pwd && /outside/agent-loop run-tests {options} python3 -m pytest tests/test_api.py"],
+            assigned_workdir=tmp_path,
+        )
+
+
+def test_chained_wrapper_in_legacy_backticked_report(tmp_path):
+    validate_test_commands_within_workdir(
+        ["Tests: `pwd && /outside/agent-loop run-tests -- python3 -m pytest tests/test_api.py` (passed)."],
+        assigned_workdir=tmp_path, origin="response",
+    )
+
+
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize("wrapper", [
     ["/outside/bin/agent-loop", "run-tests"],
     [sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests"],
 ])
