@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 from .agents.base import AgentName
-from .agents.registry import agent_display_name
+from .agents.registry import agent_display_name, agent_signature
 from .errors import AgentLoopError
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, encode_mapping, hydrate_mapping
 from .protocol_markers import TrustedBody, scan_reserved_markers
@@ -52,6 +52,11 @@ class PostedRoundMetadata:
     state: str | None = None
     canonical_plan: str | None = None
     raw_structured_coder_response: str | None = None
+    # Identity of the approved plan surfaced to a PR reviewer.  These fields
+    # are deliberately separate from ``subject`` (the PR head for PR reviews)
+    # so same-head approvals cannot cross a plan handoff.
+    approved_plan_hash: str | None = None
+    approved_plan_subject: str | None = None
     compact_prior_summaries: tuple[str, ...] = ()
     usage: dict | None = None
     model_used: str | None = None
@@ -272,6 +277,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "state": metadata.state,
         "canonical_plan": metadata.canonical_plan,
         "raw_structured_coder_response": metadata.raw_structured_coder_response,
+        "approved_plan_hash": metadata.approved_plan_hash,
+        "approved_plan_subject": metadata.approved_plan_subject,
         "compact_prior_summaries": list(metadata.compact_prior_summaries),
         "usage": metadata.usage,
         "model_used": metadata.model_used,
@@ -330,6 +337,16 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             raw_structured_coder_response=(
                 str(payload["raw_structured_coder_response"])
                 if payload.get("raw_structured_coder_response") is not None
+                else None
+            ),
+            approved_plan_hash=(
+                str(payload["approved_plan_hash"])
+                if payload.get("approved_plan_hash") is not None
+                else None
+            ),
+            approved_plan_subject=(
+                str(payload["approved_plan_subject"])
+                if payload.get("approved_plan_subject") is not None
                 else None
             ),
             compact_prior_summaries=tuple(
@@ -515,6 +532,7 @@ def _latest_pr_approved_reviews_for_head(
     *,
     head_sha: str | None,
     configured_reviewers: Sequence[AgentName],
+    approved_plan_context: ApprovedPlanContext | None = None,
 ) -> dict[str, PostedRoundRecord]:
     """Return each reviewer's latest approval for the current immutable PR head."""
     if not head_sha:
@@ -535,6 +553,13 @@ def _latest_pr_approved_reviews_for_head(
         reviewer: record
         for reviewer, record in latest_by_reviewer.items()
         if record.metadata.state == "approved"
+        and (
+            approved_plan_context is None
+            or (
+                record.metadata.approved_plan_hash == approved_plan_context.plan_hash
+                and record.metadata.approved_plan_subject == approved_plan_context.plan_subject
+            )
+        )
     }
 
 
@@ -818,6 +843,73 @@ def make_approved_plan_context(
     )
 
 
+def _legacy_freeform_plan_candidates(record: PostedRoundRecord) -> tuple[str, ...]:
+    """Return raw-text candidates for pre-canonical free-form plan comments.
+
+    Older plan comments stored only the rendered body.  The renderer may have
+    replaced a trailing provider-only signature with a model-qualified one, so
+    migration recovery considers the visible body, the body without that
+    generated signature, and the provider signatures that could have been
+    replaced.  The caller still validates the short hash and full subject
+    against the durable handoff before accepting any candidate.
+    """
+    visible = record.body.strip()
+    if not visible:
+        return ()
+    candidates: list[str] = [visible]
+    lines = visible.splitlines()
+    tail = len(lines)
+    while tail > 0 and (
+        not lines[tail - 1].strip() or HTML_COMMENT_RE.match(lines[tail - 1])
+    ):
+        tail -= 1
+    if tail <= 0 or not SIGNATURE_RE.match(lines[tail - 1]):
+        return tuple(dict.fromkeys(candidates))
+
+    signature_index = tail - 1
+    suffix = lines[tail:]
+    without_signature = "\n".join([*lines[:signature_index], *suffix]).strip()
+    if without_signature:
+        candidates.append(without_signature)
+
+    for agent in ("claude", "codex", "gemini", "antigravity"):
+        if record.metadata.agent != agent_display_name(agent):
+            continue
+        signatures = {
+            agent_signature(agent),
+            agent_signature(agent, model_used=record.metadata.model_used),
+        }
+        if record.metadata.configured_model:
+            configured_label = record.metadata.configured_model
+            if record.metadata.configured_effort:
+                configured_label = f"{configured_label} ({record.metadata.configured_effort})"
+            signatures.add(agent_signature(agent, model_used=configured_label))
+        for signature in signatures:
+            reconstructed = "\n".join(
+                [*lines[:signature_index], f"-- {signature}", *suffix]
+            ).strip()
+            if reconstructed:
+                candidates.append(reconstructed)
+        break
+    spaced_candidates: list[str] = []
+    for candidate in candidates:
+        spaced_candidates.append(candidate)
+        candidate_lines = candidate.splitlines()
+        with_comment_spacing: list[str] = []
+        for line in candidate_lines:
+            if (
+                HTML_COMMENT_RE.match(line)
+                and with_comment_spacing
+                and with_comment_spacing[-1].strip()
+            ):
+                with_comment_spacing.append("")
+            with_comment_spacing.append(line)
+        spaced = "\n".join(with_comment_spacing).strip()
+        if spaced:
+            spaced_candidates.append(spaced)
+    return tuple(dict.fromkeys(spaced_candidates))
+
+
 def recover_approved_plan_context(
     comments: Sequence[object],
     *,
@@ -828,20 +920,50 @@ def recover_approved_plan_context(
     records = _extract_round_metadata_records(comments, flow="plan")
     candidates: list[tuple[int, str]] = []
     observed_hashes: set[str] = set()
+    observed_subjects: set[str] = set()
+    subject_rejected = False
     for record in records:
         raw = record.metadata.canonical_plan
         if raw is None:
             # Legacy freeform plan records have no canonical sidecar. Their
-            # visible body is only a safe fallback when its raw hash matches.
+            # visible body is only a safe fallback when its raw hash and plan
+            # subject match. normalize_freeform_signature may have replaced a
+            # provider-only trailing signature, so try the body with that
+            # generated signature removed/reconstructed as well.
             raw = record.metadata.raw_structured_coder_response
-        if raw is None:
-            continue
-        actual_hash = _approved_plan_hash(raw)
-        observed_hashes.add(actual_hash)
-        if actual_hash == expected_hash:
-            candidates.append((record.index, raw))
+        raw_candidates = (raw,) if raw is not None else _legacy_freeform_plan_candidates(record)
+        # A canonical sidecar is already authoritative; only the migration
+        # fallback needs the legacy metadata subject as a second identity
+        # check. Existing canonical records may use arbitrary subjects from
+        # older metadata versions and must remain recoverable by handoff hash.
+        required_subject = (
+            expected_subject
+            if raw is not None
+            else expected_subject or record.metadata.subject
+        )
+        for candidate in raw_candidates:
+            if candidate is None or not candidate.strip():
+                continue
+            candidate = candidate.strip()
+            actual_hash = _approved_plan_hash(candidate)
+            observed_hashes.add(actual_hash)
+            actual_subject = _plan_subject(candidate)
+            observed_subjects.add(actual_subject)
+            if actual_hash != expected_hash:
+                continue
+            if required_subject and actual_subject != required_subject:
+                subject_rejected = True
+                continue
+            candidates.append((record.index, candidate))
     if not candidates:
         available = ", ".join(sorted(observed_hashes)) or "none"
+        subject_detail = ""
+        if subject_rejected:
+            subject_detail = (
+                " The handoff hash was observed, but no candidate also matched the "
+                f"expected plan subject; recovered subjects: "
+                f"{', '.join(sorted(observed_subjects)) or 'none'}."
+            )
         return ApprovedPlanContext(
             plan_hash=expected_hash,
             plan_subject=expected_subject,
@@ -849,7 +971,7 @@ def recover_approved_plan_context(
             has_matching_candidate=False,
             diagnostic=(
                 f"No canonical approved plan matches handoff hash {expected_hash}; "
-                f"recovered plan hashes: {available}."
+                f"recovered plan hashes: {available}.{subject_detail}"
             ),
         )
     unique_texts = {raw for _index, raw in candidates}

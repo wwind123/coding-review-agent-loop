@@ -14,6 +14,7 @@ from coding_review_agent_loop.github import (
     PullRequestReviewContext,
     deduplicate_human_requirements,
 )
+from coding_review_agent_loop.comment_rendering import normalize_freeform_signature
 from coding_review_agent_loop.prompts import (
     build_review_prompt,
     format_human_requirements,
@@ -26,6 +27,7 @@ from coding_review_agent_loop.round_state import (
     _attach_round_metadata,
     make_approved_plan_context,
     recover_approved_plan_context,
+    _latest_pr_approved_reviews_for_head,
 )
 
 
@@ -107,6 +109,45 @@ def test_interrupted_current_round_rechecks_resumed_reviewer_requirement_coverag
 
     assert _resumed_pr_reviewer_matches_requirements(record, (original,))
     assert not _resumed_pr_reviewer_matches_requirements(record, (edited,))
+
+
+def test_latest_same_head_approval_does_not_fall_back_past_plan_mismatch():
+    plan = make_approved_plan_context("Approved plan")
+    old = _attach_round_metadata(
+        "Old approval",
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="same-head",
+            state="approved",
+            approved_plan_hash=plan.plan_hash,
+            approved_plan_subject=plan.plan_subject,
+        ),
+    )
+    newer = _attach_round_metadata(
+        "Approval without plan identity",
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="same-head",
+            state="approved",
+        ),
+    )
+    comments = (
+        IssueComment(author="bot", created_at="2026-01-01T00:00:00Z", body=old),
+        IssueComment(author="bot", created_at="2026-01-01T00:01:00Z", body=newer),
+    )
+
+    assert _latest_pr_approved_reviews_for_head(
+        comments,
+        head_sha="same-head",
+        configured_reviewers=("codex",),
+        approved_plan_context=plan,
+    ) == {}
 
 
 def test_legacy_positional_acknowledgement_remains_resumable():
@@ -200,6 +241,45 @@ def test_plan_recovery_selects_expected_hash_not_newest_plan():
     assert recovered.is_available
     assert recovered.canonical_text == old_plan
     assert "Preserve the API" in recovered.canonical_text
+
+
+def test_legacy_freeform_plan_recovery_reverses_signature_normalization():
+    raw_plan = (
+        "Approved free-form plan\n\n"
+        "### Scope\n- Preserve the API.\n\n"
+        "<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude"
+    )
+    public_plan = normalize_freeform_signature(
+        raw_plan,
+        agent="claude",
+        config=None,
+        model_used="gpt-5.5 (medium)",
+    )
+    comment = IssueComment(
+        author="coder",
+        created_at="2026-01-01T00:00:00Z",
+        body=_attach_round_metadata(
+            public_plan,
+            PostedRoundMetadata(
+                flow="plan",
+                role="coder",
+                agent="Claude",
+                round_number=1,
+                subject=make_approved_plan_context(raw_plan).plan_subject,
+                model_used="gpt-5.5 (medium)",
+            ),
+        ),
+    )
+
+    expected = make_approved_plan_context(raw_plan)
+    recovered = recover_approved_plan_context(
+        (comment,),
+        expected_hash=expected.plan_hash,
+        expected_subject=expected.plan_subject,
+    )
+
+    assert recovered.is_available
+    assert recovered.canonical_text == raw_plan
 
 
 def test_plan_identity_mismatch_is_explicit_and_raw_text_is_not_silently_used():

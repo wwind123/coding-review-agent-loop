@@ -1864,12 +1864,57 @@ class TestSkillApprovedPlanRecovery:
                 },
             )
 
+    def test_legacy_linked_issue_read_failure_is_not_downgraded_to_diff_only(self, monkeypatch) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.errors import AgentLoopError
+
+        def fail_to_read(repo, issue):
+            raise AgentLoopError("legacy linked issue comments unavailable")
+
+        monkeypatch.setattr(sr, "_fetch_issue_comments_raw", fail_to_read)
+
+        with pytest.raises(AgentLoopError, match="legacy linked issue comments unavailable"):
+            sr._recover_skill_pr_plan_context(
+                "owner/repo", 7, {"body": "Fixes owner/repo#42"}
+            )
+
     def test_unplanned_direct_pr_does_not_require_plan(self) -> None:
         import helpers.skill_runner as sr
 
         assert sr._recover_skill_pr_plan_context(
             "owner/repo", 7, {"body": "A direct PR without a linked issue."}
         ) is None
+
+    def test_partial_same_head_resume_keeps_only_matching_plan_approval(self) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.round_state import make_approved_plan_context
+
+        plan = make_approved_plan_context("Approved plan")
+        resume = {
+            "current_plan_subject": "head-7",
+            "completed_reviewer_names": ["Codex", "Gemini"],
+            "completed_reviewer_data": [
+                {
+                    "reviewer_name": "Codex",
+                    "state": "approved",
+                    "approved_plan_hash": plan.plan_hash,
+                    "approved_plan_subject": plan.plan_subject,
+                },
+                {
+                    "reviewer_name": "Gemini",
+                    "state": "approved",
+                },
+            ],
+        }
+
+        filtered = sr._filter_resume_for_approved_plan(
+            resume,
+            head_sha="head-7",
+            approved_plan_context=plan,
+        )
+
+        assert filtered["completed_reviewer_names"] == ["Codex"]
+        assert [r["reviewer_name"] for r in filtered["completed_reviewer_data"]] == ["Codex"]
 
 
 # ---------------------------------------------------------------------------
@@ -2463,6 +2508,8 @@ class TestReverseRolesHelpers:
             "--flow", "plan", "--role", "coder", "--agent", "Codex",
             "--round-number", "2", "--state", "approved", "--subject", "abc123",
             "--raw-structured-coder-response-file", raw,
+            "--approved-plan-hash", "0123456789abcdef",
+            "--approved-plan-subject", "f" * 64,
         )
         text = Path(out).read_text(encoding="utf-8")
         m = _re.search(r"AGENT_LOOP_META:\s*([A-Za-z0-9+/=_-]+)", text)
@@ -2470,6 +2517,8 @@ class TestReverseRolesHelpers:
         meta = _decode_round_metadata(m.group(1))
         assert meta.agent == "Codex"
         assert meta.raw_structured_coder_response.strip() == '{"kind": "plan_revision", "x": 1}'
+        assert meta.approved_plan_hash == "0123456789abcdef"
+        assert meta.approved_plan_subject == "f" * 64
 
 
 # ---------------------------------------------------------------------------
@@ -3343,6 +3392,10 @@ class TestRunPrFix:
             return subprocess.CompletedProcess(args, 0)
 
         monkeypatch.setattr(sr, "_fetch_pr_json", lambda repo, pr: next(pr_infos))
+        # The PR has a unique legacy closing link but no PR-side contract. The
+        # new fail-closed provenance check still supports it when issue history
+        # is readable; provide that readable empty history in this unit test.
+        monkeypatch.setattr(sr, "_fetch_issue_comments_raw", lambda repo, issue: [])
         monkeypatch.setattr(sr, "_build_resume", lambda *a, **k: _pr_fix_resume())
         monkeypatch.setattr(sr, "_reconcile_pending_comment", lambda *a, **k: None)
         monkeypatch.setattr(sr, "_position_pr_fix_workdir", lambda **kwargs: None)

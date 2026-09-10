@@ -538,6 +538,7 @@ def _save_raw_to_repair_dir(
     raw_output: Path,
     context_file: Path,
     prior_items_file: Path,
+    approved_plan_context: ApprovedPlanContext | None = None,
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy raw response + context to a stable repair dir before normalization/validation."""
@@ -553,6 +554,9 @@ def _save_raw_to_repair_dir(
         "item_id_offset": item_id_offset, "validate_kind": validate_kind,
         "dry_run": dry_run, "gemini_cmd": gemini_cmd,
     }
+    if approved_plan_context is not None:
+        manifest["approved_plan_hash"] = approved_plan_context.plan_hash
+        manifest["approved_plan_subject"] = approved_plan_context.plan_subject
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -1125,13 +1129,11 @@ def _recover_skill_pr_plan_context(
             for body in _fetch_issue_comments_raw(repo, issue_number)
         ]
     except AgentLoopError:
-        # Without a PR-side approved-plan contract this may be an ordinary
-        # direct PR whose body happens to contain one closing reference. Such
-        # a PR remains supported without issue-history enrichment. A contract
-        # explicitly declaring approved-plan provenance, however, must fail
-        # closed when its issue history cannot be read.
-        if pr_contract is None:
-            return None
+        # A uniquely closing-linked issue is the authoritative legacy
+        # provenance source when no PR-side contract exists. If that history
+        # cannot be read, do not silently downgrade the review to diff-only;
+        # the caller needs an actionable recovery error. Ordinary direct PRs
+        # without a linked issue still return above before reaching this read.
         raise
 
     issue_handoff = find_latest_issue_pr_handoff(
@@ -1308,6 +1310,45 @@ def _recover_skill_pr_plan_context(
     return context
 
 
+def _filter_resume_for_approved_plan(
+    resume: dict,
+    *,
+    head_sha: str,
+    approved_plan_context: ApprovedPlanContext | None,
+) -> dict:
+    """Drop same-head reviewer approvals that did not receive this plan.
+
+    ``build-resume`` intentionally remains a transport-only operation and can
+    recover legacy reviewer records before the PR's issue provenance is known.
+    Once that provenance is validated, a plan-bound same-head resume may reuse
+    only records carrying both plan identity fields. This preserves partial
+    progress while forcing missing or stale reviewers through the current plan.
+    """
+    if approved_plan_context is None:
+        return resume
+    if str(resume.get("current_plan_subject") or "") != head_sha:
+        return resume
+    expected_hash = approved_plan_context.plan_hash
+    expected_subject = approved_plan_context.plan_subject
+    matching_data = [
+        record
+        for record in resume.get("completed_reviewer_data", [])
+        if record.get("approved_plan_hash") == expected_hash
+        and record.get("approved_plan_subject") == expected_subject
+    ]
+    matching_names = {
+        str(record.get("reviewer_name", "")) for record in matching_data
+    }
+    filtered = dict(resume)
+    filtered["completed_reviewer_data"] = matching_data
+    filtered["completed_reviewer_names"] = [
+        str(name)
+        for name in resume.get("completed_reviewer_names", [])
+        if str(name) in matching_names
+    ]
+    return filtered
+
+
 def _fetch_pr_comments_raw(repo: str, pr: int, gh_cmd: str = "gh") -> list[str]:
     # PR conversation comments live behind `gh pr view` (not `gh issue view`,
     # which rejects PR numbers). Used for the approved-followups idempotency marker.
@@ -1465,6 +1506,8 @@ def _complete_reviewer_turn(
     work_dir: Path,
     auto_recover: bool = False,
     response_evidence: dict[str, object] | None = None,
+    approved_plan_hash: str | None = None,
+    approved_plan_subject: str | None = None,
     gemini_cmd: str = "gemini",
 ) -> dict:
     """Normalize, validate, render, parse, mint IDs, attach metadata, and post.
@@ -1584,6 +1627,11 @@ def _complete_reviewer_turn(
         except (OSError, json.JSONDecodeError):
             reviewer_usage = None
     usage_args = ["--usage-file", str(usage_file)] if usage_file.exists() else []
+    approved_plan_args = []
+    if approved_plan_hash is not None:
+        approved_plan_args.extend(["--approved-plan-hash", approved_plan_hash])
+    if approved_plan_subject is not None:
+        approved_plan_args.extend(["--approved-plan-subject", approved_plan_subject])
 
     # --- Attach metadata ---
     _run_helper(
@@ -1600,6 +1648,7 @@ def _complete_reviewer_turn(
         "--new-items-file", str(new_items_file),
         "--subject", round_subject,
         *usage_args,
+        *approved_plan_args,
     )
 
     # --- Post ---
@@ -1697,6 +1746,7 @@ def _run_reviewer(
     tmpdir: Path,
     external_args: tuple[str, ...] = (),
     item_id_offset: int = 0,
+    approved_plan_context: ApprovedPlanContext | None = None,
     gemini_cmd: str = "gemini",
 ) -> dict:
     """Run one reviewer turn; return {reviewer_name, state, blocking_items, new_items}."""
@@ -1748,7 +1798,9 @@ def _run_reviewer(
         round_subject=round_subject, item_id_offset=item_id_offset,
         validate_kind=validate_kind, dry_run=dry_run,
         raw_output=raw_output, context_file=context_file,
-        prior_items_file=prior_items_file, gemini_cmd=gemini_cmd,
+        prior_items_file=prior_items_file,
+        approved_plan_context=approved_plan_context,
+        gemini_cmd=gemini_cmd,
     )
 
     response_evidence = None
@@ -1769,6 +1821,16 @@ def _run_reviewer(
             work_dir=tmpdir,
             auto_recover=_is_agent_unavailable_output(original_text) is None,
             response_evidence=response_evidence,
+            approved_plan_hash=(
+                approved_plan_context.plan_hash
+                if approved_plan_context is not None
+                else None
+            ),
+            approved_plan_subject=(
+                approved_plan_context.plan_subject
+                if approved_plan_context is not None
+                else None
+            ),
             gemini_cmd=gemini_cmd,
         )
     except _ValidationError as exc:
@@ -2882,8 +2944,19 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
     if not head_sha:
         pr_info = _fetch_pr_json(repo, pr)
         head_sha = pr_info.get("headRefOid") or ""
+    else:
+        # Plan provenance must be recovered before any same-head reviewer
+        # approval is considered reusable.
+        pr_info = _fetch_pr_json(repo, pr)
+
+    approved_plan_context = _recover_skill_pr_plan_context(repo, pr, pr_info)
 
     resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=head_sha, pr=pr)
+    resume = _filter_resume_for_approved_plan(
+        resume,
+        head_sha=head_sha,
+        approved_plan_context=approved_plan_context,
+    )
 
     # Step 2 — pending-comment reconciliation
     _reconcile_pending_comment(resume, pr, repo, dry_run)
@@ -2930,8 +3003,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             else:
                 round_approved_reviewers.append(str(record.get("reviewer_name", "")))
 
-    issue_dict = _fetch_pr_json(repo, pr)
-    approved_plan_context = _recover_skill_pr_plan_context(repo, pr, issue_dict)
+    issue_dict = pr_info
     parent_issue_number = _authoritative_issue_number_from_pr(repo, pr, issue_dict)
     pr_diff = _fetch_pr_diff(repo, pr)
 
@@ -3013,6 +3085,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 tmpdir=tmpdir,
                 external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
                 item_id_offset=item_id_offset,
+                approved_plan_context=approved_plan_context,
                 gemini_cmd=getattr(args, "gemini_cmd", "gemini"),
             )
             if record["state"] == "unavailable":
@@ -3202,6 +3275,16 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
             item_id_offset=item_id_offset, dry_run=dry_run,
             raw_output=raw_output, context_file=context_file,
             work_dir=repair_dir,
+            approved_plan_hash=(
+                manifest.get("approved_plan_hash")
+                if isinstance(manifest.get("approved_plan_hash"), str)
+                else None
+            ),
+            approved_plan_subject=(
+                manifest.get("approved_plan_subject")
+                if isinstance(manifest.get("approved_plan_subject"), str)
+                else None
+            ),
             gemini_cmd=gemini_cmd,
         )
     except _ValidationError as exc:
@@ -3271,6 +3354,16 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
             item_id_offset=manifest["item_id_offset"], dry_run=dry_run,
             raw_output=review_file, context_file=request_dir / "context.json",
             work_dir=request_dir,
+            approved_plan_hash=(
+                manifest.get("approved_plan_hash")
+                if isinstance(manifest.get("approved_plan_hash"), str)
+                else None
+            ),
+            approved_plan_subject=(
+                manifest.get("approved_plan_subject")
+                if isinstance(manifest.get("approved_plan_subject"), str)
+                else None
+            ),
         )
     except _ValidationError as exc:
         print(str(exc), file=sys.stderr)
@@ -3844,6 +3937,11 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
     resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=current_head, pr=pr)
     _reconcile_pending_comment(resume, pr, repo, dry_run)
     resume = _build_resume(pr, repo, reviewers, flow="pr", head_sha=current_head, pr=pr)
+    resume = _filter_resume_for_approved_plan(
+        resume,
+        head_sha=current_head,
+        approved_plan_context=approved_plan_context,
+    )
 
     allowed, reason = _pr_fix_gate(resume, reviewers, current_head)
     if not allowed:

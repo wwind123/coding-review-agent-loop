@@ -3737,6 +3737,7 @@ def _reviewer_requirement_coverage_matches(
 def _resumed_pr_reviewer_matches_requirements(
     record: PostedRoundRecord,
     human_requirements: Sequence[HumanReviewRequirement],
+    approved_plan_context: ApprovedPlanContext | None = None,
 ) -> bool:
     """Return whether a same-head resumed review still covers current requirements.
 
@@ -3746,7 +3747,11 @@ def _resumed_pr_reviewer_matches_requirements(
     resumable, while a non-empty current set requires both the resolution marker
     and digest-backed identities from the persisted metadata.
     """
-    return (
+    plan_matches = approved_plan_context is None or (
+        record.metadata.approved_plan_hash == approved_plan_context.plan_hash
+        and record.metadata.approved_plan_subject == approved_plan_context.plan_subject
+    )
+    return plan_matches and (
         not human_requirements
         or (
             human_requirements_resolved(record.body)
@@ -5233,6 +5238,10 @@ def _run_plan_first_loop(
                 model_used=plan_response.model_used,
             )
         else:
+            # Preserve the exact free-form response as the canonical plan.
+            # The public comment may have a normalized signature, but plan
+            # recovery must hash the raw text selected by the handoff.
+            canonical_plan = current_plan
             public_plan_output = normalize_freeform_signature(
                 plan_output, agent=config.coder, config=config, model_used=plan_response.model_used
             )
@@ -6417,6 +6426,9 @@ def _run_plan_first_loop(
         else:
             current_plan = plan_response.text
             current_coder_output = plan_response.text
+            # Free-form revisions also need a lossless canonical sidecar. The
+            # rendered signature is presentation only and is not plan identity.
+            canonical_plan = current_plan
             public_comment = normalize_freeform_signature(
                 plan_response.text, agent=config.coder, config=config, model_used=plan_response.model_used
             )
@@ -7774,7 +7786,7 @@ def run_pr_loop(
                                 )
                                 if parent_candidate.is_available:
                                     approved_plan_context = parent_candidate
-                    if not approved_plan_context.is_available and not issue_handoff.legacy_contract:
+                    if not approved_plan_context.is_available:
                         raise AgentLoopError(
                             f"PR #{pr_number} is bound to approved plan {issue_handoff.plan_hash}, "
                             f"but the canonical plan could not be recovered: "
@@ -8123,12 +8135,15 @@ def run_pr_loop(
             resumed_by_name = {
                 record.metadata.agent: record
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
-                if _resumed_pr_reviewer_matches_requirements(record, human_requirements)
+                if _resumed_pr_reviewer_matches_requirements(
+                    record, human_requirements, approved_plan_context
+                )
             }
             unchanged_head_approvals = _latest_pr_approved_reviews_for_head(
                 pr_comments,
                 head_sha=pr_metadata.head_sha,
                 configured_reviewers=configured_reviewers,
+                approved_plan_context=approved_plan_context,
             )
             skip_reviewers_for_recovery = bool(
                 current_resume is not None and current_resume.unrecorded_head_advance
@@ -8186,6 +8201,16 @@ def run_pr_loop(
                             acquisition_outcome=acquisition_outcome,
                             acquisition_returncode=acquisition_returncode,
                             surfaced_reviewer_requirement_ids=surfaced_reviewer_requirement_ids,
+                            approved_plan_hash=(
+                                approved_plan_context.plan_hash
+                                if approved_plan_context is not None
+                                else None
+                            ),
+                            approved_plan_subject=(
+                                approved_plan_context.plan_subject
+                                if approved_plan_context is not None
+                                else None
+                            ),
                             phase=phase,
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
                         ),

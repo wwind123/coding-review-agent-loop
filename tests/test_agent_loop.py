@@ -55,6 +55,7 @@ from coding_review_agent_loop.orchestrator import (
     _is_transient_public_response,
     _parse_rate_limit_reset_seconds,
     _plan_subject,
+    ROUND_RESUME_MARKER_RE,
     _resume_plan_round,
     _resolve_requested_model,
     _run_validated_agent,
@@ -3509,9 +3510,14 @@ def test_round_metadata_round_trip_preserves_canonical_plan():
         round_number=2,
         subject="abc",
         canonical_plan="Summary\n\n### Plan steps\n1. Canonical step.",
+        approved_plan_hash="0123456789abcdef",
+        approved_plan_subject="f" * 64,
     )
 
-    assert _decode_round_metadata(_encode_round_metadata(metadata)).canonical_plan == metadata.canonical_plan
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.canonical_plan == metadata.canonical_plan
+    assert decoded.approved_plan_hash == metadata.approved_plan_hash
+    assert decoded.approved_plan_subject == metadata.approved_plan_subject
 
 
 def test_round_metadata_round_trip_preserves_split_proposals():
@@ -6032,6 +6038,10 @@ def test_run_plan_loop_freeform_initial_plan_includes_model(tmp_path):
     posted_body = runner.issue_comments[0]["body"]
     stripped = _strip_round_metadata(posted_body)
     assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
+    match = ROUND_RESUME_MARKER_RE.search(posted_body)
+    assert match is not None
+    metadata = _decode_round_metadata(match.group("payload"))
+    assert metadata.canonical_plan == plan_text
 
 
 def test_run_plan_loop_freeform_revision_includes_model(tmp_path):
@@ -6091,6 +6101,10 @@ def test_run_plan_loop_freeform_revision_includes_model(tmp_path):
     revision_body = runner.issue_comments[2]["body"]
     stripped = _strip_round_metadata(revision_body)
     assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
+    match = ROUND_RESUME_MARKER_RE.search(revision_body)
+    assert match is not None
+    metadata = _decode_round_metadata(match.group("payload"))
+    assert metadata.canonical_plan == revised_plan
 
 
 # ── _failure_suggestion unit tests ─────────────────────────────────────────
