@@ -80,6 +80,7 @@ from .test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     TestRuntimeConfigurationError,
     inherited_timeout_ceiling,
+    record_launcher_health,
     record_test_observation,
     resolve_timeout_seconds,
 )
@@ -968,6 +969,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run one foreground test command with a finite watchdog and optional runtime memory.",
     )
     run_tests.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Run only the bounded non-mutating agent-loop wrapper probe.",
+    )
+    run_tests.add_argument(
         "--timeout-seconds",
         default=None,
         metavar="SECONDS",
@@ -1083,6 +1089,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"agent-loop: {exc}", file=sys.stderr)
             return 2
     if args.command == "run-tests":
+        if args.preflight:
+            print("agent-loop preflight: verified")
+            return 0
         raw_inner = list(args.inner_argv)
         if raw_inner[:1] == ["--"]:
             raw_inner = raw_inner[1:]
@@ -1111,18 +1120,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                         file=sys.stderr,
                         flush=True,
                     )
-                    record_test_observation(
-                        args.memory_dir,
-                        argv=raw_inner,
-                        cwd=Path.cwd(),
-                        outcome=broker_result.outcome,
-                        elapsed_seconds=broker_result.elapsed_seconds,
-                        attempted_timeout_seconds=chosen,
-                        policy_ceiling_seconds=policy,
-                        returncode=broker_result.returncode,
-                        containment=None,
-                        lane="broker",
-                    )
+                    if broker_result.inner_exec == "failed" or broker_result.suite_start == "not-started":
+                        record_launcher_health(
+                            args.memory_dir,
+                            cwd=Path.cwd(),
+                            candidate=raw_inner,
+                            state="failed",
+                            provenance="broker-parent",
+                            diagnostic=broker_result.diagnostic or broker_result.output_tail,
+                        )
+                    elif broker_result.suite_start != "not-started" and broker_result.outcome != "overlap-rejected":
+                        record_test_observation(
+                            args.memory_dir,
+                            argv=raw_inner,
+                            cwd=Path.cwd(),
+                            outcome=broker_result.outcome,
+                            elapsed_seconds=broker_result.elapsed_seconds,
+                            attempted_timeout_seconds=chosen,
+                            policy_ceiling_seconds=policy,
+                            returncode=broker_result.returncode,
+                            containment=None,
+                            lane="broker",
+                        )
                     return int(broker_result.returncode if broker_result.returncode is not None else 1)
             else:
                 print(
@@ -1147,19 +1166,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 containment_role="test-gate",
                 env=fallback_environment,
                 environment_is_complete=True,
+                wrapper_bootstrap="verified",
             )
-            record_test_observation(
-                args.memory_dir,
-                argv=raw_inner,
-                cwd=Path.cwd(),
-                outcome=result.outcome,
-                elapsed_seconds=result.elapsed_seconds,
-                attempted_timeout_seconds=chosen,
-                policy_ceiling_seconds=policy,
-                returncode=result.returncode,
-                containment=(result.containment.to_dict() if result.containment is not None else None),
-                lane=(result.containment.backend if result.containment is not None else None),
-            )
+            if result.inner_exec == "failed" or result.suite_start == "not-started":
+                record_launcher_health(
+                    args.memory_dir,
+                    cwd=Path.cwd(),
+                    candidate=raw_inner,
+                    state="failed",
+                    provenance="parent-runner",
+                    diagnostic=result.diagnostic or result.output_tail,
+                )
+            elif result.suite_start != "not-started" and not result.overlap_rejected:
+                record_test_observation(
+                    args.memory_dir,
+                    argv=raw_inner,
+                    cwd=Path.cwd(),
+                    outcome=result.outcome,
+                    elapsed_seconds=result.elapsed_seconds,
+                    attempted_timeout_seconds=chosen,
+                    policy_ceiling_seconds=policy,
+                    returncode=result.returncode,
+                    containment=(result.containment.to_dict() if result.containment is not None else None),
+                    lane=(result.containment.backend if result.containment is not None else None),
+                )
             return int(result.returncode if result.returncode is not None else 1)
         except (AgentLoopError, OSError, ValueError) as exc:
             print(f"agent-loop: {exc}", file=sys.stderr)

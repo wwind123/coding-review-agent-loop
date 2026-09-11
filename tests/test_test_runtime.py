@@ -409,3 +409,133 @@ def test_runtime_fingerprint_isolation_and_privacy(tmp_path):
     assert "profile-a" not in serialized
     assert "profile-b" not in serialized
     assert str(tmp_path) not in serialized
+
+
+def test_launcher_health_is_additive_bounded_redacted_and_success_clears(tmp_path):
+    memory = tmp_path / "memory"
+    wrapper = tmp_path / "bin" / "agent-loop"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    identity = runtime.launcher_candidate_identity(
+        [str(wrapper), "run-tests"], cwd=tmp_path, kind="wrapper"
+    )
+    assert runtime.record_launcher_health(
+        memory,
+        cwd=tmp_path,
+        candidate=identity,
+        state="failed",
+        provenance="wrapper-probe",
+        repository="owner/repo",
+        diagnostic="bad\n" + "x" * 500,
+        timestamp=_now(),
+    )
+    rows = runtime.load_launcher_health(memory)
+    assert len(rows) == 1
+    assert len(rows[0]["diagnostic"]) == 240
+    assert "\n" not in rows[0]["diagnostic"]
+    assert rows[0]["candidate_identity"]["path"] == str(wrapper.resolve())
+    assert str(tmp_path) in json.dumps(rows[0]["candidate_identity"])
+
+    assert runtime.record_launcher_health(
+        memory,
+        cwd=tmp_path,
+        candidate=identity,
+        state="verified",
+        provenance="wrapper-probe",
+        repository="owner/repo",
+        timestamp=_now() + timedelta(seconds=1),
+    )
+    states = [row["state"] for row in runtime.load_launcher_health(memory)]
+    assert states == ["verified"]
+    assert runtime.load_runtime_memory(memory) == []
+
+
+def test_launcher_health_scope_and_expiry_are_independent_from_timing(tmp_path):
+    memory = tmp_path / "memory"
+    candidate = [str(tmp_path / ".venv" / "bin" / "pytest"), "tests"]
+    old = _now() - timedelta(hours=25)
+    assert runtime.record_launcher_health(
+        memory, cwd=tmp_path, candidate=candidate, state="failed",
+        provenance="parent-runner", repository="owner/repo", timestamp=old,
+    )
+    assert runtime.relevant_launcher_health(
+        memory, cwd=tmp_path, repository="owner/repo", now=_now()
+    ) == []
+    assert runtime.record_test_observation(
+        memory, argv=[sys.executable, "-c", "pass"], cwd=tmp_path,
+        outcome="passed", elapsed_seconds=1, attempted_timeout_seconds=5,
+        policy_ceiling_seconds=5, timestamp=_now(),
+    )
+    assert len(runtime.load_runtime_memory(memory)) == 1
+
+
+def test_legacy_v1_sidecar_without_launcher_health_remains_writable(tmp_path):
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / runtime.RUNTIME_SIDECAR_NAME).write_text(
+        json.dumps({"schema_version": 1, "observations": [{"outcome": "passed"}]}),
+        encoding="utf-8",
+    )
+    assert runtime.load_runtime_memory(memory) == [{"outcome": "passed"}]
+    assert runtime.record_launcher_health(
+        memory, cwd=tmp_path, candidate=["pytest"], state="failed",
+        provenance="agent-reported", repository="owner/repo", diagnostic="missing",
+    )
+    payload = json.loads((memory / runtime.RUNTIME_SIDECAR_NAME).read_text(encoding="utf-8"))
+    assert payload["observations"] == [{"outcome": "passed"}]
+    assert len(payload["launcher_health"]) == 1
+
+
+def test_recognized_inner_probe_uses_only_safe_version_argv(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    result = runtime.probe_inner_launcher(
+        [sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"], cwd=tmp_path
+    )
+    assert result.state == "verified"
+    assert calls[0][0] == (sys.executable, "-m", "pytest", "--version")
+    assert calls[0][1]["timeout"] == 5.0
+
+
+def test_wrapper_preflight_has_fixed_argv_and_per_invocation_cache(tmp_path, monkeypatch):
+    calls = []
+    wrapper = tmp_path / "agent-loop"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(runtime, "_wrapper_candidates", lambda _environment: [(str(wrapper), "run-tests")])
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "health-test-turn")
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "agent-loop preflight: verified", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    first = runtime.preflight_wrapper_candidates(cwd=tmp_path)
+    second = runtime.preflight_wrapper_candidates(cwd=tmp_path)
+    assert first[0].state == "verified"
+    assert second[0].state == "verified"
+    assert calls == [(str(wrapper.resolve()), "run-tests", "--preflight")]
+
+
+def test_runner_separates_launcher_failure_from_genuine_pytest_failure(tmp_path):
+    missing = run_foreground_test(
+        [str(tmp_path / "missing-test-launcher")], cwd=tmp_path, timeout_seconds=5
+    )
+    assert missing.outcome == "launch-failed"
+    assert missing.inner_exec == "failed"
+    assert missing.suite_start == "not-started"
+
+    suite_failure = run_foreground_test(
+        [sys.executable, "-m", "pytest", str(tmp_path / "missing-test-file.py"), "-q"],
+        cwd=tmp_path,
+        timeout_seconds=30,
+    )
+    assert suite_failure.outcome == "failed"
+    assert suite_failure.inner_exec == "started"
+    assert suite_failure.suite_start == "verified"
