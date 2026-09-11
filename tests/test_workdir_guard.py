@@ -778,6 +778,33 @@ def test_quoted_shell_still_rejects_external_targets(tmp_path, script, origin):
         )
 
 
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize("operator", [";", "&&", "||", "|", "|&", "&", ";;"])
+def test_quoted_shell_rejects_external_command_after_adjacent_operator(
+    tmp_path, origin, operator,
+):
+    script = f"pytest tests/test_api.py{operator}/outside/custom_script"
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            [f"bash -c {shlex.quote(script)}"],
+            assigned_workdir=_assigned(tmp_path),
+            origin=origin,
+        )
+
+
+def test_quoted_shell_does_not_split_quoted_control_operator(tmp_path):
+    script = "python3 -c 'print(\"safe;value\")'"
+    validate_test_commands_within_workdir(
+        [f"bash -c {shlex.quote(script)}"], assigned_workdir=_assigned(tmp_path),
+    )
+
+
+def test_quoted_shell_with_unsupported_option_fails_closed(tmp_path):
+    command = "bash -o pipefail -c 'cd /outside && pytest -q'"
+    with pytest.raises(AgentLoopError, match="unsupported shell option"):
+        validate_test_commands_within_workdir([command], assigned_workdir=_assigned(tmp_path))
+
+
 def test_nested_shell_and_managed_wrapper_are_checked(tmp_path):
     assigned = _assigned(tmp_path)
     inner = "/outside/agent-loop run-tests --memory-dir /outside/cache -- python3 -m pytest tests/test_api.py"

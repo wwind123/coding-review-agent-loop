@@ -578,7 +578,8 @@ def _effective_head_index(tokens: Sequence[str]) -> int | None:
 # ---------------------------------------------------------------------------
 
 ClauseMode = Literal["structured", "code", "narrative"]
-_SEPARATOR_TOKENS = {"&&", "||", ";", "|", "&", "(", ")"}
+_SHELL_PUNCTUATION = ";&|()"
+_SHELL_PUNCTUATION_CHARS = frozenset(_SHELL_PUNCTUATION)
 
 
 @dataclass
@@ -590,7 +591,13 @@ class _Clause:
 
 def _tokenize(text: str) -> list[str]:
     try:
-        return shlex.split(text)
+        # ``shlex.split`` only separates operators surrounded by whitespace.
+        # A shell does not impose that restriction, so use punctuation-aware
+        # lexing to keep adjacent commands from hiding in an argument token.
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
     except ValueError:
         return text.split()
 
@@ -615,7 +622,7 @@ def _split_into_clauses(text: str, mode: ClauseMode) -> list[_Clause]:
         command_by_contract = next_by_contract
 
     for token in tokens:
-        if token in _SEPARATOR_TOKENS:
+        if token and set(token) <= _SHELL_PUNCTUATION_CHARS:
             flush(True)
             continue
         current.append(token)
@@ -665,6 +672,10 @@ def _shell_command_index(tokens: Sequence[str]) -> int | None:
         if option in {"--noprofile", "--norc"}:
             continue
         if not re.fullmatch(r"-[celux]+", option):
+            if any(re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", later) for later in tokens[index + 1 :]):
+                raise AgentLoopError(
+                    "Cannot validate shell command string after an unsupported shell option."
+                )
             return None
         if "c" in option:
             return index + 1 if index + 1 < len(tokens) else None

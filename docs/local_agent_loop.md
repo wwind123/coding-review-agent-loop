@@ -2836,7 +2836,9 @@ the quoted command string is not treated as one filesystem path. Launcher
 arguments, inner test targets, working directories, and live URLs remain
 subject to the existing checks. Nested shells are bounded to eight levels;
 unsupported option forms receive no special command-string handling. This
-does not evaluate shell substitutions or certify arbitrary shell programs.
+includes control operators adjacent to commands or arguments, while quoted
+operator characters remain ordinary argument text. This does not evaluate
+shell substitutions or certify arbitrary shell programs.
 
 With writable agent memory, measured wrapper/gate outcomes are stored in the
 versioned `test-runtime.json` sidecar. It records elapsed time, attempted cap,
