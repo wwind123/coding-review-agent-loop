@@ -2838,7 +2838,8 @@ subject to the existing checks. Nested shells are bounded to eight levels;
 common strict-mode forms such as `-euo pipefail` and operand-free login/profile
 options are parsed, while unsupported options before `-c` and multi-word shell
 operands without `-c` are rejected because their contents cannot be validated
-safely.
+safely. Unsupported short-option clusters containing `c` are likewise rejected
+rather than risking an uninspected command-string operand.
 
 Command-string tokenization recognizes control operators adjacent to commands
 or arguments, while quoted operator characters remain ordinary argument text.

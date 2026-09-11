@@ -824,6 +824,14 @@ def test_quoted_shell_with_unsupported_option_before_command_fails_closed(tmp_pa
         validate_test_commands_within_workdir([command], assigned_workdir=_assigned(tmp_path))
 
 
+@pytest.mark.parametrize("script", ["python -m pytest -q", "cd /outside && pytest -q"])
+def test_quoted_shell_with_unsupported_cluster_containing_c_fails_closed(tmp_path, script):
+    with pytest.raises(AgentLoopError, match="unsupported shell option"):
+        validate_test_commands_within_workdir(
+            [f"bash -ac {shlex.quote(script)}"], assigned_workdir=_assigned(tmp_path),
+        )
+
+
 def test_multi_word_shell_operand_fails_closed(tmp_path):
     with pytest.raises(AgentLoopError, match="multi-word shell script operand"):
         validate_test_commands_within_workdir(

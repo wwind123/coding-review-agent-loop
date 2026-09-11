@@ -691,6 +691,14 @@ def _shell_command_index(tokens: Sequence[str]) -> int | None:
             if any(character.isspace() for character in option):
                 raise AgentLoopError("Cannot validate multi-word shell script operand.")
             return None
+        if re.fullmatch(r"-[A-Za-z]+", option) and "c" in option:
+            # ``c`` makes the next operand executable text, even when it is
+            # grouped with a shell flag that this scanner does not support.
+            # Refuse the ambiguous cluster instead of treating that text as an
+            # ordinary non-path argument and skipping its embedded paths.
+            raise AgentLoopError(
+                "Cannot validate shell command string after an unsupported shell option."
+            )
         if any(re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", later) for later in tokens[index + 1 :]):
             raise AgentLoopError(
                 "Cannot validate shell command string after an unsupported shell option."
