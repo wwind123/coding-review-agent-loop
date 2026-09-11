@@ -814,6 +814,67 @@ def test_windows_probe_timeout_kills_descendant_holding_output_pipe(tmp_path):
         _kill_windows_if_active(descendant_pid)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object probe cleanup is Windows-specific")
+def test_windows_probe_assigns_before_probe_can_spawn_descendant(tmp_path, monkeypatch):
+    pid_file = tmp_path / "windows-suspended-descendant.pid"
+    child_code = "import time; time.sleep(30)"
+    probe_code = (
+        "import subprocess, sys, time; "
+        "from pathlib import Path; "
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"Path({str(pid_file)!r}).write_text(str(child.pid)); "
+        "time.sleep(30)"
+    )
+    real_popen = subprocess.Popen
+    real_job = runtime._WindowsProbeJob
+    assignment_saw_probe_run: list[bool] = []
+
+    class _RecordingJob:
+        def __init__(self):
+            self._job = real_job()
+
+        def assign(self, process):
+            assignment_saw_probe_run.append(pid_file.exists())
+            self._job.assign(process)
+
+        def resume(self, process):
+            self._job.resume(process)
+
+        def terminate(self):
+            self._job.terminate()
+
+        def close(self):
+            self._job.close()
+
+    def delayed_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        # An unsuspended implementation gets a deterministic pre-assignment
+        # window in which the probe can create an unowned descendant.
+        time.sleep(0.25)
+        return process
+
+    monkeypatch.setattr(runtime, "_WindowsProbeJob", _RecordingJob)
+    monkeypatch.setattr(runtime.subprocess, "Popen", delayed_popen)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            runtime._run_bounded_probe(
+                [sys.executable, "-c", probe_code],
+                cwd=tmp_path,
+                env=None,
+                timeout_seconds=0.2,
+            )
+    finally:
+        # subprocess.run in the cleanup assertion uses the same module object.
+        monkeypatch.setattr(runtime.subprocess, "Popen", real_popen)
+
+    assert assignment_saw_probe_run == [False]
+    descendant_pid = int(pid_file.read_text())
+    try:
+        _assert_windows_process_not_active(descendant_pid)
+    finally:
+        _kill_windows_if_active(descendant_pid)
+
+
 def test_wrapper_preflight_bounds_changing_completed_identities(tmp_path, monkeypatch):
     calls = []
     wrapper = tmp_path / "agent-loop"

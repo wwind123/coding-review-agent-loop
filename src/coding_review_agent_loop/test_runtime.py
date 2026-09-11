@@ -1415,6 +1415,16 @@ class _WindowsProbeJob:
         self._kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
         self._kernel32.TerminateJobObject.argtypes = [handle_type, wintypes.UINT]
         self._kernel32.TerminateJobObject.restype = wintypes.BOOL
+        self._kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        self._kernel32.CreateToolhelp32Snapshot.restype = handle_type
+        self._kernel32.Thread32First.argtypes = [handle_type, wintypes.LPVOID]
+        self._kernel32.Thread32First.restype = wintypes.BOOL
+        self._kernel32.Thread32Next.argtypes = [handle_type, wintypes.LPVOID]
+        self._kernel32.Thread32Next.restype = wintypes.BOOL
+        self._kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self._kernel32.OpenThread.restype = handle_type
+        self._kernel32.ResumeThread.argtypes = [handle_type]
+        self._kernel32.ResumeThread.restype = wintypes.DWORD
         self._kernel32.CloseHandle.argtypes = [handle_type]
         self._kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -1487,6 +1497,54 @@ class _WindowsProbeJob:
     def terminate(self) -> None:
         if self._handle:
             self._kernel32.TerminateJobObject(self._handle, 1)
+
+    def resume(self, process: subprocess.Popen) -> None:
+        """Resume the suspended primary thread after Job Object assignment.
+
+        ``subprocess.Popen`` closes the primary thread handle returned by
+        ``CreateProcess``.  While the process is still suspended it has only
+        its primary thread, so enumerate that thread by process id and resume
+        it after the Job Object owns the process.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        class _ThreadEntry32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD),
+                ("tpBasePri", wintypes.LONG),
+                ("tpDeltaPri", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        snapshot = self._kernel32.CreateToolhelp32Snapshot(0x00000004, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        if snapshot in (None, invalid_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            entry = _ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not self._kernel32.Thread32First(snapshot, ctypes.byref(entry)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            while True:
+                if entry.th32OwnerProcessID == process.pid:
+                    thread = self._kernel32.OpenThread(0x0002, False, entry.th32ThreadID)
+                    if not thread:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    try:
+                        if self._kernel32.ResumeThread(thread) == 0xFFFFFFFF:
+                            raise ctypes.WinError(ctypes.get_last_error())
+                    finally:
+                        self._kernel32.CloseHandle(thread)
+                    return
+                if not self._kernel32.Thread32Next(snapshot, ctypes.byref(entry)):
+                    break
+            raise OSError(f"suspended probe primary thread not found for pid {process.pid}")
+        finally:
+            self._kernel32.CloseHandle(snapshot)
 
     def close(self) -> None:
         handle, self._handle = self._handle, None
@@ -1589,6 +1647,10 @@ def _run_bounded_probe(
     }
     if os.name == "nt":
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # Popen closes the primary thread handle after CreateProcess, so the
+        # Windows Job Object supplies the owning boundary and this flag keeps
+        # probe code suspended until the process has been assigned to it.
+        creation_flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
         if creation_flags:
             popen_kwargs["creationflags"] = creation_flags
         popen_kwargs.pop("start_new_session", None)
@@ -1610,6 +1672,13 @@ def _run_bounded_probe(
                 _terminate_unassigned_windows_probe(process)
                 raise _ProbeContainmentUnavailable(
                     f"Windows Job Object probe assignment unavailable: {type(exc).__name__}"
+                ) from exc
+            try:
+                windows_job.resume(process)
+            except Exception as exc:
+                _terminate_probe_tree(process, windows_job=windows_job)
+                raise _ProbeContainmentUnavailable(
+                    f"Windows suspended probe resume unavailable: {type(exc).__name__}"
                 ) from exc
         stdout, stderr = process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
