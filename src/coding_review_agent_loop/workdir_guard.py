@@ -7,6 +7,7 @@ import re
 import signal
 import shlex
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Literal, Sequence
 from urllib.parse import urlsplit
@@ -488,9 +489,45 @@ _MANAGED_PREFIX_OPTIONS = {
     "time": (set(), {"-p"}),
     "command": (set(), {"-p"}),
 }
-_TIMEOUT_DURATION_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?$")
-_NICE_ADJUSTMENT_RE = re.compile(r"[+-]?\d+$")
-_STDBUF_SIZE_RE = re.compile(r"\+?\d+(?:[KMGTPE](?:i?B)?|k)?$")
+_TIMEOUT_DURATION_RE = re.compile(
+    r"(?P<number>[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?P<suffix>[smhd])?$",
+    re.ASCII,
+)
+_NICE_ADJUSTMENT_RE = re.compile(r"[+-]?[0-9]+$", re.ASCII)
+_STDBUF_SIZE_RE = re.compile(
+    r"\+?(?P<size>[0-9]+)(?P<suffix>[KMGTPE](?:i?B)?|k)?$", re.ASCII,
+)
+# Managed traversal must be portable enough to prove that the prefix reaches
+# its command.  These bounds are intentionally conservative: nice adjustments
+# fit every common 32-bit int parser, timeout durations fit signed 64-bit
+# seconds after unit conversion, and stdbuf sizes fit uint64_t after scaling.
+_MAX_NICE_ADJUSTMENT = (1 << 31) - 1
+_MIN_NICE_ADJUSTMENT = -(1 << 31)
+_MAX_TIMEOUT_SECONDS = (1 << 63) - 1
+_MAX_STDBUF_SIZE = (1 << 64) - 1
+_TIMEOUT_SUFFIX_MULTIPLIERS = {None: 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+_STDBUF_SUFFIX_POWERS = {
+    None: 0,
+    "k": 1,
+    "K": 1,
+    "KB": 1,
+    "KiB": 1,
+    "M": 2,
+    "MB": 2,
+    "MiB": 2,
+    "G": 3,
+    "GB": 3,
+    "GiB": 3,
+    "T": 4,
+    "TB": 4,
+    "TiB": 4,
+    "P": 5,
+    "PB": 5,
+    "PiB": 5,
+    "E": 6,
+    "EB": 6,
+    "EiB": 6,
+}
 _SIGNAL_NAMES = frozenset(
     name.removeprefix("SIG")
     for name, value in vars(signal).items()
@@ -517,6 +554,37 @@ def _executable_basename(token: str) -> str:
     return token.rsplit("/", 1)[-1]
 
 
+def _is_valid_timeout_duration(value: str) -> bool:
+    match = _TIMEOUT_DURATION_RE.fullmatch(value)
+    if match is None:
+        return False
+    # A length cap avoids handing an attacker an unbounded Decimal conversion;
+    # it is far above any operationally useful duration representation.
+    if len(match.group("number")) > 64:
+        return False
+    try:
+        with localcontext() as context:
+            context.prec = 96
+            seconds = Decimal(match.group("number")) * _TIMEOUT_SUFFIX_MULTIPLIERS[
+                match.group("suffix")
+            ]
+    except InvalidOperation:
+        return False
+    return seconds.is_finite() and seconds <= _MAX_TIMEOUT_SECONDS
+
+
+def _is_valid_stdbuf_size(value: str) -> bool:
+    match = _STDBUF_SIZE_RE.fullmatch(value)
+    if match is None:
+        return False
+    digits = match.group("size")
+    if len(digits) > 20:
+        return False
+    size = int(digits)
+    multiplier = 1024 ** _STDBUF_SUFFIX_POWERS[match.group("suffix")]
+    return size <= _MAX_STDBUF_SIZE // multiplier
+
+
 def _is_valid_managed_option_value(wrapper: str, option: str, value: str) -> bool:
     """Validate values closely enough to prove that a managed prefix can execute."""
     if not value:
@@ -524,19 +592,24 @@ def _is_valid_managed_option_value(wrapper: str, option: str, value: str) -> boo
     if wrapper == "env":
         return "=" not in value
     if wrapper == "nice":
-        return bool(_NICE_ADJUSTMENT_RE.fullmatch(value))
+        if not _NICE_ADJUSTMENT_RE.fullmatch(value) or len(value.lstrip("+-")) > 10:
+            return False
+        adjustment = int(value)
+        return _MIN_NICE_ADJUSTMENT <= adjustment <= _MAX_NICE_ADJUSTMENT
     if wrapper == "timeout":
         if option in {"-k", "--kill-after"}:
-            return bool(_TIMEOUT_DURATION_RE.fullmatch(value))
+            return _is_valid_timeout_duration(value)
         if option in {"-s", "--signal"}:
-            if value.isdecimal():
+            if re.fullmatch(r"[0-9]+", value, re.ASCII):
+                if len(value) > 3:
+                    return False
                 return int(value) == 0 or int(value) in signal.valid_signals()
             name = value.upper().removeprefix("SIG")
             return name in _SIGNAL_NAMES
     if wrapper == "stdbuf":
         if value == "L":
             return option not in {"-i", "--input"}
-        return bool(_STDBUF_SIZE_RE.fullmatch(value))
+        return _is_valid_stdbuf_size(value)
     return False
 
 
@@ -609,7 +682,9 @@ def _parse_wrapper(
     if next_index is None:
         return None
     if wrapper == "timeout":
-        if next_index >= len(tokens) or not _TIMEOUT_DURATION_RE.fullmatch(tokens[next_index]):
+        if next_index >= len(tokens) or (
+            managed and not _is_valid_timeout_duration(tokens[next_index])
+        ) or (not managed and not _TIMEOUT_DURATION_RE.fullmatch(tokens[next_index])):
             return None
         next_index += 1
     if next_index >= len(tokens):

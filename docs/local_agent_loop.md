@@ -2829,6 +2829,8 @@ environment, `timeout`, `nice`, `stdbuf`, `nohup`, `time -p`, and `command -p`.
 Value-taking options must also have executable syntax: timeout durations and
 signals, integer nice adjustments, valid stdbuf modes, and nonempty env names
 without `=` are checked before the managed-launcher exemption is granted.
+Numeric operands must use ASCII digits and fit conservative conversion bounds;
+overflowing values do not qualify for the exemption.
 Their executables and prefix values still undergo path and live-target checks;
 only the managed launcher and its memory output receive the special exemption.
 Unknown options, `env -S`, cwd-changing prefixes (`env -C`/`--chdir`), `sudo`,
