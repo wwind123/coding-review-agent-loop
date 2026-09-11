@@ -504,6 +504,11 @@ def _program_basename(token: str) -> str:
     return _strip_wrap(token).rstrip(".,;:!?").replace("\\", "/").rsplit("/", 1)[-1].lower()
 
 
+def _executable_basename(token: str) -> str:
+    """Return the literal basename used for managed-prefix recognition."""
+    return token.replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def _consume_wrapper_options(
     tokens: Sequence[str], start: int, wrapper: str, *, managed: bool = False,
 ) -> int | None:
@@ -575,7 +580,7 @@ def _wrapper_traversal(tokens: Sequence[str], *, managed: bool = False) -> _Wrap
         if VAR_ASSIGNMENT_RE.match(tokens[i]) and (not managed or assignments_allowed):
             i += 1
             continue
-        wrapper = _program_basename(tokens[i])
+        wrapper = _executable_basename(tokens[i]) if managed else _program_basename(tokens[i])
         if wrapper not in WRAPPER_PROGRAMS:
             positions.add(i)
             return _WrapperTraversal(recognized_prefix, positions, i)

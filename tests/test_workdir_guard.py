@@ -105,6 +105,8 @@ def test_managed_prefix_retains_other_checks(tmp_path, prefix, origin, template)
     "env -u FIRST /outside/unknown-script",
     "timeout 1800 MODE=inline", "nice MODE=inline", "stdbuf -oL MODE=inline",
     "nohup MODE=inline", "time -p MODE=inline", "command -p MODE=inline",
+    "ENV -u FIRST", "Timeout 1800", "TIME -p", "COMMAND -p",
+    "env, -u FIRST", "timeout, 1800", "nice, -n 5", "nohup,",
 ])
 def test_unsupported_prefix_cannot_grant_managed_exemption(tmp_path, prefix):
     with pytest.raises(AgentLoopError):
