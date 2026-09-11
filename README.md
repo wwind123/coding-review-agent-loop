@@ -462,7 +462,10 @@ browser/integration matrices when that improves diagnosis and retry cost.
 Before a managed wrapper is recommended, agent-loop runs a non-mutating
 `run-tests --preflight` probe. It checks at most the absolute `agent-loop`
 console entry and the current-interpreter module fallback, once per invocation,
-with a five-second watchdog. The probe never runs remembered test arguments,
+with a five-second watchdog (and no more than six distinct recognized inner
+launcher candidates per invocation). The inner probe uses the effective target
+environment, including ambient values merged with a partial overlay. The probe
+never runs remembered test arguments,
 installs dependencies, contacts a database, or executes an arbitrary shell.
 Recognized inner launchers receive the same bounded `--version` probe: direct
 `pytest`/`py.test` and exactly `<python> -m pytest`; other commands remain

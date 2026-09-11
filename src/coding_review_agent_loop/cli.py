@@ -1120,16 +1120,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                         file=sys.stderr,
                         flush=True,
                     )
-                    if broker_result.inner_exec == "failed" or broker_result.suite_start == "not-started":
+                    if broker_result.outcome == "overlap-rejected":
+                        # Overlap is coordination, not evidence about the
+                        # executable. It must not affect timing or health.
+                        pass
+                    elif broker_result.inner_exec == "failed":
                         record_launcher_health(
                             args.memory_dir,
                             cwd=Path.cwd(),
                             candidate=raw_inner,
                             state="failed",
                             provenance="broker-parent",
+                            environment=os.environ,
                             diagnostic=broker_result.diagnostic or broker_result.output_tail,
                         )
-                    elif broker_result.suite_start != "not-started" and broker_result.outcome != "overlap-rejected":
+                    elif broker_result.suite_start == "verified":
+                        record_launcher_health(
+                            args.memory_dir,
+                            cwd=Path.cwd(),
+                            candidate=raw_inner,
+                            state="verified",
+                            provenance="broker-parent",
+                            environment=os.environ,
+                            diagnostic=broker_result.diagnostic,
+                        )
+                    if broker_result.suite_start != "not-started" and broker_result.outcome != "overlap-rejected":
                         record_test_observation(
                             args.memory_dir,
                             argv=raw_inner,
@@ -1168,7 +1183,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 environment_is_complete=True,
                 wrapper_bootstrap="verified",
             )
-            if result.inner_exec == "failed" or result.suite_start == "not-started":
+            if result.overlap_rejected or result.outcome == "overlap-rejected":
+                # Overlap is coordination, not launcher health or suite
+                # timing evidence.
+                pass
+            elif result.inner_exec == "failed":
                 record_launcher_health(
                     args.memory_dir,
                     cwd=Path.cwd(),
@@ -1176,8 +1195,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     state="failed",
                     provenance="parent-runner",
                     diagnostic=result.diagnostic or result.output_tail,
+                    environment=fallback_environment,
                 )
-            elif result.suite_start != "not-started" and not result.overlap_rejected:
+            elif result.suite_start == "verified":
+                record_launcher_health(
+                    args.memory_dir,
+                    cwd=Path.cwd(),
+                    candidate=raw_inner,
+                    state="verified",
+                    provenance="parent-runner",
+                    diagnostic=result.diagnostic,
+                    environment=fallback_environment,
+                )
+            if result.suite_start != "not-started" and not result.overlap_rejected:
                 record_test_observation(
                     args.memory_dir,
                     argv=raw_inner,

@@ -487,6 +487,24 @@ def test_legacy_v1_sidecar_without_launcher_health_remains_writable(tmp_path):
     assert len(payload["launcher_health"]) == 1
 
 
+def test_malformed_health_rows_do_not_hide_timing_memory(tmp_path):
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / runtime.RUNTIME_SIDECAR_NAME).write_text(
+        json.dumps({
+            "schema_version": 1,
+            "observations": [{"outcome": "passed"}],
+            "launcher_health": [
+                {"state": "failed", "diagnostic": "untrusted"},
+                "not-a-row",
+            ],
+        }),
+        encoding="utf-8",
+    )
+    assert runtime.load_runtime_memory(memory) == [{"outcome": "passed"}]
+    assert runtime.load_launcher_health(memory) == []
+
+
 def test_recognized_inner_probe_uses_only_safe_version_argv(tmp_path, monkeypatch):
     calls = []
 
@@ -523,6 +541,43 @@ def test_wrapper_preflight_has_fixed_argv_and_per_invocation_cache(tmp_path, mon
     assert calls == [(str(wrapper.resolve()), "run-tests", "--preflight")]
 
 
+def test_wrapper_preflight_classifies_explicit_import_failure(tmp_path, monkeypatch):
+    wrapper = tmp_path / "agent-loop"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "wrapper-import-failure-test")
+    monkeypatch.setattr(runtime, "_wrapper_candidates", lambda _environment: [(str(wrapper), "run-tests")])
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type(
+            "Completed", (), {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "ModuleNotFoundError: No module named coding_review_agent_loop",
+            }
+        )(),
+    )
+    result = runtime.preflight_wrapper_candidates(cwd=tmp_path)[0]
+    assert result.state == "failed"
+
+
+def test_inner_probe_timeout_is_bounded_and_cached(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inner-timeout-test")
+
+    def timeout(*_args, **kwargs):
+        calls.append(kwargs["timeout"])
+        raise runtime.subprocess.TimeoutExpired([sys.executable, "-m", "pytest"], 5.0)
+
+    monkeypatch.setattr(runtime.subprocess, "run", timeout)
+    command = [sys.executable, "-m", "pytest", "tests"]
+    first = runtime.probe_inner_launcher(command, cwd=tmp_path)
+    second = runtime.probe_inner_launcher(command, cwd=tmp_path)
+    assert first.state == second.state == "failed"
+    assert calls == [5.0]
+
+
 def test_runner_separates_launcher_failure_from_genuine_pytest_failure(tmp_path):
     missing = run_foreground_test(
         [str(tmp_path / "missing-test-launcher")], cwd=tmp_path, timeout_seconds=5
@@ -539,3 +594,139 @@ def test_runner_separates_launcher_failure_from_genuine_pytest_failure(tmp_path)
     assert suite_failure.outcome == "failed"
     assert suite_failure.inner_exec == "started"
     assert suite_failure.suite_start == "verified"
+
+
+def test_launcher_diagnostic_redacts_common_credentials(tmp_path):
+    diagnostic = (
+        "AWS_SECRET_ACCESS_KEY=aws-secret Authorization: Bearer bearer-secret "
+        "https://user:password@example.invalid/repo --token cli-secret"
+    )
+    safe = runtime._collapsed_diagnostic(diagnostic)
+    for secret in ("aws-secret", "bearer-secret", "password@example", "cli-secret"):
+        assert secret not in safe
+    assert "<redacted>" in safe
+    assert "<userinfo:redacted>" in safe
+
+
+def test_repeated_launcher_failure_refreshes_health_timestamp(tmp_path):
+    memory = tmp_path / "memory"
+    candidate = [str(tmp_path / "missing-pytest"), "tests"]
+    first = _now() - timedelta(hours=23, minutes=59)
+    second = _now()
+    assert runtime.record_launcher_health(
+        memory, cwd=tmp_path, candidate=candidate, state="failed",
+        provenance="parent-runner", repository="owner/repo", diagnostic="missing",
+        timestamp=first,
+    )
+    assert runtime.record_launcher_health(
+        memory, cwd=tmp_path, candidate=candidate, state="failed",
+        provenance="parent-runner", repository="owner/repo", diagnostic="missing",
+        timestamp=second,
+    )
+    rows = runtime.load_launcher_health(memory)
+    assert len(rows) == 1
+    assert runtime._timestamp(rows[0]["timestamp"]) == second
+
+
+def test_console_wrapper_identity_fingerprints_actual_shebang_interpreter(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    interpreter = bin_dir / "python-real"
+    interpreter.write_text("interpreter-v1\n", encoding="utf-8")
+    wrapper = bin_dir / "agent-loop"
+    wrapper.write_text(f"#!{interpreter}\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    identity = runtime.launcher_candidate_identity(
+        [str(wrapper), "run-tests"], cwd=tmp_path, kind="wrapper"
+    )
+    assert identity["interpreter"]["path"] == str(interpreter.resolve())
+    first_key = runtime._identity_key(identity)
+    interpreter.write_text("interpreter-v2-with-a-different-size\n", encoding="utf-8")
+    changed = runtime.launcher_candidate_identity(
+        [str(wrapper), "run-tests"], cwd=tmp_path, kind="wrapper"
+    )
+    assert runtime._identity_key(changed) != first_key
+    redacted = runtime._redacted_identity(identity, cwd=tmp_path)
+    assert str(interpreter) not in json.dumps(redacted)
+
+
+def test_inner_probe_is_cached_and_uses_effective_overlay_environment(tmp_path, monkeypatch):
+    calls = []
+    invocation = "inner-cache-test"
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", invocation)
+    monkeypatch.setenv("PATH", "/ambient/path")
+
+    def fake_run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    command = [sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"]
+    overlay = {"PATH": "/overlay/path", "TEST_VALUE": "kept"}
+    first = runtime.probe_inner_launcher(command, cwd=tmp_path, environment=overlay)
+    second = runtime.probe_inner_launcher(command, cwd=tmp_path, environment=overlay)
+    assert first.state == second.state == "verified"
+    assert len(calls) == 1
+    assert calls[0][0] == (sys.executable, "-m", "pytest", "--version")
+    assert calls[0][1]["env"]["PATH"] == "/overlay/path"
+    assert calls[0][1]["env"]["TEST_VALUE"] == "kept"
+
+
+def test_inner_probe_enforces_six_new_candidates_per_invocation(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inner-limit-test")
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    for index in range(runtime.MAX_INNER_PROBE_CANDIDATES):
+        result = runtime.probe_inner_launcher(
+            [str(tmp_path / f"python-{index}"), "-m", "pytest"], cwd=tmp_path
+        )
+        assert result.state == "verified"
+    limited = runtime.probe_inner_launcher(
+        [str(tmp_path / "python-over-limit"), "-m", "pytest"], cwd=tmp_path
+    )
+    assert limited.state == "unknown"
+    assert "candidate limit" in limited.diagnostic
+    assert len(calls) == runtime.MAX_INNER_PROBE_CANDIDATES
+
+
+def test_cli_overlap_rejection_writes_no_runtime_evidence(tmp_path, monkeypatch):
+    memory = tmp_path / "memory"
+    command = [sys.executable, "-c", "pass"]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "overlap-cli-test")
+    lock = runtime.acquire_command_lane(command, cwd=tmp_path, env=os.environ)
+    assert lock is not None
+    try:
+        assert main([
+            "run-tests", "--timeout-seconds", "5", "--memory-dir", str(memory),
+            "--", *command,
+        ]) == runtime.OVERLAP_REJECTED_EXIT_CODE
+    finally:
+        lock.close()
+    assert runtime.load_runtime_memory(memory) == []
+    assert runtime.load_launcher_health(memory) == []
+
+
+def test_cli_successful_inner_probe_clears_matching_failure(tmp_path, monkeypatch):
+    memory = tmp_path / "memory"
+    command = [sys.executable, "-m", "pytest", "--version"]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "cli-health-clear-test")
+    assert runtime.record_launcher_health(
+        memory,
+        cwd=tmp_path,
+        candidate=command,
+        state="failed",
+        provenance="parent-runner",
+        diagnostic="bootstrap failed",
+    )
+    assert main([
+        "run-tests", "--timeout-seconds", "30", "--memory-dir", str(memory),
+        "--", *command,
+    ]) == 0
+    assert [row["state"] for row in runtime.load_launcher_health(memory)] == ["verified"]

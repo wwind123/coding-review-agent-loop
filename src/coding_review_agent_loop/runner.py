@@ -156,6 +156,17 @@ def _drain_nonblocking_test_output(
         consume(chunk)
 
 
+def _close_held_fds(held_fds: tuple[int, int, int, int] | None) -> None:
+    """Close broker handshake descriptors on every pre-exec failure path."""
+    if held_fds is None:
+        return
+    for fd in held_fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def run_foreground_test(
     args: Sequence[str],
     *,
@@ -207,6 +218,30 @@ def run_foreground_test(
     inner_probe_state = "unknown"
     held_fds: tuple[int, int, int, int] | None = None
     try:
+        spawn_environment = (
+            dict(env)
+            if env is not None and environment_is_complete
+            else ({**os.environ, **env} if env is not None else None)
+        )
+        # Probe before allocating containment leases or broker handshake pipes.
+        # The probe receives exactly the environment that the real target will
+        # receive, including the ambient environment for partial overlays.
+        inner_probe = probe_inner_launcher(
+            cmd,
+            cwd=cwd,
+            environment=spawn_environment,
+            environment_is_complete=spawn_environment is not None,
+        )
+        inner_probe_state = inner_probe.state
+        if inner_probe.state == "failed":
+            lane_lock.close()
+            return ForegroundTestResult(
+                cmd, cwd, "launch-failed", None, time.monotonic() - started,
+                timeout_seconds, inner_probe.diagnostic, None, False,
+                wrapper_bootstrap, "failed", "not-started", inner_probe.diagnostic,
+                health_provenance,
+            )
+        suite_start = "verified" if inner_probe.state == "verified" else "unknown"
         pass_fds: tuple[int, ...] = ()
         if parent_cgroup_path is not None:
             ready_read, ready_write = os.pipe()
@@ -257,19 +292,6 @@ def run_foreground_test(
             # directory handle is still private to this parent process.
             spawn_cwd = "/"
             spawn_preexec = lambda fd=cwd_fd: os.fchdir(fd)
-        # A recognized pytest launcher gets one fixed, non-mutating bootstrap
-        # check. It never receives the remembered suite arguments.
-        inner_probe = probe_inner_launcher(cmd, cwd=cwd, environment=env)
-        inner_probe_state = inner_probe.state
-        if inner_probe.state == "failed":
-            lane_lock.close()
-            return ForegroundTestResult(
-                cmd, cwd, "launch-failed", None, time.monotonic() - started,
-                timeout_seconds, inner_probe.diagnostic, None, False,
-                wrapper_bootstrap, "failed", "not-started", inner_probe.diagnostic,
-                health_provenance,
-            )
-        suite_start = "verified" if inner_probe.state == "verified" else "unknown"
         try:
             proc = subprocess.Popen(
                 spawn_cmd,
@@ -280,17 +302,14 @@ def run_foreground_test(
                 text=False,
                 bufsize=0,
                 start_new_session=True,
-                env=(
-                    dict(env)
-                    if environment_is_complete and env is not None
-                    else ({**os.environ, **env} if env is not None else None)
-                ),
+                env=spawn_environment,
                 preexec_fn=spawn_preexec,
                 pass_fds=pass_fds,
             )
         except OSError as exc:
             if handle is not None:
                 handle.close()
+            _close_held_fds(held_fds)
             lane_lock.close()
             return ForegroundTestResult(
                 cmd, cwd, "launch-failed", None, time.monotonic() - started,

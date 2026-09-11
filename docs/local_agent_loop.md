@@ -2887,7 +2887,10 @@ integration, or end-to-end matrices.
 `run-tests --preflight` is a bounded, non-mutating wrapper probe. It checks at
 most two candidates—the absolute `agent-loop` console entry and the current
 interpreter's `-m coding_review_agent_loop.cli` fallback—once per invocation,
-with a five-second watchdog. Candidates are executed directly, including the
+with a five-second watchdog. Recognized inner launcher probes are separately
+limited to six distinct candidate identities per invocation. Inner probes use
+the effective target environment, including ambient values merged with a
+partial overlay. Candidates are executed directly, including the
 console script's own shebang interpreter. A fixed `agent-loop preflight:
 verified` response proves startup; a non-start, timeout, or explicit import /
 bootstrap failure is unhealthy, while ambiguous output remains unknown. The

@@ -149,6 +149,7 @@ from coding_review_agent_loop.runner import Runner, run_foreground_test, tail_te
 from coding_review_agent_loop.containment import default_policy
 from coding_review_agent_loop.test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
+    record_launcher_health,
     record_test_observation,
     resolve_timeout_seconds,
 )
@@ -774,7 +775,30 @@ def _run_test_gate(
         )
     except (OSError, AgentLoopError) as exc:  # setup and policy failures remain JSON-visible
         return {**base, "error": f"could not run --test-command: {exc}"}
-    if memory_dir is not None:
+    if memory_dir is not None and result.inner_exec == "failed":
+        record_launcher_health(
+            memory_dir,
+            cwd=Path(workdir),
+            candidate=argv,
+            state="failed",
+            provenance=getattr(result, "health_provenance", "parent-runner"),
+            diagnostic=result.diagnostic or result.output_tail,
+        )
+    elif memory_dir is not None and result.suite_start == "verified":
+        record_launcher_health(
+            memory_dir,
+            cwd=Path(workdir),
+            candidate=argv,
+            state="verified",
+            provenance=getattr(result, "health_provenance", "parent-runner"),
+            diagnostic=result.diagnostic,
+        )
+    if (
+        memory_dir is not None
+        and result.suite_start != "not-started"
+        and not result.overlap_rejected
+        and result.outcome != "overlap-rejected"
+    ):
         record_test_observation(
             memory_dir,
             argv=argv,
@@ -796,7 +820,7 @@ def _run_test_gate(
         "timeout_seconds": chosen,
         "output_tail": result.output_tail,
     }
-    if result.returncode is None and result.outcome == "failed":
+    if result.returncode is None and result.outcome in {"failed", "launch-failed"}:
         response["error"] = (
             "could not run --test-command: target executable was missing or not executable"
         )

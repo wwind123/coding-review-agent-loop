@@ -8,6 +8,7 @@ an agent is never used as a timing sample.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -48,6 +49,27 @@ MAX_INNER_PROBE_CANDIDATES = 6
 _HASHED_ENV_VALUE_RE = re.compile(r"<sha256:[0-9a-f]{16}>")
 _DIAGNOSTIC_SECRET_RE = re.compile(
     r"(?i)\b(api[_-]?key|secret|password|token|credential)\s*[:=]\s*[^\s,;]+"
+)
+_DIAGNOSTIC_ASSIGNMENT_SECRET_RE = re.compile(
+    r"(?i)(\b(?:aws[_-](?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token)|"
+    r"(?:api[_-]?key|secret|password|passwd|token|credential|authorization|private[_-]?key|dsn))\b\s*=\s*)"
+    r"[^\s,;&]+"
+)
+_DIAGNOSTIC_FIELD_SECRET_RE = re.compile(
+    r"(?i)(\b(?:[a-z0-9]+[_-])*?(?:api[_-]?key|secret|password|passwd|token|credential|"
+    r"authorization|private[_-]?key|dsn)(?:[_-][a-z0-9]+)*\b\s*[:=]\s*)"
+    r"[^\s,;&]+"
+)
+_DIAGNOSTIC_OPTION_SECRET_RE = re.compile(
+    r"(?i)(?<![\w-])(--?[^\s=]*(?:api[-_]?key|token|password|passwd|secret|credential|auth)"
+    r"[^\s=]*(?:=|\s+))"
+    r"[^\s,;&]+"
+)
+_DIAGNOSTIC_AUTH_HEADER_RE = re.compile(
+    r"(?im)(^|\s)((?:proxy-)?authorization\s*:\s*)(?:bearer|basic|token)\s+[^\s,;&]+"
+)
+_DIAGNOSTIC_URL_USERINFO_RE = re.compile(
+    r"(?i)(\b(?:https?|ssh|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://)[^/@\s]+@"
 )
 
 WRAPPER_BOOTSTRAP_STATES = frozenset({"verified", "failed", "unknown"})
@@ -516,6 +538,11 @@ def _timestamp(value: object) -> datetime | None:
 
 def _collapsed_diagnostic(value: object, *, limit: int = MAX_LAUNCHER_DIAGNOSTIC_CHARS) -> str:
     text = " ".join(str(value or "").split())
+    text = _DIAGNOSTIC_ASSIGNMENT_SECRET_RE.sub(r"\1<redacted>", text)
+    text = _DIAGNOSTIC_OPTION_SECRET_RE.sub(r"\1<redacted>", text)
+    text = _DIAGNOSTIC_AUTH_HEADER_RE.sub(r"\1\2<redacted>", text)
+    text = _DIAGNOSTIC_URL_USERINFO_RE.sub(r"\1<userinfo:redacted>@", text)
+    text = _DIAGNOSTIC_FIELD_SECRET_RE.sub(r"\1<redacted>", text)
     text = _DIAGNOSTIC_SECRET_RE.sub(r"\1=<redacted>", text)
     return text[:limit]
 
@@ -586,12 +613,51 @@ def _shebang_interpreter(path: Path) -> str | None:
         return None
     if not first.startswith("#!"):
         return None
-    parts = shlex.split(first[2:].strip())
+    try:
+        parts = shlex.split(first[2:].strip())
+    except ValueError:
+        return None
     if not parts:
         return None
     if Path(parts[0]).name == "env" and len(parts) > 1:
-        return parts[-1]
+        if "-S" in parts:
+            index = parts.index("-S") + 1
+            return parts[index] if index < len(parts) else None
+        return parts[1].split("=", 1)[-1] if "=" in parts[1] else parts[1]
     return parts[0]
+
+
+def _resolve_candidate_path(
+    token: str, *, cwd: Path, environment: Mapping[str, str]
+) -> Path:
+    candidate = Path(token).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve(strict=False)
+    if token.startswith((".", "~")) or candidate.parent != Path("."):
+        return (cwd / candidate).resolve(strict=False)
+    try:
+        resolved = shutil.which(token, path=environment.get("PATH"))
+    except TypeError:
+        resolved = shutil.which(token)
+    return Path(resolved).resolve(strict=False) if resolved else candidate
+
+
+def _resolve_shebang_path(
+    shebang: str | None, *, cwd: Path, environment: Mapping[str, str]
+) -> Path | None:
+    if not shebang:
+        return None
+    return _resolve_candidate_path(shebang, cwd=cwd, environment=environment)
+
+
+def _module_origin(module_name: str) -> Path | None:
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ImportError, ModuleNotFoundError, AttributeError, ValueError):
+        return None
+    if spec is None or not spec.origin or spec.origin in {"built-in", "frozen"}:
+        return None
+    return Path(spec.origin).resolve(strict=False)
 
 
 def launcher_candidate_identity(
@@ -601,17 +667,32 @@ def launcher_candidate_identity(
     """Return a cache/persistence identity with only the managed path verbatim."""
     values = environment if environment is not None else os.environ
     tokens = tuple(str(item) for item in candidate)
-    path = Path(tokens[0]).resolve(strict=False) if tokens else Path("")
-    package_origin = Path(__file__).resolve(strict=False)
+    path = _resolve_candidate_path(tokens[0], cwd=cwd, environment=values) if tokens else Path("")
     virtual_env = Path(values["VIRTUAL_ENV"]).resolve(strict=False) if values.get("VIRTUAL_ENV") else None
+    shebang = _shebang_interpreter(path) if path.is_file() else None
+    shebang_path = _resolve_shebang_path(shebang, cwd=cwd, environment=values)
+    interpreter_path = shebang_path or path
+    package_origin = Path(__file__).resolve(strict=False)
+    module_origin = _module_origin("pytest") if kind == "inner" else None
+    prefix = (
+        tokens[:3]
+        if len(tokens) >= 3 and tokens[1:3] == ("-m", "pytest")
+        else tokens[:1]
+    )
     identity: dict[str, object] = {
         "kind": kind,
         "path": str(path),
         "entry": _stat_identity(path),
-        "shebang": _shebang_interpreter(path) if path.is_file() else None,
-        "interpreter": _stat_identity(Path(sys.executable).resolve(strict=False)),
+        "shebang": shebang,
+        "shebang_interpreter": _stat_identity(shebang_path) if shebang_path is not None else None,
+        "interpreter": _stat_identity(interpreter_path),
         "package_origin": _stat_identity(package_origin),
+        "module_origin": _stat_identity(module_origin) if module_origin is not None else None,
         "virtual_env": _stat_identity(virtual_env) if virtual_env is not None else None,
+        "path_environment_sha256": hashlib.sha256(
+            values.get("PATH", "").encode("utf-8", errors="replace")
+        ).hexdigest(),
+        "candidate_prefix": list(prefix),
         "cwd": checkout_identity(cwd),
     }
     return identity
@@ -627,6 +708,8 @@ def _redacted_identity(identity: Mapping[str, object], *, cwd: Path) -> dict[str
     for key, value in identity.items():
         if key == "path":
             result[key] = str(value) if identity.get("kind") == "wrapper" else _relative_or_basename(str(value), cwd)
+        elif key == "shebang" and isinstance(value, str):
+            result[key] = _relative_or_basename(value, cwd)
         elif isinstance(value, Mapping):
             nested = dict(value)
             nested_path = nested.get("path")
@@ -638,6 +721,17 @@ def _redacted_identity(identity: Mapping[str, object], *, cwd: Path) -> dict[str
                 if not keep_wrapper_path:
                     nested["path"] = _relative_or_basename(nested_path, cwd)
             result[key] = nested
+        elif isinstance(value, (list, tuple)):
+            result[key] = [
+                (
+                    str(item)
+                    if identity.get("kind") == "wrapper" and key == "candidate_prefix" and index == 0
+                    else _relative_or_basename(str(item), cwd)
+                    if isinstance(item, str) and Path(item).is_absolute()
+                    else item
+                )
+                for index, item in enumerate(value)
+            ]
         else:
             result[key] = value
     return result
@@ -693,14 +787,22 @@ def load_launcher_health(memory_dir: Path | None) -> list[dict]:
             continue
         if (
             isinstance(row.get("repository"), str)
+            and bool(row.get("repository"))
             and isinstance(row.get("checkout_sha256"), str)
+            and bool(row.get("checkout_sha256"))
             and isinstance(row.get("environment_fingerprint"), str)
+            and bool(row.get("environment_fingerprint"))
             and isinstance(row.get("candidate_key"), str)
+            and bool(row.get("candidate_key"))
+            and isinstance(row.get("candidate_identity"), Mapping)
             and row.get("state") in WRAPPER_BOOTSTRAP_STATES
             and row.get("provenance") in LAUNCHER_HEALTH_PROVENANCES
             and _timestamp(row.get("timestamp")) is not None
+            and isinstance(row.get("diagnostic", ""), str)
         ):
-            rows.append(dict(row))
+            safe = dict(row)
+            safe["diagnostic"] = _collapsed_diagnostic(safe.get("diagnostic", ""))
+            rows.append(safe)
     return rows
 
 
@@ -888,13 +990,23 @@ def record_launcher_health(
                 "provenance": provenance,
                 "diagnostic": _collapsed_diagnostic(diagnostic),
             }
-            if not any(
-                _health_scope(existing) == scope
-                and existing.get("state") == row["state"]
-                and existing.get("diagnostic") == row["diagnostic"]
-                for existing in rows
-            ):
+            duplicate_index = next(
+                (
+                    index
+                    for index, existing in enumerate(rows)
+                    if _health_scope(existing) == scope
+                    and existing.get("state") == row["state"]
+                    and existing.get("diagnostic") == row["diagnostic"]
+                ),
+                None,
+            )
+            if duplicate_index is None:
                 rows.append(row)
+            else:
+                # A repeated failure is still live evidence. Refresh its
+                # timestamp so a continuously broken launcher does not
+                # disappear merely because it crossed the 24-hour window.
+                rows[duplicate_index] = row
             groups: dict[tuple[str, str, str, str], list[dict]] = defaultdict(list)
             for existing in rows:
                 groups[_health_scope(existing)].append(existing)
@@ -973,6 +1085,8 @@ def _wrapper_candidates(environment: Mapping[str, str] | None = None) -> list[tu
 
 
 _WRAPPER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
+_INNER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
+_INNER_PREFLIGHT_CANDIDATES: dict[str, set[str]] = defaultdict(set)
 
 
 def preflight_wrapper_candidates(
@@ -984,7 +1098,7 @@ def preflight_wrapper_candidates(
 ) -> tuple[LauncherProbeResult, ...]:
     """Probe at most two safe wrapper prefixes once per invocation/candidate."""
     root = (cwd or Path.cwd()).resolve()
-    values = dict(environment or os.environ)
+    values = {**os.environ, **environment} if environment is not None else dict(os.environ)
     invocation = values.get("AGENT_LOOP_INVOCATION_ID")
     results: list[LauncherProbeResult] = []
     for candidate in _wrapper_candidates(values):
@@ -1004,32 +1118,29 @@ def preflight_wrapper_candidates(
                     check=False,
                     timeout=LAUNCHER_PROBE_TIMEOUT_SECONDS,
                 )
-            except subprocess.TimeoutExpired as exc:
+            except subprocess.TimeoutExpired:
                 result = LauncherProbeResult(candidate, "failed", "wrapper probe timed out after 5s", _identity_key(identity))
             except OSError as exc:
                 result = LauncherProbeResult(candidate, "failed", f"wrapper did not start: {type(exc).__name__}", _identity_key(identity))
             else:
                 output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
                 success = completed.returncode == 0 and "agent-loop preflight: verified" in output
-                started_response = "usage" in output.lower() or "run-tests" in output.lower() or "agent-loop:" in output.lower()
                 explicit_bootstrap = any(token in output.lower() for token in ("modulenotfounderror", "importerror", "no module named", "cannot import"))
                 state = "verified" if success else ("failed" if explicit_bootstrap else "unknown")
-                if state == "unknown" and not started_response and completed.returncode != 0:
-                    state = "unknown"
                 result = LauncherProbeResult(candidate, state, output, _identity_key(identity))
             if cache_key is not None:
                 _WRAPPER_PREFLIGHT_CACHE[cache_key] = result
-        if memory_dir is not None and result.state in {"failed", "verified"}:
-            record_launcher_health(
-                memory_dir,
-                cwd=root,
-                candidate=identity,
-                state=result.state,
-                provenance="wrapper-probe",
-                repository=repository,
-                environment=values,
-                diagnostic=result.diagnostic,
-            )
+            if memory_dir is not None and result.state in {"failed", "verified"}:
+                record_launcher_health(
+                    memory_dir,
+                    cwd=root,
+                    candidate=identity,
+                    state=result.state,
+                    provenance="wrapper-probe",
+                    repository=repository,
+                    environment=values,
+                    diagnostic=result.diagnostic,
+                )
         results.append(result)
         if result.state == "verified":
             break
@@ -1062,17 +1173,41 @@ def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mappi
 
 
 def probe_inner_launcher(
-    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None,
+    environment_is_complete: bool = False,
 ) -> LauncherProbeResult:
-    """Run only a recognized five-second ``--version`` bootstrap probe."""
-    probe = recognized_inner_probe(argv, cwd=cwd, environment=environment)
+    """Run only a recognized, identity-cached five-second bootstrap probe."""
+    values = (
+        dict(environment)
+        if environment is not None and environment_is_complete
+        else ({**os.environ, **environment} if environment is not None else dict(os.environ))
+    )
+    original = tuple(str(item) for item in argv)
+    probe = recognized_inner_probe(original, cwd=cwd, environment=values)
     if probe is None:
-        return LauncherProbeResult(tuple(str(item) for item in argv), "unknown", "unrecognized inner launcher")
+        return LauncherProbeResult(original, "unknown", "unrecognized inner launcher")
+    identity = launcher_candidate_identity(original, cwd=cwd, environment=values, kind="inner")
+    identity_key = _identity_key(identity)
+    invocation = values.get("AGENT_LOOP_INVOCATION_ID")
+    cache_key = (invocation, identity_key) if invocation else None
+    if cache_key is not None:
+        cached = _INNER_PREFLIGHT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        seen = _INNER_PREFLIGHT_CANDIDATES.setdefault(invocation, set())
+        if identity_key not in seen and len(seen) >= MAX_INNER_PROBE_CANDIDATES:
+            return LauncherProbeResult(
+                original,
+                "unknown",
+                f"inner probe candidate limit reached ({MAX_INNER_PROBE_CANDIDATES})",
+                identity_key,
+            )
+        seen.add(identity_key)
     try:
         completed = subprocess.run(
             probe,
             cwd=cwd,
-            env=dict(environment) if environment is not None else None,
+            env=(values if environment_is_complete or environment is not None else None),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1080,13 +1215,18 @@ def probe_inner_launcher(
             timeout=LAUNCHER_PROBE_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        return LauncherProbeResult(tuple(str(item) for item in argv), "failed", "inner bootstrap probe timed out after 5s")
+        result = LauncherProbeResult(original, "failed", "inner bootstrap probe timed out after 5s", identity_key)
     except OSError as exc:
-        return LauncherProbeResult(tuple(str(item) for item in argv), "failed", f"inner launcher did not start: {type(exc).__name__}")
-    output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
-    if completed.returncode == 0:
-        return LauncherProbeResult(tuple(str(item) for item in argv), "verified", output)
-    return LauncherProbeResult(tuple(str(item) for item in argv), "failed", output or f"bootstrap exited {completed.returncode}")
+        result = LauncherProbeResult(original, "failed", f"inner launcher did not start: {type(exc).__name__}", identity_key)
+    else:
+        output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
+        if completed.returncode == 0:
+            result = LauncherProbeResult(original, "verified", output, identity_key)
+        else:
+            result = LauncherProbeResult(original, "failed", output or f"bootstrap exited {completed.returncode}", identity_key)
+    if cache_key is not None:
+        _INNER_PREFLIGHT_CACHE[cache_key] = result
+    return result
 
 
 def _git_commit(cwd: Path) -> str | None:

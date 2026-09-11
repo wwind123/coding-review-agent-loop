@@ -131,11 +131,28 @@ def _memory_block(
             (item.candidate for item in wrapper_results if item.state == "verified"),
             None,
         )
-        health_rows = relevant_launcher_health(
-            memory.memory_dir,
-            cwd=cwd,
-            repository=config.repo,
-        )
+        # Health is scoped to the candidate identities that are actually
+        # relevant to this prompt. Do not surface stale failures from an old
+        # wrapper install or an unrelated remembered command.
+        health_candidates = [*commands, *(item.candidate for item in wrapper_results)]
+        health_rows: list[dict] = []
+        seen_health: set[tuple[object, ...]] = set()
+        for candidate in health_candidates:
+            for row in relevant_launcher_health(
+                memory.memory_dir,
+                cwd=cwd,
+                candidate=candidate,
+                repository=config.repo,
+            ):
+                key = (
+                    row.get("candidate_key"),
+                    row.get("state"),
+                    row.get("timestamp"),
+                    row.get("diagnostic"),
+                )
+                if key not in seen_health:
+                    seen_health.add(key)
+                    health_rows.append(row)
         if commands:
             recommendations = {}
             for command in commands:
@@ -190,7 +207,12 @@ def _memory_block(
                 invocation_guidance += " Evidence: " + " | ".join(diagnostics[:2])
         if health_rows:
             health_lines = ["  Launcher-health advisory evidence (not runnable commands):"]
-            if any(row.get("state") == "failed" for row in health_rows):
+            if any(
+                row.get("state") == "failed"
+                and isinstance(row.get("candidate_identity"), dict)
+                and row["candidate_identity"].get("kind") == "inner"
+                for row in health_rows
+            ):
                 health_lines.append(
                     "  The affected inner launcher is not present or bootstrapable at prompt render time; "
                     "bootstrap it or use the verified alternative."

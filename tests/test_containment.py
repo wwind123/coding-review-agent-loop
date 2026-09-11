@@ -14,7 +14,7 @@ import pytest
 import coding_review_agent_loop.cli as cli_module
 import coding_review_agent_loop.containment as containment_module
 import coding_review_agent_loop.runner as runner_module
-from coding_review_agent_loop.checks import _raise_for_gate_result
+from coding_review_agent_loop.checks import _raise_for_gate_result, _record_gate_observation
 from coding_review_agent_loop.containment import (
     AggregateLease,
     CapabilityManifest,
@@ -35,6 +35,8 @@ from coding_review_agent_loop.runner import Runner, run_foreground_test
 from coding_review_agent_loop.test_runtime import (
     OVERLAP_REJECTED_EXIT_CODE,
     acquire_command_lane,
+    load_launcher_health,
+    load_runtime_memory,
 )
 
 
@@ -383,6 +385,125 @@ def test_failed_test_gate_reports_resource_limit_and_diagnostics(tmp_path):
         )
     assert "MemoryMax/MemorySwapMax" in str(exc_info.value)
     assert "systemd scope result=oom-kill" in str(exc_info.value)
+
+
+def test_gate_launch_failure_is_health_only_and_suite_failure_clears_health(tmp_path):
+    memory = tmp_path / "memory"
+    config = SimpleNamespace(
+        dry_run=False,
+        agent_memory=True,
+        agent_memory_dir=memory,
+        repo="owner/repo",
+        coder_test_command_timeout_seconds=5,
+    )
+    missing = SimpleNamespace(
+        cwd=tmp_path,
+        args=[sys.executable, "-m", "pytest"],
+        outcome="launch-failed",
+        inner_exec="failed",
+        suite_start="not-started",
+        diagnostic="missing executable",
+        output_tail="",
+        elapsed_seconds=0.0,
+        returncode=None,
+        containment=None,
+        overlap_rejected=False,
+    )
+    _record_gate_observation(config, missing)
+    assert load_runtime_memory(memory) == []
+    assert load_launcher_health(memory)[0]["state"] == "failed"
+
+    suite_failure = SimpleNamespace(
+        cwd=tmp_path,
+        args=[sys.executable, "-m", "pytest"],
+        outcome="failed",
+        inner_exec="started",
+        suite_start="verified",
+        diagnostic="",
+        output_tail="assertion failed",
+        elapsed_seconds=0.2,
+        returncode=1,
+        containment=None,
+        overlap_rejected=False,
+    )
+    _record_gate_observation(config, suite_failure)
+    assert load_runtime_memory(memory)[0]["outcome"] == "failed"
+    assert [row["state"] for row in load_launcher_health(memory)] == ["verified"]
+
+
+def test_gate_overlap_is_neither_health_nor_timing(tmp_path):
+    memory = tmp_path / "memory"
+    config = SimpleNamespace(
+        dry_run=False,
+        agent_memory=True,
+        agent_memory_dir=memory,
+        repo="owner/repo",
+    )
+    overlap = SimpleNamespace(
+        cwd=tmp_path,
+        args=[sys.executable, "-c", "pass"],
+        outcome="overlap-rejected",
+        inner_exec="not-attempted",
+        suite_start="not-started",
+        diagnostic="overlap",
+        output_tail="",
+        elapsed_seconds=0.0,
+        returncode=125,
+        containment=None,
+        overlap_rejected=True,
+    )
+    _record_gate_observation(config, overlap)
+    assert load_runtime_memory(memory) == []
+    assert load_launcher_health(memory) == []
+
+
+def test_inner_probe_failure_precedes_containment_resource_allocation(monkeypatch, tmp_path):
+    from coding_review_agent_loop.test_runtime import LauncherProbeResult
+
+    monkeypatch.setattr(
+        runner_module,
+        "probe_inner_launcher",
+        lambda *_args, **_kwargs: LauncherProbeResult(("pytest",), "failed", "bootstrap failed"),
+    )
+    monkeypatch.setattr(runner_module.os, "pipe", lambda: pytest.fail("pipes allocated before probe"))
+    result = run_foreground_test(
+        ["pytest", "tests"],
+        cwd=tmp_path,
+        timeout_seconds=5,
+        parent_cgroup_path=tmp_path,
+    )
+    assert result.outcome == "launch-failed"
+    assert result.inner_exec == "failed"
+    assert result.suite_start == "not-started"
+
+
+def test_popen_failure_closes_all_broker_handshake_descriptors(monkeypatch, tmp_path):
+    descriptors = []
+    real_pipe = runner_module.os.pipe
+
+    def tracking_pipe():
+        pair = real_pipe()
+        descriptors.extend(pair)
+        return pair
+
+    monkeypatch.setattr(runner_module.os, "pipe", tracking_pipe)
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("synthetic spawn failure")),
+    )
+    result = run_foreground_test(
+        [sys.executable, "-c", "pass"],
+        cwd=tmp_path,
+        timeout_seconds=5,
+        parent_cgroup_path=tmp_path,
+    )
+    assert result.outcome == "launch-failed"
+    assert result.inner_exec == "failed"
+    assert len(descriptors) == 4
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_confirm_empty_does_not_accept_cgroup_read_error(monkeypatch, tmp_path):

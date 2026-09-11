@@ -7,6 +7,7 @@ from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
 import coding_review_agent_loop.test_runtime as runtime
+import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.prompts import (
     build_issue_implementation_prompt,
     build_issue_prompt,
@@ -138,6 +139,76 @@ def test_coder_prompts_include_assigned_workdir_rule(tmp_path):
         assert "must stay in that directory" in prompt
         assert "Do not `cd` into sibling, home, deployment, or duplicate clones" in prompt
         assert "`pwd` and `git status --branch --short`" in prompt
+
+
+def test_runtime_prompt_keeps_configured_command_when_wrapper_is_unverified(
+    tmp_path, monkeypatch
+):
+    config = make_config(
+        tmp_path,
+        test_command=(sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"),
+    )
+    memory_dir = tmp_path / "memory"
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit=None,
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary=None,
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+    )
+    monkeypatch.setattr(
+        prompts_module,
+        "preflight_wrapper_candidates",
+        lambda **_kwargs: (
+            runtime.LauncherProbeResult(
+                ("/opt/agent-loop", "run-tests"), "failed", "wrapper import failed"
+            ),
+        ),
+    )
+    prompt = build_issue_prompt(764, config, memory=memory)
+    assert "python -m pytest tests/test_protocol.py -q" in prompt
+    assert "Wrapper diagnostic: no wrapper candidate verified" in prompt
+    assert "Invocation guidance:" not in prompt
+
+
+def test_runtime_prompt_scopes_health_and_allows_verified_wrapper_guidance(
+    tmp_path, monkeypatch
+):
+    config = make_config(
+        tmp_path,
+        test_command=(sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"),
+    )
+    memory_dir = tmp_path / "memory"
+    assert runtime.record_launcher_health(
+        memory_dir,
+        cwd=config.claude_dir,
+        candidate=config.test_command,
+        state="failed",
+        provenance="parent-runner",
+        repository=config.repo,
+        diagnostic="pytest executable is missing",
+    )
+    memory = AgentMemoryContext(
+        memory_dir=memory_dir,
+        current_commit=None,
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary=None,
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+    )
+    wrapper = runtime.LauncherProbeResult(
+        ("/opt/agent-loop", "run-tests"), "verified", "agent-loop preflight: verified"
+    )
+    monkeypatch.setattr(prompts_module, "preflight_wrapper_candidates", lambda **_kwargs: (wrapper,))
+    prompt = build_issue_prompt(764, config, memory=memory)
+    assert "Invocation guidance:" in prompt
+    assert "Launcher-health advisory evidence" in prompt
+    assert "bootstrap it or use the verified alternative" in prompt
 
 
 def test_build_merge_conflict_prompt_content(tmp_path):
