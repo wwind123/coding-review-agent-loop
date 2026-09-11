@@ -348,6 +348,24 @@ def test_selective_final_sweep_missing_approval_stops_before_migration_or_merge(
         "validate_pr_migration_topology",
         lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
     )
+    managed_ci_calls = []
+    qualification_calls = []
+    optional_test_calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "dispatch_final_qualification",
+        lambda *args, **kwargs: managed_ci_calls.append(True),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        lambda *args, **kwargs: qualification_calls.append(True),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "run_optional_tests",
+        lambda *args, **kwargs: optional_test_calls.append(True),
+    )
     runner = FakeRunner(
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
         codex_outputs=[
@@ -377,6 +395,9 @@ def test_selective_final_sweep_missing_approval_stops_before_migration_or_merge(
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert migration_calls == []
+    assert managed_ci_calls == []
+    assert qualification_calls == []
+    assert optional_test_calls == []
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
     assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == 1
 
