@@ -534,7 +534,7 @@ def test_broker_concurrent_conflicting_replay_is_rejected(tmp_path):
         calls.append(argv)
         started.set()
         assert release.wait(5)
-        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+        return SimpleNamespace(outcome="failed", returncode=1, elapsed_seconds=0.01, output_tail="")
 
     server = BrokerServer(root=tmp_path, turn_id="turn-conflict", execute=execute).start()
     first_request = _signed_broker_request(server, tmp_path, "b" * 32)
@@ -553,6 +553,19 @@ def test_broker_concurrent_conflicting_replay_is_rejected(tmp_path):
         first.join(5)
         assert len(calls) == 1
         assert first_response[0]["type"] == "result"
+        for _index in range(evidence_module.MAX_PRIVATE_OBSERVATIONS + 8):
+            assert _raw_broker_request(server, conflicting)["type"] == "error"
+        assert len(server.journal) == 1
+        assert server.journal[0].provenance == "parent-observed"
+        assert server.journal[0].is_failure is True
+        assert server.journal[0].receipt_id == first_response[0]["receipt_id"]
+        for _index in range(evidence_module.MAX_PRIVATE_OBSERVATIONS + 8):
+            server._record_capture_failure(
+                first_request, evidence_module.AgentLoopError("synthetic infrastructure noise")
+            )
+        assert len(server.journal) == evidence_module.MAX_PRIVATE_OBSERVATIONS
+        retained = reconcile_test_observations(server.journal)
+        assert first_response[0]["receipt_id"] in retained.authoritative_failures
     finally:
         release.set()
         server.stop()
@@ -919,4 +932,30 @@ def test_snapshot_hashes_clean_and_dirty_gitlinks_without_reading_directory(tmp_
     dirty = capture_tracked_tree_snapshot(outer)
     assert dirty.complete is True
     assert dirty.status_clean is False
-    assert dirty.tracked_digest == clean.tracked_digest
+    assert dirty.tracked_digest is None
+    assert "submodule" in " ".join(dirty.caveats)
+
+    registry = EnvironmentIdentityRegistry()
+    attribution = attribute_current_head(dirty, dirty, current_head=dirty.head)
+    observation = LocalTestObservation(
+        command=(sys.executable, "-m", "pytest"),
+        outcome="passed",
+        provenance="parent-observed",
+        receipt_id="dirty-submodule-pass",
+        turn_id="current-turn",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        normalized_command="python -m pytest",
+        attribution=attribution,
+        environment_state="not-compared",
+        environment_identity=registry.capture({"PATH": "/usr/bin"}),
+    )
+    (nested / "tracked.txt").write_text("one\n", encoding="utf-8")
+    eventual = capture_tracked_tree_snapshot(outer)
+    assert eventual.status_clean is True
+    evidence = reconcile_test_observations(
+        [observation],
+        current_head=eventual.head,
+        current_snapshot=eventual,
+        registry=registry,
+    )
+    assert evidence.observations[0].attribution.state == "unknown"

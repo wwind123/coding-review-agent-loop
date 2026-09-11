@@ -1113,6 +1113,32 @@ def _git_index_entries(raw: bytes) -> dict[str, tuple[str, str]]:
     return entries
 
 
+def _dirty_gitlink_paths(
+    status_raw: bytes, index_entries: Mapping[str, tuple[str, str]]
+) -> tuple[str, ...]:
+    """Return gitlinks whose checked-out worktree state is not clean."""
+    dirty: list[str] = []
+    records = status_raw.split(b"\0")
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2:3] != b" ":
+            raise AgentLoopError("git snapshot contained malformed status data")
+        state = record[:2]
+        relative = record[3:].decode("utf-8", errors="surrogateescape")
+        if index_entries.get(relative, (None, None))[0] == "160000":
+            dirty.append(relative)
+        # In porcelain v1 -z, rename/copy entries carry one extra path.
+        if b"R" in state or b"C" in state:
+            if index >= len(records) or not records[index]:
+                raise AgentLoopError("git snapshot contained malformed rename status")
+            index += 1
+    return tuple(sorted(dirty))
+
+
 def _path_is_referenced(root: Path, token: str) -> str | None:
     if not token or token.startswith("-") or "=" in token and token.split("=", 1)[0].startswith("-"):
         return None
@@ -1322,15 +1348,18 @@ def capture_tracked_tree_snapshot(
                     raise AgentLoopError("special untracked input is not snapshot-safe")
             except (OSError, UnicodeError) as exc:
                 raise AgentLoopError("untracked file could not be read") from exc
-        # Keep a content-only tracked digest for comparison with the eventual
-        # committed PR tree. HEAD and index state remain covered by ``digest``.
-        tracked_digest = _hash_snapshot_summaries(tracked_records)
-        digest = _hash_snapshot_summaries(index_records + tracked_records + untracked_records)
         tracked_status = _run_git(
             canonical_root,
-            ("status", "--porcelain=v1", "--untracked-files=no"),
+            ("status", "--porcelain=v1", "-z", "--untracked-files=no"),
             timeout=timeout_seconds,
         )
+        dirty_gitlinks = _dirty_gitlink_paths(tracked_status, index_entries)
+        # A gitlink object ID does not describe the checked-out submodule
+        # worktree, so dirty gitlinks cannot be compared with an eventual tree.
+        tracked_digest = (
+            None if dirty_gitlinks else _hash_snapshot_summaries(tracked_records)
+        )
+        digest = _hash_snapshot_summaries(index_records + tracked_records + untracked_records)
         referenced = _referenced_paths(canonical_root, argv)
         referenced_untracked = tuple(sorted(referenced.intersection(untracked)))
         return TrackedTreeSnapshot(
@@ -1343,6 +1372,11 @@ def capture_tracked_tree_snapshot(
             stable=True,
             untracked_paths=tuple(sorted(untracked)),
             referenced_untracked_paths=referenced_untracked,
+            caveats=(
+                ("dirty submodule worktree prevents eventual-tree attribution",)
+                if dirty_gitlinks
+                else ()
+            ),
         )
     except (AgentLoopError, OSError, UnicodeError, ValueError) as exc:
         return TrackedTreeSnapshot(
@@ -1799,7 +1833,11 @@ class TestBrokerServer:
                             reservation.ready.set()
                     _send_frame(connection, response)
                 except (BrokerProtocolError, AgentLoopError, OSError, ValueError) as exc:
-                    if isinstance(exc, AgentLoopError) and validated is not None:
+                    if (
+                        isinstance(exc, AgentLoopError)
+                        and not isinstance(exc, BrokerProtocolError)
+                        and validated is not None
+                    ):
                         self._record_capture_failure(validated, exc)
                     try:
                         _send_frame(connection, {"type": "error", "error": _safe_text(exc)})
@@ -1842,8 +1880,30 @@ class TestBrokerServer:
             caveats=(f"local test capture incomplete: {type(error).__name__}",),
         )
         with self._journal_lock:
-            self._journal.append(observation)
-            self._journal[:] = self._journal[-MAX_PRIVATE_OBSERVATIONS:]
+            self._append_journal_locked(observation)
+
+    def _append_journal_locked(self, observation: LocalTestObservation) -> None:
+        """Append within the bound while retaining measured failures longest."""
+        self._journal.append(observation)
+        while len(self._journal) > MAX_PRIVATE_OBSERVATIONS:
+            discard = next(
+                (
+                    index
+                    for index, row in enumerate(self._journal)
+                    if row.provenance == "telemetry-unverified"
+                ),
+                None,
+            )
+            if discard is None:
+                discard = next(
+                    (
+                        index
+                        for index, row in enumerate(self._journal)
+                        if not row.is_failure
+                    ),
+                    0,
+                )
+            del self._journal[discard]
 
     def _execute_request(self, request: Mapping[str, object], connection: socket.socket) -> dict[str, object]:
         from .containment import open_confined_cwd
@@ -1951,8 +2011,7 @@ class TestBrokerServer:
             diagnostic=getattr(result, "output_tail", None),
         )
         with self._journal_lock:
-            self._journal.append(observation)
-            self._journal[:] = self._journal[-MAX_PRIVATE_OBSERVATIONS:]
+            self._append_journal_locked(observation)
         return {
             "type": "result",
             "receipt_id": receipt_id,
