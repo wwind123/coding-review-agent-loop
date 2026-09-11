@@ -799,10 +799,47 @@ def test_quoted_shell_does_not_split_quoted_control_operator(tmp_path):
     )
 
 
-def test_quoted_shell_with_unsupported_option_fails_closed(tmp_path):
-    command = "bash -o pipefail -c 'cd /outside && pytest -q'"
+@pytest.mark.parametrize("shell_options", [
+    "-euo pipefail",
+    "-eu -o pipefail",
+    "--login",
+    "--noprofile --norc",
+])
+def test_quoted_shell_with_supported_options_validates_nested_command(tmp_path, shell_options):
+    assigned = _assigned(tmp_path)
+    validate_test_commands_within_workdir(
+        [f"bash {shell_options} -c 'python -m pytest -q'"],
+        assigned_workdir=assigned,
+    )
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            [f"bash {shell_options} -c 'cd /outside && pytest -q'"],
+            assigned_workdir=assigned,
+        )
+
+
+def test_quoted_shell_with_unsupported_option_before_command_fails_closed(tmp_path):
+    command = "bash --rcfile config/bashrc -c 'python -m pytest -q'"
     with pytest.raises(AgentLoopError, match="unsupported shell option"):
         validate_test_commands_within_workdir([command], assigned_workdir=_assigned(tmp_path))
+
+
+def test_multi_word_shell_operand_fails_closed(tmp_path):
+    with pytest.raises(AgentLoopError, match="multi-word shell script operand"):
+        validate_test_commands_within_workdir(
+            ["bash 'cd /outside && pytest'"], assigned_workdir=_assigned(tmp_path),
+        )
+
+
+def test_shell_script_operand_keeps_ordinary_path_validation(tmp_path):
+    assigned = _assigned(tmp_path)
+    validate_test_commands_within_workdir(
+        ["bash tests/run.sh"], assigned_workdir=assigned,
+    )
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            ["bash /outside/run.sh"], assigned_workdir=assigned,
+        )
 
 
 def test_nested_shell_and_managed_wrapper_are_checked(tmp_path):

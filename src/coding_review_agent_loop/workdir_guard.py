@@ -665,20 +665,37 @@ def _shell_command_index(tokens: Sequence[str]) -> int | None:
     head = _effective_head_index(tokens)
     if head is None or _program_basename(tokens[head]) not in {"sh", "bash", "zsh"}:
         return None
-    for index in range(head + 1, len(tokens)):
+    index = head + 1
+    while index < len(tokens):
         option = tokens[index]
-        # Only options with no operands: do not confuse an rcfile/script path
-        # or the operand of -o with the executable command string.
-        if option in {"--noprofile", "--norc"}:
+        if option in {"--login", "--noprofile", "--norc"}:
+            index += 1
             continue
-        if not re.fullmatch(r"-[celux]+", option):
-            if any(re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", later) for later in tokens[index + 1 :]):
-                raise AgentLoopError(
-                    "Cannot validate shell command string after an unsupported shell option."
-                )
+        if re.fullmatch(r"-[elux]*o", option):
+            # ``-o`` takes an option name, including when combined with
+            # operand-free flags as in ``-euo pipefail``.
+            if index + 1 >= len(tokens):
+                raise AgentLoopError("Cannot validate shell -o option without its operand.")
+            index += 2
+            continue
+        if re.fullmatch(r"-[celux]+", option):
+            if "c" in option:
+                return index + 1 if index + 1 < len(tokens) else None
+            index += 1
+            continue
+        if not option.startswith("-"):
+            # A shell operand is normally a script path. A quoted command-like
+            # blob is neither a safely identifiable script path nor an explicit
+            # command-string invocation, so refuse it instead of allowing paths
+            # embedded in the blob to bypass token-level validation.
+            if any(character.isspace() for character in option):
+                raise AgentLoopError("Cannot validate multi-word shell script operand.")
             return None
-        if "c" in option:
-            return index + 1 if index + 1 < len(tokens) else None
+        if any(re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", later) for later in tokens[index + 1 :]):
+            raise AgentLoopError(
+                "Cannot validate shell command string after an unsupported shell option."
+            )
+        return None
     return None
 
 

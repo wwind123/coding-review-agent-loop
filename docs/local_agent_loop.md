@@ -2835,10 +2835,14 @@ external virtualenv interpreter is checked separately from its test paths;
 the quoted command string is not treated as one filesystem path. Launcher
 arguments, inner test targets, working directories, and live URLs remain
 subject to the existing checks. Nested shells are bounded to eight levels;
-unsupported option forms receive no special command-string handling. This
-includes control operators adjacent to commands or arguments, while quoted
-operator characters remain ordinary argument text. This does not evaluate
-shell substitutions or certify arbitrary shell programs.
+common strict-mode forms such as `-euo pipefail` and operand-free login/profile
+options are parsed, while unsupported options before `-c` and multi-word shell
+operands without `-c` are rejected because their contents cannot be validated
+safely.
+
+Command-string tokenization recognizes control operators adjacent to commands
+or arguments, while quoted operator characters remain ordinary argument text.
+This does not evaluate shell substitutions or certify arbitrary shell programs.
 
 With writable agent memory, measured wrapper/gate outcomes are stored in the
 versioned `test-runtime.json` sidecar. It records elapsed time, attempted cap,
