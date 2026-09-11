@@ -269,6 +269,32 @@ def test_coder_context_preserves_disputes_and_missing_notes():
     assert "Codex; review round 4; head abc123" in context
 
 
+def test_coder_context_carries_persisted_local_failures_to_reviewers():
+    from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+
+    evidence = bounded_evidence_for_round({"observations": [{
+        "command": ["python", "-m", "pytest"],
+        "outcome": "failed",
+        "provenance": "parent-observed",
+        "receipt_id": "carried-failure",
+        "turn_id": "prior-turn",
+        "environment": "identity-unknown",
+        "attribution": {"state": "current-head", "head": "abc123"},
+    }]})
+    output = structured_coder_followup(summary="A smaller rerun passed.")
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Codex", round_number=4,
+        subject="abc123", local_test_evidence=evidence,
+    )
+
+    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+
+    assert "carried-failure" in context
+    assert "local_test_evidence" in context
+    assert "failed" in context
+    assert "identity-unknown" in context
+
+
 @pytest.mark.parametrize("head", [None, "different-head"])
 def test_coder_notes_not_presented_as_current_after_head_change(head):
     output = structured_coder_followup(summary="Unique old-head fix claim.")

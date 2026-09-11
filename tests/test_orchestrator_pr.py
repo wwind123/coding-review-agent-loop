@@ -5449,6 +5449,77 @@ def test_pr_loop_resume_hybrid_history_prefers_metadata_ledger_over_legacy_markd
     assert "Add a regression test before merge." in gemini_prompt
     assert "Keep the legacy fallback path." not in gemini_prompt
 
+
+def test_pr_resume_preserves_persisted_failure_in_next_coder_metadata(tmp_path):
+    from coding_review_agent_loop.local_test_evidence import (
+        bounded_evidence_for_round,
+        decode_bounded_evidence,
+    )
+
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="OpenAI Codex",
+        source_round=1,
+        text="Preserve the prior local failure.",
+        status="blocking",
+    )
+    prior_evidence = bounded_evidence_for_round({"observations": [{
+        "command": ["python", "-m", "pytest"],
+        "outcome": "failed",
+        "provenance": "parent-observed",
+        "receipt_id": "persisted-failure",
+        "turn_id": "old-turn",
+        "environment": "equivalent",
+        "attribution": {"state": "current-head", "head": "abc123", "stable": True, "tracked_digest": "tree-a"},
+    }]})
+    coder_comment = _attach_round_metadata(
+        structured_coder_followup(remaining_items=["item-1"]),
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=1,
+            subject="abc123", prior_items=(item,), local_test_evidence=prior_evidence,
+            raw_structured_coder_response=structured_coder_followup(remaining_items=["item-1"]),
+        ),
+    )
+    review_comment = _attach_round_metadata(
+        structured_pr_review(
+            state="blocking",
+            summary="Failure remains.",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "blocking", "note": "Fix it."}],
+        ),
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=1,
+            subject="abc123", prior_items=(item,), state="blocking",
+            dispositions=(ReviewItemDisposition("item-1", "OpenAI Codex", "blocking", "Fix it."),),
+        ),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"], tests_run=[])],
+        codex_outputs=[structured_pr_review(
+            state="approved",
+            summary="Resolved.",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        )],
+        pr_payload={"comments": [
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": coder_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:01:00Z", "body": review_comment},
+        ]},
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex")) == 0
+    posted = next(
+        comment["body"] for comment in reversed(runner.pr_payload["comments"])
+        if "## Coder follow-up" in comment["body"]
+    )
+    match = re.search(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", posted)
+    assert match is not None
+    metadata = _decode_round_metadata(match.group("payload"))
+    decoded = decode_bounded_evidence(metadata.local_test_evidence)
+    assert decoded is not None
+    assert "persisted-failure" in [row.receipt_id for row in decoded.observations]
+    preserved = next(row for row in decoded.observations if row.receipt_id == "persisted-failure")
+    assert preserved.environment_state == "identity-unknown"
+    assert preserved.attribution.state == "stale"
+
 def test_pr_loop_routes_unrecorded_head_advance_through_coder_before_reviewers(tmp_path):
     old_item = UnresolvedReviewItem(
         item_id="item-2",

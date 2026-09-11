@@ -119,7 +119,10 @@ def _render_test_commands_for_comment(
 
 
 def _render_test_observation_citations(
-    citations: Sequence[object], *, local_test_evidence: str | None = None
+    citations: Sequence[object],
+    *,
+    local_test_evidence: str | None = None,
+    current_test_turn_id: str | None = None,
 ) -> str:
     """Correlate receipt claims with the sanitized parent journal."""
     evidence = decode_bounded_evidence(local_test_evidence) if local_test_evidence else None
@@ -130,6 +133,13 @@ def _render_test_observation_citations(
     }
     lines = ["### Test observation receipts"]
     cited: set[str] = set()
+    citation_uses: dict[str, set[tuple[str, str]]] = {}
+    for citation in citations:
+        receipt_id = str(getattr(citation, "receipt_id", ""))
+        command = str(getattr(citation, "command", ""))
+        claim = str(getattr(citation, "claim", ""))
+        safe_command, _identifiers, _caveats = redact_test_command(command)
+        citation_uses.setdefault(receipt_id, set()).add((safe_command, claim))
     for citation in citations:
         command = getattr(citation, "command", "")
         receipt_id = str(getattr(citation, "receipt_id", ""))
@@ -138,7 +148,13 @@ def _render_test_observation_citations(
         observed = by_receipt.get(receipt_id)
         supported = observed is not None
         reason = "verified against the parent journal"
-        if observed is None:
+        if len(citation_uses.get(receipt_id, ())) > 1:
+            supported = False
+            reason = "unverified: conflicting uses of one receipt"
+        elif observed is None:
+            reason = "unverified: unknown or cross-turn receipt"
+        elif current_test_turn_id is None or observed.turn_id != current_test_turn_id:
+            supported = False
             reason = "unverified: unknown or cross-turn receipt"
         elif redact_test_command(observed.command)[0] != safe_command:
             supported = False
@@ -708,6 +724,7 @@ def _render_public_coder_followup_comment(
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
     local_test_evidence: str | None = None,
+    current_test_turn_id: str | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
 
@@ -781,7 +798,9 @@ def _render_public_coder_followup_comment(
         )
     if parsed_followup.test_observations or local_test_evidence:
         sections.append(_render_test_observation_citations(
-            parsed_followup.test_observations, local_test_evidence=local_test_evidence
+            parsed_followup.test_observations,
+            local_test_evidence=local_test_evidence,
+            current_test_turn_id=current_test_turn_id,
         ))
     if parsed_followup.human_requirement_dispositions:
         sections.append(
@@ -807,6 +826,7 @@ def _render_public_issue_implementation_comment(
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
     local_test_evidence: str | None = None,
+    current_test_turn_id: str | None = None,
 ) -> str:
     """Render an implementation result without exposing its JSON envelope."""
     has_blocked_requirement = any(
@@ -836,7 +856,9 @@ def _render_public_issue_implementation_comment(
         )
     if parsed.test_observations or local_test_evidence:
         sections.append(_render_test_observation_citations(
-            parsed.test_observations, local_test_evidence=local_test_evidence
+            parsed.test_observations,
+            local_test_evidence=local_test_evidence,
+            current_test_turn_id=current_test_turn_id,
         ))
     human_section = render_human_requirement_dispositions(
         parsed.human_requirement_dispositions
@@ -964,6 +986,7 @@ def render_public_agent_comment(
     human_requirements_resolved_flag: bool = False,
     round_number: int = 1,
     local_test_evidence: str | None = None,
+    current_test_turn_id: str | None = None,
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -1005,6 +1028,7 @@ def render_public_agent_comment(
             config=config,
             model_used=model_used,
             local_test_evidence=local_test_evidence,
+            current_test_turn_id=current_test_turn_id,
         )
     if kind == "issue_implementation":
         if not isinstance(parsed, StructuredIssueImplementation):
@@ -1017,6 +1041,7 @@ def render_public_agent_comment(
             config=config,
             model_used=model_used,
             local_test_evidence=local_test_evidence,
+            current_test_turn_id=current_test_turn_id,
         )
     if kind == "plan_revision":
         if not isinstance(parsed, StructuredPlanRevision):

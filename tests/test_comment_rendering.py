@@ -498,18 +498,51 @@ def test_coder_receipts_are_correlated_and_uncited_failures_remain_visible():
     )
     evidence = bounded_evidence_for_round({
         "observations": [
-            {"command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"], "outcome": "passed", "provenance": "parent-observed", "receipt_id": "known", "environment": "unknown", "attribution": {"state": "current-head"}},
-            {"command": ["python", "-m", "pytest", "tests/test_runner.py", "-q"], "outcome": "failed", "provenance": "parent-observed", "receipt_id": "failure", "environment": "unknown"},
+            {"command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"], "outcome": "passed", "provenance": "parent-observed", "receipt_id": "known", "turn_id": "current-turn", "environment": "unknown", "attribution": {"state": "current-head"}},
+            {"command": ["python", "-m", "pytest", "tests/test_runner.py", "-q"], "outcome": "failed", "provenance": "parent-observed", "receipt_id": "failure", "turn_id": "current-turn", "environment": "unknown"},
         ]
     })
     rendered = _render_public_coder_followup_comment(
-        parsed, agent="Claude", local_test_evidence=evidence
+        parsed, agent="Claude", local_test_evidence=evidence,
+        current_test_turn_id="current-turn",
     )
     assert "unverified: receipt does not support a base reproduction" in rendered
     assert "unverified: unknown or cross-turn receipt" in rendered
     assert "uncited authoritative `failed`" in rendered
     assert "```json" not in rendered
     assert '"kind": "coder_followup"' not in rendered
+
+
+def test_coder_receipts_reject_cross_turn_and_conflicting_citations():
+    from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+
+    parsed = validate_structured_coder_followup(
+        json.dumps({
+            "schema_version": 1, "kind": "coder_followup", "state": "blocking",
+            "summary": "Checked receipts.", "addressed_items": [], "remaining_items": [],
+            "human_requirement_dispositions": [],
+            "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+            "test_observations": [
+                {"command": "python -m pytest tests/test_protocol.py -q", "receipt_id": "old", "claim": "current-result"},
+                {"command": "python -m pytest tests/test_protocol.py -q", "receipt_id": "conflict", "claim": "current-result"},
+                {"command": "python -m pytest tests/test_protocol.py -q", "receipt_id": "conflict", "claim": "base-reproduction"},
+            ],
+        }) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    evidence = bounded_evidence_for_round({"observations": [
+        {"command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"], "outcome": "passed", "provenance": "parent-observed", "receipt_id": "old", "turn_id": "prior-turn", "environment": "unknown", "attribution": {"state": "current-head"}},
+        {"command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"], "outcome": "passed", "provenance": "parent-observed", "receipt_id": "conflict", "turn_id": "current-turn", "environment": "unknown", "attribution": {"state": "current-head"}},
+    ]})
+
+    rendered = _render_public_coder_followup_comment(
+        parsed,
+        agent="Claude",
+        local_test_evidence=evidence,
+        current_test_turn_id="current-turn",
+    )
+
+    assert "unverified: unknown or cross-turn receipt" in rendered
+    assert rendered.count("unverified: conflicting uses of one receipt") == 2
 
     without_tests = validate_structured_coder_followup(
         json.dumps(

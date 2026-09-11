@@ -17,8 +17,10 @@ from coding_review_agent_loop.local_test_evidence import (
     TestBrokerServer as BrokerServer,
     TreeAttribution,
     attribute_base_reproduction,
+    attribute_current_head,
     bounded_evidence_for_round,
     canonical_environment_bytes,
+    capture_tracked_tree_snapshot,
     decode_bounded_evidence,
     environment_comparison_for_restart,
     parse_legacy_tests_run,
@@ -214,6 +216,61 @@ def test_restart_evidence_is_identity_unknown_and_never_supersedes():
     assert evidence.observations[0].environment_state == "identity-unknown"
 
 
+@pytest.mark.parametrize(
+    ("current_head", "expected_state"),
+    [("head-a", "current-head"), ("head-b", "stale")],
+)
+def test_runner_merges_persisted_restart_history_into_next_handoff(
+    monkeypatch, tmp_path, current_head, expected_state
+):
+    import coding_review_agent_loop.runner as runner_module
+    from coding_review_agent_loop.local_test_evidence import TrackedTreeSnapshot
+
+    prior = bounded_evidence_for_round({"observations": [{
+        "command": ["python", "-m", "pytest"],
+        "outcome": "failed",
+        "provenance": "parent-observed",
+        "receipt_id": "prior-failure",
+        "turn_id": "prior-turn",
+        "environment": "equivalent",
+        "attribution": {
+            "state": "current-head", "head": "head-a", "stable": True,
+            "tracked_digest": "tree-a",
+        },
+    }]})
+    monkeypatch.setattr(
+        runner_module,
+        "stable_tracked_tree_snapshot",
+        lambda _cwd: TrackedTreeSnapshot(
+            root=str(tmp_path), head=current_head, digest="all", tracked_digest="tree-a",
+            status_clean=True, complete=True, stable=True,
+        ),
+        raising=False,
+    )
+    # render_local_test_evidence imports the snapshot helper from its defining
+    # module, so patch that binding as well.
+    monkeypatch.setattr(
+        "coding_review_agent_loop.local_test_evidence.stable_tracked_tree_snapshot",
+        lambda _cwd: TrackedTreeSnapshot(
+            root=str(tmp_path), head=current_head, digest="all", tracked_digest="tree-a",
+            status_clean=True, complete=True, stable=True,
+        ),
+    )
+    runner = runner_module.Runner()
+
+    merged = runner.render_local_test_evidence(
+        current_head=current_head,
+        cwd=tmp_path,
+        prior_local_test_evidence=prior,
+    )
+    decoded = decode_bounded_evidence(merged)
+
+    assert decoded is not None
+    assert [item.receipt_id for item in decoded.observations] == ["prior-failure"]
+    assert decoded.observations[0].environment_state == "identity-unknown"
+    assert decoded.observations[0].attribution.state == expected_state
+
+
 def test_public_projection_redacts_credentials_paths_and_diagnostics(tmp_path):
     command, identifiers, caveats = redact_test_command(
         [
@@ -285,6 +342,34 @@ def test_broker_authenticates_turn_and_forwards_only_snapshot_environment(tmp_pa
         bad["AGENT_LOOP_TEST_BROKER_CAPABILITY"] = "wrong"
         with pytest.raises(Exception):
             BrokerClient(bad).run([sys.executable, "-c", "pass"], timeout_seconds=5, cwd=tmp_path)
+    finally:
+        server.stop()
+
+
+def test_broker_context_failure_returns_error_and_records_incomplete(monkeypatch, tmp_path):
+    import coding_review_agent_loop.containment as containment_module
+    from coding_review_agent_loop.errors import AgentLoopError
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-761").start()
+    monkeypatch.setattr(
+        containment_module,
+        "open_confined_cwd",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AgentLoopError("synthetic context failure")),
+    )
+    try:
+        environment = {
+            **server.environment,
+            "AGENT_LOOP_INVOCATION_ID": "turn-761",
+            "PATH": os.environ.get("PATH", ""),
+        }
+        with pytest.raises(Exception, match="synthetic context failure"):
+            BrokerClient(environment).run(
+                [sys.executable, "-c", "pass"], timeout_seconds=5, cwd=tmp_path
+            )
+        assert len(server.journal) == 1
+        assert server.journal[0].outcome == "incomplete"
+        assert server.journal[0].provenance == "telemetry-unverified"
+        assert "capture incomplete" in " ".join(server.journal[0].caveats)
     finally:
         server.stop()
 
@@ -389,3 +474,75 @@ def test_base_reproduction_requires_clean_complete_stable_snapshots():
         **{**snapshot.__dict__, "status_clean": False}
     )
     assert attribute_base_reproduction(dirty, dirty, base_commit="base").state == "unknown"
+
+
+def _init_snapshot_repo(root: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+    (root / "tracked.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "initial"], check=True)
+
+
+def test_current_head_allows_unrelated_untracked_but_rejects_referenced_input(tmp_path):
+    _init_snapshot_repo(tmp_path)
+    (tmp_path / "notes.tmp").write_text("scratch\n", encoding="utf-8")
+    before = capture_tracked_tree_snapshot(tmp_path, argv=("pytest", "tests/test_protocol.py"))
+    after = capture_tracked_tree_snapshot(tmp_path, argv=("pytest", "tests/test_protocol.py"))
+    unrelated = attribute_current_head(before, after, current_head=after.head)
+    assert unrelated.state == "current-head"
+    assert unrelated.untracked_input is False
+    assert "unrelated" in " ".join(unrelated.caveats)
+
+    referenced_before = capture_tracked_tree_snapshot(tmp_path, argv=("tool", "notes.tmp"))
+    referenced_after = capture_tracked_tree_snapshot(tmp_path, argv=("tool", "notes.tmp"))
+    referenced = attribute_current_head(
+        referenced_before, referenced_after, current_head=referenced_after.head
+    )
+    assert referenced.state == "untracked-input-unverified"
+    assert referenced.untracked_input is True
+
+
+def test_precommit_observation_is_promoted_only_when_eventual_tree_matches(tmp_path):
+    _init_snapshot_repo(tmp_path)
+    registry = EnvironmentIdentityRegistry()
+    (tmp_path / "tracked.txt").write_text("two\n", encoding="utf-8")
+    tested = capture_tracked_tree_snapshot(tmp_path)
+    attribution = attribute_current_head(tested, tested, current_head=tested.head)
+    assert attribution.state == "unknown"
+    observation = LocalTestObservation(
+        command=(sys.executable, "-m", "pytest"),
+        outcome="passed",
+        provenance="parent-observed",
+        receipt_id="precommit-pass",
+        turn_id="current-turn",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        normalized_command="python -m pytest",
+        attribution=attribution,
+        environment_state="not-compared",
+        environment_identity=registry.capture({"PATH": "/usr/bin"}),
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "eventual"], check=True)
+    eventual = capture_tracked_tree_snapshot(tmp_path)
+    evidence = reconcile_test_observations(
+        [observation],
+        current_head=eventual.head,
+        current_snapshot=eventual,
+        registry=registry,
+    )
+    assert evidence.observations[0].attribution.state == "current-head"
+    assert evidence.observations[0].attribution.head == eventual.head
+
+    (tmp_path / "tracked.txt").write_text("three\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "different"], check=True)
+    different = capture_tracked_tree_snapshot(tmp_path)
+    stale = reconcile_test_observations(
+        [observation],
+        current_head=different.head,
+        current_snapshot=different,
+        registry=registry,
+    )
+    assert stale.observations[0].attribution.state == "stale"

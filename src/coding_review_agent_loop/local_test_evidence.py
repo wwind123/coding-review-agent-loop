@@ -512,6 +512,7 @@ def reconcile_test_observations(
     observations: Iterable[LocalTestObservation | Mapping[str, object]],
     *,
     current_head: str | None = None,
+    current_snapshot: "TrackedTreeSnapshot | None" = None,
     registry: EnvironmentIdentityRegistry | None = None,
     legacy_tests_run: Sequence[str] | None = None,
     cwd: Path | None = None,
@@ -595,6 +596,38 @@ def reconcile_test_observations(
                 environment_state="unknown",
                 caveats=(*row.caveats, "effective target environment could not be compared"),
             )
+
+    # Compare live observations with the clean eventual tree at handoff. This
+    # lets a stable pre-commit test become attributable after the coder commits.
+    if (
+        current_snapshot is not None
+        and current_snapshot.complete
+        and current_snapshot.stable is True
+        and current_snapshot.status_clean is True
+        and current_snapshot.tracked_digest
+    ):
+        for index, row in enumerate(rows):
+            if row.environment_identity is None:
+                continue
+            attribution = row.attribution
+            if attribution.stable is not True or not attribution.tracked_digest:
+                continue
+            if attribution.tracked_digest == current_snapshot.tracked_digest:
+                state = "untracked-input-unverified" if attribution.untracked_input else "current-head"
+                rows[index] = replace(
+                    row,
+                    attribution=replace(
+                        attribution,
+                        state=state,
+                        head=current_head or current_snapshot.head,
+                    ),
+                )
+            else:
+                rows[index] = replace(
+                    row,
+                    attribution=replace(attribution, state="stale"),
+                    caveats=(*row.caveats, "tested tracked tree differs from the eventual PR tree"),
+                )
 
     for failure_index, failure in enumerate(rows):
         if not failure.is_failure or failure.superseded_by:
@@ -896,12 +929,9 @@ def decode_bounded_evidence(value: object) -> LocalTestEvidence | None:
     observations = tuple(
         replace(
             redact_observation(observation_from_mapping(row)),
-            environment_state=(
-                "identity-unknown"
-                if row.get("environment_state", row.get("environment", "not-compared"))
-                in {"not-compared", "unknown"}
-                else str(row.get("environment_state", row.get("environment")))
-            ),
+            # No persisted value can reconstitute the process-private canonical
+            # bytes needed for equality. Every restored row degrades visibly.
+            environment_state=environment_comparison_for_restart(),
         )
         for row in rows
         if isinstance(row, Mapping)
@@ -1080,9 +1110,15 @@ def capture_tracked_tree_snapshot(
                 untracked_records.append((relative, payload))
             except (OSError, UnicodeError) as exc:
                 raise AgentLoopError("untracked file could not be read") from exc
-        tracked_digest = _hash_snapshot_records(index_records + tracked_records, limit=max_bytes)
+        # Keep a content-only tracked digest for comparison with the eventual
+        # committed PR tree. HEAD and index state remain covered by ``digest``.
+        tracked_digest = _hash_snapshot_records(tracked_records, limit=max_bytes)
         digest = _hash_snapshot_records(index_records + tracked_records + untracked_records, limit=max_bytes)
-        status = _run_git(canonical_root, ("status", "--porcelain=v1", "--untracked-files=all"), timeout=timeout_seconds)
+        tracked_status = _run_git(
+            canonical_root,
+            ("status", "--porcelain=v1", "--untracked-files=no"),
+            timeout=timeout_seconds,
+        )
         referenced = _referenced_paths(canonical_root, argv)
         referenced_untracked = tuple(sorted(referenced.intersection(untracked)))
         return TrackedTreeSnapshot(
@@ -1090,7 +1126,7 @@ def capture_tracked_tree_snapshot(
             head=head,
             digest=digest,
             tracked_digest=tracked_digest,
-            status_clean=not bool(status.strip()),
+            status_clean=not bool(tracked_status.strip()),
             complete=True,
             stable=True,
             untracked_paths=tuple(sorted(untracked)),
@@ -1145,14 +1181,17 @@ def attribute_current_head(
     caveats = list((*before.caveats, *after.caveats))
     if not before.complete or not after.complete or before.stable is not True or after.stable is not True:
         return TreeAttribution(state="unknown", head=after.head or before.head, stable=False, caveats=tuple(caveats + ["stable repository snapshot unavailable"]))
-    if before.status_clean is not True or after.status_clean is not True:
-        return TreeAttribution(state="unknown", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, caveats=tuple(caveats + ["tracked or index working tree differs from the attributed tree"]))
+    if before.digest != after.digest or before.tracked_digest != after.tracked_digest:
+        return TreeAttribution(state="unknown", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=False, caveats=tuple(caveats + ["repository changed while the test command ran"]))
     if before.head != after.head or (current_head and after.head != current_head):
         return TreeAttribution(state="stale", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, caveats=tuple(caveats + ["head changed or does not match current head"]))
     referenced = set(before.referenced_untracked_paths) | set(after.referenced_untracked_paths)
     if referenced:
         return TreeAttribution(state="untracked-input-unverified", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=True, caveats=tuple(caveats + ["referenced non-ignored untracked input is not attributable"]))
-    return TreeAttribution(state="current-head", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=bool(set(before.untracked_paths) | set(after.untracked_paths)), caveats=tuple(caveats + (["unrelated non-ignored untracked files present"] if (set(before.untracked_paths) | set(after.untracked_paths)) else [])))
+    untracked_present = bool(set(before.untracked_paths) | set(after.untracked_paths))
+    if before.status_clean is not True or after.status_clean is not True:
+        return TreeAttribution(state="unknown", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=False, caveats=tuple(caveats + ["tracked worktree awaits comparison with the eventual PR tree"] + (["unrelated non-ignored untracked files present"] if untracked_present else [])))
+    return TreeAttribution(state="current-head", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=False, caveats=tuple(caveats + (["unrelated non-ignored untracked files present"] if untracked_present else [])))
 
 
 def attribute_base_reproduction(
@@ -1472,6 +1511,7 @@ class TestBrokerServer:
             handler.start()
 
     def _handle(self, connection: socket.socket) -> None:
+        validated: Mapping[str, object] | None = None
         try:
             with connection:
                 try:
@@ -1499,7 +1539,9 @@ class TestBrokerServer:
                             oldest = next(iter(self._receipts))
                             self._receipts.pop(oldest, None)
                     _send_frame(connection, response)
-                except (BrokerProtocolError, OSError, ValueError) as exc:
+                except (BrokerProtocolError, AgentLoopError, OSError, ValueError) as exc:
+                    if isinstance(exc, AgentLoopError):
+                        self._record_capture_failure(validated, exc)
                     try:
                         _send_frame(connection, {"type": "error", "error": _safe_text(exc)})
                     except OSError:
@@ -1507,6 +1549,42 @@ class TestBrokerServer:
         finally:
             with self._journal_lock:
                 self._handler_threads.discard(current_thread())
+
+    def _record_capture_failure(
+        self,
+        request: Mapping[str, object] | None,
+        error: BaseException,
+    ) -> None:
+        """Retain a bounded caveat when authoritative execution cannot start."""
+        argv = tuple(str(item) for item in request.get("argv", ())) if request else ()
+        cwd = str(request.get("cwd")) if request and request.get("cwd") else str(self.root)
+        try:
+            from .test_runtime import normalize_test_command
+
+            normalized = normalize_test_command(argv, cwd=Path(cwd))
+        except Exception:
+            normalized = ""
+        observation = LocalTestObservation(
+            command=argv,
+            outcome="incomplete",
+            provenance="telemetry-unverified",
+            scope=EvidenceScope("unknown", ()),
+            receipt_id=uuid.uuid4().hex,
+            turn_id=self.turn_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            cwd=cwd,
+            normalized_command=normalized,
+            attribution=TreeAttribution(
+                state="unknown",
+                stable=False,
+                caveats=("broker context or infrastructure failure",),
+            ),
+            environment_state="identity-unknown",
+            caveats=(f"local test capture incomplete: {type(error).__name__}",),
+        )
+        with self._journal_lock:
+            self._journal.append(observation)
+            self._journal[:] = self._journal[-MAX_PRIVATE_OBSERVATIONS:]
 
     def _execute_request(self, request: Mapping[str, object], connection: socket.socket) -> dict[str, object]:
         from .containment import open_confined_cwd

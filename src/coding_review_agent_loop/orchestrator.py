@@ -4959,6 +4959,7 @@ def _implement_approved_issue(
             config=implementation_config,
             model_used=coder_response.model_used,
             local_test_evidence=initial_local_test_evidence,
+            current_test_turn_id=runner.latest_test_turn_id,
         ),
         PostedRoundMetadata(
             flow="pr",
@@ -6935,6 +6936,7 @@ def run_issue_loop(
                 config=config,
                 model_used=coder_response.model_used,
                 local_test_evidence=initial_local_test_evidence,
+                current_test_turn_id=runner.latest_test_turn_id,
             ),
             PostedRoundMetadata(
                 flow="pr",
@@ -10013,6 +10015,11 @@ def run_pr_loop(
                     else None
                 ),
                 cwd=active_workdir(config),
+                prior_local_test_evidence=(
+                    latest_coder_metadata.local_test_evidence
+                    if latest_coder_metadata is not None
+                    else None
+                ),
             )
             if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                 public_comment = render_public_agent_comment(
@@ -10023,6 +10030,7 @@ def run_pr_loop(
                     config=config,
                     model_used=coder_response.model_used,
                     local_test_evidence=local_test_evidence,
+                    current_test_turn_id=runner.latest_test_turn_id,
                 )
 
             latest_coder_metadata = PostedRoundMetadata(

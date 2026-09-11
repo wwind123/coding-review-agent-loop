@@ -13,6 +13,7 @@ import pytest
 
 import coding_review_agent_loop.cli as cli_module
 import coding_review_agent_loop.containment as containment_module
+import coding_review_agent_loop.runner as runner_module
 from coding_review_agent_loop.checks import _raise_for_gate_result
 from coding_review_agent_loop.containment import (
     AggregateLease,
@@ -141,6 +142,80 @@ def test_nested_test_wrapper_inherits_parent_scope(monkeypatch, tmp_path):
     assert result.containment.backend == "systemd-cgroup-v2-inherited"
 
 
+def test_nested_test_wrapper_uses_ambient_turn_when_env_is_omitted(monkeypatch, tmp_path):
+    policy = default_policy(mode="auto", cache_dir=tmp_path / "runtime")
+    inherited = tmp_path / "parent-cgroup"
+    inherited.mkdir()
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "parent-turn")
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", lambda _pid: inherited)
+    monkeypatch.setattr(
+        runner_module.InvocationHandle,
+        "prepare",
+        lambda *_args, **_kwargs: pytest.fail("nested wrapper must not create a sibling scope"),
+    )
+
+    result = run_foreground_test(
+        [sys.executable, "-c", "print('inherited')"],
+        cwd=tmp_path,
+        timeout_seconds=2,
+        env=None,
+        containment_policy=policy,
+    )
+
+    assert result.passed
+    assert result.containment is not None
+    assert result.containment.backend == "systemd-cgroup-v2-inherited"
+
+
+def test_broker_held_exec_attaches_and_verifies_before_release(monkeypatch, tmp_path):
+    parent = tmp_path / "coder-cgroup"
+    parent.mkdir()
+    (parent / "cgroup.procs").write_text("", encoding="ascii")
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", lambda _pid: parent)
+
+    result = run_foreground_test(
+        [sys.executable, "-c", "print('attached')"],
+        cwd=tmp_path,
+        timeout_seconds=2,
+        parent_cgroup_path=parent,
+    )
+
+    assert result.passed
+    assert (parent / "cgroup.procs").read_text(encoding="ascii").isdigit()
+
+
+def test_broker_held_exec_verification_mismatch_terminates_child(monkeypatch, tmp_path):
+    parent = tmp_path / "coder-cgroup"
+    other = tmp_path / "other-cgroup"
+    parent.mkdir()
+    other.mkdir()
+    (parent / "cgroup.procs").write_text("", encoding="ascii")
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", lambda _pid: other)
+
+    with pytest.raises(AgentLoopError, match="could not be verified"):
+        run_foreground_test(
+            [sys.executable, "-c", "print('must not run')"],
+            cwd=tmp_path,
+            timeout_seconds=2,
+            parent_cgroup_path=parent,
+        )
+
+
+def test_broker_held_exec_handshake_timeout_terminates_child(monkeypatch, tmp_path):
+    parent = tmp_path / "coder-cgroup"
+    parent.mkdir()
+    (parent / "cgroup.procs").write_text("", encoding="ascii")
+    monkeypatch.setattr(runner_module.select, "select", lambda *_args, **_kwargs: ([], [], []))
+
+    with pytest.raises(AgentLoopError, match="did not reach the containment handshake"):
+        run_foreground_test(
+            [sys.executable, "-c", "print('must not run')"],
+            cwd=tmp_path,
+            timeout_seconds=2,
+            parent_cgroup_path=parent,
+        )
+
+
 def test_auto_preflight_reports_unsupported_counter_tree(tmp_path):
     (tmp_path / "cgroup.controllers").write_text("memory pids\n", encoding="ascii")
     (tmp_path / "memory.events").write_text("oom_kill 0\n", encoding="ascii")
@@ -173,7 +248,8 @@ def test_containment_preflight_cli_renders_portable_fallback(monkeypatch, capsys
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="systemd containment is Linux-only")
-def test_managed_foreground_scope_has_cleanup_evidence(tmp_path):
+def test_managed_foreground_scope_has_cleanup_evidence(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_LOOP_INVOCATION_ID", raising=False)
     policy = default_policy(mode="auto", cache_dir=tmp_path / "runtime")
     manifest = preflight_containment(policy)
     if not manifest.memory_ceiling_claimed:
@@ -331,6 +407,7 @@ def test_confirm_empty_does_not_accept_cgroup_read_error(monkeypatch, tmp_path):
 
 def test_fake_systemd_memory_limit_terminates_descendant_tree(monkeypatch, tmp_path):
     """A managed-limit termination kills all descendants and is typed as OOM."""
+    monkeypatch.delenv("AGENT_LOOP_INVOCATION_ID", raising=False)
     policy = default_policy(
         mode="auto", cache_dir=tmp_path / "runtime", memory_max=8 * 1024 * 1024,
         memory_high=6 * 1024 * 1024, memory_swap_max=0, tasks_max=32,

@@ -196,11 +196,10 @@ def run_foreground_test(
                 *cmd,
             ]
         elif containment_policy is not None and containment_policy.mode != "off":
-            # Only an explicit, complete caller context proves that this
-            # subprocess is a descendant wrapper. Ambient orchestration
-            # variables must not make unrelated in-process test calls claim
-            # inherited containment.
-            invocation_values = env if env is not None else {}
+            # An explicit caller environment takes precedence; when it is
+            # omitted, the wrapper's actual ambient environment determines
+            # whether this is already inside an orchestrated invocation.
+            invocation_values = env if env is not None else os.environ
             if invocation_values.get("AGENT_LOOP_INVOCATION_ID"):
                 # A test wrapper launched from an already-contained agent is a
                 # descendant of that scope.  Keep it in the inherited cgroup
@@ -590,6 +589,7 @@ class Runner:
         self._active_handles: dict[str, InvocationHandle] = {}
         self._active_test_brokers: dict[str, TestBrokerServer] = {}
         self._local_test_observations: list[LocalTestObservation] = []
+        self._latest_test_turn_id: str | None = None
         self._environment_registry = EnvironmentIdentityRegistry()
         self._containment_role = "coder"
 
@@ -670,6 +670,7 @@ class Runner:
         if env is not None:
             values.update({str(key): str(value) for key, value in env.items()})
         turn_id = secrets.token_hex(32)
+        self._latest_test_turn_id = turn_id
         try:
             ceiling = float(values.get("AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS", "1800"))
             broker = TestBrokerServer(
@@ -730,25 +731,40 @@ class Runner:
         with self._active_procs_lock:
             return tuple(self._local_test_observations)
 
+    @property
+    def latest_test_turn_id(self) -> str | None:
+        """Authenticated identity of the most recent coder/repair turn."""
+        return self._latest_test_turn_id
+
     def render_local_test_evidence(
         self,
         *,
         current_head: str | None = None,
         legacy_tests_run: Sequence[str] | None = None,
         cwd: Path | None = None,
+        prior_local_test_evidence: str | None = None,
     ) -> str | None:
-        observations = self.local_test_observations()
+        from .local_test_evidence import (
+            bounded_evidence_for_round,
+            decode_bounded_evidence,
+            stable_tracked_tree_snapshot,
+        )
+
+        observations = list(self.local_test_observations())
+        prior = decode_bounded_evidence(prior_local_test_evidence)
+        if prior is not None:
+            observations = [*prior.observations, *observations]
         if not observations and not legacy_tests_run:
             return None
+        current_snapshot = stable_tracked_tree_snapshot(cwd) if cwd is not None else None
         evidence = reconcile_test_observations(
             observations,
             current_head=current_head,
+            current_snapshot=current_snapshot,
             registry=self._environment_registry,
             legacy_tests_run=legacy_tests_run,
             cwd=cwd,
         )
-        from .local_test_evidence import bounded_evidence_for_round
-
         return bounded_evidence_for_round(evidence)
 
     def remember_agent_command(
