@@ -6,6 +6,7 @@ import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
+from coding_review_agent_loop.comment_rendering import _render_public_issue_implementation_comment
 from coding_review_agent_loop.decomposition import approved_plan_hash, format_one_shot_impl_handoff_comment
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.github import (
@@ -48,6 +49,7 @@ from coding_review_agent_loop.protocol import (
     PlanReviewItems,
     ReviewItemDisposition,
     UnresolvedReviewItem,
+    validate_structured_issue_implementation,
 )
 from coding_review_agent_loop.salvage import (
     SalvageContext,
@@ -67,6 +69,46 @@ from agent_loop_helpers import (
     structured_pr_review,
     structured_issue_implementation,
 )
+
+
+def test_issue_handoff_receipt_must_belong_to_current_coder_turn():
+    from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+
+    parsed = validate_structured_issue_implementation(
+        json.dumps({
+            "schema_version": 1,
+            "kind": "issue_implementation",
+            "state": "blocking",
+            "summary": "Implemented the issue.",
+            "pr_number": 77,
+            "human_requirement_dispositions": [],
+            "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+            "test_observations": [{
+                "command": "python -m pytest tests/test_protocol.py -q",
+                "receipt_id": "old-receipt",
+                "claim": "current-result",
+            }],
+            "tests_run": [],
+        }) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    evidence = bounded_evidence_for_round({"observations": [{
+        "command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"],
+        "outcome": "passed",
+        "provenance": "parent-observed",
+        "receipt_id": "old-receipt",
+        "turn_id": "prior-turn",
+        "environment": "unknown",
+        "attribution": {"state": "current-head"},
+    }]})
+
+    rendered = _render_public_issue_implementation_comment(
+        parsed,
+        agent="Claude",
+        local_test_evidence=evidence,
+        current_test_turn_id="current-turn",
+    )
+
+    assert "unverified: unknown or cross-turn receipt" in rendered
 
 
 def _provenance_pages(message: str):

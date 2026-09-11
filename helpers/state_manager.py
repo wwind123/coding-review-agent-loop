@@ -74,6 +74,7 @@ from coding_review_agent_loop.round_state import (
     _serialize_unresolved_item,
 )
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
+from coding_review_agent_loop.local_test_evidence import canonicalize_bounded_evidence
 
 
 def _session_path(repo: str, issue: int) -> Path:
@@ -173,6 +174,7 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
         "completed_reviewer_data": [],
         "completed_round_number": 0,
         "current_plan_subject": None,
+        "local_test_evidence": None,
         "pending_comment_body": session.get("pending_comment_body"),
     }
 
@@ -190,6 +192,7 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                 descriptor["completed_reviewer_names"] = completed_names
                 descriptor["current_plan"] = plan_text
                 descriptor["current_plan_subject"] = _plan_subject(plan_text)
+                descriptor["local_test_evidence"] = resumed.local_test_evidence
                 descriptor["completed_reviewer_data"] = [
                     {
                         "reviewer_name": record.metadata.agent,
@@ -234,6 +237,7 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                 completed_names = [record.metadata.agent for record in result.completed_reviews]
                 descriptor["completed_reviewer_names"] = completed_names
                 descriptor["current_plan_subject"] = head_sha
+                descriptor["local_test_evidence"] = result.local_test_evidence
                 descriptor["completed_reviewer_data"] = [
                     {
                         "reviewer_name": record.metadata.agent,
@@ -342,6 +346,21 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             print(f"state_manager: cannot read compact prior summaries file: {exc}", file=sys.stderr)
             sys.exit(1)
 
+    local_test_evidence: str | None = None
+    if getattr(args, "local_test_evidence_file", None):
+        try:
+            raw_evidence = Path(args.local_test_evidence_file).read_text(encoding="utf-8")
+            try:
+                evidence_payload = json.loads(raw_evidence)
+            except json.JSONDecodeError:
+                evidence_payload = raw_evidence
+            if isinstance(evidence_payload, dict) and "local_test_evidence" in evidence_payload:
+                evidence_payload = evidence_payload["local_test_evidence"]
+            local_test_evidence = canonicalize_bounded_evidence(evidence_payload)
+        except (OSError, ValueError) as exc:
+            print(f"state_manager: cannot read local test evidence: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     metadata = PostedRoundMetadata(
         flow=args.flow,
         role=args.role,
@@ -361,6 +380,7 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         surfaced_reviewer_requirement_ids=tuple(
             getattr(args, "surfaced_reviewer_requirement_ids", ()) or ()
         ),
+        local_test_evidence=local_test_evidence,
     )
     augmented = _attach_round_metadata(body, metadata)
 
@@ -446,6 +466,8 @@ def main() -> None:
                         help="Full subject hash of the approved plan surfaced to a PR reviewer.")
     p_meta.add_argument("--surfaced-reviewer-requirement-ids", nargs="*", default=(),
                         help="Stable signed-requirement IDs surfaced to a PR reviewer.")
+    p_meta.add_argument("--local-test-evidence-file", default=None,
+                        help="JSON sidecar containing bounded local test evidence.")
 
     # build-resume
     p_resume = subparsers.add_parser("build-resume", help="Build a resume descriptor from GitHub comments.")

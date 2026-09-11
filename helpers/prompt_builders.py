@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import dataclasses
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -49,6 +50,29 @@ def _with_containment_guidance(prompt: str, config: AgentLoopConfig) -> str:
     """Keep skill-mode prompt construction aligned with the CLI guidance."""
     guidance = containment_prompt_guidance(config)
     return prompt if guidance.strip() in prompt else f"{prompt}\n{guidance}"
+
+
+def _local_test_evidence_guidance(value: object, *, current_head: str | None = None) -> str:
+    """Carry only the already-sanitized advisory history into skill prompts."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    from coding_review_agent_loop.local_test_evidence import (
+        decode_bounded_evidence,
+        reconcile_test_observations,
+    )
+
+    parsed = decode_bounded_evidence(value)
+    if parsed is None:
+        return (
+            "\n\nLocal test evidence history is present but malformed after restart; "
+            "treat prior local claims as identity-unknown and advisory.\n"
+        )
+    parsed = reconcile_test_observations(parsed.observations, current_head=current_head)
+    return (
+        "\n\nLocal test evidence history (advisory; do not override GitHub CI):\n"
+        + json.dumps(parsed.to_dict(), ensure_ascii=False, sort_keys=True)
+        + "\n"
+    )
 
 
 def make_minimal_config(
@@ -197,6 +221,7 @@ def build_review_prompt_for_skill(
     parent_issue_context: IssueContext | None = None,
     human_requirements: Sequence | None = None,
     approved_plan_max_chars: int | None = None,
+    local_test_evidence: str | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
@@ -253,6 +278,9 @@ def build_review_prompt_for_skill(
         unresolved_items=unresolved,
         approved_plan_context=approved_plan_context,
         approved_plan_max_chars=approved_plan_max_chars,
+        coder_followup_context=_local_test_evidence_guidance(
+            local_test_evidence, current_head=issue_dict.get("headRefOid")
+        ),
     )
     if pr_diff:
         prompt += f"\n\n## PR diff\n\n```diff\n{pr_diff}\n```\n"
@@ -275,6 +303,7 @@ def build_pr_fix_prompt_for_skill(
     memory: AgentMemoryContext | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
     approved_plan_max_chars: int | None = None,
+    local_test_evidence: str | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> str:
     """Build the external-coder PR-fix prompt from skill-mode ledger items.
@@ -287,11 +316,12 @@ def build_pr_fix_prompt_for_skill(
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
     )
     unresolved = [_deserialize_unresolved_item(item) for item in active_items_raw]
+    evidence_guidance = _local_test_evidence_guidance(local_test_evidence)
     human_requirements_context = render_coder_human_requirements_prompt_context(
         human_requirements,
     )
     if same_pr_only:
-        review_text = _format_same_pr_unresolved_items(unresolved)
+        review_text = _format_same_pr_unresolved_items(unresolved) + evidence_guidance
         return _with_containment_guidance(build_same_pr_followup_prompt(
             pr_number,
             review_round_number,
@@ -305,7 +335,7 @@ def build_pr_fix_prompt_for_skill(
             approved_plan_context=approved_plan_context,
             approved_plan_max_chars=approved_plan_max_chars,
         ), config)
-    review_text = _format_unresolved_items_for_coder(unresolved)
+    review_text = _format_unresolved_items_for_coder(unresolved) + evidence_guidance
     return _with_containment_guidance(build_followup_prompt(
         pr_number,
         review_round_number,

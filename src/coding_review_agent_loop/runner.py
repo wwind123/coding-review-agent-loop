@@ -5,6 +5,8 @@ from __future__ import annotations
 import errno
 import os
 import re
+import select
+import secrets
 import shutil
 import subprocess
 import sys
@@ -27,6 +29,14 @@ from .containment import (
 )
 from .errors import AgentLoopError
 from .test_runtime import OVERLAP_REJECTED_EXIT_CODE, OVERLAP_REJECTED_MESSAGE, acquire_command_lane
+from .local_test_evidence import (
+    EvidenceScope,
+    TestBrokerServer,
+    LocalTestObservation,
+    EnvironmentIdentityRegistry,
+    reconcile_test_observations,
+    TreeAttribution,
+)
 
 
 @dataclass(frozen=True)
@@ -134,6 +144,13 @@ def run_foreground_test(
     dry_run: bool = False,
     containment_policy: ContainmentPolicy | None = None,
     containment_role: str = "test-gate",
+    environment_is_complete: bool = False,
+    output_callback: Callable[[str], None] | None = None,
+    echo_output: bool = True,
+    cwd_fd: int | None = None,
+    parent_cgroup_path: Path | None = None,
+    process_started: Callable[[subprocess.Popen], None] | None = None,
+    process_finished: Callable[[subprocess.Popen], None] | None = None,
 ) -> ForegroundTestResult:
     """Run a command in the foreground, teeing output and bounding its process group."""
     cmd = [str(value) for value in args]
@@ -157,8 +174,31 @@ def run_foreground_test(
     before_cgroup: dict[str, object] = {}
     last_cgroup: dict[str, object] = {}
     target_exec_error = False
+    proc: subprocess.Popen[bytes] | None = None
     try:
-        if containment_policy is not None and containment_policy.mode != "off":
+        held_fds: tuple[int, int, int, int] | None = None
+        pass_fds: tuple[int, ...] = ()
+        if parent_cgroup_path is not None:
+            ready_read, ready_write = os.pipe()
+            release_read, release_write = os.pipe()
+            held_fds = (ready_read, ready_write, release_read, release_write)
+            pass_fds = (ready_write, release_read)
+            spawn_cmd = [
+                sys.executable,
+                "-m",
+                "coding_review_agent_loop.containment",
+                "--held-exec",
+                "--ready-fd",
+                str(ready_write),
+                "--release-fd",
+                str(release_read),
+                "--",
+                *cmd,
+            ]
+        elif containment_policy is not None and containment_policy.mode != "off":
+            # An explicit caller environment takes precedence; when it is
+            # omitted, the wrapper's actual ambient environment determines
+            # whether this is already inside an orchestrated invocation.
             invocation_values = env if env is not None else os.environ
             if invocation_values.get("AGENT_LOOP_INVOCATION_ID"):
                 # A test wrapper launched from an already-contained agent is a
@@ -179,24 +219,67 @@ def run_foreground_test(
                 spawn_cmd = list(handle.launcher_argv)
         else:
             spawn_cmd = cmd
+        spawn_cwd: str | Path = cwd
+        spawn_preexec: Callable[[], None] | None = None
+        if cwd_fd is not None:
+            # Python's subprocess cwd parameter does not accept an fd on all
+            # supported versions. fchdir runs before exec while the validated
+            # directory handle is still private to this parent process.
+            spawn_cwd = "/"
+            spawn_preexec = lambda fd=cwd_fd: os.fchdir(fd)
         proc = subprocess.Popen(
             spawn_cmd,
-            cwd=cwd,
+            cwd=spawn_cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=False,
             bufsize=0,
             start_new_session=True,
-            env={**os.environ, **env} if env is not None else None,
+            env=(
+                dict(env)
+                if environment_is_complete and env is not None
+                else ({**os.environ, **env} if env is not None else None)
+            ),
+            preexec_fn=spawn_preexec,
+            pass_fds=pass_fds,
         )
+        if process_started is not None:
+            process_started(proc)
+        if held_fds is not None:
+            ready_read, ready_write, release_read, release_write = held_fds
+            os.close(ready_write)
+            os.close(release_read)
+            try:
+                ready, _, _ = select.select([ready_read], [], [], 5.0)
+                if not ready or os.read(ready_read, 1) != b"1":
+                    raise AgentLoopError("broker test child did not reach the containment handshake")
+                (parent_cgroup_path / "cgroup.procs").write_text(str(proc.pid), encoding="ascii")
+                attached = cgroup_path_for_pid(proc.pid)
+                if attached is None or attached.resolve() != parent_cgroup_path.resolve():
+                    raise AgentLoopError("broker test child could not be verified in the coder cgroup")
+                os.write(release_write, b"1")
+            except BaseException:
+                _terminate_process_group(proc)
+                raise
+            finally:
+                os.close(ready_read)
+                os.close(release_write)
         if handle is not None and handle.managed:
             handle.refresh_report()
             before_cgroup = sample_cgroup(handle.cgroup_path, handle.capabilities)
             last_cgroup = dict(before_cgroup)
-    except OSError as exc:
+    except (OSError, AgentLoopError) as exc:
         if handle is not None:
             handle.close()
+        if held_fds is not None:
+            for fd in held_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if proc is not None and process_finished is not None:
+            process_finished(proc)
         lane_lock.close()
         raise AgentLoopError(f"Could not start test command: {exc}") from exc
 
@@ -212,10 +295,16 @@ def run_foreground_test(
         else:
             pending = ""
         for line in lines:
-            print(line, end="", flush=True)
+            if echo_output:
+                print(line, end="", flush=True)
+            if output_callback is not None:
+                output_callback(line)
             tail.extend(line.splitlines())
         if final and pending:
-            print(pending, end="", flush=True)
+            if echo_output:
+                print(pending, end="", flush=True)
+            if output_callback is not None:
+                output_callback(pending)
             tail.extend(pending.splitlines())
             pending = ""
 
@@ -294,6 +383,8 @@ def run_foreground_test(
         _terminate_process_group(proc)
         returncode = proc.wait()
     finally:
+        if process_finished is not None:
+            process_finished(proc)
         if selector is not None:
             selector.close()
         if proc.stdout is not None:
@@ -496,6 +587,10 @@ class Runner:
         self.containment_policy = containment_policy
         self._containment_manifest = None
         self._active_handles: dict[str, InvocationHandle] = {}
+        self._active_test_brokers: dict[str, TestBrokerServer] = {}
+        self._local_test_observations: list[LocalTestObservation] = []
+        self._latest_test_turn_id: str | None = None
+        self._environment_registry = EnvironmentIdentityRegistry()
         self._containment_role = "coder"
 
     def set_containment_role(self, role: str | None) -> None:
@@ -562,6 +657,139 @@ class Runner:
             finally:
                 self._close_containment(handle)
 
+    def _start_test_broker(
+        self,
+        *,
+        cwd: Path,
+        role: str,
+        env: Mapping[str, str] | None,
+    ) -> tuple[TestBrokerServer | None, str | None]:
+        if os.name == "nt" or role not in {"coder", "repair"}:
+            return None, None
+        values = dict(os.environ)
+        if env is not None:
+            values.update({str(key): str(value) for key, value in env.items()})
+        turn_id = secrets.token_hex(32)
+        self._latest_test_turn_id = turn_id
+        try:
+            ceiling = float(values.get("AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS", "1800"))
+            broker = TestBrokerServer(
+                root=cwd,
+                turn_id=turn_id,
+                timeout_ceiling=ceiling,
+                containment_policy=self.containment_policy,
+                environment_registry=self._environment_registry,
+            ).start()
+        except (OSError, ValueError, AgentLoopError) as exc:
+            # Broker setup is infrastructure telemetry. A coder can still use
+            # the standalone wrapper, which is explicitly telemetry-unverified.
+            observation = LocalTestObservation(
+                command=(),
+                outcome="incomplete",
+                provenance="telemetry-unverified",
+                scope=EvidenceScope(),
+                receipt_id=None,
+                turn_id=turn_id,
+                timestamp=datetime.now().astimezone().isoformat(),
+                attribution=TreeAttribution(
+                    state="unknown", caveats=("test broker startup failed",)
+                ),
+                environment_state="identity-unknown",
+                caveats=(f"local test capture incomplete: broker startup {type(exc).__name__}",),
+            )
+            with self._active_procs_lock:
+                self._local_test_observations.append(observation)
+                self._local_test_observations[:] = self._local_test_observations[-64:]
+            return None, turn_id
+        with self._active_procs_lock:
+            self._active_test_brokers[turn_id] = broker
+        return broker, turn_id
+
+    def _finish_test_broker(self, broker: TestBrokerServer | None, turn_id: str | None) -> None:
+        if broker is None:
+            return
+        try:
+            broker.stop()
+            observations = broker.snapshot_journal()
+        except BaseException as exc:
+            observations = (
+                LocalTestObservation(
+                    command=(),
+                    outcome="incomplete",
+                    provenance="telemetry-unverified",
+                    scope=EvidenceScope(),
+                    receipt_id=None,
+                    turn_id=turn_id,
+                    timestamp=datetime.now().astimezone().isoformat(),
+                    attribution=TreeAttribution(
+                        state="unknown", caveats=("broker journal snapshot failed",)
+                    ),
+                    environment_state="identity-unknown",
+                    caveats=(f"broker journal snapshot failed: {type(exc).__name__}",),
+                ),
+            )
+        with self._active_procs_lock:
+            self._local_test_observations.extend(observations)
+            self._local_test_observations[:] = self._local_test_observations[-64:]
+            if turn_id is not None:
+                self._active_test_brokers.pop(turn_id, None)
+
+    def _cleanup_new_test_brokers(self, existing: set[str]) -> None:
+        with self._active_procs_lock:
+            candidates = [
+                (turn_id, broker)
+                for turn_id, broker in self._active_test_brokers.items()
+                if turn_id not in existing
+            ]
+        for turn_id, broker in candidates:
+            self._finish_test_broker(broker, turn_id)
+
+    def local_test_observations(self) -> tuple[LocalTestObservation, ...]:
+        with self._active_procs_lock:
+            return tuple(self._local_test_observations)
+
+    @property
+    def latest_test_turn_id(self) -> str | None:
+        """Authenticated identity of the most recent coder/repair turn."""
+        return self._latest_test_turn_id
+
+    def render_local_test_evidence(
+        self,
+        *,
+        current_head: str | None = None,
+        legacy_tests_run: Sequence[str] | None = None,
+        cwd: Path | None = None,
+        prior_local_test_evidence: str | None = None,
+    ) -> str | None:
+        from .local_test_evidence import (
+            bounded_evidence_for_round,
+            decode_bounded_evidence,
+            stable_tracked_tree_snapshot,
+        )
+
+        observations = list(self.local_test_observations())
+        prior = decode_bounded_evidence(prior_local_test_evidence)
+        if prior is not None:
+            live_receipts = {
+                item.receipt_id for item in observations if item.receipt_id is not None
+            }
+            observations = [
+                *(item for item in prior.observations if item.receipt_id not in live_receipts),
+                *observations,
+            ]
+        if not observations and not legacy_tests_run:
+            return None
+        current_snapshot = stable_tracked_tree_snapshot(cwd) if cwd is not None else None
+        evidence = reconcile_test_observations(
+            observations,
+            current_head=current_head,
+            current_snapshot=current_snapshot,
+            registry=self._environment_registry,
+            legacy_tests_run=legacy_tests_run,
+            cwd=cwd,
+        )
+        return bounded_evidence_for_round(evidence)
+
     def remember_agent_command(
         self,
         command: str,
@@ -599,11 +827,14 @@ class Runner:
             self._interrupted = True
             procs = list(self._active_procs.values())
             handles = list(self._active_handles.values())
+            brokers = list(self._active_test_brokers.items())
         for handle in handles:
             handle.terminate()
         for proc in procs:
             if proc.poll() is None:
                 self._terminate_process_group(proc)
+        for turn_id, broker in brokers:
+            self._finish_test_broker(broker, turn_id)
         # Do not let an interrupt return while a scope still owns descendants.
         # Escalate once after the bounded TERM confirmation window; ordinary
         # invocation cleanup will finish unregistering the handle.
@@ -767,7 +998,7 @@ class Runner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            env={**os.environ, **env} if env is not None else None,
+            env=({**os.environ, **env} if env is not None else None),
         )
         result = CommandResult(cmd, cwd, proc.stdout, proc.stderr, proc.returncode)
         if check and proc.returncode != 0:
@@ -826,6 +1057,7 @@ class Runner:
         """Run a command and clean any newly admitted scope on all exceptions."""
         with self._active_procs_lock:
             existing = set(self._active_handles)
+            existing_brokers = set(self._active_test_brokers)
         try:
             return self._run_with_log_impl(
                 args,
@@ -841,6 +1073,7 @@ class Runner:
                 containment_role=containment_role,
             )
         except BaseException:
+            self._cleanup_new_test_brokers(existing_brokers)
             self._cleanup_new_containment_handles(existing)
             raise
 
@@ -870,6 +1103,8 @@ class Runner:
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         ensure_log_dir_ignored(log_path.parent)
+        inferred_role = containment_role or self._containment_role or self._role_from_label(label)
+        broker, turn_id = self._start_test_broker(cwd=cwd, role=inferred_role, env=env)
         if use_pty:
             return self._run_with_log_pty(
                 cmd,
@@ -882,6 +1117,8 @@ class Runner:
                 input_text=input_text,
                 timeout_seconds=timeout_seconds,
                 containment_role=containment_role,
+                broker=broker,
+                turn_id=turn_id,
             )
         started = time.monotonic()
         deadline = started + timeout_seconds if timeout_seconds is not None else None
@@ -893,7 +1130,6 @@ class Runner:
             header += f"\n# stdin\n{input_text}\n"
         header += "\n"
         capture_diagnostics: list[str] = []
-        inferred_role = containment_role or self._containment_role or self._role_from_label(label)
         last_cgroup: dict[str, object] = {}
         with log_path.open("w+", encoding="utf-8") as log_file:
             log_file.write(header)
@@ -910,12 +1146,19 @@ class Runner:
                     input_file.write(input_text)
                     input_file.seek(0)
 
-                handle = self._prepare_containment(cmd, role=inferred_role, env=env)
+                launch_env = {**os.environ, **env} if env is not None else dict(os.environ)
+                if turn_id is not None:
+                    launch_env["AGENT_LOOP_INVOCATION_ID"] = turn_id
+                if broker is not None:
+                    launch_env.update(broker.environment)
+                handle = self._prepare_containment(cmd, role=inferred_role, env=launch_env)
                 launch_cmd = list(handle.launcher_argv) if handle is not None and handle.managed else cmd
-                launch_env = {**os.environ, **env} if env is not None else None
-                if handle is not None:
-                    launch_env = dict(launch_env or os.environ)
-                    launch_env["AGENT_LOOP_INVOCATION_ID"] = handle.invocation_id
+                if broker is not None:
+                    broker.set_execution_context(
+                        containment_handle=handle,
+                        process_started=self._register_active_process,
+                        process_finished=self._unregister_active_process,
+                    )
 
                 def spawn() -> subprocess.Popen[str]:
                     if input_text is not None:
@@ -1053,10 +1296,12 @@ class Runner:
             containment_evidence,
         )
         if check and returncode != 0:
+            self._finish_test_broker(broker, turn_id)
             raise AgentLoopError(
                 f"Command failed with exit {returncode}: {' '.join(cmd)}\n"
                 f"log: {log_path if not capture_diagnostics else '(capture pathname unavailable)'}\n\nlast output:\n{tail_text(full_output or output)}"
             )
+        self._finish_test_broker(broker, turn_id)
         return result
 
     @staticmethod
@@ -1083,6 +1328,8 @@ class Runner:
         input_text: str | None,
         timeout_seconds: float | None = None,
         containment_role: str | None = None,
+        broker: TestBrokerServer | None = None,
+        turn_id: str | None = None,
     ) -> CommandResult:
         """Run a command attached to a pseudo-terminal, logging and capturing output.
 
@@ -1113,6 +1360,10 @@ class Runner:
             log_file.flush()
             allocated_fds: tuple[int, int] | None = None
             launch_env = {**os.environ, **env} if env is not None else dict(os.environ)
+            if turn_id is not None:
+                launch_env["AGENT_LOOP_INVOCATION_ID"] = turn_id
+            if broker is not None:
+                launch_env.update(broker.environment)
 
             def spawn_pty() -> subprocess.Popen[bytes]:
                 nonlocal allocated_fds
@@ -1138,10 +1389,14 @@ class Runner:
             handle = self._prepare_containment(
                 cmd,
                 role=containment_role or self._containment_role or self._role_from_label(label),
-                env=env,
+                env=launch_env,
             )
-            if handle is not None:
-                launch_env["AGENT_LOOP_INVOCATION_ID"] = handle.invocation_id
+            if broker is not None:
+                broker.set_execution_context(
+                    containment_handle=handle,
+                    process_started=self._register_active_process,
+                    process_finished=self._unregister_active_process,
+                )
             if handle is not None and handle.managed:
                 # The closure reads this merged environment when the launcher
                 # is spawned.  Keep the PTY slave and regular descriptors
@@ -1314,8 +1569,10 @@ class Runner:
             containment_evidence,
         )
         if check and returncode != 0:
+            self._finish_test_broker(broker, turn_id)
             raise AgentLoopError(
                 f"Command failed with exit {returncode}: {' '.join(cmd)}\n"
                 f"log: {log_path}\n\nlast output:\n{tail_text(output)}"
             )
+        self._finish_test_broker(broker, turn_id)
         return result

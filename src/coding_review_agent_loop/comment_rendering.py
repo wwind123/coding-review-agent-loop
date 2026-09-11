@@ -49,6 +49,7 @@ from .test_runtime import (
     parse_managed_test_invocation,
     resolve_timeout_seconds,
 )
+from .local_test_evidence import decode_bounded_evidence, redact_test_command
 
 if TYPE_CHECKING:
     from .agents.base import AgentName
@@ -115,6 +116,71 @@ def _render_test_commands_for_comment(
     commands: Sequence[str], *, config: AgentLoopConfig | None = None
 ) -> list[str]:
     return [_render_test_command_for_comment(command, config=config) for command in commands]
+
+
+def _render_test_observation_citations(
+    citations: Sequence[object],
+    *,
+    local_test_evidence: str | None = None,
+    current_test_turn_id: str | None = None,
+) -> str:
+    """Correlate receipt claims with the sanitized parent journal."""
+    evidence = decode_bounded_evidence(local_test_evidence) if local_test_evidence else None
+    by_receipt = {
+        item.receipt_id: item
+        for item in (evidence.observations if evidence is not None else ())
+        if item.receipt_id
+    }
+    lines = ["### Test observation receipts"]
+    cited: set[str] = set()
+    citation_uses: dict[str, set[tuple[str, str]]] = {}
+    for citation in citations:
+        receipt_id = sanitize_historical_text(str(getattr(citation, "receipt_id", "")))
+        command = sanitize_historical_text(str(getattr(citation, "command", "")))
+        claim = sanitize_historical_text(str(getattr(citation, "claim", "")))
+        safe_command, _identifiers, _caveats = redact_test_command(command)
+        citation_uses.setdefault(receipt_id, set()).add((safe_command, claim))
+    for citation in citations:
+        command = sanitize_historical_text(str(getattr(citation, "command", "")))
+        receipt_id = sanitize_historical_text(str(getattr(citation, "receipt_id", "")))
+        claim = sanitize_historical_text(str(getattr(citation, "claim", "")))
+        safe_command, _identifiers, _caveats = redact_test_command(command)
+        observed = by_receipt.get(receipt_id)
+        supported = observed is not None
+        reason = "verified against the parent journal"
+        if len(citation_uses.get(receipt_id, ())) > 1:
+            supported = False
+            reason = "unverified: conflicting uses of one receipt"
+        elif observed is None:
+            reason = "unverified: unknown or cross-turn receipt"
+        elif current_test_turn_id is None or observed.turn_id != current_test_turn_id:
+            supported = False
+            reason = "unverified: unknown or cross-turn receipt"
+        elif redact_test_command(observed.command)[0] != safe_command:
+            supported = False
+            reason = "unverified: command disagrees with the parent journal"
+        elif claim == "base-reproduction" and observed.attribution.state != "base-reproduction":
+            supported = False
+            reason = "unverified: receipt does not support a base reproduction"
+        if supported:
+            cited.add(receipt_id)
+        lines.append(
+            f"- `{safe_command}` — receipt `{receipt_id[:256]}` — `{claim}` ({reason}; CI remains authoritative)"
+        )
+    if evidence is not None:
+        for item in evidence.observations:
+            if (
+                item.receipt_id
+                and item.receipt_id not in cited
+                and item.is_failure
+                and item.provenance == "parent-observed"
+                and not item.superseded_by
+            ):
+                safe_command, _identifiers, _caveats = redact_test_command(item.command)
+                lines.append(
+                    f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — uncited authoritative `{item.outcome}`"
+                )
+    return "\n".join(lines)
 
 
 def render_agent_unavailable_comment(unavailable: AgentUnavailable, *, signature: str) -> str:
@@ -657,6 +723,8 @@ def _render_public_coder_followup_comment(
     prior_items: Sequence[UnresolvedReviewItem] = (),
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
+    local_test_evidence: str | None = None,
+    current_test_turn_id: str | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
 
@@ -728,6 +796,12 @@ def _render_public_coder_followup_comment(
                 ]]
             )
         )
+    if parsed_followup.test_observations or local_test_evidence:
+        sections.append(_render_test_observation_citations(
+            parsed_followup.test_observations,
+            local_test_evidence=local_test_evidence,
+            current_test_turn_id=current_test_turn_id,
+        ))
     if parsed_followup.human_requirement_dispositions:
         sections.append(
             "\n".join(
@@ -751,6 +825,8 @@ def _render_public_issue_implementation_comment(
     agent: str,
     config: AgentLoopConfig | None = None,
     model_used: str | None = None,
+    local_test_evidence: str | None = None,
+    current_test_turn_id: str | None = None,
 ) -> str:
     """Render an implementation result without exposing its JSON envelope."""
     has_blocked_requirement = any(
@@ -778,6 +854,12 @@ def _render_public_issue_implementation_comment(
                 ]]
             )
         )
+    if parsed.test_observations or local_test_evidence:
+        sections.append(_render_test_observation_citations(
+            parsed.test_observations,
+            local_test_evidence=local_test_evidence,
+            current_test_turn_id=current_test_turn_id,
+        ))
     human_section = render_human_requirement_dispositions(
         parsed.human_requirement_dispositions
     )
@@ -903,6 +985,8 @@ def render_public_agent_comment(
     raw_text: str = "",
     human_requirements_resolved_flag: bool = False,
     round_number: int = 1,
+    local_test_evidence: str | None = None,
+    current_test_turn_id: str | None = None,
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -943,6 +1027,8 @@ def render_public_agent_comment(
             prior_items=prior_items,
             config=config,
             model_used=model_used,
+            local_test_evidence=local_test_evidence,
+            current_test_turn_id=current_test_turn_id,
         )
     if kind == "issue_implementation":
         if not isinstance(parsed, StructuredIssueImplementation):
@@ -954,6 +1040,8 @@ def render_public_agent_comment(
             agent=agent,
             config=config,
             model_used=model_used,
+            local_test_evidence=local_test_evidence,
+            current_test_turn_id=current_test_turn_id,
         )
     if kind == "plan_revision":
         if not isinstance(parsed, StructuredPlanRevision):

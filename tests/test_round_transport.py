@@ -200,6 +200,27 @@ def test_round_metadata_decode_uses_mapping_without_reencoding() -> None:
     assert _decode_round_metadata(_encode_round_metadata(metadata)) == metadata
 
 
+def test_round_metadata_round_trips_bounded_local_test_evidence() -> None:
+    from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+
+    evidence = bounded_evidence_for_round({
+        "observations": [{
+            "command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"],
+            "outcome": "failed", "provenance": "parent-observed",
+            "receipt_id": "receipt-1", "environment": "unknown",
+        }]
+    })
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="codex", round_number=2,
+        subject="head", local_test_evidence=evidence,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.local_test_evidence is not None
+    payload = json.loads(decoded.local_test_evidence)
+    assert payload["observations"][0]["receipt_id"] == "receipt-1"
+    assert payload["observations"][0]["environment"] == "identity-unknown"
+
+
 def test_round_metadata_preserves_mixed_legacy_claim_and_modern_evidence_exactly() -> None:
     legacy_and_modern_item = UnresolvedReviewItem(
         item_id="item-4",

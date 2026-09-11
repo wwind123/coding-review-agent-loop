@@ -344,7 +344,8 @@ For an approved coder follow-up, use `"state": "approved"`, an
     "checked_discussion_directly": false
   },
   "human_requirement_dispositions": [],
-  "tests_run": ["<exact command>"]
+  "tests_run": ["<exact command>"],
+  "test_observations": [{"command": "<exact command>", "receipt_id": "<receipt>", "claim": "current-result"}]
 }
 <!-- AGENT_STATE: blocking -->
 -- <Coder Name>
@@ -1287,7 +1288,7 @@ def _issue_implementation_instruction(
     return (
         "## Issue implementation repair rules:\n"
         "Repair only the issue_implementation envelope. Preserve `summary`, `pr_number`, "
-        "`tests_run`, and the meaning of every disposition; do not invent a PR identity. "
+        "`tests_run`, `test_observations`, and the meaning of every disposition; do not invent a PR identity. "
         + requirement_rule
         + " A positive PR with a blocked disposition remains a terminal conflict after repair; "
         "do not relabel or silently remove that blocker.\n"

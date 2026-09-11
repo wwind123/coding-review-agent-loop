@@ -3399,6 +3399,11 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                     issue_context=primary_issue_context,
                     parent_issue_context=parent_issue_context,
                     human_requirements=human_requirements,
+                    local_test_evidence=(
+                        str(resume.get("local_test_evidence"))
+                        if resume.get("local_test_evidence")
+                        else None
+                    ),
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -3790,6 +3795,7 @@ def _validate_coder_implementation_response(
     from coding_review_agent_loop.workdir_guard import (
         validate_response_tests_within_workdir,
         validate_test_commands_within_workdir,
+        validate_test_observation_citations_within_workdir,
     )
 
     result = _validate_issue_implementation_response(
@@ -3800,6 +3806,10 @@ def _validate_coder_implementation_response(
         parsed = result if isinstance(result, StructuredIssueImplementation) else result.parsed
         validate_test_commands_within_workdir(
             parsed.tests_run,
+            assigned_workdir=Path(workdir),
+        )
+        validate_test_observation_citations_within_workdir(
+            parsed.test_observations,
             assigned_workdir=Path(workdir),
         )
     elif isinstance(result, _TerminalNoPrImplementation):
@@ -3993,6 +4003,7 @@ def _run_child_or_one_shot_implementation(
         prompt_file = tmpdir / "impl-prompt.md"
         raw_output = tmpdir / "impl-raw.md"
         usage_file = tmpdir / "impl-usage.json"
+        evidence_file = tmpdir / "impl-response-evidence.json"
         _write_text(prompt_file, prompt_text)
 
         # No --repo: run_external would otherwise ensure_temp_checkout the workdir
@@ -4007,6 +4018,7 @@ def _run_child_or_one_shot_implementation(
             "--workdir", str(workdir),
             "--flow", "pr",
             "--usage-output", str(usage_file),
+            "--response-evidence-output", str(evidence_file),
             *external_args,
             *(["--dry-run"] if dry_run else []),
         )
@@ -4129,6 +4141,7 @@ def _run_child_or_one_shot_implementation(
             "--subject", str(head_sha),
             "--state", "approved",
             "--raw-structured-coder-response-file", str(raw_output),
+            *( ["--local-test-evidence-file", str(evidence_file)] if evidence_file.exists() else [] ),
         )
         tagged_with_contract = tmpdir / "impl-tagged-with-contract.md"
         _write_text(
@@ -4349,6 +4362,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         validate_assigned_head_advanced,
         validate_response_tests_within_workdir,
         validate_test_commands_within_workdir,
+        validate_test_observation_citations_within_workdir,
     )
     from helpers.prompt_builders import build_pr_fix_prompt_for_skill, make_minimal_config
 
@@ -4377,6 +4391,11 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         human_requirements=human_requirements,
         same_pr_only=same_pr_only,
         approved_plan_context=approved_plan_context,
+        local_test_evidence=(
+            str(resume.get("local_test_evidence"))
+            if resume.get("local_test_evidence")
+            else None
+        ),
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
     )
 
@@ -4481,6 +4500,10 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
                     parsed.tests_run,
                     assigned_workdir=Path(workdir),
                 )
+                validate_test_observation_citations_within_workdir(
+                    parsed.test_observations,
+                    assigned_workdir=Path(workdir),
+                )
                 public_comment = render_public_agent_comment(
                     kind="coder_followup",
                     parsed=parsed,
@@ -4541,6 +4564,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             "--usage-file", str(usage_file),
             "--compact-prior-summaries-file", str(compact_prior_file),
             *raw_structured_arg,
+            *( ["--local-test-evidence-file", str(evidence_file)] if evidence_file.exists() else [] ),
         )
         if not dry_run:
             _run_helper(

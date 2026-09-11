@@ -534,6 +534,19 @@ def main() -> None:
             output_path.write_text(failure_text or "", encoding="utf-8")
         except OSError:
             pass
+        if args.response_evidence_output:
+            try:
+                local_test_evidence = runner.render_local_test_evidence(
+                    current_head=args.pr_head_sha,
+                    cwd=workdir,
+                )
+                if local_test_evidence is not None:
+                    Path(args.response_evidence_output).write_text(
+                        json.dumps({"local_test_evidence": local_test_evidence}, indent=2),
+                        encoding="utf-8",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(f"run_external: could not write local test evidence: {exc}", file=sys.stderr)
         if args.invocation_evidence_output:
             try:
                 Path(args.invocation_evidence_output).write_text(
@@ -560,19 +573,20 @@ def main() -> None:
 
     if args.response_evidence_output:
         try:
+            local_test_evidence = runner.render_local_test_evidence(
+                current_head=args.pr_head_sha,
+                cwd=workdir,
+            )
+            response_evidence = {
+                "response_file_text": result.response_file_text,
+                "message_text": result.message_text,
+            }
+            if local_test_evidence is not None:
+                response_evidence["local_test_evidence"] = local_test_evidence
+            if result.containment is not None:
+                response_evidence["containment"] = result.containment.to_dict()
             Path(args.response_evidence_output).write_text(
-                json.dumps(
-                    {
-                        "response_file_text": result.response_file_text,
-                        "message_text": result.message_text,
-                        **(
-                            {"containment": result.containment.to_dict()}
-                            if result.containment is not None
-                            else {}
-                        ),
-                    },
-                    indent=2,
-                ),
+                json.dumps(response_evidence, indent=2),
                 encoding="utf-8",
             )
         except Exception as exc:  # noqa: BLE001
