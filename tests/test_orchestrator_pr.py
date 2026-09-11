@@ -279,7 +279,7 @@ def test_selective_pr_loop_keeps_multiple_consecutive_narrow_fixes_selective(tmp
     assert [command[0] for command in reviewer_commands].count("agy") == 2
 
 
-def test_selective_resume_with_malformed_scheduler_metadata_runs_full_board(tmp_path):
+def test_selective_resume_with_malformed_scheduler_metadata_recovers_after_full_board(tmp_path):
     malformed_checkpoint = _attach_round_metadata(
         "stale scheduler checkpoint",
         PostedRoundMetadata(
@@ -306,8 +306,7 @@ def test_selective_resume_with_malformed_scheduler_metadata_runs_full_board(tmp_
         max_rounds=2,
     )
 
-    with pytest.raises(AgentLoopError, match="Malformed or contradictory PR review scheduler metadata"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     reviewer_commands = [
         command for command, _cwd in runner.commands

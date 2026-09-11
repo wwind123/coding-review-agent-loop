@@ -7786,6 +7786,36 @@ def _scheduler_contract_from_metadata(
     return _Contract.from_mapping(metadata.scheduler_contract)
 
 
+def _is_completed_full_board_scheduler_record(
+    record: PostedRoundRecord,
+    *,
+    scheduler_contract: ReviewSchedulingContract,
+) -> bool:
+    """Return whether ``record`` is a completed conservative recovery point.
+
+    Invalid scheduler metadata must force the next scheduling decision to the
+    full board.  Once that decision has completed, however, the invalid record
+    is historical state and must not permanently veto qualification on every
+    resume.  The reconciliation checkpoint is the durable completion marker;
+    a prelaunch checkpoint or an individual reviewer record is not sufficient.
+    """
+    metadata = record.metadata
+    if (
+        metadata.scheduler_metadata_status != "valid"
+        or metadata.role != "summary"
+        or metadata.phase != "reconciliation"
+        or metadata.scheduler_current_sha != metadata.subject
+        or set(metadata.scheduler_selected_reviewers)
+        != set(scheduler_contract.required_reviewers)
+        or metadata.scheduler_paused_reviewers
+    ):
+        return False
+    try:
+        return _scheduler_contract_from_metadata(metadata) == scheduler_contract
+    except AgentLoopError:
+        return False
+
+
 def _fresh_pr_qualification_snapshot(
     runner: Runner,
     *,
@@ -7806,9 +7836,21 @@ def _fresh_pr_qualification_snapshot(
         fresh_scheduler_records = _extract_round_metadata_records(
             context.comments, flow="pr"
         )
-        for record in fresh_scheduler_records:
+        for record_position, record in enumerate(fresh_scheduler_records):
             status = record.metadata.scheduler_metadata_status
             if status == "invalid":
+                if any(
+                    candidate.index > record.index
+                    and _is_completed_full_board_scheduler_record(
+                        candidate,
+                        scheduler_contract=scheduler_contract,
+                    )
+                    for candidate in fresh_scheduler_records[record_position + 1 :]
+                ):
+                    # Resume recovery deliberately selected the full board.
+                    # A later completed reconciliation checkpoint supersedes
+                    # this historical malformed optimization record.
+                    continue
                 raise AgentLoopError(
                     "Malformed or contradictory PR review scheduler metadata was observed "
                     "during qualification; no qualification or merge is permitted."

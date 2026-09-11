@@ -502,6 +502,65 @@ def test_fresh_qualification_rejects_a_scheduler_contract_change(tmp_path):
         )
 
 
+def test_fresh_qualification_rejects_scheduler_metadata_after_recovery_boundary(tmp_path):
+    valid_reconciliation = _attach_round_metadata(
+        "completed full-board reconciliation",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=2,
+            subject="head",
+            phase="reconciliation",
+            scheduler_contract=_contract().as_dict(),
+            scheduler_previous_sha=None,
+            scheduler_current_sha="head",
+            scheduler_obligation_digest="0" * 16,
+            scheduler_selected_reviewers=("Claude", "Codex", "Antigravity"),
+            scheduler_paused_reviewers=(),
+            scheduler_reasons=("full board",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=0,
+        ),
+    )
+    malformed_after_recovery = _attach_round_metadata(
+        "new malformed scheduler checkpoint",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=3,
+            subject="head",
+            scheduler_contract={"policy": "selective-intermediate"},
+        ),
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "headRefOid": "head",
+            "comments": [
+                {"author": {"login": "bot"}, "body": valid_reconciliation},
+                {"author": {"login": "bot"}, "body": malformed_after_recovery},
+            ],
+        }
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate",
+    )
+
+    with pytest.raises(AgentLoopError, match="Malformed or contradictory PR review scheduler metadata"):
+        _fresh_pr_qualification_snapshot(
+            runner,
+            config=config,
+            pr_number=77,
+            issue_context=None,
+            parent_issue_context=None,
+            scheduler_contract=_contract(),
+        )
+
+
 def test_cleared_owner_set_is_not_vacuously_unavailable():
     item = _item(owners=("Codex",), states=(("Codex", "cleared"),))
     assert not _all_pending_resolution_owners_unavailable(item, {"Codex"})
