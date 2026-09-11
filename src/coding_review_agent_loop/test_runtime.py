@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -1294,7 +1295,12 @@ def _wrapper_candidates(environment: Mapping[str, str] | None = None) -> list[tu
     entry = shutil.which("agent-loop", path=values.get("PATH"))
     if entry and os.path.isabs(entry) and os.access(entry, os.X_OK):
         candidates.append((str(Path(entry).resolve()), "run-tests"))
-    executable = Path(sys.executable).resolve()
+    # Execute the interpreter spelling supplied by the running process.  A
+    # virtualenv commonly exposes ``bin/python`` as a symlink; resolving it
+    # here would execute the base interpreter and lose the virtualenv's
+    # site-packages, even though the resolved/stat identity remains part of
+    # the cache key in launcher_candidate_identity().
+    executable = _lexical_absolute(Path(sys.executable))
     if executable.is_file() and os.access(executable, os.X_OK):
         fallback = (str(executable), "-m", "coding_review_agent_loop.cli", "run-tests")
         if fallback not in candidates:
@@ -1358,6 +1364,105 @@ def _store_wrapper_probe_locked(
         _WRAPPER_PREFLIGHT_CACHE.pop((invocation, evicted_identity), None)
 
 
+def _decode_probe_output(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _close_probe_pipes(process: subprocess.Popen) -> None:
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _terminate_probe_tree(process: subprocess.Popen) -> None:
+    """Terminate and reap a bounded probe and its process group."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    else:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=0.5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    else:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    process.wait()
+
+
+def _run_bounded_probe(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    """Run a fixed probe with process-tree-aware timeout cleanup.
+
+    ``subprocess.run(timeout=...)`` only terminates the direct child and can
+    still wait forever in ``communicate()`` when a descendant retains a pipe.
+    Probe children get a fresh process group, and timeout/error paths close the
+    pipes after terminating and reaping that group.
+    """
+    popen_kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": False,
+        "start_new_session": os.name == "posix",
+    }
+    if os.name == "nt":
+        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
+        popen_kwargs.pop("start_new_session", None)
+    process = subprocess.Popen([str(item) for item in argv], **popen_kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_probe_tree(process)
+        output = _decode_probe_output(getattr(exc, "output", None))
+        error = _decode_probe_output(getattr(exc, "stderr", None))
+        _close_probe_pipes(process)
+        raise subprocess.TimeoutExpired(
+            [str(item) for item in argv], timeout_seconds, output=output, stderr=error
+        ) from None
+    except BaseException:
+        _terminate_probe_tree(process)
+        _close_probe_pipes(process)
+        raise
+    return subprocess.CompletedProcess(
+        [str(item) for item in argv],
+        process.returncode,
+        _decode_probe_output(stdout),
+        _decode_probe_output(stderr),
+    )
+
+
 def preflight_wrapper_candidates(
     *,
     cwd: Path | None = None,
@@ -1403,15 +1508,11 @@ def preflight_wrapper_candidates(
             try:
                 probe_argv = [*candidate, "--preflight"]
                 try:
-                    completed = subprocess.run(
+                    completed = _run_bounded_probe(
                         probe_argv,
                         cwd=root,
                         env=values,
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        check=False,
-                        timeout=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+                        timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
                     )
                 except subprocess.TimeoutExpired:
                     result = LauncherProbeResult(candidate, "failed", "wrapper probe timed out after 5s", _identity_key(identity))
@@ -1552,15 +1653,11 @@ def probe_inner_launcher(
     result: LauncherProbeResult | None = None
     try:
         try:
-            completed = subprocess.run(
+            completed = _run_bounded_probe(
                 probe,
                 cwd=cwd,
                 env=(values if environment_is_complete or environment is not None else None),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+                timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
             result = LauncherProbeResult(original, "failed", "inner bootstrap probe timed out after 5s", identity_key)

@@ -70,6 +70,20 @@ def test_wrapper_resolution_inherited_subceiling_and_policy_rejection(monkeypatc
     assert runtime.inherited_timeout_ceiling() == 7200
 
 
+def test_wrapper_module_fallback_preserves_lexical_virtualenv_interpreter(tmp_path, monkeypatch):
+    venv = tmp_path / "virtualenv"
+    interpreter = venv / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(Path(sys.executable).resolve())
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    monkeypatch.setattr(runtime.sys, "executable", str(interpreter))
+    monkeypatch.setattr(runtime.shutil, "which", lambda _name, path=None: None)
+
+    assert runtime._wrapper_candidates({"PATH": ""}) == [
+        (str(interpreter), "-m", "coding_review_agent_loop.cli", "run-tests")
+    ]
+
+
 def test_managed_invocation_parses_absolute_entrypoint_and_module_forms(tmp_path):
     executable = str(tmp_path / "agent-loop")
     parsed = runtime.parse_managed_test_invocation([
@@ -514,13 +528,13 @@ def test_recognized_inner_probe_uses_only_safe_version_argv(tmp_path, monkeypatc
         calls.append((tuple(argv), kwargs))
         return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     result = runtime.probe_inner_launcher(
         [sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"], cwd=tmp_path
     )
     assert result.state == "verified"
     assert calls[0][0] == (sys.executable, "-m", "pytest", "--version")
-    assert calls[0][1]["timeout"] == 5.0
+    assert calls[0][1]["timeout_seconds"] == 5.0
 
 
 def test_non_python_m_pytest_command_is_not_spawned_by_preflight(tmp_path, monkeypatch):
@@ -529,7 +543,7 @@ def test_non_python_m_pytest_command_is_not_spawned_by_preflight(tmp_path, monke
     non_python.write_text("#!/bin/sh\n", encoding="utf-8")
     non_python.chmod(0o755)
 
-    monkeypatch.setattr(runtime.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
     result = runtime.probe_inner_launcher(
         [str(non_python), "-m", "pytest", "tests"], cwd=tmp_path
     )
@@ -546,7 +560,7 @@ def test_script_named_python_is_not_spawned_by_preflight(tmp_path, monkeypatch):
     fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     fake_python.chmod(0o755)
 
-    monkeypatch.setattr(runtime.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
     result = runtime.probe_inner_launcher(
         [str(fake_python), "-m", "pytest", "tests"], cwd=tmp_path
     )
@@ -565,7 +579,7 @@ def test_arbitrary_native_binary_named_python_is_not_spawned_by_preflight(tmp_pa
     fake_python.write_bytes(b"\x7fELFarbitrary-native-program\n")
     fake_python.chmod(0o755)
 
-    monkeypatch.setattr(runtime.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *args, **kwargs: calls.append(args))
     result = runtime.probe_inner_launcher(
         [str(fake_python), "-m", "pytest", "tests"], cwd=tmp_path
     )
@@ -588,7 +602,7 @@ def test_copied_current_python_binary_is_safe_to_probe(tmp_path, monkeypatch):
         calls.append(tuple(argv))
         return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     result = runtime.probe_inner_launcher(
         [str(interpreter), "-m", "pytest", "tests"], cwd=tmp_path
     )
@@ -609,7 +623,7 @@ def test_wrapper_preflight_has_fixed_argv_and_per_invocation_cache(tmp_path, mon
         calls.append(tuple(argv))
         return type("Completed", (), {"returncode": 0, "stdout": "agent-loop preflight: verified", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     first = runtime.preflight_wrapper_candidates(cwd=tmp_path)
     second = runtime.preflight_wrapper_candidates(cwd=tmp_path)
     assert first[0].state == "verified"
@@ -624,8 +638,8 @@ def test_wrapper_preflight_classifies_explicit_import_failure(tmp_path, monkeypa
     monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "wrapper-import-failure-test")
     monkeypatch.setattr(runtime, "_wrapper_candidates", lambda _environment: [(str(wrapper), "run-tests")])
     monkeypatch.setattr(
-        runtime.subprocess,
-        "run",
+        runtime,
+        "_run_bounded_probe",
         lambda *_args, **_kwargs: type(
             "Completed", (), {
                 "returncode": 1,
@@ -638,6 +652,49 @@ def test_wrapper_preflight_classifies_explicit_import_failure(tmp_path, monkeypa
     assert result.state == "failed"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process-group probe cleanup is POSIX-specific")
+def test_wrapper_probe_timeout_kills_descendant_holding_output_pipe(tmp_path, monkeypatch):
+    wrapper = tmp_path / "agent-loop"
+    child_code = "import time; time.sleep(30)"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        f"import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "wrapper-process-tree-test")
+    monkeypatch.setattr(runtime, "LAUNCHER_PROBE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        runtime, "_wrapper_candidates", lambda _environment: [(str(wrapper), "run-tests")]
+    )
+
+    result = runtime.preflight_wrapper_candidates(cwd=tmp_path)[0]
+
+    assert result.state == "failed"
+    assert "timed out" in result.diagnostic
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group probe cleanup is POSIX-specific")
+def test_inner_probe_timeout_kills_descendant_holding_output_pipe(tmp_path, monkeypatch):
+    pytest_launcher = tmp_path / "pytest"
+    child_code = "import time; time.sleep(30)"
+    pytest_launcher.write_text(
+        f"#!{sys.executable}\n"
+        f"import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n",
+        encoding="utf-8",
+    )
+    pytest_launcher.chmod(0o755)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inner-process-tree-test")
+    monkeypatch.setattr(runtime, "LAUNCHER_PROBE_TIMEOUT_SECONDS", 0.2)
+
+    result = runtime.probe_inner_launcher([str(pytest_launcher), "tests"], cwd=tmp_path)
+
+    assert result.state == "failed"
+    assert "timed out" in result.diagnostic
+
+
 def test_wrapper_preflight_bounds_changing_completed_identities(tmp_path, monkeypatch):
     calls = []
     wrapper = tmp_path / "agent-loop"
@@ -648,7 +705,7 @@ def test_wrapper_preflight_bounds_changing_completed_identities(tmp_path, monkey
         calls.append(tuple(argv))
         return type("Completed", (), {"returncode": 0, "stdout": "agent-loop preflight: verified", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     for index in range(runtime.MAX_WRAPPER_PREFLIGHT_IDENTITIES_PER_INVOCATION + 5):
         wrapper.write_text(f"#!/bin/sh\n# identity-{index}\n{'x' * index}", encoding="utf-8")
         wrapper.chmod(0o755)
@@ -672,7 +729,7 @@ def test_wrapper_preflight_releases_reservation_after_unexpected_probe_exception
         calls.append(True)
         raise RuntimeError("probe harness failed")
 
-    monkeypatch.setattr(runtime.subprocess, "run", explode)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", explode)
     first = runtime.preflight_wrapper_candidates(cwd=tmp_path)[0]
     second = runtime.preflight_wrapper_candidates(cwd=tmp_path)[0]
 
@@ -687,10 +744,10 @@ def test_inner_probe_timeout_is_bounded_and_cached(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inner-timeout-test")
 
     def timeout(*_args, **kwargs):
-        calls.append(kwargs["timeout"])
+        calls.append(kwargs["timeout_seconds"])
         raise runtime.subprocess.TimeoutExpired([sys.executable, "-m", "pytest"], 5.0)
 
-    monkeypatch.setattr(runtime.subprocess, "run", timeout)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", timeout)
     command = [sys.executable, "-m", "pytest", "tests"]
     first = runtime.probe_inner_launcher(command, cwd=tmp_path)
     second = runtime.probe_inner_launcher(command, cwd=tmp_path)
@@ -780,7 +837,7 @@ def test_inner_probe_is_cached_and_uses_effective_overlay_environment(tmp_path, 
         calls.append((tuple(argv), kwargs))
         return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     command = [sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"]
     overlay = {"PATH": "/overlay/path", "TEST_VALUE": "kept"}
     first = runtime.probe_inner_launcher(command, cwd=tmp_path, environment=overlay)
@@ -801,7 +858,7 @@ def test_inner_probe_enforces_six_new_candidates_per_invocation(tmp_path, monkey
         calls.append(tuple(argv))
         return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     for index in range(runtime.MAX_INNER_PROBE_CANDIDATES):
         interpreter = tmp_path / f"venv-{index}" / "bin" / "python"
         interpreter.parent.mkdir(parents=True)
@@ -844,7 +901,7 @@ def test_alternate_interpreter_dependency_repair_invalidates_failed_probe(tmp_pa
             return type("Completed", (), {"returncode": 1, "stdout": "", "stderr": "No module named pytest"})()
         return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     command = [str(interpreter), "-m", "pytest", "tests"]
     first = runtime.probe_inner_launcher(command, cwd=tmp_path)
     assert first.state == "failed"
@@ -877,7 +934,7 @@ def test_symlinked_virtualenv_interpreter_keeps_lexical_probe_path(tmp_path, mon
         calls.append(tuple(argv))
         return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     result = runtime.probe_inner_launcher(
         [str(interpreter), "-m", "pytest", "tests"], cwd=tmp_path
     )
@@ -900,7 +957,7 @@ def test_preflight_invocation_cache_evicts_completed_buckets(tmp_path, monkeypat
         calls.append(tuple(argv))
         return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     command = [sys.executable, "-m", "pytest", "tests"]
     for index in range(runtime.MAX_PREFLIGHT_INVOCATION_BUCKETS + 7):
         monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", f"bounded-invocation-{index}")
@@ -924,7 +981,7 @@ def test_inner_probe_concurrent_same_identity_runs_once(tmp_path, monkeypatch):
         assert release.wait(5)
         return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     command = [sys.executable, "-m", "pytest", "tests"]
     results = []
     threads = [
@@ -962,7 +1019,7 @@ def test_inner_probe_concurrent_distinct_identities_respects_candidate_limit(tmp
         assert release.wait(5)
         return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
 
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
     interpreters = []
     for index in range(runtime.MAX_INNER_PROBE_CANDIDATES + 2):
         interpreter = tmp_path / f"concurrent-venv-{index}" / "bin" / "python"
