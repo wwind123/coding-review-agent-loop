@@ -20,7 +20,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +46,8 @@ MAX_LAUNCHER_DIAGNOSTIC_CHARS = 240
 LAUNCHER_PROBE_TIMEOUT_SECONDS = 5.0
 MAX_WRAPPER_PROBE_CANDIDATES = 2
 MAX_INNER_PROBE_CANDIDATES = 6
+MAX_PREFLIGHT_INVOCATION_BUCKETS = 128
+PREFLIGHT_INVOCATION_TTL_SECONDS = 3600.0
 _HASHED_ENV_VALUE_RE = re.compile(r"<sha256:[0-9a-f]{16}>")
 _DIAGNOSTIC_SECRET_RE = re.compile(
     r"(?i)\b(api[_-]?key|secret|password|token|credential)\s*[:=]\s*[^\s,;]+"
@@ -606,6 +608,22 @@ def _stat_identity(path: Path) -> dict[str, object]:
     }
 
 
+def _lexical_stat_identity(path: Path) -> dict[str, object]:
+    """Stat the directory entry itself so a symlink retarget is observable."""
+    lexical = _lexical_absolute(path)
+    try:
+        stat = lexical.lstat()
+    except OSError:
+        return {"path": str(lexical), "missing": True}
+    return {
+        "path": str(lexical),
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "mode": stat.st_mode & 0o111,
+        "symlink": lexical.is_symlink(),
+    }
+
+
 def _shebang_interpreter(path: Path) -> str | None:
     try:
         first = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
@@ -642,12 +660,39 @@ def _resolve_candidate_path(
     return Path(resolved).resolve(strict=False) if resolved else candidate
 
 
+def _lexical_candidate_path(
+    token: str, *, cwd: Path, environment: Mapping[str, str]
+) -> Path:
+    """Resolve a command token without collapsing symlinks.
+
+    A virtualenv's ``bin/python`` is commonly a symlink.  Its lexical path
+    identifies the environment that will supply site-packages, while its
+    resolved path identifies the base interpreter.  Both identities are
+    needed for safe probing and cache invalidation.
+    """
+    candidate = Path(token).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    if token.startswith((".", "~")) or candidate.parent != Path("."):
+        return cwd / candidate
+    try:
+        resolved = shutil.which(token, path=environment.get("PATH"))
+    except TypeError:
+        resolved = shutil.which(token)
+    return Path(resolved) if resolved else candidate
+
+
 def _resolve_shebang_path(
     shebang: str | None, *, cwd: Path, environment: Mapping[str, str]
 ) -> Path | None:
     if not shebang:
         return None
     return _resolve_candidate_path(shebang, cwd=cwd, environment=environment)
+
+
+def _lexical_absolute(path: Path) -> Path:
+    """Return an absolute path while retaining symlink spelling."""
+    return Path(os.path.abspath(os.fspath(path)))
 
 
 _PYTHON_INTERPRETER_NAME_RE = re.compile(
@@ -660,37 +705,57 @@ def _python_interpreter_path(
 ) -> Path | None:
     """Resolve a command token only when it has a recognizable Python identity.
 
-    This is deliberately a filesystem/name check.  It never starts the token
-    merely to decide whether it is safe to probe.  In particular, arbitrary
-    ``program -m pytest`` forms are not recognized.  The conventional Python
-    names cover both system interpreters and ``bin``/``Scripts`` virtualenv
-    interpreters; the actual bounded ``--version`` probe remains authoritative
-    for importability.
+    This is deliberately a filesystem-only check.  It never starts the token
+    merely to decide whether it is safe to probe.  In particular, an arbitrary
+    shell script named ``python`` is not recognized.  The current interpreter
+    may be addressed through any symlink that resolves to it; other candidates
+    must be conventionally named, executable Python binaries in a
+    ``pyvenv.cfg`` environment.  The bounded ``--version`` probe remains
+    authoritative for importability.
     """
-    path = _resolve_candidate_path(token, cwd=cwd, environment=environment)
+    lexical = _lexical_absolute(
+        _lexical_candidate_path(token, cwd=cwd, environment=environment)
+    )
     try:
-        resolved = path.resolve(strict=False)
+        resolved = lexical.resolve(strict=False)
         current = Path(sys.executable).resolve(strict=False)
     except OSError:
         return None
-    if resolved == current:
-        return resolved
-    if not _PYTHON_INTERPRETER_NAME_RE.fullmatch(resolved.name):
+    try:
+        same_as_current = resolved == current or os.path.samefile(lexical, current)
+    except OSError:
+        same_as_current = resolved == current
+    if same_as_current:
+        return lexical
+    if not _PYTHON_INTERPRETER_NAME_RE.fullmatch(lexical.name):
         return None
-    return resolved
+    if not lexical.is_file() or not os.access(lexical, os.X_OK):
+        return None
+    environment_root = _lexical_absolute(lexical.parent.parent) if lexical.parent.name.lower() in {"bin", "scripts"} else None
+    if environment_root is None or not (environment_root / "pyvenv.cfg").is_file():
+        return None
+    try:
+        with resolved.open("rb") as stream:
+            magic = stream.read(4)
+    except OSError:
+        return None
+    if magic not in {b"\x7fELF", b"MZ\x90\x00"}:
+        return None
+    return lexical
 
 
 def _interpreter_environment_root(
     interpreter: Path, *, environment: Mapping[str, str]
 ) -> Path | None:
     """Return a likely environment root without inspecting arbitrary paths."""
-    if interpreter == Path(sys.executable).resolve(strict=False):
+    lexical = _lexical_absolute(interpreter)
+    if lexical.parent.name.lower() in {"bin", "scripts"}:
+        return lexical.parent.parent
+    if interpreter.resolve(strict=False) == Path(sys.executable).resolve(strict=False):
         return Path(sys.prefix).resolve(strict=False)
-    if interpreter.parent.name.lower() in {"bin", "scripts"}:
-        return interpreter.parent.parent.resolve(strict=False)
     virtual_env = environment.get("VIRTUAL_ENV")
     if virtual_env:
-        return Path(virtual_env).expanduser().resolve(strict=False)
+        return _lexical_absolute(Path(virtual_env).expanduser())
     return None
 
 
@@ -750,10 +815,24 @@ def launcher_candidate_identity(
     """Return a cache/persistence identity with only the managed path verbatim."""
     values = environment if environment is not None else os.environ
     tokens = tuple(str(item) for item in candidate)
-    path = _resolve_candidate_path(tokens[0], cwd=cwd, environment=values) if tokens else Path("")
+    resolved_path = _resolve_candidate_path(tokens[0], cwd=cwd, environment=values) if tokens else Path("")
+    lexical_path = _lexical_absolute(
+        _lexical_candidate_path(tokens[0], cwd=cwd, environment=values)
+    ) if tokens else Path("")
+    # Keep managed wrapper paths canonical, but retain the configured lexical
+    # path for inner launchers so virtualenv symlinks remain distinguishable.
+    path = resolved_path if kind == "wrapper" else lexical_path
     virtual_env = Path(values["VIRTUAL_ENV"]).resolve(strict=False) if values.get("VIRTUAL_ENV") else None
     shebang = _shebang_interpreter(path) if path.is_file() else None
-    shebang_path = _resolve_shebang_path(shebang, cwd=cwd, environment=values)
+    shebang_path = (
+        _resolve_shebang_path(shebang, cwd=cwd, environment=values)
+        if kind == "wrapper"
+        else (
+            _lexical_absolute(_lexical_candidate_path(shebang, cwd=cwd, environment=values))
+            if shebang
+            else None
+        )
+    )
     interpreter_path = shebang_path or path
     package_origin = Path(__file__).resolve(strict=False)
     if kind == "inner":
@@ -774,9 +853,14 @@ def launcher_candidate_identity(
         "kind": kind,
         "path": str(path),
         "entry": _stat_identity(path),
+        "entry_lexical": _lexical_stat_identity(lexical_path),
         "shebang": shebang,
         "shebang_interpreter": _stat_identity(shebang_path) if shebang_path is not None else None,
+        "shebang_interpreter_lexical": (
+            _lexical_stat_identity(shebang_path) if shebang_path is not None else None
+        ),
         "interpreter": _stat_identity(interpreter_path),
+        "interpreter_lexical": _lexical_stat_identity(interpreter_path),
         "package_origin": _stat_identity(package_origin),
         "module_origin": _stat_identity(module_origin) if module_origin is not None else None,
         "pytest_dependency": dependency_identity,
@@ -1194,8 +1278,41 @@ def _wrapper_candidates(environment: Mapping[str, str] | None = None) -> list[tu
 _WRAPPER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
 _INNER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
 _INNER_PREFLIGHT_CANDIDATES: dict[str, set[str]] = defaultdict(set)
+_WRAPPER_PREFLIGHT_INFLIGHT: dict[tuple[str, str], threading.Event] = {}
 _INNER_PREFLIGHT_INFLIGHT: dict[tuple[str, str], threading.Event] = {}
 _INNER_PREFLIGHT_LOCK = threading.Lock()
+_PREFLIGHT_INVOCATIONS: OrderedDict[str, float] = OrderedDict()
+
+
+def _invocation_is_active_locked(invocation: str) -> bool:
+    return any(key[0] == invocation for key in (*_WRAPPER_PREFLIGHT_INFLIGHT, *_INNER_PREFLIGHT_INFLIGHT))
+
+
+def _drop_invocation_locked(invocation: str) -> None:
+    _PREFLIGHT_INVOCATIONS.pop(invocation, None)
+    _INNER_PREFLIGHT_CANDIDATES.pop(invocation, None)
+    for cache in (_WRAPPER_PREFLIGHT_CACHE, _INNER_PREFLIGHT_CACHE):
+        for key in tuple(cache):
+            if key[0] == invocation:
+                del cache[key]
+
+
+def _prune_invocations_locked(*, protected: set[str] = frozenset()) -> None:
+    now = time.monotonic()
+    for invocation, last_used in tuple(_PREFLIGHT_INVOCATIONS.items()):
+        if invocation in protected or _invocation_is_active_locked(invocation):
+            continue
+        if (
+            now - last_used > PREFLIGHT_INVOCATION_TTL_SECONDS
+            or len(_PREFLIGHT_INVOCATIONS) > MAX_PREFLIGHT_INVOCATION_BUCKETS
+        ):
+            _drop_invocation_locked(invocation)
+
+
+def _touch_invocation_locked(invocation: str) -> None:
+    _PREFLIGHT_INVOCATIONS[invocation] = time.monotonic()
+    _PREFLIGHT_INVOCATIONS.move_to_end(invocation)
+    _prune_invocations_locked(protected={invocation})
 
 
 def preflight_wrapper_candidates(
@@ -1213,8 +1330,33 @@ def preflight_wrapper_candidates(
     for candidate in _wrapper_candidates(values):
         identity = launcher_candidate_identity(candidate, cwd=root, environment=values, kind="wrapper")
         cache_key = (invocation, _identity_key(identity)) if invocation else None
-        result = _WRAPPER_PREFLIGHT_CACHE.get(cache_key) if cache_key is not None else None
-        if result is None:
+        flight: threading.Event | None = None
+        owner = True
+        result: LauncherProbeResult | None = None
+        if cache_key is not None:
+            with _INNER_PREFLIGHT_LOCK:
+                _touch_invocation_locked(invocation)
+                result = _WRAPPER_PREFLIGHT_CACHE.get(cache_key)
+                if result is None:
+                    flight = _WRAPPER_PREFLIGHT_INFLIGHT.get(cache_key)
+                    if flight is not None:
+                        owner = False
+                    else:
+                        flight = threading.Event()
+                        _WRAPPER_PREFLIGHT_INFLIGHT[cache_key] = flight
+        if not owner:
+            assert flight is not None
+            if flight.wait(LAUNCHER_PROBE_TIMEOUT_SECONDS + 1.0):
+                with _INNER_PREFLIGHT_LOCK:
+                    result = _WRAPPER_PREFLIGHT_CACHE.get(cache_key)  # type: ignore[arg-type]
+            if result is None:
+                result = LauncherProbeResult(
+                    candidate,
+                    "unknown",
+                    "wrapper probe result was not published by its owner",
+                    _identity_key(identity),
+                )
+        elif result is None:
             probe_argv = [*candidate, "--preflight"]
             try:
                 completed = subprocess.run(
@@ -1238,7 +1380,14 @@ def preflight_wrapper_candidates(
                 state = "verified" if success else ("failed" if explicit_bootstrap else "unknown")
                 result = LauncherProbeResult(candidate, state, output, _identity_key(identity))
             if cache_key is not None:
-                _WRAPPER_PREFLIGHT_CACHE[cache_key] = result
+                assert flight is not None
+                with _INNER_PREFLIGHT_LOCK:
+                    _WRAPPER_PREFLIGHT_CACHE[cache_key] = result
+                    _WRAPPER_PREFLIGHT_INFLIGHT.pop(cache_key, None)
+                    _PREFLIGHT_INVOCATIONS[invocation] = time.monotonic()
+                    _PREFLIGHT_INVOCATIONS.move_to_end(invocation)
+                    flight.set()
+                    _prune_invocations_locked()
             if memory_dir is not None and result.state in {"failed", "verified"}:
                 record_launcher_health(
                     memory_dir,
@@ -1311,6 +1460,8 @@ def probe_inner_launcher(
     owner = True
     if cache_key is not None:
         with _INNER_PREFLIGHT_LOCK:
+            assert invocation is not None
+            _touch_invocation_locked(invocation)
             cached = _INNER_PREFLIGHT_CACHE.get(cache_key)
             if cached is not None:
                 return cached
@@ -1376,7 +1527,11 @@ def probe_inner_launcher(
                 if result is not None:
                     _INNER_PREFLIGHT_CACHE[cache_key] = result
                 _INNER_PREFLIGHT_INFLIGHT.pop(cache_key, None)
+                assert invocation is not None
+                _PREFLIGHT_INVOCATIONS[invocation] = time.monotonic()
+                _PREFLIGHT_INVOCATIONS.move_to_end(invocation)
                 flight.set()
+                _prune_invocations_locked()
 
 
 def _git_commit(cwd: Path) -> str | None:

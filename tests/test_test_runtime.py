@@ -538,6 +538,23 @@ def test_non_python_m_pytest_command_is_not_spawned_by_preflight(tmp_path, monke
     assert calls == []
 
 
+def test_script_named_python_is_not_spawned_by_preflight(tmp_path, monkeypatch):
+    calls = []
+    fake_python = tmp_path / "bin" / "python"
+    fake_python.parent.mkdir()
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+
+    monkeypatch.setattr(runtime.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    result = runtime.probe_inner_launcher(
+        [str(fake_python), "-m", "pytest", "tests"], cwd=tmp_path
+    )
+
+    assert result.state == "unknown"
+    assert "unrecognized" in result.diagnostic
+    assert calls == []
+
+
 def test_wrapper_preflight_has_fixed_argv_and_per_invocation_cache(tmp_path, monkeypatch):
     calls = []
     wrapper = tmp_path / "agent-loop"
@@ -701,7 +718,8 @@ def test_inner_probe_enforces_six_new_candidates_per_invocation(tmp_path, monkey
     for index in range(runtime.MAX_INNER_PROBE_CANDIDATES):
         interpreter = tmp_path / f"venv-{index}" / "bin" / "python"
         interpreter.parent.mkdir(parents=True)
-        interpreter.write_text("python\n", encoding="utf-8")
+        (interpreter.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+        interpreter.write_bytes(b"\x7fELFfake-python\n")
         interpreter.chmod(0o755)
         result = runtime.probe_inner_launcher(
             [str(interpreter), "-m", "pytest"], cwd=tmp_path
@@ -709,7 +727,8 @@ def test_inner_probe_enforces_six_new_candidates_per_invocation(tmp_path, monkey
         assert result.state == "verified"
     over_limit = tmp_path / "venv-over-limit" / "bin" / "python"
     over_limit.parent.mkdir(parents=True)
-    over_limit.write_text("python\n", encoding="utf-8")
+    (over_limit.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    over_limit.write_bytes(b"\x7fELFfake-python\n")
     over_limit.chmod(0o755)
     limited = runtime.probe_inner_launcher(
         [str(over_limit), "-m", "pytest"], cwd=tmp_path
@@ -725,7 +744,8 @@ def test_alternate_interpreter_dependency_repair_invalidates_failed_probe(tmp_pa
     site_packages = venv / "lib" / "python3.12" / "site-packages"
     interpreter.parent.mkdir(parents=True)
     site_packages.mkdir(parents=True)
-    interpreter.write_text("python\n", encoding="utf-8")
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    interpreter.write_bytes(b"\x7fELFfake-python\n")
     interpreter.chmod(0o755)
     monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "alternate-interpreter-repair-test")
     calls = []
@@ -748,10 +768,60 @@ def test_alternate_interpreter_dependency_repair_invalidates_failed_probe(tmp_pa
 
     assert second.state == "verified"
     assert len(calls) == 2
-    assert calls[0][0] == (str(interpreter.resolve()), "-m", "pytest", "--version")
+    assert calls[0][0] == (str(interpreter), "-m", "pytest", "--version")
     identity = runtime.launcher_candidate_identity(command, cwd=tmp_path)
     redacted = runtime._redacted_identity(identity, cwd=tmp_path)
     assert str(venv) not in json.dumps(redacted)
+
+
+def test_symlinked_virtualenv_interpreter_keeps_lexical_probe_path(tmp_path, monkeypatch):
+    venv = tmp_path / "symlinked-venv"
+    interpreter = venv / "bin" / "python"
+    site_packages = venv / "lib" / "python3.12" / "site-packages"
+    interpreter.parent.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    interpreter.symlink_to(Path(sys.executable))
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "symlinked-interpreter-test")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    result = runtime.probe_inner_launcher(
+        [str(interpreter), "-m", "pytest", "tests"], cwd=tmp_path
+    )
+
+    assert result.state == "verified"
+    assert calls == [(str(interpreter), "-m", "pytest", "--version")]
+    identity = runtime.launcher_candidate_identity(
+        [str(interpreter), "-m", "pytest"], cwd=tmp_path
+    )
+    assert identity["path"] == str(interpreter)
+    assert identity["entry_lexical"]["path"] == str(interpreter)
+    assert identity["pytest_dependency"]["paths"]
+    assert str(venv) not in json.dumps(runtime._redacted_identity(identity, cwd=tmp_path))
+
+
+def test_preflight_invocation_cache_evicts_completed_buckets(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    command = [sys.executable, "-m", "pytest", "tests"]
+    for index in range(runtime.MAX_PREFLIGHT_INVOCATION_BUCKETS + 7):
+        monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", f"bounded-invocation-{index}")
+        assert runtime.probe_inner_launcher(command, cwd=tmp_path).state == "verified"
+
+    assert len(runtime._PREFLIGHT_INVOCATIONS) <= runtime.MAX_PREFLIGHT_INVOCATION_BUCKETS
+    assert len(runtime._INNER_PREFLIGHT_CANDIDATES) <= runtime.MAX_PREFLIGHT_INVOCATION_BUCKETS
+    assert len(runtime._INNER_PREFLIGHT_CACHE) <= runtime.MAX_PREFLIGHT_INVOCATION_BUCKETS
+    assert len(calls) == runtime.MAX_PREFLIGHT_INVOCATION_BUCKETS + 7
 
 
 def test_inner_probe_concurrent_same_identity_runs_once(tmp_path, monkeypatch):
@@ -808,7 +878,8 @@ def test_inner_probe_concurrent_distinct_identities_respects_candidate_limit(tmp
     for index in range(runtime.MAX_INNER_PROBE_CANDIDATES + 2):
         interpreter = tmp_path / f"concurrent-venv-{index}" / "bin" / "python"
         interpreter.parent.mkdir(parents=True)
-        interpreter.write_text("python\n", encoding="utf-8")
+        (interpreter.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+        interpreter.write_bytes(b"\x7fELFfake-python\n")
         interpreter.chmod(0o755)
         interpreters.append(interpreter)
     results = []
