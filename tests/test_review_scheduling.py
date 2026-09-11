@@ -316,6 +316,75 @@ def test_non_owner_resolution_is_evidence_only():
     assert "Claude: looks good" in remaining[0].notes
 
 
+def test_owner_scoped_future_clears_sole_owner_and_retains_future_item():
+    remaining, future_items = _apply_unresolved_item_dispositions(
+        (_item(),),
+        {
+            "item-1": [
+                ReviewItemDisposition(
+                    item_id="item-1",
+                    reviewer="Codex",
+                    disposition="future",
+                    note="Defer this non-blocking cleanup.",
+                )
+            ]
+        },
+        reconciliation_mode="owner-scoped",
+    )
+
+    assert len(remaining) == 1
+    assert remaining[0].status == "future"
+    assert remaining[0].owner_states == (("Codex", "cleared"),)
+    assert future_items == []
+
+
+def test_owner_scoped_future_and_resolved_clear_all_owners():
+    item = _item(owners=("Codex", "Claude"))
+    remaining, future_items = _apply_unresolved_item_dispositions(
+        (item,),
+        {
+            "item-1": [
+                ReviewItemDisposition(
+                    item_id="item-1", reviewer="Codex", disposition="future"
+                ),
+                ReviewItemDisposition(
+                    item_id="item-1", reviewer="Claude", disposition="resolved"
+                ),
+            ]
+        },
+        reconciliation_mode="owner-scoped",
+    )
+
+    assert remaining[0].status == "future"
+    assert remaining[0].owner_states == (
+        ("Codex", "cleared"),
+        ("Claude", "cleared"),
+    )
+    assert future_items == []
+
+
+def test_owner_scoped_future_does_not_clear_another_pending_owner():
+    item = _item(owners=("Codex", "Claude"))
+    remaining, future_items = _apply_unresolved_item_dispositions(
+        (item,),
+        {
+            "item-1": [
+                ReviewItemDisposition(
+                    item_id="item-1", reviewer="Codex", disposition="future"
+                )
+            ]
+        },
+        reconciliation_mode="owner-scoped",
+    )
+
+    assert remaining[0].status == "blocking"
+    assert remaining[0].owner_states == (
+        ("Codex", "cleared"),
+        ("Claude", "pending"),
+    )
+    assert future_items == []
+
+
 def test_scheduler_metadata_roundtrips_and_malformed_state_falls_back_to_legacy():
     metadata = PostedRoundMetadata(
         flow="pr",

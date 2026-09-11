@@ -561,7 +561,15 @@ def _apply_unresolved_item_dispositions(
                     if disposition.reviewer not in owners:
                         owners = (*owners, disposition.reviewer)
                     owner_states[disposition.reviewer] = "pending"
-                elif disposition.disposition == "resolved" and disposition.reviewer in owners:
+                elif (
+                    disposition.disposition in {"resolved", "future"}
+                    and disposition.reviewer in owners
+                ):
+                    # `future` is a valid approving disposition for a carried
+                    # item. In owner-scoped mode it clears only this owner's
+                    # obligation; other owners must still provide their own
+                    # clearing disposition before the item can leave the
+                    # active ledger.
                     owner_states[disposition.reviewer] = "cleared"
                 if disposition.note:
                     owner_evidence[disposition.reviewer] = disposition.note
