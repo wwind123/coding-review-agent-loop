@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import signal
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -488,6 +489,13 @@ _MANAGED_PREFIX_OPTIONS = {
     "command": (set(), {"-p"}),
 }
 _TIMEOUT_DURATION_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?$")
+_NICE_ADJUSTMENT_RE = re.compile(r"[+-]?\d+$")
+_STDBUF_SIZE_RE = re.compile(r"\+?\d+(?:[KMGTPE](?:i?B)?|k)?$")
+_SIGNAL_NAMES = frozenset(
+    name.removeprefix("SIG")
+    for name, value in vars(signal).items()
+    if re.fullmatch(r"SIG[A-Z0-9]+", name) and isinstance(value, int)
+)
 
 
 @dataclass(frozen=True)
@@ -509,6 +517,29 @@ def _executable_basename(token: str) -> str:
     return token.rsplit("/", 1)[-1]
 
 
+def _is_valid_managed_option_value(wrapper: str, option: str, value: str) -> bool:
+    """Validate values closely enough to prove that a managed prefix can execute."""
+    if not value:
+        return False
+    if wrapper == "env":
+        return "=" not in value
+    if wrapper == "nice":
+        return bool(_NICE_ADJUSTMENT_RE.fullmatch(value))
+    if wrapper == "timeout":
+        if option in {"-k", "--kill-after"}:
+            return bool(_TIMEOUT_DURATION_RE.fullmatch(value))
+        if option in {"-s", "--signal"}:
+            if value.isdecimal():
+                return int(value) == 0 or int(value) in signal.valid_signals()
+            name = value.upper().removeprefix("SIG")
+            return name in _SIGNAL_NAMES
+    if wrapper == "stdbuf":
+        if value == "L":
+            return option not in {"-i", "--input"}
+        return bool(_STDBUF_SIZE_RE.fullmatch(value))
+    return False
+
+
 def _consume_wrapper_options(
     tokens: Sequence[str], start: int, wrapper: str, *, managed: bool = False,
 ) -> int | None:
@@ -526,18 +557,29 @@ def _consume_wrapper_options(
         # Deliberately do not recognize slash-prefixed Windows tokens as options.
         if not token.startswith("-") or _is_path_like_token(token):
             return i
-        option, sep, _value = token.partition("=")
+        option, sep, option_value = token.partition("=")
         if option in value_options:
             if sep:
-                if managed and (not option.startswith("--") or not _value):
+                if managed and (
+                    not option.startswith("--")
+                    or not _is_valid_managed_option_value(wrapper, option, option_value)
+                ):
                     return None
                 i += 1
                 continue
             # Attached short values, such as -k10s or -n10, are valid.
             if option.startswith("-") and not option.startswith("--") and len(token) > len(option):
+                if managed and not _is_valid_managed_option_value(
+                    wrapper, option, token[len(option):]
+                ):
+                    return None
                 i += 1
                 continue
-            if i + 1 >= len(tokens) or (managed and not tokens[i + 1]):
+            if i + 1 >= len(tokens):
+                return None
+            if managed and not _is_valid_managed_option_value(
+                wrapper, option, tokens[i + 1]
+            ):
                 return None
             i += 2
             continue
@@ -547,6 +589,10 @@ def _consume_wrapper_options(
                 None,
             )
             if attached_option is not None:
+                if managed and not _is_valid_managed_option_value(
+                    wrapper, attached_option, token[len(attached_option):]
+                ):
+                    return None
                 i += 1
                 continue
         if managed and token not in flag_options:
