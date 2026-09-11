@@ -1,4 +1,5 @@
 """Tests for opt-in parallel plan/PR reviewer execution (#594)."""
+import dataclasses
 import json
 import threading
 import time
@@ -135,6 +136,25 @@ def test_selective_parallel_pr_loop_rechecks_owner_then_only_missing_sweep_revie
         "_observe_pr_transition",
         lambda *args, **kwargs: orchestrator.TransitionClassification("narrow", "scoped fix"),
     )
+    observed_reviewer_sessions = []
+    original_run_validated_agent = orchestrator._run_validated_agent
+
+    def run_validated_agent_with_session_observation(*args, **kwargs):
+        if kwargs.get("role") == "reviewer":
+            observed_reviewer_sessions.append((kwargs["agent"], kwargs.get("session_id")))
+        response = original_run_validated_agent(*args, **kwargs)
+        if kwargs.get("role") == "reviewer":
+            return dataclasses.replace(
+                response,
+                session_id=f"{kwargs['agent']}-session",
+            )
+        return response
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_validated_agent",
+        run_validated_agent_with_session_observation,
+    )
     runner = FakeRunner(
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
         codex_outputs=[
@@ -172,6 +192,9 @@ def test_selective_parallel_pr_loop_rechecks_owner_then_only_missing_sweep_revie
         command[-1] for command, _cwd in runner.commands if command[:1] == ["gemini"]
     ]
     assert any("Returning reviewer handoff context" in prompt for prompt in gemini_prompts)
+    assert [
+        session_id for agent, session_id in observed_reviewer_sessions if agent == "gemini"
+    ] == [None, None]
 
 
 # ---------------------------------------------------------------------------
