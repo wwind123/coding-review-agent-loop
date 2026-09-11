@@ -141,6 +141,11 @@ class UnresolvedReviewItem:
     resolution_owners: tuple[str, ...] = ()
     owner_states: tuple[tuple[str, str], ...] = ()
     owner_evidence: tuple[tuple[str, str], ...] = ()
+    # Durable disposition outcome for each owner.  This is separate from
+    # ``owner_states`` because a cleared owner may have cleared via
+    # ``resolved`` or ``future``; the latter must survive until all owners
+    # have cleared so a later round can retain the future reclassification.
+    owner_dispositions: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)

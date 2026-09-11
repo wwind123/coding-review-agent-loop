@@ -385,6 +385,49 @@ def test_owner_scoped_future_does_not_clear_another_pending_owner():
     assert future_items == []
 
 
+def test_owner_scoped_future_survives_until_other_owner_clears_in_later_round():
+    item = _item(owners=("Codex", "Claude"))
+    first_round, future_items = _apply_unresolved_item_dispositions(
+        (item,),
+        {
+            "item-1": [
+                ReviewItemDisposition(
+                    item_id="item-1", reviewer="Codex", disposition="future"
+                )
+            ]
+        },
+        reconciliation_mode="owner-scoped",
+    )
+
+    assert future_items == []
+    assert first_round[0].status == "blocking"
+    assert first_round[0].owner_dispositions == (("Codex", "future"),)
+
+    second_round, future_items = _apply_unresolved_item_dispositions(
+        tuple(first_round),
+        {
+            "item-1": [
+                ReviewItemDisposition(
+                    item_id="item-1", reviewer="Claude", disposition="resolved"
+                )
+            ]
+        },
+        reconciliation_mode="owner-scoped",
+    )
+
+    assert len(second_round) == 1
+    assert second_round[0].status == "future"
+    assert second_round[0].owner_states == (
+        ("Codex", "cleared"),
+        ("Claude", "cleared"),
+    )
+    assert second_round[0].owner_dispositions == (
+        ("Codex", "future"),
+        ("Claude", "resolved"),
+    )
+    assert future_items == []
+
+
 def test_scheduler_metadata_roundtrips_and_malformed_state_falls_back_to_legacy():
     metadata = PostedRoundMetadata(
         flow="pr",

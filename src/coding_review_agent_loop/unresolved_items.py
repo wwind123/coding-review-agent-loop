@@ -121,6 +121,7 @@ def _apply_dispute_evidence(
                     resolution_owners=item.resolution_owners,
                     owner_states=item.owner_states,
                     owner_evidence=item.owner_evidence,
+                    owner_dispositions=item.owner_dispositions,
                 )
             )
         else:
@@ -552,6 +553,7 @@ def _apply_unresolved_item_dispositions(
         owners = item.resolution_owners or (item.reviewer,)
         owner_states = dict(item.owner_states or ((owner, "pending") for owner in owners))
         owner_evidence = dict(item.owner_evidence)
+        owner_dispositions = dict(item.owner_dispositions)
         if reconciliation_mode == "owner-scoped":
             # A reviewer who was not an owner may supply evidence, but only a
             # blocking/same-PR disposition creates a durable new obligation.
@@ -561,6 +563,7 @@ def _apply_unresolved_item_dispositions(
                     if disposition.reviewer not in owners:
                         owners = (*owners, disposition.reviewer)
                     owner_states[disposition.reviewer] = "pending"
+                    owner_dispositions[disposition.reviewer] = disposition.disposition
                 elif (
                     disposition.disposition in {"resolved", "future"}
                     and disposition.reviewer in owners
@@ -571,6 +574,7 @@ def _apply_unresolved_item_dispositions(
                     # clearing disposition before the item can leave the
                     # active ledger.
                     owner_states[disposition.reviewer] = "cleared"
+                    owner_dispositions[disposition.reviewer] = disposition.disposition
                 if disposition.note:
                     owner_evidence[disposition.reviewer] = disposition.note
             owners = tuple(dict.fromkeys(owners))
@@ -603,6 +607,7 @@ def _apply_unresolved_item_dispositions(
                     resolution_owners=owners,
                     owner_states=tuple((owner, owner_states[owner]) for owner in owners),
                     owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
+                    owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
                 )
             )
             continue
@@ -620,6 +625,7 @@ def _apply_unresolved_item_dispositions(
                     resolution_owners=owners,
                     owner_states=tuple((owner, owner_states[owner]) for owner in owners),
                     owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
+                    owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
                 )
             )
             continue
@@ -639,10 +645,13 @@ def _apply_unresolved_item_dispositions(
                         resolution_owners=owners,
                         owner_states=tuple((owner, owner_states[owner]) for owner in owners),
                         owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
+                        owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
                     )
                 )
                 continue
-        if "future" in outcomes:
+        if "future" in outcomes or any(
+            outcome == "future" for outcome in owner_dispositions.values()
+        ):
             future_item = UnresolvedReviewItem(
                 item_id=item.item_id,
                 reviewer=item.reviewer,
@@ -655,6 +664,7 @@ def _apply_unresolved_item_dispositions(
                 resolution_owners=owners,
                 owner_states=tuple((owner, owner_states[owner]) for owner in owners),
                 owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
+                owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
             )
             if retain_future:
                 next_unresolved.append(future_item)

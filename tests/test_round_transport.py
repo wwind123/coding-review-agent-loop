@@ -245,3 +245,26 @@ def test_round_metadata_preserves_mixed_legacy_claim_and_modern_evidence_exactly
     assert _prior_item_ledger_signature(decoded.prior_items) == _prior_item_ledger_signature(
         (legacy_and_modern_item,)
     )
+
+
+def test_round_metadata_preserves_owner_future_disposition_across_resume() -> None:
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Codex",
+        source_round=1,
+        text="cleanup remains incomplete",
+        status="blocking",
+        source_status="blocking",
+        resolution_owners=("Codex", "Claude"),
+        owner_states=(("Codex", "cleared"), ("Claude", "pending")),
+        owner_dispositions=(("Codex", "future"),),
+    )
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Codex", round_number=2, subject="head",
+        prior_items=(item,),
+    )
+
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+
+    assert decoded.prior_items == (item,)
+    assert decoded.prior_items[0].owner_dispositions == (("Codex", "future"),)

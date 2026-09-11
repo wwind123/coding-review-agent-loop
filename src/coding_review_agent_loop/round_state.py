@@ -276,6 +276,7 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
         **({"resolution_owners": list(item.resolution_owners)} if item.resolution_owners else {}),
         **({"owner_states": [list(pair) for pair in item.owner_states]} if item.owner_states else {}),
         **({"owner_evidence": [list(pair) for pair in item.owner_evidence]} if item.owner_evidence else {}),
+        **({"owner_dispositions": [list(pair) for pair in item.owner_dispositions]} if item.owner_dispositions else {}),
     }
 
 
@@ -300,6 +301,12 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         for pair in raw_evidence
         if isinstance(pair, (list, tuple)) and len(pair) == 2
     ) if isinstance(raw_evidence, list) else ()
+    raw_dispositions = payload.get("owner_dispositions") or []
+    owner_dispositions = tuple(
+        (str(pair[0]), str(pair[1]))
+        for pair in raw_dispositions
+        if isinstance(pair, (list, tuple)) and len(pair) == 2
+    ) if isinstance(raw_dispositions, list) else ()
     return UnresolvedReviewItem(
         item_id=str(payload["item_id"]),
         reviewer=str(payload["reviewer"]),
@@ -312,6 +319,7 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         resolution_owners=owners,
         owner_states=states,
         owner_evidence=evidence,
+        owner_dispositions=owner_dispositions,
     )
 
 
@@ -792,6 +800,7 @@ def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple
             item.resolution_owners,
             item.owner_states,
             item.owner_evidence,
+            item.owner_dispositions,
         )
         for item in items
     )
