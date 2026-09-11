@@ -570,8 +570,9 @@ def _wrapper_traversal(tokens: Sequence[str], *, managed: bool = False) -> _Wrap
     positions: set[int] = set()
     i = 0
     recognized_prefix = False
+    assignments_allowed = True
     while i < len(tokens):
-        if VAR_ASSIGNMENT_RE.match(tokens[i]):
+        if VAR_ASSIGNMENT_RE.match(tokens[i]) and (not managed or assignments_allowed):
             i += 1
             continue
         wrapper = _program_basename(tokens[i])
@@ -584,6 +585,10 @@ def _wrapper_traversal(tokens: Sequence[str], *, managed: bool = False) -> _Wrap
         if next_index is None:
             return _WrapperTraversal(True, positions, None)
         i = next_index
+        # Shell assignments are transparent before the initial command, and
+        # env accepts them as operands before its command.  Other execution
+        # prefixes treat an assignment-shaped operand as the program to run.
+        assignments_allowed = wrapper == "env"
     return _WrapperTraversal(recognized_prefix, positions, None)
 
 
