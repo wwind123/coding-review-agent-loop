@@ -7592,6 +7592,47 @@ def _reviewer_diff_summary(
         )
 
 
+def _reviewer_history_is_reconstructible(
+    runner: Runner,
+    *,
+    checkout: Path,
+    record: PostedRoundRecord | None,
+    current_head_sha: str,
+) -> bool:
+    """Check that a returning reviewer's own history can be reconstructed.
+
+    A reviewer may legitimately miss several narrow coder rounds. Their older
+    reviewed SHA is still sufficient when Git can observe that SHA as an
+    ancestor and can produce the complete span diff. This check is intentionally
+    independent of the scheduler's previous transition SHA: trusting that SHA
+    here would turn normal selective pauses into alternating full-board rounds.
+    """
+    if record is None:
+        return False
+    last_sha = record.metadata.subject
+    if not last_sha or last_sha == current_head_sha:
+        return bool(last_sha)
+    try:
+        ancestry = runner.run(
+            ["git", "merge-base", "--is-ancestor", last_sha, current_head_sha],
+            cwd=checkout,
+            check=False,
+        )
+        if ancestry.returncode != 0:
+            return False
+        diff = runner.run(
+            [
+                "git", "diff", "--name-status", "--find-renames", "--find-copies",
+                last_sha, current_head_sha,
+            ],
+            cwd=checkout,
+            check=False,
+        )
+        return diff.returncode == 0
+    except (OSError, AttributeError, TypeError):
+        return False
+
+
 def _returning_reviewer_context(
     runner: Runner,
     *,
@@ -7753,9 +7794,44 @@ def _fresh_pr_qualification_snapshot(
     issue_context: IssueContext | None,
     parent_issue_context: IssueContext | None,
     approved_plan_context: ApprovedPlanContext | None = None,
+    scheduler_contract: ReviewSchedulingContract | None = None,
 ) -> tuple[PullRequestReviewContext, tuple[str, ...]]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    if scheduler_contract is not None:
+        # Scheduler metadata is an optimization over the immutable required
+        # reviewer contract. A fresh qualification read must never silently
+        # accept malformed or conflicting audit state, including a record
+        # posted while managed CI was running.
+        fresh_scheduler_records = _extract_round_metadata_records(
+            context.comments, flow="pr"
+        )
+        for record in fresh_scheduler_records:
+            status = record.metadata.scheduler_metadata_status
+            if status == "invalid":
+                raise AgentLoopError(
+                    "Malformed or contradictory PR review scheduler metadata was observed "
+                    "during qualification; no qualification or merge is permitted."
+                )
+            if status != "valid":
+                continue
+            try:
+                fresh_contract = _scheduler_contract_from_metadata(record.metadata)
+            except AgentLoopError as exc:
+                raise AgentLoopError(
+                    "Malformed PR review scheduler contract was observed during qualification; "
+                    "no qualification or merge is permitted."
+                ) from exc
+            if fresh_contract != scheduler_contract:
+                raise AgentLoopError(
+                    "PR review scheduler contract changed during qualification; "
+                    "no qualification or merge is permitted."
+                )
+            if record.metadata.scheduler_current_sha != record.metadata.subject:
+                raise AgentLoopError(
+                    "Contradictory PR review scheduler head metadata was observed during "
+                    "qualification; no qualification or merge is permitted."
+                )
     fresh_issue = issue_context
     fresh_parent = parent_issue_context
     if issue_context is not None:
@@ -8695,12 +8771,13 @@ def run_pr_loop(
             scheduler_diff_context = ""
             latest_reviewer_records: dict[str, PostedRoundRecord] = {}
             external_recovery_full_board = skip_reviewers_for_recovery
+            scheduler_metadata_recovery_full_board = False
             if selective_policy:
                 try:
                     historical_records = _extract_round_metadata_records(pr_comments, flow="pr")
                 except AgentLoopError:
                     historical_records = ()
-                    scheduler_force_full = True
+                    scheduler_metadata_recovery_full_board = True
                 latest_reviewer_records = _latest_pr_reviewer_records(
                     historical_records, configured_reviewers
                 )
@@ -8708,10 +8785,47 @@ def run_pr_loop(
                     record for record in historical_records
                     if record.metadata.subject == current_pr_subject
                 ]
+                scheduler_records = [
+                    record
+                    for record in historical_records
+                    if record.metadata.scheduler_metadata_status != "absent"
+                ]
+                latest_scheduler_record = scheduler_records[-1] if scheduler_records else None
+                if historical_records and (
+                    not scheduler_records
+                    or latest_scheduler_record.metadata.scheduler_metadata_status != "valid"
+                ):
+                    # This recovery override applies to the current decision;
+                    # only the explicit operator setting is a durable latch.
+                    scheduler_metadata_recovery_full_board = True
+                current_scheduler_records = [
+                    record
+                    for record in current_head_records
+                    if record.metadata.scheduler_metadata_status != "absent"
+                ]
+                if current_head_records and not current_scheduler_records:
+                    # Do not infer a same-head selective decision from legacy
+                    # reviewer/coder records without a scheduler checkpoint.
+                    scheduler_metadata_recovery_full_board = True
+                if any(
+                    record.metadata.scheduler_metadata_status == "invalid"
+                    for record in current_head_records
+                ):
+                    scheduler_metadata_recovery_full_board = True
+                if any(
+                    record.metadata.scheduler_metadata_status == "valid"
+                    and record.metadata.scheduler_current_sha != record.metadata.subject
+                    for record in historical_records
+                ):
+                    # A decoded checkpoint can still be contradictory with its
+                    # enclosing audit record's subject. Never derive a
+                    # previous transition from that state.
+                    scheduler_metadata_recovery_full_board = True
                 current_coder_record = next(
                     (
                         record for record in reversed(current_head_records)
                         if record.metadata.role == "coder"
+                        and record.metadata.scheduler_metadata_status == "valid"
                         and record.metadata.scheduler_current_sha == current_pr_subject
                     ),
                     None,
@@ -8737,7 +8851,7 @@ def run_pr_loop(
                         (
                             record.metadata.scheduler_current_sha
                             for record in reversed(historical_records)
-                            if record.metadata.scheduler_contract is not None
+                            if record.metadata.scheduler_metadata_status == "valid"
                             and record.metadata.scheduler_current_sha
                         ),
                         None,
@@ -8772,6 +8886,11 @@ def run_pr_loop(
                         "broad",
                         "external/unrecorded head advance requires full board",
                     )
+                elif scheduler_metadata_recovery_full_board:
+                    classification = TransitionClassification(
+                        "broad",
+                        "scheduler metadata is missing or invalid; full board required",
+                    )
                 elif scheduler_previous_sha is None:
                     classification = TransitionClassification("broad", "initial candidate requires the full board")
                 elif scheduler_previous_sha == current_pr_subject:
@@ -8797,28 +8916,32 @@ def run_pr_loop(
                     scheduler_previous_sha is not None
                     and not obligations
                 ) or external_recovery_full_board
-                if classification.narrow:
-                    # A reviewer that missed more than the immediately prior
-                    # turn has an unreconstructible per-reviewer history for
-                    # selective scheduling.  Reopen the full board rather
-                    # than trusting a summary from an older transition.
-                    stale_history = [
-                        name for name, record in latest_reviewer_records.items()
-                        if record.metadata.subject != current_pr_subject
-                        and scheduler_previous_sha != record.metadata.subject
+                if classification.narrow and scheduler_previous_sha != current_pr_subject:
+                    # A reviewer may miss several narrow turns. Keep that
+                    # transition narrow when the reviewer's own older span is
+                    # observable; only missing/unavailable history is broad.
+                    unreconstructible_history = [
+                        name
+                        for name in scheduler_contract.required_reviewers
+                        if not _reviewer_history_is_reconstructible(
+                            runner,
+                            checkout=active_workdir(config),
+                            record=latest_reviewer_records.get(name),
+                            current_head_sha=current_pr_subject,
+                        )
                     ]
-                    if stale_history:
+                    if unreconstructible_history:
                         classification = TransitionClassification(
                             "broad",
-                            "reviewer history spans an unavailable intermediate head",
-                            tuple(sorted(stale_history)),
+                            "a returning reviewer's history could not be reconstructed",
+                            tuple(sorted(unreconstructible_history)),
                         )
                 scheduler_snapshot = SchedulerSnapshot(
                     previous_sha=scheduler_previous_sha,
                     current_sha=current_pr_subject,
                     contract=scheduler_contract,
                     obligations=obligations,
-                    force_full=scheduler_force_full,
+                    force_full=(scheduler_force_full or scheduler_metadata_recovery_full_board),
                 )
                 scheduler_decision = select_reviewers(
                     scheduler_snapshot,
@@ -9892,6 +10015,7 @@ def run_pr_loop(
                         issue_context=issue_context,
                         parent_issue_context=parent_issue_context,
                         approved_plan_context=approved_plan_context,
+                        scheduler_contract=scheduler_contract if selective_policy else None,
                     )
                     if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                         log(
@@ -10122,6 +10246,7 @@ def run_pr_loop(
                                 issue_context=issue_context,
                                 parent_issue_context=parent_issue_context,
                                 approved_plan_context=approved_plan_context,
+                                scheduler_contract=scheduler_contract if selective_policy else None,
                             )
                             if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                                 prefetched_pr_context = fresh_context
@@ -10366,6 +10491,7 @@ def run_pr_loop(
                             issue_context=issue_context,
                             parent_issue_context=parent_issue_context,
                             approved_plan_context=approved_plan_context,
+                            scheduler_contract=scheduler_contract if selective_policy else None,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                             prefetched_pr_context = fresh_context
@@ -10385,6 +10511,7 @@ def run_pr_loop(
                             issue_context=issue_context,
                             parent_issue_context=parent_issue_context,
                             approved_plan_context=approved_plan_context,
+                            scheduler_contract=scheduler_contract if selective_policy else None,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                             log(
@@ -10451,6 +10578,7 @@ def run_pr_loop(
                                         issue_context=issue_context,
                                         parent_issue_context=parent_issue_context,
                                         approved_plan_context=approved_plan_context,
+                                        scheduler_contract=scheduler_contract if selective_policy else None,
                                     )
                                     if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                                         prefetched_pr_context = fresh_context

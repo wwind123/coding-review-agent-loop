@@ -1,4 +1,5 @@
 from agent_loop_helpers import *  # noqa: F403
+from types import SimpleNamespace
 from coding_review_agent_loop.unresolved_items import (
     _apply_unresolved_item_dispositions,
     _format_unresolved_items_for_coder,
@@ -6,6 +7,7 @@ from coding_review_agent_loop.unresolved_items import (
 )
 from coding_review_agent_loop.orchestrator import (
     _coder_followup_review_context,
+    _returning_reviewer_context,
     _reviewer_summary_context,
 )
 
@@ -324,6 +326,30 @@ def test_recovered_head_advance_retains_original_coder_binding():
     context = _coder_followup_review_context(resumed.coder_output, resumed.coder_metadata, head_sha="new-head")
     assert "Old fix claim" not in context
     assert "does not match" in context
+
+
+def test_returning_reviewer_gets_orchestrator_observed_span_and_fresh_review_instruction():
+    record = SimpleNamespace(
+        metadata=PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Gemini", round_number=1, subject="old-head"
+        )
+    )
+
+    class Runner:
+        def run(self, args, *, cwd, check=False):
+            return SimpleNamespace(returncode=0, stdout="M\tsrc/worker.py\n")
+
+    context = _returning_reviewer_context(
+        Runner(),
+        reviewer="gemini",
+        checkout=".",
+        current_head_sha="new-head",
+        current_round=3,
+        latest_reviewer_records={"Gemini": record},
+    )
+    assert "Missed 1 intervening review round(s)" in context
+    assert "Observed diff from old-head to new-head: M\tsrc/worker.py" in context
+    assert "complete current base-to-head diff" in context
 
 
 @pytest.mark.parametrize("compact", [False, True])

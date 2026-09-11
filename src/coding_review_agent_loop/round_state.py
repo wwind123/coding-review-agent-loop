@@ -129,6 +129,34 @@ class PostedRoundMetadata:
     scheduler_final_sweep: bool | None = None
     scheduler_force_full: bool | None = None
     scheduler_calls_avoided: int | None = None
+    # This is an in-memory decode-quality signal, deliberately not serialized.
+    # ``absent`` is the legacy-compatible state; ``invalid`` means scheduler
+    # fields were present but could not be reconstructed safely.
+    scheduler_metadata_status: str = "absent"
+
+    def __post_init__(self) -> None:
+        if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
+            raise ValueError("invalid scheduler metadata status")
+        # Programmatically-created scheduler checkpoints (including tests and
+        # callers that have not round-tripped through the transport) are valid
+        # when they carry scheduler fields. Decoded malformed payloads pass an
+        # explicit ``invalid`` status and remain distinguishable.
+        if self.scheduler_metadata_status == "absent" and any(
+            value not in (None, (), [])
+            for value in (
+                self.scheduler_contract,
+                self.scheduler_previous_sha,
+                self.scheduler_current_sha,
+                self.scheduler_obligation_digest,
+                self.scheduler_selected_reviewers,
+                self.scheduler_paused_reviewers,
+                self.scheduler_reasons,
+                self.scheduler_final_sweep,
+                self.scheduler_force_full,
+                self.scheduler_calls_avoided,
+            )
+        ):
+            object.__setattr__(self, "scheduler_metadata_status", "valid")
 
 
 @dataclass(frozen=True)
@@ -311,10 +339,10 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
     being allowed to select a smaller reviewer set during resume.
     """
     if not (_SCHEDULER_METADATA_KEYS & payload.keys()):
-        return {}
+        return {"scheduler_metadata_status": "absent"}
     required = _SCHEDULER_METADATA_KEYS
     if not required.issubset(payload.keys()):
-        return {}
+        return {"scheduler_metadata_status": "invalid"}
     try:
         contract = ReviewSchedulingContract.from_mapping(payload["scheduler_contract"])
         previous = payload["scheduler_previous_sha"]
@@ -365,7 +393,7 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
         if isinstance(calls_avoided, bool) or not isinstance(calls_avoided, int) or calls_avoided < 0:
             raise ValueError("invalid avoided-call count")
     except (AgentLoopError, TypeError, ValueError, KeyError):
-        return {}
+        return {"scheduler_metadata_status": "invalid"}
     return {
         "scheduler_contract": contract.as_dict(),
         "scheduler_previous_sha": previous,
@@ -377,6 +405,7 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
         "scheduler_final_sweep": final_sweep,
         "scheduler_force_full": force_full,
         "scheduler_calls_avoided": calls_avoided,
+        "scheduler_metadata_status": "valid",
     }
 
 

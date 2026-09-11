@@ -1,5 +1,7 @@
 import pytest
 
+from agent_loop_helpers import FakeRunner, make_config
+
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.cli import build_parser
 from coding_review_agent_loop.review_scheduling import (
@@ -14,11 +16,14 @@ from coding_review_agent_loop.review_scheduling import (
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
+    _attach_round_metadata,
     _decode_round_metadata_mapping,
     _encode_round_metadata,
 )
 from coding_review_agent_loop.orchestrator import (
     _all_pending_resolution_owners_unavailable,
+    _fresh_pr_qualification_snapshot,
+    _reviewer_history_is_reconstructible,
     _reviewer_needs_fresh_context,
     _reviewer_diff_summary,
 )
@@ -300,6 +305,7 @@ def test_scheduler_metadata_roundtrips_and_malformed_state_falls_back_to_legacy(
     assert decoded.scheduler_contract == _contract().as_dict()
     assert decoded.scheduler_selected_reviewers == ("Codex",)
     assert decoded.scheduler_calls_avoided == 2
+    assert decoded.scheduler_metadata_status == "valid"
 
     malformed = _decode_round_metadata_mapping(
         {
@@ -326,6 +332,18 @@ def test_scheduler_metadata_roundtrips_and_malformed_state_falls_back_to_legacy(
         }
     )
     assert malformed.scheduler_contract is None
+    assert malformed.scheduler_metadata_status == "invalid"
+
+    legacy = _decode_round_metadata_mapping(
+        {
+            "flow": "pr",
+            "role": "reviewer",
+            "agent": "Codex",
+            "round_number": 1,
+            "subject": "a" * 40,
+        }
+    )
+    assert legacy.scheduler_metadata_status == "absent"
 
 
 def test_coder_scheduler_checkpoint_is_a_complete_decodable_record():
@@ -397,6 +415,91 @@ def test_reviewer_diff_summary_is_bounded_and_observed():
     )
     assert "src/worker.py" in summary
     assert "complete base-to-head diff" in summary
+
+
+def test_returning_reviewer_history_can_span_multiple_narrow_heads_when_git_observes_it():
+    class Runner:
+        def __init__(self, *, ancestry=0, diff=0):
+            self.ancestry = ancestry
+            self.diff = diff
+
+        def run(self, args, *, cwd, check=False):
+            return type(
+                "Result",
+                (),
+                {
+                    "returncode": self.ancestry if args[1] == "merge-base" else self.diff,
+                    "stdout": "",
+                },
+            )()
+
+    record = type(
+        "Record",
+        (),
+        {"metadata": PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Claude", round_number=1, subject="h1"
+        )},
+    )()
+    assert _reviewer_history_is_reconstructible(
+        Runner(), checkout=".", record=record, current_head_sha="h3"
+    )
+    assert not _reviewer_history_is_reconstructible(
+        Runner(ancestry=1), checkout=".", record=record, current_head_sha="h3"
+    )
+    assert not _reviewer_history_is_reconstructible(
+        Runner(diff=1), checkout=".", record=record, current_head_sha="h3"
+    )
+    assert not _reviewer_history_is_reconstructible(
+        Runner(), checkout=".", record=None, current_head_sha="h3"
+    )
+
+
+def test_fresh_qualification_rejects_a_scheduler_contract_change(tmp_path):
+    changed_contract = ReviewSchedulingContract(
+        required_reviewers=("Claude", "Codex", "Antigravity"),
+        policy="all-reviewers",
+        broad_rules=(".github/**",),
+    )
+    audit = _attach_round_metadata(
+        "scheduler audit",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=2,
+            subject="head",
+            scheduler_contract=changed_contract.as_dict(),
+            scheduler_previous_sha="base",
+            scheduler_current_sha="head",
+            scheduler_obligation_digest="0" * 16,
+            scheduler_selected_reviewers=("Claude", "Codex", "Antigravity"),
+            scheduler_paused_reviewers=(),
+            scheduler_reasons=("contract changed",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=0,
+        ),
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "headRefOid": "head",
+            "comments": [{"author": {"login": "bot"}, "body": audit}],
+        }
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate",
+    )
+    with pytest.raises(AgentLoopError, match="scheduler contract changed"):
+        _fresh_pr_qualification_snapshot(
+            runner,
+            config=config,
+            pr_number=77,
+            issue_context=None,
+            parent_issue_context=None,
+            scheduler_contract=_contract(),
+        )
 
 
 def test_cleared_owner_set_is_not_vacuously_unavailable():

@@ -1,4 +1,5 @@
 """Tests for opt-in parallel plan/PR reviewer execution (#594)."""
+import json
 import threading
 import time
 from unittest.mock import patch
@@ -107,6 +108,70 @@ def test_pr_loop_parallel_runs_same_round_reviewers_concurrently(tmp_path):
     assert any("Codex PR review complete." in comment for comment in runner.comments)
     assert any("Gemini PR review complete." in comment for comment in runner.comments)
     assert "reconciliation" in runner.comments[-1]
+
+
+def test_selective_parallel_pr_loop_rechecks_owner_then_only_missing_sweep_reviewer(
+    tmp_path, monkeypatch
+):
+    def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
+        return (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "pr_review",
+                    "state": state,
+                    "summary": f"{reviewer} review",
+                    "blocking_items": blocking_items or [],
+                    "same_pr_followups": [],
+                    "future_followups": [],
+                    "prior_item_dispositions": dispositions or [],
+                }
+            )
+            + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: orchestrator.TransitionClassification("narrow", "scoped fix"),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[
+                    {"text": "worker cleanup gap", "fix_scope": ["src/worker.py"]}
+                ],
+            ),
+            review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[review(reviewer="Google Gemini"), review(reviewer="Google Gemini")],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        review_parallel=True,
+        pr_review_policy="selective-intermediate",
+        pr_review_context_mode="compact",
+        max_rounds=4,
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    reviewer_commands = [
+        command for command, _cwd in runner.commands
+        if command and command[0] in {"codex", "gemini"}
+    ]
+    assert [command[0] for command in reviewer_commands].count("codex") == 2
+    assert [command[0] for command in reviewer_commands].count("gemini") == 2
+    gemini_prompts = [
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["gemini"]
+    ]
+    assert any("Returning reviewer handoff context" in prompt for prompt in gemini_prompts)
 
 
 # ---------------------------------------------------------------------------
