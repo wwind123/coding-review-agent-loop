@@ -505,8 +505,8 @@ def _program_basename(token: str) -> str:
 
 
 def _executable_basename(token: str) -> str:
-    """Return the literal basename used for managed-prefix recognition."""
-    return token.replace("\\", "/").rsplit("/", 1)[-1]
+    """Return the literal POSIX basename used for managed-prefix recognition."""
+    return token.rsplit("/", 1)[-1]
 
 
 def _consume_wrapper_options(
