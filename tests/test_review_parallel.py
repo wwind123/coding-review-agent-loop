@@ -111,8 +111,9 @@ def test_pr_loop_parallel_runs_same_round_reviewers_concurrently(tmp_path):
     assert "reconciliation" in runner.comments[-1]
 
 
+@pytest.mark.parametrize("context_mode", ["compact", "full"])
 def test_selective_parallel_pr_loop_rechecks_owner_then_only_missing_sweep_reviewer(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, context_mode
 ):
     def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
         return (
@@ -177,7 +178,7 @@ def test_selective_parallel_pr_loop_rechecks_owner_then_only_missing_sweep_revie
         reviewer=("codex", "gemini"),
         review_parallel=True,
         pr_review_policy="selective-intermediate",
-        pr_review_context_mode="compact",
+        pr_review_context_mode=context_mode,
         max_rounds=4,
     )
 
