@@ -548,7 +548,10 @@ def test_coder_receipts_reject_cross_turn_and_conflicting_citations():
 def test_coder_receipt_command_correlation_is_stable_for_safe_complex_argv():
     from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
 
-    command = "FEATURE_FLAG='value with spaces' python -m pytest 'tests/test_protocol.py::test_case[value with spaces]'"
+    command = (
+        "FEATURE_FLAG='value with spaces' python -m pytest -p no:cacheprovider "
+        "--token secret-value 'tests/test_protocol.py::test_case[value with spaces]'"
+    )
     parsed = validate_structured_coder_followup(
         json.dumps({
             "schema_version": 1, "kind": "coder_followup", "state": "blocking",

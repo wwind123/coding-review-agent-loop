@@ -88,6 +88,7 @@ _SECRET_KEY_RE = re.compile(
 )
 _SHELL_OPERATOR_RE = re.compile(r"(?:^|\s)(?:&&|\|\||[|;<>]|\$\(|`)")
 _PARAMETER_RE = re.compile(r"\[(?:[^\]]{1,160})\]$")
+_REDACTED_VALUE_RE = re.compile(r"<(?:redacted|sha256):[0-9a-f]{16}>")
 _REPO_RELATIVE_RE = re.compile(
     r"^(?:\.?\.?/)?(?:src|tests?|docs|helpers|lib|app|packages?)/[^\s]+$"
 )
@@ -779,16 +780,26 @@ def redact_test_command(
     for index, raw in enumerate(tokens):
         token = _safe_text(raw, 2048)
         if redact_next:
-            result.append(f"<redacted:{_digest(token)}>")
+            result.append(
+                token
+                if _REDACTED_VALUE_RE.fullmatch(token)
+                else f"<redacted:{_digest(token)}>"
+            )
             redact_next = False
             continue
         if _SECRET_OPTION_RE.match(token):
             match = _SECRET_OPTION_RE.match(token)
             assert match is not None
-            result.append(match.group(1) + f"<redacted:{_digest(match.group(2))}>")
+            operand = match.group(2)
+            safe_operand = (
+                operand
+                if _REDACTED_VALUE_RE.fullmatch(operand)
+                else f"<redacted:{_digest(operand)}>"
+            )
+            result.append(match.group(1) + safe_operand)
             caveats.append("credential option redacted")
             continue
-        if token.lower() in {"--token", "--password", "--secret", "--api-key", "-p"}:
+        if token.lower() in {"--token", "--password", "--secret", "--api-key"}:
             result.append(token)
             redact_next = True
             caveats.append("credential option redacted")
@@ -869,37 +880,94 @@ def redact_observation(observation: LocalTestObservation) -> LocalTestObservatio
 
 def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object]) -> str:
     """Encode a bounded canonical metadata field, degrading before transport."""
-    payload = evidence.to_dict() if isinstance(evidence, LocalTestEvidence) else dict(evidence)
-    payload.setdefault("schema_version", SCHEMA_VERSION)
-    payload.setdefault("kind", LOCAL_TEST_EVIDENCE_SCHEMA)
-    raw_rows = payload.get("observations")
+    source = evidence.to_dict() if isinstance(evidence, LocalTestEvidence) else dict(evidence)
+    raw_rows = source.get("observations")
     rows = list(raw_rows) if isinstance(raw_rows, list) else []
-    rows = rows[-MAX_ROUND_OBSERVATIONS:]
-    details = [
+    all_details = [
         redact_observation(observation_from_mapping(row)).to_dict()
         for row in rows
         if isinstance(row, Mapping) and row.get("outcome") in OUTCOMES
     ]
-    # Keep unresolved failures longest. The first pass is chronological; this
-    # stable priority only applies when the field is still over budget.
+    # Retain unresolved failures before any class of pass, then prefer newer
+    # rows within a class. Restore chronological order for rendering.
+    def retention_priority(row: Mapping[str, object]) -> int:
+        if row.get("superseded_by"):
+            return 0
+        if row.get("outcome") in {
+            "failed",
+            "timed_out",
+            "interrupted",
+            "incomplete",
+        }:
+            return 4
+        if row.get("outcome") != "passed":
+            return 3
+        attribution = row.get("attribution")
+        state = attribution.get("state") if isinstance(attribution, Mapping) else "unknown"
+        if state == "stale":
+            return 1
+        return 2
+
+    indexed = list(enumerate(all_details))
+    selected = sorted(
+        sorted(indexed, key=lambda item: (retention_priority(item[1]), item[0]), reverse=True)[
+            :MAX_ROUND_OBSERVATIONS
+        ],
+        key=lambda item: item[0],
+    )
+    details = [row for _, row in selected]
+    count_truncated = len(details) != len(all_details)
+    source_caveats = source.get("caveats", ())
+    if not isinstance(source_caveats, (list, tuple)):
+        source_caveats = ()
+    source_failures = source.get("authoritative_failures", ())
+    if not isinstance(source_failures, (list, tuple)):
+        source_failures = ()
+    payload: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": LOCAL_TEST_EVIDENCE_SCHEMA,
+        "observations": details,
+        "caveats": [
+            _safe_text(item, MAX_SAFE_CAVEAT_BYTES)
+            for item in source_caveats
+            if item is not None
+        ],
+        "capture_incomplete": bool(source.get("capture_incomplete", False)),
+        "authoritative_failures": [
+            _safe_text(item, MAX_SAFE_IDENTIFIER_BYTES)
+            for item in source_failures
+            if item is not None
+        ],
+        "legacy_capture_limited": bool(source.get("legacy_capture_limited", False)),
+    }
+
     def encode(candidate: list[Mapping[str, object]], *, truncated: bool = False) -> str:
         value = dict(payload)
         value["observations"] = candidate
         if truncated:
-            value["caveats"] = list(value.get("caveats", [])) + [
-                "local evidence details truncated before transport"
-            ]
+            value["caveats"] = list(
+                dict.fromkeys(
+                    [
+                        *value.get("caveats", []),
+                        "local evidence details truncated before transport",
+                    ]
+                )
+            )
             value["capture_incomplete"] = True
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
-    encoded = encode(details)
+    encoded = encode(details, truncated=count_truncated)
     if len(encoded.encode()) > MAX_ROUND_BYTES:
-        unresolved = [row for row in details if row.get("outcome") in {"failed", "timed_out", "interrupted", "incomplete"}]
-        resolved = [row for row in details if row not in unresolved]
-        ordered = unresolved + resolved
-        while ordered and len(encode(ordered, truncated=True).encode()) > MAX_ROUND_BYTES:
-            ordered.pop()
-        encoded = encode(ordered, truncated=True)
+        retained = list(enumerate(details))
+        while retained and len(
+            encode([row for _, row in retained], truncated=True).encode()
+        ) > MAX_ROUND_BYTES:
+            drop_index, _ = min(
+                retained,
+                key=lambda item: (retention_priority(item[1]), item[0]),
+            )
+            retained = [item for item in retained if item[0] != drop_index]
+        encoded = encode([row for _, row in retained], truncated=True)
     if len(encoded.encode()) > MAX_ROUND_BYTES:
         redacted = json.dumps(
             {
@@ -907,8 +975,8 @@ def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object
                 "kind": LOCAL_TEST_EVIDENCE_SCHEMA,
                 "observations": [],
                 "counts": {
-                    "total": len(details),
-                    "failed": sum(row.get("outcome") in {"failed", "timed_out", "interrupted", "incomplete"} for row in details),
+                    "total": len(all_details),
+                    "failed": sum(row.get("outcome") in {"failed", "timed_out", "interrupted", "incomplete"} for row in all_details),
                 },
                 "caveats": ["local evidence details dropped; capture incomplete"],
                 "capture_incomplete": True,
@@ -1052,19 +1120,78 @@ def _referenced_paths(root: Path, argv: Sequence[str]) -> set[str]:
     }
 
 
-def _hash_snapshot_records(records: Sequence[tuple[str, bytes]], *, limit: int) -> str:
+def _hash_snapshot_summaries(
+    records: Sequence[tuple[str, int, bytes]],
+) -> str:
+    """Hash fixed-size summaries of records whose payloads were streamed."""
     digest = hashlib.sha256()
-    total = 0
-    for name, payload in sorted(records, key=lambda item: item[0].encode("utf-8", errors="surrogateescape")):
+    for name, payload_size, payload_digest in sorted(
+        records, key=lambda item: item[0].encode("utf-8", errors="surrogateescape")
+    ):
         name_bytes = name.encode("utf-8", errors="surrogateescape")
-        total += len(name_bytes) + len(payload) + 16
-        if total > limit:
-            raise AgentLoopError("git snapshot byte limit exceeded")
         digest.update(struct.pack(">I", len(name_bytes)))
         digest.update(name_bytes)
-        digest.update(struct.pack(">Q", len(payload)))
-        digest.update(payload)
+        digest.update(struct.pack(">Q", payload_size))
+        digest.update(payload_digest)
     return digest.hexdigest()
+
+
+def _stream_snapshot_record(
+    path: Path,
+    *,
+    name: str,
+    prefix: bytes,
+    remaining: list[int],
+    started: float,
+    timeout_seconds: float,
+) -> tuple[str, int, bytes]:
+    """Hash one file without reading beyond the aggregate byte/time budget."""
+    name_size = len(name.encode("utf-8", errors="surrogateescape")) + 16
+    before = path.stat(follow_symlinks=False)
+    payload_size = len(prefix) + before.st_size
+    required = name_size + payload_size
+    if required > remaining[0]:
+        raise AgentLoopError("git snapshot byte limit exceeded")
+    if time.monotonic() - started > timeout_seconds:
+        raise AgentLoopError("git snapshot time limit exceeded")
+    remaining[0] -= required
+    digest = hashlib.sha256(prefix)
+    read_size = 0
+    with path.open("rb") as stream:
+        while True:
+            if time.monotonic() - started > timeout_seconds:
+                raise AgentLoopError("git snapshot time limit exceeded")
+            chunk = stream.read(min(1024 * 1024, before.st_size - read_size + 1))
+            if not chunk:
+                break
+            read_size += len(chunk)
+            if read_size > before.st_size:
+                raise AgentLoopError("repository file changed during snapshot")
+            digest.update(chunk)
+    after = path.stat(follow_symlinks=False)
+    if read_size != before.st_size or (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_mode,
+    ) != (
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_mode,
+    ):
+        raise AgentLoopError("repository file changed during snapshot")
+    return name, payload_size, digest.digest()
+
+
+def _bytes_snapshot_record(
+    name: str, payload: bytes, *, remaining: list[int]
+) -> tuple[str, int, bytes]:
+    required = len(name.encode("utf-8", errors="surrogateescape")) + len(payload) + 16
+    if required > remaining[0]:
+        raise AgentLoopError("git snapshot byte limit exceeded")
+    remaining[0] -= required
+    return name, len(payload), hashlib.sha256(payload).digest()
 
 
 def capture_tracked_tree_snapshot(
@@ -1098,9 +1225,12 @@ def capture_tracked_tree_snapshot(
         )
         if len(tracked) + len(untracked) > max_files:
             raise AgentLoopError("git snapshot file limit exceeded")
-        index_records: list[tuple[str, bytes]] = [("HEAD", head.encode())]
-        index_records.append(("INDEX", index_raw))
-        tracked_records: list[tuple[str, bytes]] = []
+        remaining = [max_bytes]
+        index_records = [
+            _bytes_snapshot_record("HEAD", head.encode(), remaining=remaining),
+            _bytes_snapshot_record("INDEX", index_raw, remaining=remaining),
+        ]
+        tracked_records: list[tuple[str, int, bytes]] = []
         for relative in tracked:
             if time.monotonic() - started > timeout_seconds:
                 raise AgentLoopError("git snapshot time limit exceeded")
@@ -1109,30 +1239,58 @@ def capture_tracked_tree_snapshot(
                 info = path.lstat()
                 if path.is_symlink():
                     payload = b"symlink\0" + os.readlink(path).encode("utf-8", errors="surrogateescape")
+                    tracked_records.append(
+                        _bytes_snapshot_record(
+                            relative,
+                            str(info.st_mode).encode() + b"\0" + payload,
+                            remaining=remaining,
+                        )
+                    )
                 elif not path.is_file():
                     raise AgentLoopError("special tracked input is not snapshot-safe")
                 else:
-                    payload = b"file\0" + path.read_bytes()
-                tracked_records.append((relative, str(info.st_mode).encode() + b"\0" + payload))
+                    tracked_records.append(
+                        _stream_snapshot_record(
+                            path,
+                            name=relative,
+                            prefix=str(info.st_mode).encode() + b"\0file\0",
+                            remaining=remaining,
+                            started=started,
+                            timeout_seconds=timeout_seconds,
+                        )
+                    )
             except (OSError, UnicodeError) as exc:
                 raise AgentLoopError("tracked file could not be read") from exc
-        untracked_records: list[tuple[str, bytes]] = []
+        untracked_records: list[tuple[str, int, bytes]] = []
         for relative in untracked:
+            if time.monotonic() - started > timeout_seconds:
+                raise AgentLoopError("git snapshot time limit exceeded")
             path = canonical_root / relative
             try:
                 if path.is_symlink():
                     payload = b"symlink\0" + os.readlink(path).encode("utf-8", errors="surrogateescape")
+                    untracked_records.append(
+                        _bytes_snapshot_record(relative, payload, remaining=remaining)
+                    )
                 elif path.is_file():
-                    payload = b"file\0" + path.read_bytes()
+                    untracked_records.append(
+                        _stream_snapshot_record(
+                            path,
+                            name=relative,
+                            prefix=b"file\0",
+                            remaining=remaining,
+                            started=started,
+                            timeout_seconds=timeout_seconds,
+                        )
+                    )
                 else:
                     raise AgentLoopError("special untracked input is not snapshot-safe")
-                untracked_records.append((relative, payload))
             except (OSError, UnicodeError) as exc:
                 raise AgentLoopError("untracked file could not be read") from exc
         # Keep a content-only tracked digest for comparison with the eventual
         # committed PR tree. HEAD and index state remain covered by ``digest``.
-        tracked_digest = _hash_snapshot_records(tracked_records, limit=max_bytes)
-        digest = _hash_snapshot_records(index_records + tracked_records + untracked_records, limit=max_bytes)
+        tracked_digest = _hash_snapshot_summaries(tracked_records)
+        digest = _hash_snapshot_summaries(index_records + tracked_records + untracked_records)
         tracked_status = _run_git(
             canonical_root,
             ("status", "--porcelain=v1", "--untracked-files=no"),
@@ -1209,7 +1367,7 @@ def attribute_current_head(
         return TreeAttribution(state="untracked-input-unverified", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=True, caveats=tuple(caveats + ["referenced non-ignored untracked input is not attributable"]))
     untracked_present = bool(set(before.untracked_paths) | set(after.untracked_paths))
     if before.status_clean is not True or after.status_clean is not True:
-        return TreeAttribution(state="unknown", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=False, caveats=tuple(caveats + ["tracked worktree awaits comparison with the eventual PR tree"] + (["unrelated non-ignored untracked files present"] if untracked_present else [])))
+        return TreeAttribution(state="unknown", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=untracked_present, caveats=tuple(caveats + ["tracked worktree awaits comparison with the eventual PR tree"] + (["non-ignored untracked content may affect test discovery or configuration"] if untracked_present else [])))
     if untracked_present:
         return TreeAttribution(
             state="untracked-input-unverified",
