@@ -37,6 +37,7 @@ from .protocol import (
     parse_structured_discuss_answer,
     parse_legacy_structured_discuss_answer,
 )
+from .review_scheduling import ReviewSchedulingContract
 from .unresolved_items import _apply_unresolved_item_dispositions
 
 
@@ -116,6 +117,18 @@ class PostedRoundMetadata:
     # Canonical bounded local-test evidence. Raw environments and identity
     # bytes are never persisted in this field.
     local_test_evidence: str | None = None
+    # Optional selective-intermediate scheduler audit fields. They are omitted
+    # from legacy encodings unless a scheduler checkpoint actually wrote them.
+    scheduler_contract: dict | None = None
+    scheduler_previous_sha: str | None = None
+    scheduler_current_sha: str | None = None
+    scheduler_obligation_digest: str | None = None
+    scheduler_selected_reviewers: tuple[str, ...] = ()
+    scheduler_paused_reviewers: tuple[tuple[str, str], ...] = ()
+    scheduler_reasons: tuple[str, ...] = ()
+    scheduler_final_sweep: bool | None = None
+    scheduler_force_full: bool | None = None
+    scheduler_calls_avoided: int | None = None
 
 
 @dataclass(frozen=True)
@@ -231,6 +244,10 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
         "status": item.status,
         "source_status": item.source_status,
         "notes": list(item.notes),
+        **({"fix_scope": list(item.fix_scope)} if item.fix_scope is not None else {}),
+        **({"resolution_owners": list(item.resolution_owners)} if item.resolution_owners else {}),
+        **({"owner_states": [list(pair) for pair in item.owner_states]} if item.owner_states else {}),
+        **({"owner_evidence": [list(pair) for pair in item.owner_evidence]} if item.owner_evidence else {}),
     }
 
 
@@ -239,6 +256,22 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         raise AgentLoopError("Invalid round metadata unresolved-item payload.")
     raw_notes = payload.get("notes") or []
     notes = tuple(str(note) for note in raw_notes) if isinstance(raw_notes, list) else ()
+    raw_scope = payload.get("fix_scope")
+    fix_scope = tuple(str(path) for path in raw_scope) if isinstance(raw_scope, list) else None
+    raw_owners = payload.get("resolution_owners") or []
+    owners = tuple(str(owner) for owner in raw_owners) if isinstance(raw_owners, list) else ()
+    raw_states = payload.get("owner_states") or []
+    states = tuple(
+        (str(pair[0]), str(pair[1]))
+        for pair in raw_states
+        if isinstance(pair, (list, tuple)) and len(pair) == 2
+    ) if isinstance(raw_states, list) else ()
+    raw_evidence = payload.get("owner_evidence") or []
+    evidence = tuple(
+        (str(pair[0]), str(pair[1]))
+        for pair in raw_evidence
+        if isinstance(pair, (list, tuple)) and len(pair) == 2
+    ) if isinstance(raw_evidence, list) else ()
     return UnresolvedReviewItem(
         item_id=str(payload["item_id"]),
         reviewer=str(payload["reviewer"]),
@@ -247,7 +280,104 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         status=str(payload["status"]),
         source_status=str(payload["source_status"]) if payload.get("source_status") is not None else None,
         notes=notes,
+        fix_scope=fix_scope,
+        resolution_owners=owners,
+        owner_states=states,
+        owner_evidence=evidence,
     )
+
+
+_SCHEDULER_METADATA_KEYS = frozenset(
+    {
+        "scheduler_contract",
+        "scheduler_previous_sha",
+        "scheduler_current_sha",
+        "scheduler_obligation_digest",
+        "scheduler_selected_reviewers",
+        "scheduler_paused_reviewers",
+        "scheduler_reasons",
+        "scheduler_final_sweep",
+        "scheduler_force_full",
+        "scheduler_calls_avoided",
+    }
+)
+
+
+def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]:
+    """Decode scheduler metadata, dropping it conservatively when unsafe.
+
+    Scheduler records are an optimization over the required full-board review.
+    A malformed or partial record therefore becomes legacy metadata instead of
+    being allowed to select a smaller reviewer set during resume.
+    """
+    if not (_SCHEDULER_METADATA_KEYS & payload.keys()):
+        return {}
+    required = _SCHEDULER_METADATA_KEYS
+    if not required.issubset(payload.keys()):
+        return {}
+    try:
+        contract = ReviewSchedulingContract.from_mapping(payload["scheduler_contract"])
+        previous = payload["scheduler_previous_sha"]
+        current = payload["scheduler_current_sha"]
+        digest = payload["scheduler_obligation_digest"]
+        if previous is not None and (not isinstance(previous, str) or not previous):
+            raise ValueError("invalid previous scheduler SHA")
+        if not isinstance(current, str) or not current:
+            raise ValueError("invalid current scheduler SHA")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{16}", digest):
+            raise ValueError("invalid scheduler obligation digest")
+        selected = payload["scheduler_selected_reviewers"]
+        paused = payload["scheduler_paused_reviewers"]
+        reasons = payload["scheduler_reasons"]
+        if not isinstance(selected, list) or any(not isinstance(name, str) for name in selected):
+            raise ValueError("invalid selected reviewer list")
+        if len(set(selected)) != len(selected) or not set(selected).issubset(contract.required_reviewers):
+            raise ValueError("contradictory selected reviewer list")
+        if not isinstance(paused, list):
+            raise ValueError("invalid paused reviewer list")
+        paused_pairs: list[tuple[str, str]] = []
+        for pair in paused:
+            if (
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or not isinstance(pair[0], str)
+                or not isinstance(pair[1], str)
+                or not pair[0]
+                or not pair[1]
+            ):
+                raise ValueError("invalid paused reviewer entry")
+            paused_pairs.append((pair[0], pair[1]))
+        paused_names = [name for name, _reason in paused_pairs]
+        if (
+            len(set(paused_names)) != len(paused_names)
+            or not set(paused_names).issubset(contract.required_reviewers)
+            or set(selected) & set(paused_names)
+            or set(selected) | set(paused_names) != set(contract.required_reviewers)
+        ):
+            raise ValueError("contradictory reviewer scheduling state")
+        if not isinstance(reasons, list) or any(not isinstance(reason, str) or not reason for reason in reasons):
+            raise ValueError("invalid scheduler reasons")
+        final_sweep = payload["scheduler_final_sweep"]
+        force_full = payload["scheduler_force_full"]
+        calls_avoided = payload["scheduler_calls_avoided"]
+        if not isinstance(final_sweep, bool) or not isinstance(force_full, bool):
+            raise ValueError("invalid scheduler boolean")
+        if isinstance(calls_avoided, bool) or not isinstance(calls_avoided, int) or calls_avoided < 0:
+            raise ValueError("invalid avoided-call count")
+    except (AgentLoopError, TypeError, ValueError, KeyError):
+        return {}
+    return {
+        "scheduler_contract": contract.as_dict(),
+        "scheduler_previous_sha": previous,
+        "scheduler_current_sha": current,
+        "scheduler_obligation_digest": digest,
+        "scheduler_selected_reviewers": tuple(selected),
+        "scheduler_paused_reviewers": tuple(paused_pairs),
+        "scheduler_reasons": tuple(reasons),
+        "scheduler_final_sweep": final_sweep,
+        "scheduler_force_full": force_full,
+        "scheduler_calls_avoided": calls_avoided,
+    }
 
 
 def _serialize_disposition(disposition: ReviewItemDisposition) -> dict[str, object]:
@@ -324,6 +454,20 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
                 "synthesis_provenance": metadata.synthesis_provenance,
             }
         )
+    scheduler_values = {
+        "scheduler_contract": metadata.scheduler_contract,
+        "scheduler_previous_sha": metadata.scheduler_previous_sha,
+        "scheduler_current_sha": metadata.scheduler_current_sha,
+        "scheduler_obligation_digest": metadata.scheduler_obligation_digest,
+        "scheduler_selected_reviewers": list(metadata.scheduler_selected_reviewers),
+        "scheduler_paused_reviewers": [list(pair) for pair in metadata.scheduler_paused_reviewers],
+        "scheduler_reasons": list(metadata.scheduler_reasons),
+        "scheduler_final_sweep": metadata.scheduler_final_sweep,
+        "scheduler_force_full": metadata.scheduler_force_full,
+        "scheduler_calls_avoided": metadata.scheduler_calls_avoided,
+    }
+    if any(value not in (None, (), []) for value in scheduler_values.values()):
+        payload.update(scheduler_values)
     return encode_mapping(payload)
 
 
@@ -451,6 +595,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 payload.get("synthesis_provenance")
                 if isinstance(payload.get("synthesis_provenance"), dict) else None
             ),
+            **_decode_scheduler_fields(payload),
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise AgentLoopError("Invalid AGENT_LOOP_META payload.") from exc
@@ -546,6 +691,8 @@ def _latest_pr_approved_reviews_for_head(
     head_sha: str | None,
     configured_reviewers: Sequence[AgentName],
     approved_plan_context: ApprovedPlanContext | None = None,
+    human_requirements: Sequence[object] = (),
+    reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
 ) -> dict[str, PostedRoundRecord]:
     """Return each reviewer's latest approval for the current immutable PR head."""
     if not head_sha:
@@ -562,10 +709,26 @@ def _latest_pr_approved_reviews_for_head(
         ):
             continue
         latest_by_reviewer[metadata.agent] = record
+
+    def acquisition_contract_matches(record: PostedRoundRecord) -> bool:
+        if reviewer_acquisition_contract is None:
+            return True
+        expected = reviewer_acquisition_contract.get(record.metadata.agent)
+        if expected is None or len(expected) < 2:
+            return False
+        if record.metadata.acquisition_outcome != "success":
+            return False
+        return (
+            record.metadata.configured_model == expected[0]
+            and record.metadata.configured_effort == expected[1]
+            and (len(expected) < 3 or record.metadata.provider == expected[2])
+        )
+
     return {
         reviewer: record
         for reviewer, record in latest_by_reviewer.items()
         if record.metadata.state == "approved"
+        and acquisition_contract_matches(record)
         and (
             approved_plan_context is None
             or (
@@ -573,10 +736,20 @@ def _latest_pr_approved_reviews_for_head(
                 and record.metadata.approved_plan_subject == approved_plan_context.plan_subject
             )
         )
+        and (
+            not human_requirements
+            or (
+                "HUMAN_REQUIREMENTS_RESOLVED" in record.body
+                and {
+                    str(getattr(item, "requirement_id", ""))
+                    for item in human_requirements
+                }.issubset(set(record.metadata.surfaced_reviewer_requirement_ids))
+            )
+        )
     }
 
 
-def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple[tuple[str, str, int, str, str, str | None, tuple[str, ...]], ...]:
+def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple[tuple[object, ...], ...]:
     return tuple(
         (
             item.item_id,
@@ -586,6 +759,10 @@ def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple
             item.status,
             item.source_status,
             item.notes,
+            item.fix_scope,
+            item.resolution_owners,
+            item.owner_states,
+            item.owner_evidence,
         )
         for item in items
     )
@@ -667,6 +844,7 @@ def _recover_unrecorded_pr_head_advance(
     records: Sequence[PostedRoundRecord],
     *,
     head_sha: str,
+    reconciliation_mode: str = "aggregate",
 ) -> ResumedReviewRound | None:
     prior_records = [record for record in records if record.metadata.subject != head_sha]
     if not prior_records:
@@ -718,6 +896,7 @@ def _recover_unrecorded_pr_head_advance(
             latest_coder_record.metadata.prior_items,
             _aggregate_record_dispositions(reviewer_records_after_coder),
             retain_future=False,
+            reconciliation_mode=reconciliation_mode,
         )
         recovered_items = _active_pr_items(recovered_items)
         _append_active_pr_new_items(recovered_items, new_item_records_after_coder)
@@ -729,6 +908,7 @@ def _recover_unrecorded_pr_head_advance(
             anchor_metadata.prior_items,
             _aggregate_record_dispositions(all_reviewer_records),
             retain_future=False,
+            reconciliation_mode=reconciliation_mode,
         )
         recovered_items = _active_pr_items(recovered_items)
         _append_active_pr_new_items(recovered_items, all_new_item_records)
@@ -1018,6 +1198,7 @@ def _resume_pr_round(
     *,
     head_sha: str | None,
     configured_reviewers: Sequence[AgentName],
+    reconciliation_mode: str = "aggregate",
 ) -> ResumedReviewRound | None:
     if not head_sha:
         return None
@@ -1026,7 +1207,9 @@ def _resume_pr_round(
         return None
     selection = _select_current_round_records(records, subject=head_sha)
     if selection is None:
-        recovered = _recover_unrecorded_pr_head_advance(records, head_sha=head_sha)
+        recovered = _recover_unrecorded_pr_head_advance(
+            records, head_sha=head_sha, reconciliation_mode=reconciliation_mode
+        )
         if recovered is not None:
             return recovered
         if _latest_prior_pr_subject_is_coherent(records, head_sha=head_sha):

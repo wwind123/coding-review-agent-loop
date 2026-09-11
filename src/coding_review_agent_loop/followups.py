@@ -323,7 +323,7 @@ def _approved_followup_from_unresolved_item(item: UnresolvedReviewItem) -> Appro
         update_line = f"Update from {note}"
         if update_line not in text:
             text = f"{text.rstrip()}\n\n{update_line}"
-    return ApprovedFollowup(reviewer=item.reviewer, text=text)
+    return ApprovedFollowup(reviewer=item.reviewer, text=text, fix_scope=item.fix_scope)
 
 
 def _plan_followup_source_from_unresolved_item(item: UnresolvedReviewItem) -> PlanApprovedFollowupSource:

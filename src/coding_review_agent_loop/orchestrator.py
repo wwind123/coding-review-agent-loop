@@ -26,6 +26,7 @@ from .config import (
     github_bootstrap_cwd,
     resolve_base_branch,
     reviewers,
+    resolve_invocation,
     sync_coder_base_before_implementation,
     sync_coder_pr_before_validation,
     sync_reviewer_pr_before_review,
@@ -392,6 +393,16 @@ from .round_state import (
 )
 from .round_transport import is_round_transport_sidecar
 from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
+from .review_scheduling import (
+    GitChange,
+    ReviewObligation,
+    ReviewSchedulingContract,
+    SchedulerSnapshot,
+    TransitionClassification,
+    classify_transition,
+    make_contract,
+    select_reviewers,
+)
 from .unresolved_items import (
     ALL_RESOLVED_PROSE_RE,
     CODER_DISPUTE_NOTE_PREFIX,
@@ -3736,6 +3747,7 @@ def _resumed_pr_reviewer_matches_requirements(
     record: PostedRoundRecord,
     human_requirements: Sequence[HumanReviewRequirement],
     approved_plan_context: ApprovedPlanContext | None = None,
+    reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
 ) -> bool:
     """Return whether a same-head resumed review still covers current requirements.
 
@@ -3749,7 +3761,18 @@ def _resumed_pr_reviewer_matches_requirements(
         record.metadata.approved_plan_hash == approved_plan_context.plan_hash
         and record.metadata.approved_plan_subject == approved_plan_context.plan_subject
     )
-    return plan_matches and (
+    acquisition_matches = True
+    if reviewer_acquisition_contract is not None:
+        expected = reviewer_acquisition_contract.get(record.metadata.agent)
+        acquisition_matches = (
+            expected is not None
+            and len(expected) >= 2
+            and record.metadata.acquisition_outcome == "success"
+            and record.metadata.configured_model == expected[0]
+            and record.metadata.configured_effort == expected[1]
+            and (len(expected) < 3 or record.metadata.provider == expected[2])
+        )
+    return plan_matches and acquisition_matches and (
         not human_requirements
         or (
             human_requirements_resolved(record.body)
@@ -7439,6 +7462,196 @@ def _stop_after_ci_watch_timeout(
     return 0
 
 
+def _scheduler_obligations(
+    items: Sequence[UnresolvedReviewItem],
+    *,
+    required_reviewers: Sequence[str] = (),
+) -> tuple[ReviewObligation, ...]:
+    obligations: list[ReviewObligation] = []
+    required = set(required_reviewers)
+    for item in items:
+        if item.status not in {"blocking", "same-pr"}:
+            continue
+        owners = item.resolution_owners or (item.reviewer,)
+        raw_states = item.owner_states
+        states = dict(raw_states or ((owner, "pending") for owner in owners))
+        reconstructible = (
+            bool(owners)
+            and len(set(owners)) == len(owners)
+            and all(isinstance(owner, str) and owner for owner in owners)
+            and (not raw_states or (len(raw_states) == len(owners) and set(states) == set(owners)))
+            and all(state in {"pending", "cleared"} for state in states.values())
+            and item.reviewer in required
+            and not any(note.startswith(CODER_DISPUTE_NOTE_PREFIX) for note in item.notes)
+        )
+        # A synthetic or orchestrator-owned item has no reviewer-authored
+        # objective scope, so it must conservatively force a full board.
+        scope = item.fix_scope if reconstructible else None
+        if item.reviewer == "Orchestrator" or item.reviewer not in required:
+            scope = None
+        obligations.append(
+            ReviewObligation(
+                item_id=item.item_id,
+                status=item.status,
+                scope=scope,
+                resolution_owners=tuple(owners),
+                pending_owners=tuple(owner for owner in owners if states.get(owner) != "cleared"),
+            )
+        )
+    return tuple(obligations)
+
+
+def _observe_pr_transition(
+    runner: Runner,
+    *,
+    checkout: Path,
+    previous_sha: str | None,
+    current_sha: str | None,
+    scopes: Sequence[str],
+    broad_rules: Sequence[str],
+    obligations: Sequence[ReviewObligation] = (),
+) -> TransitionClassification:
+    """Collect repository-observed ancestry and exact diff facts."""
+    if not previous_sha or not current_sha or previous_sha == current_sha:
+        return TransitionClassification("broad", "missing or unchanged review SHA")
+    try:
+        ancestry = runner.run(
+            ["git", "merge-base", "--is-ancestor", previous_sha, current_sha],
+            cwd=checkout,
+            check=False,
+        )
+        if ancestry.returncode != 0:
+            return TransitionClassification("broad", "candidate history is not an available ancestor")
+        names = runner.run(
+            [
+                "git", "diff", "--name-status", "-z", "--find-renames", "--find-copies",
+                previous_sha, current_sha,
+            ],
+            cwd=checkout,
+            check=False,
+        )
+        if names.returncode != 0:
+            return TransitionClassification("broad", "complete exact Git diff was unavailable")
+        raw = names.stdout
+        if not raw:
+            return TransitionClassification("broad", "transition contained no observable diff")
+        tokens = raw.split("\0")
+        changes: list[GitChange] = []
+        index = 0
+        while index < len(tokens):
+            status = tokens[index]
+            index += 1
+            if not status:
+                continue
+            code = status[:1].upper()
+            if code in {"R", "C"}:
+                # NUL-formatted rename/copy entries carry old and new paths.
+                if index + 1 >= len(tokens):
+                    return TransitionClassification("broad", "diff contained an incomplete rename/copy record")
+                old_path, new_path = tokens[index], tokens[index + 1]
+                index += 2
+                changes.append(GitChange(old_path, status=status))
+                changes.append(GitChange(new_path, status=status))
+            else:
+                if index >= len(tokens):
+                    return TransitionClassification("broad", "diff contained an incomplete name-status record")
+                changes.append(GitChange(tokens[index], status=status))
+                index += 1
+        # A binary check is separate from name-status because a binary file can
+        # otherwise look exactly like an ordinary modification.
+        numstat = runner.run(
+            ["git", "diff", "--numstat", previous_sha, current_sha],
+            cwd=checkout,
+            check=False,
+        )
+        if numstat.returncode != 0:
+            return TransitionClassification("broad", "binary/text diff classification was unavailable")
+        binary_paths = {
+            line.rsplit("\t", 1)[-1]
+            for line in numstat.stdout.splitlines()
+            if line.startswith("-\t-\t")
+        }
+        mode = runner.run(
+            ["git", "diff", "--summary", previous_sha, current_sha],
+            cwd=checkout,
+            check=False,
+        )
+        if mode.returncode != 0:
+            return TransitionClassification("broad", "diff mode-change classification was unavailable")
+        unsafe_summary = any(
+            token in line.lower()
+            for line in mode.stdout.splitlines()
+            for token in ("mode change", "create mode", "delete mode", "submodule", "rename", "copy")
+        )
+        if binary_paths or unsafe_summary:
+            return TransitionClassification("broad", "diff contained binary or mode changes")
+        return classify_transition(
+            previous_sha,
+            current_sha,
+            changes,
+            scopes=scopes,
+            broad_rules=broad_rules,
+            obligations=obligations,
+        )
+    except (OSError, AttributeError, TypeError):
+        return TransitionClassification("broad", "repository history or diff observation failed")
+
+
+def _scheduler_contract_from_metadata(
+    metadata: PostedRoundMetadata,
+) -> ReviewSchedulingContract | None:
+    if metadata.scheduler_contract is None:
+        return None
+    from .review_scheduling import ReviewSchedulingContract as _Contract
+
+    return _Contract.from_mapping(metadata.scheduler_contract)
+
+
+def _fresh_pr_qualification_snapshot(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    issue_context: IssueContext | None,
+    parent_issue_context: IssueContext | None,
+    approved_plan_context: ApprovedPlanContext | None = None,
+) -> tuple[PullRequestReviewContext, tuple[str, ...]]:
+    """Refetch the PR-side qualification inputs immediately before a gate."""
+    context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    fresh_issue = issue_context
+    fresh_parent = parent_issue_context
+    if issue_context is not None:
+        fresh_issue = get_issue_context(runner, config=config, issue_number=issue_context.number)
+    if parent_issue_context is not None:
+        fresh_parent = get_issue_context(
+            runner, config=config, issue_number=parent_issue_context.number
+        )
+    if approved_plan_context is not None and fresh_issue is not None:
+        fresh_handoff = find_latest_issue_pr_handoff(
+            fresh_issue.comments,
+            issue_number=fresh_issue.number,
+            repo=config.repo,
+        )
+        if (
+            fresh_handoff is not None
+            and fresh_handoff.flow == "approved-plan-implementation"
+            and fresh_handoff.plan_hash != approved_plan_context.plan_hash
+        ):
+            raise AgentLoopError(
+                "Approved-plan/handoff identity changed during PR qualification; "
+                "stale approvals cannot be used for this head."
+            )
+    requirements = _build_requirements_context(
+        target_issue_context=fresh_issue,
+        pr_context=context,
+        parent_issue_context=fresh_parent,
+    )
+    return context, tuple(
+        requirement.requirement_id
+        for requirement in requirements.effective_requirements
+    )
+
+
 def run_pr_loop(
     runner: Runner,
     *,
@@ -8043,6 +8256,38 @@ def run_pr_loop(
         reviewer_session_ids: dict[AgentName, str | None] = {}
         unavailable_reviewer_failures: dict[AgentName, AgentInvocationError] = {}
         configured_reviewers = reviewers(config)
+        selective_policy = config.pr_review_policy == "selective-intermediate"
+        scheduler_contract = make_contract(
+            tuple(agent_display_name(reviewer) for reviewer in configured_reviewers),
+            config.pr_review_policy,
+            config.pr_review_broad_rules,
+        )
+        reviewer_acquisition_contract: dict[str, tuple[object, ...]] = {}
+        for reviewer in configured_reviewers:
+            invocation = resolve_invocation(config, provider=reviewer, role="reviewer")
+            reviewer_acquisition_contract[agent_display_name(reviewer)] = (
+                invocation.configured_model,
+                invocation.resolved_effort,
+                reviewer,
+            )
+        scheduler_force_full = bool(config.pr_review_force_full)
+        scheduler_calls_avoided = 0
+        final_sweep_pending = False
+        # A scheduler contract written by an earlier run is immutable. Missing
+        # legacy scheduler fields intentionally mean "use the full board".
+        for record in _extract_round_metadata_records(initial_pr_context.comments, flow="pr"):
+            persisted_contract = _scheduler_contract_from_metadata(record.metadata)
+            if persisted_contract is not None and persisted_contract != scheduler_contract:
+                raise AgentLoopError(
+                    "PR review scheduler contract changed during resume; required reviewers, "
+                    "policy, and broad-path rules must remain immutable."
+                )
+            if record.metadata.scheduler_force_full:
+                scheduler_force_full = True
+            if record.metadata.scheduler_calls_avoided is not None:
+                scheduler_calls_avoided = max(
+                    scheduler_calls_avoided, record.metadata.scheduler_calls_avoided
+                )
         unresolved_items: list[UnresolvedReviewItem] = []
         pr_compact_prior_summaries: list[str] = []
         latest_coder_output: str | None = None
@@ -8065,6 +8310,11 @@ def run_pr_loop(
             initial_pr_context.comments,
             head_sha=initial_pr_context.metadata.head_sha,
             configured_reviewers=configured_reviewers,
+            reconciliation_mode=(
+                "owner-scoped"
+                if config.pr_review_policy == "selective-intermediate"
+                else "aggregate"
+            ),
         )
         if resumed_round is not None:
             unresolved_items = list(resumed_round.prior_items)
@@ -8217,7 +8467,12 @@ def run_pr_loop(
                 record.metadata.agent: record
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
                 if _resumed_pr_reviewer_matches_requirements(
-                    record, human_requirements, approved_plan_context
+                    record,
+                    human_requirements,
+                    approved_plan_context,
+                    reviewer_acquisition_contract=(
+                        reviewer_acquisition_contract if selective_policy else None
+                    ),
                 )
             }
             # Summaries are review-level context, not new findings or substitutes
@@ -8239,6 +8494,10 @@ def run_pr_loop(
                 head_sha=pr_metadata.head_sha,
                 configured_reviewers=configured_reviewers,
                 approved_plan_context=approved_plan_context,
+                human_requirements=human_requirements,
+                reviewer_acquisition_contract=(
+                    reviewer_acquisition_contract if selective_policy else None
+                ),
             )
             skip_reviewers_for_recovery = bool(
                 current_resume is not None and current_resume.unrecorded_head_advance
@@ -8250,6 +8509,163 @@ def run_pr_loop(
                     "without current-head coder metadata; routing recovered prior items "
                     f"through {coder_name} before review",
                 )
+            scheduler_previous_sha: str | None = None
+            scheduler_diff_context = ""
+            if selective_policy:
+                historical_records: tuple[PostedRoundRecord, ...] = ()
+                if (
+                    latest_coder_metadata is not None
+                    and latest_coder_metadata.scheduler_current_sha == current_pr_subject
+                ):
+                    scheduler_previous_sha = latest_coder_metadata.scheduler_previous_sha
+                if scheduler_previous_sha is None:
+                    try:
+                        historical_records = _extract_round_metadata_records(pr_comments, flow="pr")
+                    except AgentLoopError:
+                        historical_records = ()
+                    scheduler_previous_sha = next(
+                        (
+                            record.metadata.scheduler_current_sha
+                            for record in reversed(historical_records)
+                            if record.metadata.scheduler_contract is not None
+                            and record.metadata.scheduler_current_sha
+                        ),
+                        None,
+                    )
+                obligations = _scheduler_obligations(
+                    prior_unresolved_items,
+                    required_reviewers=tuple(
+                        agent_display_name(reviewer) for reviewer in configured_reviewers
+                    ),
+                )
+                current_obligation_digest = hashlib.sha256(
+                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                ).hexdigest()[:16]
+                persisted_obligation_digest = None
+                if (
+                    latest_coder_metadata is not None
+                    and latest_coder_metadata.scheduler_current_sha == current_pr_subject
+                ):
+                    persisted_obligation_digest = latest_coder_metadata.scheduler_obligation_digest
+                if persisted_obligation_digest is None:
+                    persisted_obligation_digest = next(
+                        (
+                            record.metadata.scheduler_obligation_digest
+                            for record in reversed(historical_records)
+                            if record.metadata.scheduler_contract is not None
+                            and record.metadata.scheduler_current_sha == current_pr_subject
+                        ),
+                        None,
+                    )
+                if (
+                    persisted_obligation_digest is not None
+                    and persisted_obligation_digest != current_obligation_digest
+                ):
+                    scheduler_force_full = True
+                    log(
+                        config,
+                        f"Round {round_number}: scheduler obligation digest changed during recovery; "
+                        "forcing the full reviewer board",
+                    )
+                active_scopes = tuple(
+                    sorted({path for obligation in obligations for path in (obligation.scope or ())})
+                )
+                if scheduler_previous_sha is None:
+                    classification = TransitionClassification("broad", "initial candidate requires the full board")
+                elif scheduler_previous_sha == current_pr_subject:
+                    if any(obligation.scope is None for obligation in obligations):
+                        classification = TransitionClassification(
+                            "broad", "the active obligation ledger is not reconstructible"
+                        )
+                    else:
+                        classification = TransitionClassification(
+                            "narrow", "same exact candidate head; recover missing reviewer work"
+                        )
+                else:
+                    classification = _observe_pr_transition(
+                        runner,
+                        checkout=active_workdir(config),
+                        previous_sha=scheduler_previous_sha,
+                        current_sha=current_pr_subject,
+                        scopes=active_scopes,
+                        broad_rules=scheduler_contract.broad_rules,
+                        obligations=obligations,
+                    )
+                if classification.broad and scheduler_previous_sha not in {None, current_pr_subject}:
+                    scheduler_force_full = True
+                final_sweep = final_sweep_pending or (
+                    scheduler_previous_sha is not None
+                    and not obligations
+                )
+                scheduler_snapshot = SchedulerSnapshot(
+                    previous_sha=scheduler_previous_sha,
+                    current_sha=current_pr_subject,
+                    contract=scheduler_contract,
+                    obligations=obligations,
+                    force_full=scheduler_force_full,
+                )
+                scheduler_decision = select_reviewers(
+                    scheduler_snapshot,
+                    classification,
+                    qualifying_approvals=tuple(unchanged_head_approvals),
+                    unavailable_reviewers=tuple(
+                        agent_display_name(reviewer) for reviewer in unavailable_reviewer_failures
+                    ),
+                    final_sweep=final_sweep,
+                )
+                scheduler_diff_context = (
+                    "\nSelective review audit record: the orchestrator classified the transition as "
+                    f"{classification.kind} ({classification.reason}). Previous reviewed SHA: "
+                    f"{scheduler_previous_sha or '(none)'}; current SHA: {current_pr_subject}. "
+                    "Changed paths observed since that review: "
+                    f"{', '.join(classification.changed_paths) or '(unavailable)'}. "
+                    "Inspect the complete base-to-head diff independently; this summary is not a substitute.\n"
+                )
+                if scheduler_previous_sha not in {None, current_pr_subject}:
+                    scheduler_calls_avoided += scheduler_decision.calls_avoided
+                final_sweep_pending = False
+                selected_reviewer_names = set(scheduler_decision.selected_reviewers)
+                log(
+                    config,
+                    f"Round {round_number}: selective scheduler {scheduler_decision.reason}; "
+                    f"selected={', '.join(scheduler_decision.selected_reviewers) or 'none'}; "
+                    f"paused={', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}",
+                )
+                if scheduler_decision.selected_reviewers and not skip_reviewers_for_recovery and not conflict_pending:
+                    post_pr_comment(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        body=_attach_round_metadata(
+                            f"PR review scheduling audit: selected {', '.join(scheduler_decision.selected_reviewers)}; "
+                            f"paused {', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}; "
+                            f"reason: {scheduler_decision.reason}; "
+                            f"selective-only calls avoided cumulatively: {scheduler_calls_avoided}.",
+                            PostedRoundMetadata(
+                                flow="pr", role="summary", agent="Orchestrator",
+                                round_number=round_number, subject=current_pr_subject,
+                                prior_items=prior_unresolved_items, phase="scheduler-prelaunch",
+                                scheduler_contract=scheduler_contract.as_dict(),
+                                scheduler_previous_sha=scheduler_previous_sha,
+                                scheduler_current_sha=current_pr_subject,
+                                scheduler_obligation_digest=hashlib.sha256(
+                                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                                ).hexdigest()[:16],
+                                scheduler_selected_reviewers=scheduler_decision.selected_reviewers,
+                                scheduler_paused_reviewers=scheduler_decision.paused_reviewers,
+                                scheduler_reasons=(scheduler_decision.reason, classification.reason),
+                                scheduler_final_sweep=final_sweep,
+                                scheduler_force_full=scheduler_force_full,
+                                scheduler_calls_avoided=scheduler_calls_avoided,
+                            ),
+                        ),
+                    )
+            else:
+                scheduler_previous_sha = None
+                scheduler_decision = None
+                scheduler_diff_context = ""
+                selected_reviewer_names = {agent_display_name(reviewer) for reviewer in configured_reviewers}
+                final_sweep = False
             skip_reviewers_this_round = skip_reviewers_for_recovery or conflict_pending
 
             pr_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -8308,6 +8724,29 @@ def run_pr_loop(
                             ),
                             phase=phase,
                             canonical_reviewer_response=(review_output if phase == "publication" else None),
+                            scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                            scheduler_previous_sha=(scheduler_previous_sha if selective_policy else None),
+                            scheduler_current_sha=(current_pr_subject if selective_policy else None),
+                            scheduler_obligation_digest=(
+                                hashlib.sha256(
+                                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                                ).hexdigest()[:16]
+                                if selective_policy else None
+                            ),
+                            scheduler_selected_reviewers=(
+                                tuple(sorted(selected_reviewer_names)) if selective_policy else ()
+                            ),
+                            scheduler_paused_reviewers=(
+                                scheduler_decision.paused_reviewers
+                                if selective_policy and scheduler_decision is not None else ()
+                            ),
+                            scheduler_reasons=(
+                                (scheduler_decision.reason, classification.reason)
+                                if selective_policy and scheduler_decision is not None else ()
+                            ),
+                            scheduler_final_sweep=(final_sweep if selective_policy else None),
+                            scheduler_force_full=(scheduler_force_full if selective_policy else None),
+                            scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
                         ),
                     ),
                 )
@@ -8321,6 +8760,8 @@ def run_pr_loop(
                     return "skip"
                 if resumed_by_name.get(reviewer_name) is not None:
                     return "resumed"
+                if selective_policy and reviewer_name not in selected_reviewer_names:
+                    return "skip"
                 prior_approval = unchanged_head_approvals.get(reviewer_name)
                 if (
                     prior_approval is not None
@@ -8338,6 +8779,12 @@ def run_pr_loop(
                 ):
                     return "carried"
                 return "turn"
+
+            def _reviewer_needs_fresh_context(reviewer: AgentName) -> bool:
+                if not selective_policy:
+                    return False
+                prior = unchanged_head_approvals.get(agent_display_name(reviewer))
+                return prior is not None and prior.metadata.subject != current_pr_subject
 
             if config.review_parallel and not skip_reviewers_this_round:
                 pending_pr_reviewers = [
@@ -8392,14 +8839,17 @@ def run_pr_loop(
                                 issue_context=issue_context,
                                 human_requirements=human_requirements,
                                 unresolved_items=prior_unresolved_items,
-                                compact_context=use_compact_pr_context,
+                                compact_context=(
+                                    use_compact_pr_context
+                                    and not _reviewer_needs_fresh_context(reviewer)
+                                ),
                                 compact_prior=(
                                     CompactPriorContext(tuple(pr_compact_prior_summaries))
                                     if use_compact_pr_context
                                     else None
                                 ),
                                 compact_tail=pr_parallel_compact_tail,
-                                coder_followup_context=coder_followup_context,
+                                coder_followup_context=coder_followup_context + scheduler_diff_context,
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
                             )
@@ -8423,7 +8873,9 @@ def run_pr_loop(
                                     config=config,
                                     prompt=pr_prompts[reviewer],
                                     session_id=(
-                                        None if use_compact_pr_context else reviewer_session_ids.get(reviewer)
+                                        None
+                                        if use_compact_pr_context or _reviewer_needs_fresh_context(reviewer)
+                                        else reviewer_session_ids.get(reviewer)
                                     ),
                                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                                     validate=lambda text, reviewer_name=reviewer_name: _validate_review_response(
@@ -8502,6 +8954,17 @@ def run_pr_loop(
 
             for reviewer in (() if skip_reviewers_this_round else configured_reviewers):
                 reviewer_name = agent_display_name(reviewer)
+                if (
+                    selective_policy
+                    and reviewer_name not in selected_reviewer_names
+                    and reviewer_name not in resumed_by_name
+                ):
+                    log(
+                        config,
+                        f"Round {round_number}: pausing {reviewer_name}; "
+                        "its prior approval is historical for this candidate",
+                    )
+                    continue
                 if reviewer in unavailable_reviewer_failures:
                     log(
                         config,
@@ -8612,7 +9075,9 @@ def run_pr_loop(
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = []
                 else:
-                    context_mode = "compact" if use_compact_pr_context else "full"
+                    reviewer_fresh_context = _reviewer_needs_fresh_context(reviewer)
+                    reviewer_compact_context = use_compact_pr_context and not reviewer_fresh_context
+                    context_mode = "compact" if reviewer_compact_context else "full"
                     log(
                         config,
                         f"Round {round_number}: {reviewer_name} reviewing PR #{pr_number} "
@@ -8648,20 +9113,20 @@ def run_pr_loop(
                                 issue_context=issue_context,
                                 human_requirements=human_requirements,
                                 unresolved_items=prior_unresolved_items,
-                                compact_context=use_compact_pr_context,
+                                compact_context=reviewer_compact_context,
                                 compact_prior=(
                                     CompactPriorContext(tuple(pr_compact_prior_summaries))
                                     if use_compact_pr_context
                                     else None
                                 ),
                                 compact_tail=compact_tail,
-                                coder_followup_context=coder_followup_context,
+                                coder_followup_context=coder_followup_context + scheduler_diff_context,
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
                             ),
                             session_id=(
                                 None
-                                if use_compact_pr_context
+                                if reviewer_compact_context or reviewer_fresh_context
                                 else reviewer_session_ids.get(reviewer)
                             ),
                             marker_description="<!-- AGENT_STATE: approved|blocking -->",
@@ -8823,6 +9288,7 @@ def run_pr_loop(
                                     source_round=round_number,
                                     text=blocking_item.text,
                                     status="blocking",
+                                    fix_scope=blocking_item.fix_scope,
                                 )
                                 round_new_unresolved_items.append(tracked_item)
                                 reviewer_new_unresolved_items.append(tracked_item)
@@ -8851,6 +9317,7 @@ def run_pr_loop(
                                     source_round=round_number,
                                     text=followup.text,
                                     status="same-pr",
+                                    fix_scope=followup.fix_scope,
                                 )
                                 round_new_unresolved_items.append(tracked_item)
                                 reviewer_new_unresolved_items.append(tracked_item)
@@ -8900,22 +9367,50 @@ def run_pr_loop(
                         round_new_unresolved_items.extend(reviewer_new_unresolved_items)
 
             if (
-                config.review_parallel
+                (config.review_parallel or selective_policy)
                 and not skip_reviewers_this_round
                 and not (current_resume is not None and current_resume.reconciled)
             ):
-                settled = ", ".join(agent_display_name(reviewer) for reviewer in configured_reviewers)
+                settled_reviewers = (
+                    tuple(sorted(selected_reviewer_names))
+                    if selective_policy
+                    else tuple(agent_display_name(reviewer) for reviewer in configured_reviewers)
+                )
+                settled = ", ".join(settled_reviewers)
                 post_pr_comment(
                     runner, config=config, pr_number=pr_number,
                     body=_attach_round_metadata(
                         f"PR review round {round_number} reconciliation: settled reviewers: {settled or 'none'}. "
-                        f"Finalization {'stops' if pr_fatal_errors else 'continues'} after reconciliation.",
+                        f"Finalization {'stops' if pr_fatal_errors else 'continues'} after reconciliation. "
+                        f"Historical approvals remain SHA-bound; selective-only calls avoided cumulatively: "
+                        f"{scheduler_calls_avoided}.",
                         PostedRoundMetadata(
                             flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
                             subject=current_pr_subject, prior_items=prior_unresolved_items,
                             dispositions=tuple(
                                 disposition for values in prior_dispositions.values() for disposition in values
                             ), new_items=tuple(round_new_unresolved_items), phase="reconciliation",
+                            scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                            scheduler_previous_sha=(scheduler_previous_sha if selective_policy else None),
+                            scheduler_current_sha=(current_pr_subject if selective_policy else None),
+                            scheduler_obligation_digest=(
+                                hashlib.sha256(
+                                    repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
+                                ).hexdigest()[:16]
+                                if selective_policy else None
+                            ),
+                            scheduler_selected_reviewers=settled_reviewers if selective_policy else (),
+                            scheduler_paused_reviewers=(
+                                scheduler_decision.paused_reviewers
+                                if selective_policy and scheduler_decision is not None else ()
+                            ),
+                            scheduler_reasons=(
+                                (scheduler_decision.reason, classification.reason)
+                                if selective_policy and scheduler_decision is not None else ()
+                            ),
+                            scheduler_final_sweep=(final_sweep if selective_policy else None),
+                            scheduler_force_full=(scheduler_force_full if selective_policy else None),
+                            scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
                         ),
                     ),
                 )
@@ -8936,6 +9431,11 @@ def run_pr_loop(
                     prior_unresolved_items,
                     prior_dispositions,
                     retain_future=False,
+                    reconciliation_mode=(
+                        "owner-scoped"
+                        if config.pr_review_policy == "selective-intermediate"
+                        else "aggregate"
+                    ),
                 )
                 pr_compact_prior_summaries.extend(
                     _collect_prior_compact_summaries(
@@ -8948,6 +9448,11 @@ def run_pr_loop(
                 unresolved_items, _future_items = _apply_unresolved_item_dispositions(
                     prior_unresolved_items,
                     prior_dispositions,
+                    reconciliation_mode=(
+                        "owner-scoped"
+                        if config.pr_review_policy == "selective-intermediate"
+                        else "aggregate"
+                    ),
                 )
                 future_from_prior_items = []
             unresolved_items = [*unresolved_items, *round_new_unresolved_items]
@@ -8963,6 +9468,42 @@ def run_pr_loop(
                     must_fix_items,
                     prior_items=prior_unresolved_items,
                 )
+                if selective_policy:
+                    unavailable_names = {
+                        agent_display_name(reviewer)
+                        for reviewer in unavailable_reviewer_failures
+                    }
+                    owner_unavailable = [
+                        item
+                        for item in must_fix_items
+                        if (
+                            (lambda owners, states: bool(owners)
+                             and all(owner in unavailable_names for owner in owners if states.get(owner) != "cleared"))(
+                                item.resolution_owners or (item.reviewer,),
+                                dict(item.owner_states or ((owner, "pending") for owner in (item.resolution_owners or (item.reviewer,)))),
+                            )
+                        )
+                    ]
+                    if owner_unavailable:
+                        approved_names = [
+                            reviewer_name for reviewer_name, _output in approved_review_outputs
+                        ]
+                        post_pr_comment(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            body=_format_incomplete_pr_review_comment(
+                                pr_number=pr_number,
+                                unavailable_reviewers=unavailable_reviewer_failures,
+                                approved_reviewer_names=approved_names,
+                            ),
+                        )
+                        item_ids = ", ".join(item.item_id for item in owner_unavailable)
+                        raise AgentLoopError(
+                            f"PR #{pr_number} review incomplete: all remaining resolution owners "
+                            f"for {item_ids} are unavailable. No coder follow-up, CI, qualification, "
+                            "or merge was attempted."
+                        )
 
             pr_checks: PullRequestChecks | None = None
             if not must_fix_items:
@@ -9110,6 +9651,58 @@ def run_pr_loop(
                         f"PR #{pr_number} review incomplete: missing required input from {missing}. "
                         f"Healthy reviewers approved: {healthy}. No coder follow-up or merge was attempted."
                     )
+
+                if not must_fix_items and selective_policy:
+                    fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        issue_context=issue_context,
+                        parent_issue_context=parent_issue_context,
+                        approved_plan_context=approved_plan_context,
+                    )
+                    if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                        log(
+                            config,
+                            f"Round {round_number}: PR head changed during reviewer reconciliation; "
+                            "restarting exact-head scheduling",
+                        )
+                        prefetched_pr_context = fresh_context
+                        final_sweep_pending = False
+                        continue
+                    if set(fresh_requirement_ids) != {
+                        requirement.requirement_id for requirement in human_requirements
+                    }:
+                        log(
+                            config,
+                            f"Round {round_number}: signed human-requirement identity changed; "
+                            "invalidating prior approvals for a fresh final sweep",
+                        )
+                        final_sweep_pending = True
+                        prefetched_pr_context = fresh_context
+                        continue
+                    qualifying_names = set(unchanged_head_approvals)
+                    qualifying_names.update(
+                        reviewer_name for reviewer_name, _output in approved_review_outputs
+                    )
+                    missing_names = [
+                        agent_display_name(reviewer)
+                        for reviewer in configured_reviewers
+                        if agent_display_name(reviewer) not in qualifying_names
+                    ]
+                    if missing_names:
+                        final_sweep_pending = True
+                        log(
+                            config,
+                            f"Round {round_number}: exact-head gate requires final sweep for "
+                            f"{', '.join(missing_names)}; no coder dispatch",
+                        )
+                        if round_number == allowed_rounds:
+                            raise AgentLoopError(
+                                f"PR #{pr_number} exact-head final sweep is missing reviewer approval "
+                                f"from {', '.join(missing_names)}. No coder follow-up or merge was attempted."
+                            )
+                        continue
 
                 sync_coder_pr_before_validation(config, runner, pr_number, pr_metadata)
                 migration_validation = validate_pr_migration_topology(
@@ -9289,6 +9882,25 @@ def run_pr_loop(
                             usage_context=usage_context,
                         )
                         run_optional_tests(runner, config)
+                        if selective_policy:
+                            fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                issue_context=issue_context,
+                                parent_issue_context=parent_issue_context,
+                                approved_plan_context=approved_plan_context,
+                            )
+                            if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                                prefetched_pr_context = fresh_context
+                                final_sweep_pending = False
+                                continue
+                            if set(fresh_requirement_ids) != {
+                                requirement.requirement_id for requirement in human_requirements
+                            }:
+                                final_sweep_pending = True
+                                prefetched_pr_context = fresh_context
+                                continue
                         if config.auto_merge:
                             if not watch_outcome.head_sha:
                                 raise AgentLoopError(
@@ -9514,7 +10126,54 @@ def run_pr_loop(
                         usage_context=usage_context,
                     )
                     run_optional_tests(runner, config)
+                    if selective_policy:
+                        fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            issue_context=issue_context,
+                            parent_issue_context=parent_issue_context,
+                            approved_plan_context=approved_plan_context,
+                        )
+                        if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                            prefetched_pr_context = fresh_context
+                            final_sweep_pending = False
+                            continue
+                        if set(fresh_requirement_ids) != {
+                            requirement.requirement_id for requirement in human_requirements
+                        }:
+                            final_sweep_pending = True
+                            prefetched_pr_context = fresh_context
+                            continue
                     if config.auto_merge or managed_ci_active(pr_metadata):
+                        fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            issue_context=issue_context,
+                            parent_issue_context=parent_issue_context,
+                            approved_plan_context=approved_plan_context,
+                        )
+                        if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                            log(
+                                config,
+                                f"Round {round_number}: PR head changed before managed qualification; "
+                                "restarting review scheduling",
+                            )
+                            prefetched_pr_context = fresh_context
+                            final_sweep_pending = False
+                            continue
+                        if set(fresh_requirement_ids) != {
+                            requirement.requirement_id for requirement in human_requirements
+                        }:
+                            log(
+                                config,
+                                f"Round {round_number}: qualification contract changed before managed CI; "
+                                "restarting final sweep",
+                            )
+                            prefetched_pr_context = fresh_context
+                            final_sweep_pending = True
+                            continue
                         if managed_ci_active(pr_metadata):
                             assert pr_metadata.head_sha is not None
                             assert pr_metadata.head_branch is not None
@@ -9552,6 +10211,25 @@ def run_pr_loop(
                                 contract=managed_ci,
                             )
                             if managed_outcome.status == "passed":
+                                if selective_policy:
+                                    fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                                        runner,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        issue_context=issue_context,
+                                        parent_issue_context=parent_issue_context,
+                                        approved_plan_context=approved_plan_context,
+                                    )
+                                    if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                                        prefetched_pr_context = fresh_context
+                                        final_sweep_pending = False
+                                        continue
+                                    if set(fresh_requirement_ids) != {
+                                        requirement.requirement_id for requirement in human_requirements
+                                    }:
+                                        prefetched_pr_context = fresh_context
+                                        final_sweep_pending = True
+                                        continue
                                 if config.auto_merge:
                                     managed_ci_qualified = True
                                     prepare_v2_merge(
@@ -10046,6 +10724,20 @@ def run_pr_loop(
                 model_used=coder_response.model_used,
                 acquisition_outcome=coder_response.acquisition_outcome,
                 acquisition_returncode=coder_response.acquisition_returncode,
+                scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                scheduler_previous_sha=(pr_metadata.head_sha if selective_policy else None),
+                scheduler_current_sha=(
+                    str(updated_pr_context.metadata.head_sha or "unknown")
+                    if selective_policy else None
+                ),
+                scheduler_obligation_digest=(
+                    hashlib.sha256(
+                        repr(_prior_item_ledger_signature(unresolved_items)).encode("utf-8")
+                    ).hexdigest()[:16]
+                    if selective_policy else None
+                ),
+                scheduler_force_full=(scheduler_force_full if selective_policy else None),
+                scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
             )
             post_pr_comment(
                 runner,
