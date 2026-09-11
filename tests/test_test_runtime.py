@@ -1,8 +1,9 @@
 import json
 import os
-import signal
 import shlex
 import shutil
+import subprocess
+import signal
 import sys
 import threading
 import time
@@ -48,6 +49,41 @@ def _kill_if_active(pid: int) -> None:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+def _windows_process_is_active(pid: int) -> bool:
+    result = subprocess.run(
+        ["tasklist.exe", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=2,
+    )
+    return f'"{pid}"' in result.stdout
+
+
+def _assert_windows_process_not_active(pid: int) -> None:
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if not _windows_process_is_active(pid):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"probe descendant {pid} is still active")
+
+
+def _kill_windows_if_active(pid: int) -> None:
+    try:
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def _record(
@@ -746,6 +782,36 @@ def test_inner_probe_timeout_kills_descendant_holding_output_pipe(tmp_path, monk
         _assert_process_not_active(descendant_pid)
     finally:
         _kill_if_active(descendant_pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object probe cleanup is Windows-specific")
+def test_windows_probe_timeout_kills_descendant_holding_output_pipe(tmp_path):
+    pid_file = tmp_path / "windows-descendant.pid"
+    child_code = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(30)"
+    )
+    probe_code = (
+        "import subprocess, sys; "
+        "from pathlib import Path; "
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"Path({str(pid_file)!r}).write_text(str(child.pid))"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        runtime._run_bounded_probe(
+            [sys.executable, "-c", probe_code],
+            cwd=tmp_path,
+            env=None,
+            timeout_seconds=0.2,
+        )
+
+    descendant_pid = int(pid_file.read_text())
+    try:
+        _assert_windows_process_not_active(descendant_pid)
+    finally:
+        _kill_windows_if_active(descendant_pid)
 
 
 def test_wrapper_preflight_bounds_changing_completed_identities(tmp_path, monkeypatch):

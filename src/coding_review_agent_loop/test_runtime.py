@@ -1382,13 +1382,159 @@ def _close_probe_pipes(process: subprocess.Popen) -> None:
                 pass
 
 
-def _terminate_probe_tree(process: subprocess.Popen) -> None:
-    """Terminate and reap a bounded probe and its process group."""
+class _ProbeContainmentUnavailable(RuntimeError):
+    """The platform cannot provide the containment required for a probe."""
+
+
+class _WindowsProbeJob:
+    """Own a probe process tree with a Windows Job Object.
+
+    ``CREATE_NEW_PROCESS_GROUP`` only provides console-control isolation; it
+    does not terminate descendants when the parent is killed.  A Job Object
+    with ``KILL_ON_JOB_CLOSE`` gives the probe an owning boundary equivalent to
+    the POSIX process group used below.  This class is instantiated only on
+    Windows so importing this module remains portable and dependency-free.
+    """
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle_type = wintypes.HANDLE
+        self._kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        self._kernel32.CreateJobObjectW.restype = handle_type
+        self._kernel32.SetInformationJobObject.argtypes = [
+            handle_type,
+            wintypes.INT,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        self._kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        self._kernel32.AssignProcessToJobObject.argtypes = [handle_type, handle_type]
+        self._kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        self._kernel32.TerminateJobObject.argtypes = [handle_type, wintypes.UINT]
+        self._kernel32.TerminateJobObject.restype = wintypes.BOOL
+        self._kernel32.CloseHandle.argtypes = [handle_type]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
+
+        class _BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimitInformation),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self._handle = self._kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        information = _ExtendedLimitInformation()
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        information.BasicLimitInformation.LimitFlags = 0x00002000
+        if not self._kernel32.SetInformationJobObject(
+            self._handle,
+            9,  # JobObjectExtendedLimitInformation
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.get_last_error()
+            self.close()
+            raise ctypes.WinError(error)
+
+    @staticmethod
+    def _process_handle(process: subprocess.Popen) -> int:
+        try:
+            return int(process._handle)  # type: ignore[attr-defined]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise OSError("probe process does not expose a Windows handle") from exc
+
+    def assign(self, process: subprocess.Popen) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        process_handle = self._process_handle(process)
+        if not self._kernel32.AssignProcessToJobObject(
+            self._handle, wintypes.HANDLE(process_handle)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def terminate(self) -> None:
+        if self._handle:
+            self._kernel32.TerminateJobObject(self._handle, 1)
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle:
+            self._kernel32.CloseHandle(handle)
+
+
+def _terminate_unassigned_windows_probe(process: subprocess.Popen) -> None:
+    """Best-effort cleanup if Job Object assignment loses a startup race."""
+    try:
+        killer = subprocess.Popen(
+            ("taskkill.exe", "/PID", str(process.pid), "/T", "/F"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            killer.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            killer.kill()
+            try:
+                killer.communicate(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+    except (OSError, subprocess.SubprocessError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _terminate_probe_tree(
+    process: subprocess.Popen, *, windows_job: _WindowsProbeJob | None = None
+) -> None:
+    """Terminate and reap a bounded probe and its process tree."""
     if os.name == "posix":
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
+    elif windows_job is not None:
+        # TerminateJobObject is tree-wide, even when the direct child has
+        # already exited while a descendant still owns stdout/stderr.
+        windows_job.terminate()
     else:
         try:
             process.terminate()
@@ -1403,12 +1549,19 @@ def _terminate_probe_tree(process: subprocess.Popen) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except (OSError, ProcessLookupError):
             pass
+    elif windows_job is not None:
+        windows_job.terminate()
     else:
         try:
             process.kill()
         except OSError:
             pass
-    process.wait()
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        # The job/process was force-terminated above.  Do not turn bounded
+        # probe cleanup into an unbounded wait if a platform handle misbehaves.
+        pass
 
 
 def _run_bounded_probe(
@@ -1439,11 +1592,29 @@ def _run_bounded_probe(
         if creation_flags:
             popen_kwargs["creationflags"] = creation_flags
         popen_kwargs.pop("start_new_session", None)
-    process = subprocess.Popen([str(item) for item in argv], **popen_kwargs)
+    windows_job: _WindowsProbeJob | None = None
+    if os.name == "nt":
+        try:
+            windows_job = _WindowsProbeJob()
+        except Exception as exc:
+            raise _ProbeContainmentUnavailable(
+                f"Windows Job Object probe containment unavailable: {type(exc).__name__}"
+            ) from exc
+    process: subprocess.Popen | None = None
     try:
+        process = subprocess.Popen([str(item) for item in argv], **popen_kwargs)
+        if windows_job is not None:
+            try:
+                windows_job.assign(process)
+            except Exception as exc:
+                _terminate_unassigned_windows_probe(process)
+                raise _ProbeContainmentUnavailable(
+                    f"Windows Job Object probe assignment unavailable: {type(exc).__name__}"
+                ) from exc
         stdout, stderr = process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
-        _terminate_probe_tree(process)
+        assert process is not None
+        _terminate_probe_tree(process, windows_job=windows_job)
         output = _decode_probe_output(getattr(exc, "output", None))
         error = _decode_probe_output(getattr(exc, "stderr", None))
         _close_probe_pipes(process)
@@ -1451,15 +1622,22 @@ def _run_bounded_probe(
             [str(item) for item in argv], timeout_seconds, output=output, stderr=error
         ) from None
     except BaseException:
-        _terminate_probe_tree(process)
-        _close_probe_pipes(process)
+        if process is not None:
+            _terminate_probe_tree(process, windows_job=windows_job)
+            _close_probe_pipes(process)
         raise
-    return subprocess.CompletedProcess(
-        [str(item) for item in argv],
-        process.returncode,
-        _decode_probe_output(stdout),
-        _decode_probe_output(stderr),
-    )
+    else:
+        assert process is not None
+        result = subprocess.CompletedProcess(
+            [str(item) for item in argv],
+            process.returncode,
+            _decode_probe_output(stdout),
+            _decode_probe_output(stderr),
+        )
+    finally:
+        if windows_job is not None:
+            windows_job.close()
+    return result
 
 
 def preflight_wrapper_candidates(
@@ -1515,6 +1693,8 @@ def preflight_wrapper_candidates(
                     )
                 except subprocess.TimeoutExpired:
                     result = LauncherProbeResult(candidate, "failed", "wrapper probe timed out after 5s", _identity_key(identity))
+                except _ProbeContainmentUnavailable as exc:
+                    result = LauncherProbeResult(candidate, "unknown", str(exc), _identity_key(identity))
                 except OSError as exc:
                     result = LauncherProbeResult(candidate, "failed", f"wrapper did not start: {type(exc).__name__}", _identity_key(identity))
                 except Exception as exc:
@@ -1660,6 +1840,8 @@ def probe_inner_launcher(
             )
         except subprocess.TimeoutExpired:
             result = LauncherProbeResult(original, "failed", "inner bootstrap probe timed out after 5s", identity_key)
+        except _ProbeContainmentUnavailable as exc:
+            result = LauncherProbeResult(original, "unknown", str(exc), identity_key)
         except OSError as exc:
             result = LauncherProbeResult(original, "failed", f"inner launcher did not start: {type(exc).__name__}", identity_key)
         else:

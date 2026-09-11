@@ -2896,7 +2896,11 @@ verified` response proves startup; a non-start, timeout, or explicit import /
 bootstrap failure is unhealthy, while ambiguous output remains unknown. The
 probe does not run remembered test argv, install packages, access live
 databases, cross the assigned checkout, or alter the operator's configured
-command. The candidate cache includes executable, shebang, interpreter,
+command. Probe cleanup is process-tree aware: POSIX probes use a dedicated
+process group, while Windows probes use a kill-on-close Job Object. If the
+Windows owning boundary cannot be created or assigned, the probe is not
+launched and remains unknown. The candidate cache includes executable,
+shebang, interpreter,
 package-origin, virtualenv, and invocation identity so repair or replacement
 causes a fresh probe.
 

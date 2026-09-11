@@ -474,6 +474,10 @@ keeps independent `wrapper_bootstrap`, `inner_exec`, and `suite_start` states,
 so a missing executable or import is launcher health rather than a suite
 failure. Collection/configuration errors, failing tests, timeouts, and
 interruptions after startup remain ordinary suite evidence.
+Probe cleanup is process-tree aware: POSIX probes use a dedicated process
+group, and Windows probes use a kill-on-close Job Object. If Windows cannot
+provide that owning boundary, the probe is not launched and its result remains
+unknown rather than running an uncontained child.
 Python identity is checked without execution: the running interpreter and
 symlinks to it are trusted, as are byte-for-byte copies in a conventional
 `pyvenv.cfg` environment; name-only scripts or native binaries are unknown.
