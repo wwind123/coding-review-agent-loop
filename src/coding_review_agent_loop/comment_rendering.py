@@ -135,15 +135,15 @@ def _render_test_observation_citations(
     cited: set[str] = set()
     citation_uses: dict[str, set[tuple[str, str]]] = {}
     for citation in citations:
-        receipt_id = str(getattr(citation, "receipt_id", ""))
-        command = str(getattr(citation, "command", ""))
-        claim = str(getattr(citation, "claim", ""))
+        receipt_id = sanitize_historical_text(str(getattr(citation, "receipt_id", "")))
+        command = sanitize_historical_text(str(getattr(citation, "command", "")))
+        claim = sanitize_historical_text(str(getattr(citation, "claim", "")))
         safe_command, _identifiers, _caveats = redact_test_command(command)
         citation_uses.setdefault(receipt_id, set()).add((safe_command, claim))
     for citation in citations:
-        command = getattr(citation, "command", "")
-        receipt_id = str(getattr(citation, "receipt_id", ""))
-        claim = str(getattr(citation, "claim", ""))
+        command = sanitize_historical_text(str(getattr(citation, "command", "")))
+        receipt_id = sanitize_historical_text(str(getattr(citation, "receipt_id", "")))
+        claim = sanitize_historical_text(str(getattr(citation, "claim", "")))
         safe_command, _identifiers, _caveats = redact_test_command(command)
         observed = by_receipt.get(receipt_id)
         supported = observed is not None

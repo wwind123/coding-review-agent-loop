@@ -544,6 +544,42 @@ def test_coder_receipts_reject_cross_turn_and_conflicting_citations():
     assert "unverified: unknown or cross-turn receipt" in rendered
     assert rendered.count("unverified: conflicting uses of one receipt") == 2
 
+
+def test_coder_receipt_command_correlation_is_stable_for_safe_complex_argv():
+    from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+
+    command = "FEATURE_FLAG='value with spaces' python -m pytest 'tests/test_protocol.py::test_case[value with spaces]'"
+    parsed = validate_structured_coder_followup(
+        json.dumps({
+            "schema_version": 1, "kind": "coder_followup", "state": "blocking",
+            "summary": "Checked a complex command.", "addressed_items": [], "remaining_items": [],
+            "human_requirement_dispositions": [],
+            "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+            "test_observations": [
+                {"command": command, "receipt_id": "complex", "claim": "current-result"},
+            ],
+        }) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    evidence = bounded_evidence_for_round({"observations": [{
+        "command": shlex.split(command),
+        "outcome": "passed",
+        "provenance": "parent-observed",
+        "receipt_id": "complex",
+        "turn_id": "current-turn",
+        "environment": "unknown",
+        "attribution": {"state": "current-head"},
+    }]})
+
+    rendered = _render_public_coder_followup_comment(
+        parsed,
+        agent="Claude",
+        local_test_evidence=evidence,
+        current_test_turn_id="current-turn",
+    )
+
+    assert "verified against the parent journal" in rendered
+    assert "command disagrees" not in rendered
+
     without_tests = validate_structured_coder_followup(
         json.dumps(
             {

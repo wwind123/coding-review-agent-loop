@@ -275,6 +275,54 @@ class ContainmentPolicy:
 
 
 @dataclass
+class PinnedCheckoutRoot:
+    """Server-owned checkout identity retained for a broker lifetime."""
+
+    path: Path
+    fd: int = field(repr=False)
+    device: int
+    inode: int
+
+    @classmethod
+    def open(cls, root: Path) -> "PinnedCheckoutRoot":
+        if (
+            os.name == "nt"
+            or not hasattr(os, "O_NOFOLLOW")
+            or not hasattr(os, "fchdir")
+        ):
+            raise AgentLoopError("handle-pinned cwd confinement is unsupported on this platform")
+        if root.is_symlink():
+            raise AgentLoopError("assigned checkout root may not be a symlink")
+        root_path = root.resolve(strict=True)
+        if not root_path.is_dir():
+            raise AgentLoopError("assigned checkout root is not a directory")
+        descriptor = os.open(
+            root_path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | os.O_NOFOLLOW,
+        )
+        os.set_inheritable(descriptor, False)
+        info = os.fstat(descriptor)
+        return cls(root_path, descriptor, info.st_dev, info.st_ino)
+
+    def verify_path_identity(self) -> None:
+        try:
+            current = os.stat(self.path, follow_symlinks=False)
+        except OSError as exc:
+            raise AgentLoopError("assigned checkout root was replaced") from exc
+        if (current.st_dev, current.st_ino) != (self.device, self.inode):
+            raise AgentLoopError("assigned checkout root was replaced")
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+@dataclass
 class ConfinedCwd:
     """A handle-pinned directory inside an assigned checkout."""
 
@@ -284,7 +332,7 @@ class ConfinedCwd:
     _root_fd: int = field(repr=False)
 
     @classmethod
-    def open(cls, root: Path, requested: Path) -> "ConfinedCwd":
+    def open(cls, root: Path | PinnedCheckoutRoot, requested: Path) -> "ConfinedCwd":
         if (
             os.name == "nt"
             or not hasattr(os, "open")
@@ -295,18 +343,15 @@ class ConfinedCwd:
         if not requested.is_absolute():
             raise AgentLoopError("broker cwd must be absolute")
         try:
-            if root.is_symlink():
-                raise AgentLoopError("assigned checkout root may not be a symlink")
-            root_path = root.resolve(strict=True)
-            if not root_path.is_dir() or root_path.is_symlink():
-                raise AgentLoopError("assigned checkout root is not a pinned directory")
-            root_fd = os.open(
-                root_path,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_CLOEXEC", 0)
-                | os.O_NOFOLLOW,
-            )
+            if isinstance(root, PinnedCheckoutRoot):
+                root.verify_path_identity()
+                root_path = root.path
+                root_fd = os.dup(root.fd)
+                os.set_inheritable(root_fd, False)
+            else:
+                pinned = PinnedCheckoutRoot.open(root)
+                root_path = pinned.path
+                root_fd = pinned.fd
             root_stat = os.fstat(root_fd)
             requested_path = requested.resolve(strict=True)
             if not requested_path.is_dir():
@@ -380,7 +425,7 @@ class ConfinedCwd:
         self.close()
 
 
-def open_confined_cwd(root: Path, requested: Path) -> ConfinedCwd:
+def open_confined_cwd(root: Path | PinnedCheckoutRoot, requested: Path) -> ConfinedCwd:
     """Open and pin a broker-requested cwd below the server-owned root."""
     return ConfinedCwd.open(root, requested)
 

@@ -32,6 +32,7 @@ from threading import Lock, Thread, current_thread
 from typing import Any, Iterable, Mapping, Sequence
 
 from .errors import AgentLoopError
+from .protocol_markers import sanitize_historical_text
 
 
 SCHEMA_VERSION = 1
@@ -139,7 +140,8 @@ def _bounded(value: object, limit: int) -> str:
 
 
 def _safe_text(value: object, limit: int = MAX_SAFE_CAVEAT_BYTES) -> str:
-    return _bounded(_CONTROL_RE.sub("", _ANSI_RE.sub("", str(value))).replace("\r", ""), limit)
+    cleaned = _CONTROL_RE.sub("", _ANSI_RE.sub("", str(value))).replace("\r", "")
+    return _bounded(sanitize_historical_text(cleaned), limit)
 
 
 def _digest(value: object) -> str:
@@ -181,7 +183,10 @@ class EvidenceScope:
         return self.kind.strip().lower(), tuple(sorted(set(self.selectors)))
 
     def to_dict(self) -> dict[str, object]:
-        return {"kind": self.kind, "selectors": list(self.selectors)}
+        return {
+            "kind": _safe_text(self.kind, MAX_SAFE_IDENTIFIER_BYTES),
+            "selectors": [_safe_text(item, MAX_SAFE_IDENTIFIER_BYTES) for item in self.selectors],
+        }
 
 
 @dataclass(frozen=True)
@@ -200,13 +205,13 @@ class TreeAttribution:
     def to_dict(self) -> dict[str, object]:
         return {
             "state": self.state if self.state in ATTRIBUTIONS else "unknown",
-            "head": self.head,
-            "pre_digest": self.pre_digest,
-            "post_digest": self.post_digest,
-            "tracked_digest": self.tracked_digest,
+            "head": _safe_text(self.head, MAX_SAFE_IDENTIFIER_BYTES) if self.head else None,
+            "pre_digest": _safe_text(self.pre_digest, MAX_SAFE_IDENTIFIER_BYTES) if self.pre_digest else None,
+            "post_digest": _safe_text(self.post_digest, MAX_SAFE_IDENTIFIER_BYTES) if self.post_digest else None,
+            "tracked_digest": _safe_text(self.tracked_digest, MAX_SAFE_IDENTIFIER_BYTES) if self.tracked_digest else None,
             "stable": self.stable,
             "untracked_input": self.untracked_input,
-            "caveats": list(self.caveats[:4]),
+            "caveats": [_safe_text(item, MAX_SAFE_CAVEAT_BYTES) for item in self.caveats[:4]],
         }
 
 
@@ -342,8 +347,8 @@ class LocalTestObservation:
         )
         return {
             "command": _bounded(command, MAX_SAFE_COMMAND_BYTES),
-            "receipt_id": _bounded(self.receipt_id or "", MAX_SAFE_IDENTIFIER_BYTES),
-            "turn_id": _bounded(self.turn_id or "", MAX_SAFE_IDENTIFIER_BYTES),
+            "receipt_id": _safe_text(self.receipt_id or "", MAX_SAFE_IDENTIFIER_BYTES),
+            "turn_id": _safe_text(self.turn_id or "", MAX_SAFE_IDENTIFIER_BYTES),
             "timestamp": _bounded(_safe_text(self.timestamp, 64), 64),
             "outcome": self.outcome,
             "provenance": self.provenance,
@@ -352,12 +357,12 @@ class LocalTestObservation:
             "environment": self.environment_state,
             "returncode": self.returncode,
             "claim": self.claim if self.claim in CLAIMS else None,
-            "superseded_by": _bounded(self.superseded_by or "", MAX_SAFE_IDENTIFIER_BYTES)
+            "superseded_by": _safe_text(self.superseded_by or "", MAX_SAFE_IDENTIFIER_BYTES)
             if self.superseded_by
             else None,
-            "caveats": [_bounded(item, MAX_SAFE_CAVEAT_BYTES) for item in self.caveats[:4]],
+            "caveats": [_safe_text(item, MAX_SAFE_CAVEAT_BYTES) for item in self.caveats[:4]],
             "identifiers": [
-                _bounded(item, MAX_SAFE_IDENTIFIER_BYTES)
+                _safe_text(item, MAX_SAFE_IDENTIFIER_BYTES)
                 for item in self.identifiers[:MAX_SAFE_IDENTIFIERS]
             ],
         }
@@ -498,9 +503,12 @@ class LocalTestEvidence:
             "schema_version": SCHEMA_VERSION,
             "kind": LOCAL_TEST_EVIDENCE_SCHEMA,
             "observations": [item.to_dict() for item in self.observations],
-            "caveats": [_bounded(item, MAX_SAFE_CAVEAT_BYTES) for item in self.caveats],
+            "caveats": [_safe_text(item, MAX_SAFE_CAVEAT_BYTES) for item in self.caveats],
             "capture_incomplete": self.capture_incomplete,
-            "authoritative_failures": list(self.authoritative_failures),
+            "authoritative_failures": [
+                _safe_text(item, MAX_SAFE_IDENTIFIER_BYTES)
+                for item in self.authoritative_failures
+            ],
             "legacy_capture_limited": self.legacy_capture_limited,
         }
 
@@ -613,7 +621,12 @@ def reconcile_test_observations(
             if attribution.stable is not True or not attribution.tracked_digest:
                 continue
             if attribution.tracked_digest == current_snapshot.tracked_digest:
-                state = "untracked-input-unverified" if attribution.untracked_input else "current-head"
+                state = (
+                    "untracked-input-unverified"
+                    if attribution.untracked_input
+                    or attribution.state == "untracked-input-unverified"
+                    else "current-head"
+                )
                 rows[index] = replace(
                     row,
                     attribution=replace(
@@ -783,7 +796,9 @@ def redact_test_command(
         assignment = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", token)
         if assignment:
             name, value = assignment.groups()
-            if _SECRET_KEY_RE.match(name):
+            if re.fullmatch(r"<(?:redacted|sha256):[0-9a-f]{16}>", value):
+                safe_value = value
+            elif _SECRET_KEY_RE.match(name):
                 safe_value = f"<redacted:{_digest(value)}>"
                 caveats.append("secret-like environment assignment redacted")
             else:
@@ -809,14 +824,17 @@ def redact_test_command(
         parameter = _PARAMETER_RE.search(token)
         if parameter:
             base_token = token[: parameter.start()]
-            safe_base = (
-                base_token
-                if _REPO_RELATIVE_RE.match(base_token) or base_token.startswith(".")
-                else _path_digest(base_token)
-            )
-            token = f"{safe_base}[param-sha256:{_digest(parameter.group(0))}]"
-            found_identifiers.append(_digest(parameter.group(0)))
-            caveats.append("parametrized test identifier redacted")
+            if re.fullmatch(r"\[param-sha256:[0-9a-f]{16}\]", parameter.group(0)):
+                token = f"{base_token}{parameter.group(0)}"
+            else:
+                safe_base = (
+                    base_token
+                    if _REPO_RELATIVE_RE.match(base_token) or base_token.startswith(".")
+                    else _path_digest(base_token)
+                )
+                token = f"{safe_base}[param-sha256:{_digest(parameter.group(0))}]"
+                found_identifiers.append(_digest(parameter.group(0)))
+                caveats.append("parametrized test identifier redacted")
         if index > 0 and not token.startswith("-") and not parameter and not (
             _REPO_RELATIVE_RE.match(token) or token.startswith(".")
         ) and len(token) > 32:
@@ -841,7 +859,8 @@ def redact_observation(observation: LocalTestObservation) -> LocalTestObservatio
     return replace(
         observation,
         normalized_command=command,
-        command=tuple(command.split()),
+        # Preserve argv boundaries so repeated durable projections are stable.
+        command=tuple(shlex.split(command)),
         identifiers=identifiers,
         caveats=tuple(dict.fromkeys((*observation.caveats, *command_caveats))),
         diagnostic=None,
@@ -1191,7 +1210,18 @@ def attribute_current_head(
     untracked_present = bool(set(before.untracked_paths) | set(after.untracked_paths))
     if before.status_clean is not True or after.status_clean is not True:
         return TreeAttribution(state="unknown", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=False, caveats=tuple(caveats + ["tracked worktree awaits comparison with the eventual PR tree"] + (["unrelated non-ignored untracked files present"] if untracked_present else [])))
-    return TreeAttribution(state="current-head", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=False, caveats=tuple(caveats + (["unrelated non-ignored untracked files present"] if untracked_present else [])))
+    if untracked_present:
+        return TreeAttribution(
+            state="untracked-input-unverified",
+            head=after.head,
+            pre_digest=before.digest,
+            post_digest=after.digest,
+            tracked_digest=after.tracked_digest,
+            stable=True,
+            untracked_input=False,
+            caveats=tuple(caveats + ["non-ignored untracked content may affect test discovery or configuration"]),
+        )
+    return TreeAttribution(state="current-head", head=after.head, pre_digest=before.digest, post_digest=after.digest, tracked_digest=after.tracked_digest, stable=True, untracked_input=False, caveats=tuple(caveats))
 
 
 def attribute_base_reproduction(
@@ -1402,6 +1432,7 @@ class TestBrokerServer:
         self._process_started: Any | None = None
         self._process_finished: Any | None = None
         self._active_processes: dict[int, Any] = {}
+        self._pinned_root: Any | None = None
 
     def set_execution_context(
         self,
@@ -1437,6 +1468,9 @@ class TestBrokerServer:
     def start(self) -> "TestBrokerServer":
         if self._socket is not None:
             return self
+        from .containment import PinnedCheckoutRoot
+
+        self._pinned_root = PinnedCheckoutRoot.open(self.root)
         self._runtime_dir = Path(tempfile.mkdtemp(prefix="agent-loop-test-broker-"))
         os.chmod(self._runtime_dir, 0o700)
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1490,6 +1524,9 @@ class TestBrokerServer:
             except OSError:
                 pass
             self._runtime_dir = None
+        if self._pinned_root is not None:
+            self._pinned_root.close()
+            self._pinned_root = None
 
     def snapshot_journal(self) -> tuple[LocalTestObservation, ...]:
         return self.journal
@@ -1598,7 +1635,10 @@ class TestBrokerServer:
         for name in (BROKER_ENDPOINT_ENV, BROKER_CAPABILITY_ENV, BROKER_PROTOCOL_ENV):
             environment.pop(name, None)
         environment["AGENT_LOOP_INVOCATION_ID"] = self.turn_id
-        with open_confined_cwd(self.root, requested_cwd) as confined:
+        pinned_root = self._pinned_root
+        if pinned_root is None:
+            raise BrokerProtocolError("test broker root is not pinned")
+        with open_confined_cwd(pinned_root, requested_cwd) as confined:
             cwd = confined.path
             before = stable_tracked_tree_snapshot(
                 self.root,

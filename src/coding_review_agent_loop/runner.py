@@ -753,7 +753,13 @@ class Runner:
         observations = list(self.local_test_observations())
         prior = decode_bounded_evidence(prior_local_test_evidence)
         if prior is not None:
-            observations = [*prior.observations, *observations]
+            live_receipts = {
+                item.receipt_id for item in observations if item.receipt_id is not None
+            }
+            observations = [
+                *(item for item in prior.observations if item.receipt_id not in live_receipts),
+                *observations,
+            ]
         if not observations and not legacy_tests_run:
             return None
         current_snapshot = stable_tracked_tree_snapshot(cwd) if cwd is not None else None
