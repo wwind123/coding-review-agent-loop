@@ -8,7 +8,6 @@ an agent is never used as a timing sample.
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -19,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -650,14 +650,97 @@ def _resolve_shebang_path(
     return _resolve_candidate_path(shebang, cwd=cwd, environment=environment)
 
 
-def _module_origin(module_name: str) -> Path | None:
+_PYTHON_INTERPRETER_NAME_RE = re.compile(
+    r"(?i)(?:python(?:[0-9]+(?:\.[0-9]+)*)?|pypy(?:[0-9]+(?:\.[0-9]+)*)?|py)(?:\.exe)?$"
+)
+
+
+def _python_interpreter_path(
+    token: str, *, cwd: Path, environment: Mapping[str, str]
+) -> Path | None:
+    """Resolve a command token only when it has a recognizable Python identity.
+
+    This is deliberately a filesystem/name check.  It never starts the token
+    merely to decide whether it is safe to probe.  In particular, arbitrary
+    ``program -m pytest`` forms are not recognized.  The conventional Python
+    names cover both system interpreters and ``bin``/``Scripts`` virtualenv
+    interpreters; the actual bounded ``--version`` probe remains authoritative
+    for importability.
+    """
+    path = _resolve_candidate_path(token, cwd=cwd, environment=environment)
     try:
-        spec = importlib.util.find_spec(module_name)
-    except (ImportError, ModuleNotFoundError, AttributeError, ValueError):
+        resolved = path.resolve(strict=False)
+        current = Path(sys.executable).resolve(strict=False)
+    except OSError:
         return None
-    if spec is None or not spec.origin or spec.origin in {"built-in", "frozen"}:
+    if resolved == current:
+        return resolved
+    if not _PYTHON_INTERPRETER_NAME_RE.fullmatch(resolved.name):
         return None
-    return Path(spec.origin).resolve(strict=False)
+    return resolved
+
+
+def _interpreter_environment_root(
+    interpreter: Path, *, environment: Mapping[str, str]
+) -> Path | None:
+    """Return a likely environment root without inspecting arbitrary paths."""
+    if interpreter == Path(sys.executable).resolve(strict=False):
+        return Path(sys.prefix).resolve(strict=False)
+    if interpreter.parent.name.lower() in {"bin", "scripts"}:
+        return interpreter.parent.parent.resolve(strict=False)
+    virtual_env = environment.get("VIRTUAL_ENV")
+    if virtual_env:
+        return Path(virtual_env).expanduser().resolve(strict=False)
+    return None
+
+
+def _pytest_dependency_paths(
+    interpreter: Path, *, environment: Mapping[str, str]
+) -> tuple[Path, ...]:
+    """Enumerate a small, interpreter-scoped set of pytest dependency paths."""
+    root = _interpreter_environment_root(interpreter, environment=environment)
+    if root is None:
+        return ()
+    candidates: list[Path] = []
+    # The fixed layouts cover POSIX/Windows virtualenvs and the running
+    # interpreter's usual prefix.  Do not recursively search an environment.
+    for relative in (
+        Path("Lib") / "site-packages",
+        Path("lib") / "site-packages",
+        Path("lib64") / "site-packages",
+    ):
+        candidates.append(root / relative)
+    lib_dir = root / "lib"
+    try:
+        versioned_libs = sorted(
+            (entry for entry in lib_dir.iterdir() if entry.is_dir() and entry.name.startswith("python")),
+            key=lambda entry: entry.name,
+        )
+    except OSError:
+        versioned_libs = []
+    candidates.extend(entry / "site-packages" for entry in versioned_libs[:8])
+    paths: list[Path] = []
+    for site_packages in candidates:
+        paths.extend(
+            (
+                site_packages,
+                site_packages / "pytest",
+                site_packages / "pytest" / "__init__.py",
+                site_packages / "pytest.py",
+            )
+        )
+    return tuple(paths)
+
+
+def _pytest_dependency_identity(
+    interpreter: Path, *, environment: Mapping[str, str]
+) -> dict[str, object]:
+    """Fingerprint bounded pytest locations for the selected interpreter."""
+    paths = _pytest_dependency_paths(interpreter, environment=environment)
+    return {
+        "interpreter": str(interpreter),
+        "paths": [_stat_identity(path) for path in paths],
+    }
 
 
 def launcher_candidate_identity(
@@ -673,7 +756,15 @@ def launcher_candidate_identity(
     shebang_path = _resolve_shebang_path(shebang, cwd=cwd, environment=values)
     interpreter_path = shebang_path or path
     package_origin = Path(__file__).resolve(strict=False)
-    module_origin = _module_origin("pytest") if kind == "inner" else None
+    if kind == "inner":
+        # Never ask the agent-loop interpreter where pytest lives: that can be
+        # a different environment from ``<python> -m pytest``.  The bounded
+        # layout identity below is derived from the selected interpreter.
+        module_origin = None
+        dependency_identity = _pytest_dependency_identity(interpreter_path, environment=values)
+    else:
+        module_origin = None
+        dependency_identity = None
     prefix = (
         tokens[:3]
         if len(tokens) >= 3 and tokens[1:3] == ("-m", "pytest")
@@ -688,6 +779,7 @@ def launcher_candidate_identity(
         "interpreter": _stat_identity(interpreter_path),
         "package_origin": _stat_identity(package_origin),
         "module_origin": _stat_identity(module_origin) if module_origin is not None else None,
+        "pytest_dependency": dependency_identity,
         "virtual_env": _stat_identity(virtual_env) if virtual_env is not None else None,
         "path_environment_sha256": hashlib.sha256(
             values.get("PATH", "").encode("utf-8", errors="replace")
@@ -720,6 +812,21 @@ def _redacted_identity(identity: Mapping[str, object], *, cwd: Path) -> dict[str
                 )
                 if not keep_wrapper_path:
                     nested["path"] = _relative_or_basename(nested_path, cwd)
+            if key == "pytest_dependency":
+                interpreter = nested.get("interpreter")
+                if isinstance(interpreter, str):
+                    nested["interpreter"] = _relative_or_basename(interpreter, cwd)
+                paths = nested.get("paths")
+                if isinstance(paths, list):
+                    nested["paths"] = [
+                        {
+                            **dict(item),
+                            "path": _relative_or_basename(str(item["path"]), cwd),
+                        }
+                        if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+                        else item
+                        for item in paths
+                    ]
             result[key] = nested
         elif isinstance(value, (list, tuple)):
             result[key] = [
@@ -1087,6 +1194,8 @@ def _wrapper_candidates(environment: Mapping[str, str] | None = None) -> list[tu
 _WRAPPER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
 _INNER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
 _INNER_PREFLIGHT_CANDIDATES: dict[str, set[str]] = defaultdict(set)
+_INNER_PREFLIGHT_INFLIGHT: dict[tuple[str, str], threading.Event] = {}
+_INNER_PREFLIGHT_LOCK = threading.Lock()
 
 
 def preflight_wrapper_candidates(
@@ -1159,6 +1268,7 @@ def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mappi
     tokens = tuple(str(item) for item in argv)
     if not tokens:
         return None
+    values = environment if environment is not None else os.environ
     first = Path(tokens[0]).name
     if first in {"pytest", "py.test"}:
         executable = tokens[0]
@@ -1168,7 +1278,14 @@ def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mappi
             executable = shutil.which(executable, path=(environment or os.environ).get("PATH")) or executable
         return (executable, "--version")
     if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
-        return (tokens[0], "-m", "pytest", "--version")
+        interpreter = _python_interpreter_path(tokens[0], cwd=cwd, environment=values)
+        if interpreter is not None:
+            # Preserve the operator's current-interpreter spelling (including
+            # a symlink such as ``python3``) while still using the resolved
+            # identity for all other interpreters.
+            current = Path(sys.executable).resolve(strict=False)
+            executable = tokens[0] if interpreter == current else str(interpreter)
+            return (executable, "-m", "pytest", "--version")
     return None
 
 
@@ -1190,43 +1307,76 @@ def probe_inner_launcher(
     identity_key = _identity_key(identity)
     invocation = values.get("AGENT_LOOP_INVOCATION_ID")
     cache_key = (invocation, identity_key) if invocation else None
+    flight: threading.Event | None = None
+    owner = True
     if cache_key is not None:
-        cached = _INNER_PREFLIGHT_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
-        seen = _INNER_PREFLIGHT_CANDIDATES.setdefault(invocation, set())
-        if identity_key not in seen and len(seen) >= MAX_INNER_PROBE_CANDIDATES:
-            return LauncherProbeResult(
-                original,
-                "unknown",
-                f"inner probe candidate limit reached ({MAX_INNER_PROBE_CANDIDATES})",
-                identity_key,
-            )
-        seen.add(identity_key)
-    try:
-        completed = subprocess.run(
-            probe,
-            cwd=cwd,
-            env=(values if environment_is_complete or environment is not None else None),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+        with _INNER_PREFLIGHT_LOCK:
+            cached = _INNER_PREFLIGHT_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            flight = _INNER_PREFLIGHT_INFLIGHT.get(cache_key)
+            if flight is not None:
+                owner = False
+            else:
+                seen = _INNER_PREFLIGHT_CANDIDATES.setdefault(invocation, set())
+                if identity_key not in seen and len(seen) >= MAX_INNER_PROBE_CANDIDATES:
+                    return LauncherProbeResult(
+                        original,
+                        "unknown",
+                        f"inner probe candidate limit reached ({MAX_INNER_PROBE_CANDIDATES})",
+                        identity_key,
+                    )
+                seen.add(identity_key)
+                flight = threading.Event()
+                _INNER_PREFLIGHT_INFLIGHT[cache_key] = flight
+    if not owner:
+        assert flight is not None
+        # The owner has a five-second subprocess watchdog.  A small amount of
+        # headroom lets waiters receive its published result without ever
+        # starting a duplicate probe if the owner is slow to publish.
+        if flight.wait(LAUNCHER_PROBE_TIMEOUT_SECONDS + 1.0):
+            with _INNER_PREFLIGHT_LOCK:
+                cached = _INNER_PREFLIGHT_CACHE.get(cache_key)  # type: ignore[arg-type]
+            if cached is not None:
+                return cached
+        return LauncherProbeResult(
+            original,
+            "unknown",
+            "inner probe result was not published by its owner",
+            identity_key,
         )
-    except subprocess.TimeoutExpired:
-        result = LauncherProbeResult(original, "failed", "inner bootstrap probe timed out after 5s", identity_key)
-    except OSError as exc:
-        result = LauncherProbeResult(original, "failed", f"inner launcher did not start: {type(exc).__name__}", identity_key)
-    else:
-        output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
-        if completed.returncode == 0:
-            result = LauncherProbeResult(original, "verified", output, identity_key)
+    result: LauncherProbeResult | None = None
+    try:
+        try:
+            completed = subprocess.run(
+                probe,
+                cwd=cwd,
+                env=(values if environment_is_complete or environment is not None else None),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            result = LauncherProbeResult(original, "failed", "inner bootstrap probe timed out after 5s", identity_key)
+        except OSError as exc:
+            result = LauncherProbeResult(original, "failed", f"inner launcher did not start: {type(exc).__name__}", identity_key)
         else:
-            result = LauncherProbeResult(original, "failed", output or f"bootstrap exited {completed.returncode}", identity_key)
-    if cache_key is not None:
-        _INNER_PREFLIGHT_CACHE[cache_key] = result
-    return result
+            output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
+            if completed.returncode == 0:
+                result = LauncherProbeResult(original, "verified", output, identity_key)
+            else:
+                result = LauncherProbeResult(original, "failed", output or f"bootstrap exited {completed.returncode}", identity_key)
+        return result
+    finally:
+        if cache_key is not None:
+            assert flight is not None
+            with _INNER_PREFLIGHT_LOCK:
+                if result is not None:
+                    _INNER_PREFLIGHT_CACHE[cache_key] = result
+                _INNER_PREFLIGHT_INFLIGHT.pop(cache_key, None)
+                flight.set()
 
 
 def _git_commit(cwd: Path) -> str | None:

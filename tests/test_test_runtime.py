@@ -2,6 +2,7 @@ import json
 import os
 import shlex
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -521,6 +522,22 @@ def test_recognized_inner_probe_uses_only_safe_version_argv(tmp_path, monkeypatc
     assert calls[0][1]["timeout"] == 5.0
 
 
+def test_non_python_m_pytest_command_is_not_spawned_by_preflight(tmp_path, monkeypatch):
+    calls = []
+    non_python = tmp_path / "repo-script"
+    non_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    non_python.chmod(0o755)
+
+    monkeypatch.setattr(runtime.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    result = runtime.probe_inner_launcher(
+        [str(non_python), "-m", "pytest", "tests"], cwd=tmp_path
+    )
+
+    assert result.state == "unknown"
+    assert "unrecognized" in result.diagnostic
+    assert calls == []
+
+
 def test_wrapper_preflight_has_fixed_argv_and_per_invocation_cache(tmp_path, monkeypatch):
     calls = []
     wrapper = tmp_path / "agent-loop"
@@ -682,16 +699,138 @@ def test_inner_probe_enforces_six_new_candidates_per_invocation(tmp_path, monkey
 
     monkeypatch.setattr(runtime.subprocess, "run", fake_run)
     for index in range(runtime.MAX_INNER_PROBE_CANDIDATES):
+        interpreter = tmp_path / f"venv-{index}" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("python\n", encoding="utf-8")
+        interpreter.chmod(0o755)
         result = runtime.probe_inner_launcher(
-            [str(tmp_path / f"python-{index}"), "-m", "pytest"], cwd=tmp_path
+            [str(interpreter), "-m", "pytest"], cwd=tmp_path
         )
         assert result.state == "verified"
+    over_limit = tmp_path / "venv-over-limit" / "bin" / "python"
+    over_limit.parent.mkdir(parents=True)
+    over_limit.write_text("python\n", encoding="utf-8")
+    over_limit.chmod(0o755)
     limited = runtime.probe_inner_launcher(
-        [str(tmp_path / "python-over-limit"), "-m", "pytest"], cwd=tmp_path
+        [str(over_limit), "-m", "pytest"], cwd=tmp_path
     )
     assert limited.state == "unknown"
     assert "candidate limit" in limited.diagnostic
     assert len(calls) == runtime.MAX_INNER_PROBE_CANDIDATES
+
+
+def test_alternate_interpreter_dependency_repair_invalidates_failed_probe(tmp_path, monkeypatch):
+    venv = tmp_path / "alternate-venv"
+    interpreter = venv / "bin" / "python"
+    site_packages = venv / "lib" / "python3.12" / "site-packages"
+    interpreter.parent.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    interpreter.write_text("python\n", encoding="utf-8")
+    interpreter.chmod(0o755)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "alternate-interpreter-repair-test")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        if len(calls) == 1:
+            return type("Completed", (), {"returncode": 1, "stdout": "", "stderr": "No module named pytest"})()
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    command = [str(interpreter), "-m", "pytest", "tests"]
+    first = runtime.probe_inner_launcher(command, cwd=tmp_path)
+    assert first.state == "failed"
+
+    pytest_package = site_packages / "pytest"
+    pytest_package.mkdir()
+    (pytest_package / "__init__.py").write_text("__version__ = '9'\n", encoding="utf-8")
+    second = runtime.probe_inner_launcher(command, cwd=tmp_path)
+
+    assert second.state == "verified"
+    assert len(calls) == 2
+    assert calls[0][0] == (str(interpreter.resolve()), "-m", "pytest", "--version")
+    identity = runtime.launcher_candidate_identity(command, cwd=tmp_path)
+    redacted = runtime._redacted_identity(identity, cwd=tmp_path)
+    assert str(venv) not in json.dumps(redacted)
+
+
+def test_inner_probe_concurrent_same_identity_runs_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inner-concurrency-same-test")
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        started.set()
+        assert release.wait(5)
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    command = [sys.executable, "-m", "pytest", "tests"]
+    results = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(runtime.probe_inner_launcher(command, cwd=tmp_path))
+        )
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    assert started.wait(5)
+    release.set()
+    for thread in threads:
+        thread.join(5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(results) == len(threads)
+    assert all(result.state == "verified" for result in results)
+    assert calls == [(sys.executable, "-m", "pytest", "--version")]
+
+
+def test_inner_probe_concurrent_distinct_identities_respects_candidate_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inner-concurrency-limit-test")
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    calls_lock = threading.Lock()
+
+    def fake_run(argv, **kwargs):
+        with calls_lock:
+            calls.append(tuple(argv))
+            if len(calls) == runtime.MAX_INNER_PROBE_CANDIDATES:
+                started.set()
+        assert release.wait(5)
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    interpreters = []
+    for index in range(runtime.MAX_INNER_PROBE_CANDIDATES + 2):
+        interpreter = tmp_path / f"concurrent-venv-{index}" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("python\n", encoding="utf-8")
+        interpreter.chmod(0o755)
+        interpreters.append(interpreter)
+    results = []
+    threads = [
+        threading.Thread(
+            target=lambda interpreter=interpreter: results.append(
+                runtime.probe_inner_launcher([str(interpreter), "-m", "pytest"], cwd=tmp_path)
+            )
+        )
+        for interpreter in interpreters
+    ]
+    for thread in threads:
+        thread.start()
+    assert started.wait(5)
+    release.set()
+    for thread in threads:
+        thread.join(5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(calls) == runtime.MAX_INNER_PROBE_CANDIDATES
+    assert sum(result.state == "verified" for result in results) == runtime.MAX_INNER_PROBE_CANDIDATES
+    assert sum(result.state == "unknown" for result in results) == 2
 
 
 def test_cli_overlap_rejection_writes_no_runtime_evidence(tmp_path, monkeypatch):
