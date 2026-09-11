@@ -39,6 +39,8 @@ from coding_review_agent_loop.github import (
     get_pr_checks,
 )
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+from coding_review_agent_loop.memory import AgentMemoryContext
+import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.migrations import MigrationValidationResult
 from coding_review_agent_loop.managed_ci import (
     ManagedCiContract,
@@ -58,7 +60,9 @@ from coding_review_agent_loop.orchestrator import (
 from coding_review_agent_loop.prompts import (
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+    build_followup_prompt,
 )
+import coding_review_agent_loop.test_runtime as runtime
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     ReviewItemDisposition,
@@ -81,6 +85,33 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_pr_review,
 )
+
+
+def test_pr_resume_prompt_uses_current_wrapper_health_without_dropping_command(
+    tmp_path, monkeypatch
+):
+    config = make_config(
+        tmp_path,
+        test_command=("pytest", "tests/test_protocol.py", "-q"),
+    )
+    memory = AgentMemoryContext(
+        memory_dir=tmp_path / "memory",
+        current_commit=None,
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary=None,
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+    )
+    monkeypatch.setattr(
+        prompts_module,
+        "preflight_wrapper_candidates",
+        lambda **_kwargs: (runtime.LauncherProbeResult(("/opt/agent-loop", "run-tests"), "failed", "import failed"),),
+    )
+    prompt = build_followup_prompt(768, 2, "Repair the launcher path.", config, memory=memory)
+    assert "pytest tests/test_protocol.py -q" in prompt
+    assert "no wrapper candidate verified" in prompt
 
 
 def _assert_pending_ci_stop_guidance(text):

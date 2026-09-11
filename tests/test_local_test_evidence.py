@@ -466,6 +466,46 @@ def test_broker_authenticates_turn_and_forwards_only_snapshot_environment(tmp_pa
         server.stop()
 
 
+@pytest.mark.parametrize(
+    ("outcome", "inner_exec", "suite_start"),
+    (
+        ("launch-failed", "failed", "not-started"),
+        ("overlap-rejected", "not-attempted", "not-started"),
+    ),
+)
+def test_broker_startup_and_overlap_states_do_not_create_suite_observations(
+    tmp_path, outcome, inner_exec, suite_start
+):
+    def execute(argv, cwd, timeout, environment, stream):
+        return SimpleNamespace(
+            outcome=outcome,
+            returncode=None if outcome == "launch-failed" else 125,
+            elapsed_seconds=0.01,
+            output_tail="launcher diagnostic",
+            diagnostic="launcher diagnostic",
+            wrapper_bootstrap="verified",
+            inner_exec=inner_exec,
+            suite_start=suite_start,
+        )
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-launch-state", execute=execute).start()
+    try:
+        environment = {
+            **server.environment,
+            "AGENT_LOOP_INVOCATION_ID": "turn-launch-state",
+            "PATH": os.environ.get("PATH", ""),
+        }
+        result = BrokerClient(environment).run(
+            [sys.executable, "-c", "pass"], timeout_seconds=5, cwd=tmp_path
+        )
+        assert result.outcome == outcome
+        assert result.inner_exec == inner_exec
+        assert result.suite_start == suite_start
+        assert server.journal == ()
+    finally:
+        server.stop()
+
+
 def _signed_broker_request(server, tmp_path, raw_nonce, argv=None):
     nonce = raw_nonce + "." + hmac.new(
         server.capability.encode("ascii"), raw_nonce.encode("ascii"), hashlib.sha256

@@ -40,13 +40,16 @@ LOCAL_TEST_EVIDENCE_SCHEMA = "local-test-evidence-v1"
 LOCAL_TEST_EVIDENCE_FIELD = "local_test_evidence"
 
 OUTCOMES = frozenset(
-    {"passed", "failed", "timed_out", "interrupted", "incomplete", "overlap-rejected"}
+    {"passed", "failed", "timed_out", "interrupted", "incomplete", "overlap-rejected", "launch-failed"}
 )
 PROVENANCES = frozenset({"parent-observed", "telemetry-unverified", "self-reported"})
 CLAIMS = frozenset({"current-result", "base-reproduction"})
 ENVIRONMENT_STATES = frozenset(
     {"equivalent", "different", "unknown", "identity-unknown", "not-compared"}
 )
+WRAPPER_BOOTSTRAP_STATES = frozenset({"verified", "failed", "unknown"})
+INNER_EXEC_STATES = frozenset({"not-attempted", "started", "failed"})
+SUITE_START_STATES = frozenset({"not-started", "verified", "unknown"})
 ATTRIBUTIONS = frozenset(
     {
         "current-head",
@@ -328,6 +331,9 @@ class LocalTestObservation:
     diagnostic: str | None = field(default=None, repr=False, compare=False)
     claim: str | None = None
     superseded_by: str | None = None
+    wrapper_bootstrap: str = "unknown"
+    inner_exec: str = "not-attempted"
+    suite_start: str = "not-started"
 
     def __post_init__(self) -> None:
         if self.outcome not in OUTCOMES:
@@ -336,17 +342,23 @@ class LocalTestObservation:
             raise AgentLoopError(f"unknown local test provenance: {self.provenance}")
         if self.environment_state not in ENVIRONMENT_STATES:
             raise AgentLoopError(f"unknown environment comparison: {self.environment_state}")
+        if self.wrapper_bootstrap not in WRAPPER_BOOTSTRAP_STATES:
+            raise AgentLoopError(f"unknown wrapper bootstrap state: {self.wrapper_bootstrap}")
+        if self.inner_exec not in INNER_EXEC_STATES:
+            raise AgentLoopError(f"unknown inner exec state: {self.inner_exec}")
+        if self.suite_start not in SUITE_START_STATES:
+            raise AgentLoopError(f"unknown suite start state: {self.suite_start}")
 
     @property
     def is_failure(self) -> bool:
-        return self.outcome in {"failed", "timed_out", "interrupted", "incomplete"}
+        return self.outcome in {"failed", "timed_out", "interrupted", "incomplete", "launch-failed"}
 
     def public_projection(self) -> dict[str, object]:
         command, _, _ = redact_test_command(
             self.command,
             cwd=Path(self.cwd) if self.cwd else None,
         )
-        return {
+        projection = {
             "command": _bounded(command, MAX_SAFE_COMMAND_BYTES),
             "receipt_id": _safe_text(self.receipt_id or "", MAX_SAFE_IDENTIFIER_BYTES),
             "turn_id": _safe_text(self.turn_id or "", MAX_SAFE_IDENTIFIER_BYTES),
@@ -367,6 +379,17 @@ class LocalTestObservation:
                 for item in self.identifiers[:MAX_SAFE_IDENTIFIERS]
             ],
         }
+        # Keep the legacy wire size stable for restored rows while carrying
+        # explicit state whenever a live runner supplied it.
+        if (self.wrapper_bootstrap, self.inner_exec, self.suite_start) != (
+            "unknown", "not-attempted", "not-started"
+        ):
+            projection.update(
+                wrapper_bootstrap=self.wrapper_bootstrap,
+                inner_exec=self.inner_exec,
+                suite_start=self.suite_start,
+            )
+        return projection
 
     def to_dict(self) -> dict[str, object]:
         return self.public_projection()
@@ -441,6 +464,9 @@ def observation_from_mapping(
         identifiers=tuple(_safe_text(item, MAX_SAFE_IDENTIFIER_BYTES) for item in value.get("identifiers", ()) if item is not None),
         diagnostic=str(value["diagnostic"]) if value.get("diagnostic") is not None else None,
         claim=str(value["claim"]) if value.get("claim") is not None else None,
+        wrapper_bootstrap=str(value.get("wrapper_bootstrap", "unknown")),
+        inner_exec=str(value.get("inner_exec", "not-attempted")),
+        suite_start=str(value.get("suite_start", "not-started")),
     )
 
 
@@ -1620,6 +1646,10 @@ class BrokerRunResult:
     elapsed_seconds: float
     output_tail: str = ""
     error: str | None = None
+    wrapper_bootstrap: str = "unknown"
+    inner_exec: str = "not-attempted"
+    suite_start: str = "not-started"
+    diagnostic: str = ""
 
 
 @dataclass
@@ -1981,6 +2011,8 @@ class TestBrokerServer:
                     parent_cgroup_path=parent_cgroup,
                     process_started=started,
                     process_finished=finished,
+                    wrapper_bootstrap="verified",
+                    health_provenance="broker-parent",
                 )
             after = stable_tracked_tree_snapshot(
                 self.root,
@@ -1993,25 +2025,30 @@ class TestBrokerServer:
         # Keep the shared registry private to the broker process; the bytes are
         # not present in the journal's public projection.
         receipt_id = uuid.uuid4().hex
-        observation = LocalTestObservation(
-            command=argv,
-            outcome=str(result.outcome),
-            provenance="parent-observed",
-            scope=EvidenceScope("unknown", ()),
-            receipt_id=receipt_id,
-            turn_id=self.turn_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            cwd=str(cwd),
-            normalized_command=normalize_test_command(argv, cwd=cwd),
-            returncode=result.returncode,
-            attribution=attribution,
-            environment_state="not-compared",
-            environment_identity=identity,
-            caveats=("output stream was broker-forwarded",),
-            diagnostic=getattr(result, "output_tail", None),
-        )
-        with self._journal_lock:
-            self._append_journal_locked(observation)
+        suite_start = str(getattr(result, "suite_start", "unknown"))
+        if suite_start != "not-started" and str(getattr(result, "outcome", "")) != "overlap-rejected":
+            observation = LocalTestObservation(
+                command=argv,
+                outcome=str(result.outcome),
+                provenance="parent-observed",
+                scope=EvidenceScope("unknown", ()),
+                receipt_id=receipt_id,
+                turn_id=self.turn_id,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                cwd=str(cwd),
+                normalized_command=normalize_test_command(argv, cwd=cwd),
+                returncode=result.returncode,
+                attribution=attribution,
+                environment_state="not-compared",
+                environment_identity=identity,
+                caveats=("output stream was broker-forwarded",),
+                diagnostic=getattr(result, "output_tail", None),
+                wrapper_bootstrap=str(getattr(result, "wrapper_bootstrap", "unknown")),
+                inner_exec=str(getattr(result, "inner_exec", "not-attempted")),
+                suite_start=suite_start,
+            )
+            with self._journal_lock:
+                self._append_journal_locked(observation)
         return {
             "type": "result",
             "receipt_id": receipt_id,
@@ -2019,6 +2056,10 @@ class TestBrokerServer:
             "returncode": result.returncode,
             "elapsed_seconds": float(result.elapsed_seconds),
             "output_tail": _safe_text(getattr(result, "output_tail", ""), 8 * 1024),
+            "wrapper_bootstrap": str(getattr(result, "wrapper_bootstrap", "unknown")),
+            "inner_exec": str(getattr(result, "inner_exec", "not-attempted")),
+            "suite_start": suite_start,
+            "diagnostic": _safe_text(getattr(result, "diagnostic", ""), MAX_SAFE_CAVEAT_BYTES),
         }
 
 
@@ -2089,6 +2130,10 @@ class TestBrokerClient:
                     returncode=(int(response["returncode"]) if isinstance(response.get("returncode"), int) else None),
                     elapsed_seconds=float(response.get("elapsed_seconds", 0.0)),
                     output_tail=str(response.get("output_tail", "")),
+                    wrapper_bootstrap=str(response.get("wrapper_bootstrap", "unknown")),
+                    inner_exec=str(response.get("inner_exec", "not-attempted")),
+                    suite_start=str(response.get("suite_start", "not-started")),
+                    diagnostic=str(response.get("diagnostic", "")),
                 )
 
 

@@ -35,7 +35,13 @@ from .protocol import (
 )
 from .protocol_markers import sanitize_historical_text
 from .workdirs import agent_workdir
-from .test_runtime import recommend_timeout, render_runtime_context, render_test_wrapper
+from .test_runtime import (
+    preflight_wrapper_candidates,
+    recommend_timeout,
+    relevant_launcher_health,
+    render_runtime_context,
+    render_test_wrapper,
+)
 
 if TYPE_CHECKING:
     from .round_state import ApprovedPlanContext
@@ -116,6 +122,37 @@ def _memory_block(
                     # external executable through a different PATH entry.
                     remembered_keys[command] = (normalized, fingerprint)
         commands = commands[:6]
+        wrapper_results = preflight_wrapper_candidates(
+            cwd=cwd,
+            memory_dir=memory.memory_dir,
+            repository=config.repo,
+        )
+        verified_prefix = next(
+            (item.candidate for item in wrapper_results if item.state == "verified"),
+            None,
+        )
+        # Health is scoped to the candidate identities that are actually
+        # relevant to this prompt. Do not surface stale failures from an old
+        # wrapper install or an unrelated remembered command.
+        health_candidates = [*commands, *(item.candidate for item in wrapper_results)]
+        health_rows: list[dict] = []
+        seen_health: set[tuple[object, ...]] = set()
+        for candidate in health_candidates:
+            for row in relevant_launcher_health(
+                memory.memory_dir,
+                cwd=cwd,
+                candidate=candidate,
+                repository=config.repo,
+            ):
+                key = (
+                    row.get("candidate_key"),
+                    row.get("state"),
+                    row.get("timestamp"),
+                    row.get("diagnostic"),
+                )
+                if key not in seen_health:
+                    seen_health.add(key)
+                    health_rows.append(row)
         if commands:
             recommendations = {}
             for command in commands:
@@ -138,30 +175,64 @@ def _memory_block(
             invocation_lines = []
             for command in commands:
                 recommendation = recommendations[command]
-                wrapper = render_test_wrapper(
-                    command,
-                    timeout_seconds=(
-                        recommendation.recommended_timeout_seconds
-                        if recommendation.successful_samples or recommendation.unresolved_timeout_seconds
-                        else None
-                    ),
-                    memory_dir=memory.memory_dir,
-                )
-                invocation_lines.append(f"  Invocation guidance: {wrapper}")
+                if verified_prefix is not None:
+                    wrapper = render_test_wrapper(
+                        command,
+                        timeout_seconds=(
+                            recommendation.recommended_timeout_seconds
+                            if recommendation.successful_samples or recommendation.unresolved_timeout_seconds
+                            else None
+                        ),
+                        memory_dir=memory.memory_dir,
+                        prefix=verified_prefix,
+                    )
+                    invocation_lines.append(f"  Invocation guidance: {wrapper}")
             invocation_guidance = "\n".join(invocation_lines)
         else:
             runtime_text = "- No observed local test timings are available for this checkout."
             placeholder_command = ("<test-command>",)
+            invocation_guidance = ""
+            if verified_prefix is not None:
+                invocation_guidance = (
+                    "  Invocation guidance: "
+                    f"{render_test_wrapper(placeholder_command, memory_dir=memory.memory_dir, prefix=verified_prefix)}"
+                )
+        if verified_prefix is None:
+            diagnostics = [item.diagnostic for item in wrapper_results if item.diagnostic]
             invocation_guidance = (
-                "  Invocation guidance: "
-                f"{render_test_wrapper(placeholder_command, memory_dir=memory.memory_dir)}"
+                "  Wrapper diagnostic: no wrapper candidate verified in this invocation; "
+                "repair/bootstrap the configured command or use it manually."
             )
+            if diagnostics:
+                invocation_guidance += " Evidence: " + " | ".join(diagnostics[:2])
+        if health_rows:
+            health_lines = ["  Launcher-health advisory evidence (not runnable commands):"]
+            if any(
+                row.get("state") == "failed"
+                and isinstance(row.get("candidate_identity"), dict)
+                and row["candidate_identity"].get("kind") == "inner"
+                for row in health_rows
+            ):
+                health_lines.append(
+                    "  The affected inner launcher is not present or bootstrapable at prompt render time; "
+                    "bootstrap it or use the verified alternative."
+                )
+            for row in health_rows[:8]:
+                health_lines.append(
+                    "  - "
+                    f"{row.get('state')} via {row.get('provenance')}: "
+                    f"{row.get('diagnostic') or 'no diagnostic'}"
+                )
+            invocation_guidance = invocation_guidance + "\n" + "\n".join(health_lines)
         runtime = (
             "\n\nObserved local test timing (advisory):\n"
             f"{runtime_text}\n"
             f"{invocation_guidance}\n"
             "  The wrapper watchdog is for the whole command; omit --timeout-seconds for an "
-            "unknown command to select the inherited configured ceiling."
+            "unknown command to select the inherited configured ceiling. Wrapper/parent "
+            "observations are authoritative only for their boundary; direct agent shell "
+            "failures are not comprehensively observable, and agent-reported diagnostics "
+            "are advisory and cannot alone suppress a command."
         )
     return f"Agent memory context:\n{text}{runtime}\n"
 

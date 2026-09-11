@@ -1455,6 +1455,11 @@ def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts(monkeypatch, t
     ).resolve()
 
 
+def test_run_tests_preflight_is_a_non_mutating_success_path(monkeypatch, capsys):
+    assert main(["run-tests", "--preflight"]) == 0
+    assert capsys.readouterr().out.strip() == "agent-loop preflight: verified"
+
+
 def test_config_enables_ci_watch_with_auto_merge_without_rebuilding_antigravity_model(tmp_path):
     parser = build_parser()
     args = parser.parse_args([

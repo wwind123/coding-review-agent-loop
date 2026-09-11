@@ -28,7 +28,15 @@ from .containment import (
     sample_cgroup,
 )
 from .errors import AgentLoopError
-from .test_runtime import OVERLAP_REJECTED_EXIT_CODE, OVERLAP_REJECTED_MESSAGE, acquire_command_lane
+from .test_runtime import (
+    INNER_EXEC_STATES,
+    OVERLAP_REJECTED_EXIT_CODE,
+    OVERLAP_REJECTED_MESSAGE,
+    SUITE_START_STATES,
+    WRAPPER_BOOTSTRAP_STATES,
+    acquire_command_lane,
+    probe_inner_launcher,
+)
 from .local_test_evidence import (
     EvidenceScope,
     TestBrokerServer,
@@ -87,6 +95,19 @@ class ForegroundTestResult:
     output_tail: str = ""
     containment: ContainmentEvidence | None = None
     overlap_rejected: bool = False
+    wrapper_bootstrap: str = "unknown"
+    inner_exec: str = "not-attempted"
+    suite_start: str = "not-started"
+    diagnostic: str = ""
+    health_provenance: str = "parent-runner"
+
+    def __post_init__(self) -> None:
+        if self.wrapper_bootstrap not in WRAPPER_BOOTSTRAP_STATES:
+            raise ValueError(f"unknown wrapper bootstrap state: {self.wrapper_bootstrap}")
+        if self.inner_exec not in INNER_EXEC_STATES:
+            raise ValueError(f"unknown inner exec state: {self.inner_exec}")
+        if self.suite_start not in SUITE_START_STATES:
+            raise ValueError(f"unknown suite start state: {self.suite_start}")
 
     @property
     def passed(self) -> bool:
@@ -135,6 +156,17 @@ def _drain_nonblocking_test_output(
         consume(chunk)
 
 
+def _close_held_fds(held_fds: tuple[int, int, int, int] | None) -> None:
+    """Close broker handshake descriptors on every pre-exec failure path."""
+    if held_fds is None:
+        return
+    for fd in held_fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def run_foreground_test(
     args: Sequence[str],
     *,
@@ -151,13 +183,19 @@ def run_foreground_test(
     parent_cgroup_path: Path | None = None,
     process_started: Callable[[subprocess.Popen], None] | None = None,
     process_finished: Callable[[subprocess.Popen], None] | None = None,
+    wrapper_bootstrap: str = "unknown",
+    health_provenance: str = "parent-runner",
 ) -> ForegroundTestResult:
     """Run a command in the foreground, teeing output and bounding its process group."""
     cmd = [str(value) for value in args]
     started = time.monotonic()
     if dry_run:
         print(f"[dry-run] ({cwd}) {' '.join(cmd)}")
-        return ForegroundTestResult(cmd, cwd, "passed", 0, 0.0, timeout_seconds)
+        return ForegroundTestResult(
+            cmd, cwd, "passed", 0, 0.0, timeout_seconds,
+            wrapper_bootstrap=wrapper_bootstrap, inner_exec="started", suite_start="unknown",
+            health_provenance=health_provenance,
+        )
     if not cmd:
         raise AgentLoopError("Test command is empty.")
     lane_lock = acquire_command_lane(cmd, cwd=cwd, env=env)
@@ -166,6 +204,8 @@ def run_foreground_test(
         return ForegroundTestResult(
             cmd, cwd, "overlap-rejected", OVERLAP_REJECTED_EXIT_CODE,
             0.0, timeout_seconds, OVERLAP_REJECTED_MESSAGE, None, True,
+            wrapper_bootstrap, "not-attempted", "not-started", OVERLAP_REJECTED_MESSAGE,
+            health_provenance,
         )
     selector = None
     handle: InvocationHandle | None = None
@@ -175,8 +215,33 @@ def run_foreground_test(
     last_cgroup: dict[str, object] = {}
     target_exec_error = False
     proc: subprocess.Popen[bytes] | None = None
+    inner_probe_state = "unknown"
+    held_fds: tuple[int, int, int, int] | None = None
     try:
-        held_fds: tuple[int, int, int, int] | None = None
+        spawn_environment = (
+            dict(env)
+            if env is not None and environment_is_complete
+            else ({**os.environ, **env} if env is not None else None)
+        )
+        # Probe before allocating containment leases or broker handshake pipes.
+        # The probe receives exactly the environment that the real target will
+        # receive, including the ambient environment for partial overlays.
+        inner_probe = probe_inner_launcher(
+            cmd,
+            cwd=cwd,
+            environment=spawn_environment,
+            environment_is_complete=spawn_environment is not None,
+        )
+        inner_probe_state = inner_probe.state
+        if inner_probe.state == "failed":
+            lane_lock.close()
+            return ForegroundTestResult(
+                cmd, cwd, "launch-failed", None, time.monotonic() - started,
+                timeout_seconds, inner_probe.diagnostic, None, False,
+                wrapper_bootstrap, "failed", "not-started", inner_probe.diagnostic,
+                health_provenance,
+            )
+        suite_start = "verified" if inner_probe.state == "verified" else "unknown"
         pass_fds: tuple[int, ...] = ()
         if parent_cgroup_path is not None:
             ready_read, ready_write = os.pipe()
@@ -227,23 +292,30 @@ def run_foreground_test(
             # directory handle is still private to this parent process.
             spawn_cwd = "/"
             spawn_preexec = lambda fd=cwd_fd: os.fchdir(fd)
-        proc = subprocess.Popen(
-            spawn_cmd,
-            cwd=spawn_cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=False,
-            bufsize=0,
-            start_new_session=True,
-            env=(
-                dict(env)
-                if environment_is_complete and env is not None
-                else ({**os.environ, **env} if env is not None else None)
-            ),
-            preexec_fn=spawn_preexec,
-            pass_fds=pass_fds,
-        )
+        try:
+            proc = subprocess.Popen(
+                spawn_cmd,
+                cwd=spawn_cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=False,
+                bufsize=0,
+                start_new_session=True,
+                env=spawn_environment,
+                preexec_fn=spawn_preexec,
+                pass_fds=pass_fds,
+            )
+        except OSError as exc:
+            if handle is not None:
+                handle.close()
+            _close_held_fds(held_fds)
+            lane_lock.close()
+            return ForegroundTestResult(
+                cmd, cwd, "launch-failed", None, time.monotonic() - started,
+                timeout_seconds, str(exc), None, False,
+                wrapper_bootstrap, "failed", "not-started", str(exc), health_provenance,
+            )
         if process_started is not None:
             process_started(proc)
         if held_fds is not None:
@@ -447,12 +519,19 @@ def run_foreground_test(
         )
     lane_lock.close()
     outcome = "interrupted" if interrupted else ("timed_out" if timed_out else ("passed" if returncode == 0 else "failed"))
+    inner_exec = "started"
+    suite_start = "verified" if inner_probe_state == "verified" else "unknown"
     if target_exec_error and not timed_out and not interrupted:
         returncode = None
-        outcome = "failed"
+        outcome = "launch-failed"
+        inner_exec = "failed"
+        suite_start = "not-started"
     return ForegroundTestResult(
         cmd, cwd, outcome, (124 if timed_out else 130 if interrupted else returncode),
-        elapsed, timeout_seconds, "\n".join(tail), evidence,
+        elapsed, timeout_seconds, "\n".join(tail), evidence, False,
+        wrapper_bootstrap, inner_exec, suite_start,
+        "\n".join(handle.diagnostics) if handle is not None else "",
+        health_provenance,
     )
 
 
@@ -1024,10 +1103,14 @@ class Runner:
         """
         if type(self).run_with_log is not Runner.run_with_log:
             result = self.run(args, cwd=cwd, check=False, env=env)
-            outcome = "passed" if result.returncode == 0 else "failed"
+            outcome = "passed" if result.returncode == 0 else ("failed" if result.returncode is not None else "launch-failed")
             return ForegroundTestResult(
                 list(map(str, args)), cwd, outcome, result.returncode, 0.0,
                 timeout_seconds, tail_text(result.stdout or result.stderr),
+                wrapper_bootstrap="unknown",
+                inner_exec="started" if result.returncode is not None else "failed",
+                suite_start="unknown" if result.returncode is not None else "not-started",
+                diagnostic=tail_text(result.stdout or result.stderr),
             )
         return run_foreground_test(
             args,

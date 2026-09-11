@@ -8,7 +8,7 @@ from .github import PullRequestChecks
 from .logging import log
 from .errors import AgentLoopError
 from .runner import Runner
-from .test_runtime import record_test_observation
+from .test_runtime import record_launcher_health, record_test_observation
 from .workdirs import active_workdir
 
 
@@ -47,6 +47,31 @@ def run_pre_review_tests(runner: Runner, config: AgentLoopConfig) -> None:
 def _record_gate_observation(config: AgentLoopConfig, result) -> None:
     if config.dry_run or not config.agent_memory:
         return
+    if getattr(result, "overlap_rejected", False) or getattr(result, "outcome", "") == "overlap-rejected":
+        return
+    if getattr(result, "inner_exec", "not-attempted") == "failed":
+        record_launcher_health(
+            config.agent_memory_dir,
+            cwd=result.cwd,
+            candidate=result.args,
+            state="failed",
+            provenance=getattr(result, "health_provenance", "parent-runner"),
+            repository=config.repo,
+            diagnostic=getattr(result, "diagnostic", "") or getattr(result, "output_tail", ""),
+        )
+        return
+    if getattr(result, "suite_start", "unknown") == "verified":
+        record_launcher_health(
+            config.agent_memory_dir,
+            cwd=result.cwd,
+            candidate=result.args,
+            state="verified",
+            provenance=getattr(result, "health_provenance", "parent-runner"),
+            repository=config.repo,
+            diagnostic=getattr(result, "diagnostic", ""),
+        )
+    if getattr(result, "suite_start", "unknown") == "not-started":
+        return
     record_test_observation(
         config.agent_memory_dir,
         argv=result.args,
@@ -61,6 +86,18 @@ def _record_gate_observation(config: AgentLoopConfig, result) -> None:
 
 
 def _raise_for_gate_result(result, config: AgentLoopConfig) -> None:
+    if getattr(result, "overlap_rejected", False):
+        raise AgentLoopError(
+            "Local test command was not started because an identical managed command "
+            "is already running in this invocation lane; wait for it to exit before retrying."
+        )
+    if getattr(result, "outcome", "") == "launch-failed" or getattr(result, "inner_exec", "started") == "failed":
+        detail = getattr(result, "diagnostic", "") or getattr(result, "output_tail", "") or "no launcher diagnostic"
+        raise AgentLoopError(
+            "Local test command could not start; this is a launcher/bootstrap failure, "
+            f"not a test-suite result: {' '.join(result.args)}\n{detail}\n"
+            "Repair the configured executable or interpreter and retry the configured command."
+        )
     evidence = getattr(result, "containment", None)
     if evidence is not None and evidence.resource_exhausted and result.outcome != "passed":
         raise AgentLoopError(

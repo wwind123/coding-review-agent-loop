@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from .logging import log
 from .runner import Runner, ensure_log_dir_ignored
 from .workdirs import active_workdir
-from .test_runtime import load_runtime_memory
+from .test_runtime import load_launcher_health, load_runtime_memory
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
@@ -37,6 +37,7 @@ class AgentMemoryContext:
     test_profile: str | None
     toolchain: str | None
     runtime_observations: tuple[dict, ...] = ()
+    launcher_health: tuple[dict, ...] = ()
 
 
 def prepare_agent_memory(runner: Runner, config: AgentLoopConfig) -> AgentMemoryContext | None:
@@ -117,6 +118,7 @@ def load_agent_memory(config: AgentLoopConfig) -> AgentMemoryContext | None:
         test_profile=_read_optional(memory_dir / "test-profile.md"),
         toolchain=_read_optional(memory_dir / "toolchain.json"),
         runtime_observations=tuple(load_runtime_memory(memory_dir)),
+        launcher_health=tuple(load_launcher_health(memory_dir)),
     )
 
 

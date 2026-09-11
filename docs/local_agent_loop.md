@@ -2882,6 +2882,67 @@ Agents may use a learned sub-ceiling recommendation when rendered, but must
 continue to select focused tests and may split or shard long browser,
 integration, or end-to-end matrices.
 
+### Launcher preflight and health memory
+
+`run-tests --preflight` is a bounded, non-mutating wrapper probe. It checks at
+most two candidates—the absolute `agent-loop` console entry and the current
+interpreter's `-m coding_review_agent_loop.cli` fallback—once per invocation,
+with a five-second watchdog. Recognized inner launcher probes are separately
+limited to six distinct candidate identities per invocation. Inner probes use
+the effective target environment, including ambient values merged with a
+partial overlay. Candidates are executed directly, including the
+console script's own shebang interpreter. A fixed `agent-loop preflight:
+verified` response proves startup; a non-start, timeout, or explicit import /
+bootstrap failure is unhealthy, while ambiguous output remains unknown. The
+probe does not run remembered test argv, install packages, access live
+databases, cross the assigned checkout, or alter the operator's configured
+command. Probe cleanup is process-tree aware: POSIX probes use a dedicated
+process group, while Windows probes use a kill-on-close Job Object. If the
+Windows owning boundary cannot be created or assigned, the probe is not
+launched and remains unknown. The candidate cache includes executable,
+shebang, interpreter,
+package-origin, virtualenv, and invocation identity so repair or replacement
+causes a fresh probe.
+
+For the recognized inner forms direct `pytest`/`py.test` and exactly
+`<python> -m pytest`, agent-loop performs a fixed `--version` bootstrap probe
+under the same five-second bound. Other launchers are never classified from
+stderr or an exit code. Results carry independent `wrapper_bootstrap`,
+`inner_exec`, and `suite_start` states plus the existing suite outcome. Direct
+exec failure and a containment `target-exec-error` are launch failures;
+overlap rejection is coordination; collection/configuration errors, ordinary
+failing tests, timeout, and interruption after startup are suite results.
+Python identity is established without executing an untrusted candidate: the
+running interpreter and symlinks to it are trusted, and a conventional
+`pyvenv.cfg` interpreter is trusted only when it is a byte-for-byte copy of
+the running interpreter. Name-only scripts and arbitrary ELF/MZ binaries stay
+unknown and are never spawned by preflight.
+
+The schema-v1 runtime sidecar keeps suite timing in `observations` and stores
+bounded launcher health separately in `launcher_health`. Health rows include
+repository slug, a SHA-256 assigned-checkout identity, environment fingerprint,
+candidate identity, UTC timestamp, state, provenance, and a whitespace-collapsed
+diagnostic of at most 240 characters. External executable/interpreter/source
+paths are reduced to checkout-relative paths or basenames; only the exact
+canonical managed-wrapper path is retained. Rows are independently validated,
+locked, atomically written, capped at eight records per scoped identity and 100
+identities, deduplicated, and expired after 24 hours. A successful matching
+probe removes prior failures immediately. Scope or identity changes—including
+wrapper reinstall, interpreter/dependency changes, virtualenv recreation,
+checkout changes, and environment changes—permit a fresh probe.
+
+Coder and PR-resume prompts load health separately from timing memory. Timing
+rows remain the only source of timeout recommendations and remembered command
+discovery. The configured command is always retained and a missing inner
+launcher is annotated rather than removed. Managed invocation guidance is
+emitted only from a wrapper verified in the current invocation; otherwise the
+prompt gives an actionable repair diagnostic without claiming tests passed or
+forbidding manual repair. Wrapper/parent observations are authoritative only
+for their boundary, direct agent shell failures are not comprehensively
+observable, and agent-reported diagnostics are labelled advisory and cannot
+alone suppress a command. The finite foreground watchdog, containment,
+assigned-cwd checks, and operator configuration remain in force.
+
 Managed-wrapper recognition also traverses supported execution prefixes, using
 the same command-head parser as ordinary reports. Examples include
 `env -u AGENT_LOOP_INVOCATION_ID /absolute/agent-loop run-tests -- pytest` and

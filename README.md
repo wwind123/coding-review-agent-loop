@@ -459,6 +459,43 @@ watchdog, and the backend whole-turn timeout are separate. The backend turn
 must leave headroom for analysis, edits, and reporting; split or shard healthy
 browser/integration matrices when that improves diagnosis and retry cost.
 
+Before a managed wrapper is recommended, agent-loop runs a non-mutating
+`run-tests --preflight` probe. It checks at most the absolute `agent-loop`
+console entry and the current-interpreter module fallback, once per invocation,
+with a five-second watchdog (and no more than six distinct recognized inner
+launcher candidates per invocation). The inner probe uses the effective target
+environment, including ambient values merged with a partial overlay. The probe
+never runs remembered test arguments,
+installs dependencies, contacts a database, or executes an arbitrary shell.
+Recognized inner launchers receive the same bounded `--version` probe: direct
+`pytest`/`py.test` and exactly `<python> -m pytest`; other commands remain
+unknown rather than being judged from text or exit codes. The runtime result
+keeps independent `wrapper_bootstrap`, `inner_exec`, and `suite_start` states,
+so a missing executable or import is launcher health rather than a suite
+failure. Collection/configuration errors, failing tests, timeouts, and
+interruptions after startup remain ordinary suite evidence.
+Probe cleanup is process-tree aware: POSIX probes use a dedicated process
+group, and Windows probes use a kill-on-close Job Object. If Windows cannot
+provide that owning boundary, the probe is not launched and its result remains
+unknown rather than running an uncontained child.
+Python identity is checked without execution: the running interpreter and
+symlinks to it are trusted, as are byte-for-byte copies in a conventional
+`pyvenv.cfg` environment; name-only scripts or native binaries are unknown.
+
+Schema-v1 `test-runtime.json` persistence adds a separate `launcher_health`
+collection. It records only bounded diagnostics, repository/checkout and
+environment identities, candidate identity, timestamp, and provenance; it
+does not store environment dumps or external paths (the exact canonical
+managed-wrapper path is retained for that wrapper). Health failures expire
+after 24 hours, are capped independently at eight records per identity and 100
+identities, deduplicate, and are cleared immediately by a matching successful
+probe. Reinstalling a wrapper, changing its interpreter/dependencies,
+recreating a virtualenv, or changing the checkout/environment changes the
+identity and permits a fresh probe. Health is advisory: the configured test
+command is always shown, verified alternatives are scoped to the current
+checkout/environment, and direct agent-shell failures cannot be claimed as
+comprehensively captured.
+
 ## CI and Merge
 
 When a review round requires coder changes, agent-loop also checks for CI

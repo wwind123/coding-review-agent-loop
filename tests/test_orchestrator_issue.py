@@ -28,6 +28,8 @@ from coding_review_agent_loop.issue_pr_handoff import (
     resolve_canonical_pr_for_issue,
 )
 from coding_review_agent_loop.issue_pr_provenance import IssuePrProvenanceScope
+from coding_review_agent_loop.memory import AgentMemoryContext
+import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
     _advisory_issue_pr_provenance,
@@ -39,9 +41,11 @@ from coding_review_agent_loop.orchestrator import (
 )
 from coding_review_agent_loop.prompts import (
     build_completion_recovery_prompt,
+    build_issue_prompt,
     COMPACT_PLANNING_VOLATILE_TAIL_MARKER,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
 )
+import coding_review_agent_loop.test_runtime as runtime
 from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
@@ -69,6 +73,33 @@ from agent_loop_helpers import (
     structured_pr_review,
     structured_issue_implementation,
 )
+
+
+def test_issue_resume_prompt_retains_configured_command_when_wrapper_probe_fails(
+    tmp_path, monkeypatch
+):
+    config = make_config(
+        tmp_path,
+        test_command=("pytest", "tests/test_protocol.py", "-q"),
+    )
+    memory = AgentMemoryContext(
+        memory_dir=tmp_path / "memory",
+        current_commit=None,
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary=None,
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+    )
+    monkeypatch.setattr(
+        prompts_module,
+        "preflight_wrapper_candidates",
+        lambda **_kwargs: (runtime.LauncherProbeResult(("/opt/agent-loop", "run-tests"), "failed", "import failed"),),
+    )
+    prompt = build_issue_prompt(764, config, memory=memory)
+    assert "pytest tests/test_protocol.py -q" in prompt
+    assert "no wrapper candidate verified" in prompt
 
 
 def test_issue_handoff_receipt_must_belong_to_current_coder_turn():

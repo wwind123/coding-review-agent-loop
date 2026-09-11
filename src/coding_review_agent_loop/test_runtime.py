@@ -14,12 +14,14 @@ import os
 import platform
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,7 +40,81 @@ OVERLAP_REJECTED_MESSAGE = "agent-loop: identical test command is already runnin
 MAX_OBSERVATIONS_PER_COHORT = 20
 MAX_COHORTS = 200
 STALE_AFTER = timedelta(days=30)
+LAUNCHER_HEALTH_STALE_AFTER = timedelta(hours=24)
+MAX_LAUNCHER_HEALTH_PER_IDENTITY = 8
+MAX_LAUNCHER_HEALTH_IDENTITIES = 100
+MAX_LAUNCHER_DIAGNOSTIC_CHARS = 240
+LAUNCHER_PROBE_TIMEOUT_SECONDS = 5.0
+MAX_WRAPPER_PROBE_CANDIDATES = 2
+MAX_INNER_PROBE_CANDIDATES = 6
+MAX_WRAPPER_PREFLIGHT_IDENTITIES_PER_INVOCATION = 8
+MAX_PREFLIGHT_INVOCATION_BUCKETS = 128
+PREFLIGHT_INVOCATION_TTL_SECONDS = 3600.0
 _HASHED_ENV_VALUE_RE = re.compile(r"<sha256:[0-9a-f]{16}>")
+_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"(?i)\b(api[_-]?key|secret|password|token|credential)\s*[:=]\s*[^\s,;]+"
+)
+_DIAGNOSTIC_ASSIGNMENT_SECRET_RE = re.compile(
+    r"(?i)(\b(?:aws[_-](?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token)|"
+    r"(?:api[_-]?key|secret|password|passwd|token|credential|authorization|private[_-]?key|dsn))\b\s*=\s*)"
+    r"[^\s,;&]+"
+)
+_DIAGNOSTIC_FIELD_SECRET_RE = re.compile(
+    r"(?i)(\b(?:[a-z0-9]+[_-])*?(?:api[_-]?key|secret|password|passwd|token|credential|"
+    r"authorization|private[_-]?key|dsn)(?:[_-][a-z0-9]+)*\b\s*[:=]\s*)"
+    r"[^\s,;&]+"
+)
+_DIAGNOSTIC_OPTION_SECRET_RE = re.compile(
+    r"(?i)(?<![\w-])(--?[^\s=]*(?:api[-_]?key|token|password|passwd|secret|credential|auth)"
+    r"[^\s=]*(?:=|\s+))"
+    r"[^\s,;&]+"
+)
+_DIAGNOSTIC_AUTH_HEADER_RE = re.compile(
+    r"(?im)(^|\s)((?:proxy-)?authorization\s*:\s*)(?:bearer|basic|token)\s+[^\s,;&]+"
+)
+_DIAGNOSTIC_URL_USERINFO_RE = re.compile(
+    r"(?i)(\b(?:https?|ssh|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://)[^/@\s]+@"
+)
+
+WRAPPER_BOOTSTRAP_STATES = frozenset({"verified", "failed", "unknown"})
+INNER_EXEC_STATES = frozenset({"not-attempted", "started", "failed"})
+SUITE_START_STATES = frozenset({"not-started", "verified", "unknown"})
+LAUNCHER_HEALTH_PROVENANCES = frozenset(
+    {"wrapper-probe", "parent-runner", "broker-parent", "agent-reported"}
+)
+
+
+@dataclass(frozen=True)
+class LauncherProbeResult:
+    """Bounded result of a wrapper or recognized inner-launcher probe."""
+
+    candidate: tuple[str, ...]
+    state: str
+    diagnostic: str = ""
+    identity: str = ""
+
+    def __post_init__(self) -> None:
+        if self.state not in WRAPPER_BOOTSTRAP_STATES:
+            raise ValueError(f"unknown launcher probe state: {self.state}")
+
+
+@dataclass(frozen=True)
+class LaunchState:
+    """Independent wrapper, exec, and suite-boundary state."""
+
+    wrapper_bootstrap: str = "unknown"
+    inner_exec: str = "not-attempted"
+    suite_start: str = "not-started"
+    diagnostic: str = ""
+    provenance: str = "parent-runner"
+
+    def __post_init__(self) -> None:
+        if self.wrapper_bootstrap not in WRAPPER_BOOTSTRAP_STATES:
+            raise ValueError(f"unknown wrapper bootstrap state: {self.wrapper_bootstrap}")
+        if self.inner_exec not in INNER_EXEC_STATES:
+            raise ValueError(f"unknown inner exec state: {self.inner_exec}")
+        if self.suite_start not in SUITE_START_STATES:
+            raise ValueError(f"unknown suite start state: {self.suite_start}")
 
 
 class TestRuntimeConfigurationError(AgentLoopError):
@@ -281,16 +357,17 @@ def render_test_wrapper(
     *,
     timeout_seconds: int | None = None,
     memory_dir: Path | None = None,
+    prefix: Sequence[str] | None = None,
 ) -> str:
-    prefix = resolve_wrapper_prefix()
-    if prefix is None:
+    chosen_prefix = tuple(prefix) if prefix is not None else resolve_wrapper_prefix()
+    if chosen_prefix is None:
         return shlex.join(str(item) for item in command)
     options: list[str] = []
     if timeout_seconds is not None:
         options += ["--timeout-seconds", str(timeout_seconds)]
     if memory_dir is not None:
         options += ["--memory-dir", str(memory_dir)]
-    return shlex.join((*prefix, *options, "--", *(str(item) for item in command)))
+    return shlex.join((*chosen_prefix, *options, "--", *(str(item) for item in command)))
 
 
 def _relative_or_basename(value: str, cwd: Path) -> str:
@@ -463,12 +540,437 @@ def _timestamp(value: object) -> datetime | None:
         return None
 
 
+def _collapsed_diagnostic(value: object, *, limit: int = MAX_LAUNCHER_DIAGNOSTIC_CHARS) -> str:
+    text = " ".join(str(value or "").split())
+    text = _DIAGNOSTIC_ASSIGNMENT_SECRET_RE.sub(r"\1<redacted>", text)
+    text = _DIAGNOSTIC_OPTION_SECRET_RE.sub(r"\1<redacted>", text)
+    text = _DIAGNOSTIC_AUTH_HEADER_RE.sub(r"\1\2<redacted>", text)
+    text = _DIAGNOSTIC_URL_USERINFO_RE.sub(r"\1<userinfo:redacted>@", text)
+    text = _DIAGNOSTIC_FIELD_SECRET_RE.sub(r"\1<redacted>", text)
+    text = _DIAGNOSTIC_SECRET_RE.sub(r"\1=<redacted>", text)
+    return text[:limit]
+
+
+def checkout_identity(cwd: Path) -> str:
+    """Hash the canonical assigned checkout without retaining its raw path."""
+    canonical = str(cwd.resolve(strict=False))
+    return hashlib.sha256(canonical.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _repository_slug(cwd: Path, repository: str | None = None) -> str:
+    if repository and re.fullmatch(r"[^/\s]+/[^/\s]+", repository):
+        return repository
+    try:
+        remote = subprocess.run(
+            ("git", "config", "--get", "remote.origin.url"),
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        remote = ""
+    match = re.search(r"(?:github\.com[:/])([^/]+/[^/]+?)(?:\.git)?$", remote)
+    return match.group(1) if match else "unknown/unknown"
+
+
+def launcher_environment_fingerprint(
+    cwd: Path, *, environment: Mapping[str, str] | None = None
+) -> str:
+    """Fingerprint only stable runtime identity inputs, never raw environment values."""
+    values = environment if environment is not None else os.environ
+    payload = {
+        "runtime": platform.python_version(),
+        "platform": platform.system().lower(),
+        "release": platform.release(),
+        "architecture": platform.machine(),
+        "virtual_env": hashlib.sha256(
+            values.get("VIRTUAL_ENV", "").encode("utf-8", errors="replace")
+        ).hexdigest(),
+        "path": hashlib.sha256(
+            values.get("PATH", "").encode("utf-8", errors="replace")
+        ).hexdigest(),
+        "checkout": checkout_identity(cwd),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _stat_identity(path: Path) -> dict[str, object]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"path": str(path.resolve(strict=False)), "missing": True}
+    return {
+        "path": str(path.resolve(strict=False)),
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "mode": stat.st_mode & 0o111,
+    }
+
+
+def _lexical_stat_identity(path: Path) -> dict[str, object]:
+    """Stat the directory entry itself so a symlink retarget is observable."""
+    lexical = _lexical_absolute(path)
+    try:
+        stat = lexical.lstat()
+    except OSError:
+        return {"path": str(lexical), "missing": True}
+    return {
+        "path": str(lexical),
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+        "mode": stat.st_mode & 0o111,
+        "symlink": lexical.is_symlink(),
+    }
+
+
+def _shebang_interpreter(path: Path) -> str | None:
+    try:
+        first = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+    if not first.startswith("#!"):
+        return None
+    try:
+        parts = shlex.split(first[2:].strip())
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    if Path(parts[0]).name == "env" and len(parts) > 1:
+        if "-S" in parts:
+            index = parts.index("-S") + 1
+            return parts[index] if index < len(parts) else None
+        return parts[1].split("=", 1)[-1] if "=" in parts[1] else parts[1]
+    return parts[0]
+
+
+def _resolve_candidate_path(
+    token: str, *, cwd: Path, environment: Mapping[str, str]
+) -> Path:
+    candidate = Path(token).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve(strict=False)
+    if token.startswith((".", "~")) or candidate.parent != Path("."):
+        return (cwd / candidate).resolve(strict=False)
+    try:
+        resolved = shutil.which(token, path=environment.get("PATH"))
+    except TypeError:
+        resolved = shutil.which(token)
+    return Path(resolved).resolve(strict=False) if resolved else candidate
+
+
+def _lexical_candidate_path(
+    token: str, *, cwd: Path, environment: Mapping[str, str]
+) -> Path:
+    """Resolve a command token without collapsing symlinks.
+
+    A virtualenv's ``bin/python`` is commonly a symlink.  Its lexical path
+    identifies the environment that will supply site-packages, while its
+    resolved path identifies the base interpreter.  Both identities are
+    needed for safe probing and cache invalidation.
+    """
+    candidate = Path(token).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    if token.startswith((".", "~")) or candidate.parent != Path("."):
+        return cwd / candidate
+    try:
+        resolved = shutil.which(token, path=environment.get("PATH"))
+    except TypeError:
+        resolved = shutil.which(token)
+    return Path(resolved) if resolved else candidate
+
+
+def _resolve_shebang_path(
+    shebang: str | None, *, cwd: Path, environment: Mapping[str, str]
+) -> Path | None:
+    if not shebang:
+        return None
+    return _resolve_candidate_path(shebang, cwd=cwd, environment=environment)
+
+
+def _lexical_absolute(path: Path) -> Path:
+    """Return an absolute path while retaining symlink spelling."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+_PYTHON_INTERPRETER_NAME_RE = re.compile(
+    r"(?i)(?:python(?:[0-9]+(?:\.[0-9]+)*)?|pypy(?:[0-9]+(?:\.[0-9]+)*)?|py)(?:\.exe)?$"
+)
+
+
+def _python_interpreter_path(
+    token: str, *, cwd: Path, environment: Mapping[str, str]
+) -> Path | None:
+    """Resolve a command token only when it has a recognizable Python identity.
+
+    This is deliberately a filesystem-only check.  It never starts the token
+    merely to decide whether it is safe to probe.  In particular, an arbitrary
+    shell script named ``python`` is not recognized.  The current interpreter
+    may be addressed through any symlink that resolves to it; other candidates
+    must be conventionally named, executable Python binaries in a
+    ``pyvenv.cfg`` environment.  The bounded ``--version`` probe remains
+    authoritative for importability.
+    """
+    lexical = _lexical_absolute(
+        _lexical_candidate_path(token, cwd=cwd, environment=environment)
+    )
+    try:
+        resolved = lexical.resolve(strict=False)
+        current = Path(sys.executable).resolve(strict=False)
+    except OSError:
+        return None
+    try:
+        same_as_current = resolved == current or os.path.samefile(lexical, current)
+    except OSError:
+        same_as_current = resolved == current
+    if same_as_current:
+        return lexical
+    if not _PYTHON_INTERPRETER_NAME_RE.fullmatch(lexical.name):
+        return None
+    if not lexical.is_file() or not os.access(lexical, os.X_OK):
+        return None
+    environment_root = _lexical_absolute(lexical.parent.parent) if lexical.parent.name.lower() in {"bin", "scripts"} else None
+    if environment_root is None or not (environment_root / "pyvenv.cfg").is_file():
+        return None
+    # A file header is not an interpreter identity: any native executable can
+    # claim ELF/MZ.  The running interpreter is the only identity available to
+    # this process without starting an untrusted candidate.  A copied
+    # virtualenv executable is therefore accepted only when it is byte-for-byte
+    # identical to that trusted interpreter; symlinks/hardlinks are covered by
+    # the samefile check above.  Other native binaries remain unknown and are
+    # never spawned by the preflight.
+    if not _same_file_contents(lexical, current):
+        return None
+    return lexical
+
+
+def _same_file_contents(left: Path, right: Path) -> bool:
+    """Compare two executable files without executing either one."""
+    try:
+        left_stat = left.stat()
+        right_stat = right.stat()
+    except OSError:
+        return False
+    if left_stat.st_size != right_stat.st_size:
+        return False
+    if left_stat.st_dev == right_stat.st_dev and left_stat.st_ino == right_stat.st_ino:
+        return True
+    try:
+        with left.open("rb") as left_stream, right.open("rb") as right_stream:
+            while True:
+                left_chunk = left_stream.read(1024 * 1024)
+                right_chunk = right_stream.read(1024 * 1024)
+                if left_chunk != right_chunk:
+                    return False
+                if not left_chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def _interpreter_environment_root(
+    interpreter: Path, *, environment: Mapping[str, str]
+) -> Path | None:
+    """Return a likely environment root without inspecting arbitrary paths."""
+    lexical = _lexical_absolute(interpreter)
+    if lexical.parent.name.lower() in {"bin", "scripts"}:
+        return lexical.parent.parent
+    if interpreter.resolve(strict=False) == Path(sys.executable).resolve(strict=False):
+        return Path(sys.prefix).resolve(strict=False)
+    virtual_env = environment.get("VIRTUAL_ENV")
+    if virtual_env:
+        return _lexical_absolute(Path(virtual_env).expanduser())
+    return None
+
+
+def _pytest_dependency_paths(
+    interpreter: Path, *, environment: Mapping[str, str]
+) -> tuple[Path, ...]:
+    """Enumerate a small, interpreter-scoped set of pytest dependency paths."""
+    root = _interpreter_environment_root(interpreter, environment=environment)
+    if root is None:
+        return ()
+    candidates: list[Path] = []
+    # The fixed layouts cover POSIX/Windows virtualenvs and the running
+    # interpreter's usual prefix.  Do not recursively search an environment.
+    for relative in (
+        Path("Lib") / "site-packages",
+        Path("lib") / "site-packages",
+        Path("lib64") / "site-packages",
+    ):
+        candidates.append(root / relative)
+    lib_dir = root / "lib"
+    try:
+        versioned_libs = sorted(
+            (entry for entry in lib_dir.iterdir() if entry.is_dir() and entry.name.startswith("python")),
+            key=lambda entry: entry.name,
+        )
+    except OSError:
+        versioned_libs = []
+    candidates.extend(entry / "site-packages" for entry in versioned_libs[:8])
+    paths: list[Path] = []
+    for site_packages in candidates:
+        paths.extend(
+            (
+                site_packages,
+                site_packages / "pytest",
+                site_packages / "pytest" / "__init__.py",
+                site_packages / "pytest.py",
+            )
+        )
+    return tuple(paths)
+
+
+def _pytest_dependency_identity(
+    interpreter: Path, *, environment: Mapping[str, str]
+) -> dict[str, object]:
+    """Fingerprint bounded pytest locations for the selected interpreter."""
+    paths = _pytest_dependency_paths(interpreter, environment=environment)
+    return {
+        "interpreter": str(interpreter),
+        "paths": [_stat_identity(path) for path in paths],
+    }
+
+
+def launcher_candidate_identity(
+    candidate: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None,
+    kind: str = "inner",
+) -> dict[str, object]:
+    """Return a cache/persistence identity with only the managed path verbatim."""
+    values = environment if environment is not None else os.environ
+    tokens = tuple(str(item) for item in candidate)
+    resolved_path = _resolve_candidate_path(tokens[0], cwd=cwd, environment=values) if tokens else Path("")
+    lexical_path = _lexical_absolute(
+        _lexical_candidate_path(tokens[0], cwd=cwd, environment=values)
+    ) if tokens else Path("")
+    # Keep managed wrapper paths canonical, but retain the configured lexical
+    # path for inner launchers so virtualenv symlinks remain distinguishable.
+    path = resolved_path if kind == "wrapper" else lexical_path
+    virtual_env = Path(values["VIRTUAL_ENV"]).resolve(strict=False) if values.get("VIRTUAL_ENV") else None
+    shebang = _shebang_interpreter(path) if path.is_file() else None
+    shebang_path = (
+        _resolve_shebang_path(shebang, cwd=cwd, environment=values)
+        if kind == "wrapper"
+        else (
+            _lexical_absolute(_lexical_candidate_path(shebang, cwd=cwd, environment=values))
+            if shebang
+            else None
+        )
+    )
+    interpreter_path = shebang_path or path
+    package_origin = Path(__file__).resolve(strict=False)
+    if kind == "inner":
+        # Never ask the agent-loop interpreter where pytest lives: that can be
+        # a different environment from ``<python> -m pytest``.  The bounded
+        # layout identity below is derived from the selected interpreter.
+        module_origin = None
+        dependency_identity = _pytest_dependency_identity(interpreter_path, environment=values)
+    else:
+        module_origin = None
+        dependency_identity = None
+    prefix = (
+        tokens[:3]
+        if len(tokens) >= 3 and tokens[1:3] == ("-m", "pytest")
+        else tokens[:1]
+    )
+    identity: dict[str, object] = {
+        "kind": kind,
+        "path": str(path),
+        "entry": _stat_identity(path),
+        "entry_lexical": _lexical_stat_identity(lexical_path),
+        "shebang": shebang,
+        "shebang_interpreter": _stat_identity(shebang_path) if shebang_path is not None else None,
+        "shebang_interpreter_lexical": (
+            _lexical_stat_identity(shebang_path) if shebang_path is not None else None
+        ),
+        "interpreter": _stat_identity(interpreter_path),
+        "interpreter_lexical": _lexical_stat_identity(interpreter_path),
+        "package_origin": _stat_identity(package_origin),
+        "module_origin": _stat_identity(module_origin) if module_origin is not None else None,
+        "pytest_dependency": dependency_identity,
+        "virtual_env": _stat_identity(virtual_env) if virtual_env is not None else None,
+        "path_environment_sha256": hashlib.sha256(
+            values.get("PATH", "").encode("utf-8", errors="replace")
+        ).hexdigest(),
+        "candidate_prefix": list(prefix),
+        "cwd": checkout_identity(cwd),
+    }
+    return identity
+
+
+def _identity_key(identity: Mapping[str, object]) -> str:
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _redacted_identity(identity: Mapping[str, object], *, cwd: Path) -> dict[str, object]:
+    """Keep the exact managed wrapper path, but redact all other external paths."""
+    result: dict[str, object] = {}
+    for key, value in identity.items():
+        if key == "path":
+            result[key] = str(value) if identity.get("kind") == "wrapper" else _relative_or_basename(str(value), cwd)
+        elif key == "shebang" and isinstance(value, str):
+            result[key] = _relative_or_basename(value, cwd)
+        elif isinstance(value, Mapping):
+            nested = dict(value)
+            nested_path = nested.get("path")
+            if isinstance(nested_path, str):
+                keep_wrapper_path = (
+                    identity.get("kind") == "wrapper"
+                    and nested_path == str(identity.get("path"))
+                )
+                if not keep_wrapper_path:
+                    nested["path"] = _relative_or_basename(nested_path, cwd)
+            if key == "pytest_dependency":
+                interpreter = nested.get("interpreter")
+                if isinstance(interpreter, str):
+                    nested["interpreter"] = _relative_or_basename(interpreter, cwd)
+                paths = nested.get("paths")
+                if isinstance(paths, list):
+                    nested["paths"] = [
+                        {
+                            **dict(item),
+                            "path": _relative_or_basename(str(item["path"]), cwd),
+                        }
+                        if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+                        else item
+                        for item in paths
+                    ]
+            result[key] = nested
+        elif isinstance(value, (list, tuple)):
+            result[key] = [
+                (
+                    str(item)
+                    if identity.get("kind") == "wrapper" and key == "candidate_prefix" and index == 0
+                    else _relative_or_basename(str(item), cwd)
+                    if isinstance(item, str) and Path(item).is_absolute()
+                    else item
+                )
+                for index, item in enumerate(value)
+            ]
+        else:
+            result[key] = value
+    return result
+
+
+def _health_scope(row: Mapping[str, object]) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("repository", "")),
+        str(row.get("checkout_sha256", "")),
+        str(row.get("environment_fingerprint", "")),
+        str(row.get("candidate_key", "")),
+    )
+
+
 def _sidecar_payload(memory_dir: Path) -> dict | None:
     path = memory_dir / RUNTIME_SIDECAR_NAME
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"schema_version": RUNTIME_SCHEMA_VERSION, "observations": []}
+        return {"schema_version": RUNTIME_SCHEMA_VERSION, "observations": [], "launcher_health": []}
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or payload.get("schema_version") != RUNTIME_SCHEMA_VERSION:
@@ -476,12 +978,51 @@ def _sidecar_payload(memory_dir: Path) -> dict | None:
     observations = payload.get("observations")
     if not isinstance(observations, list):
         return None
-    return {"schema_version": RUNTIME_SCHEMA_VERSION, "observations": [item for item in observations if isinstance(item, dict)]}
+    health = payload.get("launcher_health", [])
+    if not isinstance(health, list):
+        health = []
+    return {
+        "schema_version": RUNTIME_SCHEMA_VERSION,
+        "observations": [item for item in observations if isinstance(item, dict)],
+        "launcher_health": [item for item in health if isinstance(item, dict)],
+    }
 
 
 def load_runtime_memory(memory_dir: Path) -> list[dict]:
     payload = _sidecar_payload(memory_dir)
     return list(payload["observations"]) if payload is not None else []
+
+
+def load_launcher_health(memory_dir: Path | None) -> list[dict]:
+    """Load health independently; malformed health rows never hide timing rows."""
+    if memory_dir is None:
+        return []
+    payload = _sidecar_payload(memory_dir)
+    if payload is None:
+        return []
+    rows: list[dict] = []
+    for row in payload.get("launcher_health", []):
+        if not isinstance(row, dict):
+            continue
+        if (
+            isinstance(row.get("repository"), str)
+            and bool(row.get("repository"))
+            and isinstance(row.get("checkout_sha256"), str)
+            and bool(row.get("checkout_sha256"))
+            and isinstance(row.get("environment_fingerprint"), str)
+            and bool(row.get("environment_fingerprint"))
+            and isinstance(row.get("candidate_key"), str)
+            and bool(row.get("candidate_key"))
+            and isinstance(row.get("candidate_identity"), Mapping)
+            and row.get("state") in WRAPPER_BOOTSTRAP_STATES
+            and row.get("provenance") in LAUNCHER_HEALTH_PROVENANCES
+            and _timestamp(row.get("timestamp")) is not None
+            and isinstance(row.get("diagnostic", ""), str)
+        ):
+            safe = dict(row)
+            safe["diagnostic"] = _collapsed_diagnostic(safe.get("diagnostic", ""))
+            rows.append(safe)
+    return rows
 
 
 def _lock_file(path: Path, timeout: float = 5.0):
@@ -605,6 +1146,792 @@ def record_test_observation(
             _unlock_file(lock)
     except (OSError, ValueError, TypeError, TestRuntimeConfigurationError):
         return False
+
+
+def record_launcher_health(
+    memory_dir: Path | None,
+    *,
+    cwd: Path,
+    candidate: Sequence[str] | Mapping[str, object],
+    state: str,
+    provenance: str,
+    repository: str | None = None,
+    environment: Mapping[str, str] | None = None,
+    diagnostic: object = "",
+    timestamp: datetime | None = None,
+) -> bool:
+    """Persist bounded launcher health separately from suite timing rows."""
+    if memory_dir is None or state not in WRAPPER_BOOTSTRAP_STATES or provenance not in LAUNCHER_HEALTH_PROVENANCES:
+        return False
+    try:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        lock = _lock_file(memory_dir / RUNTIME_LOCK_NAME)
+        if lock is None:
+            return False
+        try:
+            payload = _sidecar_payload(memory_dir)
+            if payload is None:
+                return False
+            if isinstance(candidate, Mapping):
+                raw_identity = dict(candidate)
+            else:
+                raw_identity = launcher_candidate_identity(candidate, cwd=cwd, environment=environment)
+            identity = _redacted_identity(raw_identity, cwd=cwd)
+            key = _identity_key(raw_identity)
+            now = (timestamp or _utc_now()).astimezone(timezone.utc)
+            repository_name = _repository_slug(cwd, repository)
+            scope = (repository_name, checkout_identity(cwd), launcher_environment_fingerprint(cwd, environment=environment), key)
+            rows = []
+            cutoff = now - LAUNCHER_HEALTH_STALE_AFTER
+            for row in payload.get("launcher_health", []):
+                if not isinstance(row, dict):
+                    continue
+                stamp = _timestamp(row.get("timestamp"))
+                if stamp is None:
+                    continue
+                if _health_scope(row) != scope:
+                    rows.append(row)
+                elif stamp >= cutoff:
+                    rows.append(row)
+            if state == "verified":
+                rows = [
+                    row for row in rows
+                    if not (_health_scope(row) == scope and row.get("state") == "failed")
+                ]
+            row = {
+                "repository": repository_name,
+                "checkout_sha256": scope[1],
+                "environment_fingerprint": scope[2],
+                "candidate_key": key,
+                "candidate_identity": identity,
+                "state": state,
+                "timestamp": now.isoformat(),
+                "provenance": provenance,
+                "diagnostic": _collapsed_diagnostic(diagnostic),
+            }
+            duplicate_index = next(
+                (
+                    index
+                    for index, existing in enumerate(rows)
+                    if _health_scope(existing) == scope
+                    and existing.get("state") == row["state"]
+                    and existing.get("diagnostic") == row["diagnostic"]
+                ),
+                None,
+            )
+            if duplicate_index is None:
+                rows.append(row)
+            else:
+                # A repeated failure is still live evidence. Refresh its
+                # timestamp so a continuously broken launcher does not
+                # disappear merely because it crossed the 24-hour window.
+                rows[duplicate_index] = row
+            groups: dict[tuple[str, str, str, str], list[dict]] = defaultdict(list)
+            for existing in rows:
+                groups[_health_scope(existing)].append(existing)
+            ordered_scopes = sorted(
+                groups,
+                key=lambda item: max((_timestamp(item_row.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc) for item_row in groups[item]), default=datetime.min.replace(tzinfo=timezone.utc)),
+                reverse=True,
+            )[:MAX_LAUNCHER_HEALTH_IDENTITIES]
+            kept: list[dict] = []
+            for group_key in ordered_scopes:
+                group = groups[group_key]
+                group.sort(key=lambda item: _timestamp(item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+                kept.extend(group[:MAX_LAUNCHER_HEALTH_PER_IDENTITY])
+            payload["launcher_health"] = kept
+            fd, temp_name = tempfile.mkstemp(prefix=".test-runtime-", suffix=".tmp", dir=memory_dir)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(payload, stream, indent=2, sort_keys=True)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temp_name, memory_dir / RUNTIME_SIDECAR_NAME)
+            finally:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
+            return True
+        finally:
+            _unlock_file(lock)
+    except (OSError, ValueError, TypeError, TestRuntimeConfigurationError):
+        return False
+
+
+def relevant_launcher_health(
+    memory_dir: Path | None,
+    *,
+    cwd: Path,
+    candidate: Sequence[str] | Mapping[str, object] | None = None,
+    repository: str | None = None,
+    environment: Mapping[str, str] | None = None,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Return fresh rows for exactly this repository/checkout/environment."""
+    if memory_dir is None:
+        return []
+    values = environment if environment is not None else os.environ
+    key = ""
+    if candidate is not None:
+        raw = dict(candidate) if isinstance(candidate, Mapping) else launcher_candidate_identity(candidate, cwd=cwd, environment=values)
+        key = _identity_key(raw)
+    scope = (_repository_slug(cwd, repository), checkout_identity(cwd), launcher_environment_fingerprint(cwd, environment=values), key)
+    cutoff = (now or _utc_now()).astimezone(timezone.utc) - LAUNCHER_HEALTH_STALE_AFTER
+    rows = []
+    for row in load_launcher_health(memory_dir):
+        if _health_scope(row)[:3] != scope[:3] or (key and row.get("candidate_key") != key):
+            continue
+        stamp = _timestamp(row.get("timestamp"))
+        if stamp is not None and stamp >= cutoff:
+            rows.append(row)
+    return rows
+
+
+def _wrapper_candidates(environment: Mapping[str, str] | None = None) -> list[tuple[str, ...]]:
+    values = environment if environment is not None else os.environ
+    candidates: list[tuple[str, ...]] = []
+    entry = shutil.which("agent-loop", path=values.get("PATH"))
+    if entry and os.path.isabs(entry) and os.access(entry, os.X_OK):
+        candidates.append((str(Path(entry).resolve()), "run-tests"))
+    # Execute the interpreter spelling supplied by the running process.  A
+    # virtualenv commonly exposes ``bin/python`` as a symlink; resolving it
+    # here would execute the base interpreter and lose the virtualenv's
+    # site-packages, even though the resolved/stat identity remains part of
+    # the cache key in launcher_candidate_identity().
+    executable = _lexical_absolute(Path(sys.executable))
+    if executable.is_file() and os.access(executable, os.X_OK):
+        fallback = (str(executable), "-m", "coding_review_agent_loop.cli", "run-tests")
+        if fallback not in candidates:
+            candidates.append(fallback)
+    return candidates[:MAX_WRAPPER_PROBE_CANDIDATES]
+
+
+_WRAPPER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
+_WRAPPER_PREFLIGHT_IDENTITIES: dict[str, OrderedDict[str, None]] = {}
+_INNER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
+_INNER_PREFLIGHT_CANDIDATES: dict[str, set[str]] = defaultdict(set)
+_WRAPPER_PREFLIGHT_INFLIGHT: dict[tuple[str, str], threading.Event] = {}
+_INNER_PREFLIGHT_INFLIGHT: dict[tuple[str, str], threading.Event] = {}
+_INNER_PREFLIGHT_LOCK = threading.Lock()
+_PREFLIGHT_INVOCATIONS: OrderedDict[str, float] = OrderedDict()
+
+
+def _invocation_is_active_locked(invocation: str) -> bool:
+    return any(key[0] == invocation for key in (*_WRAPPER_PREFLIGHT_INFLIGHT, *_INNER_PREFLIGHT_INFLIGHT))
+
+
+def _drop_invocation_locked(invocation: str) -> None:
+    _PREFLIGHT_INVOCATIONS.pop(invocation, None)
+    _WRAPPER_PREFLIGHT_IDENTITIES.pop(invocation, None)
+    _INNER_PREFLIGHT_CANDIDATES.pop(invocation, None)
+    for cache in (_WRAPPER_PREFLIGHT_CACHE, _INNER_PREFLIGHT_CACHE):
+        for key in tuple(cache):
+            if key[0] == invocation:
+                del cache[key]
+
+
+def _prune_invocations_locked(*, protected: set[str] = frozenset()) -> None:
+    now = time.monotonic()
+    for invocation, last_used in tuple(_PREFLIGHT_INVOCATIONS.items()):
+        if invocation in protected or _invocation_is_active_locked(invocation):
+            continue
+        if (
+            now - last_used > PREFLIGHT_INVOCATION_TTL_SECONDS
+            or len(_PREFLIGHT_INVOCATIONS) > MAX_PREFLIGHT_INVOCATION_BUCKETS
+        ):
+            _drop_invocation_locked(invocation)
+
+
+def _touch_invocation_locked(invocation: str) -> None:
+    _PREFLIGHT_INVOCATIONS[invocation] = time.monotonic()
+    _PREFLIGHT_INVOCATIONS.move_to_end(invocation)
+    _prune_invocations_locked(protected={invocation})
+
+
+def _store_wrapper_probe_locked(
+    cache_key: tuple[str, str], result: LauncherProbeResult
+) -> None:
+    """Store one completed wrapper probe while bounding identity churn."""
+    invocation, identity_key = cache_key
+    _WRAPPER_PREFLIGHT_CACHE[cache_key] = result
+    identities = _WRAPPER_PREFLIGHT_IDENTITIES.setdefault(invocation, OrderedDict())
+    identities.pop(identity_key, None)
+    identities[identity_key] = None
+    while len(identities) > MAX_WRAPPER_PREFLIGHT_IDENTITIES_PER_INVOCATION:
+        evicted_identity, _ = identities.popitem(last=False)
+        _WRAPPER_PREFLIGHT_CACHE.pop((invocation, evicted_identity), None)
+
+
+def _decode_probe_output(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _close_probe_pipes(process: subprocess.Popen) -> None:
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+class _ProbeContainmentUnavailable(RuntimeError):
+    """The platform cannot provide the containment required for a probe."""
+
+
+class _WindowsProbeJob:
+    """Own a probe process tree with a Windows Job Object.
+
+    ``CREATE_NEW_PROCESS_GROUP`` only provides console-control isolation; it
+    does not terminate descendants when the parent is killed.  A Job Object
+    with ``KILL_ON_JOB_CLOSE`` gives the probe an owning boundary equivalent to
+    the POSIX process group used below.  This class is instantiated only on
+    Windows so importing this module remains portable and dependency-free.
+    """
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle_type = wintypes.HANDLE
+        self._kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        self._kernel32.CreateJobObjectW.restype = handle_type
+        self._kernel32.SetInformationJobObject.argtypes = [
+            handle_type,
+            wintypes.INT,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        self._kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        self._kernel32.AssignProcessToJobObject.argtypes = [handle_type, handle_type]
+        self._kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        self._kernel32.TerminateJobObject.argtypes = [handle_type, wintypes.UINT]
+        self._kernel32.TerminateJobObject.restype = wintypes.BOOL
+        self._kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        self._kernel32.CreateToolhelp32Snapshot.restype = handle_type
+        self._kernel32.Thread32First.argtypes = [handle_type, wintypes.LPVOID]
+        self._kernel32.Thread32First.restype = wintypes.BOOL
+        self._kernel32.Thread32Next.argtypes = [handle_type, wintypes.LPVOID]
+        self._kernel32.Thread32Next.restype = wintypes.BOOL
+        self._kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self._kernel32.OpenThread.restype = handle_type
+        self._kernel32.ResumeThread.argtypes = [handle_type]
+        self._kernel32.ResumeThread.restype = wintypes.DWORD
+        self._kernel32.CloseHandle.argtypes = [handle_type]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
+
+        class _BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimitInformation),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self._handle = self._kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        information = _ExtendedLimitInformation()
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        information.BasicLimitInformation.LimitFlags = 0x00002000
+        if not self._kernel32.SetInformationJobObject(
+            self._handle,
+            9,  # JobObjectExtendedLimitInformation
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.get_last_error()
+            self.close()
+            raise ctypes.WinError(error)
+
+    @staticmethod
+    def _process_handle(process: subprocess.Popen) -> int:
+        try:
+            return int(process._handle)  # type: ignore[attr-defined]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise OSError("probe process does not expose a Windows handle") from exc
+
+    def assign(self, process: subprocess.Popen) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        process_handle = self._process_handle(process)
+        if not self._kernel32.AssignProcessToJobObject(
+            self._handle, wintypes.HANDLE(process_handle)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def terminate(self) -> None:
+        if self._handle:
+            self._kernel32.TerminateJobObject(self._handle, 1)
+
+    def resume(self, process: subprocess.Popen) -> None:
+        """Resume the suspended primary thread after Job Object assignment.
+
+        ``subprocess.Popen`` closes the primary thread handle returned by
+        ``CreateProcess``.  While the process is still suspended it has only
+        its primary thread, so enumerate that thread by process id and resume
+        it after the Job Object owns the process.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        class _ThreadEntry32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD),
+                ("tpBasePri", wintypes.LONG),
+                ("tpDeltaPri", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        snapshot = self._kernel32.CreateToolhelp32Snapshot(0x00000004, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        if snapshot in (None, invalid_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            entry = _ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not self._kernel32.Thread32First(snapshot, ctypes.byref(entry)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            while True:
+                if entry.th32OwnerProcessID == process.pid:
+                    thread = self._kernel32.OpenThread(0x0002, False, entry.th32ThreadID)
+                    if not thread:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    try:
+                        if self._kernel32.ResumeThread(thread) == 0xFFFFFFFF:
+                            raise ctypes.WinError(ctypes.get_last_error())
+                    finally:
+                        self._kernel32.CloseHandle(thread)
+                    return
+                if not self._kernel32.Thread32Next(snapshot, ctypes.byref(entry)):
+                    break
+            raise OSError(f"suspended probe primary thread not found for pid {process.pid}")
+        finally:
+            self._kernel32.CloseHandle(snapshot)
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle:
+            self._kernel32.CloseHandle(handle)
+
+
+def _terminate_unassigned_windows_probe(process: subprocess.Popen) -> None:
+    """Best-effort cleanup if Job Object assignment loses a startup race."""
+    try:
+        killer = subprocess.Popen(
+            ("taskkill.exe", "/PID", str(process.pid), "/T", "/F"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            killer.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            killer.kill()
+            try:
+                killer.communicate(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+    except (OSError, subprocess.SubprocessError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _terminate_probe_tree(
+    process: subprocess.Popen, *, windows_job: _WindowsProbeJob | None = None
+) -> None:
+    """Terminate and reap a bounded probe and its process tree."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    elif windows_job is not None:
+        # TerminateJobObject is tree-wide, even when the direct child has
+        # already exited while a descendant still owns stdout/stderr.
+        windows_job.terminate()
+    else:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    elif windows_job is not None:
+        windows_job.terminate()
+    else:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        # The job/process was force-terminated above.  Do not turn bounded
+        # probe cleanup into an unbounded wait if a platform handle misbehaves.
+        pass
+
+
+def _run_bounded_probe(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    """Run a fixed probe with process-tree-aware timeout cleanup.
+
+    ``subprocess.run(timeout=...)`` only terminates the direct child and can
+    still wait forever in ``communicate()`` when a descendant retains a pipe.
+    Probe children get a fresh process group, and timeout/error paths close the
+    pipes after terminating and reaping that group.
+    """
+    popen_kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": False,
+        "start_new_session": os.name == "posix",
+    }
+    if os.name == "nt":
+        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # Popen closes the primary thread handle after CreateProcess, so the
+        # Windows Job Object supplies the owning boundary and this flag keeps
+        # probe code suspended until the process has been assigned to it.
+        creation_flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
+        popen_kwargs.pop("start_new_session", None)
+    windows_job: _WindowsProbeJob | None = None
+    if os.name == "nt":
+        try:
+            windows_job = _WindowsProbeJob()
+        except Exception as exc:
+            raise _ProbeContainmentUnavailable(
+                f"Windows Job Object probe containment unavailable: {type(exc).__name__}"
+            ) from exc
+    process: subprocess.Popen | None = None
+    try:
+        process = subprocess.Popen([str(item) for item in argv], **popen_kwargs)
+        if windows_job is not None:
+            try:
+                windows_job.assign(process)
+            except Exception as exc:
+                _terminate_unassigned_windows_probe(process)
+                raise _ProbeContainmentUnavailable(
+                    f"Windows Job Object probe assignment unavailable: {type(exc).__name__}"
+                ) from exc
+            try:
+                windows_job.resume(process)
+            except Exception as exc:
+                _terminate_probe_tree(process, windows_job=windows_job)
+                raise _ProbeContainmentUnavailable(
+                    f"Windows suspended probe resume unavailable: {type(exc).__name__}"
+                ) from exc
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        assert process is not None
+        _terminate_probe_tree(process, windows_job=windows_job)
+        output = _decode_probe_output(getattr(exc, "output", None))
+        error = _decode_probe_output(getattr(exc, "stderr", None))
+        _close_probe_pipes(process)
+        raise subprocess.TimeoutExpired(
+            [str(item) for item in argv], timeout_seconds, output=output, stderr=error
+        ) from None
+    except BaseException:
+        if process is not None:
+            _terminate_probe_tree(process, windows_job=windows_job)
+            _close_probe_pipes(process)
+        raise
+    else:
+        assert process is not None
+        result = subprocess.CompletedProcess(
+            [str(item) for item in argv],
+            process.returncode,
+            _decode_probe_output(stdout),
+            _decode_probe_output(stderr),
+        )
+    finally:
+        if windows_job is not None:
+            windows_job.close()
+    return result
+
+
+def preflight_wrapper_candidates(
+    *,
+    cwd: Path | None = None,
+    memory_dir: Path | None = None,
+    repository: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[LauncherProbeResult, ...]:
+    """Probe at most two safe wrapper prefixes once per invocation/candidate."""
+    root = (cwd or Path.cwd()).resolve()
+    values = {**os.environ, **environment} if environment is not None else dict(os.environ)
+    invocation = values.get("AGENT_LOOP_INVOCATION_ID")
+    results: list[LauncherProbeResult] = []
+    for candidate in _wrapper_candidates(values):
+        identity = launcher_candidate_identity(candidate, cwd=root, environment=values, kind="wrapper")
+        cache_key = (invocation, _identity_key(identity)) if invocation else None
+        flight: threading.Event | None = None
+        owner = True
+        result: LauncherProbeResult | None = None
+        if cache_key is not None:
+            with _INNER_PREFLIGHT_LOCK:
+                _touch_invocation_locked(invocation)
+                result = _WRAPPER_PREFLIGHT_CACHE.get(cache_key)
+                if result is None:
+                    flight = _WRAPPER_PREFLIGHT_INFLIGHT.get(cache_key)
+                    if flight is not None:
+                        owner = False
+                    else:
+                        flight = threading.Event()
+                        _WRAPPER_PREFLIGHT_INFLIGHT[cache_key] = flight
+        if not owner:
+            assert flight is not None
+            if flight.wait(LAUNCHER_PROBE_TIMEOUT_SECONDS + 1.0):
+                with _INNER_PREFLIGHT_LOCK:
+                    result = _WRAPPER_PREFLIGHT_CACHE.get(cache_key)  # type: ignore[arg-type]
+            if result is None:
+                result = LauncherProbeResult(
+                    candidate,
+                    "unknown",
+                    "wrapper probe result was not published by its owner",
+                    _identity_key(identity),
+                )
+        elif result is None:
+            try:
+                probe_argv = [*candidate, "--preflight"]
+                try:
+                    completed = _run_bounded_probe(
+                        probe_argv,
+                        cwd=root,
+                        env=values,
+                        timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+                    )
+                except subprocess.TimeoutExpired:
+                    result = LauncherProbeResult(candidate, "failed", "wrapper probe timed out after 5s", _identity_key(identity))
+                except _ProbeContainmentUnavailable as exc:
+                    result = LauncherProbeResult(candidate, "unknown", str(exc), _identity_key(identity))
+                except OSError as exc:
+                    result = LauncherProbeResult(candidate, "failed", f"wrapper did not start: {type(exc).__name__}", _identity_key(identity))
+                except Exception as exc:
+                    # An unexpected probe implementation/environment failure is
+                    # not evidence that the wrapper itself is broken.  Cache an
+                    # unknown result, but always release the reservation below.
+                    result = LauncherProbeResult(candidate, "unknown", f"wrapper probe raised {type(exc).__name__}", _identity_key(identity))
+                else:
+                    output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
+                    success = completed.returncode == 0 and "agent-loop preflight: verified" in output
+                    explicit_bootstrap = any(token in output.lower() for token in ("modulenotfounderror", "importerror", "no module named", "cannot import"))
+                    state = "verified" if success else ("failed" if explicit_bootstrap else "unknown")
+                    result = LauncherProbeResult(candidate, state, output, _identity_key(identity))
+            finally:
+                if cache_key is not None:
+                    assert flight is not None
+                    with _INNER_PREFLIGHT_LOCK:
+                        if result is not None:
+                            _store_wrapper_probe_locked(cache_key, result)
+                        _WRAPPER_PREFLIGHT_INFLIGHT.pop(cache_key, None)
+                        assert invocation is not None
+                        _PREFLIGHT_INVOCATIONS[invocation] = time.monotonic()
+                        _PREFLIGHT_INVOCATIONS.move_to_end(invocation)
+                        flight.set()
+                        _prune_invocations_locked()
+            assert result is not None
+            if memory_dir is not None and result.state in {"failed", "verified"}:
+                record_launcher_health(
+                    memory_dir,
+                    cwd=root,
+                    candidate=identity,
+                    state=result.state,
+                    provenance="wrapper-probe",
+                    repository=repository,
+                    environment=values,
+                    diagnostic=result.diagnostic,
+                )
+        results.append(result)
+        if result.state == "verified":
+            break
+    return tuple(results)
+
+
+def verified_wrapper_prefix(**kwargs: object) -> tuple[str, ...] | None:
+    for result in preflight_wrapper_candidates(**kwargs):
+        if result.state == "verified":
+            return result.candidate
+    return None
+
+
+def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None) -> tuple[str, ...] | None:
+    """Return the only inner launcher forms eligible for a safe bootstrap probe."""
+    tokens = tuple(str(item) for item in argv)
+    if not tokens:
+        return None
+    values = environment if environment is not None else os.environ
+    first = Path(tokens[0]).name
+    if first in {"pytest", "py.test"}:
+        executable = tokens[0]
+        if not Path(executable).is_absolute() and (tokens[0].startswith((".", "~")) or Path(tokens[0]).parent != Path(".")):
+            executable = str((cwd / Path(tokens[0])).resolve(strict=False))
+        elif not Path(executable).is_absolute():
+            executable = shutil.which(executable, path=(environment or os.environ).get("PATH")) or executable
+        return (executable, "--version")
+    if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "pytest":
+        interpreter = _python_interpreter_path(tokens[0], cwd=cwd, environment=values)
+        if interpreter is not None:
+            # Preserve the operator's current-interpreter spelling (including
+            # a symlink such as ``python3``) while still using the resolved
+            # identity for all other interpreters.
+            current = Path(sys.executable).resolve(strict=False)
+            executable = tokens[0] if interpreter == current else str(interpreter)
+            return (executable, "-m", "pytest", "--version")
+    return None
+
+
+def probe_inner_launcher(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None,
+    environment_is_complete: bool = False,
+) -> LauncherProbeResult:
+    """Run only a recognized, identity-cached five-second bootstrap probe."""
+    values = (
+        dict(environment)
+        if environment is not None and environment_is_complete
+        else ({**os.environ, **environment} if environment is not None else dict(os.environ))
+    )
+    original = tuple(str(item) for item in argv)
+    probe = recognized_inner_probe(original, cwd=cwd, environment=values)
+    if probe is None:
+        return LauncherProbeResult(original, "unknown", "unrecognized inner launcher")
+    identity = launcher_candidate_identity(original, cwd=cwd, environment=values, kind="inner")
+    identity_key = _identity_key(identity)
+    invocation = values.get("AGENT_LOOP_INVOCATION_ID")
+    cache_key = (invocation, identity_key) if invocation else None
+    flight: threading.Event | None = None
+    owner = True
+    if cache_key is not None:
+        with _INNER_PREFLIGHT_LOCK:
+            assert invocation is not None
+            _touch_invocation_locked(invocation)
+            cached = _INNER_PREFLIGHT_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            flight = _INNER_PREFLIGHT_INFLIGHT.get(cache_key)
+            if flight is not None:
+                owner = False
+            else:
+                seen = _INNER_PREFLIGHT_CANDIDATES.setdefault(invocation, set())
+                if identity_key not in seen and len(seen) >= MAX_INNER_PROBE_CANDIDATES:
+                    return LauncherProbeResult(
+                        original,
+                        "unknown",
+                        f"inner probe candidate limit reached ({MAX_INNER_PROBE_CANDIDATES})",
+                        identity_key,
+                    )
+                seen.add(identity_key)
+                flight = threading.Event()
+                _INNER_PREFLIGHT_INFLIGHT[cache_key] = flight
+    if not owner:
+        assert flight is not None
+        # The owner has a five-second subprocess watchdog.  A small amount of
+        # headroom lets waiters receive its published result without ever
+        # starting a duplicate probe if the owner is slow to publish.
+        if flight.wait(LAUNCHER_PROBE_TIMEOUT_SECONDS + 1.0):
+            with _INNER_PREFLIGHT_LOCK:
+                cached = _INNER_PREFLIGHT_CACHE.get(cache_key)  # type: ignore[arg-type]
+            if cached is not None:
+                return cached
+        return LauncherProbeResult(
+            original,
+            "unknown",
+            "inner probe result was not published by its owner",
+            identity_key,
+        )
+    result: LauncherProbeResult | None = None
+    try:
+        try:
+            completed = _run_bounded_probe(
+                probe,
+                cwd=cwd,
+                env=(values if environment_is_complete or environment is not None else None),
+                timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            result = LauncherProbeResult(original, "failed", "inner bootstrap probe timed out after 5s", identity_key)
+        except _ProbeContainmentUnavailable as exc:
+            result = LauncherProbeResult(original, "unknown", str(exc), identity_key)
+        except OSError as exc:
+            result = LauncherProbeResult(original, "failed", f"inner launcher did not start: {type(exc).__name__}", identity_key)
+        else:
+            output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
+            if completed.returncode == 0:
+                result = LauncherProbeResult(original, "verified", output, identity_key)
+            else:
+                result = LauncherProbeResult(original, "failed", output or f"bootstrap exited {completed.returncode}", identity_key)
+        return result
+    finally:
+        if cache_key is not None:
+            assert flight is not None
+            with _INNER_PREFLIGHT_LOCK:
+                if result is not None:
+                    _INNER_PREFLIGHT_CACHE[cache_key] = result
+                _INNER_PREFLIGHT_INFLIGHT.pop(cache_key, None)
+                assert invocation is not None
+                _PREFLIGHT_INVOCATIONS[invocation] = time.monotonic()
+                _PREFLIGHT_INVOCATIONS.move_to_end(invocation)
+                flight.set()
+                _prune_invocations_locked()
 
 
 def _git_commit(cwd: Path) -> str | None:
