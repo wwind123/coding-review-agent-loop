@@ -753,6 +753,134 @@ def test_accepts_loopback_target_in_nested_shell_command(tmp_path):
     validate_test_commands_within_workdir((command,), assigned_workdir=_assigned(tmp_path))
 
 
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize("shell", ["bash -lc", "/bin/sh -c", "zsh -ec", "timeout 120 env X=1 bash -l -c"])
+def test_quoted_shell_keeps_external_interpreter_separate_from_tests(tmp_path, shell, origin):
+    script = "/home/wwind123/llm-dialectic/.venv/bin/pytest tests/test_grafana_dashboards.py tests/test_production_topology_artifacts.py -q"
+    validate_test_commands_within_workdir(
+        [f"{shell} {shlex.quote(script)}"], assigned_workdir=_assigned(tmp_path), origin=origin,
+    )
+
+
+@pytest.mark.parametrize("script", [
+    "/outside/.venv/bin/pytest /outside/tests/test_api.py",
+    "cd /outside && python3 -m pytest tests/test_api.py",
+    "/outside/.venv/bin/python -m pytest --rootdir=/outside",
+    "E2E_BASE=https://live.example python3 -m pytest tests/test_api.py",
+    "python3 -m pytest tests/test_api.py && curl https://live.example",
+    "/outside/custom_script tests/test_api.py",
+])
+@pytest.mark.parametrize("origin", ["structured", "response"])
+def test_quoted_shell_still_rejects_external_targets(tmp_path, script, origin):
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir(
+            [f"bash -lc {shlex.quote(script)}"], assigned_workdir=_assigned(tmp_path), origin=origin,
+        )
+
+
+@pytest.mark.parametrize("origin", ["structured", "response"])
+@pytest.mark.parametrize("operator", [";", "&&", "||", "|", "|&", "&", ";;"])
+def test_quoted_shell_rejects_external_command_after_adjacent_operator(
+    tmp_path, origin, operator,
+):
+    script = f"pytest tests/test_api.py{operator}/outside/custom_script"
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            [f"bash -c {shlex.quote(script)}"],
+            assigned_workdir=_assigned(tmp_path),
+            origin=origin,
+        )
+
+
+def test_quoted_shell_does_not_split_quoted_control_operator(tmp_path):
+    script = "python3 -c 'print(\"safe;value\")'"
+    validate_test_commands_within_workdir(
+        [f"bash -c {shlex.quote(script)}"], assigned_workdir=_assigned(tmp_path),
+    )
+
+
+@pytest.mark.parametrize("shell_options", [
+    "-euo pipefail",
+    "-eu -o pipefail",
+    "--login",
+    "--noprofile --norc",
+])
+def test_quoted_shell_with_supported_options_validates_nested_command(tmp_path, shell_options):
+    assigned = _assigned(tmp_path)
+    validate_test_commands_within_workdir(
+        [f"bash {shell_options} -c 'python -m pytest -q'"],
+        assigned_workdir=assigned,
+    )
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            [f"bash {shell_options} -c 'cd /outside && pytest -q'"],
+            assigned_workdir=assigned,
+        )
+
+
+def test_quoted_shell_with_unsupported_option_before_command_fails_closed(tmp_path):
+    command = "bash --rcfile config/bashrc -c 'python -m pytest -q'"
+    with pytest.raises(AgentLoopError, match="unsupported shell option"):
+        validate_test_commands_within_workdir([command], assigned_workdir=_assigned(tmp_path))
+
+
+@pytest.mark.parametrize("script", ["python -m pytest -q", "cd /outside && pytest -q"])
+def test_quoted_shell_with_unsupported_cluster_containing_c_fails_closed(tmp_path, script):
+    with pytest.raises(AgentLoopError, match="unsupported shell option"):
+        validate_test_commands_within_workdir(
+            [f"bash -ac {shlex.quote(script)}"], assigned_workdir=_assigned(tmp_path),
+        )
+
+
+def test_multi_word_shell_operand_fails_closed(tmp_path):
+    with pytest.raises(AgentLoopError, match="multi-word shell script operand"):
+        validate_test_commands_within_workdir(
+            ["bash 'cd /outside && pytest'"], assigned_workdir=_assigned(tmp_path),
+        )
+
+
+def test_shell_script_operand_keeps_ordinary_path_validation(tmp_path):
+    assigned = _assigned(tmp_path)
+    validate_test_commands_within_workdir(
+        ["bash tests/run.sh"], assigned_workdir=assigned,
+    )
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir(
+            ["bash /outside/run.sh"], assigned_workdir=assigned,
+        )
+
+
+def test_nested_shell_and_managed_wrapper_are_checked(tmp_path):
+    assigned = _assigned(tmp_path)
+    inner = "/outside/agent-loop run-tests --memory-dir /outside/cache -- python3 -m pytest tests/test_api.py"
+    command = "pwd && bash -c " + shlex.quote("sh -c " + shlex.quote(inner))
+    validate_test_commands_within_workdir([command], assigned_workdir=assigned)
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir(
+            [command + " && cd /outside"], assigned_workdir=assigned,
+        )
+
+
+@pytest.mark.parametrize("command", [
+    "bash -lc '/outside/.venv/bin/pytest tests/test_api.py' name /outside/test.py",
+    "bash /outside/test.sh",
+    "bash --rcfile /outside/rc -c 'python3 -m pytest'",
+    "echo bash -c '/outside/.venv/bin/pytest tests/test_api.py'",
+    "bash -c \"'unterminated\"",
+])
+def test_shell_exemption_is_not_an_arbitrary_argument_exemption(tmp_path, command):
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir([command], assigned_workdir=_assigned(tmp_path))
+
+
+def test_shell_nesting_is_bounded(tmp_path):
+    command = "pytest"
+    for _ in range(9):
+        command = "bash -c " + shlex.quote(command)
+    with pytest.raises(AgentLoopError, match="nesting"):
+        validate_test_commands_within_workdir([command], assigned_workdir=_assigned(tmp_path))
+
+
 @pytest.mark.parametrize("url", [
     "http://0.0.0.0:8765",
     "http://192.168.1.10:8765",

@@ -578,7 +578,8 @@ def _effective_head_index(tokens: Sequence[str]) -> int | None:
 # ---------------------------------------------------------------------------
 
 ClauseMode = Literal["structured", "code", "narrative"]
-_SEPARATOR_TOKENS = {"&&", "||", ";", "|", "&", "(", ")"}
+_SHELL_PUNCTUATION = ";&|()"
+_SHELL_PUNCTUATION_CHARS = frozenset(_SHELL_PUNCTUATION)
 
 
 @dataclass
@@ -590,7 +591,13 @@ class _Clause:
 
 def _tokenize(text: str) -> list[str]:
     try:
-        return shlex.split(text)
+        # ``shlex.split`` only separates operators surrounded by whitespace.
+        # A shell does not impose that restriction, so use punctuation-aware
+        # lexing to keep adjacent commands from hiding in an argument token.
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
     except ValueError:
         return text.split()
 
@@ -615,7 +622,7 @@ def _split_into_clauses(text: str, mode: ClauseMode) -> list[_Clause]:
         command_by_contract = next_by_contract
 
     for token in tokens:
-        if token in _SEPARATOR_TOKENS:
+        if token and set(token) <= _SHELL_PUNCTUATION_CHARS:
             flush(True)
             continue
         current.append(token)
@@ -649,8 +656,79 @@ def _segments_for_entry(command: str, origin: Origin) -> list[tuple[str, ClauseM
 def _clauses_for_entry(command: str, origin: Origin) -> list[_Clause]:
     clauses: list[_Clause] = []
     for text, mode in _segments_for_entry(command, origin):
-        clauses.extend(_split_into_clauses(text, mode))
+        for clause in _split_into_clauses(text, mode):
+            clauses.extend(_expand_shell_clause(clause))
     return clauses
+
+
+def _shell_command_index(tokens: Sequence[str]) -> int | None:
+    head = _effective_head_index(tokens)
+    if head is None or _program_basename(tokens[head]) not in {"sh", "bash", "zsh"}:
+        return None
+    index = head + 1
+    while index < len(tokens):
+        option = tokens[index]
+        if option in {"--login", "--noprofile", "--norc"}:
+            index += 1
+            continue
+        if re.fullmatch(r"-[elux]*o", option):
+            # ``-o`` takes an option name, including when combined with
+            # operand-free flags as in ``-euo pipefail``.
+            if index + 1 >= len(tokens):
+                raise AgentLoopError("Cannot validate shell -o option without its operand.")
+            index += 2
+            continue
+        if re.fullmatch(r"-[celux]+", option):
+            if "c" in option:
+                return index + 1 if index + 1 < len(tokens) else None
+            index += 1
+            continue
+        if not option.startswith("-"):
+            # A shell operand is normally a script path. A quoted command-like
+            # blob is neither a safely identifiable script path nor an explicit
+            # command-string invocation, so refuse it instead of allowing paths
+            # embedded in the blob to bypass token-level validation.
+            if any(character.isspace() for character in option):
+                raise AgentLoopError("Cannot validate multi-word shell script operand.")
+            return None
+        if re.fullmatch(r"-[A-Za-z]+", option) and "c" in option:
+            # ``c`` makes the next operand executable text, even when it is
+            # grouped with a shell flag that this scanner does not support.
+            # Refuse the ambiguous cluster instead of treating that text as an
+            # ordinary non-path argument and skipping its embedded paths.
+            raise AgentLoopError(
+                "Cannot validate shell command string after an unsupported shell option."
+            )
+        if any(re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", later) for later in tokens[index + 1 :]):
+            raise AgentLoopError(
+                "Cannot validate shell command string after an unsupported shell option."
+            )
+        return None
+    return None
+
+
+def _expand_shell_clause(clause: _Clause, depth: int = 0) -> list[_Clause]:
+    index = _shell_command_index(clause.tokens)
+    if index is None:
+        return [clause]
+    if depth >= 8:
+        raise AgentLoopError("Test report shell-command nesting exceeds the validation limit.")
+    script = clause.tokens[index]
+    try:
+        shlex.split(script)
+    except ValueError as exc:
+        raise AgentLoopError("Cannot validate malformed quoted shell command in test report.") from exc
+    # Keep the launcher, environment, and positional arguments under the normal
+    # checks. Only the -c operand is executable text rather than a path argument.
+    outer = _Clause(
+        tokens=clause.tokens[:index] + clause.tokens[index + 1 :],
+        mode=clause.mode,
+        command_by_contract=clause.command_by_contract,
+    )
+    expanded = [outer]
+    for inner in _split_into_clauses(script, "structured"):
+        expanded.extend(_expand_shell_clause(inner, depth + 1))
+    return expanded
 
 
 # ---------------------------------------------------------------------------
