@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import shlex
 import shutil
 import sys
@@ -19,6 +20,34 @@ from coding_review_agent_loop.runner import run_foreground_test
 
 def _now() -> datetime:
     return datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc)
+
+
+def _assert_process_not_active(pid: int) -> None:
+    """Treat a POSIX zombie as terminated while allowing init to reap it."""
+    stat_path = Path(f"/proc/{pid}/stat")
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            stat = stat_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        state = stat.split(") ", 1)[1].split(maxsplit=1)[0]
+        if state == "Z":
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"probe descendant {pid} is still active")
+
+
+def _kill_if_active(pid: int) -> None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    if stat.split(") ", 1)[1].split(maxsplit=1)[0] != "Z":
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def _record(
@@ -655,11 +684,18 @@ def test_wrapper_preflight_classifies_explicit_import_failure(tmp_path, monkeypa
 @pytest.mark.skipif(os.name != "posix", reason="process-group probe cleanup is POSIX-specific")
 def test_wrapper_probe_timeout_kills_descendant_holding_output_pipe(tmp_path, monkeypatch):
     wrapper = tmp_path / "agent-loop"
-    child_code = "import time; time.sleep(30)"
+    pid_file = tmp_path / "wrapper-descendant.pid"
+    child_code = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(30)"
+    )
     wrapper.write_text(
         f"#!{sys.executable}\n"
         f"import subprocess, sys\n"
-        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n",
+        f"from pathlib import Path\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        f"Path({str(pid_file)!r}).write_text(str(child.pid))\n",
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
@@ -673,16 +709,28 @@ def test_wrapper_probe_timeout_kills_descendant_holding_output_pipe(tmp_path, mo
 
     assert result.state == "failed"
     assert "timed out" in result.diagnostic
+    descendant_pid = int(pid_file.read_text())
+    try:
+        _assert_process_not_active(descendant_pid)
+    finally:
+        _kill_if_active(descendant_pid)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group probe cleanup is POSIX-specific")
 def test_inner_probe_timeout_kills_descendant_holding_output_pipe(tmp_path, monkeypatch):
     pytest_launcher = tmp_path / "pytest"
-    child_code = "import time; time.sleep(30)"
+    pid_file = tmp_path / "inner-descendant.pid"
+    child_code = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(30)"
+    )
     pytest_launcher.write_text(
         f"#!{sys.executable}\n"
         f"import subprocess, sys\n"
-        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n",
+        f"from pathlib import Path\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        f"Path({str(pid_file)!r}).write_text(str(child.pid))\n",
         encoding="utf-8",
     )
     pytest_launcher.chmod(0o755)
@@ -693,6 +741,11 @@ def test_inner_probe_timeout_kills_descendant_holding_output_pipe(tmp_path, monk
 
     assert result.state == "failed"
     assert "timed out" in result.diagnostic
+    descendant_pid = int(pid_file.read_text())
+    try:
+        _assert_process_not_active(descendant_pid)
+    finally:
+        _kill_if_active(descendant_pid)
 
 
 def test_wrapper_preflight_bounds_changing_completed_identities(tmp_path, monkeypatch):

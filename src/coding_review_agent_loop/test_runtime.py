@@ -1396,7 +1396,6 @@ def _terminate_probe_tree(process: subprocess.Popen) -> None:
             pass
     try:
         process.wait(timeout=0.5)
-        return
     except subprocess.TimeoutExpired:
         pass
     if os.name == "posix":
