@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock, Thread, current_thread
+from threading import Event, Lock, Thread, current_thread
 from typing import Any, Iterable, Mapping, Sequence
 
 from .errors import AgentLoopError
@@ -1091,6 +1091,28 @@ def _git_nul_paths(raw: bytes) -> tuple[str, ...]:
         raise AgentLoopError("git snapshot contained invalid path data") from exc
 
 
+def _git_index_entries(raw: bytes) -> dict[str, tuple[str, str]]:
+    """Parse stage-zero index modes and object IDs without losing odd paths."""
+    entries: dict[str, tuple[str, str]] = {}
+    try:
+        for record in raw.split(b"\0"):
+            if not record:
+                continue
+            metadata, separator, path_bytes = record.partition(b"\t")
+            fields = metadata.split(b" ")
+            if not separator or len(fields) != 3 or fields[2] != b"0":
+                raise AgentLoopError("git snapshot index has unresolved stages")
+            mode = fields[0].decode("ascii", errors="strict")
+            object_id = fields[1].decode("ascii", errors="strict")
+            relative = path_bytes.decode("utf-8", errors="surrogateescape")
+            if relative in entries:
+                raise AgentLoopError("git snapshot index contains duplicate paths")
+            entries[relative] = (mode, object_id)
+    except UnicodeError as exc:
+        raise AgentLoopError("git snapshot contained invalid index data") from exc
+    return entries
+
+
 def _path_is_referenced(root: Path, token: str) -> str | None:
     if not token or token.startswith("-") or "=" in token and token.split("=", 1)[0].startswith("-"):
         return None
@@ -1219,7 +1241,10 @@ def capture_tracked_tree_snapshot(
             raise AgentLoopError("snapshot root does not equal Git top-level")
         head = _run_git(canonical_root, ("rev-parse", "HEAD"), timeout=timeout_seconds).decode().strip()
         index_raw = _run_git(canonical_root, ("ls-files", "-s", "-z"), timeout=timeout_seconds)
+        index_entries = _git_index_entries(index_raw)
         tracked = _git_nul_paths(_run_git(canonical_root, ("ls-files", "-z"), timeout=timeout_seconds))
+        if set(index_entries) != set(tracked):
+            raise AgentLoopError("git snapshot index and tracked paths disagree")
         untracked = _git_nul_paths(
             _run_git(canonical_root, ("ls-files", "--others", "--exclude-standard", "-z"), timeout=timeout_seconds)
         )
@@ -1236,6 +1261,16 @@ def capture_tracked_tree_snapshot(
                 raise AgentLoopError("git snapshot time limit exceeded")
             path = canonical_root / relative
             try:
+                index_mode, object_id = index_entries[relative]
+                if index_mode == "160000":
+                    tracked_records.append(
+                        _bytes_snapshot_record(
+                            relative,
+                            b"gitlink\0" + object_id.encode("ascii"),
+                            remaining=remaining,
+                        )
+                    )
+                    continue
                 info = path.lstat()
                 if path.is_symlink():
                     payload = b"symlink\0" + os.readlink(path).encode("utf-8", errors="surrogateescape")
@@ -1553,6 +1588,13 @@ class BrokerRunResult:
     error: str | None = None
 
 
+@dataclass
+class _ReplayReservation:
+    digest: str
+    ready: Event = field(default_factory=Event)
+    response: dict[str, object] | None = None
+
+
 class TestBrokerServer:
     """A single-turn AF_UNIX broker owned by the parent orchestrator."""
 
@@ -1583,7 +1625,10 @@ class TestBrokerServer:
         self._stop = False
         self._send_lock = Lock()
         self._journal: list[LocalTestObservation] = []
-        self._receipts: dict[str, tuple[str, dict[str, object]]] = {}
+        # Reservations are retained for the broker lifetime. New work fails
+        # closed at the bound instead of making an old authenticated nonce
+        # executable again.
+        self._receipts: dict[str, _ReplayReservation] = {}
         self._journal_lock = Lock()
         self._environment_registry = environment_registry or EnvironmentIdentityRegistry()
         self._parent_containment_handle: Any | None = None
@@ -1721,21 +1766,40 @@ class TestBrokerServer:
                     nonce = str(validated["nonce"])
                     digest = hashlib.sha256(json.dumps(validated, sort_keys=True, default=str).encode()).hexdigest()
                     with self._journal_lock:
-                        cached = self._receipts.get(nonce)
-                    if cached is not None:
-                        if cached[0] != digest:
+                        reservation = self._receipts.get(nonce)
+                        owns_reservation = reservation is None
+                        if reservation is None:
+                            if len(self._receipts) >= MAX_PRIVATE_OBSERVATIONS:
+                                raise BrokerProtocolError("broker replay capacity is exhausted")
+                            reservation = _ReplayReservation(digest=digest)
+                            self._receipts[nonce] = reservation
+                        elif reservation.digest != digest:
                             raise BrokerProtocolError("conflicting replay for nonce")
-                        _send_frame(connection, cached[1])
+                    if not owns_reservation:
+                        reservation.ready.wait()
+                        if reservation.response is None:
+                            raise BrokerProtocolError("broker replay did not complete")
+                        _send_frame(connection, reservation.response)
                         return
-                    response = self._execute_request(validated, connection)
-                    with self._journal_lock:
-                        self._receipts[nonce] = (digest, response)
-                        if len(self._receipts) > MAX_PRIVATE_OBSERVATIONS:
-                            oldest = next(iter(self._receipts))
-                            self._receipts.pop(oldest, None)
+                    try:
+                        response = self._execute_request(validated, connection)
+                    except (BrokerProtocolError, AgentLoopError, OSError, ValueError) as exc:
+                        if isinstance(exc, AgentLoopError):
+                            self._record_capture_failure(validated, exc)
+                        response = {"type": "error", "error": _safe_text(exc)}
+                    except Exception as exc:
+                        self._record_capture_failure(validated, exc)
+                        response = {
+                            "type": "error",
+                            "error": f"broker execution failed: {type(exc).__name__}",
+                        }
+                    finally:
+                        with self._journal_lock:
+                            reservation.response = response
+                            reservation.ready.set()
                     _send_frame(connection, response)
                 except (BrokerProtocolError, AgentLoopError, OSError, ValueError) as exc:
-                    if isinstance(exc, AgentLoopError):
+                    if isinstance(exc, AgentLoopError) and validated is not None:
                         self._record_capture_failure(validated, exc)
                     try:
                         _send_frame(connection, {"type": "error", "error": _safe_text(exc)})

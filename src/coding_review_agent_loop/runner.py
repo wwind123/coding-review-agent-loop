@@ -680,9 +680,26 @@ class Runner:
                 containment_policy=self.containment_policy,
                 environment_registry=self._environment_registry,
             ).start()
-        except (OSError, ValueError, AgentLoopError):
+        except (OSError, ValueError, AgentLoopError) as exc:
             # Broker setup is infrastructure telemetry. A coder can still use
             # the standalone wrapper, which is explicitly telemetry-unverified.
+            observation = LocalTestObservation(
+                command=(),
+                outcome="incomplete",
+                provenance="telemetry-unverified",
+                scope=EvidenceScope(),
+                receipt_id=None,
+                turn_id=turn_id,
+                timestamp=datetime.now().astimezone().isoformat(),
+                attribution=TreeAttribution(
+                    state="unknown", caveats=("test broker startup failed",)
+                ),
+                environment_state="identity-unknown",
+                caveats=(f"local test capture incomplete: broker startup {type(exc).__name__}",),
+            )
+            with self._active_procs_lock:
+                self._local_test_observations.append(observation)
+                self._local_test_observations[:] = self._local_test_observations[-64:]
             return None, turn_id
         with self._active_procs_lock:
             self._active_test_brokers[turn_id] = broker

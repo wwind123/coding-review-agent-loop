@@ -1124,6 +1124,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         lane="broker",
                     )
                     return int(broker_result.returncode if broker_result.returncode is not None else 1)
+            else:
+                print(
+                    "agent-loop: test broker unavailable; running locally with telemetry-unverified evidence",
+                    file=sys.stderr,
+                    flush=True,
+                )
             containment_policy = policy_from_values(vars(args))
             fallback_environment = dict(os.environ)
             for name in (

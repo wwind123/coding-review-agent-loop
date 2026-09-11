@@ -1,7 +1,11 @@
 import json
 import os
+import hashlib
+import hmac
+import socket
 import sys
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +33,7 @@ from coding_review_agent_loop.local_test_evidence import (
     redact_test_command,
 )
 from coding_review_agent_loop.containment import open_confined_cwd
+import coding_review_agent_loop.local_test_evidence as evidence_module
 
 
 def _observation(
@@ -461,6 +466,127 @@ def test_broker_authenticates_turn_and_forwards_only_snapshot_environment(tmp_pa
         server.stop()
 
 
+def _signed_broker_request(server, tmp_path, raw_nonce, argv=None):
+    nonce = raw_nonce + "." + hmac.new(
+        server.capability.encode("ascii"), raw_nonce.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    return {
+        "turn_id": server.turn_id,
+        "nonce": nonce,
+        "argv": list(argv or (sys.executable, "-c", "pass")),
+        "timeout_seconds": 5,
+        "cwd": str(tmp_path),
+        "environment": {"PATH": os.environ.get("PATH", "")},
+    }
+
+
+def _raw_broker_request(server, request):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(10)
+        connection.connect(server.endpoint)
+        evidence_module._send_frame(connection, request)
+        while True:
+            response = evidence_module._recv_frame(connection)
+            if response.get("type") != "output":
+                return response
+
+
+def test_broker_concurrent_identical_replay_executes_once_and_reuses_receipt(
+    monkeypatch, tmp_path
+):
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def execute(argv, cwd, timeout, environment, stream):
+        calls.append(argv)
+        started.set()
+        assert release.wait(5)
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-replay", execute=execute).start()
+    request = _signed_broker_request(server, tmp_path, "a" * 32)
+    responses = []
+    first = threading.Thread(target=lambda: responses.append(_raw_broker_request(server, request)))
+    second = threading.Thread(target=lambda: responses.append(_raw_broker_request(server, request)))
+    try:
+        first.start()
+        assert started.wait(5)
+        second.start()
+        release.set()
+        first.join(5)
+        second.join(5)
+        assert not first.is_alive() and not second.is_alive()
+        assert len(calls) == 1
+        assert len(responses) == 2
+        assert responses[0] == responses[1]
+    finally:
+        release.set()
+        server.stop()
+
+
+def test_broker_concurrent_conflicting_replay_is_rejected(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def execute(argv, cwd, timeout, environment, stream):
+        calls.append(argv)
+        started.set()
+        assert release.wait(5)
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-conflict", execute=execute).start()
+    first_request = _signed_broker_request(server, tmp_path, "b" * 32)
+    conflicting = {**first_request, "argv": [sys.executable, "-c", "print('different')"]}
+    first_response = []
+    first = threading.Thread(
+        target=lambda: first_response.append(_raw_broker_request(server, first_request))
+    )
+    try:
+        first.start()
+        assert started.wait(5)
+        conflict_response = _raw_broker_request(server, conflicting)
+        assert conflict_response["type"] == "error"
+        assert "conflicting replay" in conflict_response["error"]
+        release.set()
+        first.join(5)
+        assert len(calls) == 1
+        assert first_response[0]["type"] == "result"
+    finally:
+        release.set()
+        server.stop()
+
+
+def test_broker_capacity_rejects_new_nonce_but_retains_old_replay(monkeypatch, tmp_path):
+    snapshot = evidence_module.TrackedTreeSnapshot(
+        root=str(tmp_path), head=None, digest=None, tracked_digest=None,
+        status_clean=None, complete=False, stable=None,
+    )
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", lambda *_args, **_kwargs: snapshot)
+
+    def execute(argv, cwd, timeout, environment, stream):
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-capacity", execute=execute).start()
+    try:
+        first_request = _signed_broker_request(server, tmp_path, "0" * 32)
+        first_response = _raw_broker_request(server, first_request)
+        for index in range(1, evidence_module.MAX_PRIVATE_OBSERVATIONS):
+            raw_nonce = f"{index:032x}"
+            assert _raw_broker_request(
+                server, _signed_broker_request(server, tmp_path, raw_nonce)
+            )["type"] == "result"
+        rejected = _raw_broker_request(
+            server, _signed_broker_request(server, tmp_path, "f" * 32)
+        )
+        assert rejected["type"] == "error"
+        assert "capacity" in rejected["error"]
+        assert _raw_broker_request(server, first_request) == first_response
+    finally:
+        server.stop()
+
+
 def test_broker_context_failure_returns_error_and_records_incomplete(monkeypatch, tmp_path):
     import coding_review_agent_loop.containment as containment_module
     from coding_review_agent_loop.errors import AgentLoopError
@@ -533,6 +659,34 @@ def test_runner_exceptional_teardown_preserves_broker_journal(tmp_path):
             label="coder", progress_interval_seconds=1,
         )
     assert [item.outcome for item in runner.local_test_observations()] == ["passed"]
+
+
+def test_runner_broker_start_failure_is_visible_in_handoff(monkeypatch, tmp_path):
+    from coding_review_agent_loop.containment import default_policy
+    from coding_review_agent_loop.runner import Runner
+
+    def fail_start(_server):
+        raise OSError("synthetic broker startup failure")
+
+    monkeypatch.setattr(BrokerServer, "start", fail_start)
+    runner = Runner(containment_policy=default_policy(mode="off", cache_dir=tmp_path / ".runtime"))
+    result = runner.run_with_log(
+        [sys.executable, "-c", "print('coder completed')"],
+        cwd=tmp_path,
+        log_path=tmp_path / "coder.log",
+        label="coder",
+        progress_interval_seconds=1,
+    )
+    assert result.returncode == 0
+
+    rendered = runner.render_local_test_evidence(cwd=tmp_path)
+    decoded = decode_bounded_evidence(rendered)
+    assert decoded is not None
+    assert decoded.capture_incomplete is True
+    assert len(decoded.observations) == 1
+    assert decoded.observations[0].outcome == "incomplete"
+    assert decoded.observations[0].provenance == "telemetry-unverified"
+    assert "broker startup" in " ".join(decoded.observations[0].caveats)
 
 
 def test_confined_cwd_rejects_final_symlink_and_outside_escape(tmp_path):
@@ -738,3 +892,31 @@ def test_snapshot_rejects_oversized_files_before_reading_payload(
 
     assert snapshot.complete is False
     assert "byte limit" in " ".join(snapshot.caveats)
+
+
+def test_snapshot_hashes_clean_and_dirty_gitlinks_without_reading_directory(tmp_path):
+    outer = tmp_path / "outer"
+    nested = outer / "vendor" / "dependency"
+    outer.mkdir()
+    _init_snapshot_repo(outer)
+    nested.mkdir(parents=True)
+    _init_snapshot_repo(nested)
+    nested_head = subprocess.run(
+        ["git", "-C", str(nested), "rev-parse", "HEAD"],
+        check=True, stdout=subprocess.PIPE, text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(outer), "update-index", "--add", "--cacheinfo", f"160000,{nested_head},vendor/dependency"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(outer), "commit", "-qm", "add gitlink"], check=True)
+
+    clean = capture_tracked_tree_snapshot(outer)
+    assert clean.complete is True
+    assert clean.status_clean is True
+
+    (nested / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    dirty = capture_tracked_tree_snapshot(outer)
+    assert dirty.complete is True
+    assert dirty.status_clean is False
+    assert dirty.tracked_digest == clean.tracked_digest

@@ -227,7 +227,7 @@ def test_cli_wrapper_records_omitted_ceiling_and_rejects_over_policy_before_spaw
     assert len(runtime.load_runtime_memory(memory)) == 1
 
 
-def test_cli_broker_failure_falls_back_and_records_unverified_run(tmp_path, monkeypatch):
+def test_cli_broker_failure_falls_back_and_records_unverified_run(tmp_path, monkeypatch, capsys):
     memory = tmp_path / "memory"
     marker = tmp_path / "ran"
     monkeypatch.chdir(tmp_path)
@@ -241,6 +241,22 @@ def test_cli_broker_failure_falls_back_and_records_unverified_run(tmp_path, monk
     ]) == 0
     assert marker.exists()
     assert runtime.load_runtime_memory(memory)[-1]["outcome"] == "passed"
+    assert "unverified telemetry" in capsys.readouterr().err
+
+
+def test_cli_without_broker_labels_standalone_telemetry_unverified(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "AGENT_LOOP_TEST_BROKER_ENDPOINT",
+        "AGENT_LOOP_TEST_BROKER_CAPABILITY",
+        "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert main([
+        "run-tests", "--timeout-seconds", "5", "--memory-dir", str(tmp_path / "memory"),
+        "--", sys.executable, "-c", "pass",
+    ]) == 0
+    assert "telemetry-unverified evidence" in capsys.readouterr().err
 
 
 def test_runtime_sidecar_recommendations_timeout_lower_bound_and_success_clear(tmp_path):
