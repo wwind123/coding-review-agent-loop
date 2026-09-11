@@ -2640,8 +2640,8 @@ Before approving, self-check every `future_followups` entry: if it is trivial
 or local to the current PR, reclassify it as `same_pr_followups` and return
 `blocking`, or omit it if it is only a nit.
 
-    For selective-intermediate PR scheduling, a finding may be an object instead
-    of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
+For selective-intermediate PR scheduling, a finding may be an object instead
+of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
 optional `fix_scope` must contain only exact normalized repository-relative
 POSIX paths. Never use globs, directories, absolute paths, or traversal.
 

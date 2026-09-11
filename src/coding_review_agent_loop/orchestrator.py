@@ -7501,6 +7501,144 @@ def _scheduler_obligations(
     return tuple(obligations)
 
 
+def _latest_pr_reviewer_records(
+    records: Sequence[PostedRoundRecord],
+    configured_reviewers: Sequence[AgentName],
+) -> dict[str, PostedRoundRecord]:
+    """Return the latest persisted review for every configured reviewer.
+
+    This intentionally searches all candidate subjects.  The exact-head
+    approval helper cannot be used here because a stale-head record is the
+    evidence needed to decide whether a returning reviewer needs a fresh
+    context and session.
+    """
+    configured_names = {agent_display_name(reviewer) for reviewer in configured_reviewers}
+    latest: dict[str, PostedRoundRecord] = {}
+    for record in reversed(records):
+        if record.metadata.role != "reviewer" or record.metadata.agent not in configured_names:
+            continue
+        latest.setdefault(record.metadata.agent, record)
+    return latest
+
+
+def _reviewer_needs_fresh_context(
+    reviewer: AgentName,
+    *,
+    selective_policy: bool,
+    current_head_sha: str,
+    current_round: int,
+    latest_reviewer_records: Mapping[str, PostedRoundRecord],
+) -> bool:
+    """Identify a reviewer that must receive a new full-context turn.
+
+    A reviewer with no persisted review, a review of an older head, or a
+    review that missed an intervening round cannot safely reuse a compact
+    session.  In particular, the lookup must not be limited to exact-head
+    approvals: those records intentionally exclude the stale record we need
+    to inspect.
+    """
+    if not selective_policy:
+        return False
+    record = latest_reviewer_records.get(agent_display_name(reviewer))
+    if record is None:
+        return True
+    return (
+        record.metadata.subject != current_head_sha
+        or record.metadata.round_number < current_round - 1
+    )
+
+
+def _reviewer_diff_summary(
+    runner: Runner,
+    *,
+    checkout: Path,
+    last_reviewed_sha: str | None,
+    current_head_sha: str,
+) -> str:
+    """Render a bounded, orchestrator-observed diff summary for a returner."""
+    if not last_reviewed_sha:
+        return "No prior reviewer SHA was recorded; inspect the complete base-to-head diff."
+    if last_reviewed_sha == current_head_sha:
+        return "The last reviewed SHA is the current head; inspect the complete base-to-head diff for any missed context."
+    try:
+        result = runner.run(
+            ["git", "diff", "--name-status", "--find-renames", "--find-copies", last_reviewed_sha, current_head_sha],
+            cwd=checkout,
+            check=False,
+        )
+        if result.returncode != 0:
+            return (
+                f"The diff from {last_reviewed_sha} to {current_head_sha} was unavailable; "
+                "inspect the complete base-to-head diff independently."
+            )
+        paths = tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+        if not paths:
+            return (
+                f"The diff from {last_reviewed_sha} to {current_head_sha} had no name-status output; "
+                "inspect the complete base-to-head diff independently."
+            )
+        displayed = paths[:32]
+        suffix = "; ..." if len(paths) > len(displayed) else ""
+        return (
+            f"Observed diff from {last_reviewed_sha} to {current_head_sha}: "
+            + "; ".join(displayed)
+            + suffix
+            + ". Inspect the complete base-to-head diff independently."
+        )
+    except (OSError, AttributeError, TypeError):
+        return (
+            f"The diff from {last_reviewed_sha} to {current_head_sha} could not be observed; "
+            "inspect the complete base-to-head diff independently."
+        )
+
+
+def _returning_reviewer_context(
+    runner: Runner,
+    *,
+    reviewer: AgentName,
+    checkout: Path,
+    current_head_sha: str,
+    current_round: int,
+    latest_reviewer_records: Mapping[str, PostedRoundRecord],
+) -> str:
+    record = latest_reviewer_records.get(agent_display_name(reviewer))
+    last_sha = record.metadata.subject if record is not None else None
+    if record is None:
+        history = "No prior review record is available for this reviewer."
+    else:
+        missed_rounds = max(0, current_round - record.metadata.round_number - 1)
+        history = (
+            f"Last reviewed SHA: {record.metadata.subject}; "
+            f"last attended round: {record.metadata.round_number}."
+            + (
+                f" Missed {missed_rounds} intervening review round(s); reconstruct context from the current history."
+                if missed_rounds else ""
+            )
+        )
+    return (
+        "\nReturning reviewer handoff context (orchestrator-derived):\n"
+        f"{history}\n"
+        + _reviewer_diff_summary(
+            runner,
+            checkout=checkout,
+            last_reviewed_sha=last_sha,
+            current_head_sha=current_head_sha,
+        )
+        + "\nYour review must inspect the complete current base-to-head diff; the coder's summary is not a substitute.\n"
+    )
+
+
+def _all_pending_resolution_owners_unavailable(
+    item: UnresolvedReviewItem,
+    unavailable_names: set[str],
+) -> bool:
+    """Return true only when a non-empty pending owner set is unavailable."""
+    owners = item.resolution_owners or (item.reviewer,)
+    states = dict(item.owner_states or ((owner, "pending") for owner in owners))
+    pending = [owner for owner in owners if states.get(owner) != "cleared"]
+    return bool(pending) and all(owner in unavailable_names for owner in pending)
+
+
 def _observe_pr_transition(
     runner: Runner,
     *,
@@ -7626,19 +7764,54 @@ def _fresh_pr_qualification_snapshot(
         fresh_parent = get_issue_context(
             runner, config=config, issue_number=parent_issue_context.number
         )
-    if approved_plan_context is not None and fresh_issue is not None:
+    if approved_plan_context is not None:
+        if fresh_issue is None or not approved_plan_context.plan_hash:
+            raise AgentLoopError(
+                "Approved-plan/handoff identity is missing during PR qualification; "
+                "stale approvals cannot be used for this head."
+            )
         fresh_handoff = find_latest_issue_pr_handoff(
             fresh_issue.comments,
             issue_number=fresh_issue.number,
             repo=config.repo,
         )
         if (
-            fresh_handoff is not None
-            and fresh_handoff.flow == "approved-plan-implementation"
-            and fresh_handoff.plan_hash != approved_plan_context.plan_hash
+            fresh_handoff is None
+            or fresh_handoff.pr_number != pr_number
+            or fresh_handoff.flow != "approved-plan-implementation"
+            or fresh_handoff.plan_hash != approved_plan_context.plan_hash
         ):
             raise AgentLoopError(
-                "Approved-plan/handoff identity changed during PR qualification; "
+                "Approved-plan/handoff identity changed or disappeared during PR qualification; "
+                "stale approvals cannot be used for this head."
+            )
+        # The handoff hash alone is not enough: recover the canonical plan
+        # again from the freshly fetched issue/parent comments and require the
+        # same hash and subject that the reviewers were bound to.
+        plan_candidates = [fresh_issue.comments]
+        if fresh_parent is not None:
+            plan_candidates.append(fresh_parent.comments)
+        recovered_plan = next(
+            (
+                candidate
+                for comments in plan_candidates
+                if (
+                    candidate := recover_approved_plan_context(
+                        comments,
+                        expected_hash=approved_plan_context.plan_hash,
+                        expected_subject=approved_plan_context.plan_subject,
+                    )
+                ).is_available
+            ),
+            None,
+        )
+        if (
+            recovered_plan is None
+            or recovered_plan.plan_hash != approved_plan_context.plan_hash
+            or recovered_plan.plan_subject != approved_plan_context.plan_subject
+        ):
+            raise AgentLoopError(
+                "Approved plan identity changed or disappeared during PR qualification; "
                 "stale approvals cannot be used for this head."
             )
     requirements = _build_requirements_context(
@@ -8324,6 +8497,15 @@ def run_pr_loop(
             next_unresolved_item_number = resumed_round.next_unresolved_item_number
             start_round_number = resumed_round.round_number
             log(config, f"PR #{pr_number}: resuming round {start_round_number}")
+            if latest_coder_metadata is not None and any(
+                "external/unrecorded head advance" in reason
+                for reason in latest_coder_metadata.scheduler_reasons
+            ):
+                # The first post-recovery review must be full-board even when
+                # the recovered coder checkpoint is the only current-head
+                # record.  This is an audit decision, not the durable
+                # operator force-full latch.
+                final_sweep_pending = True
         watch_failure_extension_used = False
         watch_head_extension_used = False
         watch_deadline: float | None = None
@@ -8511,18 +8693,46 @@ def run_pr_loop(
                 )
             scheduler_previous_sha: str | None = None
             scheduler_diff_context = ""
+            latest_reviewer_records: dict[str, PostedRoundRecord] = {}
+            external_recovery_full_board = skip_reviewers_for_recovery
             if selective_policy:
-                historical_records: tuple[PostedRoundRecord, ...] = ()
-                if (
-                    latest_coder_metadata is not None
-                    and latest_coder_metadata.scheduler_current_sha == current_pr_subject
-                ):
-                    scheduler_previous_sha = latest_coder_metadata.scheduler_previous_sha
-                if scheduler_previous_sha is None:
-                    try:
-                        historical_records = _extract_round_metadata_records(pr_comments, flow="pr")
-                    except AgentLoopError:
-                        historical_records = ()
+                try:
+                    historical_records = _extract_round_metadata_records(pr_comments, flow="pr")
+                except AgentLoopError:
+                    historical_records = ()
+                    scheduler_force_full = True
+                latest_reviewer_records = _latest_pr_reviewer_records(
+                    historical_records, configured_reviewers
+                )
+                current_head_records = [
+                    record for record in historical_records
+                    if record.metadata.subject == current_pr_subject
+                ]
+                current_coder_record = next(
+                    (
+                        record for record in reversed(current_head_records)
+                        if record.metadata.role == "coder"
+                        and record.metadata.scheduler_current_sha == current_pr_subject
+                    ),
+                    None,
+                )
+                coder_checkpoint_is_current = bool(
+                    current_coder_record is not None
+                    and not any(
+                        record.index > current_coder_record.index
+                        and record.metadata.role in {"reviewer", "summary"}
+                        for record in current_head_records
+                    )
+                )
+                if coder_checkpoint_is_current and current_coder_record is not None:
+                    scheduler_previous_sha = current_coder_record.metadata.scheduler_previous_sha
+                elif current_head_records:
+                    # Reviewer/audit records after a coder checkpoint mean the
+                    # candidate is already in a same-head reconciliation
+                    # round.  Never reuse the previous coder transition for a
+                    # final sweep on this unchanged head.
+                    scheduler_previous_sha = current_pr_subject
+                else:
                     scheduler_previous_sha = next(
                         (
                             record.metadata.scheduler_current_sha
@@ -8542,21 +8752,8 @@ def run_pr_loop(
                     repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                 ).hexdigest()[:16]
                 persisted_obligation_digest = None
-                if (
-                    latest_coder_metadata is not None
-                    and latest_coder_metadata.scheduler_current_sha == current_pr_subject
-                ):
-                    persisted_obligation_digest = latest_coder_metadata.scheduler_obligation_digest
-                if persisted_obligation_digest is None:
-                    persisted_obligation_digest = next(
-                        (
-                            record.metadata.scheduler_obligation_digest
-                            for record in reversed(historical_records)
-                            if record.metadata.scheduler_contract is not None
-                            and record.metadata.scheduler_current_sha == current_pr_subject
-                        ),
-                        None,
-                    )
+                if coder_checkpoint_is_current and current_coder_record is not None:
+                    persisted_obligation_digest = current_coder_record.metadata.scheduler_obligation_digest
                 if (
                     persisted_obligation_digest is not None
                     and persisted_obligation_digest != current_obligation_digest
@@ -8570,7 +8767,12 @@ def run_pr_loop(
                 active_scopes = tuple(
                     sorted({path for obligation in obligations for path in (obligation.scope or ())})
                 )
-                if scheduler_previous_sha is None:
+                if external_recovery_full_board:
+                    classification = TransitionClassification(
+                        "broad",
+                        "external/unrecorded head advance requires full board",
+                    )
+                elif scheduler_previous_sha is None:
                     classification = TransitionClassification("broad", "initial candidate requires the full board")
                 elif scheduler_previous_sha == current_pr_subject:
                     if any(obligation.scope is None for obligation in obligations):
@@ -8591,12 +8793,26 @@ def run_pr_loop(
                         broad_rules=scheduler_contract.broad_rules,
                         obligations=obligations,
                     )
-                if classification.broad and scheduler_previous_sha not in {None, current_pr_subject}:
-                    scheduler_force_full = True
                 final_sweep = final_sweep_pending or (
                     scheduler_previous_sha is not None
                     and not obligations
-                )
+                ) or external_recovery_full_board
+                if classification.narrow:
+                    # A reviewer that missed more than the immediately prior
+                    # turn has an unreconstructible per-reviewer history for
+                    # selective scheduling.  Reopen the full board rather
+                    # than trusting a summary from an older transition.
+                    stale_history = [
+                        name for name, record in latest_reviewer_records.items()
+                        if record.metadata.subject != current_pr_subject
+                        and scheduler_previous_sha != record.metadata.subject
+                    ]
+                    if stale_history:
+                        classification = TransitionClassification(
+                            "broad",
+                            "reviewer history spans an unavailable intermediate head",
+                            tuple(sorted(stale_history)),
+                        )
                 scheduler_snapshot = SchedulerSnapshot(
                     previous_sha=scheduler_previous_sha,
                     current_sha=current_pr_subject,
@@ -8780,11 +8996,25 @@ def run_pr_loop(
                     return "carried"
                 return "turn"
 
-            def _reviewer_needs_fresh_context(reviewer: AgentName) -> bool:
-                if not selective_policy:
-                    return False
-                prior = unchanged_head_approvals.get(agent_display_name(reviewer))
-                return prior is not None and prior.metadata.subject != current_pr_subject
+            reviewer_fresh_contexts = {
+                reviewer: _returning_reviewer_context(
+                    runner,
+                    reviewer=reviewer,
+                    checkout=active_workdir(config),
+                    current_head_sha=current_pr_subject,
+                    current_round=round_number,
+                    latest_reviewer_records=latest_reviewer_records,
+                )
+                if _reviewer_needs_fresh_context(
+                    reviewer,
+                    selective_policy=selective_policy,
+                    current_head_sha=current_pr_subject,
+                    current_round=round_number,
+                    latest_reviewer_records=latest_reviewer_records,
+                )
+                else ""
+                for reviewer in configured_reviewers
+            }
 
             if config.review_parallel and not skip_reviewers_this_round:
                 pending_pr_reviewers = [
@@ -8841,7 +9071,7 @@ def run_pr_loop(
                                 unresolved_items=prior_unresolved_items,
                                 compact_context=(
                                     use_compact_pr_context
-                                    and not _reviewer_needs_fresh_context(reviewer)
+                                    and not reviewer_fresh_contexts[reviewer]
                                 ),
                                 compact_prior=(
                                     CompactPriorContext(tuple(pr_compact_prior_summaries))
@@ -8849,7 +9079,11 @@ def run_pr_loop(
                                     else None
                                 ),
                                 compact_tail=pr_parallel_compact_tail,
-                                coder_followup_context=coder_followup_context + scheduler_diff_context,
+                                coder_followup_context=(
+                                    coder_followup_context
+                                    + scheduler_diff_context
+                                    + reviewer_fresh_contexts[reviewer]
+                                ),
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
                             )
@@ -8874,7 +9108,7 @@ def run_pr_loop(
                                     prompt=pr_prompts[reviewer],
                                     session_id=(
                                         None
-                                        if use_compact_pr_context or _reviewer_needs_fresh_context(reviewer)
+                                        if use_compact_pr_context or reviewer_fresh_contexts[reviewer]
                                         else reviewer_session_ids.get(reviewer)
                                     ),
                                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
@@ -9075,7 +9309,7 @@ def run_pr_loop(
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = []
                 else:
-                    reviewer_fresh_context = _reviewer_needs_fresh_context(reviewer)
+                    reviewer_fresh_context = bool(reviewer_fresh_contexts[reviewer])
                     reviewer_compact_context = use_compact_pr_context and not reviewer_fresh_context
                     context_mode = "compact" if reviewer_compact_context else "full"
                     log(
@@ -9120,7 +9354,11 @@ def run_pr_loop(
                                     else None
                                 ),
                                 compact_tail=compact_tail,
-                                coder_followup_context=coder_followup_context + scheduler_diff_context,
+                                coder_followup_context=(
+                                    coder_followup_context
+                                    + scheduler_diff_context
+                                    + reviewer_fresh_contexts[reviewer]
+                                ),
                                 approved_plan_context=approved_plan_context,
                                 parent_issue_context=parent_issue_context,
                             ),
@@ -9476,13 +9714,7 @@ def run_pr_loop(
                     owner_unavailable = [
                         item
                         for item in must_fix_items
-                        if (
-                            (lambda owners, states: bool(owners)
-                             and all(owner in unavailable_names for owner in owners if states.get(owner) != "cleared"))(
-                                item.resolution_owners or (item.reviewer,),
-                                dict(item.owner_states or ((owner, "pending") for owner in (item.resolution_owners or (item.reviewer,)))),
-                            )
-                        )
+                        if _all_pending_resolution_owners_unavailable(item, unavailable_names)
                     ]
                     if owner_unavailable:
                         approved_names = [
@@ -10736,6 +10968,25 @@ def run_pr_loop(
                     ).hexdigest()[:16]
                     if selective_policy else None
                 ),
+                scheduler_selected_reviewers=(
+                    tuple(sorted(selected_reviewer_names))
+                    if selective_policy else ()
+                ),
+                scheduler_paused_reviewers=(
+                    scheduler_decision.paused_reviewers
+                    if selective_policy and scheduler_decision is not None else ()
+                ),
+                scheduler_reasons=(
+                    (
+                        (scheduler_decision.reason, classification.reason)
+                        if scheduler_decision is not None else ()
+                    )
+                    + (
+                        ("external/unrecorded head advance requires full board",)
+                        if external_recovery_full_board else ()
+                    )
+                ) if selective_policy else (),
+                scheduler_final_sweep=(final_sweep if selective_policy else None),
                 scheduler_force_full=(scheduler_force_full if selective_policy else None),
                 scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
             )
@@ -10750,6 +11001,11 @@ def run_pr_loop(
             )
             log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")
             pre_review_test_pending = True
+            if external_recovery_full_board:
+                # The recovered external head was not reviewed by this run;
+                # keep the next candidate's full-board review requirement
+                # across an interruption without latching normal broad paths.
+                final_sweep_pending = True
             resumed_round = None
             prefetched_pr_context = updated_pr_context
 

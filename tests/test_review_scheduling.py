@@ -7,6 +7,7 @@ from coding_review_agent_loop.review_scheduling import (
     ReviewObligation,
     ReviewSchedulingContract,
     SchedulerSnapshot,
+    TransitionClassification,
     classify_transition,
     select_reviewers,
 )
@@ -15,6 +16,11 @@ from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
     _decode_round_metadata_mapping,
     _encode_round_metadata,
+)
+from coding_review_agent_loop.orchestrator import (
+    _all_pending_resolution_owners_unavailable,
+    _reviewer_needs_fresh_context,
+    _reviewer_diff_summary,
 )
 from coding_review_agent_loop.round_transport import decode_mapping
 from coding_review_agent_loop.unresolved_items import _apply_unresolved_item_dispositions
@@ -149,6 +155,67 @@ def test_selective_board_pauses_approvals_then_sweeps_missing_exact_head_approva
     )
     assert sweep.selected_reviewers == ("Claude", "Antigravity")
     assert sweep.calls_avoided == 0
+    assert dict(intermediate.paused_reviewers)["Claude"].startswith(
+        "selective intermediate pause"
+    )
+
+
+def test_pause_reasons_distinguish_approval_carries_and_unavailable_reviewers():
+    snapshot = SchedulerSnapshot(
+        previous_sha="a" * 40,
+        current_sha="b" * 40,
+        contract=_contract(),
+        obligations=(
+            ReviewObligation(
+                item_id="item-1",
+                status="blocking",
+                scope=("src/worker.py",),
+                resolution_owners=("Codex",),
+                pending_owners=("Codex",),
+            ),
+        ),
+    )
+    decision = select_reviewers(
+        snapshot,
+        TransitionClassification("narrow", "scoped fix"),
+        qualifying_approvals=("Claude",),
+        unavailable_reviewers=("Antigravity",),
+    )
+    paused = dict(decision.paused_reviewers)
+    assert "exact-head approval" in paused["Claude"]
+    assert "unavailable" in paused["Antigravity"]
+
+
+def test_broad_transition_does_not_latch_future_narrow_transitions():
+    item_obligation = ReviewObligation(
+        item_id="item-1",
+        status="blocking",
+        scope=("src/worker.py",),
+        resolution_owners=("Codex",),
+        pending_owners=("Codex",),
+    )
+    broad_snapshot = SchedulerSnapshot(
+        previous_sha="a" * 40,
+        current_sha="b" * 40,
+        contract=_contract(),
+        obligations=(item_obligation,),
+    )
+    broad = select_reviewers(
+        broad_snapshot,
+        TransitionClassification("broad", "dependency change"),
+    )
+    assert broad.selected_reviewers == ("Claude", "Codex", "Antigravity")
+    narrow = select_reviewers(
+        SchedulerSnapshot(
+            previous_sha="b" * 40,
+            current_sha="c" * 40,
+            contract=broad_snapshot.contract,
+            obligations=(item_obligation,),
+            force_full=False,
+        ),
+        TransitionClassification("narrow", "scoped fix"),
+    )
+    assert narrow.selected_reviewers == ("Codex",)
 
 
 def test_owner_scoped_reconciliation_requires_each_owner_to_clear():
@@ -259,6 +326,84 @@ def test_scheduler_metadata_roundtrips_and_malformed_state_falls_back_to_legacy(
         }
     )
     assert malformed.scheduler_contract is None
+
+
+def test_coder_scheduler_checkpoint_is_a_complete_decodable_record():
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=3,
+        subject="c" * 40,
+        scheduler_contract=_contract().as_dict(),
+        scheduler_previous_sha="b" * 40,
+        scheduler_current_sha="c" * 40,
+        scheduler_obligation_digest="1" * 16,
+        scheduler_selected_reviewers=("Codex",),
+        scheduler_paused_reviewers=(
+            ("Claude", "qualifying exact-head approval carried; no new turn needed"),
+            ("Antigravity", "qualifying exact-head approval carried; no new turn needed"),
+        ),
+        scheduler_reasons=("narrow transition: pending resolution owners and co-owners", "scoped fix"),
+        scheduler_final_sweep=False,
+        scheduler_force_full=False,
+        scheduler_calls_avoided=2,
+    )
+    decoded = _decode_round_metadata_mapping(
+        decode_mapping(_encode_round_metadata(metadata))
+    )
+    assert decoded.scheduler_contract == metadata.scheduler_contract
+    assert decoded.scheduler_selected_reviewers == ("Codex",)
+    assert decoded.scheduler_final_sweep is False
+    assert decoded.scheduler_calls_avoided == 2
+
+
+def test_returning_reviewer_uses_latest_stale_record_not_exact_head_approval():
+    stale = PostedRoundMetadata(
+        flow="pr",
+        role="reviewer",
+        agent="Claude",
+        round_number=1,
+        subject="a" * 40,
+        state="approved",
+    )
+    record = type("Record", (), {"metadata": stale})()
+    assert _reviewer_needs_fresh_context(
+        "codex",
+        selective_policy=True,
+        current_head_sha="b" * 40,
+        current_round=2,
+        latest_reviewer_records={"Claude": record},
+    ) is True
+    assert _reviewer_needs_fresh_context(
+        "claude",
+        selective_policy=True,
+        current_head_sha="b" * 40,
+        current_round=2,
+        latest_reviewer_records={"Claude": record},
+    ) is True
+
+
+def test_reviewer_diff_summary_is_bounded_and_observed():
+    class Runner:
+        def run(self, args, *, cwd, check=False):
+            return type("Result", (), {"returncode": 0, "stdout": "M\tsrc/worker.py\n"})()
+
+    summary = _reviewer_diff_summary(
+        Runner(),
+        checkout=".",
+        last_reviewed_sha="a" * 40,
+        current_head_sha="b" * 40,
+    )
+    assert "src/worker.py" in summary
+    assert "complete base-to-head diff" in summary
+
+
+def test_cleared_owner_set_is_not_vacuously_unavailable():
+    item = _item(owners=("Codex",), states=(("Codex", "cleared"),))
+    assert not _all_pending_resolution_owners_unavailable(item, {"Codex"})
+    pending = _item(owners=("Codex",), states=(("Codex", "pending"),))
+    assert _all_pending_resolution_owners_unavailable(pending, {"Codex"})
 
 
 def test_fix_scope_rejects_ambiguous_paths():

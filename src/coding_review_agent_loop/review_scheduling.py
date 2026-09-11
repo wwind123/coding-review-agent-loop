@@ -378,12 +378,29 @@ def select_reviewers(
         if not selected and available_required:
             selected = available_required
             reason = "narrow transition was not actionable without pending owners"
-    paused = tuple((name, reason) for name in required if name not in selected)
+    selected_set = set(selected)
+    paused: list[tuple[str, str]] = []
+    for name in required:
+        if name in selected_set:
+            continue
+        if name in unavailable:
+            pause_reason = "reviewer unavailable; required approval remains outstanding"
+        elif name in approvals:
+            pause_reason = "qualifying exact-head approval carried; no new turn needed"
+        elif snapshot.contract.policy == "all-reviewers":
+            pause_reason = "compatibility scheduling did not select this reviewer"
+        elif final_sweep:
+            pause_reason = "qualifying exact-head approval carry"
+        elif not classification.narrow or snapshot.force_full:
+            pause_reason = "reviewer was not selected by the full-board transition"
+        else:
+            pause_reason = "selective intermediate pause; no pending obligation ownership"
+        paused.append((name, pause_reason))
     eligible = len(tuple(name for name in required if name not in approvals and name not in unavailable))
     avoided = max(0, eligible - len(selected)) if snapshot.contract.policy == "selective-intermediate" and not final_sweep else 0
     return SchedulingDecision(
         selected_reviewers=selected,
-        paused_reviewers=paused,
+        paused_reviewers=tuple(paused),
         reason=reason,
         classification=classification,
         final_sweep=final_sweep,

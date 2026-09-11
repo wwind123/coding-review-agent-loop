@@ -63,6 +63,7 @@ from coding_review_agent_loop.prompts import (
     build_followup_prompt,
 )
 import coding_review_agent_loop.test_runtime as runtime
+from coding_review_agent_loop.review_scheduling import TransitionClassification
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     ReviewItemDisposition,
@@ -126,6 +127,73 @@ def _assert_pending_ci_stop_guidance(text):
     assert "Rerun once GitHub checks complete" not in text
     assert "because GitHub checks are still pending" not in text
     assert "because GitHub check status is unavailable" not in text
+
+
+def test_selective_pr_loop_only_rechecks_owner_then_final_missing_reviewers(tmp_path, monkeypatch):
+    def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
+        return (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "pr_review",
+                    "state": state,
+                    "summary": f"{reviewer} review",
+                    "blocking_items": blocking_items or [],
+                    "same_pr_followups": [],
+                    "future_followups": [],
+                    "prior_item_dispositions": dispositions or [],
+                }
+            )
+            + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[
+                    {"text": "worker cleanup is incomplete", "fix_scope": ["src/worker.py"]}
+                ],
+            ),
+            review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[
+            review(reviewer="Google Gemini"),
+            review(reviewer="Google Gemini"),
+        ],
+        antigravity_outputs=[
+            review(reviewer="Antigravity"),
+            review(reviewer="Antigravity"),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate",
+        max_rounds=4,
+        pr_review_context_mode="compact",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    reviewer_commands = [
+        command for command, _cwd in runner.commands
+        if command and command[0] in {"codex", "gemini", "agy"}
+    ]
+    # Initial full board, one owner-only remediation turn, then the exact-head
+    # sweep for the two paused reviewers.
+    assert [command[0] for command in reviewer_commands].count("codex") == 2
+    assert [command[0] for command in reviewer_commands].count("gemini") == 2
+    assert [command[0] for command in reviewer_commands].count("agy") == 2
 
 
 def _issue_view_commands(runner):
