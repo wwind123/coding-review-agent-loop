@@ -39,7 +39,10 @@ from coding_review_agent_loop.github import (
     PullRequestReviewContext,
     get_pr_checks,
 )
-from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+from coding_review_agent_loop.issue_pr_handoff import (
+    find_latest_issue_pr_handoff,
+    format_issue_pr_handoff_comment,
+)
 from coding_review_agent_loop.memory import AgentMemoryContext
 import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.migrations import MigrationValidationResult
@@ -797,6 +800,131 @@ def test_selective_plan_handoff_change_stops_before_migration_or_merge(tmp_path,
             approved_plan_context=plan_context,
         )
     assert migration_calls == []
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
+    tmp_path, monkeypatch
+):
+    old_plan = "Approved plan.\n\n## Scope\n- Preserve the current API."
+    new_plan = "Approved replacement plan.\n\n## Scope\n- Preserve the current API and audit trail."
+    old_plan_context = orchestrator.make_approved_plan_context(old_plan, source_locator="test")
+    new_plan_context = orchestrator.make_approved_plan_context(new_plan, source_locator="test")
+    old_handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=old_plan_context.plan_hash,
+    )
+    old_handoff_metadata = find_latest_issue_pr_handoff(
+        [IssueComment(author="bot", created_at="2026-05-01T00:01:00Z", body=old_handoff)],
+        issue_number=56,
+        repo="OWNER/REPO",
+    )
+    assert old_handoff_metadata is not None
+    new_handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=new_plan_context.plan_hash,
+        supersedes_hash=old_handoff_metadata.contract_hash,
+    )
+
+    def plan_record(plan_text, timestamp):
+        plan_context = orchestrator.make_approved_plan_context(plan_text, source_locator="test")
+        return IssueComment(
+            author="bot",
+            created_at=timestamp,
+            body=_attach_round_metadata(
+                plan_text,
+                PostedRoundMetadata(
+                    flow="plan",
+                    role="coder",
+                    agent="Claude",
+                    round_number=1,
+                    subject=plan_context.plan_subject or "plan",
+                    canonical_plan=plan_text,
+                    raw_structured_coder_response=plan_text,
+                ),
+            ),
+        )
+
+    old_plan_record = plan_record(old_plan, "2026-05-01T00:00:00Z")
+    new_plan_record = plan_record(new_plan, "2026-05-01T00:02:00Z")
+    initial_issue = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Original issue.",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(
+            old_plan_record,
+            IssueComment(author="bot", created_at="2026-05-01T00:01:00Z", body=old_handoff),
+        ),
+        human_requirements=(),
+    )
+    replacement_issue = dataclasses.replace(
+        initial_issue,
+        comments=(
+            old_plan_record,
+            IssueComment(author="bot", created_at="2026-05-01T00:01:00Z", body=old_handoff),
+            new_plan_record,
+            IssueComment(author="bot", created_at="2026-05-01T00:02:00Z", body=new_handoff),
+        ),
+    )
+    issue_fetches = 0
+
+    def changing_issue(*args, **kwargs):
+        nonlocal issue_fetches
+        issue_fetches += 1
+        return initial_issue if issue_fetches == 1 else replacement_issue
+
+    monkeypatch.setattr(orchestrator, "get_issue_context", changing_issue)
+    migration_calls = []
+
+    def validate_migration(*args, **kwargs):
+        migration_calls.append(True)
+        reviewer_commands = [
+            command
+            for command, _cwd in runner.commands
+            if command and command[0] == "codex"
+        ]
+        assert len(reviewer_commands) == 2
+        return MigrationValidationResult(ok=True)
+
+    monkeypatch.setattr(orchestrator, "validate_pr_migration_topology", validate_migration)
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(summary="Approval bound to the original plan."),
+            structured_pr_review(summary="Approval bound to the replacement plan."),
+        ]
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        max_rounds=2,
+    )
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=config,
+        issue_context=initial_issue,
+        approved_plan_context=old_plan_context,
+    ) == 0
+
+    assert migration_calls == [True]
+    reviewer_commands = [
+        command
+        for command, _cwd in runner.commands
+        if command and command[0] == "codex"
+    ]
+    assert any(new_plan in " ".join(command) for command in reviewer_commands)
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 

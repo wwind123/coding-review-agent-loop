@@ -7757,11 +7757,30 @@ def _observe_pr_transition(
         )
         if mode.returncode != 0:
             return TransitionClassification("broad", "diff mode-change classification was unavailable")
-        unsafe_summary = any(
-            token in line.lower()
-            for line in mode.stdout.splitlines()
-            for token in ("mode change", "create mode", "delete mode", "submodule", "rename", "copy")
-        )
+        added_paths = {
+            change.path
+            for change in changes
+            if change.status[:1].upper() == "A"
+        }
+        unsafe_summary = False
+        for summary_line in mode.stdout.splitlines():
+            lowered = summary_line.lower()
+            create_marker = "create mode 100644 "
+            create_index = lowered.find(create_marker)
+            if create_index >= 0:
+                # Git reports the mode of an ordinary newly-added text file in
+                # the summary.  The name-status record is authoritative for
+                # distinguishing that safe A entry from an executable,
+                # symlink, or other mode/type change.
+                created_path = summary_line[create_index + len(create_marker):].strip()
+                if created_path in added_paths:
+                    continue
+            if any(
+                token in lowered
+                for token in ("mode change", "create mode", "delete mode", "submodule", "rename", "copy")
+            ):
+                unsafe_summary = True
+                break
         if binary_paths or unsafe_summary:
             return TransitionClassification("broad", "diff contained binary or mode changes")
         return classify_transition(
@@ -7825,7 +7844,10 @@ def _fresh_pr_qualification_snapshot(
     parent_issue_context: IssueContext | None,
     approved_plan_context: ApprovedPlanContext | None = None,
     scheduler_contract: ReviewSchedulingContract | None = None,
-) -> tuple[PullRequestReviewContext, tuple[str, ...]]:
+    allow_plan_handoff_change: bool = False,
+) -> tuple[PullRequestReviewContext, tuple[str, ...]] | tuple[
+    PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None
+]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
     if scheduler_contract is not None:
@@ -7876,6 +7898,7 @@ def _fresh_pr_qualification_snapshot(
                 )
     fresh_issue = issue_context
     fresh_parent = parent_issue_context
+    fresh_approved_plan_context = approved_plan_context
     if issue_context is not None:
         fresh_issue = get_issue_context(runner, config=config, issue_number=issue_context.number)
     if parent_issue_context is not None:
@@ -7897,12 +7920,36 @@ def _fresh_pr_qualification_snapshot(
             fresh_handoff is None
             or fresh_handoff.pr_number != pr_number
             or fresh_handoff.flow != "approved-plan-implementation"
-            or fresh_handoff.plan_hash != approved_plan_context.plan_hash
         ):
             raise AgentLoopError(
                 "Approved-plan/handoff identity changed or disappeared during PR qualification; "
                 "stale approvals cannot be used for this head."
             )
+        if fresh_handoff.plan_hash != approved_plan_context.plan_hash:
+            if not allow_plan_handoff_change:
+                raise AgentLoopError(
+                    "Approved-plan/handoff identity changed or disappeared during PR qualification; "
+                    "stale approvals cannot be used for this head."
+                )
+            replacement_plan: ApprovedPlanContext | None = None
+            plan_candidates = [fresh_issue.comments]
+            if fresh_parent is not None:
+                plan_candidates.append(fresh_parent.comments)
+            for comments in plan_candidates:
+                candidate = recover_approved_plan_context(
+                    comments,
+                    expected_hash=fresh_handoff.plan_hash,
+                )
+                if candidate.is_available:
+                    replacement_plan = candidate
+                    break
+            if replacement_plan is None:
+                raise AgentLoopError(
+                    "Approved-plan/handoff identity changed during PR qualification, but the "
+                    "replacement approved plan could not be recovered; stale approvals cannot "
+                    "be used for this head."
+                )
+            fresh_approved_plan_context = replacement_plan
         # The handoff hash alone is not enough: recover the canonical plan
         # again from the freshly fetched issue/parent comments and require the
         # same hash and subject that the reviewers were bound to.
@@ -7916,8 +7963,12 @@ def _fresh_pr_qualification_snapshot(
                 if (
                     candidate := recover_approved_plan_context(
                         comments,
-                        expected_hash=approved_plan_context.plan_hash,
-                        expected_subject=approved_plan_context.plan_subject,
+                        expected_hash=fresh_approved_plan_context.plan_hash,
+                        expected_subject=(
+                            fresh_approved_plan_context.plan_subject
+                            if fresh_approved_plan_context.plan_hash == approved_plan_context.plan_hash
+                            else None
+                        ),
                     )
                 ).is_available
             ),
@@ -7925,8 +7976,11 @@ def _fresh_pr_qualification_snapshot(
         )
         if (
             recovered_plan is None
-            or recovered_plan.plan_hash != approved_plan_context.plan_hash
-            or recovered_plan.plan_subject != approved_plan_context.plan_subject
+            or recovered_plan.plan_hash != fresh_approved_plan_context.plan_hash
+            or (
+                fresh_approved_plan_context.plan_hash == approved_plan_context.plan_hash
+                and recovered_plan.plan_subject != approved_plan_context.plan_subject
+            )
         ):
             raise AgentLoopError(
                 "Approved plan identity changed or disappeared during PR qualification; "
@@ -7937,10 +7991,14 @@ def _fresh_pr_qualification_snapshot(
         pr_context=context,
         parent_issue_context=fresh_parent,
     )
-    return context, tuple(
+    result = (
         requirement.requirement_id
         for requirement in requirements.effective_requirements
     )
+    requirement_ids = tuple(result)
+    if allow_plan_handoff_change:
+        return context, requirement_ids, fresh_approved_plan_context
+    return context, requirement_ids
 
 
 def run_pr_loop(
@@ -10050,7 +10108,7 @@ def run_pr_loop(
                     )
 
                 if not must_fix_items and selective_policy:
-                    fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                    fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
                         runner,
                         config=config,
                         pr_number=pr_number,
@@ -10058,6 +10116,7 @@ def run_pr_loop(
                         parent_issue_context=parent_issue_context,
                         approved_plan_context=approved_plan_context,
                         scheduler_contract=scheduler_contract if selective_policy else None,
+                        allow_plan_handoff_change=True,
                     )
                     if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                         log(
@@ -10068,7 +10127,15 @@ def run_pr_loop(
                         prefetched_pr_context = fresh_context
                         final_sweep_pending = False
                         continue
-                    if set(fresh_requirement_ids) != {
+                    plan_identity_changed = fresh_plan_context != approved_plan_context
+                    if plan_identity_changed:
+                        approved_plan_context = fresh_plan_context
+                        log(
+                            config,
+                            f"Round {round_number}: approved-plan/handoff identity changed; "
+                            "invalidating prior approvals for a fresh final sweep",
+                        )
+                    if plan_identity_changed or set(fresh_requirement_ids) != {
                         requirement.requirement_id for requirement in human_requirements
                     }:
                         log(
@@ -10281,7 +10348,7 @@ def run_pr_loop(
                         )
                         run_optional_tests(runner, config)
                         if selective_policy:
-                            fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                            fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
                                 runner,
                                 config=config,
                                 pr_number=pr_number,
@@ -10289,12 +10356,16 @@ def run_pr_loop(
                                 parent_issue_context=parent_issue_context,
                                 approved_plan_context=approved_plan_context,
                                 scheduler_contract=scheduler_contract if selective_policy else None,
+                                allow_plan_handoff_change=True,
                             )
                             if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                                 prefetched_pr_context = fresh_context
                                 final_sweep_pending = False
                                 continue
-                            if set(fresh_requirement_ids) != {
+                            plan_identity_changed = fresh_plan_context != approved_plan_context
+                            if plan_identity_changed:
+                                approved_plan_context = fresh_plan_context
+                            if plan_identity_changed or set(fresh_requirement_ids) != {
                                 requirement.requirement_id for requirement in human_requirements
                             }:
                                 final_sweep_pending = True
@@ -10526,7 +10597,7 @@ def run_pr_loop(
                     )
                     run_optional_tests(runner, config)
                     if selective_policy:
-                        fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                        fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
                             runner,
                             config=config,
                             pr_number=pr_number,
@@ -10534,19 +10605,23 @@ def run_pr_loop(
                             parent_issue_context=parent_issue_context,
                             approved_plan_context=approved_plan_context,
                             scheduler_contract=scheduler_contract if selective_policy else None,
+                            allow_plan_handoff_change=True,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                             prefetched_pr_context = fresh_context
                             final_sweep_pending = False
                             continue
-                        if set(fresh_requirement_ids) != {
+                        plan_identity_changed = fresh_plan_context != approved_plan_context
+                        if plan_identity_changed:
+                            approved_plan_context = fresh_plan_context
+                        if plan_identity_changed or set(fresh_requirement_ids) != {
                             requirement.requirement_id for requirement in human_requirements
                         }:
                             final_sweep_pending = True
                             prefetched_pr_context = fresh_context
                             continue
                     if config.auto_merge or managed_ci_active(pr_metadata):
-                        fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                        fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
                             runner,
                             config=config,
                             pr_number=pr_number,
@@ -10554,6 +10629,7 @@ def run_pr_loop(
                             parent_issue_context=parent_issue_context,
                             approved_plan_context=approved_plan_context,
                             scheduler_contract=scheduler_contract if selective_policy else None,
+                            allow_plan_handoff_change=True,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                             log(
@@ -10564,7 +10640,10 @@ def run_pr_loop(
                             prefetched_pr_context = fresh_context
                             final_sweep_pending = False
                             continue
-                        if set(fresh_requirement_ids) != {
+                        plan_identity_changed = fresh_plan_context != approved_plan_context
+                        if plan_identity_changed:
+                            approved_plan_context = fresh_plan_context
+                        if plan_identity_changed or set(fresh_requirement_ids) != {
                             requirement.requirement_id for requirement in human_requirements
                         }:
                             log(
@@ -10613,7 +10692,7 @@ def run_pr_loop(
                             )
                             if managed_outcome.status == "passed":
                                 if selective_policy:
-                                    fresh_context, fresh_requirement_ids = _fresh_pr_qualification_snapshot(
+                                    fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
                                         runner,
                                         config=config,
                                         pr_number=pr_number,
@@ -10621,12 +10700,16 @@ def run_pr_loop(
                                         parent_issue_context=parent_issue_context,
                                         approved_plan_context=approved_plan_context,
                                         scheduler_contract=scheduler_contract if selective_policy else None,
+                                        allow_plan_handoff_change=True,
                                     )
                                     if fresh_context.metadata.head_sha != pr_metadata.head_sha:
                                         prefetched_pr_context = fresh_context
                                         final_sweep_pending = False
                                         continue
-                                    if set(fresh_requirement_ids) != {
+                                    plan_identity_changed = fresh_plan_context != approved_plan_context
+                                    if plan_identity_changed:
+                                        approved_plan_context = fresh_plan_context
+                                    if plan_identity_changed or set(fresh_requirement_ids) != {
                                         requirement.requirement_id for requirement in human_requirements
                                     }:
                                         prefetched_pr_context = fresh_context

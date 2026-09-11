@@ -300,7 +300,20 @@ def find_latest_issue_pr_handoff(
             if found is not None and found.pr_number == metadata.pr_number and found != metadata:
                 if (
                     metadata.supersedes_hash == found.contract_hash
-                    and set(found.expected_closing_issue_ids) < set(metadata.expected_closing_issue_ids)
+                    and (
+                        set(found.expected_closing_issue_ids) < set(metadata.expected_closing_issue_ids)
+                        or (
+                            # An approved implementation plan may be replaced
+                            # for the same PR without changing its closing
+                            # issue contract.  The explicit supersession still
+                            # prevents an unannotated divergent handoff from
+                            # silently replacing the authoritative identity.
+                            found.flow == metadata.flow == "approved-plan-implementation"
+                            and found.plan_hash != metadata.plan_hash
+                            and set(found.expected_closing_issue_ids)
+                            == set(metadata.expected_closing_issue_ids)
+                        )
+                    )
                 ):
                     found = metadata
                     continue

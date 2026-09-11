@@ -23,6 +23,7 @@ from coding_review_agent_loop.round_state import (
 from coding_review_agent_loop.orchestrator import (
     _all_pending_resolution_owners_unavailable,
     _fresh_pr_qualification_snapshot,
+    _observe_pr_transition,
     _reviewer_history_is_reconstructible,
     _reviewer_needs_fresh_context,
     _reviewer_diff_summary,
@@ -71,6 +72,40 @@ def test_exact_scoped_text_change_is_narrow_and_boundary_safe():
         broad_rules=("**/never/**",),
     )
     assert outside.broad
+
+
+def test_observer_allows_git_create_mode_for_an_ordinary_scoped_text_addition():
+    class GitObserver:
+        def run(self, args, *, cwd, check=False):
+            if args[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return type("Result", (), {"returncode": 0, "stdout": ""})()
+            if args[:3] == ["git", "diff", "--name-status"]:
+                return type(
+                    "Result", (), {"returncode": 0, "stdout": "A\0src/new_worker.py\0"}
+                )()
+            if args[:3] == ["git", "diff", "--numstat"]:
+                return type(
+                    "Result", (), {"returncode": 0, "stdout": "12\t0\tsrc/new_worker.py\n"}
+                )()
+            if args[:3] == ["git", "diff", "--summary"]:
+                return type(
+                    "Result",
+                    (),
+                    {"returncode": 0, "stdout": " create mode 100644 src/new_worker.py\n"},
+                )()
+            raise AssertionError(f"unexpected Git probe: {args!r}")
+
+    result = _observe_pr_transition(
+        GitObserver(),
+        checkout=".",
+        previous_sha="a" * 40,
+        current_sha="b" * 40,
+        scopes=("src/new_worker.py",),
+        broad_rules=(".github/**",),
+    )
+
+    assert result.narrow
+    assert result.changed_paths == ("src/new_worker.py",)
 
 
 @pytest.mark.parametrize(
