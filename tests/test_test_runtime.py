@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import shutil
 import sys
 import threading
 import time
@@ -555,6 +556,47 @@ def test_script_named_python_is_not_spawned_by_preflight(tmp_path, monkeypatch):
     assert calls == []
 
 
+def test_arbitrary_native_binary_named_python_is_not_spawned_by_preflight(tmp_path, monkeypatch):
+    calls = []
+    venv = tmp_path / "fake-venv"
+    fake_python = venv / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    fake_python.write_bytes(b"\x7fELFarbitrary-native-program\n")
+    fake_python.chmod(0o755)
+
+    monkeypatch.setattr(runtime.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    result = runtime.probe_inner_launcher(
+        [str(fake_python), "-m", "pytest", "tests"], cwd=tmp_path
+    )
+
+    assert result.state == "unknown"
+    assert "unrecognized" in result.diagnostic
+    assert calls == []
+
+
+def test_copied_current_python_binary_is_safe_to_probe(tmp_path, monkeypatch):
+    calls = []
+    venv = tmp_path / "copied-venv"
+    interpreter = venv / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    shutil.copyfile(sys.executable, interpreter)
+    interpreter.chmod(0o755)
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "pytest 9", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    result = runtime.probe_inner_launcher(
+        [str(interpreter), "-m", "pytest", "tests"], cwd=tmp_path
+    )
+
+    assert result.state == "verified"
+    assert calls == [(str(interpreter), "-m", "pytest", "--version")]
+
+
 def test_wrapper_preflight_has_fixed_argv_and_per_invocation_cache(tmp_path, monkeypatch):
     calls = []
     wrapper = tmp_path / "agent-loop"
@@ -594,6 +636,50 @@ def test_wrapper_preflight_classifies_explicit_import_failure(tmp_path, monkeypa
     )
     result = runtime.preflight_wrapper_candidates(cwd=tmp_path)[0]
     assert result.state == "failed"
+
+
+def test_wrapper_preflight_bounds_changing_completed_identities(tmp_path, monkeypatch):
+    calls = []
+    wrapper = tmp_path / "agent-loop"
+    monkeypatch.setattr(runtime, "_wrapper_candidates", lambda _environment: [(str(wrapper), "run-tests")])
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "wrapper-identity-churn-test")
+
+    def fake_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return type("Completed", (), {"returncode": 0, "stdout": "agent-loop preflight: verified", "stderr": ""})()
+
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    for index in range(runtime.MAX_WRAPPER_PREFLIGHT_IDENTITIES_PER_INVOCATION + 5):
+        wrapper.write_text(f"#!/bin/sh\n# identity-{index}\n{'x' * index}", encoding="utf-8")
+        wrapper.chmod(0o755)
+        assert runtime.preflight_wrapper_candidates(cwd=tmp_path)[0].state == "verified"
+
+    invocation = "wrapper-identity-churn-test"
+    assert len(runtime._WRAPPER_PREFLIGHT_IDENTITIES[invocation]) <= runtime.MAX_WRAPPER_PREFLIGHT_IDENTITIES_PER_INVOCATION
+    assert sum(key[0] == invocation for key in runtime._WRAPPER_PREFLIGHT_CACHE) <= runtime.MAX_WRAPPER_PREFLIGHT_IDENTITIES_PER_INVOCATION
+    assert len(calls) == runtime.MAX_WRAPPER_PREFLIGHT_IDENTITIES_PER_INVOCATION + 5
+
+
+def test_wrapper_preflight_releases_reservation_after_unexpected_probe_exception(tmp_path, monkeypatch):
+    calls = []
+    wrapper = tmp_path / "agent-loop"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(runtime, "_wrapper_candidates", lambda _environment: [(str(wrapper), "run-tests")])
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "wrapper-exception-cleanup-test")
+
+    def explode(*_args, **_kwargs):
+        calls.append(True)
+        raise RuntimeError("probe harness failed")
+
+    monkeypatch.setattr(runtime.subprocess, "run", explode)
+    first = runtime.preflight_wrapper_candidates(cwd=tmp_path)[0]
+    second = runtime.preflight_wrapper_candidates(cwd=tmp_path)[0]
+
+    assert first.state == second.state == "unknown"
+    assert "RuntimeError" in first.diagnostic
+    assert calls == [True]
+    assert not any(key[0] == "wrapper-exception-cleanup-test" for key in runtime._WRAPPER_PREFLIGHT_INFLIGHT)
 
 
 def test_inner_probe_timeout_is_bounded_and_cached(tmp_path, monkeypatch):
@@ -709,6 +795,7 @@ def test_inner_probe_is_cached_and_uses_effective_overlay_environment(tmp_path, 
 def test_inner_probe_enforces_six_new_candidates_per_invocation(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inner-limit-test")
+    monkeypatch.setattr(runtime, "_same_file_contents", lambda *_paths: True)
 
     def fake_run(argv, **kwargs):
         calls.append(tuple(argv))
@@ -747,6 +834,7 @@ def test_alternate_interpreter_dependency_repair_invalidates_failed_probe(tmp_pa
     (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
     interpreter.write_bytes(b"\x7fELFfake-python\n")
     interpreter.chmod(0o755)
+    monkeypatch.setattr(runtime, "_same_file_contents", lambda *_paths: True)
     monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "alternate-interpreter-repair-test")
     calls = []
 
@@ -860,6 +948,7 @@ def test_inner_probe_concurrent_same_identity_runs_once(tmp_path, monkeypatch):
 
 def test_inner_probe_concurrent_distinct_identities_respects_candidate_limit(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "inner-concurrency-limit-test")
+    monkeypatch.setattr(runtime, "_same_file_contents", lambda *_paths: True)
     started = threading.Event()
     release = threading.Event()
     calls = []

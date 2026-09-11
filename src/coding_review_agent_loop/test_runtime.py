@@ -46,6 +46,7 @@ MAX_LAUNCHER_DIAGNOSTIC_CHARS = 240
 LAUNCHER_PROBE_TIMEOUT_SECONDS = 5.0
 MAX_WRAPPER_PROBE_CANDIDATES = 2
 MAX_INNER_PROBE_CANDIDATES = 6
+MAX_WRAPPER_PREFLIGHT_IDENTITIES_PER_INVOCATION = 8
 MAX_PREFLIGHT_INVOCATION_BUCKETS = 128
 PREFLIGHT_INVOCATION_TTL_SECONDS = 3600.0
 _HASHED_ENV_VALUE_RE = re.compile(r"<sha256:[0-9a-f]{16}>")
@@ -734,14 +735,40 @@ def _python_interpreter_path(
     environment_root = _lexical_absolute(lexical.parent.parent) if lexical.parent.name.lower() in {"bin", "scripts"} else None
     if environment_root is None or not (environment_root / "pyvenv.cfg").is_file():
         return None
-    try:
-        with resolved.open("rb") as stream:
-            magic = stream.read(4)
-    except OSError:
-        return None
-    if magic not in {b"\x7fELF", b"MZ\x90\x00"}:
+    # A file header is not an interpreter identity: any native executable can
+    # claim ELF/MZ.  The running interpreter is the only identity available to
+    # this process without starting an untrusted candidate.  A copied
+    # virtualenv executable is therefore accepted only when it is byte-for-byte
+    # identical to that trusted interpreter; symlinks/hardlinks are covered by
+    # the samefile check above.  Other native binaries remain unknown and are
+    # never spawned by the preflight.
+    if not _same_file_contents(lexical, current):
         return None
     return lexical
+
+
+def _same_file_contents(left: Path, right: Path) -> bool:
+    """Compare two executable files without executing either one."""
+    try:
+        left_stat = left.stat()
+        right_stat = right.stat()
+    except OSError:
+        return False
+    if left_stat.st_size != right_stat.st_size:
+        return False
+    if left_stat.st_dev == right_stat.st_dev and left_stat.st_ino == right_stat.st_ino:
+        return True
+    try:
+        with left.open("rb") as left_stream, right.open("rb") as right_stream:
+            while True:
+                left_chunk = left_stream.read(1024 * 1024)
+                right_chunk = right_stream.read(1024 * 1024)
+                if left_chunk != right_chunk:
+                    return False
+                if not left_chunk:
+                    return True
+    except OSError:
+        return False
 
 
 def _interpreter_environment_root(
@@ -1276,6 +1303,7 @@ def _wrapper_candidates(environment: Mapping[str, str] | None = None) -> list[tu
 
 
 _WRAPPER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
+_WRAPPER_PREFLIGHT_IDENTITIES: dict[str, OrderedDict[str, None]] = {}
 _INNER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
 _INNER_PREFLIGHT_CANDIDATES: dict[str, set[str]] = defaultdict(set)
 _WRAPPER_PREFLIGHT_INFLIGHT: dict[tuple[str, str], threading.Event] = {}
@@ -1290,6 +1318,7 @@ def _invocation_is_active_locked(invocation: str) -> bool:
 
 def _drop_invocation_locked(invocation: str) -> None:
     _PREFLIGHT_INVOCATIONS.pop(invocation, None)
+    _WRAPPER_PREFLIGHT_IDENTITIES.pop(invocation, None)
     _INNER_PREFLIGHT_CANDIDATES.pop(invocation, None)
     for cache in (_WRAPPER_PREFLIGHT_CACHE, _INNER_PREFLIGHT_CACHE):
         for key in tuple(cache):
@@ -1313,6 +1342,20 @@ def _touch_invocation_locked(invocation: str) -> None:
     _PREFLIGHT_INVOCATIONS[invocation] = time.monotonic()
     _PREFLIGHT_INVOCATIONS.move_to_end(invocation)
     _prune_invocations_locked(protected={invocation})
+
+
+def _store_wrapper_probe_locked(
+    cache_key: tuple[str, str], result: LauncherProbeResult
+) -> None:
+    """Store one completed wrapper probe while bounding identity churn."""
+    invocation, identity_key = cache_key
+    _WRAPPER_PREFLIGHT_CACHE[cache_key] = result
+    identities = _WRAPPER_PREFLIGHT_IDENTITIES.setdefault(invocation, OrderedDict())
+    identities.pop(identity_key, None)
+    identities[identity_key] = None
+    while len(identities) > MAX_WRAPPER_PREFLIGHT_IDENTITIES_PER_INVOCATION:
+        evicted_identity, _ = identities.popitem(last=False)
+        _WRAPPER_PREFLIGHT_CACHE.pop((invocation, evicted_identity), None)
 
 
 def preflight_wrapper_candidates(
@@ -1357,37 +1400,47 @@ def preflight_wrapper_candidates(
                     _identity_key(identity),
                 )
         elif result is None:
-            probe_argv = [*candidate, "--preflight"]
             try:
-                completed = subprocess.run(
-                    probe_argv,
-                    cwd=root,
-                    env=values,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                    timeout=LAUNCHER_PROBE_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired:
-                result = LauncherProbeResult(candidate, "failed", "wrapper probe timed out after 5s", _identity_key(identity))
-            except OSError as exc:
-                result = LauncherProbeResult(candidate, "failed", f"wrapper did not start: {type(exc).__name__}", _identity_key(identity))
-            else:
-                output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
-                success = completed.returncode == 0 and "agent-loop preflight: verified" in output
-                explicit_bootstrap = any(token in output.lower() for token in ("modulenotfounderror", "importerror", "no module named", "cannot import"))
-                state = "verified" if success else ("failed" if explicit_bootstrap else "unknown")
-                result = LauncherProbeResult(candidate, state, output, _identity_key(identity))
-            if cache_key is not None:
-                assert flight is not None
-                with _INNER_PREFLIGHT_LOCK:
-                    _WRAPPER_PREFLIGHT_CACHE[cache_key] = result
-                    _WRAPPER_PREFLIGHT_INFLIGHT.pop(cache_key, None)
-                    _PREFLIGHT_INVOCATIONS[invocation] = time.monotonic()
-                    _PREFLIGHT_INVOCATIONS.move_to_end(invocation)
-                    flight.set()
-                    _prune_invocations_locked()
+                probe_argv = [*candidate, "--preflight"]
+                try:
+                    completed = subprocess.run(
+                        probe_argv,
+                        cwd=root,
+                        env=values,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        timeout=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+                    )
+                except subprocess.TimeoutExpired:
+                    result = LauncherProbeResult(candidate, "failed", "wrapper probe timed out after 5s", _identity_key(identity))
+                except OSError as exc:
+                    result = LauncherProbeResult(candidate, "failed", f"wrapper did not start: {type(exc).__name__}", _identity_key(identity))
+                except Exception as exc:
+                    # An unexpected probe implementation/environment failure is
+                    # not evidence that the wrapper itself is broken.  Cache an
+                    # unknown result, but always release the reservation below.
+                    result = LauncherProbeResult(candidate, "unknown", f"wrapper probe raised {type(exc).__name__}", _identity_key(identity))
+                else:
+                    output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
+                    success = completed.returncode == 0 and "agent-loop preflight: verified" in output
+                    explicit_bootstrap = any(token in output.lower() for token in ("modulenotfounderror", "importerror", "no module named", "cannot import"))
+                    state = "verified" if success else ("failed" if explicit_bootstrap else "unknown")
+                    result = LauncherProbeResult(candidate, state, output, _identity_key(identity))
+            finally:
+                if cache_key is not None:
+                    assert flight is not None
+                    with _INNER_PREFLIGHT_LOCK:
+                        if result is not None:
+                            _store_wrapper_probe_locked(cache_key, result)
+                        _WRAPPER_PREFLIGHT_INFLIGHT.pop(cache_key, None)
+                        assert invocation is not None
+                        _PREFLIGHT_INVOCATIONS[invocation] = time.monotonic()
+                        _PREFLIGHT_INVOCATIONS.move_to_end(invocation)
+                        flight.set()
+                        _prune_invocations_locked()
+            assert result is not None
             if memory_dir is not None and result.state in {"failed", "verified"}:
                 record_launcher_health(
                     memory_dir,

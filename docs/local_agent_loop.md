@@ -2908,6 +2908,11 @@ stderr or an exit code. Results carry independent `wrapper_bootstrap`,
 exec failure and a containment `target-exec-error` are launch failures;
 overlap rejection is coordination; collection/configuration errors, ordinary
 failing tests, timeout, and interruption after startup are suite results.
+Python identity is established without executing an untrusted candidate: the
+running interpreter and symlinks to it are trusted, and a conventional
+`pyvenv.cfg` interpreter is trusted only when it is a byte-for-byte copy of
+the running interpreter. Name-only scripts and arbitrary ELF/MZ binaries stay
+unknown and are never spawned by preflight.
 
 The schema-v1 runtime sidecar keeps suite timing in `observations` and stores
 bounded launcher health separately in `launcher_health`. Health rows include

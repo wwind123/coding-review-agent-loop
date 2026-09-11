@@ -474,6 +474,9 @@ keeps independent `wrapper_bootstrap`, `inner_exec`, and `suite_start` states,
 so a missing executable or import is launcher health rather than a suite
 failure. Collection/configuration errors, failing tests, timeouts, and
 interruptions after startup remain ordinary suite evidence.
+Python identity is checked without execution: the running interpreter and
+symlinks to it are trusted, as are byte-for-byte copies in a conventional
+`pyvenv.cfg` environment; name-only scripts or native binaries are unknown.
 
 Schema-v1 `test-runtime.json` persistence adds a separate `launcher_health`
 collection. It records only bounded diagnostics, repository/checkout and
