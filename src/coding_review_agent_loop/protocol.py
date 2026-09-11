@@ -9,6 +9,7 @@ import dataclasses
 from dataclasses import dataclass, field
 
 from .errors import AgentLoopError, IssueImplementationConflictError
+from .review_scheduling import normalize_fix_scope
 
 PUBLIC_RESPONSE_MARKER = "=== AGENT_LOOP_PUBLIC_RESPONSE_BELOW ==="
 
@@ -104,6 +105,9 @@ EMPTY_PLAN_SECTION_RE = _empty_placeholder_re(
 class ApprovedFollowup:
     reviewer: str
     text: str
+    # Optional reviewer-authored exact paths used only by selective PR
+    # scheduling.  None means the finding is not classifiable as narrow.
+    fix_scope: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,19 @@ class UnresolvedReviewItem:
     status: str
     source_status: str | None = None
     notes: tuple[str, ...] = ()
+    # Reviewer-provided exact paths, if present. None is deliberately distinct
+    # from an empty tuple: absent/invalid scope must force conservative review.
+    fix_scope: tuple[str, ...] | None = None
+    # Canonical ownership state used by selective PR reconciliation. Legacy
+    # records leave these empty and resolve to the source reviewer at runtime.
+    resolution_owners: tuple[str, ...] = ()
+    owner_states: tuple[tuple[str, str], ...] = ()
+    owner_evidence: tuple[tuple[str, str], ...] = ()
+    # Durable disposition outcome for each owner.  This is separate from
+    # ``owner_states`` because a cleared owner may have cleared via
+    # ``resolved`` or ``future``; the latter must survive until all owners
+    # have cleared so a later round can retain the future reclassification.
+    owner_dispositions: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1125,6 +1142,35 @@ def _expect_optional_string_list(
     )
 
 
+def _expect_review_finding_list(
+    payload: dict[str, object],
+    field_name: str,
+    *,
+    context: str,
+    reviewer: str,
+) -> tuple[ApprovedFollowup, ...]:
+    """Accept legacy strings and the scoped PR finding representation."""
+    value = payload.get(field_name, [])
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array.")
+    findings: list[ApprovedFollowup] = []
+    for index, raw in enumerate(value):
+        item_context = f"{context} at index {index}"
+        if isinstance(raw, str):
+            text = _expect_non_empty_string(raw, context=item_context)
+            scope = None
+        else:
+            item = _expect_object(raw, context=item_context)
+            _expect_exact_keys(item, context=item_context, required={"text"}, optional={"fix_scope"})
+            text = _expect_non_empty_string(item["text"], context=f"{item_context}.text")
+            try:
+                scope = normalize_fix_scope(item.get("fix_scope")) if "fix_scope" in item else None
+            except AgentLoopError as exc:
+                raise AgentLoopError(f"{item_context}.fix_scope is invalid: {exc}") from exc
+        findings.append(ApprovedFollowup(reviewer=reviewer, text=text, fix_scope=scope))
+    return tuple(findings)
+
+
 def _expect_optional_issue_id_list(
     payload: dict[str, object],
     field_name: str,
@@ -1895,23 +1941,14 @@ def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | No
     summary = review_freeform_summary_text(
         _expect_non_empty_string(payload["summary"], context="pr_review.summary")
     )
-    blocking_items = _expect_optional_string_list(
-        payload,
-        "blocking_items",
-        context="pr_review.blocking_items",
-        item_context="pr_review.blocking_items",
+    blocking_items = _expect_review_finding_list(
+        payload, "blocking_items", context="pr_review.blocking_items", reviewer=reviewer
     )
-    same_pr_followups = _expect_optional_string_list(
-        payload,
-        "same_pr_followups",
-        context="pr_review.same_pr_followups",
-        item_context="pr_review.same_pr_followups",
+    same_pr_followups = _expect_review_finding_list(
+        payload, "same_pr_followups", context="pr_review.same_pr_followups", reviewer=reviewer
     )
-    future_followups = _expect_optional_string_list(
-        payload,
-        "future_followups",
-        context="pr_review.future_followups",
-        item_context="pr_review.future_followups",
+    future_followups = _expect_review_finding_list(
+        payload, "future_followups", context="pr_review.future_followups", reviewer=reviewer
     )
     dispositions = _expect_disposition_list(
         payload["prior_item_dispositions"],
@@ -1920,12 +1957,12 @@ def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | No
         allowed_same_status="same-pr",
         is_plan_review=False,
     )
-    structured_blocking_items = _structured_followups(blocking_items, reviewer=reviewer)
+    structured_blocking_items = blocking_items
     followups = _dedupe_pr_review_items(
         structured_blocking_items,
         ApprovedFollowups(
-            same_pr=_structured_followups(same_pr_followups, reviewer=reviewer),
-            future=_structured_followups(future_followups, reviewer=reviewer),
+            same_pr=same_pr_followups,
+            future=future_followups,
         ),
     )
     return _finalize_parsed_review(

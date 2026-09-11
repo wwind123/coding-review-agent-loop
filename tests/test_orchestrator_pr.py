@@ -1,4 +1,5 @@
 import base64
+import dataclasses
 import datetime
 import json
 import re
@@ -38,7 +39,10 @@ from coding_review_agent_loop.github import (
     PullRequestReviewContext,
     get_pr_checks,
 )
-from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+from coding_review_agent_loop.issue_pr_handoff import (
+    find_latest_issue_pr_handoff,
+    format_issue_pr_handoff_comment,
+)
 from coding_review_agent_loop.memory import AgentMemoryContext
 import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.migrations import MigrationValidationResult
@@ -63,6 +67,7 @@ from coding_review_agent_loop.prompts import (
     build_followup_prompt,
 )
 import coding_review_agent_loop.test_runtime as runtime
+from coding_review_agent_loop.review_scheduling import TransitionClassification
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     ReviewItemDisposition,
@@ -126,6 +131,872 @@ def _assert_pending_ci_stop_guidance(text):
     assert "Rerun once GitHub checks complete" not in text
     assert "because GitHub checks are still pending" not in text
     assert "because GitHub check status is unavailable" not in text
+
+
+def test_selective_pr_loop_only_rechecks_owner_then_final_missing_reviewers(tmp_path, monkeypatch):
+    def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
+        return (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "pr_review",
+                    "state": state,
+                    "summary": f"{reviewer} review",
+                    "blocking_items": blocking_items or [],
+                    "same_pr_followups": [],
+                    "future_followups": [],
+                    "prior_item_dispositions": dispositions or [],
+                }
+            )
+            + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[
+                    {"text": "worker cleanup is incomplete", "fix_scope": ["src/worker.py"]}
+                ],
+            ),
+            review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[
+            review(reviewer="Google Gemini"),
+            review(reviewer="Google Gemini"),
+        ],
+        antigravity_outputs=[
+            review(reviewer="Antigravity"),
+            review(reviewer="Antigravity"),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate",
+        max_rounds=4,
+        pr_review_context_mode="compact",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    reviewer_commands = [
+        command for command, _cwd in runner.commands
+        if command and command[0] in {"codex", "gemini", "agy"}
+    ]
+    # Initial full board, one owner-only remediation turn, then the exact-head
+    # sweep for the two paused reviewers.
+    assert [command[0] for command in reviewer_commands].count("codex") == 2
+    assert [command[0] for command in reviewer_commands].count("gemini") == 2
+    assert [command[0] for command in reviewer_commands].count("agy") == 2
+
+
+def test_selective_pr_loop_keeps_multiple_consecutive_narrow_fixes_selective(tmp_path, monkeypatch):
+    def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
+        return (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "pr_review",
+                    "state": state,
+                    "summary": f"{reviewer} review",
+                    "blocking_items": blocking_items or [],
+                    "same_pr_followups": [],
+                    "future_followups": [],
+                    "prior_item_dispositions": dispositions or [],
+                }
+            )
+            + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"]),
+            structured_coder_followup(addressed_items=["item-1", "item-2"]),
+        ],
+        codex_outputs=[
+            review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[
+                    {"text": "first cleanup gap", "fix_scope": ["src/worker.py"]}
+                ],
+            ),
+            review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[
+                    {"text": "second cleanup gap", "fix_scope": ["src/worker.py"]}
+                ],
+                dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "still open"}
+                ],
+            ),
+            review(
+                reviewer="OpenAI Codex",
+                dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+        ],
+        gemini_outputs=[
+            review(
+                reviewer="Google Gemini",
+                dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            ),
+            review(reviewer="Google Gemini"),
+        ],
+        antigravity_outputs=[
+            review(reviewer="Antigravity"),
+            review(reviewer="Antigravity"),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate",
+        max_rounds=5,
+        pr_review_context_mode="compact",
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    reviewer_commands = [
+        command for command, _cwd in runner.commands
+        if command and command[0] in {"codex", "gemini", "agy"}
+    ]
+    # Both approving reviewers remain paused across both narrow transitions;
+    # they return once for the unchanged-head exact approval sweep.
+    assert [command[0] for command in reviewer_commands].count("codex") == 3
+    assert [command[0] for command in reviewer_commands].count("gemini") == 2
+    assert [command[0] for command in reviewer_commands].count("agy") == 2
+
+
+def test_selective_resume_with_malformed_scheduler_metadata_recovers_after_full_board(tmp_path):
+    malformed_checkpoint = _attach_round_metadata(
+        "stale scheduler checkpoint",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="abc123",
+            scheduler_contract={"policy": "selective-intermediate"},
+        ),
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "headRefOid": "abc123",
+            "comments": [{"author": {"login": "bot"}, "body": malformed_checkpoint}],
+        },
+        codex_outputs=[structured_pr_review(summary="Codex reviewed the full board.")],
+        gemini_outputs=[structured_pr_review(summary="Gemini reviewed the full board.", reviewer="Google Gemini")],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="selective-intermediate",
+        max_rounds=2,
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    reviewer_commands = [
+        command for command, _cwd in runner.commands
+        if command and command[0] in {"codex", "gemini"}
+    ]
+    # The invalid checkpoint cannot make the scheduler select a subset.
+    assert [command[0] for command in reviewer_commands] == ["codex", "gemini"]
+    assert not any(command[:1] == ["claude"] for command, _cwd in runner.commands)
+
+
+def test_selective_final_sweep_missing_approval_stops_before_migration_or_merge(
+    tmp_path, monkeypatch
+):
+    def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
+        return (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "pr_review",
+                    "state": state,
+                    "summary": f"{reviewer} review",
+                    "blocking_items": blocking_items or [],
+                    "same_pr_followups": [],
+                    "future_followups": [],
+                    "prior_item_dispositions": dispositions or [],
+                }
+            )
+            + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    migration_calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_pr_migration_topology",
+        lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
+    )
+    managed_ci_calls = []
+    qualification_calls = []
+    optional_test_calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "dispatch_final_qualification",
+        lambda *args, **kwargs: managed_ci_calls.append(True),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        lambda *args, **kwargs: qualification_calls.append(True),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "run_optional_tests",
+        lambda *args, **kwargs: optional_test_calls.append(True),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[
+                    {"text": "worker cleanup gap", "fix_scope": ["src/worker.py"]}
+                ],
+            ),
+            review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[review(reviewer="Google Gemini")],
+        antigravity_outputs=[review(reviewer="Antigravity")],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate",
+        max_rounds=2,
+    )
+
+    with pytest.raises(AgentLoopError, match="exact-head final sweep is missing reviewer approval"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert migration_calls == []
+    assert managed_ci_calls == []
+    assert qualification_calls == []
+    assert optional_test_calls == []
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+    assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == 1
+
+
+def test_selective_final_sweep_blocker_dispatches_coder_remediation(tmp_path, monkeypatch):
+    def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
+        return (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "pr_review",
+                    "state": state,
+                    "summary": f"{reviewer} review",
+                    "blocking_items": blocking_items or [],
+                    "same_pr_followups": [],
+                    "future_followups": [],
+                    "prior_item_dispositions": dispositions or [],
+                }
+            )
+            + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"]),
+            structured_coder_followup(addressed_items=["item-2"]),
+        ],
+        codex_outputs=[
+            review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[
+                    {"text": "first cleanup gap", "fix_scope": ["src/worker.py"]}
+                ],
+            ),
+            review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+            review(reviewer="OpenAI Codex"),
+        ],
+        gemini_outputs=[
+            review(reviewer="Google Gemini"),
+            review(
+                reviewer="Google Gemini",
+                state="blocking",
+                blocking_items=[
+                    {"text": "final-sweep regression", "fix_scope": ["src/worker.py"]}
+                ],
+            ),
+            review(
+                reviewer="Google Gemini",
+                dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            ),
+        ],
+        antigravity_outputs=[
+            review(reviewer="Antigravity"),
+            review(reviewer="Antigravity"),
+            review(reviewer="Antigravity"),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate",
+        max_rounds=4,
+    )
+
+    with pytest.raises(AgentLoopError, match="exact-head final sweep is missing reviewer approval"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    coder_commands = [
+        command for command, _cwd in runner.commands if command and command[0] == "claude"
+    ]
+    assert len(coder_commands) == 2
+    assert "final-sweep regression" in coder_commands[1][-1]
+
+
+def test_selective_owner_unavailability_stops_without_coder_redispatch(tmp_path, monkeypatch):
+    def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
+        return (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "pr_review",
+                    "state": state,
+                    "summary": f"{reviewer} review",
+                    "blocking_items": blocking_items or [],
+                    "same_pr_followups": [],
+                    "future_followups": [],
+                    "prior_item_dispositions": dispositions or [],
+                }
+            )
+            + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+        )
+
+    unavailable = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "agent_unavailable",
+            "retryable": False,
+            "category": "environment",
+            "summary": "The reviewer cannot access the repository history.",
+            "suggested_action": "Repair the reviewer environment before retrying.",
+        }
+    ) + "\n<!-- AGENT_UNAVAILABLE -->\n-- OpenAI Codex"
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[
+                    {"text": "worker cleanup gap", "fix_scope": ["src/worker.py"]}
+                ],
+            ),
+            unavailable,
+        ],
+        gemini_outputs=[review(reviewer="Google Gemini")],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="selective-intermediate",
+        max_rounds=3,
+    )
+
+    with pytest.raises(AgentLoopError, match="all remaining resolution owners for item-1 are unavailable"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == 1
+
+
+def test_selective_resume_uses_a_valid_persisted_scheduler_checkpoint(tmp_path):
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Codex",
+        source_round=1,
+        text="The worker cleanup still needs verification.",
+        status="blocking",
+        source_status="blocking",
+        fix_scope=("src/worker.py",),
+        resolution_owners=("Codex",),
+        owner_states=(("Codex", "pending"),),
+    )
+    contract = orchestrator.make_contract(
+        ("Codex", "Gemini", "Antigravity"),
+        "selective-intermediate",
+        None,
+    )
+    checkpoint = _attach_round_metadata(
+        "Persisted selective reconciliation checkpoint.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=2,
+            subject="abc123",
+            prior_items=(item,),
+            phase="reconciliation",
+            scheduler_contract=contract.as_dict(),
+            scheduler_previous_sha="abc123",
+            scheduler_current_sha="abc123",
+            scheduler_obligation_digest="0" * 16,
+            scheduler_selected_reviewers=("Codex",),
+            scheduler_paused_reviewers=(
+                ("Gemini", "approval is historical"),
+                ("Antigravity", "approval is historical"),
+            ),
+            scheduler_reasons=("pending resolution owner",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=3,
+        ),
+    )
+
+    def review(*, reviewer, dispositions=()):
+        return (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "pr_review",
+                    "state": "approved",
+                    "summary": f"{reviewer} review",
+                    "blocking_items": [],
+                    "same_pr_followups": [],
+                    "future_followups": [],
+                    "prior_item_dispositions": list(dispositions),
+                }
+            )
+            + f"\n<!-- AGENT_STATE: approved -->\n-- {reviewer}"
+        )
+
+    runner = FakeRunner(
+        pr_payload={
+            "headRefOid": "abc123",
+            "comments": [{"author": {"login": "bot"}, "body": checkpoint}],
+        },
+        codex_outputs=[
+            review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+        gemini_outputs=[review(reviewer="Google Gemini")],
+        antigravity_outputs=[review(reviewer="Antigravity")],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="selective-intermediate",
+        max_rounds=3,
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    agent_commands = [
+        command[0]
+        for command, _cwd in runner.commands
+        if command and command[0] in {"claude", "codex", "gemini", "agy"}
+    ]
+    assert agent_commands == ["codex", "gemini", "agy"]
+    assert "Persisted selective reconciliation checkpoint." not in "\n".join(
+        command[-1] for command, _cwd in runner.commands if command and command[0] == "claude"
+    )
+
+
+def test_selective_same_head_requirement_edit_invalidates_approval_before_merge(
+    tmp_path, monkeypatch
+):
+    requirement_1 = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the current audit trail.",
+    )
+    requirement_2 = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="The edited instruction changes the required audit trail.",
+    )
+    metadata = PullRequestMetadata(
+        number=77,
+        repo="OWNER/REPO",
+        title="Selective requirement edit",
+        head_branch="feature/review-context",
+        base_branch="main",
+        head_sha="abc123",
+        url="https://github.com/OWNER/REPO/pull/77",
+    )
+    context_calls = 0
+
+    def changing_context(*args, **kwargs):
+        nonlocal context_calls
+        context_calls += 1
+        return PullRequestReviewContext(
+            metadata=metadata,
+            comments=(),
+            human_requirements=(requirement_1 if context_calls == 1 else requirement_2,),
+        )
+
+    monkeypatch.setattr(orchestrator, "get_pr_review_context", changing_context)
+    runner = FakeRunner(
+        claude_outputs=[],
+        codex_outputs=[
+            structured_pr_review(
+                summary="Codex approves the original requirement.",
+                reviewer="OpenAI Codex",
+                human_requirements_resolved=True,
+            ),
+            structured_pr_review(
+                summary="Codex approves the edited requirement.",
+                reviewer="OpenAI Codex",
+                human_requirements_resolved=True,
+            ),
+        ],
+        gemini_outputs=[
+            structured_pr_review(
+                summary="Gemini approves the original requirement.",
+                reviewer="Google Gemini",
+                human_requirements_resolved=True,
+            ),
+            structured_pr_review(
+                summary="Gemini approves the edited requirement.",
+                reviewer="Google Gemini",
+                human_requirements_resolved=True,
+            ),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="selective-intermediate",
+        max_rounds=2,
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    reviewer_commands = [
+        command
+        for command, _cwd in runner.commands
+        if command and command[0] in {"codex", "gemini"}
+    ]
+    assert [command[0] for command in reviewer_commands].count("codex") == 2
+    assert [command[0] for command in reviewer_commands].count("gemini") == 2
+    assert any(requirement_2.body in command[-1] for command in reviewer_commands)
+    assert not any(command[:1] == ["claude"] for command, _cwd in runner.commands)
+
+
+def test_selective_plan_handoff_change_stops_before_migration_or_merge(tmp_path, monkeypatch):
+    plan = "Approved plan.\n\n## Scope\n- Preserve the current API."
+    plan_context = orchestrator.make_approved_plan_context(plan, source_locator="test")
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=plan_context.plan_hash,
+    )
+    plan_record = _attach_round_metadata(
+        plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject=plan_context.plan_subject or "plan",
+            canonical_plan=plan,
+            raw_structured_coder_response=plan,
+        ),
+    )
+    initial_issue = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Original issue.",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(
+            IssueComment(author="bot", created_at="2026-05-01T00:00:00Z", body=plan_record),
+            IssueComment(author="bot", created_at="2026-05-01T00:01:00Z", body=handoff),
+        ),
+        human_requirements=(),
+    )
+    changed_issue = dataclasses.replace(initial_issue, comments=(initial_issue.comments[0],))
+    issue_fetches = 0
+
+    def changing_issue(*args, **kwargs):
+        nonlocal issue_fetches
+        issue_fetches += 1
+        return initial_issue if issue_fetches == 1 else changed_issue
+
+    monkeypatch.setattr(orchestrator, "get_issue_context", changing_issue)
+    migration_calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_pr_migration_topology",
+        lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                summary="The approved plan is implemented.",
+                reviewer="OpenAI Codex",
+            )
+        ]
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        max_rounds=1,
+    )
+
+    with pytest.raises(AgentLoopError, match="Approved-plan/handoff identity changed"):
+        run_pr_loop(
+            runner,
+            pr_number=77,
+            config=config,
+            issue_context=initial_issue,
+            approved_plan_context=plan_context,
+        )
+    assert migration_calls == []
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
+    tmp_path, monkeypatch
+):
+    old_plan = "Approved plan.\n\n## Scope\n- Preserve the current API."
+    new_plan = "Approved replacement plan.\n\n## Scope\n- Preserve the current API and audit trail."
+    old_plan_context = orchestrator.make_approved_plan_context(old_plan, source_locator="test")
+    new_plan_context = orchestrator.make_approved_plan_context(new_plan, source_locator="test")
+    old_handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=old_plan_context.plan_hash,
+    )
+    old_handoff_metadata = find_latest_issue_pr_handoff(
+        [IssueComment(author="bot", created_at="2026-05-01T00:01:00Z", body=old_handoff)],
+        issue_number=56,
+        repo="OWNER/REPO",
+    )
+    assert old_handoff_metadata is not None
+    new_handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=new_plan_context.plan_hash,
+        supersedes_hash=old_handoff_metadata.contract_hash,
+    )
+
+    def plan_record(plan_text, timestamp):
+        plan_context = orchestrator.make_approved_plan_context(plan_text, source_locator="test")
+        return IssueComment(
+            author="bot",
+            created_at=timestamp,
+            body=_attach_round_metadata(
+                plan_text,
+                PostedRoundMetadata(
+                    flow="plan",
+                    role="coder",
+                    agent="Claude",
+                    round_number=1,
+                    subject=plan_context.plan_subject or "plan",
+                    canonical_plan=plan_text,
+                    raw_structured_coder_response=plan_text,
+                ),
+            ),
+        )
+
+    old_plan_record = plan_record(old_plan, "2026-05-01T00:00:00Z")
+    new_plan_record = plan_record(new_plan, "2026-05-01T00:02:00Z")
+    initial_issue = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Original issue.",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(
+            old_plan_record,
+            IssueComment(author="bot", created_at="2026-05-01T00:01:00Z", body=old_handoff),
+        ),
+        human_requirements=(),
+    )
+    replacement_issue = dataclasses.replace(
+        initial_issue,
+        comments=(
+            old_plan_record,
+            IssueComment(author="bot", created_at="2026-05-01T00:01:00Z", body=old_handoff),
+            new_plan_record,
+            IssueComment(author="bot", created_at="2026-05-01T00:02:00Z", body=new_handoff),
+        ),
+    )
+    issue_fetches = 0
+
+    def changing_issue(*args, **kwargs):
+        nonlocal issue_fetches
+        issue_fetches += 1
+        return initial_issue if issue_fetches == 1 else replacement_issue
+
+    monkeypatch.setattr(orchestrator, "get_issue_context", changing_issue)
+    migration_calls = []
+
+    def validate_migration(*args, **kwargs):
+        migration_calls.append(True)
+        reviewer_commands = [
+            command
+            for command, _cwd in runner.commands
+            if command and command[0] == "codex"
+        ]
+        assert len(reviewer_commands) == 2
+        return MigrationValidationResult(ok=True)
+
+    monkeypatch.setattr(orchestrator, "validate_pr_migration_topology", validate_migration)
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(summary="Approval bound to the original plan."),
+            structured_pr_review(summary="Approval bound to the replacement plan."),
+        ]
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        max_rounds=2,
+    )
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=config,
+        issue_context=initial_issue,
+        approved_plan_context=old_plan_context,
+    ) == 0
+
+    assert migration_calls == [True]
+    reviewer_commands = [
+        command
+        for command, _cwd in runner.commands
+        if command and command[0] == "codex"
+    ]
+    assert any(new_plan in " ".join(command) for command in reviewer_commands)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_selective_scheduler_contract_change_during_managed_ci_blocks_merge(
+    tmp_path, monkeypatch
+):
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(summary="Initial exact-head approval.")]
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        auto_merge=True,
+        max_rounds=1,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "activate_managed_ci",
+        lambda *args, **kwargs: ManagedCiContract(),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "dispatch_final_qualification",
+        lambda *args, **kwargs: None,
+    )
+    changed_contract = orchestrator.make_contract(
+        ("Codex",), "all-reviewers", None
+    )
+    changed_audit = _attach_round_metadata(
+        "A scheduler contract was changed while managed CI was running.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=2,
+            subject="abc123",
+            phase="reconciliation",
+            scheduler_contract=changed_contract.as_dict(),
+            scheduler_previous_sha=None,
+            scheduler_current_sha="abc123",
+            scheduler_obligation_digest="0" * 16,
+            scheduler_selected_reviewers=("Codex",),
+            scheduler_paused_reviewers=(),
+            scheduler_reasons=("contract changed during managed CI",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=0,
+        ),
+    )
+
+    def wait_for_managed_ci(*args, **kwargs):
+        runner.pr_payload.setdefault("comments", []).append(
+            {"author": {"login": "bot"}, "body": changed_audit}
+        )
+        return ManagedCiOutcome(status="passed", head_sha="abc123")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        wait_for_managed_ci,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda *args, **kwargs: pytest.fail("scheduler contract changes must prevent merge"),
+    )
+
+    with pytest.raises(AgentLoopError, match="scheduler contract changed during qualification"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
 def _issue_view_commands(runner):

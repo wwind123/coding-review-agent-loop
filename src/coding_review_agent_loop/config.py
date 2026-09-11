@@ -22,6 +22,11 @@ from .logging import datetime_stamp, log
 from .runner import Runner
 from .test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from .workdirs import active_workdir, agent_workdir
+from .review_scheduling import (
+    DEFAULT_BROAD_RULES,
+    PR_REVIEW_POLICIES,
+    normalize_broad_rules,
+)
 
 # Single source of truth for the Antigravity quota-exhaustion fallback signatures
 # (#348, #350). The dataclass field default, config_from_args, the CLI flag default,
@@ -136,6 +141,11 @@ class AgentLoopConfig:
     plan_execution_mode: str = "plan-only"
     planning_context_mode: str = "compact"
     pr_review_context_mode: str = "full"
+    # PR-only intermediate scheduling.  ``all-reviewers`` preserves the
+    # historical contract; selective scheduling is explicitly opt-in.
+    pr_review_policy: str = "all-reviewers"
+    pr_review_broad_rules: tuple[str, ...] = DEFAULT_BROAD_RULES
+    pr_review_force_full: bool = False
     auto_agent_dirs: tuple[AgentName, ...] = ()
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
@@ -407,6 +417,11 @@ class AgentLoopConfig:
             raise AgentLoopError("--planning-context-mode must be either 'full' or 'compact'.")
         if self.pr_review_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--pr-review-context-mode must be either 'full' or 'compact'.")
+        if self.pr_review_policy not in PR_REVIEW_POLICIES:
+            raise AgentLoopError(
+                "--pr-review-policy must be either 'all-reviewers' or 'selective-intermediate'."
+            )
+        object.__setattr__(self, "pr_review_broad_rules", normalize_broad_rules(self.pr_review_broad_rules))
         if self.discuss_research not in DISCUSS_RESEARCH_MODES:
             rendered = ", ".join(f"'{mode}'" for mode in sorted(DISCUSS_RESEARCH_MODES))
             raise AgentLoopError(f"--discuss-research must be one of: {rendered}.")
@@ -1375,6 +1390,13 @@ def config_from_args(
         plan_execution_mode=getattr(args, "plan_execution_mode", None) or "plan-only",
         planning_context_mode=getattr(args, "planning_context_mode", None) or "compact",
         pr_review_context_mode=getattr(args, "pr_review_context_mode", None) or "full",
+        pr_review_policy=getattr(args, "pr_review_policy", None) or "all-reviewers",
+        pr_review_broad_rules=tuple(
+            getattr(args, "pr_review_broad_rules", None)
+            if getattr(args, "pr_review_broad_rules", None) is not None
+            else DEFAULT_BROAD_RULES
+        ),
+        pr_review_force_full=bool(getattr(args, "pr_review_force_full", False)),
         auto_agent_dirs=auto_agent_dirs,
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),

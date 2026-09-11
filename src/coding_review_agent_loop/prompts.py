@@ -1054,6 +1054,17 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
     for item in unresolved_items:
         claim, updates = _render_unresolved_item_claim_and_updates(item)
         details = ["  Original claim:", indent(claim, "    ")]
+        if item.fix_scope:
+            details.append("  Reviewer fix scope: " + ", ".join(f"`{path}`" for path in item.fix_scope))
+        if item.resolution_owners:
+            owner_states = dict(item.owner_states)
+            details.append(
+                "  Resolution owners: "
+                + ", ".join(
+                    f"{owner} ({owner_states.get(owner, 'pending')})"
+                    for owner in item.resolution_owners
+                )
+            )
         if updates:
             details.append("  Updates/evidence:")
             details.extend(f"  - {note}" for note in updates)
@@ -1080,6 +1091,8 @@ def _format_unresolved_plan_items(unresolved_items: Sequence[UnresolvedReviewIte
     for item in unresolved_items:
         claim, updates = _render_unresolved_item_claim_and_updates(item)
         details = ["  Original claim:", indent(claim, "    ")]
+        if item.fix_scope:
+            details.append("  Reviewer fix scope: " + ", ".join(f"`{path}`" for path in item.fix_scope))
         if updates:
             details.append("  Updates/evidence:")
             details.extend(f"  - {note}" for note in updates)
@@ -2627,6 +2640,11 @@ Before approving, self-check every `future_followups` entry: if it is trivial
 or local to the current PR, reclassify it as `same_pr_followups` and return
 `blocking`, or omit it if it is only a nit.
 
+For selective-intermediate PR scheduling, a finding may be an object instead
+of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
+optional `fix_scope` must contain only exact normalized repository-relative
+POSIX paths. Never use globs, directories, absolute paths, or traversal.
+
 After the JSON object, include only:
 1. optional `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`
 2. required `<!-- AGENT_STATE: approved -->` or `<!-- AGENT_STATE: blocking -->`
@@ -2677,6 +2695,7 @@ adds a merge migration.
             workdir_guidance,
             _scratch_file_guidance(),
             _review_command_policy(config, pr_metadata),
+            _pr_review_scheduling_guidance(config),
             response_schema,
             unresolved_items_guidance,
             followup_guidance,
@@ -2923,6 +2942,34 @@ follow-ups for compatibility, but prefer `### Future follow-ups`.
 """
 
 
+def _pr_review_scheduling_guidance(config: AgentLoopConfig) -> str:
+    if config.pr_review_policy != "selective-intermediate":
+        return (
+            "PR review scheduling is using the compatibility `all-reviewers` policy: "
+            "every configured reviewer is required on each review head.\n"
+        )
+    return """PR review scheduling is using the opt-in `selective-intermediate` policy.
+The initial candidate and any conservative or broad transition receive the full
+configured reviewer board. During a narrow fix transition, only reviewers who
+own an active blocking or Same-PR obligation (including durable shared owners)
+may be invoked; a paused approval is historical evidence, never approval of a
+new head. A returning reviewer receives this complete current context and must
+inspect the complete base-to-head diff independently.
+
+Use `fix_scope` only when the finding has a bounded, exact, normalized
+repository-relative POSIX path set. Missing, disputed, invalid, or ambiguous
+scope is conservative and reactivates the full board. A non-owner's resolved
+disposition is evidence only; a non-owner blocking disposition creates a
+durable resolution-owner obligation. Every owner must later clear that same
+claim. Reviewer errors or unavailable reviewers are not approvals. After the
+active obligations clear, the orchestrator performs a final exact-head sweep
+for every required reviewer whose qualifying approval is missing. Fresh
+requirements, plan/handoff changes, unexpected head movement, and CI-driven
+changes invalidate stale approvals. The operator's force-full option remains
+latched for the rest of the run.
+"""
+
+
 def build_review_prompt(
     pr_number: int,
     round_number: int,
@@ -3006,6 +3053,7 @@ are present in the PR diff.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
 {_scratch_file_guidance()}
 {_review_command_policy(config, metadata)}
+{_pr_review_scheduling_guidance(config)}
 {checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_labeled_issue_context_block(issue_context, label="Primary/child issue context")}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {_human_requirements_block(human_requirements)}
@@ -3083,6 +3131,11 @@ exclusive: a single current-PR concern belongs in exactly one of those lists.
 Before approving, self-check every `future_followups` entry: if it is trivial
 or local to the current PR, reclassify it as `same_pr_followups` and return
 `blocking`, or omit it if it is only a nit.
+
+For selective-intermediate PR scheduling, a finding may be an object instead
+of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
+optional `fix_scope` must contain only exact normalized repository-relative
+POSIX paths. Never use globs, directories, absolute paths, or traversal.
 
 After the JSON object, include only:
 1. optional `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`

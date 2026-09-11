@@ -1,3 +1,10 @@
+import dataclasses
+import json
+from types import SimpleNamespace
+
+import pytest
+
+import coding_review_agent_loop.orchestrator as orchestrator
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.unresolved_items import (
     _apply_unresolved_item_dispositions,
@@ -6,6 +13,7 @@ from coding_review_agent_loop.unresolved_items import (
 )
 from coding_review_agent_loop.orchestrator import (
     _coder_followup_review_context,
+    _returning_reviewer_context,
     _reviewer_summary_context,
 )
 
@@ -256,6 +264,82 @@ def test_reviewers_receive_head_bound_coder_notes(tmp_path, parallel, context, r
             assert fixed in tail
 
 
+@pytest.mark.parametrize("context_mode", ["compact", "full"])
+def test_selective_sequential_returning_reviewer_gets_fresh_session(
+    tmp_path, monkeypatch, context_mode
+):
+    def review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
+        return (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "pr_review",
+                    "state": state,
+                    "summary": f"{reviewer} review",
+                    "blocking_items": blocking_items or [],
+                    "same_pr_followups": [],
+                    "future_followups": [],
+                    "prior_item_dispositions": dispositions or [],
+                }
+            )
+            + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: orchestrator.TransitionClassification("narrow", "scoped fix"),
+    )
+    observed_sessions = []
+    original_run_validated_agent = orchestrator._run_validated_agent
+
+    def run_validated_agent_with_session_observation(*args, **kwargs):
+        if kwargs.get("role") == "reviewer":
+            observed_sessions.append((kwargs["agent"], kwargs.get("session_id")))
+        response = original_run_validated_agent(*args, **kwargs)
+        if kwargs.get("role") == "reviewer":
+            return dataclasses.replace(response, session_id=f"{kwargs['agent']}-session")
+        return response
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_validated_agent",
+        run_validated_agent_with_session_observation,
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[
+                    {"text": "worker cleanup gap", "fix_scope": ["src/worker.py"]}
+                ],
+            ),
+            review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[review(reviewer="Google Gemini"), review(reviewer="Google Gemini")],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="selective-intermediate",
+        pr_review_context_mode=context_mode,
+        max_rounds=4,
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert [session for agent, session in observed_sessions if agent == "gemini"] == [None, None]
+    gemini_prompts = [
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["gemini"]
+    ]
+    assert any("Returning reviewer handoff context" in prompt for prompt in gemini_prompts)
+
+
 def test_coder_context_preserves_disputes_and_missing_notes():
     output = structured_coder_followup(
         addressed_items=["item-1"], remaining_items=["item-2"],
@@ -324,6 +408,30 @@ def test_recovered_head_advance_retains_original_coder_binding():
     context = _coder_followup_review_context(resumed.coder_output, resumed.coder_metadata, head_sha="new-head")
     assert "Old fix claim" not in context
     assert "does not match" in context
+
+
+def test_returning_reviewer_gets_orchestrator_observed_span_and_fresh_review_instruction():
+    record = SimpleNamespace(
+        metadata=PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Gemini", round_number=1, subject="old-head"
+        )
+    )
+
+    class Runner:
+        def run(self, args, *, cwd, check=False):
+            return SimpleNamespace(returncode=0, stdout="M\tsrc/worker.py\n")
+
+    context = _returning_reviewer_context(
+        Runner(),
+        reviewer="gemini",
+        checkout=".",
+        current_head_sha="new-head",
+        current_round=3,
+        latest_reviewer_records={"Gemini": record},
+    )
+    assert "Missed 1 intervening review round(s)" in context
+    assert "Observed diff from old-head to new-head: M\tsrc/worker.py" in context
+    assert "complete current base-to-head diff" in context
 
 
 @pytest.mark.parametrize("compact", [False, True])

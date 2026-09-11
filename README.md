@@ -398,6 +398,44 @@ Reviewer overrides survive the issue-to-PR implementation handoff; repeat
 them when starting a separate resume command. See the
 [issue-mode example and precedence](docs/local_agent_loop.md#independent-reviewer-selection).
 
+### Selective intermediate PR review
+
+PR review keeps the historical `all-reviewers` policy by default. To pause
+reviewers who have already approved while a narrow fix is checked, opt in with:
+
+```bash
+agent-loop pr 123 --repo OWNER/REPO \
+  --pr-review-policy selective-intermediate
+```
+
+The initial candidate always runs the full configured board. A later transition
+is considered narrow only when repository-observed Git history is available and
+the complete diff contains ordinary text additions or modifications within the
+exact reviewer-provided `fix_scope` paths. Workflow, dependency/lock,
+build/packaging, schema/migration, and repository-policy/configuration paths
+use deterministic broad rules; customize the rule list with repeated
+`--pr-review-broad-rule` options. Missing, disputed, invalid, out-of-scope, or
+uncertain scope is conservative and reactivates the full board. The
+`--pr-review-force-full` latch remains active for the rest of the run.
+
+For example, with Claude, Codex, and Antigravity required, a Codex-owned fix
+scoped to `src/worker.py` can invoke Codex for the intermediate head while the
+other two approvals are retained as historical evidence. Once the obligation
+is cleared, the final exact-head sweep invokes only Claude and Antigravity if
+they lack qualifying approvals for that head. A same-head approval is reusable
+only when its approved-plan/handoff identity, surfaced requirements, and
+acquisition contract still match. Every required reviewer must still approve
+the exact final head; selective scheduling never changes CI or merge gates.
+
+Resolution ownership is durable: a non-owner blocking disposition adds that
+reviewer as an owner, while a non-owner resolved disposition is evidence only.
+Every owner must independently clear the obligation. An unavailable owner is
+not an approval; when all remaining owners are unavailable, the run stops as an
+incomplete review without another coder turn. Scheduler decisions are recorded
+in round audit metadata and recover conservatively after interruption or a
+configuration change. Issue-mode implementation handoffs carry the same PR
+policy, while planning and discussion remain outside this policy.
+
 ## Safety and Permissions
 
 Agents can run commands and change code. Keep their normal permission prompts

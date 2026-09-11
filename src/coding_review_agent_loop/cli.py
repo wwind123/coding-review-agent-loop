@@ -660,6 +660,36 @@ def build_parser() -> argparse.ArgumentParser:
                 "(default: full)."
             ),
         )
+        subparser.add_argument(
+            "--pr-review-policy",
+            choices=("all-reviewers", "selective-intermediate"),
+            default="all-reviewers",
+            help=(
+                "PR review scheduling policy. The default invokes every configured reviewer; "
+                "selective-intermediate pauses approved reviewers only for bounded narrow fixes."
+            ),
+        )
+        subparser.add_argument(
+            "--pr-review-broad-rule",
+            dest="pr_review_broad_rules",
+            action="append",
+            default=None,
+            metavar="PATH_PATTERN",
+            help=(
+                "Path pattern that forces the full PR reviewer board under selective-intermediate. "
+                "Repeat to replace the deterministic default rule list."
+            ),
+        )
+        subparser.add_argument(
+            "--pr-review-force-full",
+            "--force-full-pr-review",
+            dest="pr_review_force_full",
+            action="store_true",
+            help=(
+                "Force the full PR reviewer board and latch that decision for the remainder "
+                "of the run."
+            ),
+        )
 
     issue = subparsers.add_parser("issue", help="Ask the coder to fix an issue, then review it.")
     issue.add_argument("issue_number", type=int)

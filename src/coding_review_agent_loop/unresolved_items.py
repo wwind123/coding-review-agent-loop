@@ -71,7 +71,11 @@ def _next_unresolved_item(
     text: str,
     status: str,
     notes: Sequence[str] = (),
+    fix_scope: tuple[str, ...] | None = None,
+    resolution_owners: Sequence[str] | None = None,
 ) -> UnresolvedReviewItem:
+    owners = tuple(resolution_owners) if resolution_owners is not None else (reviewer,)
+    owner_states = tuple((owner, "pending") for owner in owners)
     return UnresolvedReviewItem(
         item_id=f"item-{item_number}",
         reviewer=reviewer,
@@ -80,6 +84,9 @@ def _next_unresolved_item(
         status=status,
         source_status=status,
         notes=tuple(notes),
+        fix_scope=fix_scope,
+        resolution_owners=owners,
+        owner_states=owner_states,
     )
 
 
@@ -110,6 +117,11 @@ def _apply_dispute_evidence(
                     status=item.status,
                     source_status=item.source_status,
                     notes=(*item.notes, note),
+                    fix_scope=item.fix_scope,
+                    resolution_owners=item.resolution_owners,
+                    owner_states=item.owner_states,
+                    owner_evidence=item.owner_evidence,
+                    owner_dispositions=item.owner_dispositions,
                 )
             )
         else:
@@ -269,6 +281,8 @@ def _upsert_human_requirements_ack_item(
             text=text,
             status="blocking",
             source_status="blocking",
+            resolution_owners=("Orchestrator",),
+            owner_states=(("Orchestrator", "pending"),),
         )
     )
     return retained
@@ -369,6 +383,8 @@ def _upsert_merge_conflict_item(
             status="blocking",
             source_status="blocking",
             notes=notes,
+            resolution_owners=("Orchestrator",),
+            owner_states=(("Orchestrator", "pending"),),
         )
     )
     return retained
@@ -514,7 +530,12 @@ def _apply_unresolved_item_dispositions(
     *,
     same_status: str = "same-pr",
     retain_future: bool = True,
+    reconciliation_mode: str = "aggregate",
 ) -> tuple[list[UnresolvedReviewItem], list[UnresolvedReviewItem]]:
+    if reconciliation_mode not in {"aggregate", "owner-scoped"}:
+        raise AgentLoopError(
+            "reconciliation_mode must be `aggregate` or `owner-scoped`."
+        )
     next_unresolved: list[UnresolvedReviewItem] = []
     future_items: list[UnresolvedReviewItem] = []
     for item in unresolved_items:
@@ -529,6 +550,36 @@ def _apply_unresolved_item_dispositions(
         text = item.text
         notes = list(item.notes)
         outcomes = {disposition.disposition for disposition in dispositions}
+        owners = item.resolution_owners or (item.reviewer,)
+        owner_states = dict(item.owner_states or ((owner, "pending") for owner in owners))
+        owner_evidence = dict(item.owner_evidence)
+        owner_dispositions = dict(item.owner_dispositions)
+        if reconciliation_mode == "owner-scoped":
+            # A reviewer who was not an owner may supply evidence, but only a
+            # blocking/same-PR disposition creates a durable new obligation.
+            # A non-owner resolved disposition is never a waiver.
+            for disposition in dispositions:
+                if disposition.disposition in {"blocking", same_status}:
+                    if disposition.reviewer not in owners:
+                        owners = (*owners, disposition.reviewer)
+                    owner_states[disposition.reviewer] = "pending"
+                    owner_dispositions[disposition.reviewer] = disposition.disposition
+                elif (
+                    disposition.disposition in {"resolved", "future"}
+                    and disposition.reviewer in owners
+                ):
+                    # `future` is a valid approving disposition for a carried
+                    # item. In owner-scoped mode it clears only this owner's
+                    # obligation; other owners must still provide their own
+                    # clearing disposition before the item can leave the
+                    # active ledger.
+                    owner_states[disposition.reviewer] = "cleared"
+                    owner_dispositions[disposition.reviewer] = disposition.disposition
+                if disposition.note:
+                    owner_evidence[disposition.reviewer] = disposition.note
+            owners = tuple(dict.fromkeys(owners))
+            for owner in owners:
+                owner_states.setdefault(owner, "pending")
         for disposition in dispositions:
             if disposition.note:
                 note_text = f"{disposition.reviewer}: {disposition.note}"
@@ -552,6 +603,11 @@ def _apply_unresolved_item_dispositions(
                     status="blocking",
                     source_status=item.source_status,
                     notes=tuple(notes),
+                    fix_scope=item.fix_scope,
+                    resolution_owners=owners,
+                    owner_states=tuple((owner, owner_states[owner]) for owner in owners),
+                    owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
+                    owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
                 )
             )
             continue
@@ -565,10 +621,37 @@ def _apply_unresolved_item_dispositions(
                     status=same_status,
                     source_status=item.source_status,
                     notes=tuple(notes),
+                    fix_scope=item.fix_scope,
+                    resolution_owners=owners,
+                    owner_states=tuple((owner, owner_states[owner]) for owner in owners),
+                    owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
+                    owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
                 )
             )
             continue
-        if "future" in outcomes:
+        if reconciliation_mode == "owner-scoped":
+            pending_owners = [owner for owner in owners if owner_states.get(owner) != "cleared"]
+            if pending_owners:
+                next_unresolved.append(
+                    UnresolvedReviewItem(
+                        item_id=item.item_id,
+                        reviewer=item.reviewer,
+                        source_round=item.source_round,
+                        text=text,
+                        status=item.status,
+                        source_status=item.source_status,
+                        notes=tuple(notes),
+                        fix_scope=item.fix_scope,
+                        resolution_owners=owners,
+                        owner_states=tuple((owner, owner_states[owner]) for owner in owners),
+                        owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
+                        owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
+                    )
+                )
+                continue
+        if "future" in outcomes or any(
+            outcome == "future" for outcome in owner_dispositions.values()
+        ):
             future_item = UnresolvedReviewItem(
                 item_id=item.item_id,
                 reviewer=item.reviewer,
@@ -577,6 +660,11 @@ def _apply_unresolved_item_dispositions(
                 status="future",
                 source_status=item.source_status,
                 notes=tuple(notes),
+                fix_scope=item.fix_scope,
+                resolution_owners=owners,
+                owner_states=tuple((owner, owner_states[owner]) for owner in owners),
+                owner_evidence=tuple((owner, owner_evidence[owner]) for owner in owners if owner in owner_evidence),
+                owner_dispositions=tuple((owner, owner_dispositions[owner]) for owner in owners if owner in owner_dispositions),
             )
             if retain_future:
                 next_unresolved.append(future_item)
@@ -707,6 +795,17 @@ def _format_same_pr_unresolved_items(items: Sequence[UnresolvedReviewItem]) -> s
             f"{item.reviewer} same-PR follow-up [{item.item_id}] from round {item.source_round}:"
         )
         lines.append(f"- {item.text}")
+        if item.fix_scope:
+            lines.append("Reviewer fix scope: " + ", ".join(item.fix_scope))
+        if item.resolution_owners:
+            owner_states = dict(item.owner_states)
+            lines.append(
+                "Resolution owners: "
+                + ", ".join(
+                    f"{owner} ({owner_states.get(owner, 'pending')})"
+                    for owner in item.resolution_owners
+                )
+            )
         if item.notes:
             lines.append("Latest reviewer updates:")
             lines.extend(f"- {note}" for note in item.notes)

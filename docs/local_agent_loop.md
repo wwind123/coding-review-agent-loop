@@ -1119,6 +1119,70 @@ Execution model:
 - Sequential execution remains the default; prefer it when concurrent
   quota/API pressure across providers is a concern.
 
+### Selective intermediate PR review
+
+PR review defaults to `all-reviewers`, which preserves the historical behavior
+of invoking every configured reviewer on every candidate head. The opt-in
+`--pr-review-policy selective-intermediate` policy separates intermediate fix
+verification from the final independent review:
+
+1. The initial candidate runs the full required board.
+2. For a repository-observed narrow transition, only pending resolution owners
+   and conservative co-owners are invoked. Reviewers with a valid approval are
+   paused, not waived; their approval remains bound to the old SHA.
+3. After active obligations clear, a final exact-head sweep invokes each
+   required reviewer missing a qualifying approval for the unchanged head.
+
+The reviewer may attach an exact `fix_scope` path list to a blocking or Same-PR
+finding. Paths must be normalized repository-relative POSIX files, with no
+globs, directories, traversal, duplicates, or oversized payloads. The
+classifier uses repository-observed ancestry and the complete Git diff. Any
+missing/invalid/disputed scope, unavailable history, rename/copy/deletion,
+binary or mode change, out-of-scope path, or configured broad path is
+conservative and reactivates the full board. Default broad rules cover workflow,
+dependency/lock, build/packaging, schema/migration, and repository-policy or
+configuration files. Repeat `--pr-review-broad-rule` to provide an explicit
+rule list. `--pr-review-force-full` latches the full board for the remainder
+of the run.
+
+Resolution owners are stored with the canonical finding ledger. A non-owner
+blocking or Same-PR disposition adds that reviewer as a pending owner; a
+non-owner resolved disposition is evidence only. Every owner must provide its
+own valid clearing disposition. If all remaining owners are unavailable, the
+run records an incomplete review and stops without another coder turn, CI,
+qualification, or merge. Mixed-owner obligations continue only with available
+owners while the unavailable reviewer remains required.
+
+Scheduler checkpoints are written before reviewer launch and after
+reconciliation. They persist the immutable reviewer/policy/rule contract,
+head pair, selected/paused reviewers, reasons, final-sweep and force-full
+state, and cumulative selective-only calls avoided. Derived approvals and
+obligations continue to come from reviewer records and the canonical ledger.
+Missing, malformed, contradictory, or legacy scheduler metadata selects the
+full board. A changed reviewer set, policy, or broad-rule digest stops rather
+than weakening an in-flight run. Issue-mode implementation handoffs carry the
+same PR policy; planning and discussion scheduling are intentionally outside
+this feature.
+
+Returning reviewers receive fresh full context and an orchestrator-computed
+diff summary since their previous review, while still being instructed to
+inspect the complete base-to-head diff themselves. Before migration
+validation, managed CI, qualification, and merge, the live head and current
+requirements/plan contract are re-read. Same-head approvals are reusable only
+when they match the exact head, approved-plan or handoff identity, surfaced
+requirements, and current acquisition contract. Thus selective scheduling
+changes reviewer call selection only; CI health, branch protection,
+qualification, auto-merge, and the all-reviewers compatibility behavior remain
+unchanged.
+
+Example: with Claude, Codex, and Antigravity required, Codex can own a
+`src/worker.py` blocker. After a narrow fix, only Codex is called to clear it;
+Claude and Antigravity are paused. Once Codex clears the obligation, the final
+sweep calls Claude and Antigravity on the new exact head. Savings count only
+the calls avoided by selective scheduling after same-head carries, recovery
+skips, and unavailable reviewers have been removed from eligibility, so the
+example does not double-count the paused approvals.
+
 ### Phased decomposition versus split materialization
 
 Decomposition modes and split materialization select one child-issue path.
