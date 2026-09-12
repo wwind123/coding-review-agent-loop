@@ -2407,6 +2407,22 @@ A plan review uses `kind: "plan_review"`, `blocking_plan_issues`,
 current-round work in `future_followups`; approved reviews must not contain
 active blocking, Same-PR, Same-plan, or carried-forward active items.
 
+Published prior-item dispositions put the current status immediately after the
+item ID, before evidence and the original finding:
+
+```text
+- [item-3]: RESOLVED
+  Original finding: Blocking issue from Anthropic Claude, round 1: Add coverage.
+- [item-16]: SAME-PR: The error diagnostic still needs correction.
+  Original finding: Same-PR follow-up from Anthropic Claude, round 2: Preserve diagnostics.
+```
+
+`BLOCKING`, `SAME-PR`, and `SAME-PLAN` remain active dispositions; `RESOLVED`
+and `FUTURE FOLLOW-UP` have their existing meanings. These are the publishing
+reviewer's dispositions, not a substitute for the aggregate reviewer gate.
+The original finding retains its historical severity and attribution; it does
+not override the status at the start of the bullet.
+
 Coder follow-up and plan-revision rounds are structured too. A PR follow-up
 response must classify every carried reviewer item exactly once:
 

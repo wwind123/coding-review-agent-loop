@@ -279,11 +279,11 @@ def _format_unresolved_item_label(
 
 def _render_disposition_status(disposition: ReviewItemDisposition) -> str:
     labels = {
-        "resolved": "resolved",
-        "blocking": "still blocking",
-        "same-pr": "same-pr",
-        "same-plan": "same-plan",
-        "future": "future follow-up",
+        "resolved": "RESOLVED",
+        "blocking": "BLOCKING",
+        "same-pr": "SAME-PR",
+        "same-plan": "SAME-PLAN",
+        "future": "FUTURE FOLLOW-UP",
     }
     rendered = labels.get(disposition.disposition, disposition.disposition)
     if disposition.note:
@@ -308,9 +308,9 @@ def _render_prior_dispositions_section(
                 f"allowed IDs: {sorted(item_by_id)}"
             )
         lines.append(
-            f"- [{disposition.item_id}] {_format_unresolved_item_label(item, config)}"
-            f" -> {_render_disposition_status(disposition)}"
+            f"- [{disposition.item_id}]: {_render_disposition_status(disposition)}"
         )
+        lines.append(f"  Original finding: {_format_unresolved_item_label(item, config)}")
     return "\n".join(lines)
 
 
