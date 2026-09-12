@@ -1214,6 +1214,26 @@ def _latest_qualification_checkpoint(
     return None
 
 
+def _latest_qualification_checkpoint_record(
+    records: Sequence[PostedRoundRecord], *, head_sha: str
+) -> PostedRoundRecord | None:
+    """Return the metadata record that anchors the latest qualification checkpoint.
+
+    Qualification checkpoints are deliberately posted as summary records before
+    a CI dispatch or coder handoff.  A process interruption can therefore leave
+    a current-head transcript with no coder/reviewer record for the next round.
+    Keeping the record, rather than only its decoded value, lets PR recovery use
+    that summary as a durable round anchor.
+    """
+    for record in reversed(records):
+        if (
+            record.metadata.subject == head_sha
+            and record.metadata.qualification_checkpoint is not None
+        ):
+            return record
+    return None
+
+
 def _append_active_pr_new_items(
     active_items: list[UnresolvedReviewItem],
     records: Sequence[PostedRoundRecord],
@@ -1622,6 +1642,9 @@ def _resume_pr_round(
         )
     current_round_records = selection.current_round_records
     anchor_metadata = selection.anchor_record.metadata
+    checkpoint_record = _latest_qualification_checkpoint_record(
+        records, head_sha=head_sha
+    )
     latest_coder_record = next(
         (
             record
@@ -1638,7 +1661,14 @@ def _resume_pr_round(
             continue
         reviewer_records[metadata.agent] = record
     if latest_coder_record is None and not reviewer_records:
-        return None
+        if checkpoint_record is None:
+            return None
+        # A qualification checkpoint is a deliberate handoff boundary.  It is
+        # valid even when it is the only record for the current round: recovery
+        # must retain its ledger, round number, and budget instead of treating
+        # the summary-only record as an incomplete review transcript.
+        anchor_metadata = checkpoint_record.metadata
+        current_round_records = (checkpoint_record,)
     prior_items = anchor_metadata.prior_items
     round_number = anchor_metadata.round_number
     ledger_may_be_incomplete = (

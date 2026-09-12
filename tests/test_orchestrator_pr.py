@@ -53,6 +53,7 @@ from coding_review_agent_loop.managed_ci import (
 )
 from coding_review_agent_loop.orchestrator import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+    QualificationCheckpoint,
     PostedRoundMetadata,
     ValidatedAgentResponse,
     _attach_round_metadata,
@@ -154,6 +155,40 @@ def test_orchestrator_finalization_guard_rejects_uncleared_machine_obligation():
             items=[item],
             current_head_sha="newhead123",
         )
+
+
+def test_machine_checkpoint_revert_returns_to_repair_required_without_value_error():
+    item = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub PR checks",
+        source_round=1,
+        text="Checks failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="github-pr-checks",
+        lifecycle="awaiting_current_head_review",
+        failed_head_sha="failed-head",
+        candidate_head_sha="repair-head",
+    )
+
+    advanced = orchestrator._advance_machine_obligations_for_head(
+        [item], current_head_sha="failed-head"
+    )
+    checkpoint = orchestrator._machine_obligation_checkpoint(
+        advanced,
+        current_head_sha="failed-head",
+        base_branch="main",
+        allowed_rounds=2,
+        watch_failure_extension_used=False,
+        watch_head_extension_used=False,
+        lifecycle="awaiting_current_head_review",
+    )
+
+    assert advanced[0].lifecycle == "repair_required"
+    assert advanced[0].candidate_head_sha is None
+    assert checkpoint is not None
+    assert checkpoint.lifecycle == "repair_required"
+    assert checkpoint.candidate_head_sha is None
 
 
 def _assert_pending_ci_stop_guidance(text):
@@ -2313,6 +2348,55 @@ def test_round_ci_failure_is_tracked_and_resolved_with_reviewer_findings(tmp_pat
     assert sum(comment.startswith("GitHub PR checks are failing") for comment in runner.comments) == 1
 
 
+def test_review_only_mode_clears_repaired_ordinary_ci_from_fresh_passing_snapshot(
+    tmp_path, monkeypatch
+):
+    failed = PullRequestCheck(
+        name="test", kind="check_run", status="failure", url="https://example.test/555"
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Initial review."),
+            structured_pr_review(
+                state="approved",
+                summary="Repaired head approved.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Repaired the failing check.", addressed_items=["item-1"]
+            )
+        ],
+    )
+
+    def checks(*args, **kwargs):
+        if kwargs["metadata"].head_sha == "abc123":
+            return _watch_check_board("failing", failing=(failed,))
+        return _watch_check_board("passing")
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: pytest.fail("review-only mode must not start the watcher"),
+    )
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=make_config(
+            tmp_path, auto_merge=False, watch_pending_ci=False, max_rounds=2
+        ),
+    ) == 0
+
+    assert not any("watching GitHub checks" in comment for comment in runner.comments)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
 @pytest.mark.parametrize("auto_merge", [False, True])
 def test_watch_mode_success_uses_full_board_without_second_wait(
     tmp_path, monkeypatch, auto_merge
@@ -2428,6 +2512,94 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
     assert "final-ci/exact-head (failure)" in coder_prompt
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
     assert merges == [{"expected_head_sha": "abc123-coder-1"}]
+
+
+def test_managed_qualification_resume_attaches_without_redispatch(
+    tmp_path, monkeypatch
+):
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed CI failed on the previous head.",
+        status="blocking",
+        source_status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualifying",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity=item.obligation_identity,
+        lifecycle="qualifying",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        base_branch="main",
+        qualification_attempt_id="123/1",
+        allowed_rounds=1,
+    )
+    reviewer_comment = _attach_round_metadata(
+        "Approved the repaired head.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="abc123",
+            prior_items=(dataclasses.replace(item, lifecycle="awaiting_current_head_review"),),
+            state="approved",
+        ),
+    )
+    checkpoint_comment = _attach_round_metadata(
+        "Qualification was dispatched.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="abc123",
+            prior_items=(item,),
+            state="blocking",
+            phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint,
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[],
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": reviewer_comment},
+                {"author": {"login": "coding-review-agent-loop"}, "body": checkpoint_comment},
+            ]
+        },
+    )
+    contract = ManagedCiContract(
+        protocol_version=2, attached_run_id=123, run_attempt=1
+    )
+    config = make_config(tmp_path, managed_ci=True, auto_merge=True, max_rounds=1)
+    dispatches = []
+    merges = []
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    monkeypatch.setattr(
+        orchestrator,
+        "dispatch_final_qualification",
+        lambda *a, **k: dispatches.append(k),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        lambda *a, **k: ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: merges.append(k))
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert dispatches == []
+    assert merges == [{"expected_head_sha": "abc123"}]
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
 def test_managed_manual_success_publishes_result_without_merge_even_with_pending_intermediate_ci(
@@ -5857,6 +6029,128 @@ def test_resume_pr_round_prefers_structured_coder_followup_metadata():
     assert resumed_followup is not None
     assert resumed_followup.human_requirements.addressed_ids == ("Requirement 1",)
     assert '"kind": "coder_followup"' not in _strip_round_metadata(coder_comment)
+
+
+def test_resume_pr_round_recovers_summary_only_qualification_checkpoint():
+    item = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        source_status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="repair_required",
+        failed_head_sha="failed-head",
+        candidate_head_sha=None,
+        obligation_identity="managed-exact-head-ci:item-30",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity=item.obligation_identity,
+        lifecycle="repair_required",
+        failed_head_sha="failed-head",
+        candidate_head_sha=None,
+        base_branch="main",
+        watch_failure_extension_used=True,
+        allowed_rounds=2,
+    )
+    summary_comment = _attach_round_metadata(
+        "Persisted repair handoff.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=2,
+            subject="failed-head",
+            prior_items=(item,),
+            state="blocking",
+            phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint,
+        ),
+    )
+
+    resumed = _resume_pr_round(
+        [IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=summary_comment)],
+        head_sha="failed-head",
+        configured_reviewers=("codex",),
+    )
+
+    assert resumed is not None
+    assert resumed.round_number == 2
+    assert resumed.coder_output is None
+    assert resumed.completed_reviews == ()
+    assert resumed.prior_items == (item,)
+    assert resumed.qualification_checkpoint == checkpoint
+
+
+def test_pr_loop_resume_after_interrupted_coder_keeps_failed_head_and_budget(
+    tmp_path, monkeypatch
+):
+    failed = PullRequestCheck(
+        name="test", kind="check_run", status="failure", url="https://example.test/555"
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Initial review."),
+            structured_pr_review(
+                state="approved",
+                summary="Repaired head approved.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Repaired the failing check.", addressed_items=["item-1"]
+            )
+        ],
+    )
+    config = make_config(tmp_path, auto_merge=False, watch_pending_ci=False, max_rounds=3)
+
+    def checks(*args, **kwargs):
+        if kwargs["metadata"].head_sha == "abc123":
+            return _watch_check_board("failing", failing=(failed,))
+        return _watch_check_board("passing")
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
+    original = orchestrator._run_validated_agent
+    interrupt = True
+
+    class CoderInterrupted(Exception):
+        pass
+
+    def interrupt_during_coder(*args, **kwargs):
+        nonlocal interrupt
+        if kwargs.get("role") == "coder" and interrupt:
+            interrupt = False
+            raise CoderInterrupted
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", interrupt_during_coder)
+    with pytest.raises(CoderInterrupted):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    checkpoint_records = [
+        comment for comment in runner.pr_payload["comments"]
+        if "qualification checkpoint: machine obligation state persisted before coder handoff"
+        in comment["body"]
+    ]
+    assert len(checkpoint_records) == 1
+    assert "AGENT_LOOP_META" in checkpoint_records[0]["body"]
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    review_commands = [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    assert len(review_commands) == 2
+    assert sum(
+        comment.startswith(
+            "PR #77 qualification checkpoint: machine obligation state persisted before coder handoff."
+        )
+        for comment in runner.comments
+    ) == 2
 
 def test_resume_pr_round_marks_empty_ledger_incomplete_after_same_subject_prior_new_items():
     prior_new_item = UnresolvedReviewItem(

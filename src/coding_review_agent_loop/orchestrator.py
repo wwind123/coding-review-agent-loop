@@ -7585,10 +7585,22 @@ def _machine_obligation_checkpoint(
     ) or (candidates[0] if candidates else None)
     if item is None:
         return None
+    effective_lifecycle = lifecycle or item.lifecycle or "repair_required"
+    # Head advancement is deliberately fail-closed.  A force-push revert to a
+    # previously failed head leaves the obligation in ``repair_required`` with
+    # no candidate.  Several callers request the normal awaiting-review state
+    # after a head change, but that request is invalid for this transition and
+    # must not leak QualificationCheckpoint's ValueError out of the loop.
+    if (
+        not item.candidate_head_sha
+        or item.candidate_head_sha == item.failed_head_sha
+        or item.lifecycle == "repair_required"
+    ):
+        effective_lifecycle = "repair_required"
     return QualificationCheckpoint(
         obligation_kind=item.obligation_kind or "unknown",
         obligation_identity=item.obligation_identity or item.item_id,
-        lifecycle=lifecycle or item.lifecycle or "repair_required",
+        lifecycle=effective_lifecycle,
         failed_head_sha=item.failed_head_sha,
         candidate_head_sha=item.candidate_head_sha,
         base_branch=base_branch,
@@ -7694,6 +7706,26 @@ def _ensure_finalization_ready(
         raise AgentLoopError(
             f"PR #{pr_number} cannot finalize: {diagnostic} No approval or merge was attempted."
         )
+
+
+def _ordinary_checks_snapshot_is_authoritative(
+    checks: PullRequestChecks | None,
+) -> bool:
+    """Return whether a fresh ordinary-check snapshot can clear its ledger.
+
+    ``get_pr_checks`` is queried against the current PR head immediately before
+    this decision. Requiring both API surfaces and a known branch-protection
+    result keeps a passing-looking partial, absent, or unavailable snapshot
+    from becoming a final gate.
+    """
+    return bool(
+        checks is not None
+        and checks.state == "passing"
+        and checks.check_query_status == "ok"
+        and checks.branch_protection_status in {"configured", "not_found", "forbidden"}
+        and not checks.pending
+        and not checks.missing_required
+    )
 
 
 def _persist_qualification_checkpoint(
@@ -8984,10 +9016,20 @@ def run_pr_loop(
                     ),
                     None,
                 )
+                checkpoint_head_matches = (
+                    (
+                        qualification_checkpoint.lifecycle == "repair_required"
+                        and qualification_checkpoint.failed_head_sha == pr_metadata.head_sha
+                    )
+                    or (
+                        qualification_checkpoint.lifecycle != "repair_required"
+                        and qualification_checkpoint.candidate_head_sha == pr_metadata.head_sha
+                        and qualification_checkpoint.failed_head_sha != pr_metadata.head_sha
+                    )
+                )
                 checkpoint_stale = (
                     checkpoint_item is None
-                    or qualification_checkpoint.candidate_head_sha != pr_metadata.head_sha
-                    or qualification_checkpoint.failed_head_sha == pr_metadata.head_sha
+                    or not checkpoint_head_matches
                     or qualification_checkpoint.base_branch != checkpoint_base
                 )
                 if checkpoint_stale:
@@ -9175,15 +9217,31 @@ def run_pr_loop(
                 ),
             )
             skip_reviewers_for_recovery = bool(
-                current_resume is not None and current_resume.unrecorded_head_advance
+                current_resume is not None
+                and (
+                    current_resume.unrecorded_head_advance
+                    or (
+                        qualification_checkpoint is not None
+                        and qualification_checkpoint.valid
+                        and qualification_checkpoint.lifecycle
+                        in {"repair_required", "qualification_ready", "qualifying"}
+                    )
+                )
             )
             if skip_reviewers_for_recovery:
-                log(
-                    config,
-                    f"Round {round_number}: PR head advanced to {current_pr_subject} "
-                    "without current-head coder metadata; routing recovered prior items "
-                    f"through {coder_name} before review",
-                )
+                if current_resume is not None and current_resume.unrecorded_head_advance:
+                    log(
+                        config,
+                        f"Round {round_number}: PR head advanced to {current_pr_subject} "
+                        "without current-head coder metadata; routing recovered prior items "
+                        f"through {coder_name} before review",
+                    )
+                else:
+                    log(
+                        config,
+                        f"Round {round_number}: resuming the persisted machine-obligation "
+                        "checkpoint without redispatching completed reviewer work",
+                    )
             scheduler_previous_sha: str | None = None
             scheduler_diff_context = ""
             latest_reviewer_records: dict[str, PostedRoundRecord] = {}
@@ -11157,6 +11215,24 @@ def run_pr_loop(
                         )
                         if not had_ordinary_obligation:
                             next_unresolved_item_number += 1
+                    elif (
+                        not managed_ci_active(pr_metadata)
+                        and not ordinary_recovery_selected
+                        and _ordinary_checks_snapshot_is_authoritative(pr_checks)
+                        and any(
+                            _is_machine_obligation(item)
+                            and item.obligation_kind == "github-pr-checks"
+                            for item in unresolved_items
+                        )
+                    ):
+                        # In review-only mode the foreground watcher is
+                        # intentionally disabled. A fresh, correlated,
+                        # full-board passing snapshot is still the ordinary CI
+                        # authority named by the lifecycle contract and must
+                        # clear the carried obligation here.
+                        unresolved_items = _clear_machine_obligations(
+                            unresolved_items, kind="github-pr-checks"
+                        )
                     must_fix_items = list(
                         _partition_unresolved_items(
                             unresolved_items,
