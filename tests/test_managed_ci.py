@@ -1436,6 +1436,37 @@ def test_ordinary_recovery_rejects_green_checks_without_post_release_run(monkeyp
     assert outcome.status == "timeout"
 
 
+def test_ordinary_recovery_forbidden_branch_protection_never_reports_success(monkeypatch, tmp_path):
+    config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100, prior_run_ids=frozenset(),
+    )
+    passing = checks(
+        passing=(PullRequestCheck("test", "check_run", "success"),),
+        required=("test",),
+        protection="forbidden",
+    )
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(
+        managed_ci,
+        "get_pr_mergeability",
+        lambda *args, **kwargs: type("M", (), {"state": "mergeable"})(),
+    )
+    monkeypatch.setattr(
+        managed_ci,
+        "_workflow_runs_payload",
+        lambda *args, **kwargs: [{"id": 3, "status": "completed", "conclusion": "success"}],
+    )
+    monkeypatch.setattr(managed_ci, "get_pr_checks", lambda *args, **kwargs: passing)
+
+    outcome = wait_for_ordinary_recovery(
+        runner=FakeRunner(), config=config, capability=capability, metadata=metadata(),
+    )
+
+    assert outcome.status == "timeout"
+
+
 def test_ordinary_recovery_accepts_current_head_run_without_local_clock_filter(monkeypatch, tmp_path):
     config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
     capability = OrdinaryRecoveryCapability(
@@ -1675,7 +1706,10 @@ def v2_intent_comment(
     }
 
 
-def checks(*, pending=(), passing=(), failing=(), required=(FINAL_CONTEXT,), missing=()):
+def checks(
+    *, pending=(), passing=(), failing=(), required=(FINAL_CONTEXT,), missing=(),
+    protection="configured",
+):
     return PullRequestChecks(
         state="failing" if failing else "pending" if pending else "passing",
         required_checks=required,
@@ -1683,7 +1717,7 @@ def checks(*, pending=(), passing=(), failing=(), required=(FINAL_CONTEXT,), mis
         pending=pending,
         failing=failing,
         missing_required=missing,
-        branch_protection_status="configured",
+        branch_protection_status=protection,
     )
 
 

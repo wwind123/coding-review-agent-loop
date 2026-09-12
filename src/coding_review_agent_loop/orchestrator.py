@@ -7854,7 +7854,7 @@ def _ordinary_checks_snapshot_is_authoritative(
         checks is not None
         and checks.state == "passing"
         and checks.check_query_status == "ok"
-        and checks.branch_protection_status in {"configured", "not_found", "forbidden"}
+        and checks.branch_protection_status in {"configured", "not_found"}
         and not checks.pending
         and not checks.missing_required
         and successful_checks

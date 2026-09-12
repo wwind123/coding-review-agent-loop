@@ -3602,7 +3602,7 @@ def wait_for_ordinary_recovery(
         if completed and any(run.get("conclusion") != "success" for run in completed):
             return ManagedCiOutcome(status="failed", checks=latest, head_sha=live_head)
         reliable = latest.check_query_status == "ok" and latest.branch_protection_status in {
-            "configured", "not_found", "forbidden",
+            "configured", "not_found",
         }
         if (
             recovery_runs

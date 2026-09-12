@@ -216,6 +216,12 @@ def test_ordinary_checks_authority_requires_a_real_success_conclusion():
     assert orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
 
 
+def test_ordinary_checks_authority_rejects_forbidden_branch_protection():
+    checks = _watch_check_board("passing", protection="forbidden")
+
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+
+
 def test_ordinary_checks_authority_rejects_absent_partial_or_unavailable_boards():
     success = PullRequestCheck(name="test", kind="check_run", status="success")
     for state, query, missing in (
@@ -1635,7 +1641,7 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     ]
 
 
-@pytest.mark.parametrize("board", ["absent", "neutral", "skipped"])
+@pytest.mark.parametrize("board", ["absent", "neutral", "skipped", "forbidden"])
 def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
     monkeypatch, tmp_path, board
 ):
@@ -1651,6 +1657,8 @@ def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
     )
     if board == "absent":
         snapshot = None
+    elif board == "forbidden":
+        snapshot = _watch_check_board("passing", protection="forbidden")
     else:
         snapshot = _watch_check_board(
             "passing",
@@ -2502,6 +2510,7 @@ def _watch_check_board(
     pending=(),
     missing_required=(),
     errors=(),
+    protection="configured",
 ):
     if state == "passing" and not passing:
         passing = (PullRequestCheck(name="test", kind="check_run", status="success"),)
@@ -2512,7 +2521,7 @@ def _watch_check_board(
         pending=tuple(pending),
         failing=tuple(failing),
         missing_required=tuple(missing_required),
-        branch_protection_status="configured",
+        branch_protection_status=protection,
         check_query_status="partial" if errors else "ok",
         check_query_errors=tuple(errors),
     )
