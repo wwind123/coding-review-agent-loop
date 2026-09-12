@@ -1799,8 +1799,10 @@ def test_issue_loop_plan_first_posts_human_readable_item_labels_in_new_and_prior
         "**Review verdict:** Approved\n\n"
         "Plan looks sound.\n\n"
         "### Prior unresolved plan item dispositions\n"
-        "- [item-1] Blocking issue from OpenAI Codex, round 1: Keep plan-review wording distinct from PR wording. -> resolved\n"
-        "- [item-2] Same-plan follow-up from OpenAI Codex, round 1: Add one carry-forward plan test. -> resolved\n"
+        "- [item-1]: RESOLVED\n"
+        "  Original finding: Blocking issue from OpenAI Codex, round 1: Keep plan-review wording distinct from PR wording.\n"
+        "- [item-2]: RESOLVED\n"
+        "  Original finding: Same-plan follow-up from OpenAI Codex, round 1: Add one carry-forward plan test.\n"
         "<!-- AGENT_PLAN_STATE: approved -->\n"
         "-- OpenAI Codex: unknown model (medium)"
     )
