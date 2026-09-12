@@ -7304,6 +7304,24 @@ def _finalize_ordinary_recovery_merge(
             f"PR #{pr_number} ordinary recovery did not qualify the exact head "
             f"({outcome.status}); the draft was left unmerged."
         )
+    if not _ordinary_checks_snapshot_is_authoritative(outcome.checks):
+        details = (
+            _pr_check_details(outcome.checks)
+            if outcome.checks is not None
+            else ["No authoritative current-head check snapshot was available."]
+        )
+        log(
+            config,
+            f"PR #{pr_number}: ordinary recovery reported aggregate passing status "
+            "without an authoritative success-only current-head check snapshot; "
+            "leaving the PR draft and unmerged",
+        )
+        print(
+            f"PR #{pr_number} remains draft and unmerged because ordinary recovery "
+            "did not produce an authoritative success-only current-head check board "
+            f"({'; '.join(details)})."
+        )
+        return False
     if not validate_ordinary_recovery_capability(runner, config=config, capability=capability):
         raise AgentLoopError(
             f"PR #{pr_number} ordinary recovery provenance changed before readiness; no merge attempted."

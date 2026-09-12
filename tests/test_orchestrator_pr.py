@@ -1599,7 +1599,11 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     monkeypatch.setattr(
         orchestrator,
         "wait_for_ordinary_recovery",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed"),
+        lambda *args, **kwargs: ManagedCiOutcome(
+            status="passed",
+            checks=_watch_check_board("passing"),
+            head_sha="abc123",
+        ),
     )
     monkeypatch.setattr(
         orchestrator,
@@ -1629,6 +1633,72 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     assert ["gh", "pr", "ready", "77", "--repo", "OWNER/REPO"] in [
         command for command, _cwd in runner.commands
     ]
+
+
+@pytest.mark.parametrize("board", ["absent", "neutral", "skipped"])
+def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
+    monkeypatch, tmp_path, board
+):
+    runner = FakeRunner()
+    config = make_config(tmp_path, auto_merge=True)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77,
+        repository="OWNER/REPO",
+        base_ref="main",
+        expected_head_sha="abc123",
+        released_label_event_id=101,
+        released_at=100,
+    )
+    if board == "absent":
+        snapshot = None
+    else:
+        snapshot = _watch_check_board(
+            "passing",
+            passing=(PullRequestCheck(name="test", kind="check_run", status=board),),
+        )
+    monkeypatch.setattr(
+        orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: ManagedCiOutcome(
+            status="passed", checks=snapshot, head_sha="abc123"
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
+            number=77,
+            repo="OWNER/REPO",
+            title="draft",
+            head_branch="feature",
+            base_branch="main",
+            head_sha="abc123",
+            url=None,
+        )),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda *args, **kwargs: pytest.fail("non-authoritative recovery must not merge"),
+    )
+
+    ordinary_item = _carried_ci_obligations()[1]
+    items = [ordinary_item]
+    assert not orchestrator._finalize_ordinary_recovery_checked(
+        runner,
+        config=config,
+        pr_number=77,
+        round_number=1,
+        items=items,
+        current_head_sha="abc123",
+        capability=capability,
+    )
+    assert items == [ordinary_item]
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
 def test_ordinary_recovery_refuses_head_changed_before_ready(monkeypatch, tmp_path):
@@ -1665,7 +1735,11 @@ def test_ordinary_recovery_refuses_provenance_change_after_ready(monkeypatch, tm
     monkeypatch.setattr(
         orchestrator,
         "wait_for_ordinary_recovery",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed"),
+        lambda *args, **kwargs: ManagedCiOutcome(
+            status="passed",
+            checks=_watch_check_board("passing"),
+            head_sha="abc123",
+        ),
     )
     monkeypatch.setattr(
         orchestrator,
@@ -1701,7 +1775,11 @@ def test_ordinary_recovery_merge_failure_leaves_pr_ready(monkeypatch, tmp_path):
     monkeypatch.setattr(
         orchestrator,
         "wait_for_ordinary_recovery",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed"),
+        lambda *args, **kwargs: ManagedCiOutcome(
+            status="passed",
+            checks=_watch_check_board("passing"),
+            head_sha="abc123",
+        ),
     )
     monkeypatch.setattr(
         orchestrator,

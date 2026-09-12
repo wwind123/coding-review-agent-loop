@@ -1383,7 +1383,14 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
     monkeypatch.setattr(
         orchestrator,
         "wait_for_ordinary_recovery",
-        lambda *args, **kwargs: SimpleNamespace(status="passed"),
+        lambda *args, **kwargs: SimpleNamespace(
+            status="passed",
+            checks=checks(
+                passing=(PullRequestCheck("test", "check_run", "success"),),
+                required=("test",),
+            ),
+            head_sha="abc123",
+        ),
     )
     monkeypatch.setattr(
         orchestrator,
