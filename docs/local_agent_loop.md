@@ -56,142 +56,16 @@ cut short. Override it per run, e.g. `--antigravity-print-timeout-seconds
 
 ## Architecture
 
-The tool is a local orchestrator. It does not call model APIs directly; it shells
-out to locally authenticated agent and GitHub CLIs from separate checkouts. The
-only durable state it creates is local: agent logs in the active coder checkout
-and optional advisory memory in a repo-scoped cache directory.
+The canonical [architecture overview](../ARCHITECTURE.md) describes component
+ownership, lifecycle and CI flows, GitHub/local persistence, trust boundaries,
+and the CLI/skill distinction. This guide remains the detailed reference for
+commands, protocol schemas, and recovery contracts.
 
-```mermaid
-flowchart LR
-    User[Developer terminal] --> CLI[agent-loop CLI<br/>cli.py]
-    CLI --> Config[Config validation<br/>config.py]
-    Config --> Orchestrator[Issue, task, and PR loops<br/>orchestrator.py]
-
-    Orchestrator --> Workdirs[Workdir setup and validation<br/>workdirs.py / git / gh repo clone]
-    Orchestrator --> Memory[Agent memory preparation<br/>memory.py]
-
-    Workdirs --> AgentDirs[(Separate agent checkouts<br/>Claude / Codex / Gemini)]
-    Memory --> MemoryCache[(Repo-scoped memory cache<br/>summary / architecture / tests)]
-
-    Orchestrator --> Prompts[Prompt builders<br/>prompts.py]
-    Orchestrator --> Protocol[Structured JSON, marker,<br/>and follow-up validation<br/>protocol.py]
-    Orchestrator --> Repair[Malformed structured-response repair<br/>repair.py / Antigravity by default]
-    Orchestrator --> RoundState[Round resume metadata<br/>round_state.py / AGENT_LOOP_META]
-    Orchestrator --> Registry[Agent registry<br/>agents/registry.py]
-    Orchestrator --> GitHubOps[GitHub operations<br/>github.py]
-    Orchestrator --> HumanReqs[Signed human requirement handling<br/>-- Human Reviewer]
-    Orchestrator --> PreReviewTests[Optional pre-review local test command<br/>--test-command]
-    Orchestrator --> OptionalTests[Optional post-approval local test command<br/>--test-command]
-    Orchestrator --> Followups[Approved follow-up handling<br/>summaries / issues / same-PR fixes]
-    Prompts --> StructuredContracts[Structured response contracts<br/>reviews / follow-ups / plans]
-    HumanReqs --> Prompts
-    Protocol --> RoundState
-    Repair --> Protocol
-
-    %% The orchestrator owns repair invocation: it catches validation failures,
-    %% calls repair.py, then re-runs Protocol validation on the repaired output.
-
-    Registry --> Claude[Claude backend<br/>claude]
-    Registry --> Codex[Codex backend<br/>codex exec]
-    Registry --> Gemini[Gemini backend<br/>gemini --prompt]
-
-    Claude --> Runner[Subprocess runner<br/>runner.py]
-    Codex --> Runner
-    Gemini --> Runner
-    GitHubOps --> Runner
-    PreReviewTests --> Runner
-    OptionalTests --> Runner
-
-    Runner --> AgentCLIs[Local agent CLIs]
-    Runner --> GhCLI[gh CLI]
-    Runner --> TestCmd[Local test process]
-    Runner --> Logs
-
-    AgentCLIs --> AgentDirs
-    AgentCLIs --> ResponseFiles[(Public response files<br/>/tmp/coding-review-agent-loop/responses)]
-    ResponseFiles --> Protocol
-    Protocol --> Orchestrator
-    RoundState --> GitHubOps
-    GhCLI --> GitHub[(GitHub repo<br/>issues / PRs / comments / checks)]
-    GitHub --> HumanReqs
-    GitHub --> RoundState
-    Followups --> GitHubOps
-```
-
-The orchestrator owns the repair pass: it catches structured-response validation failures, invokes `repair.py`, and then sends the repaired output back through protocol validation before anything is posted.
-
-At runtime, the orchestrator drives one of three entrypoints:
-
-```mermaid
-sequenceDiagram
-    participant User as Developer
-    participant CLI as agent-loop CLI
-    participant Orch as Orchestrator
-    participant Memory as Agent memory
-    participant Coder as Coder agent CLI
-    participant Reviewer as Reviewer agent CLI(s)
-    participant Resp as Public response files
-    participant GH as GitHub via gh
-    participant Protocol as Structured response validation
-    participant Repair as Repair pass
-
-    User->>CLI: agent-loop issue | task | pr | discuss
-    CLI->>Orch: validated config
-    Orch->>Orch: ensure active agent workdirs
-    Orch->>Memory: prepare advisory repo memory
-    Orch->>GH: load prior AGENT_LOOP_META and signed human requirements
-    alt issue or task
-        Orch->>Coder: create or update PR with structured-response contract
-        Coder-->>Resp: write public response if supported
-        Resp-->>Protocol: structured JSON or marker fallback
-        Protocol-->>Orch: validated AGENT_PR marker or clarification
-        Orch->>GH: validate PR and post coder output
-    else existing PR
-        Orch->>GH: validate open PR
-    end
-
-    loop until all reviewers approve or max rounds reached
-        Orch->>Reviewer: review PR with structured JSON review schema
-        Reviewer-->>Resp: write public response if supported
-        Resp-->>Protocol: validate JSON state, item ledgers, and footer
-        opt malformed structured response
-            Protocol->>Repair: ask Gemini to reformat only
-            Repair-->>Protocol: repaired JSON + footer
-        end
-        Protocol-->>Orch: reviewed state and carried item dispositions
-        Orch->>GH: post review comment
-        alt any blocking review
-            Orch->>Coder: address combined feedback and signed human requirements
-            Coder-->>Resp: write public response if supported
-            Resp-->>Protocol: validate coder_followup JSON and human_requirements ack
-            opt malformed structured response
-                Protocol->>Repair: ask Gemini to reformat only
-                Repair-->>Protocol: repaired JSON + footer
-            end
-            Protocol-->>Orch: AGENT_STATE blocking
-            Orch->>GH: post coder update with AGENT_LOOP_META
-        else approved review has same-PR follow-ups in a fix-and mode
-            Orch->>Coder: address same-PR follow-ups and signed human requirements
-            Coder-->>Resp: write public response if supported
-            Resp-->>Protocol: validate coder_followup JSON and human_requirements ack
-            opt malformed structured response
-                Protocol->>Repair: ask Gemini to reformat only
-                Repair-->>Protocol: repaired JSON + footer
-            end
-            Protocol-->>Orch: AGENT_STATE blocking
-            Orch->>GH: post coder update with AGENT_LOOP_META
-        else all approved
-            Orch->>Protocol: require reviewer resolution marker for signed human requirements
-            opt future follow-ups requested
-                Orch->>GH: summarize follow-ups or create issues
-            end
-            Orch->>Orch: run optional local tests
-            opt auto-merge enabled
-                Orch->>GH: wait for configured check and merge
-            end
-        end
-    end
-```
+The tool shells out to authenticated agent and GitHub CLIs. Durable round,
+plan, handoff, and CI metadata is recorded on GitHub; response files, subprocess
+logs, salvage, and advisory memory are local. The orchestrator validates agent
+responses, owns bounded format repair, and revalidates live state before
+qualification or merge. See [state and recovery](../ARCHITECTURE.md#state-and-recovery).
 
 ## Agent Backends
 

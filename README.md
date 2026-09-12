@@ -627,8 +627,9 @@ See [`SKILL.md`](SKILL.md) for invocation instructions and
 
 ## Documentation
 
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): canonical component map, execution flows, state, and trust boundaries.
 - [`agent-loop --help`](docs/local_agent_loop.md#usage): full command and option reference.
-- [`docs/local_agent_loop.md`](docs/local_agent_loop.md): architecture, lifecycle, protocol, recovery, CI, memory, and safety reference.
+- [`docs/local_agent_loop.md`](docs/local_agent_loop.md): detailed lifecycle, protocol, recovery, CI, memory, and safety reference.
 - [`docs/skill_mode.md`](docs/skill_mode.md): Claude Code skill architecture and operation.
 - [`SKILL.md`](SKILL.md): executable instructions for Claude Code skill mode.
 
@@ -654,8 +655,8 @@ python -m pytest tests/test_orchestrator_pr.py
 ```
 
 Tests use fake subprocess runners and do not invoke real agent CLIs or GitHub.
-Browse the focused test modules in [`tests/`](tests/) and see the architecture
-diagram in [`docs/local_agent_loop.md`](docs/local_agent_loop.md#architecture).
+Browse the focused test modules in [`tests/`](tests/) and see the component map
+and diagrams in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Related Tools
 

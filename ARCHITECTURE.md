@@ -1,0 +1,269 @@
+# Architecture
+
+`coding-review-agent-loop` is a local Python orchestrator around authenticated
+agent CLIs, Git, and GitHub. Its primary job is to turn an issue or existing PR
+into a bounded code-review loop with explicit evidence, resumable state, and
+optional CI qualification and merge. It is not a hosted agent service or a
+model API gateway.
+
+This is the canonical implementation overview. Start with the
+[README](README.md) for installation and examples; use the
+[CLI guide](docs/local_agent_loop.md) for exact options, schemas, and recovery
+contracts. [Skill mode](docs/skill_mode.md) documents the interactive host path.
+The diagrams show responsibility and data flow, not a strictly enforced Python
+import hierarchy.
+
+## System Boundaries
+
+```mermaid
+flowchart LR
+    User[Operator] --> CLI[CLI and configuration]
+    CLI --> Orch[Lifecycle orchestrator]
+    Orch --> Context[Prompts and advisory memory]
+    Context --> Backends[Agent backend adapters]
+    Backends --> Runner[Subprocess runner and containment]
+    Runner --> Agents[Claude / Codex / Antigravity / Gemini CLIs]
+    Agents --> Checkout[(Assigned Git checkouts)]
+    Agents --> Response[Response files and output]
+    Response --> Validate[Acquisition and protocol validation]
+    Validate --> Orch
+    Orch --> State[Review ledger and resume metadata]
+    State --> GH[GitHub operations via gh]
+    Orch --> CI[CI qualification and merge gates]
+    CI --> GH
+    GH <--> Remote[(GitHub issues / PRs / comments / checks)]
+    Orch --> Local[(Logs / salvage / usage / test evidence)]
+```
+
+- The operator supplies roles, model/effort overrides, permissions, workdirs,
+  and execution limits. Agents use their own CLI authentication and quotas.
+- The coder can edit and test the assigned repository, commit, push, and create
+  a PR. The orchestrator validates the reported result and owns normal review
+  publication, handoff, scheduling, and finalization.
+- Reviewers are instructed to inspect the verified checkout without modifying
+  code or running tests. This is a command policy, not a universal read-only
+  filesystem sandbox; actual enforcement depends on backend permissions and
+  the execution environment.
+- Model responses propose verdicts and actions. They are not authoritative Git
+  state, CI results, or permission grants.
+- The tool publishes reviews as PR conversation comments, not native GitHub
+  approving reviews. Model signatures do not create separate GitHub identities
+  or satisfy native required-review branch protection.
+
+## Component Map
+
+Source paths below are relative to
+[`src/coding_review_agent_loop/`](src/coding_review_agent_loop/).
+
+| Responsibility | Main source files | Boundary |
+| --- | --- | --- |
+| Entry points and effective configuration | `cli.py`, `config.py` | Parse modes; resolve role-specific models, effort, base, and policy before invocation. |
+| Lifecycle coordination | `orchestrator.py` | Compose planning, implementation, review, recovery, and finalization; do not delegate control decisions to free-form agent prose. |
+| Checkout identity | `workdirs.py`, `workdir_guard.py` | Prepare assigned checkouts and validate repository/head and reported test locations. |
+| Agent-facing context | `prompts.py`, `memory.py` | Render issue/plan/human/feedback context and advisory repository orientation. |
+| Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
+| Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
+| Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; perform bounded format repair and reject content-loss or semantic rewrites. |
+| Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head. |
+| Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py` | Reconstruct rounds, spill oversized metadata into sidecars, and render readable comments. |
+| GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. |
+| Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
+| CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
+| Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. |
+| Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `logging.py` | Record test observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success. |
+
+`orchestrator.py` is still a large integration module. The table describes
+existing ownership, not a completed decomposition into independently deployed
+services. Shared data types live alongside their owning modules rather than in
+one central model package.
+
+## Main Lifecycle
+
+```mermaid
+flowchart TD
+    Input[Issue / task / existing PR] --> Resume[Load and validate live context and saved provenance]
+    Resume --> Plan{Plan-first issue?}
+    Plan -->|yes| Planning[Planner and plan reviewers]
+    Planning -->|revisions| Planning
+    Planning -->|approved and implementation requested| Implement[Coder implementation]
+    Planning -->|plan-only or decomposition-only| Stop[Stop with recorded outcome]
+    Plan -->|issue or task implementation| Implement
+    Plan -->|existing PR| Review[Review verified PR head]
+    Implement --> Handoff[Validate canonical PR and post handoff]
+    Handoff --> Review
+    Review --> Reconcile[Validate responses and reconcile findings]
+    Reconcile -->|code changes required| Fix[Coder addresses feedback and available CI failures]
+    Fix --> Review
+    Reconcile -->|required reviews satisfied| Final[Finalization and configured test / CI gates]
+    Final -->|actionable failure| Fix
+    Final -->|qualified, merge enabled| Merge[Head-guarded merge]
+    Final -->|approval or qualification only| Stop
+```
+
+Every stage can also stop for a clarification, invalid or unavailable required
+response, exhausted budget, or failed prerequisite. The arrows describe the
+normal path, not permission to retry indefinitely or ignore failed checks.
+
+### Planning and Implementation
+
+Plan-first mode records a canonical approved plan and its identity. The
+issue-to-PR handoff binds that plan to the implementation PR independently of
+bounded issue-comment text. Direct PR resumes recover that binding when it
+exists; an ordinary PR without planning provenance does not invent a plan.
+
+Planning, implementation, reviewer, and repair invocations have separately
+resolved model/effort settings. An implementation override must not implicitly
+change the reviewer or repair backend. Issue creation and PR resume converge
+on the shared PR loop after provenance validation.
+
+Decomposition into child phases and materialization of split proposals are
+distinct workflows, with typed topology and durable checkpoints. They are not
+inferred by creating an issue for every sentence mentioning deferred work.
+See [decomposition boundaries](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization).
+
+### Review and Feedback
+
+All selected reviewers receive the same pre-round snapshot. Parallel execution
+can publish a finished review before the other reviewers finish; durable
+provisional records are settled through a reconciliation barrier before coder
+follow-up. A peer's same-round comment is not automatically a carried item.
+
+The default policy invokes all reviewers. Opt-in selective intermediate review
+can pause already-approved reviewers for bounded fixes, but their old approvals
+remain head-bound. Changed scope, incomplete state, and final qualification can
+require a full review. The scheduler contract is immutable across a resume.
+See [selective review](docs/local_agent_loop.md#selective-intermediate-pr-review).
+
+Findings have stable IDs, provenance, dispositions, and, where applicable,
+resolution ownership. The coder reports addressed, remaining, and disputed
+items; it does not silently redefine a finding or resolve another participant's
+obligation. Human requirements and approved plans are separate from that ledger.
+Original requirements, valid later human instructions, and safety constraints
+outrank the plan; plan conflicts must be surfaced explicitly.
+
+### CI and Merge
+
+Ordinary CI observes the current-head check board. Known failures can join
+review feedback without waiting for unfinished checks. Post-approval watching
+and automatic merging use bounded gates, including infrastructure-failure
+classification and fresh mergeability checks.
+
+Managed CI is a repository-integrated alternative: intermediate runs may be
+suppressed, then a reviewed candidate receives an authenticated final workflow
+dispatch. Version-2 intent records track generation, nonce, run, and attempt.
+Qualification requires correlated exact-head evidence and the complete check
+board, not a model's statement that CI passed. Head changes invalidate the
+proof. Automatic merge uses `--match-head-commit`; explicit managed CI can
+qualify for manual merging instead.
+
+Machine-owned CI failures and reviewer-owned findings are different kinds of
+obligation. Their reconciliation must preserve CI authority without preventing
+fresh qualification of an approved correction. This boundary has a known
+selective-policy integration gap tracked in [#776](https://github.com/wwind123/coding-review-agent-loop/issues/776).
+
+The unprotected managed-CI waiver is a voluntary tool gate, not a replacement
+for GitHub enforcement. Historical audit markers cannot grant fresh authority;
+the live actor, repository, PR lifecycle, and provenance must be revalidated.
+See [managed CI](docs/local_agent_loop.md#managed-exact-head-ci).
+
+## State and Recovery
+
+There is no application database or always-running server. State is split
+between GitHub and local artifacts:
+
+| State | Location and purpose |
+| --- | --- |
+| Source and candidate identity | Git commits/branches and live GitHub PR metadata. |
+| Cross-invocation workflow history | GitHub comments with round metadata, canonical issue/PR handoffs, plan identities, and managed-CI intents; oversized payloads use sidecar comments. |
+| Invocation results | Unique response files and external subprocess logs; validate the current attempt before accepting an artifact. |
+| Work in progress | Tool-owned or explicitly supplied checkouts; tracked diffs can be preserved as salvage on supported failure paths. |
+| Local evidence | Test observations/receipts, runtime recommendations, usage summaries, and containment evidence. |
+| Orientation only | Repo-scoped memory, file inventories, and cached execution profiles; these may be stale. |
+
+Resume reconstructs state from recorded evidence and then checks it against the
+live PR, issue, plan, requirements, and policy. GitHub metadata is durable but
+not a blanket authorization token. A lost local response or uncommitted patch
+cannot necessarily be recovered from GitHub alone. Default checkouts can be
+cleaned on rerun; inspect and preserve salvage before reusing them.
+
+Salvage is partial implementation evidence, not approval or a guaranteed full
+backup. Usage can be exact, partial, or estimated. Test receipts must retain
+failure and scope caveats; a passing subset does not erase a broader failure.
+
+## Context and Trust
+
+The initial prompt does not contain the whole codebase. Agents receive a
+verified checkout, task/PR identity, available plan and human requirements,
+feedback, checks, and bounded advisory memory. Reviewers are told to inspect
+the complete base-to-head diff and use read-only source exploration for related
+code. There is no automatic semantic dependency-retrieval engine.
+
+The generated memory architecture map is primarily a directory/file inventory,
+not this document and not a semantic model of the repository. Current prompts
+do not automatically embed `ARCHITECTURE.md`. `full` versus `compact` review
+context controls review-history presentation, not whole-repository ingestion.
+
+Key contracts to preserve when changing the implementation:
+
+- Validate acquisition, structured fields, footer state, IDs, and provenance
+  before treating a response as an authoritative workflow result. Repair is
+  bounded format correction and is revalidated, not a new substantive review.
+- Keep untrusted issue/PR prose and model output separate from tool-owned
+  protocol markers. A marker or model signature alone is not authentication.
+- Re-check the live head and relevant qualification identities at finalization;
+  old approvals and CI from another head must not authorize a new one.
+- Do not equate missing required input, interrupted commands, or infrastructure
+  failures with approval. Distinguish them from actionable code defects.
+- Permissions and resource containment are different controls. Permission bypass
+  flags do not make fetched content or agent commands trustworthy.
+
+These are design contracts and validation responsibilities, not a claim that
+every integration path is bug-free. Use source inspection and regression tests
+to check them when a change crosses module boundaries.
+
+## Execution and Concurrency
+
+Use one active `agent-loop` invocation per repository per machine. Default
+workdirs are shared by repo/backend, and there is no repository-wide process
+lock enforcing this convention. Parallel reviewers within one invocation are
+supported; the orchestrator verifies distinct reviewer workdirs. Coder and
+reviewer turns are separate lifecycle stages even when they use the same CLI.
+
+On supported Linux/systemd/cgroup-v2 hosts, containment bounds aggregate and
+role-specific process trees. The portable process-group fallback can terminate
+descendants but does not impose memory ceilings. Test-wrapper lane locks prevent
+recognized duplicate commands, not all overlapping work in arbitrary shells.
+Backend turn timeouts, whole-test-command watchdogs, and framework per-test
+timeouts are independent limits. See [containment](docs/local_agent_loop.md#process-tree-containment).
+
+## Other Entry Paths
+
+- `discuss` coordinates non-implementation debate, with optional research,
+  agenda/synthesis, and evidence reconciliation. It does not implicitly enter
+  implementation or merge a PR.
+- `managed-pr` prepares a managed PR from an existing branch before opening it;
+  it is distinct from explicitly adopting an already-open PR.
+- `managed-ci preflight`, `containment-preflight`, and `run-tests` expose
+  supporting checks and execution helpers outside the full review loop.
+- Claude Code skill mode uses an interactive host plus [`helpers/`](helpers/)
+  for validation, external agents, GitHub operations, and local session state.
+  It reuses library functionality but is not an identical CLI lifecycle and
+  never auto-merges. Host-session work is outside the external-agent process
+  boundary. See [skill architecture](docs/skill_mode.md#architecture).
+
+## Tests and Document Maintenance
+
+[`tests/`](tests/) contains focused tests for the orchestrator flows, protocol,
+resume/transport, scheduling, CI contracts, backend adapters, process execution,
+and skill helpers. Fake subprocess/GitHub runners let lifecycle tests run
+without real provider turns or GitHub mutations. They cannot fully reproduce
+provider behavior, GitHub eventual consistency, or every host capability.
+
+When changing component ownership, cross-component flows, persistence, trust
+boundaries, or execution topology, update this overview and the affected detailed
+guide in the same PR. An internal refactor or ordinary bug fix need not change
+the document if those contracts stay the same. Keep diagrams textual and paths
+relative; avoid copying volatile CLI defaults or protocol schemas here.
+
+Automatic architecture-context injection and mandatory architecture-impact
+reporting are follow-up work, not functionality added by this document.
