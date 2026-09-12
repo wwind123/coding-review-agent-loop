@@ -9489,24 +9489,32 @@ def run_pr_loop(
                 current_obligation_digest = hashlib.sha256(
                     repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                 ).hexdigest()[:16]
-                current_head_digest_records = tuple(
-                    record
-                    for record in current_head_records
-                    if (
-                        record.metadata.scheduler_metadata_status == "valid"
-                        and record.metadata.scheduler_obligation_digest is not None
+                # The coder checkpoint is the conservative recovery latch for
+                # every ledger, including reviewer-only ledgers. Qualification
+                # and reconciliation summaries may add a newer digest for a
+                # machine obligation, but must not narrow the existing
+                # reviewer-only safety behavior.
+                persisted_obligation_digests: list[str] = []
+                if coder_checkpoint_is_current and current_coder_record is not None:
+                    coder_digest = current_coder_record.metadata.scheduler_obligation_digest
+                    if coder_digest is not None:
+                        persisted_obligation_digests.append(coder_digest)
+                if any(_is_machine_obligation(item) for item in prior_unresolved_items):
+                    current_head_digest_records = tuple(
+                        record
+                        for record in current_head_records
+                        if (
+                            record.metadata.scheduler_metadata_status == "valid"
+                            and record.metadata.scheduler_obligation_digest is not None
+                        )
                     )
-                )
-                persisted_obligation_digest = (
-                    current_head_digest_records[-1].metadata.scheduler_obligation_digest
-                    if current_head_digest_records
-                    else None
-                )
-                if (
-                    any(_is_machine_obligation(item) for item in prior_unresolved_items)
-                    and
-                    persisted_obligation_digest is not None
-                    and persisted_obligation_digest != current_obligation_digest
+                    if current_head_digest_records:
+                        persisted_obligation_digests.append(
+                            current_head_digest_records[-1].metadata.scheduler_obligation_digest
+                        )
+                if any(
+                    persisted_digest != current_obligation_digest
+                    for persisted_digest in persisted_obligation_digests
                 ):
                     scheduler_force_full = True
                     log(
@@ -11914,6 +11922,13 @@ def run_pr_loop(
                                     f"PR #{pr_number} ordinary recovery provenance is unavailable; "
                                     "no merge attempted."
                                 )
+                            _ensure_finalization_ready(
+                                pr_number=pr_number,
+                                round_number=round_number,
+                                items=unresolved_items,
+                                current_head_sha=pr_metadata.head_sha,
+                                ignored_machine_kinds=frozenset({"github-pr-checks"}),
+                            )
                             merged = _finalize_ordinary_recovery_merge(
                                 runner,
                                 config=config,

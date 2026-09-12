@@ -2891,6 +2891,187 @@ def test_resume_machine_authority_upgrade_forces_full_reviewer_board(
     assert force_full_values == [True]
 
 
+def test_resume_reviewer_ledger_digest_mismatch_forces_full_reviewer_board(
+    tmp_path, monkeypatch
+):
+    reviewer_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Codex",
+        source_round=1,
+        text="The worker still needs cleanup.",
+        status="blocking",
+        source_status="blocking",
+        fix_scope=("src/worker.py",),
+    )
+    scheduler_contract = orchestrator.make_contract(
+        ("Codex",), "selective-intermediate", None
+    )
+    summary = _attach_round_metadata(
+        structured_coder_followup(
+            summary="Persisted reviewer ledger with a stale scheduler digest."
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="abc123",
+            prior_items=(reviewer_item,),
+            state="blocking",
+            scheduler_contract=scheduler_contract.as_dict(),
+            scheduler_previous_sha="abc123",
+            scheduler_current_sha="abc123",
+            scheduler_obligation_digest=orchestrator._qualification_digest(()),
+            scheduler_selected_reviewers=("Codex",),
+            scheduler_paused_reviewers=(),
+            scheduler_reasons=("stale digest",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=0,
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="The reviewer item remains blocking.",
+                prior_item_dispositions=[
+                    {
+                        "item_id": reviewer_item.item_id,
+                        "disposition": "blocking",
+                        "note": "The worker cleanup remains incomplete on this head.",
+                    }
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": summary}
+            ]
+        }
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        max_rounds=1,
+    )
+    force_full_values = []
+    original_select_reviewers = orchestrator.select_reviewers
+
+    def capture_force_full(snapshot, *args, **kwargs):
+        force_full_values.append(snapshot.force_full)
+        return original_select_reviewers(snapshot, *args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
+
+    with pytest.raises(AgentLoopError, match="still reported blocking"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert force_full_values == [True]
+
+
+def test_post_review_ordinary_recovery_rejects_other_machine_obligation(
+    tmp_path, monkeypatch
+):
+    reviewer_item = UnresolvedReviewItem(
+        item_id="item-reviewer",
+        reviewer="Codex",
+        source_round=1,
+        text="The reviewer-owned cleanup is incomplete.",
+        status="blocking",
+        source_status="blocking",
+        fix_scope=("src/worker.py",),
+    )
+    managed_item = UnresolvedReviewItem(
+        item_id="item-managed",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed exact-head CI failed on the previous head.",
+        status="blocking",
+        source_status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualification_ready",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        obligation_identity="managed-exact-head-ci:item-managed",
+    )
+    carried = (reviewer_item, managed_item)
+    reviewer_comment = _attach_round_metadata(
+        structured_pr_review(
+            reviewer="OpenAI Codex",
+            state="approved",
+            summary="The reviewer-owned item is resolved.",
+            prior_item_dispositions=[
+                {"item_id": item.item_id, "disposition": "resolved"}
+                for item in carried
+            ],
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="abc123",
+            prior_items=carried,
+            dispositions=tuple(
+                ReviewItemDisposition(item.item_id, "Codex", "resolved")
+                for item in carried
+            ),
+            state="approved",
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                reviewer="OpenAI Codex",
+                state="approved",
+                summary="The reviewer-owned item is resolved.",
+                prior_item_dispositions=[
+                    {"item_id": item.item_id, "disposition": "resolved"}
+                    for item in carried
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": reviewer_comment}
+            ]
+        },
+    )
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77,
+        repository="OWNER/REPO",
+        base_ref="main",
+        expected_head_sha="abc123",
+        released_label_event_id=101,
+        released_at=100,
+    )
+    activation = ManagedCiContract(
+        activation_path="ordinary_fallback",
+        ordinary_recovery=capability,
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        auto_merge=True,
+        max_rounds=2,
+    )
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: activation)
+    monkeypatch.setattr(
+        orchestrator,
+        "_finalize_ordinary_recovery_merge",
+        lambda *args, **kwargs: pytest.fail("ordinary recovery bypassed another machine obligation"),
+    )
+
+    with pytest.raises(AgentLoopError, match="managed-exact-head-ci"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
 def test_auto_merge_supported_repo_dispatches_and_merges_exact_approved_head(
     tmp_path, monkeypatch
 ):
