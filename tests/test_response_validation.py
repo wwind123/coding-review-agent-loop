@@ -2,7 +2,9 @@ from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.protocol import StructuredCoderFollowup, classify_pr_reference
 from coding_review_agent_loop.unresolved_items import (
     CODER_DISPUTE_NOTE_PREFIX,
+    MACHINE_AUTHORITY,
     _apply_dispute_evidence,
+    _apply_unresolved_item_dispositions,
     _is_disputed_item,
 )
 
@@ -46,6 +48,40 @@ def test_validate_review_response_accepts_structured_pr_review():
     assert [item.text for item in parsed.blocking_items] == [
         "Add the mixed-history regression case to the suite."
     ]
+
+
+def test_machine_obligation_must_be_dispositioned_but_resolution_is_advisory():
+    machine_item = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        authority=MACHINE_AUTHORITY,
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="repair_required",
+        failed_head_sha="old-head",
+    )
+    review = structured_pr_review(
+        state="approved",
+        prior_item_dispositions=[{"item_id": "item-30", "disposition": "resolved"}],
+    )
+
+    parsed = _validate_review_response(
+        review,
+        reviewer="OpenAI Codex",
+        unresolved_items=(machine_item,),
+    )
+    retained, _ = _apply_unresolved_item_dispositions(
+        (machine_item,),
+        {"item-30": list(parsed.dispositions)},
+        reconciliation_mode="owner-scoped",
+    )
+
+    assert parsed.dispositions[0].disposition == "resolved"
+    assert len(retained) == 1
+    assert retained[0].lifecycle == "repair_required"
+    assert retained[0].failed_head_sha == "old-head"
 
 def test_validate_coder_followup_response_accepts_structured_item_partition():
     unresolved_items = (

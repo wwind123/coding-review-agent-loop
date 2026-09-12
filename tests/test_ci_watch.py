@@ -106,6 +106,30 @@ def test_watch_success_and_head_change_are_terminal(tmp_path):
         assert watch_pr_checks(runner, make_config(tmp_path, watch_pending_ci=True), 7, metadata=_metadata()).status == "head_changed"
 
 
+def test_watch_forbidden_branch_protection_never_reports_success(tmp_path):
+    runner = _Runner()
+    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
+         patch("coding_review_agent_loop.github.get_pr_mergeability", return_value=_mergeability()), \
+         patch(
+             "coding_review_agent_loop.github.get_pr_checks",
+             return_value=_checks("passing", protection="forbidden"),
+         ):
+        outcome = watch_pr_checks(
+            runner,
+            make_config(
+                tmp_path,
+                watch_pending_ci=True,
+                ci_timeout_seconds=1,
+                ci_poll_interval_seconds=1,
+            ),
+            7,
+            metadata=_metadata(),
+            attempts=1,
+        )
+
+    assert outcome.status == "timeout"
+
+
 def test_watch_empty_rollup_stops_as_not_started_never_as_success(tmp_path):
     runner = _Runner()
     with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="sha"), \
@@ -139,7 +163,7 @@ def test_watch_timeout_retries_transient_snapshots_and_dry_run_does_not_poll(tmp
     assert watch_pr_checks(_Runner(), dry, 7, metadata=_metadata()).status == "dry_run"
 
 
-def test_watch_accepts_forbidden_branch_protection_and_retries_flaky_head_probe(tmp_path):
+def test_watch_rejects_forbidden_branch_protection_after_flaky_head_probe(tmp_path):
     runner = _Runner()
     with patch(
         "coding_review_agent_loop.github.get_pr_head_sha",
@@ -162,5 +186,5 @@ def test_watch_accepts_forbidden_branch_protection_and_retries_flaky_head_probe(
             7,
             metadata=_metadata(),
         )
-    assert outcome.status == "passed"
+    assert outcome.status == "timeout"
     assert [command[0] for command in runner.commands] == ["sleep"]

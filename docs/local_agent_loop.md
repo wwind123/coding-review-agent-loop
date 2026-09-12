@@ -13,6 +13,39 @@ The default flow is:
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
+### Machine obligations and resumable qualification
+
+The review ledger distinguishes reviewer-owned findings from machine-owned
+obligations. Managed exact-head CI, ordinary GitHub checks, Alembic migration
+validation, merge conflicts, and human-requirement acknowledgement each have a
+stable authority kind. Repeated failures for one kind update the existing
+obligation, while authoritative success clears only obligations of that same
+kind.
+
+After any CI failure, its exact failed head remains ineligible for
+requalification. The coder must produce a strictly different repair head.
+That transition is scope-less and therefore selects the broad full reviewer
+board under `selective-intermediate`; reviewer approval of the correction is
+advisory evidence and cannot substitute for CI success. Only the source-specific
+fresh result, correlated to the required head/base and provenance, clears the
+obligation. Failed, pending, skipped, absent, stale, intermediate-filtered, or
+uncorrelated checks never satisfy the final gate.
+
+Before dispatch or a watcher, the loop records a qualification checkpoint in
+round metadata. It contains the obligation identity and lifecycle, failed and
+candidate heads, base and review/plan/requirement/scheduler identities,
+qualification attempt identity, and the independent one-shot allowances: one
+failure-repair extension and one head-change re-review extension. The effective
+ceiling is therefore at most `max_rounds + 2`. A restart attaches to a
+correlated in-flight attempt when possible; absent, malformed, stale, or
+contradictory checkpoints force safe reconstruction and full review.
+
+At the round limit, diagnostics identify the actual next action: a named
+reviewer-owned blocker, a CI obligation awaiting a repair head, a reviewed
+correction awaiting qualification, migration or mergeability validation, an
+unknown persisted obligation, or external infrastructure recovery. The loop
+does not describe a unanimous reviewer board as blocking when only CI remains.
+
 Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick a single model via `--antigravity-model`, or an ordered fallback chain via `--antigravity-models`; default chain `Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)`). Enterprise / API-key Gemini CLI paths may remain available for organizations that still have access, so the `gemini` backend is retained for those users. Direct Gemini CLI support is best-effort: maintainers without enterprise Gemini CLI access need reporter-provided `.agent-loop-logs/*gemini.log` output, response-file contents, CLI version, and any sharable account/access context to debug live `gemini` failures. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
 
 Every `agy --print` call passes `--print-timeout` from

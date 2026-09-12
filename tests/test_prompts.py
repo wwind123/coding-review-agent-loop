@@ -32,6 +32,14 @@ merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marke
 `"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
 `"blocking"`/`"same-pr"`.
 
+Machine obligations are shown in the same ledger so every reviewer must
+disposition them, but those dispositions are advisory evidence only. A machine
+`"resolved"` or `"future"` disposition never clears CI, migration, mergeability,
+or acknowledgement state. Do not treat reviewer approval, skipped checks,
+missing checks, intermediate-filtered checks, stale results, or an unrelated
+run as authoritative success; the named machine authority must validate the
+required current repair head.
+
 The displayed Original claim is this stable item ID's predicate. Narrower evidence
 for that same defect may remain on the old ID. If you accept the original predicate
 but discover a materially different defect, mark the old item `"resolved"` and put
@@ -496,6 +504,43 @@ def test_review_prompt_includes_prior_unresolved_items_and_disposition_instructi
     assert "After the JSON object, include only:" in prompt
     assert "Use this mandatory structured PR review format" in prompt
     assert "Markdown fallback" not in prompt
+
+
+def test_review_prompt_labels_machine_obligations_as_advisory(tmp_path):
+    config = make_config(tmp_path, pr_review_policy="selective-intermediate")
+    prompt = build_review_prompt(
+        77,
+        2,
+        config,
+        reviewer="codex",
+        pr_metadata=PullRequestMetadata(
+            number=77,
+            repo="OWNER/REPO",
+            title="Managed CI repair",
+            head_branch="feature/review-context",
+            base_branch="main",
+            head_sha="newhead123",
+            url="https://github.com/OWNER/REPO/pull/77",
+        ),
+        unresolved_items=(
+            UnresolvedReviewItem(
+                item_id="item-30",
+                reviewer="GitHub managed exact-head CI",
+                source_round=1,
+                text="Exact-head CI failed on the previous head.",
+                status="blocking",
+                authority="machine",
+                obligation_kind="managed-exact-head-ci",
+                lifecycle="awaiting_current_head_review",
+                failed_head_sha="oldhead123",
+                candidate_head_sha="newhead123",
+            ),
+        ),
+    )
+
+    assert "Machine obligation: managed-exact-head-ci" in prompt
+    assert "reviewer approval is advisory evidence only and never CI success" in prompt
+    assert "the named machine authority must validate" in prompt
 
 
 def test_review_prompt_splits_legacy_updates_without_mutating_claim_and_preserves_notes(tmp_path):

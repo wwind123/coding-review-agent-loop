@@ -7,6 +7,7 @@ import pytest
 import coding_review_agent_loop.orchestrator as orchestrator
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.unresolved_items import (
+    MACHINE_AUTHORITY,
     _apply_unresolved_item_dispositions,
     _format_unresolved_items_for_coder,
     _validate_review_response,
@@ -91,6 +92,41 @@ def test_note_survives_publication_metadata_and_reconciliation():
     assert items[0].text == CLAIM
     assert NOTE in _format_unresolved_items_for_coder(items)
     assert SUMMARY not in items[0].text
+
+
+def test_carried_machine_obligation_keeps_authority_after_reparsed_approval():
+    machine_item = UnresolvedReviewItem(
+        item_id="item-30", reviewer="GitHub managed exact-head CI", source_round=13,
+        text="Managed exact-head CI failed.", status="blocking",
+        authority=MACHINE_AUTHORITY, obligation_kind="managed-exact-head-ci",
+        lifecycle="awaiting_current_head_review", failed_head_sha="old-head",
+        candidate_head_sha="new-head", obligation_identity="managed:item-30",
+    )
+    review = structured_pr_review(
+        state="approved",
+        prior_item_dispositions=[{"item_id": "item-30", "disposition": "resolved"}],
+    )
+    parsed = _validate_review_response(
+        review, reviewer="Codex", unresolved_items=(machine_item,)
+    )
+    saved = _attach_round_metadata(
+        "Published review.\n<!-- AGENT_STATE: approved -->\n-- Codex",
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=14,
+            subject="new-head", prior_items=(machine_item,),
+            dispositions=parsed.dispositions, state="approved",
+        ),
+    )
+    reparsed = parse_review(saved, reviewer="Codex")
+    retained, _ = _apply_unresolved_item_dispositions(
+        (machine_item,), {"item-30": list(reparsed.dispositions)},
+        reconciliation_mode="owner-scoped",
+    )
+
+    assert len(retained) == 1
+    assert retained[0].obligation_kind == "managed-exact-head-ci"
+    assert retained[0].candidate_head_sha == "new-head"
+    assert retained[0].failed_head_sha == "old-head"
 
 
 @pytest.mark.parametrize("parallel", [False, True])

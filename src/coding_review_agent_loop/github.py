@@ -2108,7 +2108,7 @@ def watch_pr_checks(
                 attempts_used=attempt + 1,
             )
         reliable = snapshot.check_query_status == "ok" and snapshot.branch_protection_status in {
-            "configured", "not_found", "forbidden",
+            "configured", "not_found",
         }
         # A positively observed failure is actionable even when another query
         # was partial or a required check has not materialized yet. Those

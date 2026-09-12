@@ -53,6 +53,7 @@ from coding_review_agent_loop.managed_ci import (
 )
 from coding_review_agent_loop.orchestrator import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+    QualificationCheckpoint,
     PostedRoundMetadata,
     ValidatedAgentResponse,
     _attach_round_metadata,
@@ -60,6 +61,7 @@ from coding_review_agent_loop.orchestrator import (
     _reconcile_human_requirements_ack_item,
     _resume_pr_round,
     _strip_round_metadata,
+    _ensure_finalization_ready,
 )
 from coding_review_agent_loop.prompts import (
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
@@ -92,6 +94,45 @@ from agent_loop_helpers import (
 )
 
 
+def _advance_head_after_coder(monkeypatch, runner, head_sha="repaired-head"):
+    """Make the fake coder handoff obey the repair-head contract."""
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = head_sha
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+
+def _carried_ci_obligations() -> tuple[UnresolvedReviewItem, ...]:
+    return tuple(
+        UnresolvedReviewItem(
+            item_id=f"item-{index}",
+            reviewer=reviewer,
+            source_round=1,
+            text=f"{kind} failed on the previous head.",
+            status="blocking",
+            source_status="blocking",
+            authority="machine",
+            obligation_kind=kind,
+            lifecycle="qualification_ready",
+            failed_head_sha="old-head",
+            candidate_head_sha="abc123",
+            obligation_identity=f"{kind}:item-{index}",
+        )
+        for index, (reviewer, kind) in enumerate(
+            (
+                ("GitHub managed exact-head CI", "managed-exact-head-ci"),
+                ("GitHub PR checks", "github-pr-checks"),
+            ),
+            start=1,
+        )
+    )
+
+
 def test_pr_resume_prompt_uses_current_wrapper_health_without_dropping_command(
     tmp_path, monkeypatch
 ):
@@ -117,6 +158,232 @@ def test_pr_resume_prompt_uses_current_wrapper_health_without_dropping_command(
     prompt = build_followup_prompt(768, 2, "Repair the launcher path.", config, memory=memory)
     assert "pytest tests/test_protocol.py -q" in prompt
     assert "no wrapper candidate verified" in prompt
+
+
+def test_orchestrator_finalization_guard_rejects_uncleared_machine_obligation():
+    item = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualification_ready",
+        failed_head_sha="oldhead123",
+        candidate_head_sha="newhead123",
+    )
+
+    with pytest.raises(AgentLoopError, match="No approval or merge was attempted"):
+        _ensure_finalization_ready(
+            pr_number=777,
+            round_number=20,
+            items=[item],
+            current_head_sha="newhead123",
+        )
+
+
+@pytest.mark.parametrize("status", ["skipped", "neutral"])
+def test_ordinary_checks_authority_rejects_non_executed_passing_conclusions(status):
+    check = PullRequestCheck(name="test", kind="check_run", status=status)
+    checks = PullRequestChecks(
+        state="passing",
+        required_checks=("test",),
+        passing=(check,),
+        pending=(),
+        failing=(),
+        missing_required=(),
+        branch_protection_status="configured",
+        check_query_status="ok",
+    )
+
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+
+
+def test_ordinary_checks_authority_requires_a_real_success_conclusion():
+    check = PullRequestCheck(name="test", kind="check_run", status="success")
+    checks = PullRequestChecks(
+        state="passing",
+        required_checks=("test",),
+        passing=(check,),
+        pending=(),
+        failing=(),
+        missing_required=(),
+        branch_protection_status="configured",
+        check_query_status="ok",
+    )
+
+    assert orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+
+
+def test_ordinary_checks_authority_rejects_forbidden_branch_protection():
+    checks = _watch_check_board("passing", protection="forbidden")
+
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+
+
+def test_ordinary_checks_authority_rejects_absent_partial_or_unavailable_boards():
+    success = PullRequestCheck(name="test", kind="check_run", status="success")
+    for state, query, missing in (
+        ("no_checks", "ok", ()),
+        ("unavailable", "unavailable", ()),
+        ("passing", "partial", ()),
+        ("passing", "ok", ("test",)),
+    ):
+        checks = PullRequestChecks(
+            state=state,
+            required_checks=("test",),
+            passing=(success,),
+            pending=(),
+            failing=(),
+            missing_required=missing,
+            branch_protection_status="configured",
+            check_query_status=query,
+        )
+        assert not orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+
+
+def test_machine_authority_clears_only_its_own_obligation_kind():
+    managed = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed CI failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualification_ready",
+        failed_head_sha="old",
+        candidate_head_sha="new",
+    )
+    ordinary = dataclasses.replace(
+        managed,
+        item_id="item-2",
+        reviewer="GitHub PR checks",
+        text="Ordinary checks failed.",
+        obligation_kind="github-pr-checks",
+        obligation_identity="github-pr-checks:item-2",
+    )
+
+    after_managed = orchestrator._clear_machine_obligations(
+        [managed, ordinary], kind="managed-exact-head-ci"
+    )
+    after_ordinary = orchestrator._clear_machine_obligations(
+        [managed, ordinary], kind="github-pr-checks"
+    )
+
+    assert [item.obligation_kind for item in after_managed] == ["github-pr-checks"]
+    assert [item.obligation_kind for item in after_ordinary] == ["managed-exact-head-ci"]
+
+
+def test_qualification_checkpoint_review_identity_is_fail_closed():
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed CI failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualifying",
+        failed_head_sha="old",
+        candidate_head_sha="new",
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity=item.obligation_identity,
+        lifecycle="qualifying",
+        failed_head_sha="old",
+        candidate_head_sha="new",
+        base_branch="main",
+        approval_digest="approval",
+        requirements_digest="requirements",
+        acquisition_digest="acquisition",
+        scheduler_digest="scheduler",
+        qualification_attempt_id="run/1",
+        allowed_rounds=1,
+    )
+
+    assert not orchestrator._qualification_checkpoint_review_identity_matches(
+        checkpoint,
+        configured_reviewers=("codex",),
+        current_approvals={},
+        unresolved_items=[item],
+        expected_plan_digest=None,
+        expected_requirements_digest="requirements",
+        expected_acquisition_digest="acquisition",
+        expected_qualification_attempt_id="run/1",
+    )
+    complete = dataclasses.replace(
+        checkpoint,
+        approval_digest=orchestrator._qualification_digest(("Codex",)),
+        scheduler_digest=orchestrator._qualification_digest(
+            orchestrator._prior_item_ledger_signature([item])
+        ),
+    )
+    assert orchestrator._qualification_checkpoint_review_identity_matches(
+        complete,
+        configured_reviewers=("codex",),
+        current_approvals={"Codex": object()},
+        unresolved_items=[item],
+        expected_plan_digest=None,
+        expected_requirements_digest="requirements",
+        expected_acquisition_digest="acquisition",
+        expected_qualification_attempt_id="run/1",
+    )
+    for field in (
+        "plan_digest",
+        "requirements_digest",
+        "acquisition_digest",
+        "scheduler_digest",
+        "qualification_attempt_id",
+    ):
+        tampered = dataclasses.replace(complete, **{field: "different"})
+        assert not orchestrator._qualification_checkpoint_review_identity_matches(
+            tampered,
+            configured_reviewers=("codex",),
+            current_approvals={"Codex": object()},
+            unresolved_items=[item],
+            expected_plan_digest=None,
+            expected_requirements_digest="requirements",
+            expected_acquisition_digest="acquisition",
+            expected_qualification_attempt_id="run/1",
+        )
+
+
+def test_machine_checkpoint_revert_returns_to_repair_required_without_value_error():
+    item = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub PR checks",
+        source_round=1,
+        text="Checks failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="github-pr-checks",
+        lifecycle="awaiting_current_head_review",
+        failed_head_sha="failed-head",
+        candidate_head_sha="repair-head",
+    )
+
+    advanced = orchestrator._advance_machine_obligations_for_head(
+        [item], current_head_sha="failed-head"
+    )
+    checkpoint = orchestrator._machine_obligation_checkpoint(
+        advanced,
+        current_head_sha="failed-head",
+        base_branch="main",
+        allowed_rounds=2,
+        watch_failure_extension_used=False,
+        watch_head_extension_used=False,
+        lifecycle="awaiting_current_head_review",
+    )
+
+    assert advanced[0].lifecycle == "repair_required"
+    assert advanced[0].candidate_head_sha is None
+    assert checkpoint is not None
+    assert checkpoint.lifecycle == "repair_required"
+    assert checkpoint.candidate_head_sha is None
 
 
 def _assert_pending_ci_stop_guidance(text):
@@ -1338,7 +1605,11 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     monkeypatch.setattr(
         orchestrator,
         "wait_for_ordinary_recovery",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed"),
+        lambda *args, **kwargs: ManagedCiOutcome(
+            status="passed",
+            checks=_watch_check_board("passing"),
+            head_sha="abc123",
+        ),
     )
     monkeypatch.setattr(
         orchestrator,
@@ -1368,6 +1639,74 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     assert ["gh", "pr", "ready", "77", "--repo", "OWNER/REPO"] in [
         command for command, _cwd in runner.commands
     ]
+
+
+@pytest.mark.parametrize("board", ["absent", "neutral", "skipped", "forbidden"])
+def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
+    monkeypatch, tmp_path, board
+):
+    runner = FakeRunner()
+    config = make_config(tmp_path, auto_merge=True)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77,
+        repository="OWNER/REPO",
+        base_ref="main",
+        expected_head_sha="abc123",
+        released_label_event_id=101,
+        released_at=100,
+    )
+    if board == "absent":
+        snapshot = None
+    elif board == "forbidden":
+        snapshot = _watch_check_board("passing", protection="forbidden")
+    else:
+        snapshot = _watch_check_board(
+            "passing",
+            passing=(PullRequestCheck(name="test", kind="check_run", status=board),),
+        )
+    monkeypatch.setattr(
+        orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_ordinary_recovery",
+        lambda *args, **kwargs: ManagedCiOutcome(
+            status="passed", checks=snapshot, head_sha="abc123"
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_review_context",
+        lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
+            number=77,
+            repo="OWNER/REPO",
+            title="draft",
+            head_branch="feature",
+            base_branch="main",
+            head_sha="abc123",
+            url=None,
+        )),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda *args, **kwargs: pytest.fail("non-authoritative recovery must not merge"),
+    )
+
+    ordinary_item = _carried_ci_obligations()[1]
+    items = [ordinary_item]
+    assert not orchestrator._finalize_ordinary_recovery_checked(
+        runner,
+        config=config,
+        pr_number=77,
+        round_number=1,
+        items=items,
+        current_head_sha="abc123",
+        capability=capability,
+    )
+    assert items == [ordinary_item]
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
 def test_ordinary_recovery_refuses_head_changed_before_ready(monkeypatch, tmp_path):
@@ -1404,7 +1743,11 @@ def test_ordinary_recovery_refuses_provenance_change_after_ready(monkeypatch, tm
     monkeypatch.setattr(
         orchestrator,
         "wait_for_ordinary_recovery",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed"),
+        lambda *args, **kwargs: ManagedCiOutcome(
+            status="passed",
+            checks=_watch_check_board("passing"),
+            head_sha="abc123",
+        ),
     )
     monkeypatch.setattr(
         orchestrator,
@@ -1440,7 +1783,11 @@ def test_ordinary_recovery_merge_failure_leaves_pr_ready(monkeypatch, tmp_path):
     monkeypatch.setattr(
         orchestrator,
         "wait_for_ordinary_recovery",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed"),
+        lambda *args, **kwargs: ManagedCiOutcome(
+            status="passed",
+            checks=_watch_check_board("passing"),
+            head_sha="abc123",
+        ),
     )
     monkeypatch.setattr(
         orchestrator,
@@ -2092,7 +2439,7 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
         ],
         claude_outputs=["Investigated CI.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
     )
-    config = make_config(tmp_path, max_rounds=2)
+    config = make_config(tmp_path, max_rounds=2, watch_pending_ci=True)
     check_states = iter(
         [
             {
@@ -2129,6 +2476,15 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
 
     original_get_pr_checks = orchestrator_module.get_pr_checks
     monkeypatch.setattr(orchestrator_module, "get_pr_checks", advance_checks)
+    _advance_head_after_coder(monkeypatch, runner)
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: CiWatchOutcome(
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+        ),
+    )
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -2149,19 +2505,23 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
 def _watch_check_board(
     state,
     *,
+    passing=(),
     failing=(),
     pending=(),
     missing_required=(),
     errors=(),
+    protection="configured",
 ):
+    if state == "passing" and not passing:
+        passing = (PullRequestCheck(name="test", kind="check_run", status="success"),)
     return PullRequestChecks(
         state=state,
         required_checks=("test",),
-        passing=(),
+        passing=tuple(passing),
         pending=tuple(pending),
         failing=tuple(failing),
         missing_required=tuple(missing_required),
-        branch_protection_status="configured",
+        branch_protection_status=protection,
         check_query_status="partial" if errors else "ok",
         check_query_errors=tuple(errors),
     )
@@ -2253,14 +2613,75 @@ def test_round_ci_failure_is_tracked_and_resolved_with_reviewer_findings(tmp_pat
         _watch_check_board("passing"),
     ])
     monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: next(snapshots))
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
-        status="passed", head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
-    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge)) == 0
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=make_config(tmp_path, auto_merge=auto_merge, watch_pending_ci=True),
+    ) == 0
     second_review = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ["codex"]][-1]
     assert "item-2" in second_review
     assert "Failing checks: test (failure)" in second_review
     assert sum(comment.startswith("GitHub PR checks are failing") for comment in runner.comments) == 1
+
+
+def test_review_only_mode_clears_repaired_ordinary_ci_from_fresh_passing_snapshot(
+    tmp_path, monkeypatch
+):
+    failed = PullRequestCheck(
+        name="test", kind="check_run", status="failure", url="https://example.test/555"
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Initial review."),
+            structured_pr_review(
+                state="approved",
+                summary="Repaired head approved.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Repaired the failing check.", addressed_items=["item-1"]
+            )
+        ],
+    )
+
+    def checks(*args, **kwargs):
+        if kwargs["metadata"].head_sha == "abc123":
+            return _watch_check_board("failing", failing=(failed,))
+        return _watch_check_board(
+            "passing",
+            passing=(
+                PullRequestCheck(name="test", kind="check_run", status="success"),
+                PullRequestCheck(name="docs", kind="check_run", status="skipped"),
+            ),
+        )
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: pytest.fail("review-only mode must not start the watcher"),
+    )
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=make_config(
+            tmp_path, auto_merge=False, watch_pending_ci=False, max_rounds=2
+        ),
+    ) == 0
+
+    assert not any("watching GitHub checks" in comment for comment in runner.comments)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
 @pytest.mark.parametrize("auto_merge", [False, True])
@@ -2273,7 +2694,8 @@ def test_watch_mode_success_uses_full_board_without_second_wait(
         orchestrator,
         "watch_pr_checks",
         lambda *args, **kwargs: CiWatchOutcome(
-            status="passed", head_sha="abc123", attempts_used=1
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha="abc123", attempts_used=1
         ),
     )
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -2282,6 +2704,566 @@ def test_watch_mode_success_uses_full_board_without_second_wait(
         cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "merge"]
     ]
     assert bool(merge_commands) is auto_merge
+
+
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_skipped_only_watcher_pass_does_not_clear_or_merge(
+    tmp_path, monkeypatch, auto_merge
+):
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")]
+    )
+    skipped_only = PullRequestChecks(
+        state="passing",
+        required_checks=(),
+        passing=(PullRequestCheck(name="docs", kind="check_run", status="skipped"),),
+        pending=(),
+        failing=(),
+        missing_required=(),
+        branch_protection_status="configured",
+        check_query_status="ok",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: CiWatchOutcome(
+            status="passed", pr_checks=skipped_only, head_sha="abc123", attempts_used=1
+        ),
+    )
+
+    if auto_merge:
+        with pytest.raises(AgentLoopError, match="non-authoritative"):
+            run_pr_loop(
+                runner,
+                pr_number=77,
+                config=make_config(tmp_path, watch_pending_ci=True, auto_merge=True),
+            )
+    else:
+        assert run_pr_loop(
+            runner,
+            pr_number=77,
+            config=make_config(tmp_path, watch_pending_ci=True, auto_merge=False),
+        ) == 0
+
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("kind", ["absent", "skipped", "stale", "uncorrelated"])
+def test_invalid_watcher_success_cannot_finalize_carried_ci_obligation(
+    tmp_path, monkeypatch, kind
+):
+    ordinary_item = _carried_ci_obligations()[1]
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="Approved.",
+                prior_item_dispositions=[
+                    {"item_id": ordinary_item.item_id, "disposition": "resolved"}
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {
+                    "author": {"login": "coding-review-agent-loop"},
+                    "body": _carried_ci_review_comment((ordinary_item,)),
+                }
+            ]
+        },
+    )
+    if kind == "absent":
+        outcome = CiWatchOutcome(
+            status="passed", pr_checks=None, head_sha="abc123", attempts_used=1
+        )
+        expected = "non-authoritative"
+    elif kind == "skipped":
+        skipped_only = PullRequestChecks(
+            state="passing",
+            required_checks=(),
+            passing=(PullRequestCheck(name="docs", kind="check_run", status="skipped"),),
+            pending=(),
+            failing=(),
+            missing_required=(),
+            branch_protection_status="configured",
+            check_query_status="ok",
+        )
+        outcome = CiWatchOutcome(
+            status="passed", pr_checks=skipped_only, head_sha="abc123", attempts_used=1
+        )
+        expected = "non-authoritative"
+    elif kind == "stale":
+        outcome = CiWatchOutcome(
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha="old-head", attempts_used=1
+        )
+        expected = "stale head"
+    else:
+        outcome = CiWatchOutcome(
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha=None, attempts_used=1
+        )
+        expected = "stale head"
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *args, **kwargs: outcome)
+
+    with pytest.raises(AgentLoopError, match=expected):
+        run_pr_loop(
+            runner,
+            pr_number=77,
+            config=make_config(tmp_path, watch_pending_ci=True, auto_merge=True),
+        )
+
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def _carried_ci_review_comment(items):
+    dispositions = tuple(
+        ReviewItemDisposition(item.item_id, "Codex", "resolved") for item in items
+    )
+    return _attach_round_metadata(
+        structured_pr_review(
+            reviewer="OpenAI Codex",
+            state="approved",
+            summary="The reviewed repair is approved.",
+            prior_item_dispositions=[
+                {"item_id": item.item_id, "disposition": "resolved"}
+                for item in items
+            ],
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="abc123",
+            prior_items=items,
+            dispositions=dispositions,
+            state="approved",
+        ),
+    )
+
+
+def test_managed_success_does_not_clear_carried_ordinary_ci_obligation(
+    tmp_path, monkeypatch
+):
+    items = _carried_ci_obligations()
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                reviewer="OpenAI Codex",
+                state="approved",
+                prior_item_dispositions=[
+                    {"item_id": item.item_id, "disposition": "resolved"}
+                    for item in items
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {
+                    "author": {"login": "coding-review-agent-loop"},
+                    "body": _carried_ci_review_comment(items),
+                }
+            ]
+        }
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        managed_ci=True,
+        auto_merge=True,
+        max_rounds=1,
+    )
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("ordinary obligation was bypassed")
+    )
+
+    with pytest.raises(AgentLoopError, match="github-pr-checks"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+
+def test_ordinary_success_does_not_clear_carried_managed_ci_obligation(
+    tmp_path, monkeypatch
+):
+    items = _carried_ci_obligations()
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                reviewer="OpenAI Codex",
+                state="approved",
+                prior_item_dispositions=[
+                    {"item_id": item.item_id, "disposition": "resolved"}
+                    for item in items
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {
+                    "author": {"login": "coding-review-agent-loop"},
+                    "body": _carried_ci_review_comment(items),
+                }
+            ]
+        }
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        auto_merge=False,
+        watch_pending_ci=False,
+        max_rounds=1,
+    )
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("managed obligation was bypassed")
+    )
+
+    with pytest.raises(AgentLoopError, match="managed-exact-head-ci"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+
+def test_ordinary_watcher_success_does_not_clear_carried_managed_ci_obligation(
+    tmp_path, monkeypatch
+):
+    items = _carried_ci_obligations()
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                reviewer="OpenAI Codex",
+                state="approved",
+                prior_item_dispositions=[
+                    {"item_id": item.item_id, "disposition": "resolved"}
+                    for item in items
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {
+                    "author": {"login": "coding-review-agent-loop"},
+                    "body": _carried_ci_review_comment(items),
+                }
+            ]
+        },
+    )
+    watcher_calls = []
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        auto_merge=True,
+        watch_pending_ci=True,
+        max_rounds=1,
+    )
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: None)
+
+    def watch(*args, **kwargs):
+        watcher_calls.append(kwargs["metadata"].head_sha)
+        return CiWatchOutcome(
+            status="passed",
+            pr_checks=_watch_check_board("passing"),
+            head_sha="abc123",
+            attempts_used=1,
+        )
+
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda *args, **kwargs: pytest.fail("managed obligation was bypassed"),
+    )
+
+    with pytest.raises(AgentLoopError, match="managed-exact-head-ci"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert watcher_calls == ["abc123"]
+
+
+def test_resume_machine_authority_upgrade_forces_full_reviewer_board(
+    tmp_path, monkeypatch
+):
+    legacy = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        source_status="blocking",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity="managed-exact-head-ci:item-30",
+        lifecycle="repair_required",
+        failed_head_sha="abc123",
+        candidate_head_sha=None,
+        base_branch="main",
+        allowed_rounds=1,
+    )
+    scheduler_contract = orchestrator.make_contract(
+        ("Codex",), "selective-intermediate", None
+    )
+    summary = _attach_round_metadata(
+        "Persisted legacy machine obligation.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="abc123",
+            prior_items=(legacy,),
+            state="blocking",
+            phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint,
+            scheduler_contract=scheduler_contract.as_dict(),
+            scheduler_previous_sha="abc123",
+            scheduler_current_sha="abc123",
+            scheduler_obligation_digest=orchestrator._qualification_digest(
+                orchestrator._prior_item_ledger_signature((legacy,))
+            ),
+            scheduler_selected_reviewers=("Codex",),
+            scheduler_paused_reviewers=(),
+            scheduler_reasons=("legacy checkpoint",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=0,
+        ),
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": summary}
+            ]
+        }
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        max_rounds=1,
+    )
+    force_full_values = []
+    original_select_reviewers = orchestrator.select_reviewers
+
+    def capture_force_full(snapshot, *args, **kwargs):
+        force_full_values.append(snapshot.force_full)
+        return original_select_reviewers(snapshot, *args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
+
+    with pytest.raises(AgentLoopError, match="awaiting a new repair head"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert force_full_values == [True]
+
+
+def test_resume_reviewer_ledger_digest_mismatch_forces_full_reviewer_board(
+    tmp_path, monkeypatch
+):
+    reviewer_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="Codex",
+        source_round=1,
+        text="The worker still needs cleanup.",
+        status="blocking",
+        source_status="blocking",
+        fix_scope=("src/worker.py",),
+    )
+    scheduler_contract = orchestrator.make_contract(
+        ("Codex",), "selective-intermediate", None
+    )
+    summary = _attach_round_metadata(
+        structured_coder_followup(
+            summary="Persisted reviewer ledger with a stale scheduler digest."
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="abc123",
+            prior_items=(reviewer_item,),
+            state="blocking",
+            scheduler_contract=scheduler_contract.as_dict(),
+            scheduler_previous_sha="abc123",
+            scheduler_current_sha="abc123",
+            scheduler_obligation_digest=orchestrator._qualification_digest(()),
+            scheduler_selected_reviewers=("Codex",),
+            scheduler_paused_reviewers=(),
+            scheduler_reasons=("stale digest",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=0,
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="The reviewer item remains blocking.",
+                prior_item_dispositions=[
+                    {
+                        "item_id": reviewer_item.item_id,
+                        "disposition": "blocking",
+                        "note": "The worker cleanup remains incomplete on this head.",
+                    }
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": summary}
+            ]
+        }
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        max_rounds=1,
+    )
+    force_full_values = []
+    original_select_reviewers = orchestrator.select_reviewers
+
+    def capture_force_full(snapshot, *args, **kwargs):
+        force_full_values.append(snapshot.force_full)
+        return original_select_reviewers(snapshot, *args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
+
+    with pytest.raises(AgentLoopError, match="still reported blocking"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert force_full_values == [True]
+
+
+def test_post_review_ordinary_recovery_rejects_other_machine_obligation(
+    tmp_path, monkeypatch
+):
+    reviewer_item = UnresolvedReviewItem(
+        item_id="item-reviewer",
+        reviewer="Codex",
+        source_round=1,
+        text="The reviewer-owned cleanup is incomplete.",
+        status="blocking",
+        source_status="blocking",
+        fix_scope=("src/worker.py",),
+    )
+    managed_item = UnresolvedReviewItem(
+        item_id="item-managed",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed exact-head CI failed on the previous head.",
+        status="blocking",
+        source_status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualification_ready",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        obligation_identity="managed-exact-head-ci:item-managed",
+    )
+    carried = (reviewer_item, managed_item)
+    reviewer_comment = _attach_round_metadata(
+        structured_pr_review(
+            reviewer="OpenAI Codex",
+            state="approved",
+            summary="The reviewer-owned item is resolved.",
+            prior_item_dispositions=[
+                {"item_id": item.item_id, "disposition": "resolved"}
+                for item in carried
+            ],
+        ),
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="abc123",
+            prior_items=carried,
+            dispositions=tuple(
+                ReviewItemDisposition(item.item_id, "Codex", "resolved")
+                for item in carried
+            ),
+            state="approved",
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                reviewer="OpenAI Codex",
+                state="approved",
+                summary="The reviewer-owned item is resolved.",
+                prior_item_dispositions=[
+                    {"item_id": item.item_id, "disposition": "resolved"}
+                    for item in carried
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": reviewer_comment}
+            ]
+        },
+    )
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77,
+        repository="OWNER/REPO",
+        base_ref="main",
+        expected_head_sha="abc123",
+        released_label_event_id=101,
+        released_at=100,
+    )
+    activation = ManagedCiContract(
+        activation_path="ordinary_fallback",
+        ordinary_recovery=capability,
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        auto_merge=True,
+        max_rounds=2,
+    )
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: activation)
+    monkeypatch.setattr(
+        orchestrator,
+        "_finalize_ordinary_recovery_merge",
+        lambda *args, **kwargs: pytest.fail("ordinary recovery bypassed another machine obligation"),
+    )
+    guard_calls = []
+    original_guard = orchestrator._ensure_finalization_ready
+
+    def capture_guard(*args, **kwargs):
+        guard_calls.append(
+            {
+                "ignored_machine_kinds": kwargs.get("ignored_machine_kinds"),
+                "items": tuple(kwargs.get("items", ())),
+            }
+        )
+        return original_guard(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_ensure_finalization_ready", capture_guard)
+
+    with pytest.raises(AgentLoopError, match="managed-exact-head-ci"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+    assert len(guard_calls) == 1
+    assert guard_calls[0]["ignored_machine_kinds"] == frozenset({"github-pr-checks"})
+    assert [item.obligation_kind for item in guard_calls[0]["items"]] == [
+        "managed-exact-head-ci"
+    ]
 
 
 def test_auto_merge_supported_repo_dispatches_and_merges_exact_approved_head(
@@ -2378,6 +3360,222 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
     assert "final-ci/exact-head (failure)" in coder_prompt
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
     assert merges == [{"expected_head_sha": "abc123-coder-1"}]
+
+
+def test_managed_qualification_resume_attaches_without_redispatch(
+    tmp_path, monkeypatch
+):
+    config = make_config(tmp_path, managed_ci=True, auto_merge=True, max_rounds=1)
+    invocation = orchestrator.resolve_invocation(
+        config, provider="codex", role="reviewer"
+    )
+    acquisition_contract = {
+        "Codex": (invocation.configured_model, invocation.resolved_effort, "codex")
+    }
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed CI failed on the previous head.",
+        status="blocking",
+        source_status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualifying",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity=item.obligation_identity,
+        lifecycle="qualifying",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        base_branch="main",
+        requirements_digest=orchestrator._qualification_digest(tuple()),
+        acquisition_digest=orchestrator._qualification_digest(acquisition_contract),
+        approval_digest=orchestrator._qualification_digest(("Codex",)),
+        scheduler_digest=orchestrator._qualification_digest(
+            orchestrator._prior_item_ledger_signature((item,))
+        ),
+        qualification_attempt_id="123/1",
+        allowed_rounds=1,
+    )
+    reviewer_comment = _attach_round_metadata(
+        "Approved the repaired head.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="abc123",
+            prior_items=(dataclasses.replace(item, lifecycle="awaiting_current_head_review"),),
+            state="approved",
+        ),
+    )
+    checkpoint_comment = _attach_round_metadata(
+        "Qualification was dispatched.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="abc123",
+            prior_items=(item,),
+            state="blocking",
+            phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint,
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[],
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": reviewer_comment},
+                {"author": {"login": "coding-review-agent-loop"}, "body": checkpoint_comment},
+            ]
+        },
+    )
+    contract = ManagedCiContract(
+        protocol_version=2, attached_run_id=123, run_attempt=1
+    )
+    dispatches = []
+    merges = []
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    monkeypatch.setattr(
+        orchestrator,
+        "dispatch_final_qualification",
+        lambda *a, **k: dispatches.append(k),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "wait_for_final_qualification",
+        lambda *a, **k: ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: merges.append(k))
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert dispatches == []
+    assert merges == [{"expected_head_sha": "abc123"}]
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("approval_digest", None),
+        ("requirements_digest", None),
+        ("acquisition_digest", None),
+        ("scheduler_digest", None),
+        ("qualification_attempt_id", None),
+        ("approval_digest", "stale-approval"),
+        ("requirements_digest", "stale-requirements"),
+        ("acquisition_digest", "stale-acquisition"),
+        ("scheduler_digest", "stale-scheduler"),
+        ("qualification_attempt_id", "stale-attempt"),
+    ],
+)
+def test_resume_qualification_identity_gap_forces_review_before_qualification(
+    tmp_path, monkeypatch, field, value
+):
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        managed_ci=False,
+        auto_merge=True,
+        max_rounds=1,
+    )
+    invocation = orchestrator.resolve_invocation(
+        config, provider="codex", role="reviewer"
+    )
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="GitHub PR checks",
+        source_round=1,
+        text="GitHub PR checks failed on the previous head.",
+        status="blocking",
+        source_status="blocking",
+        authority="machine",
+        obligation_kind="github-pr-checks",
+        lifecycle="qualification_ready",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        obligation_identity="github-pr-checks:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="github-pr-checks",
+        obligation_identity=item.obligation_identity,
+        lifecycle="qualifying",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        base_branch="main",
+        requirements_digest=orchestrator._qualification_digest(tuple()),
+        acquisition_digest=orchestrator._qualification_digest(
+            {"Codex": (invocation.configured_model, invocation.resolved_effort, "codex")}
+        ),
+        approval_digest=orchestrator._qualification_digest(("Codex",)),
+        scheduler_digest=orchestrator._qualification_digest(
+            orchestrator._prior_item_ledger_signature((item,))
+        ),
+        qualification_attempt_id="github-checks:abc123",
+        allowed_rounds=1,
+    )
+    checkpoint = dataclasses.replace(checkpoint, **{field: value})
+    summary = _attach_round_metadata(
+        "Persisted qualifying checkpoint without reviewer records.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="abc123",
+            prior_items=(item,),
+            state="blocking",
+            phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint,
+        ),
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": summary}
+            ]
+        }
+    )
+    force_full_values = []
+    reviewer_calls = []
+    original_select_reviewers = orchestrator.select_reviewers
+    original_run_validated_agent = orchestrator._run_validated_agent
+
+    def capture_force_full(snapshot, *args, **kwargs):
+        force_full_values.append(snapshot.force_full)
+        return original_select_reviewers(snapshot, *args, **kwargs)
+
+    def stop_at_reviewer(*args, **kwargs):
+        if kwargs.get("role") == "reviewer":
+            reviewer_calls.append(kwargs)
+            raise AgentLoopError("review board invoked before qualification")
+        return original_run_validated_agent(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", stop_at_reviewer)
+    dispatches = []
+    monkeypatch.setattr(
+        orchestrator,
+        "dispatch_final_qualification",
+        lambda *args, **kwargs: dispatches.append(kwargs),
+    )
+
+    with pytest.raises(AgentLoopError, match="review board invoked"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert reviewer_calls
+    assert force_full_values == [True]
+    assert dispatches == []
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
 def test_managed_manual_success_publishes_result_without_merge_even_with_pending_intermediate_ci(
@@ -2682,7 +3880,10 @@ def test_watch_failure_on_final_round_dispatches_coder_with_check_diagnostic(
                 failed_checks=(failed_check,),
                 attempts_used=1,
             ),
-            CiWatchOutcome(status="passed", head_sha="abc123", attempts_used=1),
+            CiWatchOutcome(
+                status="passed", pr_checks=_watch_check_board("passing"),
+                head_sha="repaired-head", attempts_used=1
+            ),
         ]
     )
     runner = FakeRunner(
@@ -2705,6 +3906,7 @@ def test_watch_failure_on_final_round_dispatches_coder_with_check_diagnostic(
         ],
     )
     config = make_config(tmp_path, watch_pending_ci=True, max_rounds=1)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     monkeypatch.setattr(
         orchestrator, "watch_pr_checks", lambda *args, **kwargs: next(outcomes)
     )
@@ -2749,7 +3951,10 @@ def test_watch_head_change_re_reviews_without_coder_and_preserves_budget(
             return CiWatchOutcome(
                 status="head_changed", head_sha="new-head", attempts_used=2
             )
-        return CiWatchOutcome(status="passed", head_sha="new-head", attempts_used=1)
+        return CiWatchOutcome(
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha="new-head", attempts_used=1
+        )
 
     monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
 
@@ -2777,7 +3982,13 @@ def test_watch_combined_failure_and_head_change_can_use_both_extensions(
                     {"item_id": "item-1", "disposition": "resolved"}
                 ],
             ),
-            structured_pr_review(state="approved", summary="Round three approved."),
+            structured_pr_review(
+                state="approved",
+                summary="Round three approved.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
         ],
         claude_outputs=[
             structured_coder_followup(
@@ -2788,6 +3999,7 @@ def test_watch_combined_failure_and_head_change_can_use_both_extensions(
         ],
     )
     config = make_config(tmp_path, watch_pending_ci=True, max_rounds=1)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     call_count = 0
 
     def watch(*args, **kwargs):
@@ -2805,7 +4017,10 @@ def test_watch_combined_failure_and_head_change_can_use_both_extensions(
             return CiWatchOutcome(
                 status="head_changed", head_sha="newer-head", attempts_used=1
             )
-        return CiWatchOutcome(status="passed", head_sha="newer-head", attempts_used=1)
+        return CiWatchOutcome(
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha="newer-head", attempts_used=1
+        )
 
     monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
 
@@ -2842,6 +4057,7 @@ def test_watch_combined_head_change_and_failure_can_use_both_extensions(
         ],
     )
     config = make_config(tmp_path, watch_pending_ci=True, max_rounds=1)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     call_count = 0
 
     def watch(*args, **kwargs):
@@ -2859,7 +4075,10 @@ def test_watch_combined_head_change_and_failure_can_use_both_extensions(
                 failed_checks=(failed_check,),
                 attempts_used=1,
             )
-        return CiWatchOutcome(status="passed", head_sha="newer-head", attempts_used=1)
+        return CiWatchOutcome(
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha="repaired-head", attempts_used=1
+        )
 
     monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
 
@@ -2997,7 +4216,10 @@ def test_disabled_watch_mode_preserves_manual_path_and_auto_merge_uses_full_boar
 
     def watch(*args, **kwargs):
         watch_calls.append((args, kwargs))
-        return CiWatchOutcome(status="passed", head_sha="abc123", attempts_used=1)
+        return CiWatchOutcome(
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha="abc123", attempts_used=1
+        )
 
     monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
 
@@ -3080,6 +4302,7 @@ def test_watch_publishes_approved_followups_only_after_terminal_success(
         max_rounds=1,
         approved_followups="summarize",
     )
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     call_count = 0
 
     def watch(*args, **kwargs):
@@ -3096,7 +4319,10 @@ def test_watch_publishes_approved_followups_only_after_terminal_success(
                 failed_checks=(failed_check,),
                 attempts_used=1,
             )
-        return CiWatchOutcome(status="passed", head_sha="abc123", attempts_used=1)
+        return CiWatchOutcome(
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha="repaired-head", attempts_used=1
+        )
 
     monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
 
@@ -3134,7 +4360,10 @@ def test_pr_loop_refreshes_checks_between_reviewers_and_before_coder(tmp_path, m
             )
         ],
     )
-    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=2, watch_pending_ci=True
+    )
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     failure_url = "https://github.com/OWNER/REPO/actions/runs/555"
     check_states = iter(
         [
@@ -3173,6 +4402,14 @@ def test_pr_loop_refreshes_checks_between_reviewers_and_before_coder(tmp_path, m
 
     original_get_pr_checks = orchestrator_module.get_pr_checks
     monkeypatch.setattr(orchestrator_module, "get_pr_checks", next_checks)
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: CiWatchOutcome(
+            status="passed", pr_checks=_watch_check_board("passing"),
+            head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+        ),
+    )
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -5787,6 +7024,128 @@ def test_resume_pr_round_prefers_structured_coder_followup_metadata():
     assert resumed_followup is not None
     assert resumed_followup.human_requirements.addressed_ids == ("Requirement 1",)
     assert '"kind": "coder_followup"' not in _strip_round_metadata(coder_comment)
+
+
+def test_resume_pr_round_recovers_summary_only_qualification_checkpoint():
+    item = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        source_status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="repair_required",
+        failed_head_sha="failed-head",
+        candidate_head_sha=None,
+        obligation_identity="managed-exact-head-ci:item-30",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity=item.obligation_identity,
+        lifecycle="repair_required",
+        failed_head_sha="failed-head",
+        candidate_head_sha=None,
+        base_branch="main",
+        watch_failure_extension_used=True,
+        allowed_rounds=2,
+    )
+    summary_comment = _attach_round_metadata(
+        "Persisted repair handoff.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=2,
+            subject="failed-head",
+            prior_items=(item,),
+            state="blocking",
+            phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint,
+        ),
+    )
+
+    resumed = _resume_pr_round(
+        [IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=summary_comment)],
+        head_sha="failed-head",
+        configured_reviewers=("codex",),
+    )
+
+    assert resumed is not None
+    assert resumed.round_number == 2
+    assert resumed.coder_output is None
+    assert resumed.completed_reviews == ()
+    assert resumed.prior_items == (item,)
+    assert resumed.qualification_checkpoint == checkpoint
+
+
+def test_pr_loop_resume_after_interrupted_coder_keeps_failed_head_and_budget(
+    tmp_path, monkeypatch
+):
+    failed = PullRequestCheck(
+        name="test", kind="check_run", status="failure", url="https://example.test/555"
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Initial review."),
+            structured_pr_review(
+                state="approved",
+                summary="Repaired head approved.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Repaired the failing check.", addressed_items=["item-1"]
+            )
+        ],
+    )
+    config = make_config(tmp_path, auto_merge=False, watch_pending_ci=False, max_rounds=3)
+
+    def checks(*args, **kwargs):
+        if kwargs["metadata"].head_sha == "abc123":
+            return _watch_check_board("failing", failing=(failed,))
+        return _watch_check_board("passing")
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
+    original = orchestrator._run_validated_agent
+    interrupt = True
+
+    class CoderInterrupted(Exception):
+        pass
+
+    def interrupt_during_coder(*args, **kwargs):
+        nonlocal interrupt
+        if kwargs.get("role") == "coder" and interrupt:
+            interrupt = False
+            raise CoderInterrupted
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", interrupt_during_coder)
+    with pytest.raises(CoderInterrupted):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    checkpoint_records = [
+        comment for comment in runner.pr_payload["comments"]
+        if "qualification checkpoint: machine obligation state persisted before coder handoff"
+        in comment["body"]
+    ]
+    assert len(checkpoint_records) == 1
+    assert "AGENT_LOOP_META" in checkpoint_records[0]["body"]
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    review_commands = [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    assert len(review_commands) == 2
+    assert sum(
+        comment.startswith(
+            "PR #77 qualification checkpoint: machine obligation state persisted before coder handoff."
+        )
+        for comment in runner.comments
+    ) == 2
 
 def test_resume_pr_round_marks_empty_ledger_incomplete_after_same_subject_prior_new_items():
     prior_new_item = UnresolvedReviewItem(
