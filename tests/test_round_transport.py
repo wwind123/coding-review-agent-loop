@@ -23,6 +23,7 @@ from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
     UNKNOWN_MACHINE_AUTHORITY,
 )
+from coding_review_agent_loop.review_scheduling import ReviewSchedulingContract
 
 
 def _random_text(size: int) -> str:
@@ -359,6 +360,48 @@ def test_invalid_qualification_checkpoint_decodes_fail_closed() -> None:
     assert decoded.qualification_checkpoint.obligation_kind == "unknown"
 
 
+@pytest.mark.parametrize(
+    ("kind", "lifecycle", "candidate", "failed"),
+    [
+        ("unknown", "qualifying", "newhead123", "oldhead123"),
+        ("managed-exact-head-ci", "cleared", "newhead123", "oldhead123"),
+        ("managed-exact-head-ci", "qualifying", None, "oldhead123"),
+    ],
+)
+def test_contradictory_qualification_checkpoint_payloads_decode_invalid(
+    kind, lifecycle, candidate, failed
+) -> None:
+    payload = {
+        "flow": "pr",
+        "role": "summary",
+        "agent": "Orchestrator",
+        "round_number": 14,
+        "subject": "newhead123",
+        "qualification_checkpoint": {
+            "obligation_kind": kind,
+            "obligation_identity": "machine:item-30",
+            "lifecycle": lifecycle,
+            "failed_head_sha": failed,
+            "candidate_head_sha": candidate,
+            "base_branch": "main",
+            "approval_digest": None,
+            "plan_digest": None,
+            "requirements_digest": None,
+            "acquisition_digest": None,
+            "scheduler_digest": None,
+            "qualification_attempt_id": None,
+            "watch_failure_extension_used": False,
+            "watch_head_extension_used": False,
+            "allowed_rounds": 1,
+        },
+    }
+
+    decoded = _decode_round_metadata_mapping(payload)
+
+    assert decoded.qualification_checkpoint is not None
+    assert not decoded.qualification_checkpoint.valid
+
+
 def test_legacy_machine_item_requires_orchestrator_lineage_for_promotion() -> None:
     legacy = UnresolvedReviewItem(
         item_id="item-30",
@@ -403,3 +446,46 @@ def test_legacy_machine_item_requires_orchestrator_lineage_for_promotion() -> No
     assert trusted_item.failed_head_sha == "oldhead123"
     assert ambiguous_item.authority == UNKNOWN_MACHINE_AUTHORITY
     assert ambiguous_item.obligation_kind == "unknown"
+
+
+def test_legacy_coder_checkpoint_recovers_failed_head_from_scheduler_provenance() -> None:
+    legacy = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="The managed check failed; repair the code.",
+        status="blocking",
+        source_status="blocking",
+    )
+    coder_checkpoint = _attach_round_metadata(
+        "Coder repaired the PR.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="coder",
+            agent="Claude",
+            round_number=14,
+            subject="newhead123",
+            prior_items=(legacy,),
+            scheduler_contract=ReviewSchedulingContract(
+                required_reviewers=("Claude",),
+                policy="selective-intermediate",
+                broad_rules=("src/**",),
+            ).as_dict(),
+            scheduler_previous_sha="oldhead123",
+            scheduler_current_sha="newhead123",
+            scheduler_obligation_digest="0123456789abcdef",
+            scheduler_selected_reviewers=("Claude",),
+            scheduler_reasons=("full board",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=0,
+        ),
+    )
+
+    record = _extract_round_metadata_records(
+        [SimpleNamespace(body=coder_checkpoint)], flow="pr"
+    )[0].metadata.prior_items[0]
+
+    assert record.authority == MACHINE_AUTHORITY
+    assert record.obligation_kind == "managed-exact-head-ci"
+    assert record.failed_head_sha == "oldhead123"

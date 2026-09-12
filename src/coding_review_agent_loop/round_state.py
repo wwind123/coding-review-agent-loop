@@ -353,9 +353,9 @@ class QualificationCheckpoint:
         )
         if any(value[key] is not None and not isinstance(value[key], str) for key in strings):
             return cls.invalid("checkpoint contains a non-string identity")
-        if value["obligation_kind"] not in MACHINE_OBLIGATION_KINDS:
+        if value["obligation_kind"] not in MACHINE_OBLIGATION_KINDS - {"unknown"}:
             return cls.invalid("checkpoint has an unknown obligation kind")
-        if value["lifecycle"] not in MACHINE_LIFECYCLE_STATES:
+        if value["lifecycle"] not in MACHINE_LIFECYCLE_STATES - {"cleared"}:
             return cls.invalid("checkpoint has an unknown lifecycle")
         if (
             not isinstance(value["watch_failure_extension_used"], bool)
@@ -371,24 +371,31 @@ class QualificationCheckpoint:
         candidate = value["candidate_head_sha"]
         if candidate is not None and candidate == failed:
             return cls.invalid("checkpoint requalifies the failed head")
-        return cls(
-            obligation_kind=value["obligation_kind"],
-            obligation_identity=value["obligation_identity"],
-            lifecycle=value["lifecycle"],
-            failed_head_sha=failed,
-            candidate_head_sha=candidate,
-            base_branch=value["base_branch"],
-            approval_digest=value["approval_digest"],
-            plan_digest=value["plan_digest"],
-            requirements_digest=value["requirements_digest"],
-            acquisition_digest=value["acquisition_digest"],
-            scheduler_digest=value["scheduler_digest"],
-            qualification_attempt_id=value["qualification_attempt_id"],
-            watch_failure_extension_used=value["watch_failure_extension_used"],
-            watch_head_extension_used=value["watch_head_extension_used"],
-            allowed_rounds=value["allowed_rounds"],
-            valid=True,
-        )
+        try:
+            return cls(
+                obligation_kind=value["obligation_kind"],
+                obligation_identity=value["obligation_identity"],
+                lifecycle=value["lifecycle"],
+                failed_head_sha=failed,
+                candidate_head_sha=candidate,
+                base_branch=value["base_branch"],
+                approval_digest=value["approval_digest"],
+                plan_digest=value["plan_digest"],
+                requirements_digest=value["requirements_digest"],
+                acquisition_digest=value["acquisition_digest"],
+                scheduler_digest=value["scheduler_digest"],
+                qualification_attempt_id=value["qualification_attempt_id"],
+                watch_failure_extension_used=value["watch_failure_extension_used"],
+                watch_head_extension_used=value["watch_head_extension_used"],
+                allowed_rounds=value["allowed_rounds"],
+                valid=True,
+            )
+        except (TypeError, ValueError):
+            # A well-typed but contradictory persisted checkpoint must be
+            # treated exactly like any other malformed checkpoint. Recovery
+            # can then force a fresh board instead of making the whole ledger
+            # unresumable or accidentally treating it as ready.
+            return cls.invalid("checkpoint contains contradictory lifecycle fields")
 
     @classmethod
     def invalid(cls, reason: str) -> "QualificationCheckpoint":
@@ -937,11 +944,25 @@ def _legacy_machine_promotion(
             resolution_owners=(),
             owner_states=(),
         )
-    failed_head = lineage.metadata.subject
-    # Prefer an explicitly recorded head in the original claim when present.
-    head_match = re.search(r"\bhead(?: SHA)?\s*[`']?([0-9a-f]{7,64})", item.text, re.I)
-    if head_match:
-        failed_head = head_match.group(1)
+    failed_head: str | None = None
+    if lineage.metadata.role == "summary" and lineage.metadata.agent == "Orchestrator":
+        # An orchestrator summary's subject is the authoritative PR head for
+        # the recorded machine event.
+        failed_head = lineage.metadata.subject
+    elif lineage.metadata.role == "coder":
+        # A legacy CI failure was often first carried by the coder checkpoint,
+        # after the coder had already pushed a repair head. The scheduler
+        # previous/current pair is the producer-owned provenance that lets us
+        # recover the failed head; visible CI prose is not authority.
+        previous_head = lineage.metadata.scheduler_previous_sha
+        current_head = lineage.metadata.scheduler_current_sha
+        if (
+            previous_head
+            and current_head
+            and lineage.metadata.subject == current_head
+            and previous_head != current_head
+        ):
+            failed_head = previous_head
     if not failed_head or failed_head == "unknown":
         return replace(
             item,

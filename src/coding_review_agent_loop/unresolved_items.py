@@ -157,7 +157,7 @@ def _machine_obligation_is_revalidation_candidate(
 ) -> bool:
     return (
         _is_machine_obligation(item)
-        and item.obligation_kind in MACHINE_OBLIGATION_KINDS - {UNKNOWN_OBLIGATION_KIND}
+        and item.obligation_kind in CI_MACHINE_OBLIGATION_KINDS
         and item.lifecycle in {"awaiting_current_head_review", "qualification_ready", "qualifying"}
         and bool(item.candidate_head_sha)
         and item.candidate_head_sha == current_head_sha
@@ -255,7 +255,15 @@ def _advance_machine_obligations_for_head(
             else:
                 result.append(item)
             continue
-        if item.candidate_head_sha and item.candidate_head_sha != current_head_sha:
+        if item.failed_head_sha == current_head_sha:
+            # A force-push revert/reset-and-repush must never be allowed to
+            # requalify the failed head. Return to repair-required instead of
+            # constructing an invalid candidate and leaking ValueError out of
+            # the orchestration loop.
+            result.append(
+                replace(item, lifecycle="repair_required", candidate_head_sha=None)
+            )
+        elif item.candidate_head_sha and item.candidate_head_sha != current_head_sha:
             result.append(
                 replace(item, lifecycle="awaiting_current_head_review", candidate_head_sha=current_head_sha)
             )

@@ -799,3 +799,51 @@ def test_selective_machine_ci_obligation_survives_reviewer_approval_until_new_he
     )
     assert "reviewed correction awaiting authoritative qualification" in diagnostic
     assert "reviewer" not in diagnostic.lower()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["alembic-migration", "merge-conflict", "human-requirements-acknowledgement"],
+)
+def test_non_ci_machine_obligations_remain_coder_blockers_on_a_new_head(kind):
+    item = _next_unresolved_item(
+        item_number=30,
+        reviewer="Orchestrator",
+        source_round=13,
+        text=f"{kind} requires authoritative validation.",
+        status="blocking",
+        authority="machine",
+        obligation_kind=kind,
+        lifecycle="awaiting_current_head_review",
+        failed_head_sha="oldhead123" if kind != "human-requirements-acknowledgement" else None,
+        candidate_head_sha="newhead123",
+    )
+
+    partitions = _partition_unresolved_items(
+        [item], current_head_sha="newhead123"
+    )
+
+    assert partitions["revalidation_candidates"] == ()
+    assert partitions["coder_blockers"] == (item,)
+
+
+def test_machine_obligation_revert_to_failed_head_returns_to_repair_required():
+    item = _next_unresolved_item(
+        item_number=30,
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualification_ready",
+        failed_head_sha="oldhead123",
+        candidate_head_sha="newhead123",
+    )
+
+    reverted = _advance_machine_obligations_for_head(
+        [item], current_head_sha="oldhead123"
+    )
+
+    assert reverted[0].lifecycle == "repair_required"
+    assert reverted[0].candidate_head_sha is None

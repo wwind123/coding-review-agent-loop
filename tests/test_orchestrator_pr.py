@@ -60,6 +60,7 @@ from coding_review_agent_loop.orchestrator import (
     _reconcile_human_requirements_ack_item,
     _resume_pr_round,
     _strip_round_metadata,
+    _ensure_finalization_ready,
 )
 from coding_review_agent_loop.prompts import (
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
@@ -92,6 +93,19 @@ from agent_loop_helpers import (
 )
 
 
+def _advance_head_after_coder(monkeypatch, runner, head_sha="repaired-head"):
+    """Make the fake coder handoff obey the repair-head contract."""
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = head_sha
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+
 def test_pr_resume_prompt_uses_current_wrapper_health_without_dropping_command(
     tmp_path, monkeypatch
 ):
@@ -117,6 +131,29 @@ def test_pr_resume_prompt_uses_current_wrapper_health_without_dropping_command(
     prompt = build_followup_prompt(768, 2, "Repair the launcher path.", config, memory=memory)
     assert "pytest tests/test_protocol.py -q" in prompt
     assert "no wrapper candidate verified" in prompt
+
+
+def test_orchestrator_finalization_guard_rejects_uncleared_machine_obligation():
+    item = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualification_ready",
+        failed_head_sha="oldhead123",
+        candidate_head_sha="newhead123",
+    )
+
+    with pytest.raises(AgentLoopError, match="No approval or merge was attempted"):
+        _ensure_finalization_ready(
+            pr_number=777,
+            round_number=20,
+            items=[item],
+            current_head_sha="newhead123",
+        )
 
 
 def _assert_pending_ci_stop_guidance(text):
@@ -2092,7 +2129,7 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
         ],
         claude_outputs=["Investigated CI.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
     )
-    config = make_config(tmp_path, max_rounds=2)
+    config = make_config(tmp_path, max_rounds=2, watch_pending_ci=True)
     check_states = iter(
         [
             {
@@ -2129,6 +2166,14 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
 
     original_get_pr_checks = orchestrator_module.get_pr_checks
     monkeypatch.setattr(orchestrator_module, "get_pr_checks", advance_checks)
+    _advance_head_after_coder(monkeypatch, runner)
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: CiWatchOutcome(
+            status="passed", head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+        ),
+    )
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -2253,10 +2298,15 @@ def test_round_ci_failure_is_tracked_and_resolved_with_reviewer_findings(tmp_pat
         _watch_check_board("passing"),
     ])
     monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: next(snapshots))
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
-    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge)) == 0
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=make_config(tmp_path, auto_merge=auto_merge, watch_pending_ci=True),
+    ) == 0
     second_review = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ["codex"]][-1]
     assert "item-2" in second_review
     assert "Failing checks: test (failure)" in second_review
@@ -2682,7 +2732,7 @@ def test_watch_failure_on_final_round_dispatches_coder_with_check_diagnostic(
                 failed_checks=(failed_check,),
                 attempts_used=1,
             ),
-            CiWatchOutcome(status="passed", head_sha="abc123", attempts_used=1),
+            CiWatchOutcome(status="passed", head_sha="repaired-head", attempts_used=1),
         ]
     )
     runner = FakeRunner(
@@ -2705,6 +2755,7 @@ def test_watch_failure_on_final_round_dispatches_coder_with_check_diagnostic(
         ],
     )
     config = make_config(tmp_path, watch_pending_ci=True, max_rounds=1)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     monkeypatch.setattr(
         orchestrator, "watch_pr_checks", lambda *args, **kwargs: next(outcomes)
     )
@@ -2777,7 +2828,13 @@ def test_watch_combined_failure_and_head_change_can_use_both_extensions(
                     {"item_id": "item-1", "disposition": "resolved"}
                 ],
             ),
-            structured_pr_review(state="approved", summary="Round three approved."),
+            structured_pr_review(
+                state="approved",
+                summary="Round three approved.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
         ],
         claude_outputs=[
             structured_coder_followup(
@@ -2788,6 +2845,7 @@ def test_watch_combined_failure_and_head_change_can_use_both_extensions(
         ],
     )
     config = make_config(tmp_path, watch_pending_ci=True, max_rounds=1)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     call_count = 0
 
     def watch(*args, **kwargs):
@@ -2842,6 +2900,7 @@ def test_watch_combined_head_change_and_failure_can_use_both_extensions(
         ],
     )
     config = make_config(tmp_path, watch_pending_ci=True, max_rounds=1)
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     call_count = 0
 
     def watch(*args, **kwargs):
@@ -2859,7 +2918,7 @@ def test_watch_combined_head_change_and_failure_can_use_both_extensions(
                 failed_checks=(failed_check,),
                 attempts_used=1,
             )
-        return CiWatchOutcome(status="passed", head_sha="newer-head", attempts_used=1)
+        return CiWatchOutcome(status="passed", head_sha="repaired-head", attempts_used=1)
 
     monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
 
@@ -3080,6 +3139,7 @@ def test_watch_publishes_approved_followups_only_after_terminal_success(
         max_rounds=1,
         approved_followups="summarize",
     )
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     call_count = 0
 
     def watch(*args, **kwargs):
@@ -3096,7 +3156,7 @@ def test_watch_publishes_approved_followups_only_after_terminal_success(
                 failed_checks=(failed_check,),
                 attempts_used=1,
             )
-        return CiWatchOutcome(status="passed", head_sha="abc123", attempts_used=1)
+        return CiWatchOutcome(status="passed", head_sha="repaired-head", attempts_used=1)
 
     monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
 
@@ -3134,7 +3194,10 @@ def test_pr_loop_refreshes_checks_between_reviewers_and_before_coder(tmp_path, m
             )
         ],
     )
-    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=2, watch_pending_ci=True
+    )
+    _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     failure_url = "https://github.com/OWNER/REPO/actions/runs/555"
     check_states = iter(
         [
@@ -3173,6 +3236,13 @@ def test_pr_loop_refreshes_checks_between_reviewers_and_before_coder(tmp_path, m
 
     original_get_pr_checks = orchestrator_module.get_pr_checks
     monkeypatch.setattr(orchestrator_module, "get_pr_checks", next_checks)
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: CiWatchOutcome(
+            status="passed", head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+        ),
+    )
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
