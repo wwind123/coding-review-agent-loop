@@ -6,6 +6,7 @@ from coding_review_agent_loop.cli import build_parser
 REPO_ROOT = Path(__file__).parent.parent
 LOCAL_AGENT_LOOP_DOC = REPO_ROOT / "docs" / "local_agent_loop.md"
 README = REPO_ROOT / "README.md"
+ARCHITECTURE = REPO_ROOT / "ARCHITECTURE.md"
 
 HEADING_TEXT = "Phased decomposition versus split materialization"
 CI_STALL_HEADING_TEXT = "External CI infrastructure stalls"
@@ -24,6 +25,30 @@ def _github_anchor(heading_text: str) -> str:
     slug = re.sub(r"[^\w\- ]", "", slug)
     slug = slug.replace(" ", "-")
     return slug
+
+
+def test_architecture_is_discoverable_from_existing_guides():
+    assert "(ARCHITECTURE.md)" in README.read_text(encoding="utf-8")
+    for path in (LOCAL_AGENT_LOOP_DOC, SKILL_MODE_DOC):
+        assert "(../ARCHITECTURE.md)" in path.read_text(encoding="utf-8")
+    # Preserve the old inbound anchor while the overview moves to its own file.
+    assert "## Architecture\n" in LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+
+
+def test_architecture_links_and_component_paths_exist():
+    text = ARCHITECTURE.read_text(encoding="utf-8")
+    for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
+        if target.startswith("https://"):
+            continue
+        path_text, _, anchor = target.partition("#")
+        path = ARCHITECTURE.parent / path_text
+        assert path.exists(), target
+        if anchor:
+            headings = re.findall(r"^#+ (.+)$", path.read_text(encoding="utf-8"), re.M)
+            assert anchor in {_github_anchor(heading) for heading in headings}, target
+    table = text.split("## Component Map\n", 1)[1].split("## Main Lifecycle\n", 1)[0]
+    for module in re.findall(r"`([\w/]+\.py)`", table):
+        assert (REPO_ROOT / "src" / "coding_review_agent_loop" / module).is_file(), module
 
 
 def test_local_agent_loop_doc_has_decision_heading_and_table():

@@ -52,6 +52,9 @@ fail-closed behavior as the standalone CLI.
 
 ## Architecture
 
+See the [canonical architecture overview](../ARCHITECTURE.md) for shared library
+boundaries, state, and trust contracts. This section describes the skill host.
+
 ```
 Claude Code (interactive session)
 │
