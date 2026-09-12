@@ -18,6 +18,7 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_plan_revision_comment,
     _render_public_pr_review_comment,
     _render_public_issue_implementation_comment,
+    _render_prior_dispositions_section,
     _render_test_command_for_comment,
     decode_deferred_stages_marker,
     normalize_freeform_signature,
@@ -57,6 +58,7 @@ from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
     parse_pr_review,
+    parse_plan_item_dispositions,
     parse_review,
     parse_structured_plan_review,
     parse_unresolved_item_dispositions,
@@ -334,8 +336,8 @@ def test_render_canonical_plan_revision_and_public_comment():
     assert canonical == (
         "Revised the plan to cover rollback behavior.\n\n"
         "### Prior plan item dispositions\n"
-        "- [item-4] Blocking issue from OpenAI Codex, round 2: Add a resume-path step. -> "
-        "resolved: Added a resume-path step.\n\n"
+        "- [item-4]: RESOLVED: Added a resume-path step.\n"
+        "  Original finding: Blocking issue from OpenAI Codex, round 2: Add a resume-path step.\n\n"
         "### Plan steps\n"
         "1. Update protocol.py.\n"
         "2. Add orchestrator resume tests."
@@ -780,11 +782,46 @@ def test_render_public_plan_review_comment_normalizes_sections():
         "### Same-plan follow-ups\n"
         "- Mention canonical hashing explicitly.\n\n"
         "### Prior unresolved plan item dispositions\n"
-        "- [item-2] Same-plan follow-up from Google Gemini, round 1: Mention canonical hashing explicitly. -> "
-        "same-plan: Still needs one more prompt assertion.\n\n"
+        "- [item-2]: SAME-PLAN: Still needs one more prompt assertion.\n"
+        "  Original finding: Same-plan follow-up from Google Gemini, round 1: Mention canonical hashing explicitly.\n\n"
         "<!-- AGENT_PLAN_STATE: blocking -->\n"
         "-- OpenAI Codex"
     )
+
+
+@pytest.mark.parametrize("kind", ["pr", "plan"])
+@pytest.mark.parametrize("with_note", [False, True])
+def test_disposition_status_leads_each_bullet_and_round_trips(kind, with_note):
+    same = "same-pr" if kind == "pr" else "same-plan"
+    statuses = ["resolved", "blocking", same, "future"]
+    heading = (
+        "### Prior unresolved item dispositions" if kind == "pr"
+        else "### Prior unresolved plan item dispositions"
+    )
+    items = tuple(
+        UnresolvedReviewItem(
+            item_id=f"item-{index}", reviewer="Claude", source_round=1,
+            text="The original finding is long. " * 20, status="blocking",
+        )
+        for index, _ in enumerate(statuses, 1)
+    )
+    dispositions = tuple(
+        ReviewItemDisposition(
+            item_id=item.item_id, reviewer="Codex", disposition=status,
+            note="Evidence: inspected the current implementation." if with_note else None,
+        )
+        for item, status in zip(items, statuses)
+    )
+    rendered = _render_prior_dispositions_section(
+        heading=heading, prior_items=items, dispositions=dispositions,
+    )
+    bullets = [line for line in rendered.splitlines() if line.startswith("- ")]
+    for index, label in enumerate(["RESOLVED", "BLOCKING", same.upper(), "FUTURE FOLLOW-UP"], 1):
+        suffix = ": Evidence: inspected the current implementation." if with_note else ""
+        assert bullets[index - 1] == f"- [item-{index}]: {label}{suffix}"
+    assert rendered.count("  Original finding: Blocking issue from Anthropic Claude") == 4
+    parser = parse_unresolved_item_dispositions if kind == "pr" else parse_plan_item_dispositions
+    assert parser(rendered, reviewer="Codex") == dispositions
 
 
 def test_review_freeform_summary_text_strips_structured_followup_sections():
@@ -851,7 +888,8 @@ def test_render_public_pr_review_comment_uses_normalized_sections_and_footer():
         "### Same-PR follow-ups\n"
         "- Rename the helper for clarity.\n\n"
         "### Prior unresolved item dispositions\n"
-        "- [item-1] Blocking issue from Anthropic Claude, round 1: Add a regression test before merge. -> resolved\n\n"
+        "- [item-1]: RESOLVED\n"
+        "  Original finding: Blocking issue from Anthropic Claude, round 1: Add a regression test before merge.\n\n"
         "<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n"
         "<!-- AGENT_STATE: blocking -->\n"
         "-- OpenAI Codex"
@@ -1024,7 +1062,8 @@ def test_render_public_review_comment_replaces_dispositions_without_exposing_sam
     assert "### Same-PR follow-ups\n- Keep the source issue reference in the PR body." in rendered
     assert (
         "### Prior unresolved item dispositions\n"
-        "- [item-1] Same-PR follow-up from Google Gemini, round 1: Require source issue reference in PR body. -> same-pr: keep the body reference"
+        "- [item-1]: SAME-PR: keep the body reference\n"
+        "  Original finding: Same-PR follow-up from Google Gemini, round 1: Require source issue reference in PR body."
     ) in rendered
     assert "### New tracked unresolved items" not in rendered
     assert "[item-2]" not in rendered
@@ -1068,9 +1107,9 @@ def test_render_public_review_comment_preserves_unknown_disposition_values():
 
     assert (
         "### Prior unresolved item dispositions\n"
-        "- [item-1] Same-PR follow-up from Google Gemini, round 1: "
-        "Keep the parser and renderer aligned when new dispositions are added. "
-        "-> deferred: tracked for a later parser update"
+        "- [item-1]: deferred: tracked for a later parser update\n"
+        "  Original finding: Same-PR follow-up from Google Gemini, round 1: "
+        "Keep the parser and renderer aligned when new dispositions are added."
     ) in rendered
 
 

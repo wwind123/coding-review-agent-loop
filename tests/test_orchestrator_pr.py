@@ -5502,7 +5502,8 @@ def test_pr_loop_posts_human_readable_item_labels_in_new_and_prior_sections(tmp_
         "**Review verdict:** Approved\n\n"
         "Looks good.\n\n"
         "### Prior unresolved item dispositions\n"
-        "- [item-1] Same-PR follow-up from OpenAI Codex, round 1: Require source issue reference in PR body. -> resolved\n"
+        "- [item-1]: RESOLVED\n"
+        "  Original finding: Same-PR follow-up from OpenAI Codex, round 1: Require source issue reference in PR body.\n"
         "<!-- AGENT_STATE: approved -->\n"
         "-- OpenAI Codex: unknown model (medium)"
     )
