@@ -24,12 +24,18 @@ from coding_review_agent_loop.orchestrator import (
     _all_pending_resolution_owners_unavailable,
     _fresh_pr_qualification_snapshot,
     _observe_pr_transition,
+    _partition_unresolved_items,
+    _round_limit_diagnostic,
     _reviewer_history_is_reconstructible,
     _reviewer_needs_fresh_context,
     _reviewer_diff_summary,
 )
 from coding_review_agent_loop.round_transport import decode_mapping
-from coding_review_agent_loop.unresolved_items import _apply_unresolved_item_dispositions
+from coding_review_agent_loop.unresolved_items import (
+    _advance_machine_obligations_for_head,
+    _apply_unresolved_item_dispositions,
+    _next_unresolved_item,
+)
 
 
 def _contract() -> ReviewSchedulingContract:
@@ -740,3 +746,56 @@ def test_pr_scheduler_options_are_explicit_and_repeatable():
     assert args.pr_review_policy == "selective-intermediate"
     assert args.pr_review_broad_rules == ["src/generated/**", "config.py"]
     assert args.pr_review_force_full is True
+
+
+def test_selective_machine_ci_obligation_survives_reviewer_approval_until_new_head():
+    item = _next_unresolved_item(
+        item_number=30,
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="repair_required",
+        failed_head_sha="oldhead123",
+    )
+    dispositions = {
+        item.item_id: [
+            ReviewItemDisposition(item.item_id, reviewer, "resolved")
+            for reviewer in ("Claude", "Antigravity", "Codex")
+        ]
+    }
+
+    same_head, _ = _apply_unresolved_item_dispositions(
+        [item], dispositions, reconciliation_mode="owner-scoped"
+    )
+    assert len(same_head) == 1
+    assert same_head[0].lifecycle == "repair_required"
+    assert same_head[0].authority == "machine"
+
+    candidate = _advance_machine_obligations_for_head(
+        same_head, current_head_sha="newhead123"
+    )
+    assert candidate[0].lifecycle == "awaiting_current_head_review"
+    assert candidate[0].candidate_head_sha == "newhead123"
+    reviewed_candidate, _ = _apply_unresolved_item_dispositions(
+        candidate, dispositions, reconciliation_mode="owner-scoped"
+    )
+
+    assert len(reviewed_candidate) == 1
+    assert reviewed_candidate[0].failed_head_sha == "oldhead123"
+    assert reviewed_candidate[0].candidate_head_sha == "newhead123"
+    partitions = _partition_unresolved_items(
+        reviewed_candidate, current_head_sha="newhead123"
+    )
+    assert partitions["coder_blockers"] == ()
+    assert partitions["revalidation_candidates"] == tuple(reviewed_candidate)
+    diagnostic = _round_limit_diagnostic(
+        pr_number=77,
+        round_number=20,
+        items=reviewed_candidate,
+        current_head_sha="newhead123",
+    )
+    assert "reviewed correction awaiting authoritative qualification" in diagnostic
+    assert "reviewer" not in diagnostic.lower()

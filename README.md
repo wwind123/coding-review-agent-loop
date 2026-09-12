@@ -227,6 +227,29 @@ metadata, so a later run can reconstruct the active review state. When the PR
 number is known, resume with `agent-loop pr <number>` instead of starting issue
 implementation again.
 
+### Machine obligations and CI repair
+
+Selective review keeps reviewer-owned findings separate from machine-owned
+obligations. Managed exact-head CI, ordinary PR checks, migration validation,
+mergeability, and human-requirement acknowledgement have stable authority kinds
+and are upserted by kind rather than accumulated as duplicate reviewer items.
+After a machine failure, the failed head is permanently ineligible for
+requalification: the coder must produce a strictly different head, and the
+selective scheduler takes the broad full-board path for that repair transition.
+
+Reviewer dispositions keep machine records complete in the review ledger, but
+approval is evidence about the correction only; it is never CI success. Each
+authority clears only from its own fresh, correctly correlated result for the
+current head and base. Skipped, absent, intermediate-filtered, stale, or
+uncorrelated checks cannot satisfy the final gate. Qualification checkpoints
+record the obligation, heads, review/plan/requirement identities, scheduler
+inputs, attached attempt, and the two independent one-shot allowances (one
+failure repair and one head-change re-review, for at most `max_rounds + 2`).
+Restarts resume a correlated attempt when possible and otherwise fail closed.
+Terminal diagnostics distinguish reviewer objections, repair-required CI,
+qualification pending, migration/mergeability validation, unknown persisted
+state, and external infrastructure stops.
+
 Signed comments ending in `-- Human Reviewer` are treated as explicit human
 requirements and remain approval-critical. See
 [Human requirements](docs/local_agent_loop.md#human-requirements) for the exact

@@ -23,6 +23,7 @@ from .protocol import (
     DeferredStage,
     TypedPlanStages,
     HumanRequirementDisposition,
+    MACHINE_AUTHORITY,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
     ParsedDiscussFinalSynthesis,
@@ -266,6 +267,11 @@ def _format_unresolved_item_label(
         return f"Human-requirements acknowledgement item, round {item.source_round}: {summary}"
     if item.item_id == MERGE_CONFLICT_ITEM_ID:
         return f"Merge conflict item, round {item.source_round}: {summary}"
+    if item.authority == MACHINE_AUTHORITY or item.obligation_kind is not None:
+        return (
+            f"Machine obligation ({item.obligation_kind or 'unknown'}), "
+            f"lifecycle {item.lifecycle or 'unknown'}, round {item.source_round}: {summary}"
+        )
     phrases = {
         "blocking": "Blocking issue",
         "same-pr": "Same-PR follow-up",

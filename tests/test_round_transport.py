@@ -10,13 +10,19 @@ import coding_review_agent_loop.round_transport as transport
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
+    QualificationCheckpoint,
     _attach_round_metadata,
     _decode_round_metadata,
+    _decode_round_metadata_mapping,
     _encode_round_metadata,
     _extract_round_metadata_records,
     _prior_item_ledger_signature,
 )
-from coding_review_agent_loop.protocol import UnresolvedReviewItem
+from coding_review_agent_loop.protocol import (
+    MACHINE_AUTHORITY,
+    UnresolvedReviewItem,
+    UNKNOWN_MACHINE_AUTHORITY,
+)
 
 
 def _random_text(size: int) -> str:
@@ -268,3 +274,132 @@ def test_round_metadata_preserves_owner_future_disposition_across_resume() -> No
 
     assert decoded.prior_items == (item,)
     assert decoded.prior_items[0].owner_dispositions == (("Codex", "future"),)
+
+
+def test_machine_obligation_and_qualification_checkpoint_round_trip() -> None:
+    item = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        source_status="blocking",
+        authority=MACHINE_AUTHORITY,
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualifying",
+        failed_head_sha="oldhead123",
+        candidate_head_sha="newhead123",
+        obligation_identity="managed-exact-head-ci:item-30",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity=item.obligation_identity,
+        lifecycle="qualifying",
+        failed_head_sha=item.failed_head_sha,
+        candidate_head_sha=item.candidate_head_sha,
+        base_branch="main",
+        approval_digest="approval",
+        plan_digest="plan",
+        requirements_digest="requirements",
+        acquisition_digest="acquisition",
+        scheduler_digest="scheduler",
+        qualification_attempt_id="123/1",
+        watch_failure_extension_used=True,
+        watch_head_extension_used=False,
+        allowed_rounds=3,
+    )
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="summary",
+        agent="Orchestrator",
+        round_number=14,
+        subject="newhead123",
+        prior_items=(item,),
+        qualification_checkpoint=checkpoint,
+    )
+
+    encoded = _encode_round_metadata(metadata)
+    decoded = _decode_round_metadata(encoded)
+
+    assert decoded.prior_items == (item,)
+    assert decoded.qualification_checkpoint == checkpoint
+    assert transport.decode_mapping(encoded)["prior_items"][0]["authority"] == MACHINE_AUTHORITY
+
+
+def test_invalid_qualification_checkpoint_decodes_fail_closed() -> None:
+    payload = {
+        "flow": "pr",
+        "role": "summary",
+        "agent": "Orchestrator",
+        "round_number": 14,
+        "subject": "newhead123",
+        "qualification_checkpoint": {
+            "obligation_kind": "managed-exact-head-ci",
+            "obligation_identity": "managed-exact-head-ci:item-30",
+            "lifecycle": "qualifying",
+            "failed_head_sha": "samehead",
+            "candidate_head_sha": "samehead",
+            "base_branch": "main",
+            "approval_digest": None,
+            "plan_digest": None,
+            "requirements_digest": None,
+            "acquisition_digest": None,
+            "scheduler_digest": None,
+            "qualification_attempt_id": None,
+            "watch_failure_extension_used": False,
+            "watch_head_extension_used": False,
+            "allowed_rounds": 1,
+        },
+    }
+
+    decoded = _decode_round_metadata_mapping(payload)
+
+    assert decoded.qualification_checkpoint is not None
+    assert not decoded.qualification_checkpoint.valid
+    assert decoded.qualification_checkpoint.obligation_kind == "unknown"
+
+
+def test_legacy_machine_item_requires_orchestrator_lineage_for_promotion() -> None:
+    legacy = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="CI failed at head `oldhead123`.",
+        status="blocking",
+        source_status="blocking",
+    )
+    trusted = _attach_round_metadata(
+        "machine failure",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=13,
+            subject="oldhead123",
+            new_items=(legacy,),
+        ),
+    )
+    ambiguous = _attach_round_metadata(
+        "reviewer prose",
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=13,
+            subject="oldhead123",
+            new_items=(legacy,),
+        ),
+    )
+
+    trusted_item = _extract_round_metadata_records(
+        [SimpleNamespace(body=trusted)], flow="pr"
+    )[0].metadata.new_items[0]
+    ambiguous_item = _extract_round_metadata_records(
+        [SimpleNamespace(body=ambiguous)], flow="pr"
+    )[0].metadata.new_items[0]
+
+    assert trusted_item.authority == MACHINE_AUTHORITY
+    assert trusted_item.obligation_kind == "managed-exact-head-ci"
+    assert trusted_item.failed_head_sha == "oldhead123"
+    assert ambiguous_item.authority == UNKNOWN_MACHINE_AUTHORITY
+    assert ambiguous_item.obligation_kind == "unknown"

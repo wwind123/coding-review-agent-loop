@@ -23,6 +23,7 @@ from .round_transport import is_round_transport_sidecar
 from .protocol import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
+    MACHINE_AUTHORITY,
     ParsedDiscussAgenda,
     ParsedDiscussAnswer,
     ParsedDiscussFinalSynthesis,
@@ -1047,13 +1048,25 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
         "Prior unresolved review items from earlier rounds",
         "",
         "Explicitly evaluate every item below before approving. Use the item IDs exactly as written.",
-        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge.",
+        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge. Machine obligations must still be dispositioned, but reviewer approval is advisory evidence only and never CI success.",
         "Every `blocking` or `same-pr` prior-item disposition requires an actionable `note`: explain what remains wrong on this head, cite relevant code or test evidence, and say what change or test would resolve it. A bare status or summary alone is insufficient. A different defect needs a new item, not a repurposed ID. Resolved dispositions may omit the note.",
         "",
     ]
     for item in unresolved_items:
         claim, updates = _render_unresolved_item_claim_and_updates(item)
         details = ["  Original claim:", indent(claim, "    ")]
+        if item.authority == MACHINE_AUTHORITY or item.obligation_kind is not None:
+            details.extend(
+                [
+                    "  Machine obligation: "
+                    f"{item.obligation_kind or 'unknown'}; lifecycle="
+                    f"{item.lifecycle or 'unknown'}; failed head="
+                    f"{item.failed_head_sha or '(unknown)'}; candidate head="
+                    f"{item.candidate_head_sha or '(none)'}.",
+                    "  Reviewer dispositions are advisory evidence only; only the "
+                    "authoritative source-specific validation can clear this obligation.",
+                ]
+            )
         if item.fix_scope:
             details.append("  Reviewer fix scope: " + ", ".join(f"`{path}`" for path in item.fix_scope))
         if item.resolution_owners:
@@ -2826,6 +2839,14 @@ Only use `"future"` when returning `approved`. If an item should still be fixed 
 merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
 `"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
 `"blocking"`/`"same-pr"`.
+
+Machine obligations are shown in the same ledger so every reviewer must
+disposition them, but those dispositions are advisory evidence only. A machine
+`"resolved"` or `"future"` disposition never clears CI, migration, mergeability,
+or acknowledgement state. Do not treat reviewer approval, skipped checks,
+missing checks, intermediate-filtered checks, stale results, or an unrelated
+run as authoritative success; the named machine authority must validate the
+required current repair head.
 
 The displayed Original claim is this stable item ID's predicate. Narrower evidence
 for that same defect may remain on the old ID. If you accept the original predicate

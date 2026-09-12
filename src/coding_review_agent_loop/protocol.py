@@ -124,6 +124,35 @@ class ReviewItemDisposition:
     note: str | None = None
 
 
+# Machine-owned obligations are deliberately distinct from reviewer findings.
+# These values are persisted in round metadata, so changing one is a protocol
+# migration rather than a display-only change.
+MACHINE_AUTHORITY = "machine"
+UNKNOWN_MACHINE_AUTHORITY = "unknown"
+MACHINE_OBLIGATION_KINDS = frozenset(
+    {
+        "managed-exact-head-ci",
+        "github-pr-checks",
+        "alembic-migration",
+        "merge-conflict",
+        "human-requirements-acknowledgement",
+        "unknown",
+    }
+)
+MACHINE_LIFECYCLE_STATES = frozenset(
+    {
+        "repair_required",
+        "awaiting_current_head_review",
+        "qualification_ready",
+        "qualifying",
+        "cleared",
+    }
+)
+CI_MACHINE_OBLIGATION_KINDS = frozenset(
+    {"managed-exact-head-ci", "github-pr-checks"}
+)
+
+
 @dataclass(frozen=True)
 class UnresolvedReviewItem:
     item_id: str
@@ -146,6 +175,55 @@ class UnresolvedReviewItem:
     # ``resolved`` or ``future``; the latter must survive until all owners
     # have cleared so a later round can retain the future reclassification.
     owner_dispositions: tuple[tuple[str, str], ...] = ()
+    # Authority-aware machine-obligation fields. ``None`` retains the legacy
+    # reviewer-finding representation; recovery promotes only trusted
+    # orchestrator records to a machine authority. Unknown/invalid machine
+    # records are represented as the non-bypassable ``unknown`` kind.
+    authority: str | None = None
+    obligation_kind: str | None = None
+    lifecycle: str | None = None
+    failed_head_sha: str | None = None
+    candidate_head_sha: str | None = None
+    obligation_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        authority = self.authority
+        kind = self.obligation_kind
+        lifecycle = self.lifecycle
+        machine = authority in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY} or kind is not None
+        if not machine:
+            return
+        if authority not in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY}:
+            raise ValueError("machine obligations require a known authority value")
+        if kind not in MACHINE_OBLIGATION_KINDS:
+            raise ValueError("machine obligations require a known obligation kind")
+        if lifecycle not in MACHINE_LIFECYCLE_STATES:
+            raise ValueError("machine obligations require a known lifecycle")
+        if (
+            lifecycle == "repair_required"
+            and not self.failed_head_sha
+            and kind in CI_MACHINE_OBLIGATION_KINDS
+        ):
+            raise ValueError("repair-required machine obligations need a failed head")
+        if self.candidate_head_sha and self.failed_head_sha == self.candidate_head_sha:
+            raise ValueError("a qualification candidate must differ from the failed head")
+
+    @property
+    def is_machine_obligation(self) -> bool:
+        return self.authority in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY} or self.obligation_kind is not None
+
+    @property
+    def authority_kind(self) -> str | None:
+        """Compatibility alias for authority-aware callers."""
+        return self.authority
+
+    @property
+    def machine_authority(self) -> str | None:
+        return self.authority
+
+    @property
+    def machine_obligation_kind(self) -> str | None:
+        return self.obligation_kind
 
 
 @dataclass(frozen=True)

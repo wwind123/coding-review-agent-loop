@@ -232,6 +232,7 @@ from .protocol import (
     StructuredPlanState,
     StructuredPlanRevision,
     UnresolvedReviewItem,
+    CI_MACHINE_OBLIGATION_KINDS,
     human_requirements_resolved,
     is_clarification_request,
     parse_human_requirements_acknowledgement,
@@ -364,6 +365,7 @@ from .followups import (
 )
 from .round_state import (
     ApprovedPlanContext,
+    QualificationCheckpoint,
     PostedRoundMetadata,
     PostedRoundRecord,
     ROUND_RESUME_MARKER_RE,
@@ -417,6 +419,14 @@ from .unresolved_items import (
     _format_unresolved_items_for_coder,
     _maybe_fill_resolved_dispositions_from_prose,
     _next_unresolved_item,
+    _advance_machine_obligations_for_head,
+    _clear_machine_obligations,
+    _is_machine_obligation,
+    _machine_obligation_is_ci,
+    _machine_obligation_is_revalidation_candidate,
+    _machine_obligation_requires_repair,
+    _set_machine_obligation_lifecycle,
+    _upsert_machine_obligation,
     _normalize_disposition_section_prose,
     _reconcile_merge_conflict_item,
     _record_prior_item_disposition,
@@ -7501,6 +7511,153 @@ def _scheduler_obligations(
     return tuple(obligations)
 
 
+def _partition_unresolved_items(
+    items: Sequence[UnresolvedReviewItem],
+    *,
+    current_head_sha: str | None,
+) -> dict[str, tuple[UnresolvedReviewItem, ...]]:
+    """Separate human review work from machine qualification work.
+
+    ``must_fix_items`` historically mixed these categories and made a
+    synthetic CI reviewer look like a human owner.  The partitions are kept
+    explicit so a reviewed repair head may qualify while every machine gate
+    remains pending and visible until its own authority clears it.
+    """
+    reviewer_blockers: list[UnresolvedReviewItem] = []
+    repair_required: list[UnresolvedReviewItem] = []
+    revalidation_candidates: list[UnresolvedReviewItem] = []
+    finalization_blockers: list[UnresolvedReviewItem] = []
+    for item in items:
+        if item.status not in {"blocking", "same-pr"}:
+            continue
+        finalization_blockers.append(item)
+        if not _is_machine_obligation(item):
+            reviewer_blockers.append(item)
+        elif _machine_obligation_requires_repair(item, current_head_sha=current_head_sha):
+            repair_required.append(item)
+        elif _machine_obligation_is_revalidation_candidate(
+            item, current_head_sha=current_head_sha
+        ):
+            revalidation_candidates.append(item)
+        else:
+            repair_required.append(item)
+    coder_blockers = [*reviewer_blockers, *repair_required]
+    return {
+        "reviewer_blockers": tuple(reviewer_blockers),
+        "repair_required_machine_obligations": tuple(repair_required),
+        "revalidation_candidates": tuple(revalidation_candidates),
+        "finalization_blockers": tuple(finalization_blockers),
+        "coder_blockers": tuple(coder_blockers),
+    }
+
+
+def _machine_obligation_checkpoint(
+    items: Sequence[UnresolvedReviewItem],
+    *,
+    current_head_sha: str | None,
+    base_branch: str | None,
+    allowed_rounds: int,
+    watch_failure_extension_used: bool,
+    watch_head_extension_used: bool,
+    lifecycle: str | None = None,
+    qualification_attempt_id: str | None = None,
+    approval_digest: str | None = None,
+    plan_digest: str | None = None,
+    requirements_digest: str | None = None,
+    acquisition_digest: str | None = None,
+    scheduler_digest: str | None = None,
+) -> QualificationCheckpoint | None:
+    """Create a bounded checkpoint from the active source-specific obligation."""
+    candidates = [
+        item for item in items
+        if _is_machine_obligation(item)
+        and item.status in {"blocking", "same-pr"}
+        and item.obligation_kind in CI_MACHINE_OBLIGATION_KINDS
+    ]
+    item = next(
+        (
+            candidate for candidate in candidates
+            if _machine_obligation_is_revalidation_candidate(
+                candidate, current_head_sha=current_head_sha
+            )
+        ),
+        None,
+    ) or (candidates[0] if candidates else None)
+    if item is None:
+        return None
+    return QualificationCheckpoint(
+        obligation_kind=item.obligation_kind or "unknown",
+        obligation_identity=item.obligation_identity or item.item_id,
+        lifecycle=lifecycle or item.lifecycle or "repair_required",
+        failed_head_sha=item.failed_head_sha,
+        candidate_head_sha=item.candidate_head_sha,
+        base_branch=base_branch,
+        approval_digest=approval_digest,
+        plan_digest=plan_digest,
+        requirements_digest=requirements_digest,
+        acquisition_digest=acquisition_digest,
+        scheduler_digest=scheduler_digest,
+        qualification_attempt_id=qualification_attempt_id,
+        watch_failure_extension_used=watch_failure_extension_used,
+        watch_head_extension_used=watch_head_extension_used,
+        allowed_rounds=allowed_rounds,
+    )
+
+
+def _qualification_digest(value: object) -> str:
+    return hashlib.sha256(repr(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _round_limit_diagnostic(
+    *,
+    pr_number: int,
+    round_number: int,
+    items: Sequence[UnresolvedReviewItem],
+    current_head_sha: str | None,
+) -> str:
+    """Describe the actual terminal/resumable blocker, not its display owner."""
+    partitions = _partition_unresolved_items(items, current_head_sha=current_head_sha)
+    reviewer_blockers = partitions["reviewer_blockers"]
+    repair = partitions["repair_required_machine_obligations"]
+    candidates = partitions["revalidation_candidates"]
+    if reviewer_blockers:
+        names = ", ".join(
+            f"{item.reviewer} ({item.item_id})" for item in reviewer_blockers
+        )
+        return (
+            f"PR #{pr_number} still reported blocking issues after round {round_number}: "
+            f"reviewer-owned findings: {names}. "
+            "The named reviewer/owner must provide actionable resolution evidence."
+        )
+    if repair:
+        details = ", ".join(
+            f"{item.obligation_kind or 'unknown'} ({item.item_id})"
+            for item in repair
+        )
+        return (
+            f"PR #{pr_number} has blocking issues after round {round_number}: machine obligation(s) "
+            "awaiting a new repair head: "
+            f"{details}. Reviewer approval cannot clear them; push a strictly "
+            "different corrected head."
+        )
+    if candidates:
+        details = ", ".join(
+            f"{item.obligation_kind or 'unknown'} ({item.item_id})"
+            for item in candidates
+        )
+        return (
+            f"PR #{pr_number} has a unanimously reviewed correction awaiting authoritative "
+            f"qualification after round {round_number}: {details}."
+        )
+    active = [item for item in items if item.status in {"blocking", "same-pr"}]
+    if active:
+        return (
+            f"PR #{pr_number} has an unknown or unreconstructible persisted obligation after "
+            f"round {round_number}; no qualification or merge is permitted."
+        )
+    return f"Reached the review budget after round {round_number} for PR #{pr_number}; human review required."
+
+
 def _latest_pr_reviewer_records(
     records: Sequence[PostedRoundRecord],
     configured_reviewers: Sequence[AgentName],
@@ -8644,6 +8801,7 @@ def run_pr_loop(
         next_unresolved_item_number = 1
         start_round_number = 1
         resumed_round: ResumedReviewRound | None = None
+        qualification_checkpoint: QualificationCheckpoint | None = None
         if reviewer_session_id is not None and configured_reviewers:
             # Backward-compatible single-reviewer resume support: older callers
             # pass one reviewer session, so attach it to the first configured reviewer.
@@ -8670,6 +8828,7 @@ def run_pr_loop(
             pr_compact_prior_summaries = list(resumed_round.compact_prior_summaries)
             latest_coder_output = resumed_round.coder_output
             latest_coder_metadata = resumed_round.coder_metadata
+            qualification_checkpoint = resumed_round.qualification_checkpoint
             next_unresolved_item_number = resumed_round.next_unresolved_item_number
             start_round_number = resumed_round.round_number
             log(config, f"PR #{pr_number}: resuming round {start_round_number}")
@@ -8689,6 +8848,23 @@ def run_pr_loop(
         # One extra slot is only activated by a watcher-discovered failure on
         # the configured final round; ordinary review failures retain the cap.
         allowed_rounds = config.max_rounds
+        if qualification_checkpoint is not None:
+            if qualification_checkpoint.valid:
+                if config.max_rounds <= qualification_checkpoint.allowed_rounds <= config.max_rounds + 2:
+                    allowed_rounds = qualification_checkpoint.allowed_rounds
+                    watch_failure_extension_used = qualification_checkpoint.watch_failure_extension_used
+                    watch_head_extension_used = qualification_checkpoint.watch_head_extension_used
+                else:
+                    # A persisted ceiling outside this invocation's bounded
+                    # repair budget is not an authorization to mint rounds.
+                    qualification_checkpoint = QualificationCheckpoint.invalid(
+                        "checkpoint budget is outside the configured bound"
+                    )
+                    scheduler_force_full = True
+                    final_sweep_pending = True
+            else:
+                scheduler_force_full = True
+                final_sweep_pending = True
         # The two independent one-shot watcher allowances below can extend the
         # effective ceiling by two rounds in one invocation. Keep the static
         # range large enough to reach both; ``allowed_rounds`` remains the
@@ -8697,7 +8873,16 @@ def run_pr_loop(
         for round_number in range(start_round_number, config.max_rounds + 3):
             if round_number > allowed_rounds:
                 raise AgentLoopError(
-                    f"One or more reviewers still reported blocking issues after round {allowed_rounds}; human review required."
+                    _round_limit_diagnostic(
+                        pr_number=pr_number,
+                        round_number=allowed_rounds,
+                        items=unresolved_items,
+                        current_head_sha=(
+                            prefetched_pr_context.metadata.head_sha
+                            if prefetched_pr_context is not None
+                            else initial_pr_context.metadata.head_sha
+                        ),
+                    )
                 )
             coder_name = agent_display_name(config.coder)
             pre_review_tests_passed = False
@@ -8714,6 +8899,33 @@ def run_pr_loop(
                 pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
             initial_pr_context = pr_context
             pr_metadata = pr_context.metadata
+            if qualification_checkpoint is not None and qualification_checkpoint.valid:
+                checkpoint_base = pr_metadata.base_branch or config.base
+                checkpoint_item = next(
+                    (
+                        item for item in unresolved_items
+                        if _is_machine_obligation(item)
+                        and item.obligation_kind == qualification_checkpoint.obligation_kind
+                        and (item.obligation_identity or item.item_id)
+                        == qualification_checkpoint.obligation_identity
+                    ),
+                    None,
+                )
+                checkpoint_stale = (
+                    checkpoint_item is None
+                    or qualification_checkpoint.candidate_head_sha != pr_metadata.head_sha
+                    or qualification_checkpoint.failed_head_sha == pr_metadata.head_sha
+                    or qualification_checkpoint.base_branch != checkpoint_base
+                )
+                if checkpoint_stale:
+                    # Readiness is a cache, never authority.  A changed head,
+                    # base, or obligation identity forces safe reconstruction
+                    # and a full reviewer board before another qualification.
+                    qualification_checkpoint = QualificationCheckpoint.invalid(
+                        "checkpoint no longer matches the live qualification inputs"
+                    )
+                    scheduler_force_full = True
+                    final_sweep_pending = True
             if issue_context is not None and not (
                 round_number == start_round_number and issue_context_refreshed
             ):
@@ -8757,12 +8969,44 @@ def run_pr_loop(
                 parent_issue_context=parent_issue_context,
             )
             human_requirements = requirements_context.effective_requirements
+            if qualification_checkpoint is not None and qualification_checkpoint.valid:
+                checkpoint_plan = (
+                    approved_plan_context.plan_hash
+                    if approved_plan_context is not None else None
+                )
+                checkpoint_inputs_stale = (
+                    qualification_checkpoint.plan_digest is not None
+                    and qualification_checkpoint.plan_digest != checkpoint_plan
+                ) or (
+                    qualification_checkpoint.requirements_digest is not None
+                    and qualification_checkpoint.requirements_digest != _qualification_digest(
+                        tuple(requirement.requirement_id for requirement in human_requirements)
+                    )
+                ) or (
+                    qualification_checkpoint.acquisition_digest is not None
+                    and qualification_checkpoint.acquisition_digest != _qualification_digest(
+                        reviewer_acquisition_contract
+                    )
+                )
+                if checkpoint_inputs_stale:
+                    qualification_checkpoint = QualificationCheckpoint.invalid(
+                        "qualification inputs changed during resume"
+                    )
+                    scheduler_force_full = True
+                    final_sweep_pending = True
             current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
             unresolved_items = _reconcile_human_requirements_ack_item(
                 current_resume.prior_items if current_resume is not None else unresolved_items,
                 coder_output=latest_coder_output,
                 human_requirements=human_requirements,
                 source_round=round_number,
+            )
+            # A CI obligation is bound to the head that failed.  Only a
+            # strictly different live head may become a qualification
+            # candidate; reviewer dispositions never perform this transition.
+            unresolved_items = _advance_machine_obligations_for_head(
+                unresolved_items,
+                current_head_sha=pr_metadata.head_sha,
             )
             # GitHub mergeability gate (#606): fetch and evaluate before starting
             # a review round so a confirmed conflict routes straight to the coder
@@ -9917,12 +10161,44 @@ def run_pr_loop(
                 )
                 future_from_prior_items = []
             unresolved_items = [*unresolved_items, *round_new_unresolved_items]
+            # Human-requirement acknowledgement is a structured reviewer/coder
+            # contract, not a reviewer-item ownership decision. Once every
+            # required reviewer has emitted the explicit acknowledgement on
+            # this round, clear the durable acknowledgement obligation here;
+            # ordinary `resolved` dispositions alone still cannot do so.
+            if human_requirements and any(
+                item.item_id == HUMAN_REQUIREMENTS_ACK_ITEM_ID
+                for item in unresolved_items
+            ):
+                required_reviewer_names = {
+                    agent_display_name(reviewer) for reviewer in configured_reviewers
+                }
+                acknowledged_reviewer_names = {
+                    reviewer_name
+                    for reviewer_name, review_output in approved_review_outputs
+                    if human_requirements_resolved(review_output)
+                }
+                if required_reviewer_names <= acknowledged_reviewer_names:
+                    unresolved_items = _clear_human_requirements_ack_item(unresolved_items)
             future_followups = [
                 _approved_followup_from_unresolved_item(item)
                 for item in [*unresolved_items, *future_from_prior_items]
                 if item.status == "future"
             ]
-            must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-pr"}]
+            item_partitions = _partition_unresolved_items(
+                unresolved_items,
+                current_head_sha=pr_metadata.head_sha,
+            )
+            reviewer_blockers = list(item_partitions["reviewer_blockers"])
+            repair_required_machine_obligations = list(
+                item_partitions["repair_required_machine_obligations"]
+            )
+            revalidation_candidates = list(item_partitions["revalidation_candidates"])
+            finalization_blockers = list(item_partitions["finalization_blockers"])
+            # Only human findings and machine obligations that explicitly need
+            # repair go to the coder.  A current, fully reviewed CI candidate
+            # proceeds to source-authoritative qualification instead.
+            must_fix_items = list(item_partitions["coder_blockers"])
 
             if must_fix_items:
                 _raise_if_maintained_disputed_items(
@@ -10169,6 +10445,16 @@ def run_pr_loop(
                             )
                         continue
 
+                for obligation_kind in {
+                    item.obligation_kind
+                    for item in revalidation_candidates
+                    if item.obligation_kind is not None
+                }:
+                    unresolved_items = _set_machine_obligation_lifecycle(
+                        unresolved_items,
+                        kind=obligation_kind,
+                        lifecycle="qualification_ready",
+                    )
                 sync_coder_pr_before_validation(config, runner, pr_number, pr_metadata)
                 migration_validation = validate_pr_migration_topology(
                     runner,
@@ -10178,17 +10464,34 @@ def run_pr_loop(
                 )
                 if not migration_validation.ok:
                     log(config, f"Round {round_number}: Alembic migration validation blocked approval")
-                    unresolved_items.append(
-                        _next_unresolved_item(
-                            item_number=next_unresolved_item_number,
-                            reviewer="Alembic migration validation",
-                            source_round=round_number,
-                            text=migration_validation.message or "Migration validation failed.",
-                            status="blocking",
-                        )
+                    had_migration_obligation = any(
+                        _is_machine_obligation(item)
+                        and item.obligation_kind == "alembic-migration"
+                        for item in unresolved_items
                     )
-                    next_unresolved_item_number += 1
-                    must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-pr"}]
+                    unresolved_items = _upsert_machine_obligation(
+                        unresolved_items,
+                        item_number=next_unresolved_item_number,
+                        kind="alembic-migration",
+                        source_round=round_number,
+                        text=(
+                            "Alembic migration validation failed: "
+                            + (migration_validation.message or "Migration validation failed.")
+                        ),
+                        failed_head_sha=pr_metadata.head_sha,
+                    )
+                    if not had_migration_obligation:
+                        next_unresolved_item_number += 1
+                else:
+                    unresolved_items = _clear_machine_obligations(
+                        unresolved_items, kind="alembic-migration"
+                    )
+                must_fix_items = list(
+                    _partition_unresolved_items(
+                        unresolved_items,
+                        current_head_sha=pr_metadata.head_sha,
+                    )["coder_blockers"]
+                )
 
                 # Re-evaluate mergeability before CI checks / merge (#606): reviews
                 # can take a while, so the branch may have gone conflicted since
@@ -10202,7 +10505,12 @@ def run_pr_loop(
                     source_round=round_number,
                     current_head_sha=pr_metadata.head_sha,
                 )
-                must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-pr"}]
+                must_fix_items = list(
+                    _partition_unresolved_items(
+                        unresolved_items,
+                        current_head_sha=pr_metadata.head_sha,
+                    )["coder_blockers"]
+                )
                 merge_gate_conflict_pending = any(
                     item.item_id == MERGE_CONFLICT_ITEM_ID for item in unresolved_items
                 )
@@ -10218,6 +10526,19 @@ def run_pr_loop(
                     pr_checks = get_pr_checks(runner, config=config, metadata=pr_metadata)
                     if managed_ci_active(pr_metadata):
                         pr_checks = intermediate_managed_checks(pr_checks)
+                    elif (
+                        pr_checks.state == "passing"
+                        and pr_checks.check_query_status == "ok"
+                        and not pr_checks.failing
+                        and not pr_checks.pending
+                        and not pr_checks.missing_required
+                    ):
+                        # Only the fresh full-board watcher snapshot can clear
+                        # an ordinary-check obligation; managed exact-head
+                        # success is a different authority kind.
+                        unresolved_items = _clear_machine_obligations(
+                            unresolved_items, kind="github-pr-checks"
+                        )
                 if pr_checks is not None and not must_fix_items and is_wholly_infrastructure_blocked(pr_checks):
                     # Every remaining blocking/pending signal is external GitHub
                     # Actions infrastructure (a queued check that never started a
@@ -10287,6 +10608,59 @@ def run_pr_loop(
                     # approval snapshot.
                     and (pr_checks is None or pr_checks.state != "failing")
                 ):
+                    unresolved_items = _set_machine_obligation_lifecycle(
+                        unresolved_items,
+                        kind="github-pr-checks",
+                        lifecycle="qualifying",
+                    )
+                    qualification_checkpoint = _machine_obligation_checkpoint(
+                        unresolved_items,
+                        current_head_sha=pr_metadata.head_sha,
+                        base_branch=pr_metadata.base_branch or config.base,
+                        allowed_rounds=allowed_rounds,
+                        watch_failure_extension_used=watch_failure_extension_used,
+                        watch_head_extension_used=watch_head_extension_used,
+                        approval_digest=_qualification_digest(
+                            tuple(sorted({
+                                *unchanged_head_approvals,
+                                *(name for name, _output in approved_review_outputs),
+                            }))
+                        ),
+                        plan_digest=(
+                            approved_plan_context.plan_hash
+                            if approved_plan_context is not None else None
+                        ),
+                        requirements_digest=_qualification_digest(
+                            tuple(requirement.requirement_id for requirement in human_requirements)
+                        ),
+                        acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
+                        scheduler_digest=_qualification_digest(
+                            _prior_item_ledger_signature(unresolved_items)
+                        ),
+                        qualification_attempt_id=(
+                            f"github-checks:{pr_metadata.head_sha}"
+                            if pr_metadata.head_sha else None
+                        ),
+                    )
+                    if qualification_checkpoint is not None:
+                        post_pr_comment(
+                            runner,
+                            config=config,
+                            pr_number=pr_number,
+                            body=_attach_round_metadata(
+                                f"PR #{pr_number} qualification checkpoint: full-board checks are being watched.",
+                                PostedRoundMetadata(
+                                    flow="pr",
+                                    role="summary",
+                                    agent="Orchestrator",
+                                    round_number=round_number,
+                                    subject=pr_metadata.head_sha,
+                                    prior_items=tuple(unresolved_items),
+                                    phase="qualification-checkpoint",
+                                    qualification_checkpoint=qualification_checkpoint,
+                                ),
+                            ),
+                        )
                     if watch_deadline is None:
                         watch_deadline = time.monotonic() + config.ci_timeout_seconds
                         watch_attempts_remaining = max(
@@ -10491,22 +10865,32 @@ def run_pr_loop(
                             pr_number=pr_number,
                             body=_format_pr_checks_comment(pr_number, "failing", details),
                         )
-                        unresolved_items.append(
-                            _next_unresolved_item(
-                                item_number=next_unresolved_item_number,
-                                reviewer="GitHub PR checks",
-                                source_round=round_number,
-                                text=_pr_check_blocking_review(
-                                    pr_number, "failing", details
-                                ),
-                                status="blocking",
-                            )
+                        had_ordinary_obligation = any(
+                            _is_machine_obligation(item)
+                            and item.obligation_kind == "github-pr-checks"
+                            for item in unresolved_items
                         )
-                        next_unresolved_item_number += 1
+                        unresolved_items = _upsert_machine_obligation(
+                            unresolved_items,
+                            item_number=next_unresolved_item_number,
+                            kind="github-pr-checks",
+                            source_round=round_number,
+                            text=_pr_check_blocking_review(
+                                pr_number, "failing", details
+                            ),
+                            failed_head_sha=watch_outcome.head_sha or pr_metadata.head_sha,
+                        )
+                        if not had_ordinary_obligation:
+                            next_unresolved_item_number += 1
                         if round_number == allowed_rounds and not watch_failure_extension_used:
                             allowed_rounds += 1
                             watch_failure_extension_used = True
-                    must_fix_items = [item for item in unresolved_items if item.status in {"blocking", "same-pr"}]
+                    must_fix_items = list(
+                        _partition_unresolved_items(
+                            unresolved_items,
+                            current_head_sha=pr_metadata.head_sha,
+                        )["coder_blockers"]
+                    )
                 if not must_fix_items:
                     if pr_checks.state in {"pending", "unavailable"}:
                         details = _pr_check_details(pr_checks)
@@ -10571,19 +10955,27 @@ def run_pr_loop(
                             config,
                             f"Round {round_number}: GitHub PR checks blocked approval ({pr_checks.state})",
                         )
-                        unresolved_items.append(
-                            _next_unresolved_item(
-                                item_number=next_unresolved_item_number,
-                                reviewer="GitHub PR checks",
-                                source_round=round_number,
-                                text=_pr_check_blocking_review(pr_number, pr_checks.state, details),
-                                status="blocking",
-                            )
+                        had_ordinary_obligation = any(
+                            _is_machine_obligation(item)
+                            and item.obligation_kind == "github-pr-checks"
+                            for item in unresolved_items
                         )
-                        next_unresolved_item_number += 1
-                        must_fix_items = [
-                            item for item in unresolved_items if item.status in {"blocking", "same-pr"}
-                        ]
+                        unresolved_items = _upsert_machine_obligation(
+                            unresolved_items,
+                            item_number=next_unresolved_item_number,
+                            kind="github-pr-checks",
+                            source_round=round_number,
+                            text=_pr_check_blocking_review(pr_number, pr_checks.state, details),
+                            failed_head_sha=pr_metadata.head_sha,
+                        )
+                        if not had_ordinary_obligation:
+                            next_unresolved_item_number += 1
+                    must_fix_items = list(
+                        _partition_unresolved_items(
+                            unresolved_items,
+                            current_head_sha=pr_metadata.head_sha,
+                        )["coder_blockers"]
+                    )
                 if not must_fix_items:
                     _publish_approved_followups(
                         runner,
@@ -10657,14 +11049,112 @@ def run_pr_loop(
                         if managed_ci_active(pr_metadata):
                             assert pr_metadata.head_sha is not None
                             assert pr_metadata.head_branch is not None
-                            dispatch_final_qualification(
-                                runner,
-                                config=config,
-                                pr_number=pr_number,
-                                expected_head_sha=pr_metadata.head_sha,
-                                head_ref=pr_metadata.head_branch,
-                                contract=managed_ci,
+                            unresolved_items = _set_machine_obligation_lifecycle(
+                                unresolved_items,
+                                kind="managed-exact-head-ci",
+                                lifecycle="qualifying",
                             )
+                            qualification_checkpoint = _machine_obligation_checkpoint(
+                                unresolved_items,
+                                current_head_sha=pr_metadata.head_sha,
+                                base_branch=pr_metadata.base_branch or config.base,
+                                allowed_rounds=allowed_rounds,
+                                watch_failure_extension_used=watch_failure_extension_used,
+                                watch_head_extension_used=watch_head_extension_used,
+                                approval_digest=_qualification_digest(
+                                    tuple(sorted({
+                                        *unchanged_head_approvals,
+                                        *(name for name, _output in approved_review_outputs),
+                                    }))
+                                ),
+                                plan_digest=(
+                                    approved_plan_context.plan_hash
+                                    if approved_plan_context is not None else None
+                                ),
+                                requirements_digest=_qualification_digest(
+                                    tuple(requirement.requirement_id for requirement in human_requirements)
+                                ),
+                                acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
+                                scheduler_digest=_qualification_digest(
+                                    _prior_item_ledger_signature(unresolved_items)
+                                ),
+                            )
+                            if qualification_checkpoint is not None:
+                                post_pr_comment(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    body=_attach_round_metadata(
+                                        (
+                                            f"PR #{pr_number} qualification checkpoint: "
+                                            "authoritative exact-head validation is in progress."
+                                        ),
+                                        PostedRoundMetadata(
+                                            flow="pr",
+                                            role="summary",
+                                            agent="Orchestrator",
+                                            round_number=round_number,
+                                            subject=pr_metadata.head_sha,
+                                            prior_items=tuple(unresolved_items),
+                                            phase="qualification-checkpoint",
+                                            qualification_checkpoint=qualification_checkpoint,
+                                        ),
+                                    ),
+                                )
+                            attached_attempt = (
+                                qualification_checkpoint is not None
+                                and qualification_checkpoint.valid
+                                and qualification_checkpoint.lifecycle == "qualifying"
+                                and qualification_checkpoint.candidate_head_sha == pr_metadata.head_sha
+                                and managed_ci.attached_run_id is not None
+                                and managed_ci.run_attempt is not None
+                            )
+                            if attached_attempt:
+                                log(
+                                    config,
+                                    f"PR #{pr_number}: resuming attached qualification attempt "
+                                    f"{managed_ci.attached_run_id}/{managed_ci.run_attempt}",
+                                )
+                            else:
+                                dispatch_final_qualification(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    expected_head_sha=pr_metadata.head_sha,
+                                    head_ref=pr_metadata.head_branch,
+                                    contract=managed_ci,
+                                )
+                            if (
+                                qualification_checkpoint is not None
+                                and qualification_checkpoint.valid
+                                and managed_ci.attached_run_id is not None
+                                and managed_ci.run_attempt is not None
+                            ):
+                                qualification_checkpoint = dataclasses_replace(
+                                    qualification_checkpoint,
+                                    qualification_attempt_id=(
+                                        f"{managed_ci.attached_run_id}/{managed_ci.run_attempt}"
+                                    ),
+                                )
+                                post_pr_comment(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    body=_attach_round_metadata(
+                                        f"PR #{pr_number} qualification checkpoint: attached attempt "
+                                        f"{qualification_checkpoint.qualification_attempt_id}.",
+                                        PostedRoundMetadata(
+                                            flow="pr",
+                                            role="summary",
+                                            agent="Orchestrator",
+                                            round_number=round_number,
+                                            subject=pr_metadata.head_sha,
+                                            prior_items=tuple(unresolved_items),
+                                            phase="qualification-checkpoint",
+                                            qualification_checkpoint=qualification_checkpoint,
+                                        ),
+                                    ),
+                                )
                             if managed_ci.activation_path == "ordinary_fallback":
                                 ordinary_recovery_selected = True
                                 ordinary_recovery = managed_ci.ordinary_recovery
@@ -10691,6 +11181,21 @@ def run_pr_loop(
                                 contract=managed_ci,
                             )
                             if managed_outcome.status == "passed":
+                                if managed_outcome.head_sha != pr_metadata.head_sha:
+                                    log(
+                                        config,
+                                        f"PR #{pr_number} managed CI reported success for a stale or "
+                                        "unidentified head; requiring re-review",
+                                    )
+                                    resumed_round = None
+                                    current_resume = None
+                                    prefetched_pr_context = get_pr_review_context(
+                                        runner, config=config, pr_number=pr_number
+                                    )
+                                    continue
+                                unresolved_items = _clear_machine_obligations(
+                                    unresolved_items, kind="managed-exact-head-ci"
+                                )
                                 if selective_policy:
                                     fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
                                         runner,
@@ -10839,18 +11344,23 @@ def run_pr_loop(
                                     pr_number=pr_number,
                                     body=_format_pr_checks_comment(pr_number, "failing", details),
                                 )
-                                unresolved_items.append(
-                                    _next_unresolved_item(
-                                        item_number=next_unresolved_item_number,
-                                        reviewer="GitHub managed exact-head CI",
-                                        source_round=round_number,
-                                        text=_pr_check_blocking_review(
-                                            pr_number, "failing", details
-                                        ),
-                                        status="blocking",
-                                    )
+                                had_managed_obligation = any(
+                                    _is_machine_obligation(item)
+                                    and item.obligation_kind == "managed-exact-head-ci"
+                                    for item in unresolved_items
                                 )
-                                next_unresolved_item_number += 1
+                                unresolved_items = _upsert_machine_obligation(
+                                    unresolved_items,
+                                    item_number=next_unresolved_item_number,
+                                    kind="managed-exact-head-ci",
+                                    source_round=round_number,
+                                    text=_pr_check_blocking_review(
+                                        pr_number, "failing", details
+                                    ),
+                                    failed_head_sha=managed_outcome.head_sha or pr_metadata.head_sha,
+                                )
+                                if not had_managed_obligation:
+                                    next_unresolved_item_number += 1
                                 if round_number == allowed_rounds and not watch_failure_extension_used:
                                     allowed_rounds += 1
                                     watch_failure_extension_used = True
@@ -10859,11 +11369,6 @@ def run_pr_loop(
                                     f"Managed exact-head CI for PR #{pr_number} did not pass within "
                                     f"{config.ci_timeout_seconds}s."
                                 )
-                            must_fix_items = [
-                                item
-                                for item in unresolved_items
-                                if item.status in {"blocking", "same-pr"}
-                            ]
                         elif ordinary_recovery_selected:
                             if ordinary_recovery is None:
                                 raise AgentLoopError(
@@ -10884,13 +11389,23 @@ def run_pr_loop(
                                 f"PR #{pr_number} reached the ordinary auto-merge path without "
                                 "consuming a full-board CI watcher result; no merge attempted."
                             )
+                        must_fix_items = list(
+                            _partition_unresolved_items(
+                                unresolved_items,
+                                current_head_sha=pr_metadata.head_sha,
+                            )["coder_blockers"]
+                        )
                     if not must_fix_items:
                         print(f"PR #{pr_number} approved by {format_agent_list(configured_reviewers)}.")
                         return 0
             if round_number == allowed_rounds:
                 raise AgentLoopError(
-                    f"One or more reviewers still reported blocking issues after round {round_number}; "
-                    "human review required."
+                    _round_limit_diagnostic(
+                        pr_number=pr_number,
+                        round_number=round_number,
+                        items=unresolved_items,
+                        current_head_sha=pr_metadata.head_sha,
+                    )
                 )
 
             has_merge_conflict_item = any(
@@ -11170,6 +11685,10 @@ def run_pr_loop(
                 source_round=round_number,
             )
             updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+            unresolved_items = _advance_machine_obligations_for_head(
+                unresolved_items,
+                current_head_sha=updated_pr_context.metadata.head_sha,
+            )
             local_test_evidence = runner.render_local_test_evidence(
                 current_head=updated_pr_context.metadata.head_sha,
                 legacy_tests_run=(
@@ -11196,6 +11715,25 @@ def run_pr_loop(
                     current_test_turn_id=runner.latest_test_turn_id,
                 )
 
+            qualification_checkpoint = _machine_obligation_checkpoint(
+                unresolved_items,
+                current_head_sha=updated_pr_context.metadata.head_sha,
+                base_branch=updated_pr_context.metadata.base_branch or config.base,
+                allowed_rounds=allowed_rounds,
+                watch_failure_extension_used=watch_failure_extension_used,
+                watch_head_extension_used=watch_head_extension_used,
+                plan_digest=(
+                    approved_plan_context.plan_hash
+                    if approved_plan_context is not None else None
+                ),
+                requirements_digest=_qualification_digest(
+                    tuple(requirement.requirement_id for requirement in human_requirements)
+                ),
+                acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
+                scheduler_digest=_qualification_digest(
+                    _prior_item_ledger_signature(unresolved_items)
+                ),
+            )
             latest_coder_metadata = PostedRoundMetadata(
                 flow="pr",
                 role="coder",
@@ -11242,6 +11780,7 @@ def run_pr_loop(
                 scheduler_final_sweep=(final_sweep if selective_policy else None),
                 scheduler_force_full=(scheduler_force_full if selective_policy else None),
                 scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
+                qualification_checkpoint=qualification_checkpoint,
             )
             post_pr_comment(
                 runner,

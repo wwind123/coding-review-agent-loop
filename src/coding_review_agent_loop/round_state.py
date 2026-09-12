@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -28,6 +28,10 @@ from .protocol import (
     ParsedDiscussReview,
     ReviewItemDisposition,
     UnresolvedReviewItem,
+    MACHINE_AUTHORITY,
+    MACHINE_LIFECYCLE_STATES,
+    MACHINE_OBLIGATION_KINDS,
+    UNKNOWN_MACHINE_AUTHORITY,
     failed_discuss_review_placeholder,
     failed_discuss_answer_placeholder,
     parse_structured_discuss_agenda,
@@ -133,6 +137,10 @@ class PostedRoundMetadata:
     # ``absent`` is the legacy-compatible state; ``invalid`` means scheduler
     # fields were present but could not be reconstructed safely.
     scheduler_metadata_status: str = "absent"
+    # Durable checkpoint for a source-specific exact-head qualification.  It
+    # is intentionally independent of the scheduler optimization so a restart
+    # can attach to an existing attempt without minting another one.
+    qualification_checkpoint: "QualificationCheckpoint | None" = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -261,10 +269,142 @@ class ResumedReviewRound:
     reconciled: bool = False
     coder_metadata: PostedRoundMetadata | None = None
     local_test_evidence: str | None = None
+    qualification_checkpoint: QualificationCheckpoint | None = None
+
+
+@dataclass(frozen=True)
+class QualificationCheckpoint:
+    """Bounded durable state for a machine-obligation qualification attempt."""
+
+    obligation_kind: str
+    obligation_identity: str
+    lifecycle: str
+    failed_head_sha: str | None
+    candidate_head_sha: str | None
+    base_branch: str | None = None
+    approval_digest: str | None = None
+    plan_digest: str | None = None
+    requirements_digest: str | None = None
+    acquisition_digest: str | None = None
+    scheduler_digest: str | None = None
+    qualification_attempt_id: str | None = None
+    watch_failure_extension_used: bool = False
+    watch_head_extension_used: bool = False
+    allowed_rounds: int = 0
+    valid: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.valid:
+            return
+        if self.obligation_kind not in MACHINE_OBLIGATION_KINDS - {"unknown"}:
+            raise ValueError("qualification checkpoints require a known machine kind")
+        if self.lifecycle not in MACHINE_LIFECYCLE_STATES - {"cleared"}:
+            raise ValueError("qualification checkpoints require an active lifecycle")
+        if self.lifecycle == "repair_required" and self.obligation_kind in {
+            "managed-exact-head-ci", "github-pr-checks"
+        } and not self.failed_head_sha:
+            raise ValueError("CI qualification checkpoints need a failed head")
+        if self.lifecycle in {
+            "awaiting_current_head_review", "qualification_ready", "qualifying"
+        } and not self.candidate_head_sha:
+            raise ValueError("qualification-ready checkpoints need a candidate head")
+        if self.candidate_head_sha and self.candidate_head_sha == self.failed_head_sha:
+            raise ValueError("qualification checkpoints cannot target the failed head")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "obligation_kind": self.obligation_kind,
+            "obligation_identity": self.obligation_identity,
+            "lifecycle": self.lifecycle,
+            "failed_head_sha": self.failed_head_sha,
+            "candidate_head_sha": self.candidate_head_sha,
+            "base_branch": self.base_branch,
+            "approval_digest": self.approval_digest,
+            "plan_digest": self.plan_digest,
+            "requirements_digest": self.requirements_digest,
+            "acquisition_digest": self.acquisition_digest,
+            "scheduler_digest": self.scheduler_digest,
+            "qualification_attempt_id": self.qualification_attempt_id,
+            "watch_failure_extension_used": self.watch_failure_extension_used,
+            "watch_head_extension_used": self.watch_head_extension_used,
+            "allowed_rounds": self.allowed_rounds,
+            "valid": self.valid,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "QualificationCheckpoint":
+        if not isinstance(value, dict):
+            return cls.invalid("checkpoint is not an object")
+        required = {
+            "obligation_kind", "obligation_identity", "lifecycle",
+            "failed_head_sha", "candidate_head_sha", "base_branch",
+            "approval_digest", "plan_digest", "requirements_digest",
+            "acquisition_digest", "scheduler_digest", "qualification_attempt_id",
+            "watch_failure_extension_used", "watch_head_extension_used",
+            "allowed_rounds",
+        }
+        if not required.issubset(value):
+            return cls.invalid("checkpoint is partial")
+        strings = (
+            "obligation_kind", "obligation_identity", "lifecycle", "failed_head_sha",
+            "candidate_head_sha", "base_branch", "approval_digest", "plan_digest",
+            "requirements_digest", "acquisition_digest", "scheduler_digest",
+            "qualification_attempt_id",
+        )
+        if any(value[key] is not None and not isinstance(value[key], str) for key in strings):
+            return cls.invalid("checkpoint contains a non-string identity")
+        if value["obligation_kind"] not in MACHINE_OBLIGATION_KINDS:
+            return cls.invalid("checkpoint has an unknown obligation kind")
+        if value["lifecycle"] not in MACHINE_LIFECYCLE_STATES:
+            return cls.invalid("checkpoint has an unknown lifecycle")
+        if (
+            not isinstance(value["watch_failure_extension_used"], bool)
+            or not isinstance(value["watch_head_extension_used"], bool)
+            or isinstance(value["allowed_rounds"], bool)
+            or not isinstance(value["allowed_rounds"], int)
+            or value["allowed_rounds"] < 0
+        ):
+            return cls.invalid("checkpoint has invalid budget fields")
+        if "valid" in value and value["valid"] is not True:
+            return cls.invalid("checkpoint is not marked valid")
+        failed = value["failed_head_sha"]
+        candidate = value["candidate_head_sha"]
+        if candidate is not None and candidate == failed:
+            return cls.invalid("checkpoint requalifies the failed head")
+        return cls(
+            obligation_kind=value["obligation_kind"],
+            obligation_identity=value["obligation_identity"],
+            lifecycle=value["lifecycle"],
+            failed_head_sha=failed,
+            candidate_head_sha=candidate,
+            base_branch=value["base_branch"],
+            approval_digest=value["approval_digest"],
+            plan_digest=value["plan_digest"],
+            requirements_digest=value["requirements_digest"],
+            acquisition_digest=value["acquisition_digest"],
+            scheduler_digest=value["scheduler_digest"],
+            qualification_attempt_id=value["qualification_attempt_id"],
+            watch_failure_extension_used=value["watch_failure_extension_used"],
+            watch_head_extension_used=value["watch_head_extension_used"],
+            allowed_rounds=value["allowed_rounds"],
+            valid=True,
+        )
+
+    @classmethod
+    def invalid(cls, reason: str) -> "QualificationCheckpoint":
+        return cls(
+            obligation_kind="unknown",
+            obligation_identity="invalid-checkpoint",
+            lifecycle="repair_required",
+            failed_head_sha=None,
+            candidate_head_sha=None,
+            allowed_rounds=0,
+            valid=False,
+        )
 
 
 def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
-    return {
+    payload = {
         "item_id": item.item_id,
         "reviewer": item.reviewer,
         "source_round": item.source_round,
@@ -278,6 +418,16 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
         **({"owner_evidence": [list(pair) for pair in item.owner_evidence]} if item.owner_evidence else {}),
         **({"owner_dispositions": [list(pair) for pair in item.owner_dispositions]} if item.owner_dispositions else {}),
     }
+    machine_fields = {
+        "authority": item.authority,
+        "obligation_kind": item.obligation_kind,
+        "lifecycle": item.lifecycle,
+        "failed_head_sha": item.failed_head_sha,
+        "candidate_head_sha": item.candidate_head_sha,
+        "obligation_identity": item.obligation_identity,
+    }
+    payload.update({key: value for key, value in machine_fields.items() if value is not None})
+    return payload
 
 
 def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
@@ -307,7 +457,7 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         for pair in raw_dispositions
         if isinstance(pair, (list, tuple)) and len(pair) == 2
     ) if isinstance(raw_dispositions, list) else ()
-    return UnresolvedReviewItem(
+    core = dict(
         item_id=str(payload["item_id"]),
         reviewer=str(payload["reviewer"]),
         source_round=int(payload["source_round"]),
@@ -321,6 +471,45 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         owner_evidence=evidence,
         owner_dispositions=owner_dispositions,
     )
+    machine_keys = {
+        "authority", "obligation_kind", "lifecycle", "failed_head_sha",
+        "candidate_head_sha", "obligation_identity",
+    }
+    if machine_keys & payload.keys():
+        for key in machine_keys:
+            if key in payload and payload[key] is not None and not isinstance(payload[key], str):
+                # Invalid persisted authority is itself a blocker.  Do not
+                # reject the entire ledger and do not let a malformed field
+                # fall back to an ordinary reviewer finding.
+                return UnresolvedReviewItem(
+                    **{**core, "notes": (*notes, f"Invalid persisted machine field: {key}")},
+                    authority=UNKNOWN_MACHINE_AUTHORITY,
+                    obligation_kind="unknown",
+                    lifecycle="repair_required",
+                    obligation_identity="invalid-machine-record",
+                    # ``core`` already carries the original notes; append the
+                    # diagnostic through a copied mapping to avoid duplicate
+                    # keyword arguments.
+                )
+        machine = dict(
+            authority=payload.get("authority"),
+            obligation_kind=payload.get("obligation_kind"),
+            lifecycle=payload.get("lifecycle"),
+            failed_head_sha=payload.get("failed_head_sha"),
+            candidate_head_sha=payload.get("candidate_head_sha"),
+            obligation_identity=payload.get("obligation_identity"),
+        )
+        try:
+            return UnresolvedReviewItem(**core, **machine)
+        except ValueError as exc:
+            return UnresolvedReviewItem(
+                **{**core, "notes": (*notes, f"Invalid persisted machine record: {exc}")},
+                authority=UNKNOWN_MACHINE_AUTHORITY,
+                obligation_kind="unknown",
+                lifecycle="repair_required",
+                obligation_identity="invalid-machine-record",
+            )
+    return UnresolvedReviewItem(**core)
 
 
 _SCHEDULER_METADATA_KEYS = frozenset(
@@ -502,6 +691,11 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "scheduler_final_sweep": metadata.scheduler_final_sweep,
         "scheduler_force_full": metadata.scheduler_force_full,
         "scheduler_calls_avoided": metadata.scheduler_calls_avoided,
+        "qualification_checkpoint": (
+            metadata.qualification_checkpoint.as_dict()
+            if isinstance(metadata.qualification_checkpoint, QualificationCheckpoint)
+            else metadata.qualification_checkpoint
+        ),
     }
     if any(value not in (None, (), []) for value in scheduler_values.values()):
         payload.update(scheduler_values)
@@ -616,6 +810,11 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             local_test_evidence=(
                 canonicalize_bounded_evidence(payload.get("local_test_evidence"))
             ),
+            qualification_checkpoint=(
+                QualificationCheckpoint.from_mapping(payload["qualification_checkpoint"])
+                if payload.get("qualification_checkpoint") is not None
+                else None
+            ),
             round_synthesis=(
                 str(payload["round_synthesis"])
                 if payload.get("round_synthesis") is not None else None
@@ -680,6 +879,123 @@ def _strip_round_metadata(body: str) -> str:
     return cleaned.strip()
 
 
+_LEGACY_MACHINE_REVIEWERS = {
+    "GitHub managed exact-head CI": "managed-exact-head-ci",
+    "GitHub PR checks": "github-pr-checks",
+    "Alembic migration validation": "alembic-migration",
+}
+
+
+def _legacy_machine_kind(item: UnresolvedReviewItem) -> str | None:
+    if item.item_id == "item-merge-conflict":
+        return "merge-conflict"
+    if item.item_id == "item-human-requirements-acknowledgement":
+        return "human-requirements-acknowledgement"
+    return _LEGACY_MACHINE_REVIEWERS.get(item.reviewer) or (
+        "unknown" if item.reviewer == "Orchestrator" else None
+    )
+
+
+def _legacy_machine_promotion(
+    item: UnresolvedReviewItem,
+    *,
+    record: PostedRoundRecord,
+    first_record: PostedRoundRecord | None,
+) -> UnresolvedReviewItem:
+    """Promote only orchestrator-lineage synthetic items from old ledgers.
+
+    A display name in reviewer prose is not authority.  The first durable
+    ``new_items`` record (or a coder checkpoint carrying a legacy machine item)
+    must be an orchestrator-produced record before a known kind is promoted.
+    Ambiguous synthetic records become explicit unknown blockers.
+    """
+    if item.is_machine_obligation:
+        return item
+    kind = _legacy_machine_kind(item)
+    if kind is None:
+        return item
+    lineage = first_record or record
+    trusted = (
+        lineage.metadata.role in {"summary", "coder"}
+        and (
+            lineage.metadata.agent == "Orchestrator"
+            or lineage.metadata.role == "coder"
+        )
+        and item.status in {"blocking", "same-pr"}
+        and lineage.metadata.round_number >= item.source_round
+    )
+    if not trusted:
+        return replace(
+            item,
+            authority=UNKNOWN_MACHINE_AUTHORITY,
+            obligation_kind="unknown",
+            lifecycle="repair_required",
+            failed_head_sha=None,
+            candidate_head_sha=None,
+            obligation_identity=f"unknown:{item.item_id}",
+            notes=(*item.notes, "Synthetic machine record lacked trusted orchestrator lineage."),
+            resolution_owners=(),
+            owner_states=(),
+        )
+    failed_head = lineage.metadata.subject
+    # Prefer an explicitly recorded head in the original claim when present.
+    head_match = re.search(r"\bhead(?: SHA)?\s*[`']?([0-9a-f]{7,64})", item.text, re.I)
+    if head_match:
+        failed_head = head_match.group(1)
+    if not failed_head or failed_head == "unknown":
+        return replace(
+            item,
+            authority=UNKNOWN_MACHINE_AUTHORITY,
+            obligation_kind="unknown",
+            lifecycle="repair_required",
+            obligation_identity=f"unknown:{item.item_id}",
+            notes=(*item.notes, "Known machine item could not be bound to a failed head."),
+            resolution_owners=(),
+            owner_states=(),
+        )
+    return replace(
+        item,
+        authority=MACHINE_AUTHORITY,
+        obligation_kind=kind,
+        lifecycle="repair_required",
+        failed_head_sha=failed_head,
+        candidate_head_sha=None,
+        obligation_identity=f"{kind}:{item.item_id}",
+        resolution_owners=(),
+        owner_states=(),
+    )
+
+
+def _promote_legacy_machine_items(records: Sequence[PostedRoundRecord]) -> tuple[PostedRoundRecord, ...]:
+    first_new_item_record: dict[str, PostedRoundRecord] = {}
+    for record in records:
+        for item in record.metadata.new_items:
+            first_new_item_record.setdefault(item.item_id, record)
+    promoted: list[PostedRoundRecord] = []
+    for record in records:
+        metadata = record.metadata
+        prior = tuple(
+            _legacy_machine_promotion(
+                item,
+                record=record,
+                first_record=first_new_item_record.get(item.item_id),
+            )
+            for item in metadata.prior_items
+        )
+        new_items = tuple(
+            _legacy_machine_promotion(
+                item,
+                record=record,
+                first_record=first_new_item_record.get(item.item_id, record),
+            )
+            for item in metadata.new_items
+        )
+        if prior != metadata.prior_items or new_items != metadata.new_items:
+            metadata = replace(metadata, prior_items=prior, new_items=new_items)
+        promoted.append(replace(record, metadata=metadata))
+    return tuple(promoted)
+
+
 def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) -> tuple[PostedRoundRecord, ...]:
     records: list[PostedRoundRecord] = []
     bodies = tuple(body for comment in comments if isinstance((body := getattr(comment, "body", None)), str))
@@ -719,7 +1035,7 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
                 body=_strip_round_metadata(body),
             )
         )
-    return tuple(records)
+    return _promote_legacy_machine_items(tuple(records))
 
 
 def _latest_pr_approved_reviews_for_head(
@@ -801,6 +1117,12 @@ def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple
             item.owner_states,
             item.owner_evidence,
             item.owner_dispositions,
+            item.authority,
+            item.obligation_kind,
+            item.lifecycle,
+            item.failed_head_sha,
+            item.candidate_head_sha,
+            item.obligation_identity,
         )
         for item in items
     )
@@ -853,6 +1175,22 @@ def _max_unresolved_item_number_from_records(records: Sequence[PostedRoundRecord
 
 def _active_pr_items(items: Sequence[UnresolvedReviewItem]) -> list[UnresolvedReviewItem]:
     return [item for item in items if item.status in {"blocking", "same-pr"}]
+
+
+def _latest_qualification_checkpoint(
+    records: Sequence[PostedRoundRecord], *, head_sha: str
+) -> QualificationCheckpoint | None:
+    """Return the newest checkpoint bound to the live head.
+
+    An invalid decoded checkpoint is intentionally returned as a value with
+    ``valid=False``.  Callers can then force full reconstruction instead of
+    treating malformed persistence as an absent, safe-to-merge state.
+    """
+    for record in reversed(records):
+        checkpoint = record.metadata.qualification_checkpoint
+        if checkpoint is not None and record.metadata.subject == head_sha:
+            return checkpoint
+    return None
 
 
 def _append_active_pr_new_items(
@@ -973,6 +1311,7 @@ def _recover_unrecorded_pr_head_advance(
             if latest_coder_record is not None
             else None
         ),
+        qualification_checkpoint=_latest_qualification_checkpoint(records, head_sha=head_sha),
     )
 
 
@@ -1317,6 +1656,7 @@ def _resume_pr_round(
             if latest_coder_record is not None
             else None
         ),
+        qualification_checkpoint=_latest_qualification_checkpoint(records, head_sha=head_sha),
     )
 
 

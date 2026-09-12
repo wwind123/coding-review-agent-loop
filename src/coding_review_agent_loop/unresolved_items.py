@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import replace
 
 from .errors import (
     AgentLoopError,
@@ -19,6 +20,10 @@ from .protocol import (
     StructuredCoderFollowup,
     StructuredIssueImplementation,
     UnresolvedReviewItem,
+    CI_MACHINE_OBLIGATION_KINDS,
+    MACHINE_AUTHORITY,
+    MACHINE_OBLIGATION_KINDS,
+    UNKNOWN_MACHINE_AUTHORITY,
     parse_plan_review,
     parse_pr_review,
     validate_human_requirements_acknowledgement,
@@ -31,6 +36,12 @@ from .protocol import (
 HUMAN_REQUIREMENTS_ACK_ITEM_ID = "item-human-requirements-acknowledgement"
 MERGE_CONFLICT_ITEM_ID = "item-merge-conflict"
 CODER_DISPUTE_NOTE_PREFIX = "Coder disputes this item"
+MANAGED_CI_OBLIGATION_KIND = "managed-exact-head-ci"
+ORDINARY_CI_OBLIGATION_KIND = "github-pr-checks"
+MIGRATION_OBLIGATION_KIND = "alembic-migration"
+MERGE_CONFLICT_OBLIGATION_KIND = "merge-conflict"
+HUMAN_REQUIREMENTS_OBLIGATION_KIND = "human-requirements-acknowledgement"
+UNKNOWN_OBLIGATION_KIND = "unknown"
 ALL_RESOLVED_PROSE_RE = re.compile(
     r"^all (?:prior items|listed items|carried-forward items) are resolved\.?$"
     r"|^all prior unresolved items have been resolved\.?$",
@@ -73,8 +84,21 @@ def _next_unresolved_item(
     notes: Sequence[str] = (),
     fix_scope: tuple[str, ...] | None = None,
     resolution_owners: Sequence[str] | None = None,
+    authority: str | None = None,
+    obligation_kind: str | None = None,
+    lifecycle: str | None = None,
+    failed_head_sha: str | None = None,
+    candidate_head_sha: str | None = None,
+    obligation_identity: str | None = None,
 ) -> UnresolvedReviewItem:
-    owners = tuple(resolution_owners) if resolution_owners is not None else (reviewer,)
+    if obligation_kind is not None and authority is None:
+        authority = MACHINE_AUTHORITY
+    if authority in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY}:
+        obligation_kind = obligation_kind or UNKNOWN_OBLIGATION_KIND
+        lifecycle = lifecycle or "repair_required"
+        owners = ()
+    else:
+        owners = tuple(resolution_owners) if resolution_owners is not None else (reviewer,)
     owner_states = tuple((owner, "pending") for owner in owners)
     return UnresolvedReviewItem(
         item_id=f"item-{item_number}",
@@ -87,7 +111,184 @@ def _next_unresolved_item(
         fix_scope=fix_scope,
         resolution_owners=owners,
         owner_states=owner_states,
+        authority=authority,
+        obligation_kind=obligation_kind,
+        lifecycle=lifecycle,
+        failed_head_sha=failed_head_sha,
+        candidate_head_sha=candidate_head_sha,
+        obligation_identity=obligation_identity or (
+            f"{obligation_kind}:item-{item_number}" if obligation_kind else None
+        ),
     )
+
+
+def _is_machine_obligation(item: UnresolvedReviewItem) -> bool:
+    return item.is_machine_obligation
+
+
+def _machine_obligation_is_ci(item: UnresolvedReviewItem) -> bool:
+    return _is_machine_obligation(item) and item.obligation_kind in CI_MACHINE_OBLIGATION_KINDS
+
+
+def _machine_obligation_requires_repair(
+    item: UnresolvedReviewItem, *, current_head_sha: str | None
+) -> bool:
+    if not _is_machine_obligation(item) or item.status not in {"blocking", "same-pr"}:
+        return False
+    if item.obligation_kind == UNKNOWN_OBLIGATION_KIND:
+        return True
+    if item.lifecycle == "repair_required":
+        return not bool(
+            item.failed_head_sha
+            and current_head_sha
+            and current_head_sha != item.failed_head_sha
+        )
+    if item.lifecycle not in {"awaiting_current_head_review", "qualification_ready", "qualifying"}:
+        return True
+    return bool(
+        item.failed_head_sha
+        and current_head_sha
+        and current_head_sha == item.failed_head_sha
+    )
+
+
+def _machine_obligation_is_revalidation_candidate(
+    item: UnresolvedReviewItem, *, current_head_sha: str | None
+) -> bool:
+    return (
+        _is_machine_obligation(item)
+        and item.obligation_kind in MACHINE_OBLIGATION_KINDS - {UNKNOWN_OBLIGATION_KIND}
+        and item.lifecycle in {"awaiting_current_head_review", "qualification_ready", "qualifying"}
+        and bool(item.candidate_head_sha)
+        and item.candidate_head_sha == current_head_sha
+        and item.failed_head_sha != current_head_sha
+    )
+
+
+def _machine_obligation_is_pending_non_ci(item: UnresolvedReviewItem) -> bool:
+    return _is_machine_obligation(item) and not _machine_obligation_is_ci(item) and item.status in {
+        "blocking", "same-pr"
+    }
+
+
+def _upsert_machine_obligation(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    *,
+    item_number: int,
+    kind: str,
+    source_round: int,
+    text: str,
+    failed_head_sha: str | None,
+) -> list[UnresolvedReviewItem]:
+    """Upsert one stable source-specific obligation instead of accumulating items."""
+    if kind not in MACHINE_OBLIGATION_KINDS or kind == UNKNOWN_OBLIGATION_KIND:
+        kind = UNKNOWN_OBLIGATION_KIND
+        failed_head_sha = None
+    for index, existing in enumerate(unresolved_items):
+        if _is_machine_obligation(existing) and existing.obligation_kind == kind:
+            updated = replace(
+                existing,
+                reviewer=(existing.reviewer if existing.reviewer else "Orchestrator"),
+                source_round=source_round,
+                text=text,
+                status="blocking",
+                source_status="blocking",
+                notes=existing.notes,
+                resolution_owners=(),
+                owner_states=(),
+                authority=MACHINE_AUTHORITY if kind != UNKNOWN_OBLIGATION_KIND else UNKNOWN_MACHINE_AUTHORITY,
+                obligation_kind=kind,
+                lifecycle="repair_required",
+                failed_head_sha=failed_head_sha,
+                candidate_head_sha=None,
+                obligation_identity=existing.obligation_identity or f"{kind}:{existing.item_id}",
+            )
+            result = list(unresolved_items)
+            result[index] = updated
+            return result
+    item = _next_unresolved_item(
+        item_number=item_number,
+        reviewer=(
+            "GitHub managed exact-head CI"
+            if kind == MANAGED_CI_OBLIGATION_KIND
+            else "GitHub PR checks"
+            if kind == ORDINARY_CI_OBLIGATION_KIND
+            else "Alembic migration validation"
+            if kind == MIGRATION_OBLIGATION_KIND
+            else "Orchestrator"
+        ),
+        source_round=source_round,
+        text=text,
+        status="blocking",
+        authority=(MACHINE_AUTHORITY if kind != UNKNOWN_OBLIGATION_KIND else UNKNOWN_MACHINE_AUTHORITY),
+        obligation_kind=kind,
+        lifecycle="repair_required",
+        failed_head_sha=failed_head_sha,
+    )
+    return [*unresolved_items, item]
+
+
+def _advance_machine_obligations_for_head(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    *,
+    current_head_sha: str | None,
+) -> list[UnresolvedReviewItem]:
+    """Bind machine revalidation to the first strictly-new candidate head."""
+    if not current_head_sha:
+        return list(unresolved_items)
+    result: list[UnresolvedReviewItem] = []
+    for item in unresolved_items:
+        if not _is_machine_obligation(item) or item.lifecycle == "cleared":
+            result.append(item)
+            continue
+        if item.lifecycle == "repair_required":
+            if item.failed_head_sha and item.failed_head_sha != current_head_sha:
+                result.append(
+                    replace(
+                        item,
+                        lifecycle="awaiting_current_head_review",
+                        candidate_head_sha=current_head_sha,
+                        resolution_owners=(),
+                        owner_states=(),
+                    )
+                )
+            else:
+                result.append(item)
+            continue
+        if item.candidate_head_sha and item.candidate_head_sha != current_head_sha:
+            result.append(
+                replace(item, lifecycle="awaiting_current_head_review", candidate_head_sha=current_head_sha)
+            )
+        else:
+            result.append(item)
+    return result
+
+
+def _clear_machine_obligations(
+    unresolved_items: Sequence[UnresolvedReviewItem], *, kind: str
+) -> list[UnresolvedReviewItem]:
+    """Clear all historical/current obligations of exactly one authority kind."""
+    return [
+        item
+        for item in unresolved_items
+        if not (_is_machine_obligation(item) and item.obligation_kind == kind)
+    ]
+
+
+def _set_machine_obligation_lifecycle(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    *,
+    kind: str,
+    lifecycle: str,
+) -> list[UnresolvedReviewItem]:
+    if lifecycle not in {"repair_required", "awaiting_current_head_review", "qualification_ready", "qualifying", "cleared"}:
+        raise AgentLoopError(f"Unknown machine-obligation lifecycle: {lifecycle}.")
+    return [
+        replace(item, lifecycle=lifecycle)
+        if _is_machine_obligation(item) and item.obligation_kind == kind
+        else item
+        for item in unresolved_items
+    ]
 
 
 def _apply_dispute_evidence(
@@ -109,20 +310,7 @@ def _apply_dispute_evidence(
         note = f"{CODER_DISPUTE_NOTE_PREFIX}: {evidence}" if evidence else CODER_DISPUTE_NOTE_PREFIX
         if note not in item.notes:
             result.append(
-                UnresolvedReviewItem(
-                    item_id=item.item_id,
-                    reviewer=item.reviewer,
-                    source_round=item.source_round,
-                    text=item.text,
-                    status=item.status,
-                    source_status=item.source_status,
-                    notes=(*item.notes, note),
-                    fix_scope=item.fix_scope,
-                    resolution_owners=item.resolution_owners,
-                    owner_states=item.owner_states,
-                    owner_evidence=item.owner_evidence,
-                    owner_dispositions=item.owner_dispositions,
-                )
+                replace(item, notes=(*item.notes, note))
             )
         else:
             result.append(item)
@@ -283,6 +471,10 @@ def _upsert_human_requirements_ack_item(
             source_status="blocking",
             resolution_owners=("Orchestrator",),
             owner_states=(("Orchestrator", "pending"),),
+            authority=MACHINE_AUTHORITY,
+            obligation_kind=HUMAN_REQUIREMENTS_OBLIGATION_KIND,
+            lifecycle="repair_required",
+            obligation_identity=HUMAN_REQUIREMENTS_OBLIGATION_KIND,
         )
     )
     return retained
@@ -385,6 +577,11 @@ def _upsert_merge_conflict_item(
             notes=notes,
             resolution_owners=("Orchestrator",),
             owner_states=(("Orchestrator", "pending"),),
+            authority=MACHINE_AUTHORITY,
+            obligation_kind=MERGE_CONFLICT_OBLIGATION_KIND,
+            lifecycle="repair_required",
+            failed_head_sha=confirmed_head_sha,
+            obligation_identity=MERGE_CONFLICT_OBLIGATION_KIND,
         )
     )
     return retained
@@ -542,6 +739,25 @@ def _apply_unresolved_item_dispositions(
         dispositions = dispositions_by_item.get(item.item_id, [])
         if not dispositions:
             next_unresolved.append(item)
+            continue
+        if _is_machine_obligation(item):
+            # Reviewers must still disposition machine records so the durable
+            # review contract remains complete, but their prose is evidence
+            # only.  In particular, a synthetic CI owner can never be cleared
+            # by unanimous reviewer approval.
+            notes = list(item.notes)
+            for disposition in dispositions:
+                if disposition.note:
+                    note = f"{disposition.reviewer}: {disposition.note}"
+                    if note not in notes:
+                        notes.append(note)
+            preserved = replace(item, notes=tuple(notes)) if tuple(notes) != item.notes else item
+            if preserved.status in {"blocking", "same-pr"}:
+                next_unresolved.append(preserved)
+            elif preserved.status == "future" and retain_future:
+                next_unresolved.append(preserved)
+            elif preserved.status == "future":
+                future_items.append(preserved)
             continue
         # `text` is the item’s canonical claim.  Dispositions may add evidence
         # for that claim, but must never rewrite it: a reviewer that discovers a
@@ -835,6 +1051,16 @@ def _format_unresolved_items_for_coder(items: Sequence[UnresolvedReviewItem]) ->
         lines.append(
             f"{item.reviewer} unresolved {item.status} item [{item.item_id}] from round {item.source_round}:"
         )
+        if _is_machine_obligation(item):
+            lines.append(
+                f"Machine authority: {item.obligation_kind or 'unknown'}; lifecycle="
+                f"{item.lifecycle or 'unknown'}; failed head={item.failed_head_sha or '(unknown)'}; "
+                f"candidate head={item.candidate_head_sha or '(none)'}."
+            )
+            lines.append(
+                "Reviewer dispositions cannot clear this obligation; fix the failed head and "
+                "wait for authoritative source-specific validation."
+            )
         lines.append(f"- {item.text}")
         if item.notes:
             lines.append("Latest reviewer updates:")
