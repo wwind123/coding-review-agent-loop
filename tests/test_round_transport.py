@@ -360,7 +360,16 @@ def test_invalid_qualification_checkpoint_decodes_fail_closed() -> None:
     assert decoded.qualification_checkpoint.obligation_kind == "unknown"
 
 
-@pytest.mark.parametrize("missing", ["approval_digest", "scheduler_digest"])
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "approval_digest",
+        "requirements_digest",
+        "acquisition_digest",
+        "scheduler_digest",
+        "qualification_attempt_id",
+    ],
+)
 def test_qualification_checkpoint_missing_resume_identity_decodes_fail_closed(missing):
     checkpoint = {
         "obligation_kind": "managed-exact-head-ci",

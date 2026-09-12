@@ -357,15 +357,27 @@ class QualificationCheckpoint:
             return cls.invalid("checkpoint has an unknown obligation kind")
         if value["lifecycle"] not in MACHINE_LIFECYCLE_STATES - {"cleared"}:
             return cls.invalid("checkpoint has an unknown lifecycle")
-        if value["lifecycle"] in {"qualification_ready", "qualifying"} and (
-            not isinstance(value["approval_digest"], str)
-            or not value["approval_digest"].strip()
-            or not isinstance(value["scheduler_digest"], str)
-            or not value["scheduler_digest"].strip()
-        ):
-            return cls.invalid(
-                "qualification checkpoint is missing review or scheduler identity"
+        if value["lifecycle"] in {"qualification_ready", "qualifying"}:
+            required_identities = (
+                "approval_digest",
+                "requirements_digest",
+                "acquisition_digest",
+                "scheduler_digest",
             )
+            if any(
+                not isinstance(value[key], str) or not value[key].strip()
+                for key in required_identities
+            ):
+                return cls.invalid(
+                    "qualification checkpoint is missing a current contract identity"
+                )
+            if value["lifecycle"] == "qualifying" and (
+                not isinstance(value["qualification_attempt_id"], str)
+                or not value["qualification_attempt_id"].strip()
+            ):
+                return cls.invalid(
+                    "qualifying checkpoint is missing its qualification attempt identity"
+                )
         if (
             not isinstance(value["watch_failure_extension_used"], bool)
             or not isinstance(value["watch_head_extension_used"], bool)
@@ -707,14 +719,15 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "scheduler_final_sweep": metadata.scheduler_final_sweep,
         "scheduler_force_full": metadata.scheduler_force_full,
         "scheduler_calls_avoided": metadata.scheduler_calls_avoided,
-        "qualification_checkpoint": (
-            metadata.qualification_checkpoint.as_dict()
-            if isinstance(metadata.qualification_checkpoint, QualificationCheckpoint)
-            else metadata.qualification_checkpoint
-        ),
     }
     if any(value not in (None, (), []) for value in scheduler_values.values()):
         payload.update(scheduler_values)
+    if metadata.qualification_checkpoint is not None:
+        payload["qualification_checkpoint"] = (
+            metadata.qualification_checkpoint.as_dict()
+            if isinstance(metadata.qualification_checkpoint, QualificationCheckpoint)
+            else metadata.qualification_checkpoint
+        )
     return encode_mapping(payload)
 
 

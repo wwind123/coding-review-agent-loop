@@ -7416,7 +7416,7 @@ def _stop_after_ci_watch_timeout(
     pr_comments: Sequence[object],
     followups: list[ApprovedFollowup],
     details: list[str],
-    reason: Literal["budget_exhausted", "timeout"],
+    reason: Literal["budget_exhausted", "timeout", "non_authoritative"],
     source_context: FollowupSourceContext,
     usage_context: RunUsageContext | None = None,
 ) -> int:
@@ -7459,7 +7459,7 @@ def _stop_after_ci_watch_timeout(
                 f"PR #{pr_number} full-board CI watch budget was exhausted before "
                 "a fresh poll; no merge attempted."
             )
-    else:
+    elif reason == "timeout":
         print(
             f"PR #{pr_number} CI watch timed out: {'; '.join(details)}. "
             f"Rerun: {rerun}{note}"
@@ -7468,6 +7468,21 @@ def _stop_after_ci_watch_timeout(
             raise AgentLoopError(
                 f"PR #{pr_number} full-board CI watch did not pass within "
                 f"{config.ci_timeout_seconds}s; no merge attempted."
+            )
+    else:
+        log(
+            config,
+            f"Round {round_number}: ordinary CI watcher returned a non-authoritative "
+            "passing-looking board; no merge attempted",
+        )
+        print(
+            f"PR #{pr_number} CI watch did not produce an authoritative success for the "
+            f"current head: {'; '.join(details)}. No merge was attempted; rerun: {rerun}{note}"
+        )
+        if config.auto_merge:
+            raise AgentLoopError(
+                f"PR #{pr_number} full-board CI watch returned a non-authoritative "
+                "passing-looking result; no merge attempted."
             )
     return 0
 
@@ -7626,6 +7641,10 @@ def _qualification_checkpoint_review_identity_matches(
     configured_reviewers: Sequence[AgentName],
     current_approvals: Mapping[str, object],
     unresolved_items: Sequence[UnresolvedReviewItem],
+    expected_plan_digest: str | None,
+    expected_requirements_digest: str,
+    expected_acquisition_digest: str,
+    expected_qualification_attempt_id: str | None = None,
 ) -> bool:
     """Check the durable proof needed to skip a resumed reviewer board.
 
@@ -7644,7 +7663,12 @@ def _qualification_checkpoint_review_identity_matches(
     observed_reviewers = set(current_approvals)
     if observed_reviewers != expected_reviewers:
         return False
-    if not checkpoint.approval_digest or not checkpoint.scheduler_digest:
+    if (
+        not checkpoint.approval_digest
+        or not checkpoint.requirements_digest
+        or not checkpoint.acquisition_digest
+        or not checkpoint.scheduler_digest
+    ):
         return False
     current_approval_digest = _qualification_digest(tuple(sorted(observed_reviewers)))
     current_scheduler_digest = _qualification_digest(
@@ -7652,7 +7676,17 @@ def _qualification_checkpoint_review_identity_matches(
     )
     return (
         checkpoint.approval_digest == current_approval_digest
+        and checkpoint.plan_digest == expected_plan_digest
+        and checkpoint.requirements_digest == expected_requirements_digest
+        and checkpoint.acquisition_digest == expected_acquisition_digest
         and checkpoint.scheduler_digest == current_scheduler_digest
+        and (
+            checkpoint.lifecycle != "qualifying"
+            or (
+                expected_qualification_attempt_id is not None
+                and checkpoint.qualification_attempt_id == expected_qualification_attempt_id
+            )
+        )
     )
 
 
@@ -7780,10 +7814,6 @@ def _ordinary_checks_snapshot_is_authoritative(
         and not checks.pending
         and not checks.missing_required
         and successful_checks
-        and all(
-            check.status.strip().lower() == "success"
-            for check in checks.passing
-        )
         and required_success_names == required_names
         and all(
             check.status.strip().lower() == "success"
@@ -9280,6 +9310,37 @@ def run_pr_loop(
                     reviewer_acquisition_contract if selective_policy else None
                 ),
             )
+            checkpoint_expected_plan_digest = (
+                approved_plan_context.plan_hash
+                if approved_plan_context is not None
+                else None
+            )
+            checkpoint_expected_requirements_digest = _qualification_digest(
+                tuple(requirement.requirement_id for requirement in human_requirements)
+            )
+            checkpoint_expected_acquisition_digest = _qualification_digest(
+                reviewer_acquisition_contract
+            )
+            checkpoint_expected_attempt_id: str | None = None
+            if (
+                qualification_checkpoint is not None
+                and qualification_checkpoint.lifecycle == "qualifying"
+            ):
+                if qualification_checkpoint.obligation_kind == "github-pr-checks":
+                    checkpoint_expected_attempt_id = (
+                        f"github-checks:{pr_metadata.head_sha}"
+                        if pr_metadata.head_sha
+                        else None
+                    )
+                elif (
+                    qualification_checkpoint.obligation_kind == "managed-exact-head-ci"
+                    and managed_ci is not None
+                    and managed_ci.attached_run_id is not None
+                    and managed_ci.run_attempt is not None
+                ):
+                    checkpoint_expected_attempt_id = (
+                        f"{managed_ci.attached_run_id}/{managed_ci.run_attempt}"
+                    )
             if (
                 qualification_checkpoint is not None
                 and qualification_checkpoint.valid
@@ -9290,6 +9351,10 @@ def run_pr_loop(
                     configured_reviewers=configured_reviewers,
                     current_approvals=unchanged_head_approvals,
                     unresolved_items=unresolved_items,
+                    expected_plan_digest=checkpoint_expected_plan_digest,
+                    expected_requirements_digest=checkpoint_expected_requirements_digest,
+                    expected_acquisition_digest=checkpoint_expected_acquisition_digest,
+                    expected_qualification_attempt_id=checkpoint_expected_attempt_id,
                 )
             ):
                 # A persisted readiness marker is only a cache.  Missing
@@ -9424,10 +9489,22 @@ def run_pr_loop(
                 current_obligation_digest = hashlib.sha256(
                     repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                 ).hexdigest()[:16]
-                persisted_obligation_digest = None
-                if coder_checkpoint_is_current and current_coder_record is not None:
-                    persisted_obligation_digest = current_coder_record.metadata.scheduler_obligation_digest
+                current_head_digest_records = tuple(
+                    record
+                    for record in current_head_records
+                    if (
+                        record.metadata.scheduler_metadata_status == "valid"
+                        and record.metadata.scheduler_obligation_digest is not None
+                    )
+                )
+                persisted_obligation_digest = (
+                    current_head_digest_records[-1].metadata.scheduler_obligation_digest
+                    if current_head_digest_records
+                    else None
+                )
                 if (
+                    any(_is_machine_obligation(item) for item in prior_unresolved_items)
+                    and
                     persisted_obligation_digest is not None
                     and persisted_obligation_digest != current_obligation_digest
                 ):
@@ -11036,9 +11113,30 @@ def run_pr_loop(
                             raise AgentLoopError(
                                 f"PR #{pr_number} full-board CI passed for a stale head; no merge attempted."
                             )
-                        # This is the only ordinary-check clearing authority:
-                        # the foreground watcher returned a passing full-board
-                        # result correlated to the reviewed live head.
+                        # The watcher status is only an aggregate. Apply the same
+                        # source-specific proof predicate used by the review-only
+                        # snapshot path before clearing or merging.
+                        if not _ordinary_checks_snapshot_is_authoritative(
+                            watch_outcome.pr_checks
+                        ):
+                            details = (
+                                _pr_check_details(watch_outcome.pr_checks)
+                                if watch_outcome.pr_checks is not None
+                                else ["No authoritative current-head check snapshot was available."]
+                            )
+                            return _stop_after_ci_watch_timeout(
+                                runner,
+                                config=config,
+                                pr_number=pr_number,
+                                round_number=round_number,
+                                head_sha=pr_metadata.head_sha,
+                                pr_comments=pr_comments,
+                                followups=future_followups,
+                                source_context=followup_source_context,
+                                usage_context=usage_context,
+                                details=details,
+                                reason="non_authoritative",
+                            )
                         unresolved_items = _clear_machine_obligations(
                             unresolved_items, kind="github-pr-checks"
                         )
