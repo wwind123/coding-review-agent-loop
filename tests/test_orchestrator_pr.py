@@ -3087,6 +3087,122 @@ def test_managed_qualification_resume_attaches_without_redispatch(
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("approval_digest", None),
+        ("requirements_digest", None),
+        ("acquisition_digest", None),
+        ("scheduler_digest", None),
+        ("qualification_attempt_id", None),
+        ("approval_digest", "stale-approval"),
+        ("requirements_digest", "stale-requirements"),
+        ("acquisition_digest", "stale-acquisition"),
+        ("scheduler_digest", "stale-scheduler"),
+        ("qualification_attempt_id", "stale-attempt"),
+    ],
+)
+def test_resume_qualification_identity_gap_forces_review_before_qualification(
+    tmp_path, monkeypatch, field, value
+):
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        managed_ci=False,
+        auto_merge=True,
+        max_rounds=1,
+    )
+    invocation = orchestrator.resolve_invocation(
+        config, provider="codex", role="reviewer"
+    )
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="GitHub PR checks",
+        source_round=1,
+        text="GitHub PR checks failed on the previous head.",
+        status="blocking",
+        source_status="blocking",
+        authority="machine",
+        obligation_kind="github-pr-checks",
+        lifecycle="qualification_ready",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        obligation_identity="github-pr-checks:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="github-pr-checks",
+        obligation_identity=item.obligation_identity,
+        lifecycle="qualifying",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        base_branch="main",
+        requirements_digest=orchestrator._qualification_digest(tuple()),
+        acquisition_digest=orchestrator._qualification_digest(
+            {"Codex": (invocation.configured_model, invocation.resolved_effort, "codex")}
+        ),
+        approval_digest=orchestrator._qualification_digest(("Codex",)),
+        scheduler_digest=orchestrator._qualification_digest(
+            orchestrator._prior_item_ledger_signature((item,))
+        ),
+        qualification_attempt_id="github-checks:abc123",
+        allowed_rounds=1,
+    )
+    checkpoint = dataclasses.replace(checkpoint, **{field: value})
+    summary = _attach_round_metadata(
+        "Persisted qualifying checkpoint without reviewer records.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="abc123",
+            prior_items=(item,),
+            state="blocking",
+            phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint,
+        ),
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": summary}
+            ]
+        }
+    )
+    force_full_values = []
+    reviewer_calls = []
+    original_select_reviewers = orchestrator.select_reviewers
+    original_run_validated_agent = orchestrator._run_validated_agent
+
+    def capture_force_full(snapshot, *args, **kwargs):
+        force_full_values.append(snapshot.force_full)
+        return original_select_reviewers(snapshot, *args, **kwargs)
+
+    def stop_at_reviewer(*args, **kwargs):
+        if kwargs.get("role") == "reviewer":
+            reviewer_calls.append(kwargs)
+            raise AgentLoopError("review board invoked before qualification")
+        return original_run_validated_agent(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", stop_at_reviewer)
+    dispatches = []
+    monkeypatch.setattr(
+        orchestrator,
+        "dispatch_final_qualification",
+        lambda *args, **kwargs: dispatches.append(kwargs),
+    )
+
+    with pytest.raises(AgentLoopError, match="review board invoked"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert reviewer_calls
+    assert force_full_values == [True]
+    assert dispatches == []
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
 def test_managed_manual_success_publishes_result_without_merge_even_with_pending_intermediate_ci(
     tmp_path, monkeypatch, capsys
 ):
