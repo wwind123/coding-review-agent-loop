@@ -2661,16 +2661,48 @@ def test_skipped_only_watcher_pass_does_not_clear_or_merge(
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
 
-@pytest.mark.parametrize("kind", ["absent", "stale", "uncorrelated"])
+@pytest.mark.parametrize("kind", ["absent", "skipped", "stale", "uncorrelated"])
 def test_invalid_watcher_success_cannot_finalize_carried_ci_obligation(
     tmp_path, monkeypatch, kind
 ):
+    ordinary_item = _carried_ci_obligations()[1]
     runner = FakeRunner(
-        codex_outputs=[structured_pr_review(state="approved", summary="Approved.")]
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="Approved.",
+                prior_item_dispositions=[
+                    {"item_id": ordinary_item.item_id, "disposition": "resolved"}
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {
+                    "author": {"login": "coding-review-agent-loop"},
+                    "body": _carried_ci_review_comment((ordinary_item,)),
+                }
+            ]
+        },
     )
     if kind == "absent":
         outcome = CiWatchOutcome(
             status="passed", pr_checks=None, head_sha="abc123", attempts_used=1
+        )
+        expected = "non-authoritative"
+    elif kind == "skipped":
+        skipped_only = PullRequestChecks(
+            state="passing",
+            required_checks=(),
+            passing=(PullRequestCheck(name="docs", kind="check_run", status="skipped"),),
+            pending=(),
+            failing=(),
+            missing_required=(),
+            branch_protection_status="configured",
+            check_query_status="ok",
+        )
+        outcome = CiWatchOutcome(
+            status="passed", pr_checks=skipped_only, head_sha="abc123", attempts_used=1
         )
         expected = "non-authoritative"
     elif kind == "stale":
@@ -2812,6 +2844,63 @@ def test_ordinary_success_does_not_clear_carried_managed_ci_obligation(
 
     with pytest.raises(AgentLoopError, match="managed-exact-head-ci"):
         run_pr_loop(runner, pr_number=77, config=config)
+
+
+def test_ordinary_watcher_success_does_not_clear_carried_managed_ci_obligation(
+    tmp_path, monkeypatch
+):
+    items = _carried_ci_obligations()
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                reviewer="OpenAI Codex",
+                state="approved",
+                prior_item_dispositions=[
+                    {"item_id": item.item_id, "disposition": "resolved"}
+                    for item in items
+                ],
+            )
+        ],
+        pr_payload={
+            "comments": [
+                {
+                    "author": {"login": "coding-review-agent-loop"},
+                    "body": _carried_ci_review_comment(items),
+                }
+            ]
+        },
+    )
+    watcher_calls = []
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        pr_review_policy="selective-intermediate",
+        auto_merge=True,
+        watch_pending_ci=True,
+        max_rounds=1,
+    )
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: None)
+
+    def watch(*args, **kwargs):
+        watcher_calls.append(kwargs["metadata"].head_sha)
+        return CiWatchOutcome(
+            status="passed",
+            pr_checks=_watch_check_board("passing"),
+            head_sha="abc123",
+            attempts_used=1,
+        )
+
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+    monkeypatch.setattr(
+        orchestrator,
+        "merge_pr",
+        lambda *args, **kwargs: pytest.fail("managed obligation was bypassed"),
+    )
+
+    with pytest.raises(AgentLoopError, match="managed-exact-head-ci"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert watcher_calls == ["abc123"]
 
 
 def test_resume_machine_authority_upgrade_forces_full_reviewer_board(

@@ -29,6 +29,7 @@ from .protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
     MACHINE_AUTHORITY,
+    MACHINE_OBLIGATION_FIELDS,
     MACHINE_LIFECYCLE_STATES,
     MACHINE_OBLIGATION_KINDS,
     UNKNOWN_MACHINE_AUTHORITY,
@@ -499,10 +500,7 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         owner_evidence=evidence,
         owner_dispositions=owner_dispositions,
     )
-    machine_keys = {
-        "authority", "obligation_kind", "lifecycle", "failed_head_sha",
-        "candidate_head_sha", "obligation_identity",
-    }
+    machine_keys = MACHINE_OBLIGATION_FIELDS
     if machine_keys & payload.keys():
         for key in machine_keys:
             if key in payload and payload[key] is not None and not isinstance(payload[key], str):
@@ -528,7 +526,15 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
             obligation_identity=payload.get("obligation_identity"),
         )
         try:
-            return UnresolvedReviewItem(**core, **machine)
+            item = UnresolvedReviewItem(**core, **machine)
+            # ``None`` is a valid default for the in-memory dataclass, but a
+            # serialized record that contains machine keys and no usable
+            # machine value is still a machine-shaped record.  Preserve it as
+            # an explicit unknown blocker instead of reviving a reviewer
+            # finding that dispositions can clear.
+            if not item.is_machine_obligation:
+                raise ValueError("machine record contains no valid machine fields")
+            return item
         except ValueError as exc:
             return UnresolvedReviewItem(
                 **{**core, "notes": (*notes, f"Invalid persisted machine record: {exc}")},

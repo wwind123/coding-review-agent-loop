@@ -20,10 +20,12 @@ from coding_review_agent_loop.round_state import (
 )
 from coding_review_agent_loop.protocol import (
     MACHINE_AUTHORITY,
+    ReviewItemDisposition,
     UnresolvedReviewItem,
     UNKNOWN_MACHINE_AUTHORITY,
 )
 from coding_review_agent_loop.review_scheduling import ReviewSchedulingContract
+from coding_review_agent_loop.unresolved_items import _apply_unresolved_item_dispositions
 
 
 def _random_text(size: int) -> str:
@@ -325,6 +327,52 @@ def test_machine_obligation_and_qualification_checkpoint_round_trip() -> None:
     assert decoded.prior_items == (item,)
     assert decoded.qualification_checkpoint == checkpoint
     assert transport.decode_mapping(encoded)["prior_items"][0]["authority"] == MACHINE_AUTHORITY
+
+
+@pytest.mark.parametrize(
+    "machine_fields",
+    [
+        {"authority": "bogus"},
+        {"lifecycle": "repair_required"},
+        {"failed_head_sha": "oldhead123"},
+        {"candidate_head_sha": "newhead123"},
+        {"obligation_identity": "machine:item-30"},
+        {"authority": None, "obligation_kind": None, "lifecycle": None},
+    ],
+)
+def test_partial_or_invalid_machine_item_decodes_as_non_bypassable_unknown(
+    machine_fields,
+) -> None:
+    payload = {
+        "flow": "pr",
+        "role": "summary",
+        "agent": "Orchestrator",
+        "round_number": 14,
+        "subject": "newhead123",
+        "prior_items": [
+            {
+                "item_id": "item-30",
+                "reviewer": "GitHub managed exact-head CI",
+                "source_round": 13,
+                "text": "Persisted machine obligation.",
+                "status": "blocking",
+                **machine_fields,
+            }
+        ],
+    }
+
+    item = _decode_round_metadata_mapping(payload).prior_items[0]
+
+    assert item.is_machine_obligation
+    assert item.authority == UNKNOWN_MACHINE_AUTHORITY
+    assert item.obligation_kind == "unknown"
+    assert item.lifecycle == "repair_required"
+    retained, _ = _apply_unresolved_item_dispositions(
+        [item],
+        {item.item_id: [ReviewItemDisposition(item.item_id, "Codex", "resolved")]},
+        reconciliation_mode="owner-scoped",
+    )
+    assert retained == [item]
 
 
 def test_invalid_qualification_checkpoint_decodes_fail_closed() -> None:

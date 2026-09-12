@@ -148,6 +148,16 @@ MACHINE_LIFECYCLE_STATES = frozenset(
         "cleared",
     }
 )
+MACHINE_OBLIGATION_FIELDS = frozenset(
+    {
+        "authority",
+        "obligation_kind",
+        "lifecycle",
+        "failed_head_sha",
+        "candidate_head_sha",
+        "obligation_identity",
+    }
+)
 CI_MACHINE_OBLIGATION_KINDS = frozenset(
     {"managed-exact-head-ci", "github-pr-checks"}
 )
@@ -190,7 +200,20 @@ class UnresolvedReviewItem:
         authority = self.authority
         kind = self.obligation_kind
         lifecycle = self.lifecycle
-        machine = authority in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY} or kind is not None
+        # Any populated machine field makes this a machine record.  Do not
+        # let an invalid authority, a partial lifecycle/head tuple, or a
+        # machine identity without a kind fall back to an ordinary finding.
+        machine = any(
+            value is not None
+            for value in (
+                authority,
+                kind,
+                lifecycle,
+                self.failed_head_sha,
+                self.candidate_head_sha,
+                self.obligation_identity,
+            )
+        )
         if not machine:
             return
         if authority not in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY}:
