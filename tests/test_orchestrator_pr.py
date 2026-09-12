@@ -3154,11 +3154,29 @@ def test_post_review_ordinary_recovery_rejects_other_machine_obligation(
         "_finalize_ordinary_recovery_merge",
         lambda *args, **kwargs: pytest.fail("ordinary recovery bypassed another machine obligation"),
     )
+    guard_calls = []
+    original_guard = orchestrator._ensure_finalization_ready
+
+    def capture_guard(*args, **kwargs):
+        guard_calls.append(
+            {
+                "ignored_machine_kinds": kwargs.get("ignored_machine_kinds"),
+                "items": tuple(kwargs.get("items", ())),
+            }
+        )
+        return original_guard(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_ensure_finalization_ready", capture_guard)
 
     with pytest.raises(AgentLoopError, match="managed-exact-head-ci"):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+    assert len(guard_calls) == 1
+    assert guard_calls[0]["ignored_machine_kinds"] == frozenset({"github-pr-checks"})
+    assert [item.obligation_kind for item in guard_calls[0]["items"]] == [
+        "managed-exact-head-ci"
+    ]
 
 
 def test_auto_merge_supported_repo_dispatches_and_merges_exact_approved_head(

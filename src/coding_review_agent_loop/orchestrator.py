@@ -7778,6 +7778,32 @@ def _ensure_finalization_ready(
         )
 
 
+def _finalize_ordinary_recovery_checked(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    items: Sequence[UnresolvedReviewItem],
+    current_head_sha: str | None,
+    capability: OrdinaryRecoveryCapability,
+) -> bool:
+    """Run ordinary recovery only after every unrelated obligation is clear."""
+    _ensure_finalization_ready(
+        pr_number=pr_number,
+        round_number=round_number,
+        items=items,
+        current_head_sha=current_head_sha,
+        ignored_machine_kinds=frozenset({"github-pr-checks"}),
+    )
+    return _finalize_ordinary_recovery_merge(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        capability=capability,
+    )
+
+
 def _ordinary_checks_snapshot_is_authoritative(
     checks: PullRequestChecks | None,
 ) -> bool:
@@ -10924,17 +10950,13 @@ def run_pr_loop(
                             f"PR #{pr_number} was released to ordinary CI, but recovery provenance "
                             "could not be correlated; no merge attempted."
                         )
-                    _ensure_finalization_ready(
+                    merged = _finalize_ordinary_recovery_checked(
+                        runner,
+                        config=config,
                         pr_number=pr_number,
                         round_number=round_number,
                         items=unresolved_items,
                         current_head_sha=pr_metadata.head_sha,
-                        ignored_machine_kinds=frozenset({"github-pr-checks"}),
-                    )
-                    merged = _finalize_ordinary_recovery_merge(
-                        runner,
-                        config=config,
-                        pr_number=pr_number,
                         capability=ordinary_recovery,
                     )
                     if merged:
@@ -11643,17 +11665,13 @@ def run_pr_loop(
                                         f"PR #{pr_number} managed resume could not be correlated to ordinary "
                                         "recovery CI; no merge attempted."
                                     )
-                                _ensure_finalization_ready(
+                                merged = _finalize_ordinary_recovery_checked(
+                                    runner,
+                                    config=config,
                                     pr_number=pr_number,
                                     round_number=round_number,
                                     items=unresolved_items,
                                     current_head_sha=pr_metadata.head_sha,
-                                    ignored_machine_kinds=frozenset({"github-pr-checks"}),
-                                )
-                                merged = _finalize_ordinary_recovery_merge(
-                                    runner,
-                                    config=config,
-                                    pr_number=pr_number,
                                     capability=ordinary_recovery,
                                 )
                                 if merged:
@@ -11922,17 +11940,13 @@ def run_pr_loop(
                                     f"PR #{pr_number} ordinary recovery provenance is unavailable; "
                                     "no merge attempted."
                                 )
-                            _ensure_finalization_ready(
+                            merged = _finalize_ordinary_recovery_checked(
+                                runner,
+                                config=config,
                                 pr_number=pr_number,
                                 round_number=round_number,
                                 items=unresolved_items,
                                 current_head_sha=pr_metadata.head_sha,
-                                ignored_machine_kinds=frozenset({"github-pr-checks"}),
-                            )
-                            merged = _finalize_ordinary_recovery_merge(
-                                runner,
-                                config=config,
-                                pr_number=pr_number,
                                 capability=ordinary_recovery,
                             )
                             if merged:
