@@ -357,6 +357,15 @@ class QualificationCheckpoint:
             return cls.invalid("checkpoint has an unknown obligation kind")
         if value["lifecycle"] not in MACHINE_LIFECYCLE_STATES - {"cleared"}:
             return cls.invalid("checkpoint has an unknown lifecycle")
+        if value["lifecycle"] in {"qualification_ready", "qualifying"} and (
+            not isinstance(value["approval_digest"], str)
+            or not value["approval_digest"].strip()
+            or not isinstance(value["scheduler_digest"], str)
+            or not value["scheduler_digest"].strip()
+        ):
+            return cls.invalid(
+                "qualification checkpoint is missing review or scheduler identity"
+            )
         if (
             not isinstance(value["watch_failure_extension_used"], bool)
             or not isinstance(value["watch_head_extension_used"], bool)

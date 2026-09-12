@@ -157,6 +157,140 @@ def test_orchestrator_finalization_guard_rejects_uncleared_machine_obligation():
         )
 
 
+@pytest.mark.parametrize("status", ["skipped", "neutral"])
+def test_ordinary_checks_authority_rejects_non_executed_passing_conclusions(status):
+    check = PullRequestCheck(name="test", kind="check_run", status=status)
+    checks = PullRequestChecks(
+        state="passing",
+        required_checks=("test",),
+        passing=(check,),
+        pending=(),
+        failing=(),
+        missing_required=(),
+        branch_protection_status="configured",
+        check_query_status="ok",
+    )
+
+    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+
+
+def test_ordinary_checks_authority_requires_a_real_success_conclusion():
+    check = PullRequestCheck(name="test", kind="check_run", status="success")
+    checks = PullRequestChecks(
+        state="passing",
+        required_checks=("test",),
+        passing=(check,),
+        pending=(),
+        failing=(),
+        missing_required=(),
+        branch_protection_status="configured",
+        check_query_status="ok",
+    )
+
+    assert orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+
+
+def test_ordinary_checks_authority_rejects_absent_partial_or_unavailable_boards():
+    success = PullRequestCheck(name="test", kind="check_run", status="success")
+    for state, query, missing in (
+        ("no_checks", "ok", ()),
+        ("unavailable", "unavailable", ()),
+        ("passing", "partial", ()),
+        ("passing", "ok", ("test",)),
+    ):
+        checks = PullRequestChecks(
+            state=state,
+            required_checks=("test",),
+            passing=(success,),
+            pending=(),
+            failing=(),
+            missing_required=missing,
+            branch_protection_status="configured",
+            check_query_status=query,
+        )
+        assert not orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+
+
+def test_machine_authority_clears_only_its_own_obligation_kind():
+    managed = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed CI failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualification_ready",
+        failed_head_sha="old",
+        candidate_head_sha="new",
+    )
+    ordinary = dataclasses.replace(
+        managed,
+        item_id="item-2",
+        reviewer="GitHub PR checks",
+        text="Ordinary checks failed.",
+        obligation_kind="github-pr-checks",
+        obligation_identity="github-pr-checks:item-2",
+    )
+
+    after_managed = orchestrator._clear_machine_obligations(
+        [managed, ordinary], kind="managed-exact-head-ci"
+    )
+    after_ordinary = orchestrator._clear_machine_obligations(
+        [managed, ordinary], kind="github-pr-checks"
+    )
+
+    assert [item.obligation_kind for item in after_managed] == ["github-pr-checks"]
+    assert [item.obligation_kind for item in after_ordinary] == ["managed-exact-head-ci"]
+
+
+def test_qualification_checkpoint_review_identity_is_fail_closed():
+    item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed CI failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="qualifying",
+        failed_head_sha="old",
+        candidate_head_sha="new",
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity=item.obligation_identity,
+        lifecycle="qualifying",
+        failed_head_sha="old",
+        candidate_head_sha="new",
+        base_branch="main",
+        approval_digest="approval",
+        scheduler_digest="scheduler",
+        allowed_rounds=1,
+    )
+
+    assert not orchestrator._qualification_checkpoint_review_identity_matches(
+        checkpoint,
+        configured_reviewers=("codex",),
+        current_approvals={},
+        unresolved_items=[item],
+    )
+    complete = dataclasses.replace(
+        checkpoint,
+        approval_digest=orchestrator._qualification_digest(("Codex",)),
+        scheduler_digest=orchestrator._qualification_digest(
+            orchestrator._prior_item_ledger_signature([item])
+        ),
+    )
+    assert orchestrator._qualification_checkpoint_review_identity_matches(
+        complete,
+        configured_reviewers=("codex",),
+        current_approvals={"Codex": object()},
+        unresolved_items=[item],
+    )
+
+
 def test_machine_checkpoint_revert_returns_to_repair_required_without_value_error():
     item = UnresolvedReviewItem(
         item_id="item-30",
@@ -2229,15 +2363,18 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
 def _watch_check_board(
     state,
     *,
+    passing=(),
     failing=(),
     pending=(),
     missing_required=(),
     errors=(),
 ):
+    if state == "passing" and not passing:
+        passing = (PullRequestCheck(name="test", kind="check_run", status="success"),)
     return PullRequestChecks(
         state=state,
         required_checks=("test",),
-        passing=(),
+        passing=tuple(passing),
         pending=tuple(pending),
         failing=tuple(failing),
         missing_required=tuple(missing_required),
@@ -2538,6 +2675,10 @@ def test_managed_qualification_resume_attaches_without_redispatch(
         failed_head_sha="old-head",
         candidate_head_sha="abc123",
         base_branch="main",
+        approval_digest=orchestrator._qualification_digest(("Codex",)),
+        scheduler_digest=orchestrator._qualification_digest(
+            orchestrator._prior_item_ledger_signature((item,))
+        ),
         qualification_attempt_id="123/1",
         allowed_rounds=1,
     )

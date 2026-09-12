@@ -19,6 +19,7 @@ from coding_review_agent_loop.round_state import (
     _attach_round_metadata,
     _decode_round_metadata_mapping,
     _encode_round_metadata,
+    _prior_item_ledger_signature,
 )
 from coding_review_agent_loop.orchestrator import (
     _all_pending_resolution_owners_unavailable,
@@ -799,6 +800,41 @@ def test_selective_machine_ci_obligation_survives_reviewer_approval_until_new_he
     )
     assert "reviewed correction awaiting authoritative qualification" in diagnostic
     assert "reviewer" not in diagnostic.lower()
+
+
+def test_machine_authority_upgrade_changes_scheduler_digest_and_forces_full_board():
+    legacy = UnresolvedReviewItem(
+        item_id="item-30",
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        source_status="blocking",
+    )
+    promoted = _next_unresolved_item(
+        item_number=30,
+        reviewer="GitHub managed exact-head CI",
+        source_round=13,
+        text="Managed exact-head CI failed.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="repair_required",
+        failed_head_sha="oldhead123",
+    )
+
+    assert _prior_item_ledger_signature((legacy,)) != _prior_item_ledger_signature((promoted,))
+    decision = select_reviewers(
+        SchedulerSnapshot(
+            previous_sha="a" * 40,
+            current_sha="b" * 40,
+            contract=_contract(),
+            obligations=(),
+            force_full=True,
+        ),
+        TransitionClassification("narrow", "same scoped change"),
+    )
+    assert decision.selected_reviewers == _contract().required_reviewers
 
 
 @pytest.mark.parametrize(

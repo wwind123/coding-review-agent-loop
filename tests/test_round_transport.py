@@ -360,6 +360,33 @@ def test_invalid_qualification_checkpoint_decodes_fail_closed() -> None:
     assert decoded.qualification_checkpoint.obligation_kind == "unknown"
 
 
+@pytest.mark.parametrize("missing", ["approval_digest", "scheduler_digest"])
+def test_qualification_checkpoint_missing_resume_identity_decodes_fail_closed(missing):
+    checkpoint = {
+        "obligation_kind": "managed-exact-head-ci",
+        "obligation_identity": "managed-exact-head-ci:item-30",
+        "lifecycle": "qualifying",
+        "failed_head_sha": "oldhead123",
+        "candidate_head_sha": "newhead123",
+        "base_branch": "main",
+        "approval_digest": "approval",
+        "plan_digest": None,
+        "requirements_digest": "requirements",
+        "acquisition_digest": "acquisition",
+        "scheduler_digest": "scheduler",
+        "qualification_attempt_id": "run/1",
+        "watch_failure_extension_used": False,
+        "watch_head_extension_used": False,
+        "allowed_rounds": 1,
+    }
+    checkpoint[missing] = None
+
+    decoded = QualificationCheckpoint.from_mapping(checkpoint)
+
+    assert not decoded.valid
+    assert decoded.obligation_kind == "unknown"
+
+
 @pytest.mark.parametrize(
     ("kind", "lifecycle", "candidate", "failed"),
     [

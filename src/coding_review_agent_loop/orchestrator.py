@@ -7620,6 +7620,42 @@ def _qualification_digest(value: object) -> str:
     return hashlib.sha256(repr(value).encode("utf-8")).hexdigest()[:16]
 
 
+def _qualification_checkpoint_review_identity_matches(
+    checkpoint: QualificationCheckpoint,
+    *,
+    configured_reviewers: Sequence[AgentName],
+    current_approvals: Mapping[str, object],
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> bool:
+    """Check the durable proof needed to skip a resumed reviewer board.
+
+    Repair handoffs do not claim that the candidate has been reviewed.  Once a
+    checkpoint says that the candidate is ready for, or is already in, final
+    qualification, however, it may suppress reviewer execution only when the
+    persisted identities still describe the live transcript.  In particular,
+    a summary-only checkpoint or a checkpoint with a changed ledger must force
+    the normal full-board recovery path.
+    """
+    if checkpoint.lifecycle not in {"qualification_ready", "qualifying"}:
+        return True
+    expected_reviewers = {
+        agent_display_name(reviewer) for reviewer in configured_reviewers
+    }
+    observed_reviewers = set(current_approvals)
+    if observed_reviewers != expected_reviewers:
+        return False
+    if not checkpoint.approval_digest or not checkpoint.scheduler_digest:
+        return False
+    current_approval_digest = _qualification_digest(tuple(sorted(observed_reviewers)))
+    current_scheduler_digest = _qualification_digest(
+        _prior_item_ledger_signature(unresolved_items)
+    )
+    return (
+        checkpoint.approval_digest == current_approval_digest
+        and checkpoint.scheduler_digest == current_scheduler_digest
+    )
+
+
 def _round_limit_diagnostic(
     *,
     pr_number: int,
@@ -7718,6 +7754,24 @@ def _ordinary_checks_snapshot_is_authoritative(
     result keeps a passing-looking partial, absent, or unavailable snapshot
     from becoming a final gate.
     """
+    # ``PullRequestChecks.state`` deliberately treats neutral and skipped
+    # conclusions as passing for ordinary status reporting.  That aggregate is
+    # useful for display, but it is not evidence that a final gate actually
+    # ran.  A clearing snapshot must contain a real success conclusion; when
+    # branch protection names required checks, each of those checks must also
+    # have that conclusion.
+    successful_checks = tuple(
+        check for check in (checks.passing if checks is not None else ())
+        if check.status.strip().lower() == "success"
+    )
+    required_names = set(checks.required_checks) if checks is not None else set()
+    required_success_names = {
+        check.name for check in successful_checks if check.name in required_names
+    }
+    required_observations = (
+        check for check in (checks.passing if checks is not None else ())
+        if check.name in required_names
+    )
     return bool(
         checks is not None
         and checks.state == "passing"
@@ -7725,6 +7779,16 @@ def _ordinary_checks_snapshot_is_authoritative(
         and checks.branch_protection_status in {"configured", "not_found", "forbidden"}
         and not checks.pending
         and not checks.missing_required
+        and successful_checks
+        and all(
+            check.status.strip().lower() == "success"
+            for check in checks.passing
+        )
+        and required_success_names == required_names
+        and all(
+            check.status.strip().lower() == "success"
+            for check in required_observations
+        )
     )
 
 
@@ -9216,6 +9280,26 @@ def run_pr_loop(
                     reviewer_acquisition_contract if selective_policy else None
                 ),
             )
+            if (
+                qualification_checkpoint is not None
+                and qualification_checkpoint.valid
+                and qualification_checkpoint.lifecycle
+                in {"qualification_ready", "qualifying"}
+                and not _qualification_checkpoint_review_identity_matches(
+                    qualification_checkpoint,
+                    configured_reviewers=configured_reviewers,
+                    current_approvals=unchanged_head_approvals,
+                    unresolved_items=unresolved_items,
+                )
+            ):
+                # A persisted readiness marker is only a cache.  Missing
+                # reviewer records, a changed approval set, or a changed
+                # authority/ledger signature must never suppress the board.
+                qualification_checkpoint = QualificationCheckpoint.invalid(
+                    "qualification checkpoint review identities are incomplete or stale"
+                )
+                scheduler_force_full = True
+                final_sweep_pending = True
             skip_reviewers_for_recovery = bool(
                 current_resume is not None
                 and (
