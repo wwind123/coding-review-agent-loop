@@ -121,7 +121,7 @@ def _fresh_v1_plan_for_isolation(strategy: str) -> str:
 @pytest.mark.parametrize("strategy", ["one-shot", "staged"])
 @pytest.mark.parametrize(
     "execution_mode",
-    ["plan-only", "implement-one-shot", "decompose-only", "implement-by-phase"],
+    ["plan-only", "implement-one-shot", "decompose-only", "implement-by-phase", "auto"],
 )
 @pytest.mark.parametrize("materialize", [False, True])
 def test_fresh_v1_recommendation_is_inert_at_legacy_split_seam(
@@ -196,12 +196,15 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
 
     compatible = (
         execution_mode == "plan-only"
-        or strategy == "one-shot" and execution_mode == "implement-one-shot"
-        or strategy == "staged" and execution_mode in {"decompose-only", "implement-by-phase"}
+        or strategy == "one-shot" and execution_mode in {"implement-one-shot", "auto"}
+        or strategy == "staged" and execution_mode in {"decompose-only", "implement-by-phase", "auto"}
     )
     if compatible:
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
-        assert tuple(events) == expected_events if execution_mode != "plan-only" else tuple(events) == ()
+        expected = expected_events
+        if execution_mode == "auto":
+            expected = ("implement",) if strategy == "one-shot" else ("decompose", "implement")
+        assert tuple(events) == expected if execution_mode != "plan-only" else tuple(events) == ()
         assert runner.issues == []
         assert not any("AGENT_PLAN_TOPOLOGY_CHECKPOINT" in comment for comment in runner.comments)
         assert not any("AGENT_DISCUSS_SPLIT" in comment for comment in runner.comments)
@@ -214,6 +217,54 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
         assert not any("AGENT_PLAN_DECOMPOSITION" in comment for comment in runner.comments)
         assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("strategy", ["one-shot", "staged"])
+def test_auto_dry_run_previews_without_approval_bound_mutation(tmp_path, capsys, strategy):
+    plan = _fresh_v1_plan_for_isolation(strategy)
+    runner = FakeRunner(
+        claude_outputs=[plan],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(
+            tmp_path,
+            dry_run=True,
+            plan_execution_mode="auto",
+            execution_strategy_contract_required=True,
+        ),
+        plan_first=True,
+    ) == 0
+
+    assert "dry-run preview" in capsys.readouterr().out
+    assert runner.issues == []
+    assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
+    assert not any("AGENT_PLAN_DECOMPOSITION" in comment for comment in runner.comments)
+    assert not any("AGENT_PLAN_ONE_SHOT_IMPL" in comment for comment in runner.comments)
+    assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
+    assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+
+def test_auto_refuses_legacy_undecided_approved_plan_before_mutation(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[structured_plan_state(summary="Historical plan without a strategy.")],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+
+    with pytest.raises(AgentLoopError, match="legacy-undecided"):
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, plan_execution_mode="auto"),
+            plan_first=True,
+        )
+
+    assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
+    assert not any("AGENT_PLAN_ONE_SHOT_IMPL" in comment for comment in runner.comments)
+    assert runner.issues == []
 
 
 def test_fresh_staged_recovery_conflict_is_rejected_before_decision_record(tmp_path):

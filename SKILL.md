@@ -248,6 +248,9 @@ but it does not create child issues, post markers, push branches, or open a real
 PR. Dry-run child issue numbers may be absent, so the JSON is a preview of the
 phase that would be implemented.
 
+The `auto` policy is not a supported interactive skill-mode surface for #787;
+these existing explicit helpers remain unchanged.
+
 ### PR-loop (for PR N)
 
 1. Run one round. The PR diff is fetched automatically — there is no plan-file

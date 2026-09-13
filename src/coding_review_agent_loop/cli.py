@@ -770,17 +770,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     issue.add_argument(
         "--plan-execution-mode",
-        choices=("plan-only", "decompose-only", "implement-one-shot", "implement-by-phase"),
+        choices=("plan-only", "decompose-only", "implement-one-shot", "implement-by-phase", "auto"),
         default=None,
         help=(
             "With --plan-first, choose what happens after approval: plan-only, "
-            "decompose-only, implement-one-shot, or implement-by-phase. "
+            "decompose-only, implement-one-shot, implement-by-phase, or auto. "
+            "auto selects one-shot or by-phase from the reviewed recommendation "
+            "only after approval; it is not a pre-approval topology choice. "
             "Defaults to plan-only unless --implement-after-approval is used. "
             "--implement-after-approval is a one-shot alias and cannot be combined "
-            "with any explicit non-one-shot mode. "
+            "with auto or any explicit non-one-shot mode. "
             "decompose-only/implement-by-phase already create one detailed child "
             "issue per phase; do not also pass --materialize-split-issues for the "
-            "same run. See docs/local_agent_loop.md#phased-decomposition-versus-split-materialization."
+            "same run. auto cannot be combined with --materialize-split-issues "
+            "or --split-stage because the topology is unknown before approval. "
+            "See docs/local_agent_loop.md#phased-decomposition-versus-split-materialization."
         ),
     )
     issue.add_argument(
@@ -790,8 +794,9 @@ def build_parser() -> argparse.ArgumentParser:
             "File a linked child GitHub issue for each remaining discuss `split` proposal "
             "or plan `deferred_stages` entry instead of leaving them as unfiled text "
             "(default: off, warning-only). Do not combine with "
-            "--plan-execution-mode decompose-only or implement-by-phase, which already "
-            "create detailed child issues. See "
+            "--plan-execution-mode decompose-only, implement-by-phase, or auto. The "
+            "first two already create detailed child issues; auto selects its topology "
+            "only after approval. See "
             "docs/local_agent_loop.md#phased-decomposition-versus-split-materialization."
         ),
     )
@@ -1410,6 +1415,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "--plan-execution-mode decompose-only or implement-by-phase; "
                     "those modes select one child topology source."
                 )
+            if plan_execution_mode == "auto" and getattr(args, "materialize_split_issues", False):
+                raise AgentLoopError(
+                    "--materialize-split-issues cannot be combined with "
+                    "--plan-execution-mode auto; automatic routing selects the reviewed "
+                    "topology after approval."
+                )
+            if plan_execution_mode == "auto" and getattr(args, "split_stage", None) is not None:
+                raise AgentLoopError(
+                    "--split-stage cannot be combined with --plan-execution-mode auto; "
+                    "automatic routing selects the reviewed topology after approval."
+                )
             config = AgentLoopConfig(
                 **{
                     **config.__dict__,
@@ -1421,7 +1437,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 issue_number=args.issue_number,
                 config=config,
                 plan_first=args.plan_first,
-                implement_after_approval=plan_execution_mode == "implement-one-shot",
             )
         if args.command == "pr":
             return run_pr_loop(runner, pr_number=args.pr_number, config=config)

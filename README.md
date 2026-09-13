@@ -311,7 +311,7 @@ gates.
 
 ## Planning and Decomposition
 
-Plan-first mode supports four post-approval choices:
+Plan-first mode supports five post-approval choices:
 
 | Mode | Result after plan approval |
 | --- | --- |
@@ -319,6 +319,7 @@ Plan-first mode supports four post-approval choices:
 | `implement-one-shot` | Implement the approved plan in one PR. |
 | `decompose-only` | Create detailed child issues for the approved phases and stop. |
 | `implement-by-phase` | Create the phase issues and implement only the first phase. |
+| `auto` | After approval, select one-shot or by-phase from the reviewed recommendation. |
 
 Example:
 
@@ -332,7 +333,8 @@ agent-loop issue 123 --repo OWNER/REPO \
 different mechanisms. Do not combine them for the same decomposition: doing so
 can create duplicate children. Use the former for detailed approved phases and
 the latter for discuss-mode split proposals or eligible plan-only deferred
-work. Read
+work. `auto` cannot be combined with either `--materialize-split-issues` or
+`--split-stage`, because its topology is unknown until approval. Read
 [Phased decomposition versus split materialization](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization)
 before filing child issues.
 

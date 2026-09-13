@@ -1,5 +1,6 @@
 import json
 import re
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -53,6 +54,7 @@ from coding_review_agent_loop.protocol import (
     PlanReviewItems,
     ReviewItemDisposition,
     UnresolvedReviewItem,
+    validate_structured_plan_state,
     validate_structured_issue_implementation,
 )
 from coding_review_agent_loop.salvage import (
@@ -74,6 +76,49 @@ from agent_loop_helpers import (
     structured_pr_review,
     structured_issue_implementation,
 )
+
+
+def test_auto_execution_resolves_one_shot_after_approval(tmp_path):
+    config = make_config(tmp_path, plan_execution_mode="auto")
+    recommendation = validate_structured_plan_state(
+        structured_v1_plan_state()
+    ).execution_recommendation
+
+    resolved = orchestrator_module._resolve_execution_policy(
+        config,
+        recommendation=recommendation,
+    )
+
+    assert resolved.requested_policy == "auto"
+    assert resolved.action == "implement-one-shot"
+    assert resolved.strategy == "one-shot"
+
+
+def test_auto_execution_resolves_staged_after_approval(tmp_path):
+    config = make_config(tmp_path, plan_execution_mode="auto")
+    recommendation = validate_structured_plan_state(
+        structured_v1_plan_state()
+    ).execution_recommendation
+    staged_recommendation = replace(recommendation, strategy="staged")
+
+    resolved = orchestrator_module._resolve_execution_policy(
+        config,
+        recommendation=staged_recommendation,
+    )
+
+    assert resolved.requested_policy == "auto"
+    assert resolved.action == "implement-by-phase"
+    assert resolved.strategy == "staged"
+
+
+def test_auto_execution_rejects_legacy_undecided_plan(tmp_path):
+    config = make_config(tmp_path, plan_execution_mode="auto")
+
+    with pytest.raises(AgentLoopError, match="legacy-undecided"):
+        orchestrator_module._resolve_execution_policy(
+            config,
+            recommendation=None,
+        )
 
 
 def test_issue_resume_prompt_retains_configured_command_when_wrapper_probe_fails(

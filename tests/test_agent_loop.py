@@ -2081,7 +2081,7 @@ def test_approved_followups_cli_mode_is_configurable(tmp_path, mode):
 
 @pytest.mark.parametrize(
     "mode",
-    ["plan-only", "decompose-only", "implement-one-shot", "implement-by-phase"],
+    ["plan-only", "decompose-only", "implement-one-shot", "implement-by-phase", "auto"],
 )
 def test_plan_execution_mode_cli_is_configurable(tmp_path, mode):
     parser = build_parser()
@@ -2185,7 +2185,7 @@ def test_plan_first_post_approval_options_require_plan_first(capsys):
     assert "--plan-execution-mode requires --plan-first" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("mode", ["plan-only", "decompose-only", "implement-by-phase"])
+@pytest.mark.parametrize("mode", ["plan-only", "decompose-only", "implement-by-phase", "auto"])
 def test_cli_rejects_alias_with_conflicting_explicit_execution_mode(tmp_path, capsys, mode):
     result = main([
         "issue", "56", "--repo", "OWNER/REPO", "--plan-first",
@@ -2199,11 +2199,25 @@ def test_cli_rejects_alias_with_conflicting_explicit_execution_mode(tmp_path, ca
     assert "--implement-after-approval is only compatible" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("mode", ["decompose-only", "implement-by-phase"])
+@pytest.mark.parametrize("mode", ["decompose-only", "implement-by-phase", "auto"])
 def test_cli_rejects_split_materialization_with_decomposition_modes(tmp_path, capsys, mode):
     result = main([
         "issue", "56", "--repo", "OWNER/REPO", "--plan-first",
         "--plan-execution-mode", mode, "--materialize-split-issues",
+        "--claude-dir", str(tmp_path / "claude"),
+        "--codex-dir", str(tmp_path / "codex"),
+        "--gemini-dir", str(tmp_path / "gemini"),
+        "--dry-run",
+    ])
+
+    assert result == 1
+    assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_cli_rejects_split_stage_with_auto(tmp_path, capsys):
+    result = main([
+        "issue", "56", "--repo", "OWNER/REPO", "--plan-first",
+        "--plan-execution-mode", "auto", "--split-stage", "1",
         "--claude-dir", str(tmp_path / "claude"),
         "--codex-dir", str(tmp_path / "codex"),
         "--gemini-dir", str(tmp_path / "gemini"),
