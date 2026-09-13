@@ -24,6 +24,10 @@ _EXECUTION_RECOMMENDATION_RE = re.compile(
     r"(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
     re.I,
 )
+_EXECUTION_RECOMMENDATION_HEADING_RE = re.compile(
+    r"(?m)^###\s+Execution strategy recommendation \(v1\)\s*$",
+    re.I,
+)
 # Spill reviewer checkpoints first: they are often the largest metadata field
 # and are required to safely resume a provisional parallel-review round.
 _SPILL_FIELDS = (
@@ -109,7 +113,7 @@ def _sidecar(payload: Mapping[str, object]) -> TrustedBody:
 
 def _prepare_execution_recommendation_transport(
     body_text: str,
-) -> tuple[str, list[TrustedBody]]:
+) -> tuple[str, list[TrustedBody], tuple[int, int, str] | None]:
     """Spill an oversized v1 recommendation into bounded round sidecars.
 
     The recommendation marker remains in the public anchor as a small reference;
@@ -118,7 +122,7 @@ def _prepare_execution_recommendation_transport(
     """
     matches = list(_EXECUTION_RECOMMENDATION_RE.finditer(body_text))
     if not matches or len(body_text) <= MAX_GITHUB_BODY_CHARS:
-        return body_text, []
+        return body_text, [], None
     match = matches[-1]
     try:
         raw_payload = base64.urlsafe_b64decode(match.group("payload").encode("ascii"))
@@ -130,7 +134,7 @@ def _prepare_execution_recommendation_transport(
             "Execution recommendation marker is not a recoverable JSON object."
         ) from exc
     if "$round_transport_execution_recommendation" in parsed:
-        return body_text, []
+        return body_text, [], None
 
     canonical_raw = json.dumps(
         parsed, separators=(",", ":"), sort_keys=True, ensure_ascii=False
@@ -176,7 +180,124 @@ def _prepare_execution_recommendation_transport(
         )
         for index, chunk in enumerate(chunks)
     ]
-    return transformed, sidecars
+
+    # The complete recommendation is needed by agents and resume, but its
+    # human-readable projection is deliberately unbounded.  Once the marker
+    # has been moved into transport sidecars, replace the whole rendered
+    # section with a bounded, explicit summary.  The canonical plan in round
+    # metadata remains lossless, and the marker below lets readers hydrate the
+    # same structured object from the sidecars.
+    headings = [
+        heading
+        for heading in _EXECUTION_RECOMMENDATION_HEADING_RE.finditer(body_text)
+        if heading.end() <= match.start()
+    ]
+    if not headings:
+        return transformed, sidecars, None
+    heading = headings[-1]
+    transported_matches = list(_EXECUTION_RECOMMENDATION_RE.finditer(transformed))
+    if not transported_matches:
+        raise AgentLoopError(
+            "Execution recommendation transport rewrite lost its protocol marker."
+        )
+    transported_match = transported_matches[-1]
+    preserved_markers = [
+        occurrence.text
+        for occurrence in scan_reserved_markers(body_text)
+        if (
+            heading.start() <= occurrence.start < match.end()
+            and occurrence.definition.token != "AGENT_EXECUTION_RECOMMENDATION"
+        )
+    ]
+    compact_lines = [
+        "### Execution strategy recommendation (v1)",
+    ]
+    if parsed.get("strategy") in {"one-shot", "staged"}:
+        compact_lines.append(f"- `strategy`: `{parsed['strategy']}`")
+    if parsed.get("staging_feasibility") in {"safe", "inseparable"}:
+        compact_lines.append(
+            f"- `staging_feasibility`: `{parsed['staging_feasibility']}`"
+        )
+    compact_lines.extend(
+        [
+            "The complete validated execution recommendation is retained in the "
+            "canonical plan metadata and bounded transport sidecars for reviewer "
+            "prompts and lossless resume.",
+            *preserved_markers,
+            transported_match.group(0),
+        ]
+    )
+    compact_section = "\n".join(compact_lines)
+    compacted = (
+        transformed[: heading.start()]
+        + compact_section
+        + transformed[transported_match.end() :]
+    )
+    # The range is expressed in the original carrier so the caller can retain
+    # authorization for every marker outside the rewritten recommendation.
+    return compacted, sidecars, (heading.start(), match.end(), compact_section)
+
+
+def _replace_authorized_range(
+    carrier: TrustedBody,
+    *,
+    start: int,
+    end: int,
+    replacement: TrustedBody,
+) -> TrustedBody:
+    """Replace visible text while retaining marker provenance around it."""
+    original = str(carrier)
+    if start < 0 or end < start or end > len(original):
+        raise AgentLoopError("Cannot transport an invalid authorized text range.")
+
+    segments = []
+    cursor = 0
+    inserted = False
+    replacement_markers = {
+        (segment.token, segment.text)
+        for segment in replacement._segments
+        if segment.token is not None
+    }
+    for segment in carrier._segments:
+        segment_start = cursor
+        segment_end = cursor + len(segment.text)
+        overlaps = segment_start < end and segment_end > start
+        if not overlaps:
+            if not inserted and segment_start >= end:
+                segments.extend(replacement._segments)
+                inserted = True
+            segments.append(segment)
+        else:
+            if segment.token is not None:
+                if not (
+                    start <= segment_start
+                    and segment_end <= end
+                    and (
+                        segment.token == "AGENT_EXECUTION_RECOMMENDATION"
+                        or (segment.token, segment.text) in replacement_markers
+                    )
+                ):
+                    raise AgentLoopError(
+                        "Cannot transport a range containing an unrelated authorized marker."
+                    )
+            else:
+                if segment_start < start:
+                    segments.append(
+                        type(segment)(segment.text[: start - segment_start])
+                    )
+                if not inserted:
+                    segments.extend(replacement._segments)
+                    inserted = True
+                if segment_end > end:
+                    segments.append(type(segment)(segment.text[end - segment_start :]))
+        cursor = segment_end
+
+    if not inserted:
+        segments.extend(replacement._segments)
+    return TrustedBody(
+        "".join(segment.text for segment in segments),
+        tuple(segment for segment in segments if segment.text),
+    )
 
 
 def _replace_authorized_marker(
@@ -221,9 +342,26 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             )
         )
     body_text = str(carrier)
-    body_text, sidecars = _prepare_execution_recommendation_transport(body_text)
+    body_text, sidecars, execution_rewrite = _prepare_execution_recommendation_transport(
+        body_text
+    )
     trusted_anchor = carrier
-    if sidecars:
+    if execution_rewrite is not None:
+        start, end, compact_section = execution_rewrite
+        trusted_compact_section = TrustedBody.canonical(
+            compact_section,
+            expected_tokens=tuple(
+                occurrence.definition.token
+                for occurrence in scan_reserved_markers(compact_section)
+            ),
+        )
+        trusted_anchor = _replace_authorized_range(
+            trusted_anchor,
+            start=start,
+            end=end,
+            replacement=trusted_compact_section,
+        )
+    elif sidecars:
         original_execution = _EXECUTION_RECOMMENDATION_RE.search(str(carrier))
         transported_execution = _EXECUTION_RECOMMENDATION_RE.search(body_text)
         if original_execution is not None and transported_execution is not None:

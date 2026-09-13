@@ -24,6 +24,7 @@ from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
     UNKNOWN_MACHINE_AUTHORITY,
+    validate_structured_plan_state,
 )
 from coding_review_agent_loop.review_scheduling import ReviewSchedulingContract
 from coding_review_agent_loop.unresolved_items import _apply_unresolved_item_dispositions
@@ -175,6 +176,51 @@ def test_oversized_execution_recommendation_uses_bounded_lossless_sidecar() -> N
     assert comment_rendering.decode_execution_recommendation_marker(
         marker.group("payload"), bodies=tuple(map(str, prepared))
     ) == recommendation
+
+
+def test_rendered_oversized_execution_recommendation_keeps_anchor_bounded_and_reviewable() -> None:
+    from agent_loop_helpers import structured_v1_plan_state
+
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["execution_recommendation"]["rationale"] = _random_text(50_000)
+    parsed = validate_structured_plan_state(
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder",
+        require_execution_strategy_contract=1,
+    )
+    rendered = comment_rendering.render_execution_recommendation_section(
+        parsed.execution_recommendation
+    )
+    rendered = _attach_round_metadata(
+        rendered,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="codex",
+            round_number=1,
+            subject="plan-subject",
+        ),
+    )
+    assert len(rendered) > transport.MAX_GITHUB_BODY_CHARS
+
+    prepared = transport.prepare_round_comment(rendered)
+    anchor_body = prepared[-1]
+    anchor = str(anchor_body)
+
+    assert len(anchor) <= transport.MAX_GITHUB_BODY_CHARS
+    assert "complete validated execution recommendation" in anchor
+    assert "`strategy`: `one-shot`" in anchor
+    assert "`staging_feasibility`: `inseparable`" in anchor
+    assert "AGENT_LOOP_META" in anchor
+    assert "rationale" not in anchor
+    marker = list(comment_rendering.EXECUTION_RECOMMENDATION_MARKER_RE.finditer(anchor))[-1]
+    assert comment_rendering.decode_execution_recommendation_marker(
+        marker.group("payload"), bodies=tuple(map(str, prepared))
+    ) == parsed.execution_recommendation.to_payload()
+    assert all(
+        len(item) <= transport.MAX_GITHUB_BODY_CHARS
+        for item in prepared
+    )
+    anchor_body.validate_for_surface("issue_comment")
 
 
 def test_prepare_round_comment_spills_multiple_fields_in_fixed_order() -> None:
