@@ -10,6 +10,9 @@ from pathlib import Path
 
 import pytest
 
+from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
+from helpers.prompt_builders import build_review_prompt_for_skill
+
 
 def test_demo_loop_dry_run() -> None:
     """
@@ -67,3 +70,18 @@ def test_demo_loop_dry_run() -> None:
     assert session_path.exists(), f"session file not found: {session_path}"
     data = json.loads(session_path.read_text(encoding="utf-8"))
     assert data.get("last_completed_step") == "post_review", data
+
+
+def test_skill_review_builder_accepts_frozen_architecture_snapshot(tmp_path) -> None:
+    snapshot = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="a" * 40,
+        blob_oid="b" * 40, sha256="c" * 64, availability="available",
+        size=12, content="# Components\n",
+    )
+    prompt = build_review_prompt_for_skill(
+        {"number": 77, "title": "PR", "body": "", "headRefOid": "d" * 40},
+        "diff --git a/x b/x", [], 1, "codex", repo="owner/repo", pr_number=77,
+        workdir=str(tmp_path), architecture_context=snapshot,
+    )
+    assert "advisory repository context" in prompt
+    assert snapshot.blob_oid in prompt
