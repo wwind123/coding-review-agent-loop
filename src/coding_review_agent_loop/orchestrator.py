@@ -4411,20 +4411,19 @@ def _extract_current_expected_closing_issue_ids(
 def _extract_current_child_stages(current_plan: str) -> tuple[ChildStage, ...]:
     """Return only explicitly typed legacy child stages.
 
-    A fresh execution recommendation may appear beside the legacy typed
-    category.  Its enriched recommendation stages remain audit-only in Stage
-    1, while the separate top-level two-field stages retain their explicitly
-    selected decomposition behavior.
+    Fresh generation-1 plans have one reviewed topology. Their enriched
+    recommendation stages remain audit-only in Stage 1, and a top-level
+    legacy child category is rejected by protocol validation rather than being
+    adopted as a second executable topology. Only unversioned historical
+    plans can return legacy two-field child stages here.
     """
     try:
         structured = validate_structured_plan_state(current_plan)
     except AgentLoopError:
         structured = None
     if structured is not None:
-        # Generation-1 child stages live inside the recommendation and remain
-        # audit-only in Stage 1.  The separate top-level typed category is the
-        # historical, explicitly selected decomposition input and must retain
-        # its behavior even when a fresh recommendation is present alongside it.
+        if structured.execution_strategy_contract_version == 1:
+            return ()
         return structured.typed_stages.child_stages
     marker = re.search(r"<!--\s*AGENT_TYPED_PLAN_STAGES:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", current_plan, re.I)
     if not marker:

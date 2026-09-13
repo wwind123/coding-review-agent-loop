@@ -4,8 +4,11 @@ import json
 
 import pytest
 
+import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.decomposition import (
+    CreatedPhaseIssue,
+    RecordedPhase,
     approved_plan_hash,
     format_one_shot_impl_handoff_comment,
 )
@@ -39,14 +42,27 @@ from agent_loop_helpers import (
 )
 
 
-def test_v1_recommendation_keeps_legacy_typed_split_input_separate():
+def test_v1_recommendation_rejects_legacy_typed_split_input():
     from coding_review_agent_loop.orchestrator import _extract_current_child_stages
 
     plan = structured_v1_plan_state(
         legacy_child_stages=[{"title": "Legacy split", "summary": "Explicit legacy path."}]
     )
 
-    stages = _extract_current_child_stages(plan)
+    # The protocol validator rejects this mixed payload. The extraction seam
+    # is defensive as well: an invalid fresh record cannot leak legacy stages
+    # into a mutation path.
+    assert _extract_current_child_stages(plan) == ()
+
+
+def test_unversioned_plan_keeps_legacy_typed_split_input():
+    from coding_review_agent_loop.orchestrator import _extract_current_child_stages
+
+    stages = _extract_current_child_stages(
+        structured_plan_state(
+            child_stages=[{"title": "Legacy split", "summary": "Explicit legacy path."}]
+        )
+    )
 
     assert [(stage.title, stage.summary) for stage in stages] == [
         ("Legacy split", "Explicit legacy path.")
@@ -128,6 +144,64 @@ def test_fresh_v1_recommendation_is_inert_at_legacy_split_seam(
     assert result is False
     assert runner.comments == []
     assert runner.issues == []
+    assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("strategy", ["one-shot", "staged"])
+@pytest.mark.parametrize(
+    "execution_mode, expected_events",
+    [
+        ("plan-only", ()),
+        ("implement-one-shot", ("implement",)),
+        ("decompose-only", ("decompose",)),
+        ("implement-by-phase", ("decompose", "implement")),
+    ],
+)
+@pytest.mark.parametrize("materialize", [False, True])
+def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
+    tmp_path, monkeypatch, strategy, execution_mode, expected_events, materialize
+):
+    """Exercise the approval boundary, not only the split helper.
+
+    Explicit execution modes remain responsible for their historical
+    downstream path. The v1 recommendation must not add a second split,
+    checkpoint, child, or dispatch path, regardless of its recommendation or
+    split-materialization setting.
+    """
+    events = []
+    runner = FakeRunner(
+        claude_outputs=[_fresh_v1_plan_for_isolation(strategy)],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = make_config(
+        tmp_path,
+        plan_execution_mode=execution_mode,
+        materialize_split_issues=materialize,
+        execution_strategy_contract_required=True,
+    )
+
+    def fake_decompose(*_args, **kwargs):
+        events.append("decompose")
+        return (
+            CreatedPhaseIssue(
+                phase=RecordedPhase(title="legacy-model-phase", automation="agent-pr"),
+                issue_url="https://github.com/OWNER/REPO/issues/101",
+                issue_number=101,
+            ),
+        )
+
+    def fake_implement(*_args, **kwargs):
+        events.append("implement")
+        return 0
+
+    monkeypatch.setattr(orchestrator_module, "_decompose_approved_plan", fake_decompose)
+    monkeypatch.setattr(orchestrator_module, "_implement_approved_issue", fake_implement)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert tuple(events) == expected_events
+    assert runner.issues == []
+    assert not any("AGENT_PLAN_TOPOLOGY_CHECKPOINT" in comment for comment in runner.comments)
+    assert not any("AGENT_DISCUSS_SPLIT" in comment for comment in runner.comments)
     assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
 
 

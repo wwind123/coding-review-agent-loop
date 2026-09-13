@@ -1684,10 +1684,11 @@ single child with no retained or final work is invalid; recommend one-shot.
 `none` allocations have three empty arrays; `required` allocations have all
 three arrays non-empty. Automation is exactly `agent-pr`, `human-action`, or
 `manual-close`. Preserve issue references and tracker actions in existing
-non-child typed categories. A legacy top-level `child_stages` array may still
-be supplied alongside v1 for explicitly selected legacy materialization; its
-entries must remain the old `{title, summary}` shape. The enriched v1 stages
-under `execution_recommendation` are review/audit data only in this phase.
+non-child typed categories. Do not include non-empty top-level legacy
+`child_stages` in a v1 response: a versioned response has exactly one
+reviewed topology. The enriched v1 stages under `execution_recommendation`
+are review/audit data only in this phase, and historical unversioned
+`child_stages` remain the only legacy materialization input.
 
 Minimal valid one-shot example (the recommendation is complete even when the
 legacy typed categories are omitted):
@@ -2484,6 +2485,8 @@ cases, and tests. Use `same-plan`, never `same-pr`, when describing plan-only
 current-round refinements.
 
 Use this mandatory structured JSON response format:
+
+{_execution_strategy_contract_guidance()}
 
 {{
   "schema_version": 1,

@@ -13,42 +13,97 @@ def check(source, target):
     validate_repair_preservation(json.dumps(source), json.dumps(target))
 
 
-def test_repair_preserves_every_nested_execution_recommendation_field():
+def _execution_source(*, strategy: str) -> dict:
     raw_source = structured_v1_plan_state()
     source, _ = json.JSONDecoder().raw_decode(raw_source.lstrip())
-    target = json.loads(json.dumps(source))
-    check(source, target)
-
-    target["execution_recommendation"]["caveats"] = ["A different caveat."]
-    with pytest.raises(AgentLoopError, match="execution_recommendation.caveats"):
-        check(source, target)
-
-
-def test_repair_preservation_checks_each_nested_execution_field():
-    source_text = structured_v1_plan_state()
-    source, _ = json.JSONDecoder().raw_decode(source_text.lstrip())
     recommendation = source["execution_recommendation"]
-    recommendation["coupling_constraints"] = [{
-        "constraint_id": "coupling-1",
-        "scope_item_ids": ["scope-1"],
-        "rationale": "These requirements must ship together.",
-    }]
-    recommendation["child_stages"] = [{
-        "stage_id": "stage-1", "position": 1, "title": "Reviewed stage",
-        "summary": "A reviewed intermediate delivery.",
-        "deliverables": ["The intermediate behavior."],
-        "non_goals": ["No unrelated changes."],
-        "acceptance_criteria": ["The intermediate behavior passes."],
-        "depends_on_stage_ids": [], "dependency_notes": "No dependencies.",
-        "automation": "agent-pr", "rollout_risk": "low",
-        "compatibility_constraints": ["Keep the old entry point."],
-        "covered_scope_item_ids": ["scope-1"],
-    }]
+    if strategy == "one-shot":
+        recommendation["scope_items"] = [
+            {
+                "scope_item_id": "scope-1",
+                "requirement": "Deliver the API behavior.",
+                "acceptance_criteria": ["The API behavior is complete."],
+            },
+            {
+                "scope_item_id": "scope-2",
+                "requirement": "Deliver its compatibility tests.",
+                "acceptance_criteria": ["The compatibility tests pass."],
+            },
+        ]
+        recommendation["coupling_constraints"] = [{
+            "constraint_id": "coupling-1",
+            "scope_item_ids": ["scope-1", "scope-2"],
+            "rationale": "The API and compatibility tests ship together.",
+        }]
+        recommendation["one_shot_delivery"]["covered_scope_item_ids"] = [
+            "scope-1", "scope-2"
+        ]
+    else:
+        recommendation.update({
+            "strategy": "staged",
+            "staging_feasibility": "safe",
+            "scope_items": [
+                {
+                    "scope_item_id": "scope-1",
+                    "requirement": "Deliver the intermediate API behavior.",
+                    "acceptance_criteria": ["The intermediate API works."],
+                },
+                {
+                    "scope_item_id": "scope-2",
+                    "requirement": "Deliver compatibility tests.",
+                    "acceptance_criteria": ["Compatibility tests pass."],
+                },
+                {
+                    "scope_item_id": "scope-3",
+                    "requirement": "Complete final integration.",
+                    "acceptance_criteria": ["The integrated behavior works."],
+                },
+            ],
+            "coupling_constraints": [{
+                "constraint_id": "coupling-1",
+                "scope_item_ids": ["scope-1", "scope-2"],
+                "rationale": "The API and its tests must stay together.",
+            }],
+            "child_stages": [
+                {
+                    "stage_id": "stage-1", "position": 1, "title": "API and tests",
+                    "summary": "Deliver the intermediate API and its tests.",
+                    "deliverables": ["API behavior and tests."],
+                    "non_goals": ["No final integration."],
+                    "acceptance_criteria": ["The intermediate API and tests pass."],
+                    "depends_on_stage_ids": [], "dependency_notes": "No dependencies.",
+                    "automation": "agent-pr", "rollout_risk": "low",
+                    "compatibility_constraints": ["Keep the old entry point."],
+                    "covered_scope_item_ids": ["scope-1", "scope-2"],
+                },
+                {
+                    "stage_id": "stage-2", "position": 2, "title": "Final integration",
+                    "summary": "Complete the final integration.",
+                    "deliverables": ["Integrated behavior."],
+                    "non_goals": [],
+                    "acceptance_criteria": ["The integrated behavior passes."],
+                    "depends_on_stage_ids": ["stage-1"],
+                    "dependency_notes": "Run after the API and tests.",
+                    "automation": "human-action", "rollout_risk": "medium",
+                    "compatibility_constraints": ["Preserve the compatibility boundary."],
+                    "covered_scope_item_ids": ["scope-3"],
+                },
+            ],
+        })
+        recommendation.pop("one_shot_delivery", None)
+    return source
 
-    mutations = [
-        ("strategy", "staged"),
+
+@pytest.mark.parametrize("strategy", ["one-shot", "staged"])
+def test_repair_preserves_every_nested_execution_recommendation_field(strategy):
+    source = _execution_source(strategy=strategy)
+    check(source, deepcopy(source))
+
+    recommendation = source["execution_recommendation"]
+    paths = [
+        ("strategy", "one-shot" if strategy == "staged" else "staged"),
         ("rationale", "A changed rationale."),
-        ("staging_feasibility", "safe"),
+        ("staging_feasibility", "safe" if strategy == "one-shot" else "inseparable"),
         ("caveats", ["A changed caveat."]),
         ("scope_items.0.scope_item_id", "scope-other"),
         ("scope_items.0.requirement", "A changed requirement."),
@@ -56,25 +111,32 @@ def test_repair_preservation_checks_each_nested_execution_field():
         ("coupling_constraints.0.constraint_id", "coupling-other"),
         ("coupling_constraints.0.scope_item_ids.0", "scope-other"),
         ("coupling_constraints.0.rationale", "A changed coupling rationale."),
-        ("one_shot_delivery.deliverables.0", "A changed deliverable."),
-        ("one_shot_delivery.acceptance_criteria.0", "A changed delivery criterion."),
-        ("one_shot_delivery.covered_scope_item_ids.0", "scope-other"),
-        ("child_stages.0.stage_id", "stage-other"),
-        ("child_stages.0.position", 2),
-        ("child_stages.0.title", "Changed stage"),
-        ("child_stages.0.summary", "Changed stage summary."),
-        ("child_stages.0.deliverables.0", "Changed stage deliverable."),
-        ("child_stages.0.non_goals.0", "Changed stage non-goal."),
-        ("child_stages.0.acceptance_criteria.0", "Changed stage criterion."),
-        ("child_stages.0.dependency_notes", "Changed dependency notes."),
-        ("child_stages.0.automation", "human-action"),
-        ("child_stages.0.rollout_risk", "high"),
-        ("child_stages.0.compatibility_constraints.0", "Changed compatibility."),
-        ("child_stages.0.covered_scope_item_ids.0", "scope-other"),
         ("retained_parent_work.status", "required"),
         ("final_integration_work.status", "required"),
     ]
-    for path, replacement in mutations:
+    if strategy == "one-shot":
+        paths.extend([
+            ("one_shot_delivery.deliverables.0", "A changed deliverable."),
+            ("one_shot_delivery.acceptance_criteria.0", "A changed delivery criterion."),
+            ("one_shot_delivery.covered_scope_item_ids.0", "scope-other"),
+        ])
+    else:
+        paths.extend([
+            ("child_stages.0.stage_id", "stage-other"),
+            ("child_stages.0.position", 2),
+            ("child_stages.0.title", "Changed stage"),
+            ("child_stages.0.summary", "Changed stage summary."),
+            ("child_stages.0.deliverables.0", "Changed stage deliverable."),
+            ("child_stages.0.non_goals.0", "Changed stage non-goal."),
+            ("child_stages.0.acceptance_criteria.0", "Changed stage criterion."),
+            ("child_stages.0.dependency_notes", "Changed dependency notes."),
+            ("child_stages.0.automation", "manual-close"),
+            ("child_stages.0.rollout_risk", "high"),
+            ("child_stages.0.compatibility_constraints.0", "Changed compatibility."),
+            ("child_stages.0.covered_scope_item_ids.0", "scope-other"),
+            ("child_stages.1.depends_on_stage_ids.0", "stage-other"),
+        ])
+    for path, replacement in paths:
         target = deepcopy(source)
         cursor = target["execution_recommendation"]
         parts = path.split(".")

@@ -76,6 +76,7 @@ def test_fresh_plan_prompts_show_the_exact_one_shot_contract_shape(tmp_path):
         assert '"child_stages": []' in prompt
         assert '"retained_parent_work": {"status": "none"' in prompt
         assert '"final_integration_work": {"status": "none"' in prompt
+        assert "Do not include non-empty top-level legacy" in prompt
     assert "omit child stages" not in initial.lower()
 
 _EXPECTED_FOLLOWUP_FIX_AND = """For small, localized, low-risk cleanup that must still be fixed in this PR

@@ -1952,9 +1952,22 @@ def _parse_execution_contract_fields(
     version = _expect_int(payload["execution_strategy_contract_version"], context=f"{context}.execution_strategy_contract_version")
     if version != EXECUTION_STRATEGY_CONTRACT_VERSION:
         raise AgentLoopError(f"{context}.execution_strategy_contract_version must be 1.")
-    return version, _expect_execution_recommendation(
+    recommendation = _expect_execution_recommendation(
         payload["execution_recommendation"], context=f"{context}.execution_recommendation"
     )
+    # Generation 1 has one reviewed topology. The legacy top-level
+    # ``child_stages`` category is executable only for unversioned historical
+    # plans; allowing it beside a v1 recommendation would create two
+    # competing topologies and let a legacy splitter mutate a fresh plan.
+    # Keep an explicitly empty legacy category harmless for callers that still
+    # emit the shared optional key.
+    if "child_stages" in payload and payload["child_stages"] != []:
+        raise AgentLoopError(
+            f"{context} cannot combine a generation-1 execution recommendation "
+            "with non-empty top-level legacy child_stages; use only the reviewed "
+            "execution_recommendation topology."
+        )
+    return version, recommendation
 
 
 def parse_execution_recommendation_payload(
