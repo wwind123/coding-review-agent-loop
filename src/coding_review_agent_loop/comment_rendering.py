@@ -524,24 +524,59 @@ def render_execution_recommendation_section(
     payload = _sanitize_execution_payload(recommendation.to_payload())
     assert isinstance(payload, dict)
     encoded = _encode_json_payload(payload)
-    return "\n".join(
-        [
-            "### Execution strategy recommendation (v1)",
-            f"Topology source: `{EXECUTION_TOPOLOGY_SOURCE}`; strategy: `{recommendation.strategy}`.",
-            "```json",
-            json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False),
-            "```",
-            f"<!-- {EXECUTION_RECOMMENDATION_MARKER}: {encoded} -->",
-        ]
+    lines = [
+        "### Execution strategy recommendation (v1)",
+        f"Topology source: `{EXECUTION_TOPOLOGY_SOURCE}`; strategy: `{recommendation.strategy}`.",
+        f"Staging feasibility: `{recommendation.staging_feasibility}`.",
+        f"Rationale: {sanitize_historical_text(recommendation.rationale)}",
+        "Scope ownership: " + ", ".join(
+            sanitize_historical_text(item.scope_item_id) for item in recommendation.scope_items
+        ),
+    ]
+    if recommendation.child_stages:
+        lines.append(
+            "Delivery stages: "
+            + "; ".join(
+                f"{stage.stage_id} ({stage.automation})"
+                for stage in recommendation.child_stages
+            )
+        )
+    else:
+        lines.append("Delivery stages: none; the approved recommendation is one-shot.")
+    lines.append(
+        "The complete reviewed recommendation is retained in the bounded sidecar below."
     )
+    lines.append(f"<!-- {EXECUTION_RECOMMENDATION_MARKER}: {encoded} -->")
+    return "\n".join(lines)
 
 
-def decode_execution_recommendation_marker(encoded: str) -> dict[str, object]:
+def decode_execution_recommendation_marker(
+    encoded: str, *, bodies: Sequence[str] = ()
+) -> dict[str, object]:
     payload = _decode_json_payload(encoded, marker_name=EXECUTION_RECOMMENDATION_MARKER)
     if _encode_json_payload(payload) != encoded:
         raise AgentLoopError(
             f"Invalid {EXECUTION_RECOMMENDATION_MARKER} payload: non-canonical encoding."
         )
+    if "$round_transport_execution_recommendation" in payload:
+        from .round_transport import hydrate_mapping
+
+        hydrated, missing = hydrate_mapping(
+            {"execution_recommendation": payload}, bodies
+        )
+        if missing or not isinstance(hydrated.get("execution_recommendation"), str):
+            raise AgentLoopError(
+                f"Invalid {EXECUTION_RECOMMENDATION_MARKER} payload: sidecar unavailable."
+            )
+        try:
+            recovered = json.loads(hydrated["execution_recommendation"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise AgentLoopError(
+                f"Invalid {EXECUTION_RECOMMENDATION_MARKER} payload: sidecar is not JSON."
+            ) from exc
+        if not isinstance(recovered, dict):
+            raise AgentLoopError(f"Invalid {EXECUTION_RECOMMENDATION_MARKER} payload.")
+        payload = recovered
     return payload
 
 

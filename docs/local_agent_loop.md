@@ -31,6 +31,11 @@ two-field typed stages remain legacy-undecided and are decoded without
 inventing v1 data. A bounded repair can only reformat a complete recoverable v1
 source; missing or partial strategy data requires a new planner turn.
 
+Issue #785 is the first PR in the sequential #785 -> #786 -> #787 queue. This
+phase does not change recommendation-driven execution policy or route work from
+the reviewed recommendation; those decisions remain with the existing
+explicit execution modes until the later phases consume the contract.
+
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
 ### Machine obligations and resumable qualification

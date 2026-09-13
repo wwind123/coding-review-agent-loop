@@ -86,6 +86,33 @@ _VALID_PLAN_STATE = json.dumps({
     "state": "blocking",
     "summary": "Plan is ready for review.",
     "plan_steps": ["Step one"],
+    "execution_strategy_contract_version": 1,
+    "execution_recommendation": {
+        "strategy": "one-shot",
+        "rationale": "The dry-run work is one coherent boundary.",
+        "staging_feasibility": "inseparable",
+        "scope_items": [{
+            "scope_item_id": "scope-1",
+            "requirement": "Complete the planned work.",
+            "acceptance_criteria": ["The planned work is complete."],
+        }],
+        "coupling_constraints": [],
+        "one_shot_delivery": {
+            "deliverables": ["Completed work"],
+            "acceptance_criteria": ["The planned work is complete."],
+            "covered_scope_item_ids": ["scope-1"],
+        },
+        "child_stages": [],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "caveats": [],
+    },
     "architecture_impact": {
         "status": "unchanged",
         "rationale": "No architectural contract changed.",
@@ -124,6 +151,16 @@ class TestValidateResponse:
     def test_valid_plan_state_accepted(self) -> None:
         path = _write_tmp(_VALID_PLAN_STATE)
         result = _run("helpers.validate_response", "--file", path, "--kind", "plan_state")
+        assert "validation passed: plan_state" in result.stdout
+
+    def test_valid_plan_state_accepted_when_generation_one_is_required(self) -> None:
+        path = _write_tmp(_VALID_PLAN_STATE)
+        result = _run(
+            "helpers.validate_response",
+            "--file", path,
+            "--kind", "plan_state",
+            "--require-execution-strategy-contract",
+        )
         assert "validation passed: plan_state" in result.stdout
 
     def test_missing_plan_state_marker_rejected(self) -> None:
@@ -485,6 +522,7 @@ class TestStateManager:
 
             tagged = output_file.read_text(encoding="utf-8")
             assert "AGENT_LOOP_META" in tagged
+            assert "AGENT_EXECUTION_RECOMMENDATION" in tagged
 
             # Verify _resume_plan_round can reconstruct from this comment alone
             from coding_review_agent_loop.round_state import _resume_plan_round
@@ -498,6 +536,8 @@ class TestStateManager:
             assert result is not None, "build-resume could not find skill-posted coder round"
             _plan_text, resumed = result
             assert resumed.round_number == 1
+            assert resumed.coder_metadata.execution_strategy_contract_version == 1
+            assert resumed.coder_metadata.execution_strategy_identity["recommendation_sha256"]
 
     def test_attach_metadata_persists_surfaced_reviewer_requirement_ids(self) -> None:
         requirement_id = "hr-" + "a" * 64
@@ -3170,9 +3210,8 @@ class TestRetryValidateCoder:
             assert match is not None
             assert tagged[: match.start()].startswith("## Plan\n")
             assert "Plan is ready for review." in tagged[: match.start()]
-            assert tagged[match.end() :].strip().startswith(
-                "<!-- AGENT_PLAN_STATE: blocking -->"
-            )
+            assert "<!-- AGENT_EXECUTION_RECOMMENDATION:" in tagged[match.end() :]
+            assert "<!-- AGENT_PLAN_STATE: blocking -->" in tagged[match.end() :]
 
     def test_retry_validate_coder_invalid_plan_state_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

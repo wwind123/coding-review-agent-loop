@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import coding_review_agent_loop.round_transport as transport
+import coding_review_agent_loop.comment_rendering as comment_rendering
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
@@ -73,6 +74,48 @@ def test_prepare_round_comment_spills_only_until_anchor_fits() -> None:
     hydrated, missing = transport.hydrate_mapping(anchor_payload, prepared)
     assert missing == set()
     assert hydrated == payload
+
+
+def test_oversized_execution_recommendation_uses_bounded_lossless_sidecar() -> None:
+    recommendation = {
+        "strategy": "one-shot",
+        "rationale": _random_text(50_000),
+        "staging_feasibility": "inseparable",
+        "scope_items": [{
+            "scope_item_id": "scope-1",
+            "requirement": "Implement the requested behavior.",
+            "acceptance_criteria": ["The focused regression passes."],
+        }],
+        "coupling_constraints": [],
+        "one_shot_delivery": {
+            "deliverables": ["Implementation and tests."],
+            "acceptance_criteria": ["The focused regression passes."],
+            "covered_scope_item_ids": ["scope-1"],
+        },
+        "child_stages": [],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "caveats": [],
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(recommendation, separators=(",", ":"), sort_keys=True).encode()
+    ).decode()
+    body = _random_text(5_000) + f"\n<!-- AGENT_EXECUTION_RECOMMENDATION: {encoded} -->"
+
+    prepared = transport.prepare_round_comment(body)
+    anchor = str(prepared[-1])
+
+    assert len(anchor) <= transport.MAX_GITHUB_BODY_CHARS
+    marker = list(comment_rendering.EXECUTION_RECOMMENDATION_MARKER_RE.finditer(anchor))[-1]
+    assert comment_rendering.decode_execution_recommendation_marker(
+        marker.group("payload"), bodies=tuple(map(str, prepared))
+    ) == recommendation
 
 
 def test_prepare_round_comment_spills_multiple_fields_in_fixed_order() -> None:

@@ -2979,7 +2979,7 @@ def test_generation_one_execution_strategy_accepts_one_shot_and_staged_shapes():
     ]
 
 
-def test_generation_one_execution_strategy_rejects_missing_contract_and_mixed_legacy_children():
+def test_generation_one_execution_strategy_rejects_missing_contract_and_keeps_legacy_children_separate():
     payload = _execution_plan_payload()
     payload.pop("execution_strategy_contract_version")
     payload.pop("execution_recommendation")
@@ -2990,8 +2990,11 @@ def test_generation_one_execution_strategy_rejects_missing_contract_and_mixed_le
 
     payload = _execution_plan_payload()
     payload["child_stages"] = [{"title": "Legacy", "summary": "Must not mix."}]
-    with pytest.raises(AgentLoopError, match="cannot mix"):
-        validate_structured_plan_state(_execution_plan_text(payload))
+    parsed = validate_structured_plan_state(
+        _execution_plan_text(payload), require_execution_strategy_contract=1
+    )
+    assert parsed is not None
+    assert [stage.title for stage in parsed.typed_stages.child_stages] == ["Legacy"]
 
 
 def test_generation_one_execution_strategy_rejects_split_coupling_and_duplicate_coverage():
@@ -3014,6 +3017,36 @@ def test_generation_one_execution_strategy_rejects_split_coupling_and_duplicate_
         validate_structured_plan_state(
             _execution_plan_text(payload), require_execution_strategy_contract=1
         )
+
+
+def test_generation_one_identity_covers_complete_recommendation_content():
+    original = validate_structured_plan_state(
+        _execution_plan_text(_execution_plan_payload()),
+        require_execution_strategy_contract=1,
+    )
+    changed_payload = _execution_plan_payload()
+    changed_payload["execution_recommendation"]["rationale"] = (
+        "A materially different reviewed rationale."
+    )
+    changed = validate_structured_plan_state(
+        _execution_plan_text(changed_payload),
+        require_execution_strategy_contract=1,
+    )
+
+    assert original.execution_recommendation.identity() != changed.execution_recommendation.identity()
+
+
+def test_generation_one_keeps_explicit_legacy_typed_stages_materializable():
+    from coding_review_agent_loop.orchestrator import _extract_current_child_stages
+
+    payload = _execution_plan_payload()
+    payload["child_stages"] = [{"title": "Legacy split", "summary": "Existing explicit path."}]
+
+    stages = _extract_current_child_stages(_execution_plan_text(payload))
+
+    assert [(stage.title, stage.summary) for stage in stages] == [
+        ("Legacy split", "Existing explicit path.")
+    ]
 
 
 def test_validate_plan_revision_response_rejects_marker_only_markdown():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 import dataclasses
@@ -613,87 +614,89 @@ class ExecutionStrategyRecommendation:
     final_integration_work: ExecutionAllocation
     caveats: tuple[str, ...]
 
-    @property
-    def is_fresh(self) -> bool:
-        return True
-
     def to_payload(self) -> dict[str, object]:
         """Return the exact v1 wire shape for canonical rendering/storage."""
+        clean = sanitize_historical_text
+
         def allocation(value: ExecutionAllocation) -> dict[str, object]:
             return {
-                "status": value.status,
-                "deliverables": list(value.deliverables),
-                "acceptance_criteria": list(value.acceptance_criteria),
-                "covered_scope_item_ids": list(value.covered_scope_item_ids),
+                "status": clean(value.status),
+                "deliverables": [clean(item) for item in value.deliverables],
+                "acceptance_criteria": [clean(item) for item in value.acceptance_criteria],
+                "covered_scope_item_ids": [clean(item) for item in value.covered_scope_item_ids],
             }
 
         payload: dict[str, object] = {
-            "strategy": self.strategy,
-            "rationale": self.rationale,
-            "staging_feasibility": self.staging_feasibility,
+            "strategy": clean(self.strategy),
+            "rationale": clean(self.rationale),
+            "staging_feasibility": clean(self.staging_feasibility),
             "scope_items": [
                 {
-                    "scope_item_id": item.scope_item_id,
-                    "requirement": item.requirement,
-                    "acceptance_criteria": list(item.acceptance_criteria),
+                    "scope_item_id": clean(item.scope_item_id),
+                    "requirement": clean(item.requirement),
+                    "acceptance_criteria": [clean(value) for value in item.acceptance_criteria],
                 }
                 for item in self.scope_items
             ],
             "coupling_constraints": [
                 {
-                    "constraint_id": item.constraint_id,
-                    "scope_item_ids": list(item.scope_item_ids),
-                    "rationale": item.rationale,
+                    "constraint_id": clean(item.constraint_id),
+                    "scope_item_ids": [clean(value) for value in item.scope_item_ids],
+                    "rationale": clean(item.rationale),
                 }
                 for item in self.coupling_constraints
             ],
             "child_stages": [
                 {
-                    "stage_id": stage.stage_id,
+                    "stage_id": clean(stage.stage_id),
                     "position": stage.position,
-                    "title": stage.title,
-                    "summary": stage.summary,
-                    "deliverables": list(stage.deliverables),
-                    "non_goals": list(stage.non_goals),
-                    "acceptance_criteria": list(stage.acceptance_criteria),
-                    "depends_on_stage_ids": list(stage.depends_on_stage_ids),
-                    "dependency_notes": stage.dependency_notes,
-                    "automation": stage.automation,
-                    "rollout_risk": stage.rollout_risk,
-                    "compatibility_constraints": list(stage.compatibility_constraints),
-                    "covered_scope_item_ids": list(stage.covered_scope_item_ids),
+                    "title": clean(stage.title),
+                    "summary": clean(stage.summary),
+                    "deliverables": [clean(value) for value in stage.deliverables],
+                    "non_goals": [clean(value) for value in stage.non_goals],
+                    "acceptance_criteria": [clean(value) for value in stage.acceptance_criteria],
+                    "depends_on_stage_ids": [clean(value) for value in stage.depends_on_stage_ids],
+                    "dependency_notes": clean(stage.dependency_notes),
+                    "automation": clean(stage.automation),
+                    "rollout_risk": clean(stage.rollout_risk),
+                    "compatibility_constraints": [clean(value) for value in stage.compatibility_constraints],
+                    "covered_scope_item_ids": [clean(value) for value in stage.covered_scope_item_ids],
                 }
                 for stage in self.child_stages
             ],
             "retained_parent_work": allocation(self.retained_parent_work),
             "final_integration_work": allocation(self.final_integration_work),
-            "caveats": list(self.caveats),
+            "caveats": [clean(value) for value in self.caveats],
         }
         if self.one_shot_delivery is not None:
             payload["one_shot_delivery"] = {
-                "deliverables": list(self.one_shot_delivery.deliverables),
-                "acceptance_criteria": list(self.one_shot_delivery.acceptance_criteria),
-                "covered_scope_item_ids": list(self.one_shot_delivery.covered_scope_item_ids),
+                "deliverables": [clean(value) for value in self.one_shot_delivery.deliverables],
+                "acceptance_criteria": [clean(value) for value in self.one_shot_delivery.acceptance_criteria],
+                "covered_scope_item_ids": [clean(value) for value in self.one_shot_delivery.covered_scope_item_ids],
             }
         return payload
 
     def identity(self) -> dict[str, object]:
-        """Stable mode-independent identity used by canonical plan consumers."""
+        """Stable mode-independent identity for the complete recommendation.
+
+        The digest deliberately covers every approval-relevant field, including
+        prose, coverage, dependencies, automation, compatibility constraints,
+        and caveats.  Short topology summaries are useful diagnostics but are
+        not sufficient to prove that a resumed response is the approved one.
+        """
+        canonical = json.dumps(
+            self.to_payload(), separators=(",", ":"), sort_keys=True, ensure_ascii=False
+        ).encode("utf-8")
         return {
             "contract_version": EXECUTION_STRATEGY_CONTRACT_VERSION,
             "strategy": self.strategy,
             "topology_source": EXECUTION_TOPOLOGY_SOURCE,
+            "recommendation_sha256": hashlib.sha256(canonical).hexdigest(),
             "scope_item_ids": [item.scope_item_id for item in self.scope_items],
             "stage_ids": [stage.stage_id for stage in self.child_stages],
             "retained_parent_status": self.retained_parent_work.status,
             "final_integration_status": self.final_integration_work.status,
         }
-
-
-# Descriptive aliases make the model discoverable to helper and integration
-# callers without exposing the legacy ChildStage as a v1 type.
-ExecutionRecommendation = ExecutionStrategyRecommendation
-ExecutionStrategyContract = ExecutionStrategyRecommendation
 
 
 # Shared classification rules for typed plan validation and materialization.
@@ -742,11 +745,6 @@ class StructuredPlanState:
     architecture_impact: ArchitectureImpact | None = None
     execution_strategy_contract_version: int | None = None
     execution_recommendation: ExecutionStrategyRecommendation | None = None
-
-    @property
-    def legacy_undecided(self) -> bool:
-        return self.execution_strategy_contract_version is None
-
 
 @dataclass(frozen=True)
 class StructuredDiscussReview:
@@ -3090,10 +3088,6 @@ def validate_structured_plan_revision(
         context="plan_revision",
         required=require_execution_strategy_contract == 1,
     )
-    if execution_recommendation is not None and "child_stages" in payload:
-        raise AgentLoopError(
-            "plan_revision cannot mix v1 execution child stages with legacy typed `child_stages`."
-        )
     state = _expect_non_empty_string(payload["state"], context="plan_revision.state")
     if state != "blocking":
         raise AgentLoopError("plan_revision.state must be `blocking`.")
@@ -3181,10 +3175,6 @@ def validate_structured_plan_state(
         context="plan_state",
         required=require_execution_strategy_contract == 1,
     )
-    if execution_recommendation is not None and "child_stages" in payload:
-        raise AgentLoopError(
-            "plan_state cannot mix v1 execution child stages with legacy typed `child_stages`."
-        )
     state = _expect_state(payload["state"], context="plan_state.state")
     if state != "blocking":
         raise AgentLoopError("plan_state.state must be `blocking`.")

@@ -14,6 +14,8 @@ from coding_review_agent_loop.prompts import (
     build_followup_prompt,
     build_issue_implementation_prompt,
     build_issue_prompt,
+    build_issue_plan_prompt,
+    build_plan_revision_prompt,
     build_task_clarification_prompt,
     format_pr_checks,
 )
@@ -60,6 +62,21 @@ Trivial style nits in touched code should be omitted unless worth requiring
 before merge; if required, they are current-PR work and the review is blocking,
 not approved with Future follow-ups.
 """
+
+
+def test_fresh_plan_prompts_show_the_exact_one_shot_contract_shape(tmp_path):
+    config = make_config(tmp_path)
+
+    initial = build_issue_plan_prompt(783, config)
+    revision = build_plan_revision_prompt(783, 2, "Previous plan", "Blocking review", config)
+
+    for prompt in (initial, revision):
+        assert '"execution_strategy_contract_version": 1' in prompt
+        assert '"execution_recommendation"' in prompt
+        assert '"child_stages": []' in prompt
+        assert '"retained_parent_work": {"status": "none"' in prompt
+        assert '"final_integration_work": {"status": "none"' in prompt
+    assert "omit child stages" not in initial.lower()
 
 _EXPECTED_FOLLOWUP_FIX_AND = """For small, localized, low-risk cleanup that must still be fixed in this PR
 before merge, return `<!-- AGENT_STATE: blocking -->` and list those items

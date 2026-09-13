@@ -59,6 +59,7 @@ from .child_topology import NeedsHumanDecision
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
+    FreshContractIntegrityError,
     IssueImplementationConflictError,
     QuotaResetExceededError,
     UnknownPriorItemDispositionError,
@@ -278,7 +279,7 @@ from .repair import (
     attempt_repair,
     execute_repair,
     strip_unknown_prior_item_dispositions,
-    _require_recoverable_fresh_execution_contract,
+    require_recoverable_fresh_execution_contract,
 )
 from .runner import Runner
 from .salvage import (
@@ -2194,7 +2195,22 @@ def _run_structured_repair(
     if repair_kwargs.get("require_execution_strategy_contract"):
         expected_kind = repair_kwargs.get("expected_kind")
         if isinstance(expected_kind, str):
-            _require_recoverable_fresh_execution_contract(raw, expected_kind=expected_kind)
+            try:
+                require_recoverable_fresh_execution_contract(raw, expected_kind=expected_kind)
+            except FreshContractIntegrityError as exc:
+                return None, None, [
+                    RepairAttemptResult(
+                        backend="none",
+                        model="fresh-contract-integrity",
+                        prompt="",
+                        output=raw,
+                        returncode=None,
+                        outcome="fresh_contract_integrity",
+                        diagnostic=str(exc),
+                        log_path=None,
+                        fallback_planned=False,
+                    )
+                ]
     if attempt_repair is not _ORIGINAL_ATTEMPT_REPAIR:
         try:
             repaired = attempt_repair(raw, config.gemini_cmd, **repair_kwargs)
@@ -3445,6 +3461,19 @@ def _run_validated_agent(
                         repair_kwargs=repair_kwargs,
                     )
                     _log_repair_attempts(config, agent_name, repair_attempts)
+                    fresh_contract_integrity = any(
+                        attempt.outcome == "fresh_contract_integrity"
+                        for attempt in repair_attempts
+                    )
+                    if fresh_contract_integrity:
+                        # A fresh planning response with no mechanically
+                        # recoverable recommendation must get a new planner
+                        # invocation. It is not safe for the repair model to
+                        # synthesize topology, but it is also not a terminal
+                        # provider failure.
+                        should_retry = True
+                        last_failure_category = "fresh-contract-integrity"
+                        last_classification_text = "fresh planning contract requires a new planner turn"
                     if repaired is not None:
                         if repaired_marker is None:
                             repair_detail = (
@@ -4380,17 +4409,22 @@ def _extract_current_expected_closing_issue_ids(
 
 
 def _extract_current_child_stages(current_plan: str) -> tuple[ChildStage, ...]:
-    """Return only explicitly typed child stages; legacy entries are record-only."""
+    """Return only explicitly typed legacy child stages.
+
+    A fresh execution recommendation may appear beside the legacy typed
+    category.  Its enriched recommendation stages remain audit-only in Stage
+    1, while the separate top-level two-field stages retain their explicitly
+    selected decomposition behavior.
+    """
     try:
         structured = validate_structured_plan_state(current_plan)
     except AgentLoopError:
         structured = None
     if structured is not None:
-        if structured.execution_recommendation is not None:
-            # Generation-1 topology is review/audit data only in Stage 1.
-            # Never let its enriched child stages fall through the legacy
-            # adapter or create GitHub side effects.
-            return ()
+        # Generation-1 child stages live inside the recommendation and remain
+        # audit-only in Stage 1.  The separate top-level typed category is the
+        # historical, explicitly selected decomposition input and must retain
+        # its behavior even when a fresh recommendation is present alongside it.
         return structured.typed_stages.child_stages
     marker = re.search(r"<!--\s*AGENT_TYPED_PLAN_STAGES:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", current_plan, re.I)
     if not marker:

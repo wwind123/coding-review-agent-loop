@@ -14,6 +14,10 @@ from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .errors import AgentLoopError
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, encode_mapping, hydrate_mapping
+from .comment_rendering import (
+    EXECUTION_RECOMMENDATION_MARKER_RE,
+    decode_execution_recommendation_marker,
+)
 from .local_test_evidence import canonicalize_bounded_evidence
 from .protocol_markers import TrustedBody, scan_reserved_markers
 from .workdir_guard import validate_checkout_inspected_evidence
@@ -1803,6 +1807,9 @@ def _resume_plan_round(
     current_plan = latest_coder_record.metadata.canonical_plan or latest_coder_record.body
     coder_output = latest_coder_record.metadata.raw_structured_coder_response or current_plan
     metadata_version = latest_coder_record.metadata.execution_strategy_contract_version
+    all_bodies = tuple(
+        body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
+    )
     fresh_artifact = False
     try:
         raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
@@ -1831,14 +1838,9 @@ def _resume_plan_round(
         )
 
         try:
-            parsed = validate_structured_plan_state(
-                coder_output,
-                require_execution_strategy_contract=1,
-            )
-            parsed_recommendation = (
-                parsed.execution_recommendation if parsed is not None else None
-            )
-            if parsed is None:
+            raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
+            response_kind = raw_payload.get("kind") if isinstance(raw_payload, dict) else None
+            if response_kind == "plan_revision":
                 parsed_revision = validate_structured_plan_revision(
                     coder_output,
                     require_execution_strategy_contract=1,
@@ -1848,17 +1850,58 @@ def _resume_plan_round(
                         "Generation-1 planning metadata has no recoverable structured response."
                     )
                 parsed_recommendation = parsed_revision.execution_recommendation
+            elif response_kind == "plan_state":
+                parsed = validate_structured_plan_state(
+                    coder_output,
+                    require_execution_strategy_contract=1,
+                )
+                if parsed is None:
+                    raise AgentLoopError(
+                        "Generation-1 planning metadata has no recoverable structured response."
+                    )
+                parsed_recommendation = parsed.execution_recommendation
+            else:
+                raise AgentLoopError(
+                    "Generation-1 planning metadata has an unknown structured response kind."
+                )
+            if parsed_recommendation is None:
+                raise AgentLoopError(
+                    "Generation-1 planning metadata has no execution recommendation."
+                )
+
+            # The canonical plan is the public, hashed rendering.  Recover the
+            # recommendation sidecar from it (including transport sidecars) and
+            # compare it with both the raw response and durable metadata.  This
+            # prevents a restart from accepting a changed recommendation that
+            # retained only the old short topology summary.
+            marker_match = EXECUTION_RECOMMENDATION_MARKER_RE.search(current_plan)
+            if marker_match is None:
+                marker_match = EXECUTION_RECOMMENDATION_MARKER_RE.search(
+                    latest_coder_record.body
+                )
+            if marker_match is None:
+                raise AgentLoopError(
+                    "Generation-1 planning metadata has no canonical execution recommendation sidecar."
+                )
+            from .protocol import parse_execution_recommendation_payload
+
+            sidecar_payload = decode_execution_recommendation_marker(
+                marker_match.group("payload"), bodies=all_bodies
+            )
+            sidecar_recommendation = parse_execution_recommendation_payload(
+                sidecar_payload, context="canonical execution_recommendation"
+            )
             if (
                 not isinstance(latest_coder_record.metadata.execution_strategy_identity, dict)
-                or parsed_recommendation is None
                 or latest_coder_record.metadata.execution_strategy_identity
                 != parsed_recommendation.identity()
+                or sidecar_recommendation.identity() != parsed_recommendation.identity()
             ):
                 raise AgentLoopError(
-                    "Generation-1 planning metadata has a missing or mismatched "
-                    "strategy/topology identity."
+                    "Generation-1 planning metadata has a missing or mismatched complete "
+                    "strategy/topology identity across raw response, canonical sidecar, and metadata."
                 )
-        except AgentLoopError as exc:
+        except (AgentLoopError, AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AgentLoopError(
                 "Generation-1 planning round metadata is missing or has a malformed "
                 "execution strategy contract; repair the handoff or start a new plan round."
@@ -1893,6 +1936,7 @@ def _resume_plan_round(
             ledger_may_be_incomplete=ledger_may_be_incomplete,
             compact_prior_summaries=latest_coder_record.metadata.compact_prior_summaries,
             reconciled=any(record.metadata.role == "summary" for record in current_round_records),
+            coder_metadata=latest_coder_record.metadata,
             local_test_evidence=latest_coder_record.metadata.local_test_evidence,
         ),
     )

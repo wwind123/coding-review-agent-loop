@@ -5,10 +5,22 @@ import pytest
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.repair import _build_repair_prompt
 from coding_review_agent_loop.repair_preservation import validate_repair_preservation
+from agent_loop_helpers import structured_v1_plan_state
 
 
 def check(source, target):
     validate_repair_preservation(json.dumps(source), json.dumps(target))
+
+
+def test_repair_preserves_every_nested_execution_recommendation_field():
+    raw_source = structured_v1_plan_state()
+    source, _ = json.JSONDecoder().raw_decode(raw_source.lstrip())
+    target = json.loads(json.dumps(source))
+    check(source, target)
+
+    target["execution_recommendation"]["caveats"] = ["A different caveat."]
+    with pytest.raises(AgentLoopError, match="execution_recommendation.caveats"):
+        check(source, target)
 
 
 def test_prompt_demands_lossless_repair_and_separate_ledgers():

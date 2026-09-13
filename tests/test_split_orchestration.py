@@ -34,8 +34,23 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_plan_revision,
     structured_plan_state,
+    structured_v1_plan_state,
     structured_pr_review,
 )
+
+
+def test_v1_recommendation_keeps_legacy_typed_split_input_separate():
+    from coding_review_agent_loop.orchestrator import _extract_current_child_stages
+
+    plan = structured_v1_plan_state(
+        legacy_child_stages=[{"title": "Legacy split", "summary": "Explicit legacy path."}]
+    )
+
+    stages = _extract_current_child_stages(plan)
+
+    assert [(stage.title, stage.summary) for stage in stages] == [
+        ("Legacy split", "Explicit legacy path.")
+    ]
 
 
 def _existing_split_children_comment() -> dict:

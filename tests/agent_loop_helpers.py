@@ -1471,6 +1471,53 @@ def structured_plan_state(
     )
 
 
+def structured_v1_plan_state(
+    *,
+    reviewer: str = "Anthropic Claude",
+    legacy_child_stages: list[dict[str, str]] | None = None,
+) -> str:
+    """Return the smallest fresh generation-1 plan fixture for integration tests."""
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_state",
+        "state": "blocking",
+        "summary": "Fresh execution strategy plan.",
+        "plan_steps": ["Implement the reviewed scope."],
+        "execution_strategy_contract_version": 1,
+        "execution_recommendation": {
+            "strategy": "one-shot",
+            "rationale": "The reviewed scope is one coherent delivery.",
+            "staging_feasibility": "inseparable",
+            "scope_items": [{
+                "scope_item_id": "scope-1",
+                "requirement": "Implement the reviewed scope.",
+                "acceptance_criteria": ["The reviewed scope is complete."],
+            }],
+            "coupling_constraints": [],
+            "one_shot_delivery": {
+                "deliverables": ["The reviewed implementation."],
+                "acceptance_criteria": ["The reviewed scope is complete."],
+                "covered_scope_item_ids": ["scope-1"],
+            },
+            "child_stages": [],
+            "retained_parent_work": {
+                "status": "none", "deliverables": [], "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "final_integration_work": {
+                "status": "none", "deliverables": [], "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "caveats": [],
+        },
+        "human_requirement_dispositions": [],
+        "architecture_impact": dict(_DEFAULT_ARCHITECTURE_IMPACT),
+    }
+    if legacy_child_stages is not None:
+        payload["child_stages"] = legacy_child_stages
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- " + reviewer
+
+
 _DEFAULT_ARCHITECTURE_IMPACT = {
     "status": "unchanged",
     "rationale": "No architectural contract changed.",

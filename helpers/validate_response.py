@@ -233,6 +233,11 @@ def main() -> None:
         default=None,
         help="Optional JSON file with reviewer identity and prior item context.",
     )
+    parser.add_argument(
+        "--require-execution-strategy-contract",
+        action="store_true",
+        help="Require the fresh generation-1 planning execution recommendation.",
+    )
     args = parser.parse_args()
 
     try:
@@ -257,6 +262,9 @@ def main() -> None:
             prior_items=prior_items,
             current_round_items=current_round_items,
             human_requirements=human_requirements,
+            require_execution_strategy_contract=(
+                1 if args.require_execution_strategy_contract else 0
+            ),
         )
     except AgentLoopError as exc:
         print(f"validation failed: {kind}: {exc}", file=sys.stderr)

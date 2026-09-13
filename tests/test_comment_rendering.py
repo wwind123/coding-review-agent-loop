@@ -23,11 +23,13 @@ from coding_review_agent_loop.comment_rendering import (
     _render_prior_dispositions_section,
     _render_test_command_for_comment,
     decode_deferred_stages_marker,
+    decode_execution_recommendation_marker,
     normalize_freeform_signature,
     render_agent_unavailable_comment,
     render_deferred_stages_section,
     render_discuss_round_summary_comment,
     render_typed_plan_stages_section,
+    render_execution_recommendation_section,
 )
 from coding_review_agent_loop.protocol import (
     DiscussSynthesisConsensus,
@@ -80,8 +82,25 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_plan_revision,
     structured_plan_state,
+    structured_v1_plan_state,
     structured_pr_review,
 )
+
+
+def test_execution_recommendation_rendering_round_trips_without_visible_duplication():
+    parsed = validate_structured_plan_state(
+        structured_v1_plan_state(), require_execution_strategy_contract=1
+    )
+    section = render_execution_recommendation_section(parsed.execution_recommendation)
+    marker = list(re.finditer(
+        r"<!--\s*AGENT_EXECUTION_RECOMMENDATION:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+        section,
+    ))[-1]
+
+    assert '"scope_items"' not in section
+    assert decode_execution_recommendation_marker(marker.group("payload")) == (
+        parsed.execution_recommendation.to_payload()
+    )
 
 
 def test_managed_test_comment_hides_wrapper_plumbing_and_keeps_inner_command():

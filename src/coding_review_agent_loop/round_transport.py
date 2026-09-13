@@ -19,6 +19,11 @@ ROUND_RESUME_MARKER_RE = re.compile(
 ROUND_TRANSPORT_SIDECAR_RE = re.compile(
     r"<!--\s*AGENT_LOOP_SIDECAR:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I
 )
+_EXECUTION_RECOMMENDATION_RE = re.compile(
+    r"<!--\s*AGENT_EXECUTION_RECOMMENDATION:\s*"
+    r"(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.I,
+)
 # Spill reviewer checkpoints first: they are often the largest metadata field
 # and are required to safely resume a provisional parallel-review round.
 _SPILL_FIELDS = (
@@ -31,6 +36,7 @@ _SPILL_FIELDS = (
     "final_analyzer_response",
     "raw_synthesis_response",
     "local_test_evidence",
+    "execution_recommendation",
 )
 _MAX_COMPRESSED = 8_000_000
 _MAX_DECOMPRESSED = 16_000_000
@@ -101,6 +107,78 @@ def _sidecar(payload: Mapping[str, object]) -> TrustedBody:
     )
 
 
+def _prepare_execution_recommendation_transport(
+    body_text: str,
+) -> tuple[str, list[TrustedBody]]:
+    """Spill an oversized v1 recommendation into bounded round sidecars.
+
+    The recommendation marker remains in the public anchor as a small reference;
+    the complete canonical JSON is carried losslessly by ordinary round sidecars.
+    This keeps large scope ledgers from being duplicated in the visible comment.
+    """
+    matches = list(_EXECUTION_RECOMMENDATION_RE.finditer(body_text))
+    if not matches or len(body_text) <= MAX_GITHUB_BODY_CHARS:
+        return body_text, []
+    match = matches[-1]
+    try:
+        raw_payload = base64.urlsafe_b64decode(match.group("payload").encode("ascii"))
+        parsed = json.loads(raw_payload.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("recommendation object required")
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentLoopError(
+            "Execution recommendation marker is not a recoverable JSON object."
+        ) from exc
+    if "$round_transport_execution_recommendation" in parsed:
+        return body_text, []
+
+    canonical_raw = json.dumps(
+        parsed, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+    packed = zlib.compress(canonical_raw, 9)
+    if len(packed) > _MAX_COMPRESSED:
+        raise AgentLoopError("Execution recommendation is too large to transport safely.")
+    encoded_packed = _b64(packed)
+    anchor_id = hashlib.sha256(body_text.encode("utf-8")).hexdigest()[:24]
+    spill_digest = hashlib.sha256(packed).hexdigest()
+    raw_digest = hashlib.sha256(canonical_raw).hexdigest()
+    chunks = [
+        encoded_packed[index : index + _PART_CHARS]
+        for index in range(0, len(encoded_packed), _PART_CHARS)
+    ]
+    reference = {
+        "$round_transport_execution_recommendation": anchor_id,
+        "field": "execution_recommendation",
+        "parts": len(chunks),
+        "sha256": raw_digest,
+        "spill": spill_digest,
+    }
+    replacement = _b64(
+        json.dumps(reference, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    transformed = (
+        body_text[: match.start("payload")]
+        + replacement
+        + body_text[match.end("payload") :]
+    )
+    sidecars = [
+        _sidecar(
+            {
+                "v": 1,
+                "anchor": anchor_id,
+                "spill": spill_digest,
+                "field": "execution_recommendation",
+                "index": index,
+                "count": len(chunks),
+                "sha256": raw_digest,
+                "data": chunk,
+            }
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+    return transformed, sidecars
+
+
 def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
     """Return sidecars followed by an anchor; non-round bodies are strictly bounded."""
     if isinstance(body, TrustedBody):
@@ -116,18 +194,30 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             )
         )
     body_text = str(carrier)
+    body_text, sidecars = _prepare_execution_recommendation_transport(body_text)
     matches = list(ROUND_RESUME_MARKER_RE.finditer(body_text))
-    if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches:
+    if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches and not sidecars:
         raise AgentLoopError(
             f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response."
         )
     if not matches:
-        return (carrier,)
+        if len(body_text) > MAX_GITHUB_BODY_CHARS and not sidecars:
+            raise AgentLoopError(
+                f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response."
+            )
+        if sidecars:
+            if len(body_text) > MAX_GITHUB_BODY_CHARS:
+                raise AgentLoopError(
+                    f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters after execution sidecar spill."
+                )
+            expected = tuple(item.definition.token for item in scan_reserved_markers(body_text))
+            return (*sidecars, TrustedBody.canonical(body_text, expected_tokens=expected))
+        return (TrustedBody.canonical(body_text, expected_tokens=tuple(item.definition.token for item in scan_reserved_markers(body_text))),)
 
     # Resume reads the last marker when a legacy comment contains more than one.
     match = matches[-1]
     payload = decode_mapping(match.group("payload"))
-    sidecars: list[str] = []
+    sidecars = list(sidecars)
     anchor_id = hashlib.sha256(body_text.encode()).hexdigest()[:24]
 
     def render_anchor(mapping: Mapping[str, object]) -> str:
@@ -218,10 +308,17 @@ def hydrate_mapping(
     missing: set[str] = set()
     for field in _SPILL_FIELDS:
         ref = result.get(field)
-        if not isinstance(ref, dict) or "$round_transport_spill" not in ref:
+        if not isinstance(ref, dict):
+            continue
+        reference_key = (
+            "$round_transport_execution_recommendation"
+            if "$round_transport_execution_recommendation" in ref
+            else "$round_transport_spill"
+        )
+        if reference_key not in ref:
             continue
         try:
-            anchor = str(ref["$round_transport_spill"])
+            anchor = str(ref[reference_key])
             count = int(ref["parts"])
             entries = parts.get((anchor, field), {})
             if count < 1 or len(entries) != count or any(index not in entries for index in range(count)):

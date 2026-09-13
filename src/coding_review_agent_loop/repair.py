@@ -1308,7 +1308,7 @@ def _issue_implementation_instruction(
     )
 
 
-def _require_recoverable_fresh_execution_contract(raw: str, *, expected_kind: str) -> None:
+def require_recoverable_fresh_execution_contract(raw: str, *, expected_kind: str) -> None:
     """Reject repair when the source cannot prove the reviewed v1 topology."""
     try:
         payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
@@ -1731,8 +1731,6 @@ def attempt_repair(
     Returns the repaired text on success, or None when the CLI fails or returns empty output.
     The caller is responsible for re-validating the returned text.
     """
-    if require_execution_strategy_contract and expected_kind in {"plan_state", "plan_revision"}:
-        _require_recoverable_fresh_execution_contract(raw, expected_kind=expected_kind)
     prompt = _build_repair_prompt(
         raw,
         expected_kind=expected_kind,

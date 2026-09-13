@@ -176,6 +176,7 @@ from coding_review_agent_loop.unresolved_items import (
 from coding_review_agent_loop.repair import (
     attempt_envelope_normalization,
     attempt_repair,
+    require_recoverable_fresh_execution_contract,
     strip_unknown_prior_item_dispositions,
 )
 from helpers.validate_response import _deserialize_human_requirements, validate_response_text
@@ -463,8 +464,13 @@ def _recover_structured_response(
     response_evidence: dict[str, object] | None = None,
     gemini_cmd: str = "gemini",
     reviewer_normalization: bool = False,
+    require_execution_strategy_contract: bool = False,
 ) -> tuple[str, object]:
     """Run deterministic-to-Gemini recovery without mutating the saved raw artifact."""
+    if require_execution_strategy_contract and expected_kind in {"plan_state", "plan_revision"}:
+        require_recoverable_fresh_execution_contract(
+            original_text, expected_kind=expected_kind
+        )
     candidate = original_text
     if reviewer_normalization:
         candidate = _normalize_disposition_values(_normalize_raw_response(candidate))
@@ -2548,6 +2554,7 @@ def _save_coder_raw_to_repair_dir(
     architecture_identity: dict | None = None,
     architecture_contract_version: int | None = None,
     execution_strategy_contract_version: int | None = None,
+    execution_strategy_contract_required: bool = False,
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy the coder's raw response + context to a stable repair dir.
@@ -2576,6 +2583,8 @@ def _save_coder_raw_to_repair_dir(
         manifest["architecture_contract_version"] = architecture_contract_version
     if execution_strategy_contract_version is not None:
         manifest["execution_strategy_contract_version"] = execution_strategy_contract_version
+    if execution_strategy_contract_required:
+        manifest["execution_strategy_contract_required"] = True
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -2635,11 +2644,7 @@ def _complete_coder_turn(
             )
         return parsed
     try:
-        if auto_recover and kind == "plan_revision":
-            if require_execution_strategy_contract:
-                from coding_review_agent_loop.repair import _require_recoverable_fresh_execution_contract
-
-                _require_recoverable_fresh_execution_contract(raw_text, expected_kind=kind)
+        if auto_recover and kind in {"plan_state", "plan_revision"}:
             raw_text, _ = _recover_structured_response(
                 raw_text,
                 expected_kind=kind,
@@ -2653,6 +2658,9 @@ def _complete_coder_turn(
                 requires_direct_discussion_ack=requires_direct_discussion_ack,
                 response_evidence=response_evidence,
                 gemini_cmd=gemini_cmd,
+                require_execution_strategy_contract=bool(
+                    require_execution_strategy_contract
+                ),
             )
             validated_result = validate(raw_text)
         else:
@@ -2975,7 +2983,7 @@ def _run_external_coder_phase(
                 if hasattr(coder_architecture, "identity") else None
             ),
             architecture_contract_version=1,
-            execution_strategy_contract_version=1,
+            execution_strategy_contract_required=True,
             gemini_cmd=gemini_cmd,
         )
 
@@ -3390,6 +3398,7 @@ def _run_host_coder_phase(
             "helpers.validate_response",
             "--file", str(plan_file),
             "--kind", "plan_state",
+            "--require-execution-strategy-contract",
         )
         if result.returncode != 0:
             print(f"skill_runner: plan validation failed: {result.stderr.strip()}", file=sys.stderr)
@@ -4072,7 +4081,10 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                     1 if manifest.get("architecture_contract_version") == 1 else 0
                 ),
                 require_execution_strategy_contract=(
-                    1 if manifest.get("execution_strategy_contract_version") == 1 else 0
+                    1
+                    if manifest.get("execution_strategy_contract_required")
+                    or manifest.get("execution_strategy_contract_version") == 1
+                    else 0
                 ),
             )
         except _ValidationError as exc:
@@ -5339,7 +5351,6 @@ def _run_decomposition_for_skill(
         typed_stages = (
             parsed_plan.typed_stages.child_stages
             if parsed_plan is not None
-            and parsed_plan.execution_recommendation is None
             and mode == "decompose-only"
             else ()
         )

@@ -8,7 +8,9 @@ from coding_review_agent_loop.repair import (
     attempt_envelope_normalization,
     attempt_repair,
     execute_repair,
+    require_recoverable_fresh_execution_contract,
 )
+from coding_review_agent_loop.errors import FreshContractIntegrityError
 from coding_review_agent_loop.protocol import (
     validate_human_requirement_dispositions,
     validate_structured_discuss_answer,
@@ -58,6 +60,13 @@ def test_answer_repair_prompt_has_mode_specific_schema_and_examples():
     assert '"unresolved_items"' in prompt
     assert "Do not repair answer mode into `discuss_review`" in prompt
     assert "split_proposals" in prompt
+
+
+def test_fresh_contract_guard_requires_mechanically_recoverable_source():
+    with pytest.raises(FreshContractIntegrityError, match="new planner turn"):
+        require_recoverable_fresh_execution_contract(
+            "leading prose before the JSON", expected_kind="plan_state"
+        )
 
 
 def test_answer_repair_shape_preserves_answer_and_rejects_triage_fields():
