@@ -825,7 +825,7 @@ def _human_requirements_block(
 def render_coder_human_requirements_prompt_context(
     human_requirements: Sequence[HumanReviewRequirement] | None,
     *,
-    max_chars: int = 12_000,
+    max_chars: int | None = 12_000,
     requirement_scope: str = "PR requirements",
     full_omission_fallback: str = "Fetch the PR discussion directly before approving.",
 ) -> CoderHumanRequirementsPromptContext:
@@ -1714,6 +1714,7 @@ def _issue_human_requirements_prompt_context(
     *,
     requirement_scope: str,
     full_omission_fallback: str,
+    config: AgentLoopConfig | None = None,
 ) -> CoderHumanRequirementsPromptContext:
     if issue_context is None:
         return CoderHumanRequirementsPromptContext(
@@ -1723,6 +1724,7 @@ def _issue_human_requirements_prompt_context(
         )
     return render_coder_human_requirements_prompt_context(
         issue_context.human_requirements,
+        max_chars=(None if config is not None and architecture_material(config.architecture_context) else 12_000),
         requirement_scope=requirement_scope,
         full_omission_fallback=full_omission_fallback,
     )
@@ -1834,12 +1836,14 @@ def build_issue_prompt(
     parent_issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
     human_requirements_context = _issue_human_requirements_prompt_context(
         issue_context,
         requirement_scope="implementation requirements",
         full_omission_fallback="Fetch the issue discussion directly before implementing.",
+        config=config,
     )
     pr_reference_guidance = (
         _staged_issue_pr_reference_guidance(
@@ -1868,7 +1872,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {provenance_guidance}
 {managed_creation_guidance}
 {_architecture_context_block(config, architecture_context, protected_context=(human_requirements_context.block,))}
-{_architecture_impact_guidance()}
+{_architecture_impact_guidance(required=architecture_material(config.architecture_context))}
 {human_requirements_context.block}{_structured_issue_implementation_guidance(
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
@@ -1895,11 +1899,13 @@ def build_issue_plan_prompt(
         issue_context,
         requirement_scope="planning requirements",
         full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
+        config=config,
     )
     return f"""Plan GitHub issue #{issue_number} in {config.repo}.
 
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this planning stage.
+{_architecture_impact_guidance(required=architecture_material(config.architecture_context))}
 For a plan (rather than a clarification), respond with exactly one structured JSON
 `plan_state` object. It must have this complete contract:
 
@@ -2282,13 +2288,14 @@ def build_plan_revision_prompt(
         issue_context,
         requirement_scope="planning requirements",
         full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+        config=config,
     )
     return f"""{reviewer_name} reviewed the implementation plan for GitHub issue #{issue_number} in {config.repo} and found blocking issues.
 
 Revise the plan in this local checkout without editing code. Do not create a
 branch, commit, push, or open a pull request during this planning stage.
 {_coder_workdir_guidance(config, implementation=False)}
-{_architecture_impact_guidance()}
+{_architecture_impact_guidance(required=architecture_material(config.architecture_context))}
 {_scratch_file_guidance()}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
@@ -2389,6 +2396,7 @@ def _build_compact_plan_revision_prompt(
         issue_context,
         requirement_scope="planning requirements",
         full_omission_fallback="Fetch the issue discussion directly before revising the plan.",
+        config=config,
     )
     stable_prefix = _compact_plan_stable_prefix(
         config=config,
@@ -2468,6 +2476,7 @@ def build_issue_implementation_prompt(
         issue_context,
         requirement_scope="implementation requirements",
         full_omission_fallback="Fetch the issue discussion directly before implementing.",
+        config=config,
     )
     pr_reference_guidance = (
         _staged_issue_pr_reference_guidance(
@@ -2509,7 +2518,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {provenance_guidance}
 {managed_creation_guidance}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, format_approved_plan_context(plan_context, max_chars=None)))}
-{_architecture_impact_guidance()}
+{_architecture_impact_guidance(required=architecture_material(config.architecture_context))}
 {human_requirements_context.block}{_structured_issue_implementation_guidance(
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
@@ -2550,10 +2559,12 @@ def build_completion_recovery_prompt(
             issue_context,
             requirement_scope="implementation requirements",
             full_omission_fallback="Fetch the issue discussion directly before implementing.",
+            config=config,
         )
     else:
         human_requirements_context = render_coder_human_requirements_prompt_context(
             human_requirements,
+            max_chars=(None if architecture_material(config.architecture_context) else 12_000),
             requirement_scope="implementation requirements",
             full_omission_fallback="Fetch the issue discussion directly before implementing.",
         )
@@ -2601,6 +2612,7 @@ def build_task_prompt(
 
 Task:
 {task_text}
+{_architecture_impact_guidance(required=architecture_material(config.architecture_context))}
 {_architecture_context_block(config, protected_context=(task_text,))}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -2637,7 +2649,7 @@ cannot create a PR — for example after a bounded local test run exceeded its
 timeout — explain the blocker, naming the exact command and the timeout, and
 end with `AGENT_STATE: blocking` without an `AGENT_PR` marker instead of
 inventing a placeholder like `AGENT_PR: 0`. Do not place your signature before
-the AGENT_STATE or AGENT_CLARIFY marker. Your response must end with, in this
+the AGENT_STATE marker. Your response must end with, in this
     exact order:
 
 <!-- AGENT_STATE: blocking -->
@@ -2672,6 +2684,7 @@ def build_task_clarification_prompt(
 
 Original task:
 {task_text}
+{_architecture_impact_guidance(required=architecture_material(config.architecture_context))}
 {_architecture_context_block(config, protected_context=(task_text,))}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -2681,8 +2694,7 @@ Clarification so far:
 
 Now proceed. Strongly prefer to implement the task and open a PR. Only ask
 again if a critical detail is still missing.
-If implementing or asking another clarification, use exactly the structured
-`task_result` JSON envelope and
+If implementing or asking another clarification, use exactly the structured `task_result` JSON envelope and
 footer described below: begin with one JSON object, add no prose before the
 `<!-- AGENT_STATE: blocking -->` footer, and put the PR number in `pr_number`
 instead of an `AGENT_PR` marker. For clarification set `outcome` to
@@ -2696,7 +2708,7 @@ If you cannot safely proceed and cannot create a PR — for example after a
 bounded local test run exceeded its timeout — explain the blocker, naming the
 exact command and the timeout, and end with `AGENT_STATE: blocking` without an
 `AGENT_PR` marker instead of inventing a placeholder like `AGENT_PR: 0`. Do not
-place your signature before the AGENT_STATE or AGENT_CLARIFY marker. Your
+place your signature before the AGENT_STATE marker. Your
 response must end with, in this exact order:
 
 For implementation or clarification:
@@ -2708,7 +2720,7 @@ For a no-PR blocking result:
 -- {coder_signature}
 
 For another clarification round:
-<!-- AGENT_CLARIFY -->
+<!-- AGENT_STATE: blocking -->
 -- {coder_signature}
 """
 
@@ -3397,6 +3409,10 @@ def build_followup_prompt(
     coder_signature = agent_signature(config.coder, config, role="coder")
     if human_requirements_context is None:
         human_requirements_context = render_coder_human_requirements_prompt_context(human_requirements)
+    elif architecture_material(config.architecture_context) and human_requirements is not None:
+        human_requirements_context = render_coder_human_requirements_prompt_context(
+            human_requirements, max_chars=None
+        )
     return f"""{reviewer_name} reviewed pull request #{pr_number} in {config.repo} and found blocking issues.
 
 Address the review below in this local checkout. Pull/sync the PR branch if
@@ -3407,7 +3423,7 @@ Do not create a new PR.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
-{_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
+    {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and format_approved_plan_context(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
@@ -3450,6 +3466,10 @@ def build_same_pr_followup_prompt(
     coder_signature = agent_signature(config.coder, config, role="coder")
     if human_requirements_context is None:
         human_requirements_context = render_coder_human_requirements_prompt_context(human_requirements)
+    elif architecture_material(config.architecture_context) and human_requirements is not None:
+        human_requirements_context = render_coder_human_requirements_prompt_context(
+            human_requirements, max_chars=None
+        )
     return f"""{reviewer_name} requested same-PR follow-ups on pull request #{pr_number} in {config.repo}.
 
 Address the follow-up items below in this local checkout. Pull/sync the PR
@@ -3464,7 +3484,7 @@ remains blocked pending another review round after this cleanup.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
-{_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
+    {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and format_approved_plan_context(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
@@ -3510,6 +3530,10 @@ def build_merge_conflict_prompt(
     coder_signature = agent_signature(config.coder, config, role="coder")
     if human_requirements_context is None:
         human_requirements_context = render_coder_human_requirements_prompt_context(human_requirements)
+    elif architecture_material(config.architecture_context) and human_requirements is not None:
+        human_requirements_context = render_coder_human_requirements_prompt_context(
+            human_requirements, max_chars=None
+        )
     head_description = f"`{head_sha}`" if head_sha else "the current PR head"
     return f"""GitHub reports that pull request #{pr_number} in {config.repo} has a merge conflict \
 with its base branch `{base_branch}` ({merge_state_detail}) at {head_description}.
@@ -3526,7 +3550,7 @@ against the new head after your push.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
-{_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
+    {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and format_approved_plan_context(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}

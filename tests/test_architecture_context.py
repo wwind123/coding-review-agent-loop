@@ -6,6 +6,7 @@ import pytest
 
 from coding_review_agent_loop.architecture_context import (
     ArchitecturePair,
+    ArchitectureSnapshot,
     acquire_architecture_pair,
     acquire_architecture_snapshot,
     normalize_architecture_path,
@@ -121,6 +122,49 @@ def test_binary_capture_timeout_is_bounded(tmp_path):
             cwd=tmp_path,
             timeout_seconds=0.05,
         )
+
+
+def test_binary_capture_timeout_is_nonfatal_when_check_is_false(tmp_path):
+    result = run_binary_capture(
+        ("python3", "-c", "import time; time.sleep(2)"),
+        cwd=tmp_path,
+        check=False,
+        timeout_seconds=0.05,
+    )
+    assert result.returncode != 0
+    assert b"timed out" in result.stderr
+
+
+def test_pair_budget_retains_both_snapshot_identities(tmp_path):
+    base = _repo(tmp_path, "# Base\n\n" + ("base detail " * 300))
+    _git(tmp_path, "checkout", "-qb", "candidate")
+    (tmp_path / "ARCHITECTURE.md").write_text("# Candidate\n\n" + ("candidate detail " * 300), encoding="utf-8")
+    _git(tmp_path, "commit", "-qam", "candidate")
+    candidate = _git(tmp_path, "rev-parse", "HEAD")
+    pair = acquire_architecture_pair(
+        Runner(), checkout=tmp_path, repository="owner/repo",
+        target_revision=base, candidate_revision=candidate,
+    )
+    rendered = render_architecture_pair(pair, max_chars=2_000)
+    assert len(rendered) <= 2_000
+    assert "Established base architecture snapshot" in rendered
+    assert "Candidate architecture snapshot" in rendered
+    assert pair.base.blob_oid in rendered
+    assert pair.candidate.blob_oid in rendered
+    assert pair.base.sha256 in rendered
+    assert pair.candidate.sha256 in rendered
+
+
+def test_invalid_utf8_is_classified_as_binary(tmp_path):
+    _repo(tmp_path)
+    (tmp_path / "ARCHITECTURE.md").write_bytes(b"# invalid \xff\n")
+    _git(tmp_path, "add", "ARCHITECTURE.md")
+    _git(tmp_path, "commit", "-qm", "invalid utf8")
+    snapshot = acquire_architecture_snapshot(
+        Runner(), checkout=tmp_path, repository="owner/repo", revision=_git(tmp_path, "rev-parse", "HEAD")
+    )
+    assert snapshot.availability == "binary"
+    assert "UTF-8" in (snapshot.diagnostic or "")
 
 
 def test_pair_keeps_base_separate_from_candidate(tmp_path):

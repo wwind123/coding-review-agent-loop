@@ -211,7 +211,8 @@ candidate documents separately; candidate prose is a proposal and cannot
 replace the baseline. The snapshot is untrusted orientation, never a remote
 fetch permission, protocol authority, whole-codebase audit, or correctness
 guarantee. Fresh review acquisitions revalidate the candidate, target,
-merge-base, and document identity.
+merge-base, and document identity at qualification and merge gates; each
+review prompt uses the immutable acquisition frozen for its current round.
 
 Key contracts to preserve when changing the implementation:
 

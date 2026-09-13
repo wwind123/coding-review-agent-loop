@@ -128,6 +128,9 @@ class PullRequestReviewContext:
     metadata: PullRequestMetadata
     comments: tuple[IssueComment, ...]
     human_requirements: tuple[HumanReviewRequirement, ...]
+    # Set by the orchestration qualification read when immutable architecture
+    # context changed. It is a scheduling signal, not GitHub-supplied state.
+    architecture_identity_changed: bool = False
 
 
 @dataclass(frozen=True)

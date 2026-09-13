@@ -368,6 +368,10 @@ def build_pr_fix_prompt_for_skill(
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context_enabled: bool = True,
     architecture_path: str = "ARCHITECTURE.md",
+    architecture_read_size: int = 64 * 1024,
+    architecture_snapshot_max_chars: int = 12_000,
+    architecture_aggregate_max_chars: int = 24_000,
+    managed_context_max_chars: int = 80_000,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     """Build the external-coder PR-fix prompt from skill-mode ledger items.
@@ -380,6 +384,10 @@ def build_pr_fix_prompt_for_skill(
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_context_enabled=architecture_context_enabled,
         architecture_path=architecture_path,
+        architecture_read_size=architecture_read_size,
+        architecture_snapshot_max_chars=architecture_snapshot_max_chars,
+        architecture_aggregate_max_chars=architecture_aggregate_max_chars,
+        managed_context_max_chars=managed_context_max_chars,
         architecture_context=architecture_context,
     )
     architecture_context = architecture_context or _acquire_skill_architecture(config, workdir=workdir)

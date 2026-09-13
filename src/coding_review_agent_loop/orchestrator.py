@@ -569,12 +569,13 @@ def _architecture_metadata_fields(
 
 
 def _revalidate_pr_architecture_identity(
-    runner: Runner, *, config: AgentLoopConfig, metadata: PullRequestMetadata
-) -> None:
+    runner: Runner, *, config: AgentLoopConfig, metadata: PullRequestMetadata,
+    stored_identity: dict | None = None,
+) -> tuple[object | None, bool]:
     """Reacquire the live PR pair at every qualification/merge snapshot."""
     stored = config.architecture_context
     if not config.architecture_context_enabled or not hasattr(stored, "identity"):
-        return
+        return None, False
     fresh_config = _freeze_prompt_architecture(
         runner,
         config,
@@ -584,15 +585,16 @@ def _revalidate_pr_architecture_identity(
     )
     fresh = fresh_config.architecture_context
     if not architecture_material(stored) and not architecture_material(fresh):
-        # Missing or unreadable documents retain the legacy no-material path.
-        # A later unavailable-to-available transition is still observable and
-        # invalidates the frozen identity below.
-        return
-    if hasattr(fresh, "identity") and fresh.identity() != stored.identity():
-        raise AgentLoopError(
-            "PR architecture identity changed during qualification or merge gate; "
-            "stale approval cannot be reused and a fresh review is required."
-        )
+        # Missing, opted-out, or unreadable documents retain the legacy
+        # no-material path. A transition to usable material is handled by the
+        # identity comparison below.
+        return fresh, False
+    previous_identity = stored_identity if stored_identity is not None else stored.identity()
+    changed = bool(hasattr(fresh, "identity") and fresh.identity() != previous_identity)
+    # A changed observation is a normal exact-once scheduling transition. The
+    # caller marks the fresh context and persists it with the next checkpoint;
+    # it must not abort a review/fix/re-review cycle.
+    return fresh, changed
 TASK_IMPLEMENTATION_SALVAGE_SCOPE = "task-implementation"
 PR_FOLLOWUP_SALVAGE_SCOPE = "pr-followup"
 
@@ -8412,9 +8414,20 @@ def _fresh_pr_qualification_snapshot(
 ]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
-    _revalidate_pr_architecture_identity(
-        runner, config=config, metadata=context.metadata
+    stored_identity = next(
+        (
+            record.metadata.architecture_identity
+            for record in reversed(_extract_round_metadata_records(context.comments, flow="pr"))
+            if record.metadata.architecture_identity is not None
+        ),
+        None,
     )
+    fresh_architecture, architecture_changed = _revalidate_pr_architecture_identity(
+        runner, config=config, metadata=context.metadata, stored_identity=stored_identity
+    )
+    if architecture_changed and fresh_architecture is not None:
+        object.__setattr__(config, "architecture_context", fresh_architecture)
+        context = dataclasses_replace(context, architecture_identity_changed=True)
     if scheduler_contract is not None:
         # Scheduler metadata is an optimization over the immutable required
         # reviewer contract. A fresh qualification read must never silently
@@ -10933,7 +10946,7 @@ def run_pr_loop(
                         scheduler_contract=scheduler_contract if selective_policy else None,
                         allow_plan_handoff_change=True,
                     )
-                    if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                    if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                         log(
                             config,
                             f"Round {round_number}: PR head changed during reviewer reconciliation; "
@@ -11291,7 +11304,7 @@ def run_pr_loop(
                                 scheduler_contract=scheduler_contract if selective_policy else None,
                                 allow_plan_handoff_change=True,
                             )
-                            if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                            if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                 unresolved_items = _advance_machine_obligations_for_head(
                                     unresolved_items,
                                     current_head_sha=fresh_context.metadata.head_sha,
@@ -11665,7 +11678,7 @@ def run_pr_loop(
                             scheduler_contract=scheduler_contract if selective_policy else None,
                             allow_plan_handoff_change=True,
                         )
-                        if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                        if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             prefetched_pr_context = fresh_context
                             final_sweep_pending = False
                             continue
@@ -11689,7 +11702,7 @@ def run_pr_loop(
                             scheduler_contract=scheduler_contract if selective_policy else None,
                             allow_plan_handoff_change=True,
                         )
-                        if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                        if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             log(
                                 config,
                                 f"Round {round_number}: PR head changed before managed qualification; "
@@ -11928,7 +11941,7 @@ def run_pr_loop(
                                         scheduler_contract=scheduler_contract if selective_policy else None,
                                         allow_plan_handoff_change=True,
                                     )
-                                    if fresh_context.metadata.head_sha != pr_metadata.head_sha:
+                                    if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                         prefetched_pr_context = fresh_context
                                         final_sweep_pending = False
                                         continue
@@ -12424,6 +12437,7 @@ def run_pr_loop(
                     text,
                     unresolved_items=items,
                     human_requirements=human_requirements,
+                    required_architecture_impact_contract=(1 if architecture_material(config.architecture_context) else 0),
                 ),
                 usage_context=usage_context,
                 role="coder",

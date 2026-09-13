@@ -171,9 +171,13 @@ def run_binary_capture(
     stderr = b"".join(stderr_chunks)
     result = BinaryCommandResult(cmd, cwd, stdout, stderr, proc.returncode)
     if timed_out:
-        raise AgentLoopError(
-            f"Command timed out after {timeout_seconds:g} seconds: {' '.join(cmd)}"
-        )
+        message = f"Command timed out after {timeout_seconds:g} seconds: {' '.join(cmd)}"
+        if check:
+            raise AgentLoopError(message)
+        # Immutable-object reads use check=False so a hung Git process degrades
+        # to an unavailable snapshot instead of aborting the agent turn.
+        stderr = stderr + (message + "\n").encode("utf-8", "replace")
+        return BinaryCommandResult(cmd, cwd, stdout, stderr, proc.returncode)
     if check and result.returncode != 0:
         raise AgentLoopError(
             f"Command failed with exit {result.returncode}: {' '.join(cmd)}\n"

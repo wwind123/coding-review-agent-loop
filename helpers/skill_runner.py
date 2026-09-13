@@ -4402,6 +4402,15 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
 
     same_pr_only = all(item.get("status") == "same-pr" for item in active_items_raw)
     review_round_number = int(resume.get("round_number") or resume.get("completed_round_number") or 1)
+    if not dry_run:
+        _position_pr_fix_workdir(
+            repo=repo,
+            coder=coder,
+            workdir=workdir,
+            branch=pr_branch,
+            head_sha=current_head,
+            dry_run=False,
+        )
     prompt_text = build_pr_fix_prompt_for_skill(
         pr,
         active_items_raw,
@@ -4421,18 +4430,15 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             else None
         ),
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_context_enabled=getattr(args, "architecture_context_enabled", True),
+        architecture_path=getattr(args, "architecture_path", "ARCHITECTURE.md"),
+        architecture_read_size=getattr(args, "architecture_read_size", 64 * 1024),
+        architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
+        architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
+        managed_context_max_chars=getattr(args, "managed_context_max_chars", 80_000),
     )
 
-    if not dry_run:
-        _position_pr_fix_workdir(
-            repo=repo,
-            coder=coder,
-            workdir=workdir,
-            branch=pr_branch,
-            head_sha=current_head,
-            dry_run=False,
-        )
-    else:
+    if dry_run:
         _position_pr_fix_workdir(
             repo=repo,
             coder=coder,

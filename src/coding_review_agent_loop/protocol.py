@@ -2264,7 +2264,9 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
     )
 
 
-def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | None:
+def validate_structured_coder_followup(
+    text: str, *, required_architecture_impact_contract: int = 0
+) -> StructuredCoderFollowup | None:
     payload = _extract_structured_coder_followup_payload(text)
     if payload is None:
         return None
@@ -2326,6 +2328,10 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
         _parse_architecture_impact(payload["architecture_impact"], context="coder_followup.architecture_impact")
         if "architecture_impact" in payload else None
     )
+    if required_architecture_impact_contract == 1 and architecture_impact is None:
+        raise AgentLoopError(
+            "coder_followup must include architecture_impact for this fresh contract turn."
+        )
     addressed_items = _expect_item_id_list(
         payload["addressed_items"],
         context="coder_followup.addressed_items",

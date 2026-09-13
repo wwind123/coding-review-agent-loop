@@ -1,10 +1,12 @@
 import sys
+import json
 from datetime import datetime as datetime_type, timezone
 
 import pytest
 
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
+from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
 from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
 import coding_review_agent_loop.test_runtime as runtime
 import coding_review_agent_loop.prompts as prompts_module
@@ -2255,6 +2257,49 @@ def test_task_prompts_document_no_pr_blocking_branch(tmp_path):
     for prompt in (task_prompt, clarification_prompt):
         assert "For a no-PR blocking result:" in prompt
         assert "without an `AGENT_PR` marker" in prompt
+
+
+def test_task_prompt_structured_clarification_footer_matches_validator(tmp_path):
+    from coding_review_agent_loop.protocol import validate_structured_task_result
+
+    config = make_config(tmp_path)
+    task_prompt = build_task_prompt("Clarify the implementation.", config)
+    clarification_prompt = build_task_clarification_prompt(
+        "Clarify the implementation.", [("Which API?", "The public API.")], config
+    )
+    payload = {
+        "schema_version": 1,
+        "kind": "task_result",
+        "state": "blocking",
+        "outcome": "clarification",
+        "summary": "One API detail is still required.",
+        "clarification": ["Which endpoint should change?"],
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No contract is changed before clarification.",
+        },
+    }
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Coder"
+    assert validate_structured_task_result(text, required_architecture_impact_contract=1)
+    for prompt in (task_prompt, clarification_prompt):
+        assert "structured `task_result`" in prompt
+        assert "AGENT_CLARIFY -->" not in prompt
+
+
+def test_active_architecture_uses_lossless_requirements_and_omits_architecture_first(tmp_path):
+    architecture = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available",
+        size=20, content="# System\n\nThe architecture overview.", heading_index=("System",),
+    )
+    config = make_config(
+        tmp_path,
+        architecture_context=architecture,
+        managed_context_max_chars=300,
+    )
+    prompt = build_task_prompt("Implement the requested change.", config)
+    assert "Architecture context omitted for managed prompt budget" in prompt
+    assert "The architecture overview" not in prompt
 
 
 @pytest.mark.parametrize("compact_context", [False, True])

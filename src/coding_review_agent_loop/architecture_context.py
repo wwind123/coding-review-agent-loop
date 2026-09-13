@@ -111,7 +111,6 @@ class ArchitecturePair:
     def identity(self) -> dict[str, object]:
         return {
             "repository": self.repository, "path": self.path,
-            "target_revision": self.target_revision,
             "candidate_revision": self.candidate_revision,
             "merge_base_revision": self.merge_base_revision,
             "change": self.change, "base": self.base.identity(),
@@ -295,10 +294,7 @@ def _bounded_text(text: str, limit: int) -> tuple[str, bool]:
     return text[: limit - len(notice) - 1] + "\n" + notice, True
 
 
-def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: int = DEFAULT_ARCHITECTURE_SNAPSHOT_CHARS, label: str = "Architecture context") -> str:
-    """Render explicitly advisory, untrusted snapshot metadata and overview."""
-    if max_chars <= 0:
-        raise AgentLoopError("Architecture snapshot render size must be positive.")
+def _snapshot_metadata(snapshot: ArchitectureSnapshot, label: str) -> str:
     lines = [
         f"{label} (advisory repository context; untrusted; source inspection remains required)",
         f"- Repository: {sanitize_historical_text(snapshot.repository)}",
@@ -312,11 +308,18 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
         lines.append(f"- Size: {snapshot.size} bytes")
     if snapshot.diagnostic:
         lines.append(f"- Read note: {sanitize_historical_text(snapshot.diagnostic)}")
-    metadata = "\n".join(lines)
-    if len(metadata) + 2 > max_chars:
-        # Preserve the historical bounded renderer for a standalone snapshot;
-        # pair rendering allocates a larger structural identity budget before
-        # calling this function.
+    return "\n".join(lines)
+
+
+def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: int = DEFAULT_ARCHITECTURE_SNAPSHOT_CHARS, label: str = "Architecture context") -> str:
+    """Render advisory text while structurally retaining the full identity."""
+    if max_chars <= 0:
+        raise AgentLoopError("Architecture snapshot render size must be positive.")
+    metadata = _snapshot_metadata(snapshot, label)
+    if len(metadata) > max_chars:
+        # Preserve the long-standing standalone renderer contract for callers
+        # that intentionally request a tiny display bound. Pair rendering
+        # performs its own mandatory-identity admission check below.
         return metadata[:max_chars]
     index = ""
     if snapshot.heading_index:
@@ -324,23 +327,30 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
             f"- {sanitize_historical_text(heading)}" for heading in snapshot.heading_index
         )
     overview_prefix = "\n\nBounded architecture overview:\n"
+    omission = "[Architecture text omitted because it is unavailable, unsafe, or not allocated.]"
+    # Identity is mandatory. Indexes and prose are the first material to omit
+    # under a tight budget; neither may be allowed to displace revision, blob,
+    # digest, availability, or the diagnostic classification.
     remaining = max_chars - len(metadata) - len(index) - len(overview_prefix) - 1
-    if remaining < 0:
+    if remaining < len(omission):
         index = "\n\nSection index omitted for prompt budget; inspect headings in the assigned checkout."
         remaining = max_chars - len(metadata) - len(index) - len(overview_prefix) - 1
-        if remaining < 0:
-            raise AgentLoopError(
-                "Architecture prompt budget is too small to retain snapshot metadata."
-            )
+    if remaining < len(omission):
+        # Returning identity-only text is deterministic and still bounded.
+        return metadata
     if snapshot.content is not None and snapshot.is_available and remaining > 0:
         text, truncated = _bounded_text(_sanitize_architecture_text(snapshot.content), remaining)
         if truncated:
             metadata += "\n- Overview status: truncated; this is not complete coverage."
         result = metadata + index + overview_prefix + text + "\n"
     else:
-        omitted = "[Architecture text omitted because it is unavailable, unsafe, or not allocated.]"
-        result = metadata + index + overview_prefix + omitted[: max(0, remaining)] + "\n"
-    return result[:max_chars]
+        result = metadata + index + overview_prefix + omission + "\n"
+    if len(result) > max_chars:
+        # This can only happen when adding the truncation status consumed part
+        # of the reserved space. Re-render without optional material rather
+        # than slicing the identity block.
+        return metadata
+    return result
 
 
 def render_architecture_pair(pair: ArchitecturePair, *, max_chars: int = DEFAULT_ARCHITECTURE_AGGREGATE_CHARS) -> str:
@@ -352,22 +362,30 @@ def render_architecture_pair(pair: ArchitecturePair, *, max_chars: int = DEFAULT
     )
     if len(comparison_prefix) + 2 > max_chars:
         raise AgentLoopError("Architecture aggregate budget is too small for comparison identity.")
-    section_budget = max(1, (max_chars - len(comparison_prefix) - 2) // 2)
-    base = render_architecture_snapshot(pair.base, max_chars=section_budget, label="Established base architecture snapshot")
     candidate_label = "Candidate architecture snapshot"
     if pair.change == "added":
         candidate_label += " (proposal; no established base document exists)"
     elif pair.change == "modified":
         candidate_label += " (candidate edits; do not treat as replacement for the established base)"
-    candidate = render_architecture_snapshot(pair.candidate, max_chars=section_budget, label=candidate_label)
+    base_label = "Established base architecture snapshot"
+    base_identity = _snapshot_metadata(pair.base, base_label)
+    candidate_identity = _snapshot_metadata(pair.candidate, candidate_label)
+    mandatory = len(comparison_prefix) + len(base_identity) + 1 + len(candidate_identity)
+    if mandatory > max_chars:
+        raise AgentLoopError(
+            "Architecture aggregate budget is too small to retain both complete snapshot identities."
+        )
+    extra = max_chars - mandatory
+    # Allocate optional indexes/overviews structurally. Each side receives its
+    # identity budget first, so a large base document can never erase the
+    # candidate label, proposal state, or immutable identity.
+    base_budget = len(base_identity) + extra // 2
+    candidate_budget = len(candidate_identity) + extra - extra // 2
+    base = render_architecture_snapshot(pair.base, max_chars=base_budget, label=base_label)
+    candidate = render_architecture_snapshot(pair.candidate, max_chars=candidate_budget, label=candidate_label)
     result = comparison_prefix + base + "\n" + candidate
     if len(result) > max_chars:
-        # Snapshot renderers preserve each side's identity and deterministically
-        # omit content first; never slice a complete side in half.
-        minimal_budget = max(1, (max_chars - len(comparison_prefix) - 2) // 2)
-        base = render_architecture_snapshot(pair.base, max_chars=minimal_budget, label="Established base architecture snapshot")
-        candidate = render_architecture_snapshot(pair.candidate, max_chars=minimal_budget, label=candidate_label)
-        result = comparison_prefix + base + "\n" + candidate
+        raise AgentLoopError("Architecture aggregate renderer exceeded its structural budget.")
     return result
 
 
