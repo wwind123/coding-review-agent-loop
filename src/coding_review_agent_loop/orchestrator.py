@@ -45,7 +45,6 @@ from .decomposition import (
     find_one_shot_impl_handoffs,
     find_latest_one_shot_impl_handoff,
     find_existing_phase_implementation_handoff,
-    find_phase_implementation_handoffs,
     parse_plan_decomposition,
     post_decomposition_parent_summary,
     post_one_shot_impl_handoff_comment,
@@ -59,6 +58,9 @@ from .decomposition import (
     reject_legacy_topology_collision,
     post_execution_decision,
     find_existing_topology_checkpoint,
+    find_topology_checkpoints_for_parent,
+    find_decompositions_for_parent,
+    find_phase_implementation_handoffs_for_parent,
     PHASE_IDENTITY_MARKER_RE,
     phase_identity,
     post_topology_checkpoint,
@@ -4701,11 +4703,47 @@ def _preflight_fresh_staged_topology(
         parent_issue=issue_number,
         plan_hash=plan_hash,
     )
+    parent_summaries = find_decompositions_for_parent(
+        issue_context.comments, parent_issue=issue_number
+    )
+    if any(summary.plan_hash != plan_hash for summary in parent_summaries):
+        recorded = next(summary for summary in parent_summaries if summary.plan_hash != plan_hash)
+        raise AgentLoopError(
+            "Fresh staged execution conflicts with an existing decomposition summary for "
+            f"plan {recorded.plan_hash}; repair or resume the recorded topology before rerunning."
+        )
+    if any(summary != parent_summaries[0] for summary in parent_summaries[1:]):
+        raise AgentLoopError(
+            "Ambiguous staged recovery: multiple divergent decomposition summaries exist for the parent."
+        )
     existing_summary = find_existing_decomposition(
         issue_context.comments,
         parent_issue=issue_number,
         plan_hash=plan_hash,
     )
+    parent_checkpoints = find_topology_checkpoints_for_parent(
+        issue_context.comments, parent_issue=issue_number
+    )
+    for checkpoint in parent_checkpoints:
+        if checkpoint.plan_hash != plan_hash:
+            raise AgentLoopError(
+                "Fresh staged execution conflicts with an existing topology checkpoint for "
+                f"plan {checkpoint.plan_hash}; repair or resume the recorded topology before rerunning."
+            )
+        if checkpoint.mode not in {"decompose-only", "implement-by-phase"}:
+            raise AgentLoopError(
+                "Fresh staged execution conflicts with a topology checkpoint using unsupported "
+                f"mode `{checkpoint.mode}`; repair the recorded topology before rerunning."
+            )
+    for checkpoint_mode in ("decompose-only", "implement-by-phase"):
+        # Preserve the existing same-plan divergence check while the parent
+        # inventory above catches records hidden under older plan hashes.
+        find_existing_topology_checkpoint(
+            issue_context.comments,
+            parent_issue=issue_number,
+            plan_hash=plan_hash,
+            mode=checkpoint_mode,
+        )
     if existing_summary is not None and (
         existing_summary.topology_source != EXECUTION_TOPOLOGY_SOURCE
         or existing_summary.strategy != "staged"
@@ -4797,10 +4835,8 @@ def _preflight_fresh_staged_topology(
                 "repair the recorded stage allocation, child references, or integration obligations before rerunning."
             )
 
-    handoffs = find_phase_implementation_handoffs(
-        issue_context.comments,
-        parent_issue=issue_number,
-        plan_hash=plan_hash,
+    handoffs = find_phase_implementation_handoffs_for_parent(
+        issue_context.comments, parent_issue=issue_number
     )
     seen_handoff_phases: set[int] = set()
     for handoff in handoffs:
@@ -4810,7 +4846,8 @@ def _preflight_fresh_staged_topology(
             )
         seen_handoff_phases.add(handoff.phase_index)
         if (
-            handoff.mode != "implement-by-phase"
+            handoff.plan_hash != plan_hash
+            or handoff.mode != "implement-by-phase"
             or handoff.strategy != "staged"
             or handoff.topology_source != EXECUTION_TOPOLOGY_SOURCE
             or handoff.execution_strategy_contract_version
@@ -4934,37 +4971,29 @@ def _preflight_fresh_one_shot_recovery(
         config=config,
         issue_context=issue_context,
     )
-    existing_summary = find_existing_decomposition(
-        issue_context.comments,
-        parent_issue=issue_number,
-        plan_hash=plan_hash,
+    parent_summaries = find_decompositions_for_parent(
+        issue_context.comments, parent_issue=issue_number
     )
-    if existing_summary is not None:
+    if parent_summaries:
+        recorded = parent_summaries[0]
         raise AgentLoopError(
-            "Fresh one-shot execution conflicts with an existing decomposition summary; "
-            "resume the staged topology or revise the approved plan before rerunning."
+            "Fresh one-shot execution conflicts with an existing decomposition summary for "
+            f"plan {recorded.plan_hash}; resume the staged topology or repair it before rerunning."
         )
-    if find_phase_implementation_handoffs(
-        issue_context.comments,
-        parent_issue=issue_number,
-        plan_hash=plan_hash,
+    if find_phase_implementation_handoffs_for_parent(
+        issue_context.comments, parent_issue=issue_number
     ):
         raise AgentLoopError(
             "Fresh one-shot execution conflicts with an existing phase implementation handoff; "
             "resume the staged topology or repair the conflicting handoff first."
         )
-    for checkpoint_mode in ("decompose-only", "implement-by-phase"):
-        checkpoint = find_existing_topology_checkpoint(
-            issue_context.comments,
-            parent_issue=issue_number,
-            plan_hash=plan_hash,
-            mode=checkpoint_mode,
+    if find_topology_checkpoints_for_parent(
+        issue_context.comments, parent_issue=issue_number
+    ):
+        raise AgentLoopError(
+            "Fresh one-shot execution conflicts with an existing staged topology checkpoint; "
+            "resume the staged topology or revise the approved plan before rerunning."
         )
-        if checkpoint is not None:
-            raise AgentLoopError(
-                "Fresh one-shot execution conflicts with an existing staged topology checkpoint; "
-                "resume the staged topology or revise the approved plan before rerunning."
-            )
     resolved_pr = resolve_canonical_pr_for_issue(
         runner,
         config=config,

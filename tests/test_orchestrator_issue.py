@@ -2908,6 +2908,40 @@ def test_issue_loop_plan_first_one_shot_posts_handoff_after_pr_creation(tmp_path
     assert "PR #77" in handoff_comments[0]
 
 
+def test_issue_loop_fresh_one_shot_publishes_decision_before_handoff(tmp_path):
+    plan = structured_v1_plan_state()
+    runner = FakeRunner(
+        claude_outputs=[
+            plan,
+            "Implemented the approved fresh plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        plan_execution_mode="implement-one-shot",
+        execution_strategy_contract_required=True,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    decision_indexes = [
+        index for index, comment in enumerate(runner.comments)
+        if "AGENT_PLAN_EXECUTION_DECISION" in comment
+    ]
+    handoff_indexes = [
+        index for index, comment in enumerate(runner.comments)
+        if "AGENT_PLAN_ONE_SHOT_IMPL" in comment
+    ]
+    assert len(decision_indexes) == 1
+    assert len(handoff_indexes) == 1
+    assert decision_indexes[0] < handoff_indexes[0]
+
+
 def test_issue_loop_plan_first_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_path):
     old_plan = "Approved old plan.\n\n### Scope\n- Preserve the old API."
     later_plan = "Unrelated later plan.\n\n### Scope\n- Replace the old API."

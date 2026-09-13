@@ -970,6 +970,28 @@ def find_existing_topology_checkpoint(
     return found
 
 
+def find_topology_checkpoints_for_parent(
+    comments: Sequence[object], *, parent_issue: int
+) -> tuple[TopologyCheckpoint, ...]:
+    """Return every checkpoint for a parent, regardless of approved plan.
+
+    Fresh execution recovery must inventory the parent before publishing a new
+    decision.  The normal lookup is deliberately plan-scoped for legacy
+    resume, while this helper closes the interrupted-run window where an older
+    checkpoint would otherwise be invisible to a new approved plan.
+    """
+    found: list[TopologyCheckpoint] = []
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in TOPOLOGY_CHECKPOINT_MARKER_RE.finditer(body):
+            checkpoint = _decode_checkpoint(match.group("payload"))
+            if checkpoint.parent_issue == parent_issue:
+                found.append(checkpoint)
+    return tuple(found)
+
+
 def format_topology_checkpoint(checkpoint: TopologyCheckpoint) -> str:
     raw = json.dumps(
         _checkpoint_payload(checkpoint),
@@ -1947,7 +1969,7 @@ def find_existing_decomposition(
     comments: Sequence[object],
     *,
     parent_issue: int,
-    plan_hash: str,
+    plan_hash: str | None,
     mode: str | None = None,
     strategy: str | None = None,
     topology_source: str | None = None,
@@ -1963,7 +1985,7 @@ def find_existing_decomposition(
             metadata = _decode_metadata(match.group("payload"))
             matches = (
                 metadata.parent_issue == parent_issue
-                and metadata.plan_hash == plan_hash
+                and (plan_hash is None or metadata.plan_hash == plan_hash)
                 and (mode is None or metadata.mode == mode)
                 and (strategy is None or metadata.strategy == strategy)
                 and (topology_source is None or metadata.topology_source == topology_source)
@@ -1991,6 +2013,22 @@ def find_existing_decomposition(
     return found
 
 
+def find_decompositions_for_parent(
+    comments: Sequence[object], *, parent_issue: int
+) -> tuple[DecompositionMetadata, ...]:
+    """Return every decomposition summary for a parent, across plan hashes."""
+    found: list[DecompositionMetadata] = []
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in DECOMPOSITION_MARKER_RE.finditer(body):
+            metadata = _decode_metadata(match.group("payload"))
+            if metadata.parent_issue == parent_issue:
+                found.append(metadata)
+    return tuple(found)
+
+
 def reject_legacy_topology_collision(
     comments: Sequence[object],
     *,
@@ -2003,27 +2041,26 @@ def reject_legacy_topology_collision(
     A same-plan legacy checkpoint or summary is not evidence for that identity
     and must not be bypassed by title-shaped child discovery.
     """
-    summary = find_existing_decomposition(
-        comments,
-        parent_issue=parent_issue,
-        plan_hash=plan_hash,
-    )
-    if summary is not None and summary.topology_source != EXECUTION_TOPOLOGY_SOURCE:
-        raise AgentLoopError(
-            "Fresh execution topology conflicts with an existing legacy decomposition summary; "
-            "repair the historical mode/source identity before rerunning."
-        )
-    for mode in ("decompose-only", "implement-by-phase"):
-        checkpoint = find_existing_topology_checkpoint(
-            comments,
-            parent_issue=parent_issue,
-            plan_hash=plan_hash,
-            mode=mode,
-        )
-        if checkpoint is not None and checkpoint.topology_source != EXECUTION_TOPOLOGY_SOURCE:
+    # This inventory intentionally ignores the current plan hash.  A crash can
+    # leave only a legacy summary/checkpoint; filtering by the newly approved
+    # hash would make that state look absent and permit a second topology.
+    for summary in find_decompositions_for_parent(comments, parent_issue=parent_issue):
+        if (
+            summary.plan_hash != plan_hash
+            or summary.topology_source != EXECUTION_TOPOLOGY_SOURCE
+        ):
             raise AgentLoopError(
-                "Fresh execution topology conflicts with an existing legacy topology checkpoint; "
-                "repair the historical mode/source identity before rerunning."
+                "Fresh execution topology conflicts with an existing decomposition summary "
+                f"for plan {summary.plan_hash}; repair or resume the recorded topology before rerunning."
+            )
+    for checkpoint in find_topology_checkpoints_for_parent(comments, parent_issue=parent_issue):
+        if (
+            checkpoint.plan_hash != plan_hash
+            or checkpoint.topology_source != EXECUTION_TOPOLOGY_SOURCE
+        ):
+            raise AgentLoopError(
+                "Fresh execution topology conflicts with an existing topology checkpoint "
+                f"for plan {checkpoint.plan_hash}; repair or resume the recorded topology before rerunning."
             )
 
 
@@ -2075,6 +2112,22 @@ def find_phase_implementation_handoffs(
         for match in PHASE_IMPLEMENTATION_MARKER_RE.finditer(body):
             metadata = _decode_phase_implementation_handoff_metadata(match.group("payload"))
             if metadata.parent_issue == parent_issue and metadata.plan_hash == plan_hash:
+                found.append(metadata)
+    return tuple(found)
+
+
+def find_phase_implementation_handoffs_for_parent(
+    comments: Sequence[object], *, parent_issue: int
+) -> tuple[PhaseImplementationHandoffMetadata, ...]:
+    """Return every phase handoff for a parent, across plan hashes."""
+    found: list[PhaseImplementationHandoffMetadata] = []
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in PHASE_IMPLEMENTATION_MARKER_RE.finditer(body):
+            metadata = _decode_phase_implementation_handoff_metadata(match.group("payload"))
+            if metadata.parent_issue == parent_issue:
                 found.append(metadata)
     return tuple(found)
 

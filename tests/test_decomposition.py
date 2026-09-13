@@ -32,7 +32,7 @@ from coding_review_agent_loop.decomposition import (
     normalize_execution_recommendation,
     find_existing_execution_decision,
 )
-from coding_review_agent_loop.protocol import ExecutionChildStage
+from coding_review_agent_loop.protocol import ExecutionChildStage, validate_structured_plan_state
 from coding_review_agent_loop.github import IssueComment, IssueContext
 from coding_review_agent_loop.child_topology import NeedsHumanDecision
 from coding_review_agent_loop.orchestrator import (
@@ -40,6 +40,7 @@ from coding_review_agent_loop.orchestrator import (
     _attach_round_metadata,
     _plan_subject,
     _preflight_fresh_one_shot_recovery,
+    _preflight_fresh_staged_topology,
 )
 from coding_review_agent_loop.split_materialization import (
     MaterializedSplitChild,
@@ -394,6 +395,108 @@ def test_execution_decision_recovery_rejects_a_changed_parent_plan():
             strategy="one-shot",
             recommendation_digest="new-digest",
         )
+
+
+def _parent_recovery_record(kind: str) -> str:
+    old_plan_hash = "old-plan-hash"
+    phase = _phase("Recorded stage")
+    created = CreatedPhaseIssue(
+        phase=phase,
+        issue_url="https://github.com/OWNER/REPO/issues/101",
+        issue_number=101,
+    )
+    if kind == "summary":
+        return format_decomposition_parent_summary(
+            parent_issue=56,
+            mode="decompose-only",
+            plan_hash=old_plan_hash,
+            created=(created,),
+            topology_source="model",
+        )
+    if kind == "checkpoint":
+        return format_topology_checkpoint(
+            TopologyCheckpoint(
+                parent_issue=56,
+                plan_hash=old_plan_hash,
+                mode="decompose-only",
+                topology_source="model",
+                phases=(phase,),
+            )
+        )
+    if kind == "phase-handoff":
+        return format_phase_implementation_handoff_comment(
+            parent_issue=56,
+            mode="implement-by-phase",
+            plan_hash=old_plan_hash,
+            phase_index=1,
+            created=created,
+        )
+    raise AssertionError(f"unknown recovery record kind: {kind}")
+
+
+@pytest.mark.parametrize("record_kind", ["summary", "checkpoint", "phase-handoff"])
+def test_fresh_staged_preflight_inventories_record_only_parent_state_before_writes(
+    tmp_path, record_kind
+):
+    plan = "Approved fresh staged plan"
+    topology = _fresh_recovery_topology(plan)
+    context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(IssueComment(author="bot", created_at=None, body=_parent_recovery_record(record_kind)),),
+    )
+    runner = FakeRunner()
+
+    with pytest.raises(AgentLoopError, match="recorded topology|handoff|record-only"):
+        _preflight_fresh_staged_topology(
+            runner,
+            issue_number=56,
+            approved_plan=plan,
+            config=make_config(tmp_path),
+            issue_context=context,
+            mode="decompose-only",
+            normalized_topology=(topology, RetainedParentScope(
+                plan_subject=_plan_subject(plan), plan_hash=approved_plan_hash(plan), excerpt=plan,
+                status="none",
+            )),
+        )
+
+    assert runner.comments == []
+    assert runner.issues == []
+
+
+@pytest.mark.parametrize("record_kind", ["summary", "checkpoint", "phase-handoff"])
+def test_fresh_one_shot_preflight_inventories_record_only_parent_state_before_writes(
+    tmp_path, record_kind
+):
+    plan = structured_v1_plan_state()
+    recommendation = validate_structured_plan_state(plan).execution_recommendation
+    assert recommendation is not None
+    context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(IssueComment(author="bot", created_at=None, body=_parent_recovery_record(record_kind)),),
+    )
+    runner = FakeRunner()
+
+    with pytest.raises(AgentLoopError, match="existing|recorded topology"):
+        _preflight_fresh_one_shot_recovery(
+            runner,
+            issue_number=56,
+            approved_plan=plan,
+            config=make_config(tmp_path),
+            issue_context=context,
+            recommendation=recommendation,
+        )
+
+    assert runner.comments == []
+    assert runner.issues == []
 
 
 @pytest.mark.parametrize("split_state", ["materialized", "orphan-child"])

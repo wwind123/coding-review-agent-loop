@@ -4818,6 +4818,7 @@ class TestRunDecompose:
         import helpers.skill_runner as sr
         import coding_review_agent_loop.decomposition as decomp
         import coding_review_agent_loop.github as gh
+        import coding_review_agent_loop.orchestrator as orchestrator_module
         from coding_review_agent_loop.github import IssueContext
 
         raw_outputs: list[str] = []
@@ -5013,6 +5014,171 @@ class TestRunDecompose:
         assert output["reused"] is True
         assert output["phase_count"] == 1
         assert output["phases"][0]["issue_number"] == 123
+
+    def test_fresh_decompose_rejects_older_parent_summary_before_any_skill_write(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        import coding_review_agent_loop.orchestrator as orchestrator_module
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.github import IssueComment, IssueContext
+
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        recommendation = payload["execution_recommendation"]
+        recommendation["strategy"] = "staged"
+        recommendation["staging_feasibility"] = "safe"
+        recommendation.pop("one_shot_delivery")
+        recommendation["scope_items"] = [
+            {
+                "scope_item_id": "scope-api",
+                "requirement": "Implement the API.",
+                "acceptance_criteria": ["The API tests pass."],
+            },
+            {
+                "scope_item_id": "scope-integration",
+                "requirement": "Verify integration.",
+                "acceptance_criteria": ["The integration tests pass."],
+            },
+        ]
+        recommendation["child_stages"] = [
+            {
+                "stage_id": "stage-api",
+                "position": 1,
+                "title": "API contract",
+                "summary": "Implement the API.",
+                "deliverables": ["API implementation."],
+                "non_goals": [],
+                "acceptance_criteria": ["The API tests pass."],
+                "depends_on_stage_ids": [],
+                "dependency_notes": "No dependencies.",
+                "automation": "agent-pr",
+                "rollout_risk": "low",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-api"],
+            },
+            {
+                "stage_id": "stage-integration",
+                "position": 2,
+                "title": "Integration verification",
+                "summary": "Verify integration.",
+                "deliverables": ["Integration verification."],
+                "non_goals": [],
+                "acceptance_criteria": ["The integration tests pass."],
+                "depends_on_stage_ids": ["stage-api"],
+                "dependency_notes": "After the API contract.",
+                "automation": "agent-pr",
+                "rollout_risk": "medium",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-integration"],
+            },
+        ]
+        recommendation["retained_parent_work"] = {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        }
+        recommendation["final_integration_work"] = {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        }
+        plan = json.dumps(payload) + _VALID_PLAN_STATE[_VALID_PLAN_STATE.find("\n<!--") :]
+        plan_file = tmp_path / "fresh-plan.md"
+        plan_file.write_text(plan, encoding="utf-8")
+        stale_summary = decomp.format_decomposition_parent_summary(
+            parent_issue=77,
+            mode="decompose-only",
+            plan_hash="older-plan",
+            created=(decomp.CreatedPhaseIssue(
+                phase=decomp.RecordedPhase(title="Older phase", automation="agent-pr"),
+                issue_url="https://github.com/test/skill-repo/issues/123",
+                issue_number=123,
+            ),),
+            topology_source="model",
+        )
+
+        def fake_get_issue_context(_runner, *, config, issue_number):
+            return IssueContext(
+                number=issue_number,
+                repo=config.repo,
+                title="Parent",
+                body="Body",
+                url="u",
+                comments=(IssueComment(author="bot", created_at=None, body=stale_summary),),
+                human_requirements=(),
+            )
+
+        monkeypatch.setattr(gh, "get_issue_context", fake_get_issue_context)
+        monkeypatch.setattr(orchestrator_module, "search_issues", lambda *_args, **_kwargs: ())
+        monkeypatch.setattr(sr, "_run_helper", lambda *_args, **_kwargs: pytest.fail("coder must not run"))
+
+        with pytest.raises(AgentLoopError, match="older-plan|recorded topology"):
+            sr.cmd_run_decompose(types.SimpleNamespace(
+                issue=77,
+                repo="test/skill-repo",
+                coder="codex",
+                plan_file=str(plan_file),
+                workdir=str(tmp_path),
+                workdir_codex=None,
+                workdir_gemini=None,
+                workdir_antigravity=None,
+                dry_run=False,
+            ))
+
+    def test_fresh_implement_rejects_older_parent_summary_before_any_skill_write(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        import coding_review_agent_loop.orchestrator as orchestrator_module
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.github import IssueComment, IssueContext
+
+        stale_summary = decomp.format_decomposition_parent_summary(
+            parent_issue=77,
+            mode="decompose-only",
+            plan_hash="older-plan",
+            created=(decomp.CreatedPhaseIssue(
+                phase=decomp.RecordedPhase(title="Older phase", automation="agent-pr"),
+                issue_url="https://github.com/test/skill-repo/issues/123",
+                issue_number=123,
+            ),),
+            topology_source="model",
+        )
+        plan_file = tmp_path / "fresh-one-shot.md"
+        plan_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+
+        monkeypatch.setattr(sr, "_fetch_issue_comments_raw", lambda _repo, _issue: [stale_summary])
+        monkeypatch.setattr(
+            gh,
+            "get_issue_context",
+            lambda _runner, *, config, issue_number: IssueContext(
+                number=issue_number,
+                repo=config.repo,
+                title="Parent",
+                body="Body",
+                url="u",
+                comments=(IssueComment(author="bot", created_at=None, body=stale_summary),),
+                human_requirements=(),
+            ),
+        )
+        monkeypatch.setattr(orchestrator_module, "search_issues", lambda *_args, **_kwargs: ())
+        monkeypatch.setattr(sr, "_run_helper", lambda *_args, **_kwargs: pytest.fail("coder must not run"))
+
+        with pytest.raises(AgentLoopError, match="older-plan|existing decomposition"):
+            sr.cmd_run_implement(types.SimpleNamespace(
+                issue=77,
+                repo="test/skill-repo",
+                coder="codex",
+                plan_file=str(plan_file),
+                workdir=str(tmp_path),
+                workdir_codex=None,
+                workdir_gemini=None,
+                workdir_antigravity=None,
+                base="main",
+                dry_run=False,
+            ))
 
 
 # ---------------------------------------------------------------------------
