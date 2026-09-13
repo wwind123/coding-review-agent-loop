@@ -113,7 +113,11 @@ from coding_review_agent_loop.config import (
     ensure_temp_checkout,
     sync_checkout_to_pr,
 )
-from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
+from coding_review_agent_loop.errors import (
+    AgentLoopError,
+    FreshContractIntegrityError,
+    UnknownPriorItemDispositionError,
+)
 from coding_review_agent_loop.decomposition import (
     PHASE_IDENTITY_MARKER_RE,
     _decode_json_payload,
@@ -1982,6 +1986,11 @@ def _complete_reviewer_turn(
             raw_text = _normalize_disposition_values(_normalize_raw_response(raw_text))
             validate(raw_text)
         raw_output.write_text(raw_text, encoding="utf-8")
+    except FreshContractIntegrityError:
+        # The source cannot prove a reviewed v1 topology.  Keep the raw repair
+        # artifact, but do not route it through retry-validate: the next skill
+        # invocation must obtain a fresh planner response.
+        raise
     except (AgentLoopError, ValueError) as exc:
         raise _ValidationError(
             f"skill_runner: {agent} review validation failed: {exc}\n"
@@ -2666,6 +2675,10 @@ def _complete_coder_turn(
         else:
             validated_result = validate(raw_text)
         raw_output.write_text(raw_text, encoding="utf-8")
+    except FreshContractIntegrityError:
+        # Preserve the dedicated outcome so the caller can request a fresh
+        # planner turn instead of suggesting format repair for unproven data.
+        raise
     except (AgentLoopError, ValueError) as exc:
         raise _ValidationError(
             f"skill_runner: {coder_cap} {kind} validation failed: {exc}\n"
@@ -3012,6 +3025,17 @@ def _run_external_coder_phase(
                 ),
                 architecture_contract_version=1,
             )
+        except FreshContractIntegrityError as exc:
+            print(
+                f"skill_runner: fresh planning contract integrity failure: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                "skill_runner: raw response was retained for diagnostics; do not run "
+                "retry-validate. Re-run run-plan-round to start a fresh planner turn.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
             dry_run_flag = " --dry-run" if dry_run else ""
@@ -4087,6 +4111,13 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                     else 0
                 ),
             )
+        except FreshContractIntegrityError as exc:
+            print(
+                f"skill_runner: fresh planning contract integrity failure: {exc}; "
+                "start a fresh planner turn instead of retry-validate.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
             sys.exit(1)
