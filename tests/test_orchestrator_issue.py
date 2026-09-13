@@ -11,7 +11,13 @@ from coding_review_agent_loop.comment_rendering import (
     _render_public_issue_implementation_comment,
     render_canonical_plan_state,
 )
-from coding_review_agent_loop.decomposition import approved_plan_hash, format_one_shot_impl_handoff_comment
+from coding_review_agent_loop.decomposition import (
+    CreatedPhaseIssue,
+    RecordedPhase,
+    approved_plan_hash,
+    format_decomposition_parent_summary,
+    format_one_shot_impl_handoff_comment,
+)
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
@@ -208,6 +214,7 @@ def _fresh_staged_plan_for_recovery() -> tuple[str, str]:
     [
         ("auto", "existing implementation PR"),
         ("implement-one-shot", "incompatible"),
+        ("plan-only", "existing implementation PR"),
     ],
 )
 def test_plan_first_pr_recovery_reconciles_fresh_strategy_before_resume(
@@ -256,6 +263,95 @@ def test_plan_first_pr_recovery_reconciles_fresh_strategy_before_resume(
         )
 
     assert not any(cmd[:1] == ["claude"] or cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
+
+
+def test_plan_first_plan_only_does_not_review_canonical_pr_without_plan_round(tmp_path, capsys):
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="issue-implementation",
+        plan_hash=None,
+    )
+    runner = _FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:00Z", "body": handoff}
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(tmp_path, plan_execution_mode="plan-only"),
+        plan_first=True,
+    ) == 0
+
+    assert "review was not started" in capsys.readouterr().out
+    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+def test_plan_first_plan_only_reconciles_one_shot_against_staged_state(tmp_path):
+    canonical_plan = render_canonical_plan_state(
+        validate_structured_plan_state(structured_v1_plan_state())
+    )
+    plan_comment = _attach_round_metadata(
+        canonical_plan + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject=_plan_subject(canonical_plan),
+            canonical_plan=canonical_plan,
+            raw_structured_coder_response=structured_v1_plan_state(),
+            execution_strategy_contract_version=1,
+            execution_strategy_identity=(
+                validate_structured_plan_state(structured_v1_plan_state())
+                .execution_recommendation.identity()
+            ),
+        ),
+    )
+    staged_summary = format_decomposition_parent_summary(
+        parent_issue=56,
+        mode="decompose-only",
+        plan_hash="old-plan-hash",
+        created=(
+            CreatedPhaseIssue(
+                phase=RecordedPhase(title="Existing stage", automation="agent-pr"),
+                issue_url="https://github.com/OWNER/REPO/issues/101",
+                issue_number=101,
+            ),
+        ),
+    )
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=approved_plan_hash(canonical_plan),
+    )
+    runner = _FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:00Z", "body": plan_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:01Z", "body": staged_summary},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:02Z", "body": handoff},
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+
+    with pytest.raises(AgentLoopError, match="existing decomposition summary"):
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, plan_execution_mode="plan-only"),
+            plan_first=True,
+        )
+
     assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
 
 
@@ -3223,7 +3319,12 @@ def test_issue_loop_plan_first_resume_uses_handoff_bound_plan_when_later_plan_ex
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
 
-    assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path), plan_first=True) == 0
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(tmp_path, plan_execution_mode="implement-one-shot"),
+        plan_first=True,
+    ) == 0
 
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
@@ -3316,7 +3417,12 @@ def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path,
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
 
-    assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path), plan_first=True) == 0
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+        plan_first=True,
+    ) == 0
 
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])

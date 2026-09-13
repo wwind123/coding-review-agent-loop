@@ -1197,8 +1197,10 @@ What each mechanism produces and where the run stops:
   `--materialize-split-issues` is also passed, generic split children are
   still filed even in `plan-only`, because that materialization step runs
   before the mode is dispatched — `plan-only` only skips decomposition and
-  implementation, not legacy split materialization. A fresh v1 recommendation
-  owns its complete topology, so it remains inert at that legacy seam.
+  implementation, not legacy split materialization. A fresh v1 staged
+  recommendation owns its complete topology, so it remains inert at that
+  legacy seam; a fresh v1 one-shot recommendation preserves the historical
+  split-materialization behavior.
 - **`decompose-only`**: uses typed `child_stages` directly when present;
   otherwise it validates one model decomposition. The complete topology is
   checked against the shared default cap of 15 (override with

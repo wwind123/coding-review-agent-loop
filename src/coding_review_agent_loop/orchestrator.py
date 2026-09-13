@@ -7925,9 +7925,12 @@ def run_issue_loop(
                 if (
                     recovered_execution.recommendation is not None
                     and recovered_execution.strategy == "staged"
-                    and recovered_execution.action != "plan-only"
                 ):
-                    assert recovered_plan_context is not None
+                    if recovered_plan_context is None or not recovered_plan_context.canonical_text:
+                        raise AgentLoopError(
+                            "Fresh staged execution recovery has no reconstructable approved plan; "
+                            "repair the handoff or rerun plan-first planning before resuming."
+                        )
                     recovered_topology = normalize_execution_recommendation(
                         recovered_execution.recommendation,
                         approved_plan=recovered_plan_context.canonical_text or "",
@@ -7945,9 +7948,12 @@ def run_issue_loop(
                 elif (
                     recovered_execution.recommendation is not None
                     and recovered_execution.strategy == "one-shot"
-                    and recovered_execution.action != "plan-only"
                 ):
-                    assert recovered_plan_context is not None
+                    if recovered_plan_context is None or not recovered_plan_context.canonical_text:
+                        raise AgentLoopError(
+                            "Fresh one-shot execution recovery has no reconstructable approved plan; "
+                            "repair the handoff or rerun plan-first planning before resuming."
+                        )
                     _preflight_fresh_one_shot_recovery(
                         runner,
                         issue_number=issue_number,
@@ -8003,16 +8009,17 @@ def run_issue_loop(
                         normalized_topology=recovered_topology,
                     )
                     return 0
-                _persist_execution_decision_if_needed(
-                    runner,
-                    config=config,
-                    issue_number=issue_number,
-                    current_plan=recovered_plan_context.canonical_text,
-                    issue_comments=issue_context.comments,
-                    recommendation=recovered_execution.recommendation,
-                    requested_policy=recovered_execution.requested_policy,
-                    resolved_execution=recovered_execution,
-                )
+                if recovered_plan_context is not None and recovered_plan_context.canonical_text:
+                    _persist_execution_decision_if_needed(
+                        runner,
+                        config=config,
+                        issue_number=issue_number,
+                        current_plan=recovered_plan_context.canonical_text,
+                        issue_comments=issue_context.comments,
+                        recommendation=recovered_execution.recommendation,
+                        requested_policy=recovered_execution.requested_policy,
+                        resolved_execution=recovered_execution,
+                    )
             if plan_first and resolved_pr.source == "canonical" and resolved_metadata is not None:
                 if resolved_metadata.flow == "approved-plan-implementation" and recovered_plan_hash is None:
                     log(
@@ -8028,6 +8035,12 @@ def run_issue_loop(
                     "Issue-mode plan-first recovery cannot invent plan provenance; review the PR "
                     f"directly with `agent-loop pr {resolved_pr.pr_number}` or rerun direct issue mode."
                 )
+            if recovered_execution is not None and recovered_execution.action == "plan-only":
+                print(
+                    f"Issue #{issue_number} plan-first recovery resolved to plan-only; "
+                    f"PR #{resolved_pr.pr_number} review was not started."
+                )
+                return 0
             log(
                 config,
                 f"Issue #{issue_number}: resuming PR #{resolved_pr.pr_number} review instead of "
