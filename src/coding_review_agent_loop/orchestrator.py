@@ -561,8 +561,58 @@ def _architecture_metadata_fields(
     return {
         "architecture_identity": identity,
         "architecture_impact": dataclasses.asdict(impact) if dataclasses.is_dataclass(impact) else None,
-        "architecture_contract_version": 1 if identity is not None else None,
+        # This records the response-contract generation, not document
+        # availability. A fresh turn must remain distinguishable from a
+        # legacy record even when architecture acquisition is opted out or
+        # unavailable.
+        "architecture_contract_version": 1,
     }
+
+
+def _latest_pr_approval_architecture_identity(
+    comments: Sequence[object], *, head_sha: str | None = None
+) -> dict | None:
+    """Read the architecture identity bound to the latest approved review.
+
+    Coder and checkpoint records are observations, not approvals. Resume and
+    qualification therefore bind invalidation to an actual approved reviewer
+    record instead of whichever metadata comment happened to be posted last.
+    """
+    try:
+        records = _extract_round_metadata_records(comments, flow="pr")
+    except AgentLoopError:
+        return None
+    for record in reversed(records):
+        metadata = record.metadata
+        if metadata.role != "reviewer" or metadata.state != "approved":
+            continue
+        if head_sha is not None and metadata.subject != head_sha:
+            continue
+        if isinstance(metadata.architecture_identity, dict):
+            return metadata.architecture_identity
+    return None
+
+
+def _latest_pr_architecture_observation(
+    comments: Sequence[object], *, head_sha: str | None = None
+) -> dict | None:
+    """Return the newest durable PR architecture observation.
+
+    Qualification checkpoints are written before a rerun. Reading the newest
+    observation makes the invalidation transition idempotent: once the new
+    identity is persisted, an identical gate does not schedule another review.
+    """
+    try:
+        records = _extract_round_metadata_records(comments, flow="pr")
+    except AgentLoopError:
+        return None
+    for record in reversed(records):
+        metadata = record.metadata
+        if head_sha is not None and metadata.subject != head_sha:
+            continue
+        if isinstance(metadata.architecture_identity, dict):
+            return metadata.architecture_identity
+    return None
 
 
 def _revalidate_pr_architecture_identity(
@@ -4948,9 +4998,7 @@ def _implement_approved_issue(
         validate=lambda text: _validate_issue_implementation_response(
             text,
             human_requirements=implementation_requirements,
-            require_architecture_impact=architecture_material(
-                implementation_config.architecture_context
-            ),
+            require_architecture_impact=True,
         ),
         usage_context=usage_context,
         role="coder",
@@ -5381,9 +5429,10 @@ def _run_plan_first_loop(
                 text,
                 marker_validator=lambda text: _require_plan_state_or_clarification(
                     text,
-                    required_architecture_impact_contract=(
-                        1 if architecture_material(config.architecture_context) else 0
-                    ),
+                    # Fresh planner turns always use the v1 impact contract.
+                    # Document availability controls prompt material, not the
+                    # response protocol or the assessment requirement.
+                    required_architecture_impact_contract=1,
                 ),
                 human_requirements=human_requirements,
                 requirement_scope="planning requirements",
@@ -6572,9 +6621,7 @@ def _run_plan_first_loop(
                 marker_validator=lambda revised_text: _validate_plan_revision_response(
                     revised_text,
                     unresolved_items=items,
-                    require_architecture_impact=architecture_material(
-                        config.architecture_context
-                    ),
+                    require_architecture_impact=True,
                 ),
                 human_requirements=human_requirements,
                 requirement_scope="planning requirements",
@@ -6953,9 +7000,7 @@ def run_issue_loop(
             validate=lambda text: _validate_issue_implementation_response(
                 text,
                 human_requirements=implementation_requirements,
-                require_architecture_impact=architecture_material(
-                    config.architecture_context
-                ),
+                require_architecture_impact=True,
             ),
             usage_context=usage_context,
             use_repair=True,
@@ -7239,9 +7284,9 @@ def run_task_loop(
                 marker_description="structured task_result JSON, blocking, or clarification outcome",
                 validate=lambda text: _require_task_implementation_result(
                     text,
-                    required_architecture_impact_contract=(
-                        1 if architecture_material(config.architecture_context) else 0
-                    ),
+                    # This is a fresh task turn even when architecture context
+                    # is disabled or unavailable; legacy decoding is resume-only.
+                    required_architecture_impact_contract=1,
                 ),
                 usage_context=usage_context,
                 salvage_context=SalvageContext(
@@ -8446,14 +8491,28 @@ def _fresh_pr_qualification_snapshot(
 ) -> tuple[PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None, AgentLoopConfig]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
-    stored_identity = next(
-        (
-            record.metadata.architecture_identity
-            for record in reversed(_extract_round_metadata_records(context.comments, flow="pr"))
-            if record.metadata.architecture_identity is not None
-        ),
-        None,
+    approved_identity = _latest_pr_approval_architecture_identity(
+        context.comments, head_sha=context.metadata.head_sha
     )
+    stored_identity = _latest_pr_architecture_observation(
+        context.comments, head_sha=context.metadata.head_sha
+    )
+    if stored_identity is None:
+        # A reviewer approval is the durable resume authority when no
+        # qualification checkpoint has recorded a newer observation. Never
+        # invent an identity for legacy records.
+        stored_identity = approved_identity
+    if stored_identity is None:
+        # There may be no current-head approval yet. Retain the latest durable
+        # observation as a compatibility fallback, but never use raw prose.
+        stored_identity = next(
+            (
+                record.metadata.architecture_identity
+                for record in reversed(_extract_round_metadata_records(context.comments, flow="pr"))
+                if isinstance(record.metadata.architecture_identity, dict)
+            ),
+            None,
+        )
     fresh_architecture, architecture_changed = _revalidate_pr_architecture_identity(
         runner, config=config, metadata=context.metadata, stored_identity=stored_identity
     )
@@ -9414,6 +9473,39 @@ def run_pr_loop(
             if parent_issue_context is not None:
                 parent_issue_context_refreshed = True
             pr_comments = pr_context.comments
+            # A review round is a fresh acquisition boundary. Rebind the
+            # candidate/base pair before constructing any reviewer prompt so
+            # a coder push or retarget cannot be reviewed with stale
+            # architecture prose. The approved reviewer identity is the
+            # invalidation anchor; target-tip movement alone is intentionally
+            # ignored by ArchitecturePair.identity().
+            if config.architecture_context_enabled:
+                stored_architecture_identity = _latest_pr_architecture_observation(
+                    pr_comments, head_sha=pr_metadata.head_sha
+                )
+                round_architecture_config = _freeze_prompt_architecture(
+                    runner,
+                    config,
+                    target_revision=pr_metadata.base_branch,
+                    candidate_revision=pr_metadata.head_sha,
+                    pr_pair=True,
+                )
+                round_architecture = round_architecture_config.architecture_context
+                round_architecture_identity = (
+                    round_architecture.identity()
+                    if hasattr(round_architecture, "identity")
+                    else None
+                )
+                if (
+                    stored_architecture_identity is not None
+                    and round_architecture_identity != stored_architecture_identity
+                ):
+                    # The scheduler will launch a full current-head review;
+                    # persistence of that review makes this transition
+                    # exact-once on resume.
+                    final_sweep_pending = True
+                    scheduler_force_full = True
+                config = round_architecture_config
             followup_source_context = _pr_followup_source_context(
                 config=config,
                 pr_number=pr_number,
@@ -9568,6 +9660,7 @@ def run_pr_loop(
                 configured_reviewers=configured_reviewers,
                 approved_plan_context=approved_plan_context,
                 human_requirements=human_requirements,
+                require_architecture_contract=config.architecture_context_enabled,
                 reviewer_acquisition_contract=(
                     reviewer_acquisition_contract if selective_policy else None
                 ),
@@ -9902,6 +9995,7 @@ def run_pr_loop(
                                 scheduler_final_sweep=final_sweep,
                                 scheduler_force_full=scheduler_force_full,
                                 scheduler_calls_avoided=scheduler_calls_avoided,
+                                **_architecture_metadata_fields(config),
                             ),
                         ),
                     )
@@ -12472,7 +12566,9 @@ def run_pr_loop(
                     text,
                     unresolved_items=items,
                     human_requirements=human_requirements,
-                    required_architecture_impact_contract=(1 if architecture_material(config.architecture_context) else 0),
+                    # Every new coder-followup response is v1. A missing
+                    # document must not silently downgrade the protocol.
+                    required_architecture_impact_contract=1,
                 ),
                 usage_context=usage_context,
                 role="coder",

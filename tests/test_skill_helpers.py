@@ -80,14 +80,23 @@ def _write_fake_gh(directory: Path) -> Path:
 # helpers/validate_response.py
 # ---------------------------------------------------------------------------
 
-_VALID_PLAN_STATE = """\
-## Plan
-
-1. Step one
-
-<!-- AGENT_PLAN_STATE: approved -->
--- Anthropic Claude
-"""
+_VALID_PLAN_STATE = json.dumps({
+    "schema_version": 1,
+    "kind": "plan_state",
+    "state": "blocking",
+    "summary": "Plan is ready for review.",
+    "plan_steps": ["Step one"],
+    "architecture_impact": {
+        "status": "unchanged",
+        "rationale": "No architectural contract changed.",
+        "affected_components": [], "dependencies": [],
+        "execution_data_flows": [], "persistence": [],
+        "public_contracts": [], "security_boundaries": [],
+        "canonical_document_action": "no-change",
+        "canonical_document_path": None,
+        "canonical_document_rationale": "",
+    },
+}) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
 
 _INVALID_PLAN_STATE = "This has no marker at all."
 
@@ -653,7 +662,7 @@ class TestRunExternal:
         assert result.returncode == 0
         content = Path(output_path).read_text(encoding="utf-8")
         # Coder dry-run stub must be a valid plan_state (no JSON, just markdown + marker)
-        assert "AGENT_PLAN_STATE: approved" in content
+        assert "AGENT_PLAN_STATE: blocking" in content
         # Must NOT be a plan_review JSON blob
         assert '"kind": "plan_review"' not in content
 
@@ -3127,14 +3136,11 @@ class TestRetryValidateCoder:
 
             match = ROUND_RESUME_MARKER_RE.search(tagged)
             assert match is not None
-            original_prefix, original_suffix = _VALID_PLAN_STATE.strip().split(
-                "<!-- AGENT_PLAN_STATE: approved -->",
-                1,
+            assert tagged[: match.start()].startswith("## Plan\n")
+            assert "Plan is ready for review." in tagged[: match.start()]
+            assert tagged[match.end() :].strip().startswith(
+                "<!-- AGENT_PLAN_STATE: blocking -->"
             )
-            assert tagged[: match.start()].rstrip() == original_prefix.rstrip()
-            assert tagged[match.end() :].strip() == (
-                "<!-- AGENT_PLAN_STATE: approved -->" + original_suffix
-            ).strip()
 
     def test_retry_validate_coder_invalid_plan_state_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3828,6 +3834,16 @@ def _structured_pr_fix_output() -> str:
                 "addressed_ids": [_HUMAN_REQUIREMENT.requirement_id],
                 "checked_discussion_directly": False,
             },
+            "architecture_impact": {
+                "status": "unchanged",
+                "rationale": "No architectural contract changed.",
+                "affected_components": [], "dependencies": [],
+                "execution_data_flows": [], "persistence": [],
+                "public_contracts": [], "security_boundaries": [],
+                "canonical_document_action": "no-change",
+                "canonical_document_path": None,
+                "canonical_document_rationale": "",
+            },
         }
     ) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
 
@@ -4281,6 +4297,16 @@ _DECOMP_JSON = json.dumps(
     {
         "schema_version": 1,
         "kind": "plan_decomposition",
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "affected_components": [], "dependencies": [],
+            "execution_data_flows": [], "persistence": [],
+            "public_contracts": [], "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
         "phases": [
             {
                 "title": "Schema helpers",

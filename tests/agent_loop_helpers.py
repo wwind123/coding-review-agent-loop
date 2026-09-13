@@ -507,6 +507,47 @@ class FakeRunner(Runner):
                     else ""
                 ),
                 )
+        if (
+            ('"kind": "task_result"' in prompt or '"kind":"task_result"' in prompt)
+            and ("<!-- AGENT_STATE:" in output or "<!-- AGENT_CLARIFY -->" in output)
+        ):
+            pr_number = parse_pr_number(output)
+            signature_matches = re.findall(
+                r"-- (OpenAI Codex|Google Gemini|Anthropic Claude)", output
+            )
+            signature = signature_matches[-1] if signature_matches else "Anthropic Claude"
+            if "AGENT_CLARIFY" in output:
+                outcome = "clarification"
+                clarification = [
+                    line.strip() for line in output.splitlines()
+                    if line.strip() and "AGENT_" not in line and not line.strip().startswith("--")
+                ] or ["Please clarify the requested behavior."]
+            elif pr_number is not None:
+                outcome, clarification = "opened_pr", []
+            else:
+                outcome, clarification = "blocking", []
+            payload = {
+                "schema_version": 1,
+                "kind": "task_result",
+                "state": "blocking",
+                "outcome": outcome,
+                "summary": _review_freeform_summary_text(output) or "Task result.",
+                "architecture_impact": {
+                    "status": "unchanged",
+                    "rationale": "No architectural contract changed.",
+                    "affected_components": [], "dependencies": [],
+                    "execution_data_flows": [], "persistence": [],
+                    "public_contracts": [], "security_boundaries": [],
+                    "canonical_document_action": "no-change",
+                    "canonical_document_path": None,
+                    "canonical_document_rationale": "",
+                },
+            }
+            if pr_number is not None:
+                payload["pr_number"] = pr_number
+            if clarification:
+                payload["clarification"] = clarification
+            return json.dumps(payload) + f"\n<!-- AGENT_STATE: blocking -->\n-- {signature}"
         if '"kind": "issue_implementation"' in prompt and (
             "<!-- AGENT_STATE:" in output or parse_pr_number(output) is not None
         ):
@@ -610,6 +651,14 @@ class FakeRunner(Runner):
                 and not isinstance(payload.get("pr_number"), bool)
                 and payload["pr_number"] > 0
             )
+            if not has_pr_identity and isinstance(payload, dict):
+                has_pr_identity = (
+                    payload.get("kind") == "task_result"
+                    and payload.get("outcome") == "opened_pr"
+                    and isinstance(payload.get("pr_number"), int)
+                    and not isinstance(payload.get("pr_number"), bool)
+                    and payload["pr_number"] > 0
+                )
             if not has_pr_identity and isinstance(payload, dict):
                 for key in ("response", "result"):
                     value = payload.get(key)
@@ -799,7 +848,7 @@ class FakeRunner(Runner):
                         f"stdout:\n\n\nstderr:\n{error}"
                     )
                 return CommandResult(cmd, cwd_path, "", error, 1)
-            return self._run_locked(args, cwd=cwd, check=check)
+            return self._run_locked(args, cwd=cwd, check=check, input_text=input_text)
 
     @staticmethod
     def _gh_argv_error(cmd):
@@ -851,13 +900,15 @@ class FakeRunner(Runner):
                 return f"unknown flag: {token}"
         return None
 
-    def _run_locked(self, args, *, cwd, check):
+    def _run_locked(self, args, *, cwd, check, input_text=None):
         cmd, cwd_path = self._record_command(args, cwd)
 
         if cmd[:1] == ["claude"]:
             output, returncode = self._next_agent_output(self.claude_outputs)
             if isinstance(output, str):
-                output = self._normalize_legacy_agent_output(output, "\n".join(cmd))
+                output = self._normalize_legacy_agent_output(
+                    output, input_text or "\n".join(cmd)
+                )
             self._maybe_advance_git_head_for_agent_pr(output)
             self._maybe_advance_pr_head_for_coder_followup(cmd)
             self._mark_agent_command_seen()
@@ -873,7 +924,9 @@ class FakeRunner(Runner):
                 public_response, returncode = output
                 stdout = public_response
             if isinstance(public_response, str):
-                normalized = self._normalize_legacy_agent_output(public_response, "\n".join(cmd))
+                normalized = self._normalize_legacy_agent_output(
+                    public_response, input_text or "\n".join(cmd)
+                )
                 if normalized != public_response:
                     public_response = normalized
             if "--output-last-message" in cmd:

@@ -174,6 +174,23 @@ def test_pair_does_not_use_target_tip_without_merge_base(tmp_path):
     assert "candidate edits" not in rendered
 
 
+def test_pair_resolves_remote_tracking_base_when_local_branch_is_absent(tmp_path):
+    base = _repo(tmp_path, "# Base\n")
+    _git(tmp_path, "update-ref", "refs/remotes/origin/release", base)
+    _git(tmp_path, "checkout", "-qb", "candidate")
+    (tmp_path / "ARCHITECTURE.md").write_text("# Candidate\n", encoding="utf-8")
+    _git(tmp_path, "commit", "-qam", "candidate")
+    candidate = _git(tmp_path, "rev-parse", "HEAD")
+    pair = acquire_architecture_pair(
+        Runner(), checkout=tmp_path, repository="owner/repo",
+        target_revision="release", candidate_revision=candidate,
+    )
+    assert pair.target_revision == "release"
+    assert pair.merge_base_revision == base
+    assert pair.change == "modified"
+    assert pair.base.content == "# Base\n"
+
+
 def test_binary_capture_timeout_is_bounded(tmp_path):
     with pytest.raises(AgentLoopError, match="timed out"):
         run_binary_capture(

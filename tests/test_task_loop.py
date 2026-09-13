@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError, run_task_loop
@@ -37,7 +39,7 @@ def test_task_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):
     assert ["claude", "--print"] in command_names
     assert ["codex", "exec"] in command_names
     assert len(runner.comments) == 4
-    assert runner.comments[0].startswith("Implemented.")
+    assert json.loads(runner.comments[0].split("\n", 1)[0])["kind"] == "task_result"
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
 
 def test_task_loop_syncs_coder_base_before_first_implementation_attempt(tmp_path):
@@ -172,7 +174,7 @@ def test_task_loop_requires_pr_or_clarification_marker(tmp_path):
     )
     config = make_config(tmp_path)
 
-    with pytest.raises(AgentLoopError, match="PR marker"):
+    with pytest.raises(AgentLoopError, match="structured task_result"):
         run_task_loop(runner, task_text="Do something", config=config)
 
 
@@ -207,7 +209,7 @@ def test_codex_task_loop_creates_pr_then_claude_approves(tmp_path):
     assert run_task_loop(runner, task_text="Add /healthz endpoint.", config=config) == 0
 
     assert len(runner.comments) == 2
-    assert runner.comments[0].startswith("Implemented task.")
+    assert json.loads(runner.comments[0].split("\n", 1)[0])["kind"] == "task_result"
     assert runner.comments[1].startswith("**Review verdict:** Approved\n\nShip it.")
 
 def test_codex_task_loop_picks_up_pr_url_when_marker_missing(tmp_path):

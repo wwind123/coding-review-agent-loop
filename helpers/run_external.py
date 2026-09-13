@@ -64,11 +64,9 @@ _CANNED_PR_REVIEW_FOOTER = (
 )
 
 _CANNED_PLAN_STATE = """\
-## Plan (dry-run stub)
+{"schema_version": 1, "kind": "plan_state", "state": "blocking", "summary": "Dry-run stub: plan is ready.", "plan_steps": ["Implement the requested changes."], "human_requirement_dispositions": [], "architecture_impact": {"status": "unchanged", "rationale": "No architectural contract changed.", "affected_components": [], "dependencies": [], "execution_data_flows": [], "persistence": [], "public_contracts": [], "security_boundaries": [], "canonical_document_action": "no-change", "canonical_document_path": null, "canonical_document_rationale": ""}}
 
-1. Implement the requested changes.
-
-<!-- AGENT_PLAN_STATE: approved -->
+<!-- AGENT_PLAN_STATE: blocking -->
 -- Codex (dry-run stub)
 """
 
@@ -86,6 +84,16 @@ _CANNED_IMPLEMENTATION = json.dumps(
             "checked_discussion_directly": False,
         },
         "human_requirement_dispositions": [],
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "affected_components": [], "dependencies": [],
+            "execution_data_flows": [], "persistence": [],
+            "public_contracts": [], "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
         "tests_run": None,
     },
     indent=2,
@@ -95,6 +103,16 @@ _CANNED_PLAN_DECOMPOSITION = json.dumps(
     {
         "schema_version": 1,
         "kind": "plan_decomposition",
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "affected_components": [], "dependencies": [],
+            "execution_data_flows": [], "persistence": [],
+            "public_contracts": [], "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
         "phases": [
             {
                 "title": "Dry-run implementation phase",

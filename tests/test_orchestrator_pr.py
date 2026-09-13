@@ -62,6 +62,7 @@ from coding_review_agent_loop.orchestrator import (
     _resume_pr_round,
     _strip_round_metadata,
     _ensure_finalization_ready,
+    _latest_pr_architecture_observation,
 )
 from coding_review_agent_loop.prompts import (
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
@@ -92,6 +93,29 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_pr_review,
 )
+
+
+def test_latest_pr_architecture_observation_uses_new_checkpoint_once():
+    old_identity = {"target_revision": "main", "merge_base_revision": "old"}
+    new_identity = {"target_revision": "release", "merge_base_revision": "new"}
+    approval = _attach_round_metadata(
+        "approved review",
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=1,
+            subject="head", state="approved", architecture_identity=old_identity,
+            architecture_contract_version=1,
+        ),
+    )
+    checkpoint = _attach_round_metadata(
+        "qualification checkpoint",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=2,
+            subject="head", phase="qualification-checkpoint",
+            architecture_identity=new_identity, architecture_contract_version=1,
+        ),
+    )
+    comments = (SimpleNamespace(body=approval), SimpleNamespace(body=checkpoint))
+    assert _latest_pr_architecture_observation(comments, head_sha="head") == new_identity
 
 
 def _advance_head_after_coder(monkeypatch, runner, head_sha="repaired-head"):
@@ -2172,11 +2196,24 @@ def test_pr_loop_accepts_structured_coder_followup_in_pr_round(tmp_path):
                     "addressed_item_notes": {
                         "item-1": "Added the structured coder follow-up regression case."
                     },
-                    "human_requirements": {
-                        "addressed_ids": [],
-                        "checked_discussion_directly": False,
-                    },
-                    "tests_run": ["pytest tests/test_agent_loop.py -k structured_coder_followup"],
+                        "human_requirements": {
+                            "addressed_ids": [],
+                            "checked_discussion_directly": False,
+                        },
+                        "architecture_impact": {
+                            "status": "unchanged",
+                            "rationale": "No architectural contract changed.",
+                            "affected_components": [],
+                            "dependencies": [],
+                            "execution_data_flows": [],
+                            "persistence": [],
+                            "public_contracts": [],
+                            "security_boundaries": [],
+                            "canonical_document_action": "no-change",
+                            "canonical_document_path": None,
+                            "canonical_document_rationale": "",
+                        },
+                        "tests_run": ["pytest tests/test_agent_loop.py -k structured_coder_followup"],
                 }
             )
             + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
@@ -2222,6 +2259,16 @@ def test_pr_loop_rejects_malformed_structured_coder_followup_before_re_review(tm
                     "human_requirements": {
                         "addressed_ids": [],
                         "checked_discussion_directly": False,
+                    },
+                    "architecture_impact": {
+                        "status": "unchanged",
+                        "rationale": "No architectural contract changed.",
+                        "affected_components": [], "dependencies": [],
+                        "execution_data_flows": [], "persistence": [],
+                        "public_contracts": [], "security_boundaries": [],
+                        "canonical_document_action": "no-change",
+                        "canonical_document_path": None,
+                        "canonical_document_rationale": "",
                     },
                 }
             )
@@ -3412,6 +3459,7 @@ def test_managed_qualification_resume_attaches_without_redispatch(
             subject="abc123",
             prior_items=(dataclasses.replace(item, lifecycle="awaiting_current_head_review"),),
             state="approved",
+            architecture_contract_version=1,
         ),
     )
     checkpoint_comment = _attach_round_metadata(
@@ -3426,6 +3474,7 @@ def test_managed_qualification_resume_attaches_without_redispatch(
             state="blocking",
             phase="qualification-checkpoint",
             qualification_checkpoint=checkpoint,
+            architecture_contract_version=1,
         ),
     )
     runner = FakeRunner(

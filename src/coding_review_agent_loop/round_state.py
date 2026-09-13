@@ -1113,6 +1113,7 @@ def _latest_pr_approved_reviews_for_head(
     approved_plan_context: ApprovedPlanContext | None = None,
     human_requirements: Sequence[object] = (),
     reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
+    require_architecture_contract: bool = False,
 ) -> dict[str, PostedRoundRecord]:
     """Return each reviewer's latest approval for the current immutable PR head."""
     if not head_sha:
@@ -1127,6 +1128,8 @@ def _latest_pr_approved_reviews_for_head(
             or metadata.agent not in configured_names
             or metadata.agent in latest_by_reviewer
         ):
+            continue
+        if require_architecture_contract and metadata.architecture_contract_version != 1:
             continue
         latest_by_reviewer[metadata.agent] = record
 

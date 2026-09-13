@@ -2234,6 +2234,7 @@ def build_plan_decomposition_prompt(
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this decomposition stage.
 {_coder_workdir_guidance(config, implementation=False)}
+{_architecture_impact_guidance(required=True)}
 {_architecture_context_block(config, protected_context=(human_requirements_block, approved_plan))}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}
@@ -2450,7 +2451,7 @@ def _build_compact_plan_revision_prompt(
             ),
         ),
         architecture_context=_architecture_context_block(
-            config, protected_context=(human_requirements_context.block,)
+            config, protected_context=(human_requirements_context.block, previous_plan)
         ),
         response_protocol=_plan_revision_schema_and_rules(),
     )
@@ -2681,11 +2682,17 @@ Use this local checkout as your workspace. Decide between two paths:
 Prefer (a) when reasonable assumptions can be documented in the PR description;
 choose (b) only for material ambiguity. If you cannot safely proceed and
 cannot create a PR — for example after a bounded local test run exceeded its
-timeout — explain the blocker, naming the exact command and the timeout, and
-end with `AGENT_STATE: blocking` without an `AGENT_PR` marker instead of
-inventing a placeholder like `AGENT_PR: 0`. Do not place your signature before
-the AGENT_STATE marker. Your response must end with, in this
-exact order:
+timeout — use this exact structured no-PR blocking envelope. Put the
+explanation in `summary`; do not add prose between the JSON and footer, and do
+not emit `AGENT_PR` or `AGENT_CLARIFY`:
+
+`{{"schema_version":1,"kind":"task_result","state":"blocking",`
+`"outcome":"blocking","summary":"Blocked by <exact command and timeout>",`
+`"architecture_impact":{{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}}}`
+followed immediately by the AGENT_STATE footer and standalone signature,
+without an `AGENT_PR` marker. Do not invent a placeholder like `AGENT_PR: 0`.
+Do not place your signature before
+the AGENT_STATE marker. Your response must end with, in this exact order:
 
 <!-- AGENT_STATE: blocking -->
 -- {coder_signature}
@@ -2750,12 +2757,11 @@ structured result; `pr_number` and `clarification` are the sole outcome data.
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
 {_agent_unavailable_guidance(coder_signature)}
-If you cannot safely proceed and cannot create a PR — for example after a
-bounded local test run exceeded its timeout — explain the blocker, naming the
-exact command and the timeout, and end with `AGENT_STATE: blocking` without an
-`AGENT_PR` marker instead of inventing a placeholder like `AGENT_PR: 0`. Do not
-place your signature before the AGENT_STATE marker. Your
-response must end with, in this exact order:
+If you cannot safely proceed and cannot create a PR, use the structured no-PR
+blocking envelope above and put the exact command and timeout in its `summary`.
+Do not add prose between that JSON object and its footer, and do not emit
+without an `AGENT_PR` marker or `AGENT_CLARIFY` marker. Do not place your signature before the
+AGENT_STATE marker. Your response must end with, in this exact order:
 
 For implementation or clarification:
 <!-- AGENT_STATE: blocking -->
@@ -3472,7 +3478,7 @@ Do not create a new PR.
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_architecture_impact_guidance(required=True)}
-{_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and format_approved_plan_context(approved_plan_context, max_chars=None) or ""))}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
 
 {reviewer_name} review:
@@ -3534,7 +3540,7 @@ remains blocked pending another review round after this cleanup.
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_architecture_impact_guidance(required=True)}
-{_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and format_approved_plan_context(approved_plan_context, max_chars=None) or ""))}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
 
 Same-PR follow-ups:
@@ -3601,7 +3607,7 @@ against the new head after your push.
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
 {_architecture_impact_guidance(required=True)}
-{_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and format_approved_plan_context(approved_plan_context, max_chars=None) or ""))}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
 
 Other unresolved reviewer items carried into this round (address them in the same \

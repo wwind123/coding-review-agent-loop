@@ -247,7 +247,25 @@ def acquire_architecture_pair(
 ) -> ArchitecturePair:
     """Capture base/candidate architecture from one immutable PR acquisition."""
     locator = ArchitectureLocator(repository, path)
-    merge = runner.run(("git", "merge-base", target_revision, candidate_revision), cwd=checkout, check=False)
+    # PR metadata supplies a logical base branch, while a PR checkout normally
+    # has only the remote-tracking ref. Resolve that ref for the read, but keep
+    # the logical value in the pair identity so a retarget is observable. A
+    # caller may already have supplied ``origin/<branch>`` or an immutable OID.
+    merge_target = target_revision
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", target_revision):
+        remote_target = (
+            target_revision
+            if target_revision.startswith(("origin/", "refs/"))
+            else f"origin/{target_revision}"
+        )
+        resolved = runner.run(
+            ("git", "rev-parse", "--verify", remote_target),
+            cwd=checkout,
+            check=False,
+        )
+        if resolved.returncode == 0 and resolved.stdout.strip():
+            merge_target = remote_target
+    merge = runner.run(("git", "merge-base", merge_target, candidate_revision), cwd=checkout, check=False)
     merge_base = merge.stdout.strip() if merge.returncode == 0 else None
     if not merge_base or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_base):
         base = _snapshot_unavailable(locator, None, "No valid merge base was established.")

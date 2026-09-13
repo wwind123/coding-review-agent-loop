@@ -2450,6 +2450,7 @@ def _complete_coder_turn(
     gemini_cmd: str = "gemini",
     surfaced_requirement_ids: Sequence[str] = (),
     requires_direct_discussion_ack: bool = False,
+    required_architecture_impact_contract: int = 0,
 ) -> dict:
     """Validate, render, canonicalize, attach (role coder), and post a coder plan.
 
@@ -2466,6 +2467,7 @@ def _complete_coder_turn(
             text,
             kind=kind,
             prior_items=next_prior_items_raw,
+            required_architecture_impact_contract=required_architecture_impact_contract,
         )
         if kind == "plan_revision" and (
             surfaced_requirement_ids or requires_direct_discussion_ack
@@ -2774,6 +2776,7 @@ def _run_external_coder_phase(
                 gemini_cmd=gemini_cmd,
                 surfaced_requirement_ids=human_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
+                required_architecture_impact_contract=1,
             )
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
@@ -4552,6 +4555,10 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             text,
             unresolved_items=unresolved_items,
             human_requirements=human_requirements,
+            # This is a fresh skill coder turn. Architecture availability is
+            # prompt material only and must not downgrade the response
+            # contract.
+            required_architecture_impact_contract=1,
         )
         try:
             coder_output, parsed = _recover_structured_response(
@@ -4922,7 +4929,9 @@ def _run_decomposition_for_skill(
                     coder_usage = None
 
             try:
-                decomposition = parse_plan_decomposition(coder_output)
+                decomposition = parse_plan_decomposition(
+                    coder_output, required_architecture_impact_contract=1
+                )
             except AgentLoopError as exc:
                 debug_dir = _REPAIR_BASE / f"{issue}-decompose-debug"
                 debug_dir.mkdir(parents=True, exist_ok=True)
