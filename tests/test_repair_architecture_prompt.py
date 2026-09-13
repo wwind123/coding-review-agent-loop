@@ -74,15 +74,15 @@ def test_two_quoted_markers_allow_rewording_without_delimiters():
         'schema_version': 1,
         'kind': 'coder_followup',
         'summary': (
-            'Discuss `AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1` and '
-            '`AGENT_MANAGED_PR_SOURCE_V1` here.'
+            'Discuss `AGENT_SPLIT_UNFILED_WARNING` and '
+            '`AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1` here.'
         ),
     }
     repaired = {
         'schema_version': 1,
         'kind': 'coder_followup',
         'summary': (
-            'Discuss the managed-CI override record and managed-PR origin record here.'
+            'Discuss the split-warning protocol record and managed-CI override record here.'
         ),
     }
     validate_repair_preservation(json.dumps(original), json.dumps(repaired))

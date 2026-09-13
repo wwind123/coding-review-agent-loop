@@ -413,6 +413,19 @@ def scan_reserved_markers(text: str) -> tuple[MarkerOccurrence, ...]:
     return _all_occurrences(text)
 
 
+def _is_complete_historical_occurrence(occurrence: MarkerOccurrence) -> bool:
+    match = occurrence.definition.pattern.fullmatch(occurrence.text)
+    if match is None:
+        return False
+    if occurrence.definition.codec != "key-value-line":
+        return True
+    try:
+        occurrence.definition.canonicalizer(match)
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, zlib.error):
+        return False
+    return True
+
+
 def _historical_replacement_occurrences(text: str) -> tuple[MarkerOccurrence, ...]:
     """Return safe replacement spans without discarding surrounding prose.
 
@@ -421,8 +434,13 @@ def _historical_replacement_occurrences(text: str) -> tuple[MarkerOccurrence, ..
     retain the prose around that mention, though, so replace the token itself
     unless the complete marker grammar matched the occurrence.
     """
+    occurrences = _all_occurrences(text)
+    complete_occurrences = tuple(
+        occurrence for occurrence in occurrences
+        if _is_complete_historical_occurrence(occurrence)
+    )
     replacements: list[MarkerOccurrence] = []
-    for occurrence in _all_occurrences(text):
+    for occurrence in occurrences:
         definition = occurrence.definition
         line_match = definition.pattern.fullmatch(occurrence.text)
         invalid_line_record = False
@@ -446,6 +464,28 @@ def _historical_replacement_occurrences(text: str) -> tuple[MarkerOccurrence, ..
                 )
         else:
             replacements.append(occurrence)
+
+    # The scanner deliberately returns non-overlapping spans, so a broad
+    # name-bearing-line fallback can hide another strict token on the same
+    # line. Historical text must neutralize both mentions unless a complete
+    # record already covers the nested token.
+    seen = {(item.definition.token, item.start, item.end) for item in replacements}
+    for definition in RESERVED_MARKER_REGISTRY:
+        if definition.strictness == "well-formed-only":
+            continue
+        for match in re.finditer(re.escape(definition.token), text, re.I):
+            if any(
+                complete.start <= match.start() and match.end() <= complete.end
+                for complete in complete_occurrences
+            ):
+                continue
+            key = (definition.token, match.start(), match.end())
+            if key in seen:
+                continue
+            replacements.append(
+                MarkerOccurrence(definition, match.start(), match.end(), match.group(0))
+            )
+            seen.add(key)
     return tuple(sorted(replacements, key=lambda item: item.start))
 
 
