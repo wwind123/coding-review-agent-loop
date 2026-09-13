@@ -60,6 +60,7 @@ from .decomposition import (
     find_existing_topology_checkpoint,
     find_topology_checkpoints_for_parent,
     find_decompositions_for_parent,
+    find_phase_implementation_handoffs,
     find_phase_implementation_handoffs_for_parent,
     PHASE_IDENTITY_MARKER_RE,
     phase_identity,
@@ -9988,16 +9989,38 @@ def run_pr_loop(
                                     raise AgentLoopError(
                                         "Fresh decomposition child phase disagrees with the parent topology summary."
                                     )
-                                phase_handoff = find_existing_phase_implementation_handoff(
-                                    parent_issue_context.comments,
-                                    parent_issue=parent_issue_context.number,
-                                    plan_hash=phase_plan_hash,
-                                    mode=summary.mode,
-                                    phase_index=phase_index,
-                                    child_issue_number=issue_context.number,
+                                # The decomposition summary records how the
+                                # topology was first materialized and is
+                                # intentionally not rewritten when a later
+                                # implement-by-phase invocation dispatches a
+                                # child. Inventory parent handoffs by phase
+                                # instead of using that immutable mode.
+                                phase_handoffs = tuple(
+                                    handoff
+                                    for handoff in find_phase_implementation_handoffs(
+                                        parent_issue_context.comments,
+                                        parent_issue=parent_issue_context.number,
+                                        plan_hash=phase_plan_hash,
+                                    )
+                                    if (
+                                        handoff.phase_index == phase_index
+                                        or handoff.stage_id == stable_stage_id
+                                        or handoff.child_issue_number == issue_context.number
+                                    )
                                 )
-                                if summary.mode == "implement-by-phase" and (
-                                    phase_handoff is None
+                                if len(phase_handoffs) > 1:
+                                    raise AgentLoopError(
+                                        "Fresh decomposition child phase has multiple parent "
+                                        "implementation handoffs for the same phase."
+                                    )
+                                phase_handoff = phase_handoffs[0] if phase_handoffs else None
+                                if phase_handoff is not None and (
+                                    phase_handoff.mode != "implement-by-phase"
+                                    or phase_handoff.child_issue_number != issue_context.number
+                                    or (
+                                        issue_handoff is not None
+                                        and issue_handoff.plan_hash != phase_plan_hash
+                                    )
                                     or phase_handoff.strategy != "staged"
                                     or phase_handoff.topology_source != EXECUTION_TOPOLOGY_SOURCE
                                     or phase_handoff.execution_strategy_contract_version != 1
@@ -10008,7 +10031,13 @@ def run_pr_loop(
                                     or phase_handoff.automation != phase.automation
                                 ):
                                     raise AgentLoopError(
-                                        "Fresh decomposition child phase has no matching canonical implementation handoff."
+                                        "Fresh decomposition child phase implementation handoff "
+                                        "disagrees with the parent topology."
+                                    )
+                                if summary.mode == "implement-by-phase" and phase_handoff is None:
+                                    raise AgentLoopError(
+                                        "Fresh decomposition child phase has no matching canonical "
+                                        "implementation handoff."
                                     )
                             else:
                                 checkpoint = None

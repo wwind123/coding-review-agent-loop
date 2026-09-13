@@ -2276,10 +2276,15 @@ class TestSkillApprovedPlanRecovery:
         assert context.canonical_text == plan
         assert context.plan_hash == plan_hash
 
+    @pytest.mark.parametrize(
+        ("handoff_mode", "should_fail"),
+        [("implement-by-phase", False), ("decompose-only", True)],
+    )
     def test_fresh_decomposition_child_handoff_recovers_matching_stage_by_ordinal(
-        self, monkeypatch
+        self, monkeypatch, handoff_mode, should_fail
     ) -> None:
         import helpers.skill_runner as sr
+        from coding_review_agent_loop.errors import AgentLoopError
         from coding_review_agent_loop.decomposition import (
             CreatedPhaseIssue,
             ExecutionAllocation,
@@ -2289,6 +2294,7 @@ class TestSkillApprovedPlanRecovery:
             PlanPhase,
             format_decomposition_parent_summary,
             format_phase_issue_body,
+            format_phase_implementation_handoff_comment,
             normalize_execution_recommendation,
             phase_identity,
         )
@@ -2437,7 +2443,22 @@ class TestSkillApprovedPlanRecovery:
             recommendation_digest=normalized.recommendation_digest,
             plan_subject=_plan_subject(plan),
         )
-        parent_comments = [plan_comment, summary]
+        parent_comments = [
+            plan_comment,
+            summary,
+            format_phase_implementation_handoff_comment(
+                parent_issue=56,
+                mode=handoff_mode,
+                plan_hash=plan_hash,
+                phase_index=2,
+                created=child,
+                strategy="staged",
+                topology_source="approved-plan-v1",
+                execution_strategy_contract_version=1,
+                recommendation_digest=normalized.recommendation_digest,
+                plan_subject=_plan_subject(plan),
+            ),
+        ]
         child_comments = [
             format_issue_pr_handoff_comment(
                 issue_number=99,
@@ -2461,6 +2482,18 @@ class TestSkillApprovedPlanRecovery:
             primary_issue_number=99,
             expected_closing_issue_ids=(99,),
         )
+
+        if should_fail:
+            with pytest.raises(AgentLoopError, match="implementation handoff"):
+                sr._recover_skill_pr_plan_context(
+                    "owner/repo",
+                    7,
+                    {
+                        "body": "Fixes #99",
+                        "comments": [{"body": format_pr_contract_comment(contract)}],
+                    },
+                )
+            return
 
         context = sr._recover_skill_pr_plan_context(
             "owner/repo",

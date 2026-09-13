@@ -129,6 +129,7 @@ from coding_review_agent_loop.decomposition import (
     PHASE_IDENTITY_MARKER_RE,
     _decode_json_payload,
     find_existing_phase_implementation_handoff,
+    find_phase_implementation_handoffs,
     find_existing_decomposition,
     find_existing_topology_checkpoint,
     find_latest_one_shot_impl_handoff,
@@ -1532,7 +1533,7 @@ def _recover_skill_pr_plan_context(
             )
         if authoritative_parent_out is not None:
             authoritative_parent_out.append(parent_issue)
-        if expected_hash is not None and expected_hash != plan_hash:
+        if expected_hash is not None and expected_hash != plan_hash and not fresh_phase:
             raise AgentLoopError(
                 f"PR #{pr} child issue handoff has plan hash {expected_hash}, but its "
                 f"staged phase identity names {plan_hash}; repair the handoff provenance."
@@ -1616,25 +1617,35 @@ def _recover_skill_pr_plan_context(
                 raise AgentLoopError(
                     f"PR #{pr} fresh phase identity disagrees with the parent topology summary."
                 )
-            # Parent-owned implement-by-phase dispatch records a phase
-            # handoff. A separately planned child from decompose-only has its
-            # own child-plan provenance and does not require that record.
-            if summary.mode == "decompose-only":
-                return context
-            phase_handoff = find_existing_phase_implementation_handoff(
-                parent_comments,
-                parent_issue=parent_issue,
-                plan_hash=plan_hash,
-                mode=summary.mode,
-                phase_index=phase_index,
-                child_issue_number=issue_number,
-            )
-            if summary.mode == "implement-by-phase" and phase_handoff is None:
-                raise AgentLoopError(
-                    f"PR #{pr} has a fresh phase identity but no matching parent phase handoff."
+            # The decomposition summary records how the topology was first
+            # materialized and is intentionally not rewritten when a later
+            # implement-by-phase invocation dispatches a child. Inventory the
+            # parent handoff independently of that immutable summary mode so a
+            # parent-owned child cannot be treated as independently planned.
+            phase_handoffs = tuple(
+                handoff
+                for handoff in find_phase_implementation_handoffs(
+                    parent_comments,
+                    parent_issue=parent_issue,
+                    plan_hash=plan_hash,
                 )
-            if summary.mode == "implement-by-phase" and (
-                phase_handoff.strategy != normalized.strategy
+                if (
+                    handoff.phase_index == phase_index
+                    or handoff.stage_id == stage_id
+                    or handoff.child_issue_number == issue_number
+                )
+            )
+            if len(phase_handoffs) > 1:
+                raise AgentLoopError(
+                    f"PR #{pr} has multiple parent phase implementation handoffs for staged phase "
+                    f"{phase_index}; repair the handoff provenance before reviewing."
+                )
+            phase_handoff = phase_handoffs[0] if phase_handoffs else None
+            if phase_handoff is not None and (
+                phase_handoff.mode != "implement-by-phase"
+                or phase_handoff.child_issue_number != issue_number
+                or (expected_hash is not None and expected_hash != plan_hash)
+                or phase_handoff.strategy != normalized.strategy
                 or phase_handoff.topology_source != EXECUTION_TOPOLOGY_SOURCE
                 or phase_handoff.execution_strategy_contract_version != 1
                 or phase_handoff.recommendation_digest != normalized.recommendation_digest
@@ -1646,6 +1657,29 @@ def _recover_skill_pr_plan_context(
                 raise AgentLoopError(
                     f"PR #{pr} fresh phase implementation handoff disagrees with the parent topology."
                 )
+            if summary.mode == "implement-by-phase" and phase_handoff is None:
+                raise AgentLoopError(
+                    f"PR #{pr} has a fresh phase identity but no matching parent phase handoff."
+                )
+            # With no parent-owned handoff, a separately planned child must
+            # use its own issue-side approved-plan provenance. Its plan hash
+            # intentionally differs from the parent topology hash.
+            if (
+                phase_handoff is None
+                and expected_hash is not None
+                and expected_hash != plan_hash
+            ):
+                child_context = recover_approved_plan_context(
+                    comments,
+                    expected_hash=expected_hash,
+                    expected_subject=expected_subject,
+                )
+                if not child_context.is_available:
+                    raise AgentLoopError(
+                        f"PR #{pr} child issue #{issue_number} has no recoverable approved "
+                        f"child plan {expected_hash}; repair the issue-to-PR handoff."
+                    )
+                return child_context
             return context
 
         matching_mode: str | None = None

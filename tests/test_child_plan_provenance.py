@@ -121,7 +121,13 @@ def fresh_staged_plan():
     )
 
 
-def fresh_child_contexts(plan, *, stable_stage_id="stage-one"):
+def fresh_child_contexts(
+    plan,
+    *,
+    stable_stage_id="stage-one",
+    summary_mode="implement-by-phase",
+    handoff_mode="implement-by-phase",
+):
     raw_payload, _ = json.JSONDecoder().raw_decode(plan)
     from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
 
@@ -180,7 +186,7 @@ def fresh_child_contexts(plan, *, stable_stage_id="stage-one"):
         ),
     )
     summary = format_decomposition_parent_summary(
-        parent_issue=55, mode="implement-by-phase", plan_hash=parent_hash,
+        parent_issue=55, mode=summary_mode, plan_hash=parent_hash,
         created=parent_children, topology_source="approved-plan-v1",
         retained_parent_scope=retained, final_integration_work=normalized.final_integration_work,
         strategy="staged", execution_strategy_contract_version=1,
@@ -188,7 +194,7 @@ def fresh_child_contexts(plan, *, stable_stage_id="stage-one"):
         plan_subject=orchestrator._plan_subject(plan),
     )
     handoff = format_phase_implementation_handoff_comment(
-        parent_issue=55, mode="implement-by-phase", plan_hash=parent_hash,
+        parent_issue=55, mode=handoff_mode, plan_hash=parent_hash,
         phase_index=1, created=parent_children[0], strategy="staged",
         topology_source="approved-plan-v1", execution_strategy_contract_version=1,
         recommendation_digest=normalized.recommendation_digest,
@@ -302,3 +308,60 @@ def test_cli_run_pr_loop_validates_fresh_child_phase_identity(
     else:
         assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
         assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+def test_cli_run_pr_loop_validates_parent_handoff_after_decompose_only_transition(
+    tmp_path, monkeypatch
+):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(
+        plan,
+        summary_mode="decompose-only",
+        handoff_mode="implement-by-phase",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77,
+            "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+def test_cli_run_pr_loop_rejects_mismatched_parent_handoff_after_decompose_only_transition(
+    tmp_path, monkeypatch
+):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(
+        plan,
+        summary_mode="decompose-only",
+        handoff_mode="decompose-only",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77,
+            "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="implementation handoff"):
+        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
