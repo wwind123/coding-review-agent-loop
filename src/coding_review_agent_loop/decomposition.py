@@ -1628,16 +1628,27 @@ def find_existing_execution_decision(
             continue
         for match in EXECUTION_DECISION_MARKER_RE.finditer(body):
             decision = _decode_execution_decision(match.group("payload"))
-            if decision.parent_issue == parent_issue and decision.plan_hash == plan_hash:
-                if decision.identity() != expected_identity:
-                    raise AgentLoopError(
-                        "Conflicting execution decision identity exists for the approved plan; "
-                        "refusing to publish or adopt a different topology."
-                    )
-                # Requested policy and current action are diagnostics only.
-                # Explicit staged actions may resume the same canonical
-                # decision, so do not fork identity on those fields.
-                found = decision
+            if decision.parent_issue != parent_issue:
+                continue
+            if decision.plan_hash != plan_hash:
+                # A decision is durable approval-bound state, not a cache keyed
+                # only by the currently visible plan.  If approval changed
+                # after a crash, publishing a second decision would allow the
+                # same parent to acquire two competing execution topologies.
+                raise AgentLoopError(
+                    "Conflicting execution decision exists for this parent under a different "
+                    f"approved plan hash ({decision.plan_hash} vs {plan_hash}); repair or "
+                    "resume the recorded plan before publishing a new execution decision."
+                )
+            if decision.identity() != expected_identity:
+                raise AgentLoopError(
+                    "Conflicting execution decision identity exists for the approved plan; "
+                    "refusing to publish or adopt a different topology."
+                )
+            # Requested policy and current action are diagnostics only.
+            # Explicit staged actions may resume the same canonical
+            # decision, so do not fork identity on those fields.
+            found = decision
     return found
 
 

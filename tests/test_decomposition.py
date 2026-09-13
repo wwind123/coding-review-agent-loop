@@ -33,15 +33,26 @@ from coding_review_agent_loop.decomposition import (
     find_existing_execution_decision,
 )
 from coding_review_agent_loop.protocol import ExecutionChildStage
-from coding_review_agent_loop.github import IssueComment
+from coding_review_agent_loop.github import IssueComment, IssueContext
 from coding_review_agent_loop.child_topology import NeedsHumanDecision
-from coding_review_agent_loop.orchestrator import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+from coding_review_agent_loop.orchestrator import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+    _plan_subject,
+    _preflight_fresh_one_shot_recovery,
+)
+from coding_review_agent_loop.split_materialization import (
+    MaterializedSplitChild,
+    SplitMaterializationMetadata,
+    format_split_materialization_summary,
+)
 from agent_loop_helpers import (
     FakeRunner,
     make_config,
     plan_decomposition_json,
     structured_plan_review,
     structured_plan_state,
+    structured_v1_plan_state,
 )
 
 
@@ -357,6 +368,97 @@ def test_execution_decision_format_is_reused_for_same_identity():
     )
 
     assert recovered == decision
+
+
+def test_execution_decision_recovery_rejects_a_changed_parent_plan():
+    from types import SimpleNamespace
+
+    decision = ExecutionDecision(
+        parent_issue=56,
+        plan_hash="old-plan-hash",
+        plan_subject="old-subject",
+        execution_strategy_contract_version=1,
+        strategy="one-shot",
+        topology_source="approved-plan-v1",
+        recommendation_digest="old-digest",
+        requested_policy="implement-one-shot",
+        current_action="implement-one-shot",
+    )
+
+    with pytest.raises(AgentLoopError, match="different approved plan hash"):
+        find_existing_execution_decision(
+            (SimpleNamespace(body=format_execution_decision(decision)),),
+            parent_issue=56,
+            plan_hash="new-plan-hash",
+            plan_subject="new-subject",
+            strategy="one-shot",
+            recommendation_digest="new-digest",
+        )
+
+
+@pytest.mark.parametrize("split_state", ["materialized", "orphan-child"])
+def test_fresh_one_shot_preflight_rejects_existing_split_state_before_writes(
+    tmp_path, split_state
+):
+    plan = structured_v1_plan_state()
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+    recommendation = validate_structured_plan_state(plan).execution_recommendation
+    assert recommendation is not None
+    if split_state == "materialized":
+        split_body = format_split_materialization_summary(
+            parent_issue=56,
+            metadata=SplitMaterializationMetadata(
+                parent_issue=56,
+                subject="split subject",
+                children=(
+                    MaterializedSplitChild(
+                        title="Existing split stage",
+                        key="a" * 64,
+                        url="https://github.com/OWNER/REPO/issues/99",
+                        number=99,
+                        origin="created",
+                    ),
+                ),
+            ),
+        )
+        comments = (IssueComment(author="bot", created_at=None, body=split_body),)
+        runner = FakeRunner()
+    else:
+        comments = ()
+        runner = FakeRunner(
+            search_issues_payload=[
+                [
+                    {
+                        "number": 99,
+                        "title": "[#56 stage] Existing split stage",
+                        "url": "https://github.com/OWNER/REPO/issues/99",
+                        "body": "",
+                    }
+                ]
+            ]
+        )
+    context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=comments,
+    )
+
+    with pytest.raises(AgentLoopError, match="existing split"):
+        _preflight_fresh_one_shot_recovery(
+            runner,
+            issue_number=56,
+            approved_plan=plan,
+            config=make_config(tmp_path),
+            issue_context=context,
+            recommendation=recommendation,
+        )
+
+    assert runner.comments == []
+    assert runner.issues == []
 
 
 def test_fresh_parent_summary_round_trips_final_integration_obligation():

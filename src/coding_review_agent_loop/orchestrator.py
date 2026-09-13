@@ -101,6 +101,7 @@ from .github import (
     post_trusted_pr_contract_record,
     post_trusted_pr_comment,
     reject_forged_protocol_markers,
+    search_issues,
     validate_open_issue,
     validate_open_pr,
     validate_pr_body_does_not_close_issue,
@@ -4683,6 +4684,18 @@ def _preflight_fresh_staged_topology(
     decomposition, retained_parent_scope = normalized_topology
     plan_hash = approved_plan_hash(approved_plan)
     plan_subject = _plan_subject(approved_plan)
+    # Reconcile any already-published approval-bound decision before the
+    # summary/child/handoff inventory below.  The finder also scans decisions
+    # for older plan hashes, preventing a changed approved plan from creating a
+    # second canonical decision on the same parent.
+    find_existing_execution_decision(
+        issue_context.comments,
+        parent_issue=issue_number,
+        plan_hash=plan_hash,
+        plan_subject=plan_subject,
+        strategy="staged",
+        recommendation_digest=decomposition.recommendation_digest,
+    )
     reject_legacy_topology_collision(
         issue_context.comments,
         parent_issue=issue_number,
@@ -4828,6 +4841,67 @@ def _preflight_fresh_staged_topology(
     return preflight_children
 
 
+def _preflight_fresh_split_topology(
+    runner: Runner,
+    *,
+    issue_number: int,
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+) -> None:
+    """Reject split state before a fresh one-shot decision can be published.
+
+    The parent comment is the normal materialization record, but a crash can
+    occur after a split child is filed and before that cumulative record is
+    posted.  Search both historical child-title forms as a read-only recovery
+    pass so one-shot execution cannot race an orphaned split child into a
+    second topology.
+    """
+    materialization = find_existing_split_materialization(
+        issue_context.comments,
+        parent_issue=issue_number,
+    )
+    if materialization is not None and materialization.children:
+        raise AgentLoopError(
+            "Fresh one-shot execution conflicts with an existing split materialization; "
+            "resume the split topology or repair it before rerunning."
+        )
+
+    for comment in issue_context.comments:
+        body = getattr(comment, "body", None)
+        if isinstance(body, str):
+            marker = SPLIT_CHILD_MARKER_RE.search(body)
+            if marker is not None and int(marker.group("parent")) == issue_number:
+                raise AgentLoopError(
+                    "Fresh one-shot execution conflicts with an existing split child; "
+                    "resume the split topology or repair it before rerunning."
+                )
+
+    searches = (
+        f'"(from #{issue_number})" in:title',
+        f'"[#{issue_number} stage]" in:title',
+    )
+    for search in searches:
+        for candidate in search_issues(
+            runner,
+            config=config,
+            search=search,
+            state="all",
+        ):
+            body = candidate.body or ""
+            marker = SPLIT_CHILD_MARKER_RE.search(body)
+            marker_matches = marker is not None and int(marker.group("parent")) == issue_number
+            title_matches = (
+                not body
+                and bool(candidate.title)
+                and candidate.title.startswith(f"[#{issue_number} stage] ")
+            )
+            if marker_matches or title_matches:
+                raise AgentLoopError(
+                    "Fresh one-shot execution conflicts with an existing split child; "
+                    "resume the split topology or repair it before rerunning."
+                )
+
+
 def _preflight_fresh_one_shot_recovery(
     runner: Runner,
     *,
@@ -4839,6 +4913,27 @@ def _preflight_fresh_one_shot_recovery(
 ) -> None:
     """Validate existing one-shot handoffs before the decision record is posted."""
     plan_hash = approved_plan_hash(approved_plan)
+    plan_subject = _plan_subject(approved_plan)
+    if recommendation is not None:
+        identity = recommendation.identity()
+        # Validate durable decision identity as part of the read-only
+        # preflight, rather than waiting for the publication helper after
+        # other recovery checks have started.  In particular, a changed
+        # approved plan must not acquire a second decision record.
+        find_existing_execution_decision(
+            issue_context.comments,
+            parent_issue=issue_number,
+            plan_hash=plan_hash,
+            plan_subject=plan_subject,
+            strategy="one-shot",
+            recommendation_digest=str(identity["recommendation_sha256"]),
+        )
+    _preflight_fresh_split_topology(
+        runner,
+        issue_number=issue_number,
+        config=config,
+        issue_context=issue_context,
+    )
     existing_summary = find_existing_decomposition(
         issue_context.comments,
         parent_issue=issue_number,
@@ -4966,7 +5061,7 @@ def _preflight_fresh_one_shot_recovery(
                 or existing_handoff.topology_source != identity["topology_source"]
                 or existing_handoff.execution_strategy_contract_version != 1
                 or existing_handoff.recommendation_digest != identity["recommendation_sha256"]
-                or existing_handoff.plan_subject != _plan_subject(approved_plan)
+                or existing_handoff.plan_subject != plan_subject
             ):
                 raise AgentLoopError(
                     "Fresh one-shot handoff disagrees with the approved recommendation; "
