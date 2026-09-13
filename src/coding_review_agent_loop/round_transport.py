@@ -19,6 +19,16 @@ ROUND_RESUME_MARKER_RE = re.compile(
 ROUND_TRANSPORT_SIDECAR_RE = re.compile(
     r"<!--\s*AGENT_LOOP_SIDECAR:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I
 )
+_EXECUTION_RECOMMENDATION_RE = re.compile(
+    r"<!--\s*AGENT_EXECUTION_RECOMMENDATION:\s*"
+    r"(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.I,
+)
+_EXECUTION_RECOMMENDATION_SECTION_BOUNDARY_RE = re.compile(
+    r"(?m)^<!--\s*execution-recommendation-section:\s*"
+    r"(?P<digest>[0-9a-f]{64})\s*-->\r?$",
+    re.I,
+)
 # Spill reviewer checkpoints first: they are often the largest metadata field
 # and are required to safely resume a provisional parallel-review round.
 _SPILL_FIELDS = (
@@ -31,10 +41,17 @@ _SPILL_FIELDS = (
     "final_analyzer_response",
     "raw_synthesis_response",
     "local_test_evidence",
+    "execution_recommendation",
 )
 _MAX_COMPRESSED = 8_000_000
 _MAX_DECOMPRESSED = 16_000_000
 _PART_CHARS = 40_000
+
+
+def execution_recommendation_section_boundary(encoded: str) -> str:
+    """Return the renderer-owned boundary for one recommendation marker."""
+    digest = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+    return f"<!-- execution-recommendation-section: {digest} -->"
 
 
 def _b64(data: bytes) -> str:
@@ -101,6 +118,233 @@ def _sidecar(payload: Mapping[str, object]) -> TrustedBody:
     )
 
 
+def _prepare_execution_recommendation_transport(
+    body_text: str,
+) -> tuple[str, list[TrustedBody], tuple[int, int, str] | None]:
+    """Spill an oversized v1 recommendation into bounded round sidecars.
+
+    The recommendation marker remains in the public anchor as a small reference;
+    the complete canonical JSON is carried losslessly by ordinary round sidecars.
+    This keeps large scope ledgers from being duplicated in the visible comment.
+    """
+    matches = list(_EXECUTION_RECOMMENDATION_RE.finditer(body_text))
+    if not matches or len(body_text) <= MAX_GITHUB_BODY_CHARS:
+        return body_text, [], None
+    match = matches[-1]
+    try:
+        raw_payload = base64.urlsafe_b64decode(match.group("payload").encode("ascii"))
+        parsed = json.loads(raw_payload.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("recommendation object required")
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentLoopError(
+            "Execution recommendation marker is not a recoverable JSON object."
+        ) from exc
+    if "$round_transport_execution_recommendation" in parsed:
+        return body_text, [], None
+
+    canonical_raw = json.dumps(
+        parsed, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+    packed = zlib.compress(canonical_raw, 9)
+    if len(packed) > _MAX_COMPRESSED:
+        raise AgentLoopError("Execution recommendation is too large to transport safely.")
+    encoded_packed = _b64(packed)
+    anchor_id = hashlib.sha256(body_text.encode("utf-8")).hexdigest()[:24]
+    spill_digest = hashlib.sha256(packed).hexdigest()
+    raw_digest = hashlib.sha256(canonical_raw).hexdigest()
+    chunks = [
+        encoded_packed[index : index + _PART_CHARS]
+        for index in range(0, len(encoded_packed), _PART_CHARS)
+    ]
+    reference = {
+        "$round_transport_execution_recommendation": anchor_id,
+        "field": "execution_recommendation",
+        "parts": len(chunks),
+        "sha256": raw_digest,
+        "spill": spill_digest,
+    }
+    replacement = _b64(
+        json.dumps(reference, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    transformed = (
+        body_text[: match.start("payload")]
+        + replacement
+        + body_text[match.end("payload") :]
+    )
+    sidecars = [
+        _sidecar(
+            {
+                "v": 1,
+                "anchor": anchor_id,
+                "spill": spill_digest,
+                "field": "execution_recommendation",
+                "index": index,
+                "count": len(chunks),
+                "sha256": raw_digest,
+                "data": chunk,
+            }
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+
+    # The complete recommendation is needed by agents and resume, but its
+    # human-readable projection is deliberately unbounded.  Once the marker
+    # has been moved into transport sidecars, replace the whole rendered
+    # section with a bounded, explicit summary.  The canonical plan in round
+    # metadata remains lossless, and the marker below lets readers hydrate the
+    # same structured object from the sidecars.
+    boundaries = [
+        boundary
+        for boundary in _EXECUTION_RECOMMENDATION_SECTION_BOUNDARY_RE.finditer(body_text)
+        if (
+            boundary.end() <= match.start()
+            and boundary.group("digest")
+            == hashlib.sha256(match.group("payload").encode("ascii")).hexdigest()
+            and body_text[boundary.end() :].lstrip("\r\n").startswith(
+                "### Execution strategy recommendation (v1)"
+            )
+        )
+    ]
+    if not boundaries:
+        return transformed, sidecars, None
+    section_boundary = boundaries[-1]
+    transported_matches = list(_EXECUTION_RECOMMENDATION_RE.finditer(transformed))
+    if not transported_matches:
+        raise AgentLoopError(
+            "Execution recommendation transport rewrite lost its protocol marker."
+        )
+    transported_match = transported_matches[-1]
+    preserved_markers = [
+        occurrence.text
+        for occurrence in scan_reserved_markers(body_text)
+        if (
+            section_boundary.start() <= occurrence.start < match.end()
+            and occurrence.definition.token != "AGENT_EXECUTION_RECOMMENDATION"
+        )
+    ]
+    compact_lines = [
+        "### Execution strategy recommendation (v1)",
+    ]
+    if parsed.get("strategy") in {"one-shot", "staged"}:
+        compact_lines.append(f"- `strategy`: `{parsed['strategy']}`")
+    if parsed.get("staging_feasibility") in {"safe", "inseparable"}:
+        compact_lines.append(
+            f"- `staging_feasibility`: `{parsed['staging_feasibility']}`"
+        )
+    compact_lines.extend(
+        [
+            "The complete validated execution recommendation is retained in the "
+            "canonical plan metadata and bounded transport sidecars for reviewer "
+            "prompts and lossless resume.",
+            *preserved_markers,
+            transported_match.group(0),
+        ]
+    )
+    compact_section = "\n".join(compact_lines)
+    compacted = (
+        transformed[: section_boundary.start()]
+        + compact_section
+        + transformed[transported_match.end() :]
+    )
+    # The range is expressed in the original carrier so the caller can retain
+    # authorization for every marker outside the rewritten recommendation.
+    return compacted, sidecars, (
+        section_boundary.start(),
+        match.end(),
+        compact_section,
+    )
+
+
+def _replace_authorized_range(
+    carrier: TrustedBody,
+    *,
+    start: int,
+    end: int,
+    replacement: TrustedBody,
+) -> TrustedBody:
+    """Replace visible text while retaining marker provenance around it."""
+    original = str(carrier)
+    if start < 0 or end < start or end > len(original):
+        raise AgentLoopError("Cannot transport an invalid authorized text range.")
+
+    segments = []
+    cursor = 0
+    inserted = False
+    replacement_markers = {
+        (segment.token, segment.text)
+        for segment in replacement._segments
+        if segment.token is not None
+    }
+    for segment in carrier._segments:
+        segment_start = cursor
+        segment_end = cursor + len(segment.text)
+        overlaps = segment_start < end and segment_end > start
+        if not overlaps:
+            if not inserted and segment_start >= end:
+                segments.extend(replacement._segments)
+                inserted = True
+            segments.append(segment)
+        else:
+            if segment.token is not None:
+                if not (
+                    start <= segment_start
+                    and segment_end <= end
+                    and (
+                        segment.token == "AGENT_EXECUTION_RECOMMENDATION"
+                        or (segment.token, segment.text) in replacement_markers
+                    )
+                ):
+                    raise AgentLoopError(
+                        "Cannot transport a range containing an unrelated authorized marker."
+                    )
+            else:
+                if segment_start < start:
+                    segments.append(
+                        type(segment)(segment.text[: start - segment_start])
+                    )
+                if not inserted:
+                    segments.extend(replacement._segments)
+                    inserted = True
+                if segment_end > end:
+                    segments.append(type(segment)(segment.text[end - segment_start :]))
+        cursor = segment_end
+
+    if not inserted:
+        segments.extend(replacement._segments)
+    return TrustedBody(
+        "".join(segment.text for segment in segments),
+        tuple(segment for segment in segments if segment.text),
+    )
+
+
+def _replace_authorized_marker(
+    carrier: TrustedBody,
+    *,
+    token: str,
+    old_text: str,
+    new_text: str,
+) -> TrustedBody:
+    """Replace one marker while retaining the carrier's segment provenance."""
+    if old_text == new_text:
+        return carrier
+    replaced = False
+    segments = []
+    for segment in carrier._segments:
+        if not replaced and segment.token == token and segment.text == old_text:
+            segments.append(type(segment)(new_text, token))
+            replaced = True
+        else:
+            segments.append(segment)
+    if not replaced:
+        raise AgentLoopError(
+            f"Cannot transport {token}: its authorized marker segment was not found."
+        )
+    return TrustedBody(
+        "".join(segment.text for segment in segments), tuple(segments)
+    )
+
+
 def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
     """Return sidecars followed by an anchor; non-round bodies are strictly bounded."""
     if isinstance(body, TrustedBody):
@@ -116,18 +360,56 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             )
         )
     body_text = str(carrier)
+    body_text, sidecars, execution_rewrite = _prepare_execution_recommendation_transport(
+        body_text
+    )
+    trusted_anchor = carrier
+    if execution_rewrite is not None:
+        start, end, compact_section = execution_rewrite
+        trusted_compact_section = TrustedBody.canonical(
+            compact_section,
+            expected_tokens=tuple(
+                occurrence.definition.token
+                for occurrence in scan_reserved_markers(compact_section)
+            ),
+        )
+        trusted_anchor = _replace_authorized_range(
+            trusted_anchor,
+            start=start,
+            end=end,
+            replacement=trusted_compact_section,
+        )
+    elif sidecars:
+        original_execution = _EXECUTION_RECOMMENDATION_RE.search(str(carrier))
+        transported_execution = _EXECUTION_RECOMMENDATION_RE.search(body_text)
+        if original_execution is not None and transported_execution is not None:
+            trusted_anchor = _replace_authorized_marker(
+                trusted_anchor,
+                token="AGENT_EXECUTION_RECOMMENDATION",
+                old_text=original_execution.group(0),
+                new_text=transported_execution.group(0),
+            )
     matches = list(ROUND_RESUME_MARKER_RE.finditer(body_text))
-    if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches:
+    if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches and not sidecars:
         raise AgentLoopError(
             f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response."
         )
     if not matches:
+        if sidecars:
+            if len(body_text) > MAX_GITHUB_BODY_CHARS:
+                raise AgentLoopError(
+                    f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters after execution sidecar spill."
+                )
+            return (*sidecars, trusted_anchor)
+        # Preserve the caller's authorization when no transport rewrite was
+        # needed. Re-scanning this same text would authorize markers that the
+        # caller did not authorize at composition time.
         return (carrier,)
 
     # Resume reads the last marker when a legacy comment contains more than one.
     match = matches[-1]
     payload = decode_mapping(match.group("payload"))
-    sidecars: list[str] = []
+    sidecars = list(sidecars)
     anchor_id = hashlib.sha256(body_text.encode()).hexdigest()[:24]
 
     def render_anchor(mapping: Mapping[str, object]) -> str:
@@ -186,8 +468,17 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
         )
     if any(len(item) > MAX_GITHUB_BODY_CHARS for item in sidecars):
         raise AgentLoopError("Round metadata sidecar exceeds GitHub body budget.")
-    expected = tuple(item.definition.token for item in scan_reserved_markers(anchor))
-    return (*sidecars, TrustedBody.canonical(anchor, expected_tokens=expected))
+    original_round = ROUND_RESUME_MARKER_RE.search(str(trusted_anchor))
+    transported_round = ROUND_RESUME_MARKER_RE.search(anchor)
+    if original_round is None or transported_round is None:
+        raise AgentLoopError("Cannot transport AGENT_LOOP_META without its authorized marker segment.")
+    trusted_anchor = _replace_authorized_marker(
+        trusted_anchor,
+        token="AGENT_LOOP_META",
+        old_text=original_round.group(0),
+        new_text=transported_round.group(0),
+    )
+    return (*sidecars, trusted_anchor)
 
 
 def hydrate_mapping(
@@ -218,10 +509,17 @@ def hydrate_mapping(
     missing: set[str] = set()
     for field in _SPILL_FIELDS:
         ref = result.get(field)
-        if not isinstance(ref, dict) or "$round_transport_spill" not in ref:
+        if not isinstance(ref, dict):
+            continue
+        reference_key = (
+            "$round_transport_execution_recommendation"
+            if "$round_transport_execution_recommendation" in ref
+            else "$round_transport_spill"
+        )
+        if reference_key not in ref:
             continue
         try:
-            anchor = str(ref["$round_transport_spill"])
+            anchor = str(ref[reference_key])
             count = int(ref["parts"])
             entries = parts.get((anchor, field), {})
             if count < 1 or len(entries) != count or any(index not in entries for index in range(count)):

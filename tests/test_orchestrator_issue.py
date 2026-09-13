@@ -70,6 +70,7 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_plan_revision,
     structured_plan_state,
+    structured_v1_plan_state,
     structured_pr_review,
     structured_issue_implementation,
 )
@@ -1360,6 +1361,66 @@ def test_issue_loop_structured_plan_state_public_comment_renders_markdown_and_pr
     metadata = _decode_round_metadata(match.group("payload"))
     assert metadata.canonical_plan == raw_structured_plan
     assert metadata.raw_structured_coder_response == raw_structured_plan
+
+
+def test_issue_loop_accepts_fresh_v1_plan_without_recommendation_driven_routing(tmp_path):
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        reviewer="codex",
+        execution_strategy_contract_required=True,
+    )
+
+    assert run_issue_loop(runner, issue_number=783, config=config, plan_first=True) == 0
+    assert runner.issues == []
+    assert any("AGENT_EXECUTION_RECOMMENDATION" in comment for comment in runner.comments)
+
+
+def test_fresh_v1_plan_host_resume_reuses_posted_round_without_new_agent_turn(tmp_path):
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        reviewer="codex",
+        execution_strategy_contract_required=True,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    initial_agent_commands = [
+        cmd for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] or cmd[:2] == ["codex", "exec"]
+    ]
+    coder_metadata = next(
+        _decode_round_metadata(match.group("payload"))
+        for comment in runner.issue_comments
+        if (match := re.search(
+            r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+            comment["body"],
+        ))
+        and _decode_round_metadata(match.group("payload")).role == "coder"
+    )
+    assert coder_metadata.execution_strategy_contract_version == 1
+
+    # The host rerun sees the durable canonical plan, raw response, sidecar,
+    # and metadata identity. It must resume the approved plan without asking
+    # either agent to produce a competing round.
+    runner.claude_outputs = []
+    runner.codex_outputs = []
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    resumed_agent_commands = [
+        cmd for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] or cmd[:2] == ["codex", "exec"]
+    ]
+    assert resumed_agent_commands == initial_agent_commands
+    assert runner.issues == []
 
 
 def test_plan_review_accepts_valid_response_file_after_nonzero_exit(tmp_path):

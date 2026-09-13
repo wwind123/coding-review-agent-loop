@@ -15,6 +15,19 @@ from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
 from helpers.prompt_builders import build_review_prompt_for_skill
 
 
+def test_skill_planning_recovery_refuses_to_invent_fresh_contract():
+    from coding_review_agent_loop.errors import FreshContractIntegrityError
+    from helpers.skill_runner import _recover_structured_response
+
+    with pytest.raises(FreshContractIntegrityError, match="new planner turn"):
+        _recover_structured_response(
+            "leading prose before a plan",
+            expected_kind="plan_state",
+            validate=lambda _text: None,
+            require_execution_strategy_contract=True,
+        )
+
+
 def test_demo_loop_dry_run() -> None:
     """
     Run helpers/demo_loop.py and verify it:

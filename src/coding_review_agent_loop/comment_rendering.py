@@ -38,12 +38,17 @@ from .protocol import (
     StructuredIssueImplementation,
     StructuredPlanState,
     StructuredPlanRevision,
+    ExecutionStrategyRecommendation,
+    EXECUTION_TOPOLOGY_SOURCE,
     UnresolvedReviewItem,
     review_freeform_summary_text,
 )
 from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID
 from .protocol_markers import sanitize_historical_text
-from .round_transport import MAX_GITHUB_BODY_CHARS
+from .round_transport import (
+    MAX_GITHUB_BODY_CHARS,
+    execution_recommendation_section_boundary,
+)
 from .test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     TestRuntimeConfigurationError,
@@ -60,6 +65,11 @@ ITEM_SUMMARY_LIMIT = 100
 PLAN_EXPECTED_CLOSING_MARKER = "AGENT_PLAN_EXPECTED_CLOSING_ISSUES"
 PLAN_EXPECTED_CLOSING_MARKER_RE = re.compile(
     rf"<!--\s*{PLAN_EXPECTED_CLOSING_MARKER}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.IGNORECASE,
+)
+EXECUTION_RECOMMENDATION_MARKER = "AGENT_EXECUTION_RECOMMENDATION"
+EXECUTION_RECOMMENDATION_MARKER_RE = re.compile(
+    rf"<!--\s*{EXECUTION_RECOMMENDATION_MARKER}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
     re.IGNORECASE,
 )
 # Reverse map display-name -> agent. agent_display_name is config-independent, so
@@ -496,6 +506,223 @@ def render_typed_plan_stages_section(stages: TypedPlanStages) -> str | None:
     return "\n".join(lines)
 
 
+def _sanitize_execution_payload(value: object) -> object:
+    if isinstance(value, str):
+        return sanitize_historical_text(value)
+    if isinstance(value, dict):
+        return {str(key): _sanitize_execution_payload(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_execution_payload(child) for child in value]
+    return value
+
+
+def render_execution_recommendation_section(
+    recommendation: ExecutionStrategyRecommendation,
+) -> str:
+    """Render the complete v1 recommendation and its lossless sidecar.
+
+    The sidecar is a distinct marker so legacy typed-stage extraction cannot
+    accidentally treat reviewed v1 topology as executable child issues.
+    """
+    payload = _sanitize_execution_payload(recommendation.to_payload())
+    assert isinstance(payload, dict)
+    encoded = _encode_json_payload(payload)
+    lines = [
+        execution_recommendation_section_boundary(encoded),
+        "### Execution strategy recommendation (v1)",
+        f"- `topology_source`: `{EXECUTION_TOPOLOGY_SOURCE}`",
+        f"- `strategy`: `{sanitize_historical_text(recommendation.strategy)}`",
+        f"- `staging_feasibility`: `{sanitize_historical_text(recommendation.staging_feasibility)}`",
+        f"- `rationale`: {sanitize_historical_text(recommendation.rationale)}",
+        "",
+        "#### `scope_items`",
+    ]
+    for item in recommendation.scope_items:
+        lines.extend(
+            [
+                f"- `{sanitize_historical_text(item.scope_item_id)}`",
+                f"  - `requirement`: {sanitize_historical_text(item.requirement)}",
+                "  - `acceptance_criteria`:",
+            ]
+        )
+        if item.acceptance_criteria:
+            lines.extend(
+                f"    - {sanitize_historical_text(value)}"
+                for value in item.acceptance_criteria
+            )
+        else:
+            lines.append("    - None")
+
+    lines.extend(["", "#### `coupling_constraints`"])
+    if recommendation.coupling_constraints:
+        for constraint in recommendation.coupling_constraints:
+            lines.extend(
+                [
+                    f"- `{sanitize_historical_text(constraint.constraint_id)}`",
+                    "  - `scope_item_ids`: "
+                    + ", ".join(
+                        f"`{sanitize_historical_text(value)}`"
+                        for value in constraint.scope_item_ids
+                    ),
+                    f"  - `rationale`: {sanitize_historical_text(constraint.rationale)}",
+                ]
+            )
+    else:
+        lines.append("- None")
+
+    if recommendation.one_shot_delivery is not None:
+        delivery = recommendation.one_shot_delivery
+        lines.extend(["", "#### `one_shot_delivery`"])
+        lines.extend(
+            [
+                "- `deliverables`:",
+                *(
+                    [f"  - {sanitize_historical_text(value)}" for value in delivery.deliverables]
+                    or ["  - None"]
+                ),
+                "- `acceptance_criteria`:",
+                *(
+                    [
+                        f"  - {sanitize_historical_text(value)}"
+                        for value in delivery.acceptance_criteria
+                    ]
+                    or ["  - None"]
+                ),
+                "- `covered_scope_item_ids`: "
+                + ", ".join(
+                    f"`{sanitize_historical_text(value)}`"
+                    for value in delivery.covered_scope_item_ids
+                ),
+            ]
+        )
+
+    lines.extend(["", "#### `child_stages`"])
+    if recommendation.child_stages:
+        for stage in recommendation.child_stages:
+            lines.extend(
+                [
+                    f"- `{sanitize_historical_text(stage.stage_id)}` (`position`: {stage.position})",
+                    f"  - `title`: {sanitize_historical_text(stage.title)}",
+                    f"  - `summary`: {sanitize_historical_text(stage.summary)}",
+                    "  - `deliverables`:",
+                    *(
+                        [f"    - {sanitize_historical_text(value)}" for value in stage.deliverables]
+                        or ["    - None"]
+                    ),
+                    "  - `non_goals`:",
+                    *(
+                        [f"    - {sanitize_historical_text(value)}" for value in stage.non_goals]
+                        or ["    - None"]
+                    ),
+                    "  - `acceptance_criteria`:",
+                    *(
+                        [
+                            f"    - {sanitize_historical_text(value)}"
+                            for value in stage.acceptance_criteria
+                        ]
+                        or ["    - None"]
+                    ),
+                    "  - `depends_on_stage_ids`: "
+                    + ", ".join(
+                        f"`{sanitize_historical_text(value)}`"
+                        for value in stage.depends_on_stage_ids
+                    )
+                    if stage.depends_on_stage_ids
+                    else "  - `depends_on_stage_ids`: None",
+                    f"  - `dependency_notes`: {sanitize_historical_text(stage.dependency_notes)}",
+                    f"  - `automation`: `{sanitize_historical_text(stage.automation)}`",
+                    f"  - `rollout_risk`: {sanitize_historical_text(stage.rollout_risk)}",
+                    "  - `compatibility_constraints`:",
+                    *(
+                        [
+                            f"    - {sanitize_historical_text(value)}"
+                            for value in stage.compatibility_constraints
+                        ]
+                        or ["    - None"]
+                    ),
+                    "  - `covered_scope_item_ids`: "
+                    + ", ".join(
+                        f"`{sanitize_historical_text(value)}`"
+                        for value in stage.covered_scope_item_ids
+                    ),
+                ]
+            )
+    else:
+        lines.append("- None")
+
+    def render_allocation(title: str, allocation: object) -> None:
+        lines.extend(["", f"#### {title}"])
+        lines.append(f"- `status`: `{sanitize_historical_text(allocation.status)}`")
+        lines.append("- `deliverables`:")
+        lines.extend(
+            f"  - {sanitize_historical_text(value)}" for value in allocation.deliverables
+        )
+        if not allocation.deliverables:
+            lines.append("  - None")
+        lines.append("- `acceptance_criteria`:")
+        lines.extend(
+            f"  - {sanitize_historical_text(value)}"
+            for value in allocation.acceptance_criteria
+        )
+        if not allocation.acceptance_criteria:
+            lines.append("  - None")
+        lines.append(
+            "- `covered_scope_item_ids`: "
+            + (
+                ", ".join(
+                    f"`{sanitize_historical_text(value)}`"
+                    for value in allocation.covered_scope_item_ids
+                )
+                if allocation.covered_scope_item_ids
+                else "None"
+            )
+        )
+
+    render_allocation("`retained_parent_work`", recommendation.retained_parent_work)
+    render_allocation("`final_integration_work`", recommendation.final_integration_work)
+    lines.extend(["", "#### `caveats`"])
+    lines.extend(
+        f"- {sanitize_historical_text(value)}" for value in recommendation.caveats
+    )
+    if not recommendation.caveats:
+        lines.append("- None")
+    lines.append(
+        "The same complete recommendation is retained in the bounded sidecar below for lossless resume."
+    )
+    lines.append(f"<!-- {EXECUTION_RECOMMENDATION_MARKER}: {encoded} -->")
+    return "\n".join(lines)
+
+
+def decode_execution_recommendation_marker(
+    encoded: str, *, bodies: Sequence[str] = ()
+) -> dict[str, object]:
+    payload = _decode_json_payload(encoded, marker_name=EXECUTION_RECOMMENDATION_MARKER)
+    if _encode_json_payload(payload) != encoded:
+        raise AgentLoopError(
+            f"Invalid {EXECUTION_RECOMMENDATION_MARKER} payload: non-canonical encoding."
+        )
+    if "$round_transport_execution_recommendation" in payload:
+        from .round_transport import hydrate_mapping
+
+        hydrated, missing = hydrate_mapping(
+            {"execution_recommendation": payload}, bodies
+        )
+        if missing or not isinstance(hydrated.get("execution_recommendation"), str):
+            raise AgentLoopError(
+                f"Invalid {EXECUTION_RECOMMENDATION_MARKER} payload: sidecar unavailable."
+            )
+        try:
+            recovered = json.loads(hydrated["execution_recommendation"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise AgentLoopError(
+                f"Invalid {EXECUTION_RECOMMENDATION_MARKER} payload: sidecar is not JSON."
+            ) from exc
+        if not isinstance(recovered, dict):
+            raise AgentLoopError(f"Invalid {EXECUTION_RECOMMENDATION_MARKER} payload.")
+        payload = recovered
+    return payload
+
+
 def _encode_deferred_stages_marker(deferred_stages: Sequence[DeferredStage]) -> str:
     return _encode_json_payload(
         {"stages": [{"title": stage.title, "summary": stage.summary} for stage in deferred_stages]}
@@ -564,6 +791,31 @@ def render_canonical_plan_revision(
     typed_section = render_typed_plan_stages_section(parsed_revision.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    if parsed_revision.execution_recommendation is not None:
+        sections.append(render_execution_recommendation_section(parsed_revision.execution_recommendation))
+    return "\n\n".join(sections)
+
+
+def render_canonical_plan_state(
+    parsed_plan: StructuredPlanState,
+    config: AgentLoopConfig | None = None,
+) -> str:
+    """Render a first-round plan using the same canonical rules as revisions."""
+    sections = [parsed_plan.summary.strip(), "### Plan steps", render_canonical_plan_steps(parsed_plan.plan_steps)]
+    expected_section = render_expected_closing_issue_declaration(parsed_plan.additional_closing_issue_ids)
+    if expected_section:
+        sections.append(expected_section)
+    human_section = render_human_requirement_dispositions(parsed_plan.human_requirement_dispositions)
+    if human_section:
+        sections.append(human_section)
+    deferred_section = render_deferred_stages_section(parsed_plan.deferred_stages)
+    if deferred_section:
+        sections.append(deferred_section)
+    typed_section = render_typed_plan_stages_section(parsed_plan.typed_stages)
+    if typed_section:
+        sections.append(typed_section)
+    if parsed_plan.execution_recommendation is not None:
+        sections.append(render_execution_recommendation_section(parsed_plan.execution_recommendation))
     return "\n\n".join(sections)
 
 
@@ -940,6 +1192,8 @@ def _render_public_plan_state_comment(
     typed_section = render_typed_plan_stages_section(parsed_plan.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    if parsed_plan.execution_recommendation is not None:
+        sections.append(render_execution_recommendation_section(parsed_plan.execution_recommendation))
     sections.append(f"<!-- AGENT_PLAN_STATE: {parsed_plan.state} -->")
     sections.append(f"-- {_comment_signature(agent, config, model_used)}")
     return "\n\n".join(section for section in sections if section)

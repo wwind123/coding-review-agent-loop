@@ -77,8 +77,40 @@ from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
     sanitize_architecture_impact,
+    validate_structured_plan_state,
+    validate_structured_plan_revision,
 )
 from coding_review_agent_loop.local_test_evidence import canonicalize_bounded_evidence
+
+
+def _canonicalize_plan_subject_source(
+    text: str, *, prior_items: tuple[UnresolvedReviewItem, ...] = ()
+) -> str:
+    """Use the v1 canonical rendering when a subject file is raw plan JSON."""
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(text.lstrip())
+        kind = payload.get("kind") if isinstance(payload, dict) else None
+        if kind == "plan_state":
+            parsed = validate_structured_plan_state(
+                text, require_execution_strategy_contract=1
+            )
+            if parsed is not None:
+                from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+
+                return render_canonical_plan_state(parsed)
+        elif kind == "plan_revision":
+            parsed = validate_structured_plan_revision(
+                text, require_execution_strategy_contract=1
+            )
+            if parsed is not None:
+                from coding_review_agent_loop.comment_rendering import render_canonical_plan_revision
+
+                return render_canonical_plan_revision(parsed, prior_items)
+    except (AgentLoopError, AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        # The normal caller validation owns malformed plan diagnostics. This
+        # helper only canonicalizes a valid v1 subject source.
+        pass
+    return text
 
 
 def _session_path(repo: str, issue: int) -> Path:
@@ -216,6 +248,8 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                         ),
                         "architecture_identity": record.metadata.architecture_identity,
                         "architecture_contract_version": record.metadata.architecture_contract_version,
+                        "execution_strategy_contract_version": record.metadata.execution_strategy_contract_version,
+                        "execution_strategy_identity": record.metadata.execution_strategy_identity,
                     }
                     for record in resumed.completed_reviews
                 ]
@@ -263,6 +297,8 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                         ),
                         "architecture_identity": record.metadata.architecture_identity,
                         "architecture_contract_version": record.metadata.architecture_contract_version,
+                        "execution_strategy_contract_version": record.metadata.execution_strategy_contract_version,
+                        "execution_strategy_identity": record.metadata.execution_strategy_identity,
                     }
                     for record in result.completed_reviews
                 ]
@@ -292,20 +328,6 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         body = Path(args.body_file).read_text(encoding="utf-8")
     except OSError as exc:
         print(f"state_manager: cannot read body file: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    # Compute subject
-    if args.subject:
-        subject = args.subject
-    elif args.subject_plan_file:
-        try:
-            plan_text = Path(args.subject_plan_file).read_text(encoding="utf-8")
-        except OSError as exc:
-            print(f"state_manager: cannot read subject plan file: {exc}", file=sys.stderr)
-            sys.exit(1)
-        subject = _plan_subject(plan_text)
-    else:
-        print("state_manager attach-metadata: provide --subject or --subject-plan-file", file=sys.stderr)
         sys.exit(1)
 
     # Load optional item lists
@@ -342,6 +364,122 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         except OSError as exc:
             print(f"state_manager: cannot read raw coder response file: {exc}", file=sys.stderr)
             sys.exit(1)
+
+    execution_strategy_contract_version = getattr(
+        args, "execution_strategy_contract_version", None
+    )
+    execution_strategy_identity: dict | None = None
+    parsed_strategy = None
+    identity_source = raw_structured_coder_response or body
+    fresh_source = False
+    try:
+        source_payload, _source_end = json.JSONDecoder().raw_decode(identity_source.lstrip())
+        fresh_source = isinstance(source_payload, dict) and (
+            "execution_strategy_contract_version" in source_payload
+            or "execution_recommendation" in source_payload
+        )
+    except (AttributeError, json.JSONDecodeError):
+        fresh_source = False
+    if execution_strategy_contract_version is not None or fresh_source:
+        if execution_strategy_contract_version != 1:
+            if execution_strategy_contract_version is not None:
+                print(
+                    "state_manager: execution strategy contract version must be 1",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            execution_strategy_contract_version = 1
+        try:
+            decoder = json.JSONDecoder()
+            payload, _end = decoder.raw_decode(identity_source.lstrip())
+            kind = payload.get("kind") if isinstance(payload, dict) else None
+            if kind == "plan_state":
+                parsed_strategy = validate_structured_plan_state(
+                    identity_source, require_execution_strategy_contract=1
+                )
+            elif kind == "plan_revision":
+                parsed_strategy = validate_structured_plan_revision(
+                    identity_source, require_execution_strategy_contract=1
+                )
+            else:
+                raise AgentLoopError(
+                    "fresh planning metadata requires a structured plan_state or plan_revision source"
+                )
+            if parsed_strategy is None or parsed_strategy.execution_recommendation is None:
+                raise AgentLoopError(
+                    "fresh planning metadata requires a complete execution recommendation"
+                )
+            execution_strategy_identity = parsed_strategy.execution_recommendation.identity()
+            if raw_structured_coder_response is None:
+                raw_structured_coder_response = identity_source
+        except (AgentLoopError, AttributeError, json.JSONDecodeError, TypeError) as exc:
+            print(f"state_manager: cannot derive execution strategy identity: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    identity_file = getattr(args, "execution_strategy_identity_file", None)
+    if identity_file:
+        try:
+            loaded_identity = json.loads(Path(identity_file).read_text(encoding="utf-8"))
+            if not isinstance(loaded_identity, dict):
+                raise ValueError("expected a JSON object")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"state_manager: cannot read execution strategy identity: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if (
+            execution_strategy_identity is not None
+            and loaded_identity != execution_strategy_identity
+        ):
+            print(
+                "state_manager: supplied execution strategy identity does not match the validated response",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        execution_strategy_identity = loaded_identity
+
+    # Host-mode plan files are raw structured responses. Publish the same
+    # canonical human-readable representation used by external/skill turns so
+    # the recommendation sidecar is available to restart recovery. External
+    # turns already arrive rendered and are left untouched. The canonical plan
+    # is deliberately the subject source: hashing the raw host JSON while
+    # storing rendered markdown makes the next resume look like a new round.
+    if parsed_strategy is not None and body.lstrip().startswith("{"):
+        from coding_review_agent_loop.comment_rendering import (
+            render_canonical_plan_revision,
+            render_canonical_plan_state,
+            render_public_agent_comment,
+        )
+
+        body = render_public_agent_comment(
+            kind=parsed_strategy.kind,
+            parsed=parsed_strategy,
+            agent=args.agent,
+        )
+        if parsed_strategy.kind == "plan_state":
+            canonical_plan = render_canonical_plan_state(parsed_strategy)
+        elif parsed_strategy.kind == "plan_revision":
+            canonical_plan = render_canonical_plan_revision(parsed_strategy, prior_items)
+
+    # Compute the subject only after a fresh host plan has been canonicalized.
+    # Explicit callers (for example PR-head metadata) retain their supplied
+    # subject; plan-file callers hash the exact canonical plan persisted above.
+    if args.subject:
+        subject = args.subject
+    elif args.subject_plan_file:
+        try:
+            plan_text = (
+                canonical_plan
+                if parsed_strategy is not None and canonical_plan is not None
+                else Path(args.subject_plan_file).read_text(encoding="utf-8")
+            )
+        except OSError as exc:
+            print(f"state_manager: cannot read subject plan file: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if parsed_strategy is None:
+            plan_text = _canonicalize_plan_subject_source(plan_text, prior_items=prior_items)
+        subject = _plan_subject(plan_text)
+    else:
+        print("state_manager attach-metadata: provide --subject or --subject-plan-file", file=sys.stderr)
+        sys.exit(1)
 
     compact_prior_summaries: tuple[str, ...] = ()
     if getattr(args, "compact_prior_summaries_file", None):
@@ -421,6 +559,8 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             1 if getattr(args, "architecture_contract_version", None) is not None
             else None
         ),
+        execution_strategy_contract_version=execution_strategy_contract_version,
+        execution_strategy_identity=execution_strategy_identity,
     )
     augmented = _attach_round_metadata(body, metadata)
 
@@ -511,6 +651,14 @@ def main() -> None:
     p_meta.add_argument(
         "--architecture-contract-version", type=int, default=None,
         help="Fresh architecture-impact contract generation carried by this record.",
+    )
+    p_meta.add_argument(
+        "--execution-strategy-contract-version", type=int, default=None,
+        help="Fresh execution-strategy contract generation carried by this record.",
+    )
+    p_meta.add_argument(
+        "--execution-strategy-identity-file", default=None,
+        help="Validated complete execution-strategy identity JSON for this record.",
     )
     p_meta.add_argument("--architecture-identity-file", default=None)
     p_meta.add_argument("--architecture-impact-file", default=None)

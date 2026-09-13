@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import coding_review_agent_loop.round_transport as transport
+import coding_review_agent_loop.comment_rendering as comment_rendering
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
@@ -23,9 +24,11 @@ from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
     UNKNOWN_MACHINE_AUTHORITY,
+    validate_structured_plan_state,
 )
 from coding_review_agent_loop.review_scheduling import ReviewSchedulingContract
 from coding_review_agent_loop.unresolved_items import _apply_unresolved_item_dispositions
+from coding_review_agent_loop.protocol_markers import TrustedBody
 
 
 def _random_text(size: int) -> str:
@@ -55,6 +58,64 @@ def test_is_round_transport_sidecar() -> None:
     assert not transport.is_round_transport_sidecar("ordinary agent output")
 
 
+def test_prepare_round_comment_preserves_trusted_carrier_without_spill() -> None:
+    carrier = TrustedBody.join(
+        TrustedBody.current_untrusted_visible("first"),
+        TrustedBody.current_untrusted_visible("second"),
+    )
+
+    prepared = transport.prepare_round_comment(carrier)
+
+    assert prepared == (carrier,)
+    assert prepared[0] is carrier
+    assert prepared[0].segments == carrier.segments
+
+
+def test_prepare_round_comment_spill_keeps_existing_segment_provenance() -> None:
+    recommendation = {
+        "strategy": "one-shot",
+        "rationale": _random_text(50_000),
+        "staging_feasibility": "inseparable",
+        "scope_items": [{
+            "scope_item_id": "scope-1",
+            "requirement": "Implement the requested behavior.",
+            "acceptance_criteria": ["The focused regression passes."],
+        }],
+        "coupling_constraints": [],
+        "one_shot_delivery": {
+            "deliverables": ["Implementation."],
+            "acceptance_criteria": ["The regression passes."],
+            "covered_scope_item_ids": ["scope-1"],
+        },
+        "child_stages": [],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "caveats": [],
+    }
+    encoded = transport._b64(
+        json.dumps(recommendation, separators=(",", ":"), sort_keys=True).encode()
+    )
+    marker_text = f"<!-- AGENT_EXECUTION_RECOMMENDATION: {encoded} -->"
+    carrier = TrustedBody.join(
+        TrustedBody.current_untrusted_visible("first"),
+        TrustedBody.current_untrusted_visible("second"),
+        TrustedBody.marker("AGENT_EXECUTION_RECOMMENDATION", marker_text),
+    )
+
+    prepared = transport.prepare_round_comment(carrier)
+
+    assert len(prepared) > 1
+    assert prepared[-1].segments[0] == ("first", None)
+    assert prepared[-1].segments[1] == ("second", None)
+    assert prepared[-1].segments[2][1] == "AGENT_EXECUTION_RECOMMENDATION"
+
+
 def test_prepare_round_comment_spills_only_until_anchor_fits() -> None:
     review = _random_text(46_000)
     payload = {
@@ -73,6 +134,97 @@ def test_prepare_round_comment_spills_only_until_anchor_fits() -> None:
     hydrated, missing = transport.hydrate_mapping(anchor_payload, prepared)
     assert missing == set()
     assert hydrated == payload
+
+
+def test_oversized_execution_recommendation_uses_bounded_lossless_sidecar() -> None:
+    recommendation = {
+        "strategy": "one-shot",
+        "rationale": _random_text(50_000),
+        "staging_feasibility": "inseparable",
+        "scope_items": [{
+            "scope_item_id": "scope-1",
+            "requirement": "Implement the requested behavior.",
+            "acceptance_criteria": ["The focused regression passes."],
+        }],
+        "coupling_constraints": [],
+        "one_shot_delivery": {
+            "deliverables": ["Implementation and tests."],
+            "acceptance_criteria": ["The focused regression passes."],
+            "covered_scope_item_ids": ["scope-1"],
+        },
+        "child_stages": [],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "caveats": [],
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(recommendation, separators=(",", ":"), sort_keys=True).encode()
+    ).decode()
+    body = _random_text(5_000) + f"\n<!-- AGENT_EXECUTION_RECOMMENDATION: {encoded} -->"
+
+    prepared = transport.prepare_round_comment(body)
+    anchor = str(prepared[-1])
+
+    assert len(anchor) <= transport.MAX_GITHUB_BODY_CHARS
+    marker = list(comment_rendering.EXECUTION_RECOMMENDATION_MARKER_RE.finditer(anchor))[-1]
+    assert comment_rendering.decode_execution_recommendation_marker(
+        marker.group("payload"), bodies=tuple(map(str, prepared))
+    ) == recommendation
+
+
+def test_rendered_oversized_execution_recommendation_keeps_anchor_bounded_and_reviewable() -> None:
+    from agent_loop_helpers import structured_v1_plan_state
+
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["execution_recommendation"]["rationale"] = (
+        _random_text(50_000)
+        + "\n### Execution strategy recommendation (v1)\n"
+        + _random_text(500)
+    )
+    parsed = validate_structured_plan_state(
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder",
+        require_execution_strategy_contract=1,
+    )
+    rendered = comment_rendering.render_execution_recommendation_section(
+        parsed.execution_recommendation
+    )
+    rendered = _attach_round_metadata(
+        rendered,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="codex",
+            round_number=1,
+            subject="plan-subject",
+        ),
+    )
+    assert len(rendered) > transport.MAX_GITHUB_BODY_CHARS
+
+    prepared = transport.prepare_round_comment(rendered)
+    anchor_body = prepared[-1]
+    anchor = str(anchor_body)
+
+    assert len(anchor) <= transport.MAX_GITHUB_BODY_CHARS
+    assert "complete validated execution recommendation" in anchor
+    assert "`strategy`: `one-shot`" in anchor
+    assert "`staging_feasibility`: `inseparable`" in anchor
+    assert "AGENT_LOOP_META" in anchor
+    assert "rationale" not in anchor
+    marker = list(comment_rendering.EXECUTION_RECOMMENDATION_MARKER_RE.finditer(anchor))[-1]
+    assert comment_rendering.decode_execution_recommendation_marker(
+        marker.group("payload"), bodies=tuple(map(str, prepared))
+    ) == parsed.execution_recommendation.to_payload()
+    assert all(
+        len(item) <= transport.MAX_GITHUB_BODY_CHARS
+        for item in prepared
+    )
+    anchor_body.validate_for_surface("issue_comment")
 
 
 def test_prepare_round_comment_spills_multiple_fields_in_fixed_order() -> None:

@@ -293,6 +293,7 @@ from coding_review_agent_loop.prompts import (
 
 from agent_loop_helpers import (
     FakeRunner,
+    _DEFAULT_ARCHITECTURE_IMPACT,
     blocking_issues,
     make_config,
     prior_item_dispositions,
@@ -2866,6 +2867,187 @@ def test_render_canonical_plan_revision_omits_deferred_stages_section_when_absen
     canonical = render_canonical_plan_revision(parsed, ())
 
     assert "Deferred stages" not in canonical
+
+
+def _execution_plan_payload(*, strategy: str = "one-shot") -> dict:
+    recommendation = {
+        "strategy": strategy,
+        "rationale": "The reviewed work has a bounded delivery boundary.",
+        "staging_feasibility": "inseparable" if strategy == "one-shot" else "safe",
+        "scope_items": [
+            {
+                "scope_item_id": "scope-api",
+                "requirement": "Preserve the API.",
+                "acceptance_criteria": ["Existing callers continue to work."],
+            },
+            {
+                "scope_item_id": "scope-tests",
+                "requirement": "Cover the behavior with tests.",
+                "acceptance_criteria": ["The focused regression test passes."],
+            },
+        ],
+        "coupling_constraints": [
+            {
+                "constraint_id": "couple-api-tests",
+                "scope_item_ids": ["scope-api", "scope-tests"],
+                "rationale": "The compatibility test must ship with the API change.",
+            }
+        ],
+        "child_stages": [],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "caveats": [],
+    }
+    if strategy == "one-shot":
+        recommendation["one_shot_delivery"] = {
+            "deliverables": ["API change and regression test."],
+            "acceptance_criteria": ["The API and focused test are complete."],
+            "covered_scope_item_ids": ["scope-api", "scope-tests"],
+        }
+    else:
+        recommendation["coupling_constraints"] = []
+        recommendation["child_stages"] = [
+            {
+                "stage_id": "stage-api",
+                "position": 1,
+                "title": "API change",
+                "summary": "Implement the compatibility-preserving API change.",
+                "deliverables": ["API implementation."],
+                "non_goals": [],
+                "acceptance_criteria": ["The API remains compatible."],
+                "depends_on_stage_ids": [],
+                "dependency_notes": "This is the first stage.",
+                "automation": "agent-pr",
+                "rollout_risk": "low",
+                "compatibility_constraints": ["Preserve existing callers."],
+                "covered_scope_item_ids": ["scope-api"],
+            },
+            {
+                "stage_id": "stage-tests",
+                "position": 2,
+                "title": "Regression coverage",
+                "summary": "Add the focused regression test.",
+                "deliverables": ["Regression test."],
+                "non_goals": [],
+                "acceptance_criteria": ["The focused regression test passes."],
+                "depends_on_stage_ids": ["stage-api"],
+                "dependency_notes": "Run after the API stage.",
+                "automation": "agent-pr",
+                "rollout_risk": "low",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-tests"],
+            },
+        ]
+    return {
+        "schema_version": 1,
+        "kind": "plan_state",
+        "state": "blocking",
+        "summary": "Execution strategy.",
+        "plan_steps": ["Implement the reviewed plan."],
+        "execution_strategy_contract_version": 1,
+        "execution_recommendation": recommendation,
+    }
+
+
+def _execution_plan_text(payload: dict) -> str:
+    payload = {
+        **payload,
+        "architecture_impact": dict(_DEFAULT_ARCHITECTURE_IMPACT),
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder"
+
+
+def test_generation_one_execution_strategy_accepts_one_shot_and_staged_shapes():
+    one_shot = validate_structured_plan_state(
+        _execution_plan_text(_execution_plan_payload()),
+        require_execution_strategy_contract=1,
+    )
+    staged = validate_structured_plan_state(
+        _execution_plan_text(_execution_plan_payload(strategy="staged")),
+        require_execution_strategy_contract=1,
+    )
+    assert one_shot.execution_recommendation.strategy == "one-shot"
+    assert staged.execution_recommendation.strategy == "staged"
+    assert [stage.stage_id for stage in staged.execution_recommendation.child_stages] == [
+        "stage-api", "stage-tests"
+    ]
+
+
+def test_generation_one_execution_strategy_rejects_missing_contract_and_mixed_legacy_children():
+    payload = _execution_plan_payload()
+    payload.pop("execution_strategy_contract_version")
+    payload.pop("execution_recommendation")
+    with pytest.raises(AgentLoopError, match="execution_strategy_contract_version"):
+        validate_structured_plan_state(
+            _execution_plan_text(payload), require_execution_strategy_contract=1
+        )
+
+    payload = _execution_plan_payload()
+    payload["child_stages"] = [{"title": "Legacy", "summary": "Must not mix."}]
+    with pytest.raises(AgentLoopError, match="cannot combine.*top-level legacy child_stages"):
+        validate_structured_plan_state(
+            _execution_plan_text(payload), require_execution_strategy_contract=1
+        )
+
+
+def test_generation_one_execution_strategy_rejects_split_coupling_and_duplicate_coverage():
+    payload = _execution_plan_payload(strategy="staged")
+    payload["execution_recommendation"]["coupling_constraints"] = [{
+        "constraint_id": "couple-api-tests",
+        "scope_item_ids": ["scope-api", "scope-tests"],
+        "rationale": "Keep together.",
+    }]
+    with pytest.raises(AgentLoopError, match="splits coupled"):
+        validate_structured_plan_state(
+            _execution_plan_text(payload), require_execution_strategy_contract=1
+        )
+
+    payload = _execution_plan_payload(strategy="one-shot")
+    payload["execution_recommendation"]["one_shot_delivery"]["covered_scope_item_ids"] = [
+        "scope-api", "scope-api"
+    ]
+    with pytest.raises(AgentLoopError, match="more than once"):
+        validate_structured_plan_state(
+            _execution_plan_text(payload), require_execution_strategy_contract=1
+        )
+
+
+def test_generation_one_identity_covers_complete_recommendation_content():
+    original = validate_structured_plan_state(
+        _execution_plan_text(_execution_plan_payload()),
+        require_execution_strategy_contract=1,
+    )
+    changed_payload = _execution_plan_payload()
+    changed_payload["execution_recommendation"]["rationale"] = (
+        "A materially different reviewed rationale."
+    )
+    changed = validate_structured_plan_state(
+        _execution_plan_text(changed_payload),
+        require_execution_strategy_contract=1,
+    )
+
+    assert original.execution_recommendation.identity() != changed.execution_recommendation.identity()
+
+
+def test_unversioned_plans_keep_explicit_legacy_typed_stages_materializable():
+    from coding_review_agent_loop.orchestrator import _extract_current_child_stages
+
+    payload = _execution_plan_payload()
+    payload.pop("execution_strategy_contract_version")
+    payload.pop("execution_recommendation")
+    payload["child_stages"] = [{"title": "Legacy split", "summary": "Existing explicit path."}]
+
+    stages = _extract_current_child_stages(_execution_plan_text(payload))
+
+    assert [(stage.title, stage.summary) for stage in stages] == [
+        ("Legacy split", "Existing explicit path.")
+    ]
 
 
 def test_validate_plan_revision_response_rejects_marker_only_markdown():

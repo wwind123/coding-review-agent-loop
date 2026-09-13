@@ -23,11 +23,13 @@ from coding_review_agent_loop.comment_rendering import (
     _render_prior_dispositions_section,
     _render_test_command_for_comment,
     decode_deferred_stages_marker,
+    decode_execution_recommendation_marker,
     normalize_freeform_signature,
     render_agent_unavailable_comment,
     render_deferred_stages_section,
     render_discuss_round_summary_comment,
     render_typed_plan_stages_section,
+    render_execution_recommendation_section,
 )
 from coding_review_agent_loop.protocol import (
     DiscussSynthesisConsensus,
@@ -80,8 +82,124 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_plan_revision,
     structured_plan_state,
+    structured_v1_plan_state,
     structured_pr_review,
 )
+
+
+def test_execution_recommendation_rendering_round_trips_with_all_review_fields_visible():
+    parsed = validate_structured_plan_state(
+        structured_v1_plan_state(), require_execution_strategy_contract=1
+    )
+    section = render_execution_recommendation_section(parsed.execution_recommendation)
+    marker = list(re.finditer(
+        r"<!--\s*AGENT_EXECUTION_RECOMMENDATION:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+        section,
+    ))[-1]
+
+    assert "`scope_items`" in section
+    assert "Implement the reviewed scope." in section
+    assert "The reviewed scope is complete." in section
+    assert "`one_shot_delivery`" in section
+    assert "`retained_parent_work`" in section
+    assert "`final_integration_work`" in section
+    assert "`caveats`" in section
+    assert decode_execution_recommendation_marker(marker.group("payload")) == (
+        parsed.execution_recommendation.to_payload()
+    )
+
+
+def test_staged_execution_recommendation_rendering_exposes_nested_stage_fields():
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    recommendation = payload["execution_recommendation"]
+    recommendation.pop("one_shot_delivery", None)
+    recommendation.update(
+        {
+            "strategy": "staged",
+            "staging_feasibility": "safe",
+            "scope_items": [
+                {
+                    "scope_item_id": "scope-api",
+                    "requirement": "Preserve the API.",
+                    "acceptance_criteria": ["Existing callers continue to work."],
+                },
+                {
+                    "scope_item_id": "scope-tests",
+                    "requirement": "Cover the behavior.",
+                    "acceptance_criteria": ["The focused test passes."],
+                },
+                {
+                    "scope_item_id": "scope-integration",
+                    "requirement": "Verify the integrated delivery.",
+                    "acceptance_criteria": ["The stages work together."],
+                },
+            ],
+            "child_stages": [
+                {
+                    "stage_id": "stage-api",
+                    "position": 1,
+                    "title": "API change",
+                    "summary": "Implement the compatibility-preserving API change.",
+                    "deliverables": ["API implementation."],
+                    "non_goals": ["No migration."],
+                    "acceptance_criteria": ["The API remains compatible."],
+                    "depends_on_stage_ids": [],
+                    "dependency_notes": "First stage.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "low",
+                    "compatibility_constraints": ["Preserve existing callers."],
+                    "covered_scope_item_ids": ["scope-api"],
+                },
+                {
+                    "stage_id": "stage-tests",
+                    "position": 2,
+                    "title": "Regression coverage",
+                    "summary": "Add the focused regression test.",
+                    "deliverables": ["Regression test."],
+                    "non_goals": [],
+                    "acceptance_criteria": ["The focused test passes."],
+                    "depends_on_stage_ids": ["stage-api"],
+                    "dependency_notes": "Run after the API stage.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "low",
+                    "compatibility_constraints": [],
+                    "covered_scope_item_ids": ["scope-tests"],
+                },
+            ],
+            "retained_parent_work": {
+                "status": "none",
+                "deliverables": [],
+                "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "final_integration_work": {
+                "status": "required",
+                "deliverables": ["Verify the integrated change."],
+                "acceptance_criteria": ["Both stages work together."],
+                "covered_scope_item_ids": ["scope-integration"],
+            },
+            "caveats": ["Roll out the API change gradually."],
+        }
+    )
+    parsed = validate_structured_plan_state(
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder",
+        require_execution_strategy_contract=1,
+    )
+    section = render_execution_recommendation_section(parsed.execution_recommendation)
+
+    for visible in (
+        "Preserve the API.",
+        "Existing callers continue to work.",
+        "API implementation.",
+        "No migration.",
+        "stage-api",
+        "stage-tests",
+        "Run after the API stage.",
+        "Preserve existing callers.",
+        "Verify the integrated change.",
+        "Roll out the API change gradually.",
+    ):
+        assert visible in section
 
 
 def test_managed_test_comment_hides_wrapper_plumbing_and_keeps_inner_command():

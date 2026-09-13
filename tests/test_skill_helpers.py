@@ -86,6 +86,33 @@ _VALID_PLAN_STATE = json.dumps({
     "state": "blocking",
     "summary": "Plan is ready for review.",
     "plan_steps": ["Step one"],
+    "execution_strategy_contract_version": 1,
+    "execution_recommendation": {
+        "strategy": "one-shot",
+        "rationale": "The dry-run work is one coherent boundary.",
+        "staging_feasibility": "inseparable",
+        "scope_items": [{
+            "scope_item_id": "scope-1",
+            "requirement": "Complete the planned work.",
+            "acceptance_criteria": ["The planned work is complete."],
+        }],
+        "coupling_constraints": [],
+        "one_shot_delivery": {
+            "deliverables": ["Completed work"],
+            "acceptance_criteria": ["The planned work is complete."],
+            "covered_scope_item_ids": ["scope-1"],
+        },
+        "child_stages": [],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "caveats": [],
+    },
     "architecture_impact": {
         "status": "unchanged",
         "rationale": "No architectural contract changed.",
@@ -124,6 +151,16 @@ class TestValidateResponse:
     def test_valid_plan_state_accepted(self) -> None:
         path = _write_tmp(_VALID_PLAN_STATE)
         result = _run("helpers.validate_response", "--file", path, "--kind", "plan_state")
+        assert "validation passed: plan_state" in result.stdout
+
+    def test_valid_plan_state_accepted_when_generation_one_is_required(self) -> None:
+        path = _write_tmp(_VALID_PLAN_STATE)
+        result = _run(
+            "helpers.validate_response",
+            "--file", path,
+            "--kind", "plan_state",
+            "--require-execution-strategy-contract",
+        )
         assert "validation passed: plan_state" in result.stdout
 
     def test_missing_plan_state_marker_rejected(self) -> None:
@@ -485,9 +522,10 @@ class TestStateManager:
 
             tagged = output_file.read_text(encoding="utf-8")
             assert "AGENT_LOOP_META" in tagged
+            assert "AGENT_EXECUTION_RECOMMENDATION" in tagged
 
             # Verify _resume_plan_round can reconstruct from this comment alone
-            from coding_review_agent_loop.round_state import _resume_plan_round
+            from coding_review_agent_loop.round_state import _plan_subject, _resume_plan_round
 
             class _FC:
                 def __init__(self, body: str) -> None:
@@ -498,6 +536,49 @@ class TestStateManager:
             assert result is not None, "build-resume could not find skill-posted coder round"
             _plan_text, resumed = result
             assert resumed.round_number == 1
+            assert resumed.coder_metadata.execution_strategy_contract_version == 1
+            assert resumed.coder_metadata.execution_strategy_identity["recommendation_sha256"]
+            assert resumed.coder_metadata.canonical_plan == _plan_text
+            assert resumed.coder_metadata.subject == _plan_subject(_plan_text)
+
+    def test_host_plan_rerun_reuses_canonical_subject(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unchanged raw host plan must resume instead of posting a new round."""
+        from helpers import skill_runner
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+        from coding_review_agent_loop.round_state import _plan_subject
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan_file = Path(tmpdir) / "plan.json"
+            plan_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            parsed = validate_structured_plan_state(
+                _VALID_PLAN_STATE, require_execution_strategy_contract=1
+            )
+            canonical = render_canonical_plan_state(parsed)
+            monkeypatch.setattr(
+                skill_runner,
+                "_run_helper_capture",
+                lambda *_args: subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="", stderr=""
+                ),
+            )
+            args = types.SimpleNamespace(issue=783, repo="OWNER/REPO")
+
+            first = skill_runner._run_host_coder_phase(args, plan_file, {}, True)
+            assert first["is_new_round"] is True
+            assert first["plan_text"] == canonical
+            assert first["plan_subject"] == _plan_subject(canonical)
+
+            resume = {
+                "current_plan_subject": first["plan_subject"],
+                "round_number": first["new_round_number"],
+                "prior_items": [],
+                "completed_reviewer_names": [],
+            }
+            second = skill_runner._run_host_coder_phase(args, plan_file, resume, True)
+            assert second["is_new_round"] is False
+            assert second["new_round_number"] == first["new_round_number"]
+            assert second["plan_subject"] == first["plan_subject"]
 
     def test_attach_metadata_persists_surfaced_reviewer_requirement_ids(self) -> None:
         requirement_id = "hr-" + "a" * 64
@@ -638,6 +719,41 @@ class TestStateManager:
             assert len(resumed.completed_reviews) == 1, (
                 f"Expected 1 completed reviewer (Codex), got {len(resumed.completed_reviews)}"
             )
+
+    def test_generation_one_resume_rejects_canonical_subject_mismatch(self) -> None:
+        from dataclasses import replace
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.round_state import (
+            _attach_round_metadata,
+            _extract_round_metadata_records,
+            _resume_plan_round,
+            _strip_round_metadata,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            body_file = Path(tmpdir) / "plan.md"
+            body_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            tagged_file = Path(tmpdir) / "tagged.md"
+            _run(
+                "helpers.state_manager", "attach-metadata",
+                "--body-file", str(body_file), "--output", str(tagged_file),
+                "--flow", "plan", "--role", "coder", "--agent", "Claude",
+                "--round-number", "1", "--state", "approved",
+                "--subject-plan-file", str(body_file),
+                "--canonical-plan-file", str(body_file),
+            )
+            tagged = tagged_file.read_text(encoding="utf-8")
+            record = _extract_round_metadata_records(
+                [types.SimpleNamespace(body=tagged)], flow="plan"
+            )[0]
+            bad_metadata = replace(record.metadata, subject="0" * 64)
+            bad_tagged = _attach_round_metadata(_strip_round_metadata(tagged), bad_metadata)
+
+            with pytest.raises(AgentLoopError, match="subject does not match"):
+                _resume_plan_round(
+                    [types.SimpleNamespace(body=bad_tagged)],
+                    configured_reviewers=["codex"],
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -3170,9 +3286,8 @@ class TestRetryValidateCoder:
             assert match is not None
             assert tagged[: match.start()].startswith("## Plan\n")
             assert "Plan is ready for review." in tagged[: match.start()]
-            assert tagged[match.end() :].strip().startswith(
-                "<!-- AGENT_PLAN_STATE: blocking -->"
-            )
+            assert "<!-- AGENT_EXECUTION_RECOMMENDATION:" in tagged[match.end() :]
+            assert "<!-- AGENT_PLAN_STATE: blocking -->" in tagged[match.end() :]
 
     def test_retry_validate_coder_invalid_plan_state_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

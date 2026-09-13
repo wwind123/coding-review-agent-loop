@@ -60,6 +60,11 @@ def main() -> None:
         default="",
         help="Model the agent actually ran, stamped into the signature (#332).",
     )
+    parser.add_argument(
+        "--require-execution-strategy-contract",
+        action="store_true",
+        help="Require the generation-1 execution strategy contract for plan responses.",
+    )
     args = parser.parse_args()
     model_used = args.model or None
 
@@ -135,7 +140,12 @@ def main() -> None:
                 model_used=model_used,
             )
         elif args.kind == "plan_revision":
-            parsed = validate_structured_plan_revision(text)
+            parsed = validate_structured_plan_revision(
+                text,
+                require_execution_strategy_contract=(
+                    1 if args.require_execution_strategy_contract else 0
+                ),
+            )
             if parsed is None:
                 print("render_response: plan_revision did not parse", file=sys.stderr)
                 sys.exit(1)
@@ -148,7 +158,12 @@ def main() -> None:
                 model_used=model_used,
             )
         elif args.kind == "plan_state":
-            parsed = validate_structured_plan_state(text)
+            parsed = validate_structured_plan_state(
+                text,
+                require_execution_strategy_contract=(
+                    1 if args.require_execution_strategy_contract else 0
+                ),
+            )
             if parsed is None:
                 rendered = text
             else:

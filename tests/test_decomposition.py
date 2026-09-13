@@ -21,7 +21,9 @@ from coding_review_agent_loop.decomposition import (
     phase_identity,
     parse_plan_decomposition,
     create_decomposition_child_issues,
+    adapt_typed_child_stages,
 )
+from coding_review_agent_loop.protocol import ExecutionChildStage
 from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.child_topology import NeedsHumanDecision
 from coding_review_agent_loop.orchestrator import PostedRoundMetadata, _attach_round_metadata, _plan_subject
@@ -68,6 +70,29 @@ def test_parse_plan_decomposition_accepts_agent_and_human_phases():
     ]
     assert parsed.phases[1].automation == "human-action"
     assert parsed.phases[1].depends_on == ("Internal schema utilities",)
+
+
+def test_legacy_typed_adapter_rejects_reviewed_generation_one_children():
+    stage = ExecutionChildStage(
+        stage_id="stage-1",
+        position=1,
+        title="Reviewed stage",
+        summary="Audit-only recommendation stage.",
+        deliverables=("A deliverable.",),
+        non_goals=(),
+        acceptance_criteria=("The stage is complete.",),
+        depends_on_stage_ids=(),
+        dependency_notes="No dependencies.",
+        automation="agent-pr",
+        rollout_risk="low",
+        compatibility_constraints=(),
+        covered_scope_item_ids=("scope-1",),
+    )
+
+    with pytest.raises(AgentLoopError, match="cannot reach the legacy typed-stage adapter"):
+        adapt_typed_child_stages(
+            (stage,), approved_plan="Approved plan.", plan_subject="subject"
+        )
 
 
 def test_fresh_plan_decomposition_requires_architecture_impact():

@@ -97,6 +97,7 @@ def validate_response_text(
     current_round_items: list[object] | tuple[object, ...] = (),
     human_requirements: list[object] | tuple[object, ...] = (),
     required_architecture_impact_contract: int = 0,
+    require_execution_strategy_contract: int = 0,
 ) -> object:
     """Validate response text with the same context used by the helper CLI.
 
@@ -142,6 +143,7 @@ def validate_response_text(
         parsed = validate_structured_plan_state(
             text,
             required_architecture_impact_contract=required_architecture_impact_contract,
+            require_execution_strategy_contract=require_execution_strategy_contract,
         )
         if parsed is None:
             if required_architecture_impact_contract == 1:
@@ -196,6 +198,7 @@ def validate_response_text(
     parsed = validate_structured_plan_revision(
         text,
         required_architecture_impact_contract=required_architecture_impact_contract,
+        require_execution_strategy_contract=require_execution_strategy_contract,
     )
     if parsed is None:
         raise AgentLoopError("Response did not parse as a structured plan_revision.")
@@ -230,6 +233,11 @@ def main() -> None:
         default=None,
         help="Optional JSON file with reviewer identity and prior item context.",
     )
+    parser.add_argument(
+        "--require-execution-strategy-contract",
+        action="store_true",
+        help="Require the fresh generation-1 planning execution recommendation.",
+    )
     args = parser.parse_args()
 
     try:
@@ -254,6 +262,9 @@ def main() -> None:
             prior_items=prior_items,
             current_round_items=current_round_items,
             human_requirements=human_requirements,
+            require_execution_strategy_contract=(
+                1 if args.require_execution_strategy_contract else 0
+            ),
         )
     except AgentLoopError as exc:
         print(f"validation failed: {kind}: {exc}", file=sys.stderr)

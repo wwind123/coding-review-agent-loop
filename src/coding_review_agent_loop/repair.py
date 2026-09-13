@@ -31,7 +31,9 @@ from .protocol import (
     PLAN_STATE_RE,
     STATE_RE,
     parse_human_requirements_acknowledgement,
+    parse_execution_recommendation_payload,
 )
+from .errors import FreshContractIntegrityError
 
 _logger = logging.getLogger(__name__)
 
@@ -100,7 +102,13 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
 
     stripped = raw.lstrip()
     if not stripped.startswith("{"):
-        return None
+        # Deterministic recovery for the common JSON-fence/leading-envelope
+        # shape. The source object is still parsed and validated below; this
+        # only removes material outside the structured response.
+        brace_index = stripped.find("{")
+        if brace_index < 0:
+            return None
+        stripped = stripped[brace_index:]
     try:
         payload, json_end = json.JSONDecoder().raw_decode(stripped)
     except json.JSONDecodeError:
@@ -115,7 +123,11 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
     if state_match is None:
         return None
 
-    before_footer = trailing[: state_match.start()]
+    before_footer = re.sub(
+        r"(?im)^\s*(?:`{3,}|~{3,})(?:json)?\s*$\n?",
+        "",
+        trailing[: state_match.start()],
+    )
     after_footer_raw = trailing[state_match.end() :]
     footer = trailing[state_match.start() : state_match.end()].strip()
 
@@ -221,6 +233,8 @@ You are a format-repair assistant. An AI agent produced an initial plan state, c
 {reviewer_human_requirements_instruction}
 
 {prior_item_dispositions_instruction}
+
+{fresh_contract_instruction}
 
 ## LOSSLESS CONTENT CONTRACT (all response kinds):
 
@@ -1143,12 +1157,13 @@ _SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_fo
 RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
+    "fresh_contract_integrity",
 ]
 
 
 @dataclass
 class RepairAttemptResult:
-    backend: Literal["antigravity", "gemini", "codex", "claude"]
+    backend: Literal["none", "antigravity", "gemini", "codex", "claude"]
     model: str
     prompt: str
     output: str
@@ -1200,6 +1215,7 @@ def _build_repair_prompt(
     allowed_prior_item_ids: Sequence[str] | None = None,
     unknown_prior_item_ids: Sequence[str] | None = None,
     same_round_context: str | None = None,
+    require_execution_strategy_contract: bool = False,
 ) -> str:
     if expected_kind is not None and expected_kind not in _SUPPORTED_EXPECTED_KINDS:
         raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
@@ -1246,6 +1262,13 @@ def _build_repair_prompt(
         if expected_kind is not None
         else "## Expected response kind:\nNo expected response kind was provided; choose from the format-selection rules.\n"
     )
+    fresh_contract_instruction = (
+        "This is a fresh generation-1 planning response. Preserve the complete, mechanically "
+        "recovered execution_strategy_contract_version and execution_recommendation exactly; "
+        "do not invent, summarize, reorder, or fill missing strategy, scope, allocation, or "
+        "topology data.\n"
+        if require_execution_strategy_contract else ""
+    )
     prompt = _REPAIR_PROMPT.replace("{expected_kind_instruction}", expected_kind_instruction, 1)
     replacements = (
         ("{issue_implementation_instruction}", issue_implementation_instruction),
@@ -1254,6 +1277,7 @@ def _build_repair_prompt(
         ("{planning_human_requirements_instruction}", planning_human_requirements_instruction),
         ("{reviewer_human_requirements_instruction}", reviewer_human_requirements_instr),
         ("{prior_item_dispositions_instruction}", prior_item_dispositions_instruction),
+        ("{fresh_contract_instruction}", fresh_contract_instruction),
         ("{raw_response}", raw),
     )
     for placeholder, value in replacements:
@@ -1293,6 +1317,34 @@ def _issue_implementation_instruction(
         + " A positive PR with a blocked disposition remains a terminal conflict after repair; "
         "do not relabel or silently remove that blocker.\n"
     )
+
+
+def require_recoverable_fresh_execution_contract(raw: str, *, expected_kind: str) -> None:
+    """Reject repair when the source cannot prove the reviewed v1 topology."""
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
+    except json.JSONDecodeError as exc:
+        raise FreshContractIntegrityError(
+            "Fresh planning response is not mechanically recoverable: its JSON source "
+            "cannot be parsed; start a new planner turn."
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("kind") != expected_kind:
+        raise FreshContractIntegrityError(
+            "Fresh planning response is not mechanically recoverable: expected the "
+            f"`{expected_kind}` source envelope; start a new planner turn."
+        )
+    if payload.get("execution_strategy_contract_version") != 1 or "execution_recommendation" not in payload:
+        raise FreshContractIntegrityError(
+            "Fresh planning response is not mechanically recoverable: the complete "
+            "generation-1 execution recommendation is absent; start a new planner turn."
+        )
+    try:
+        parse_execution_recommendation_payload(payload["execution_recommendation"])
+    except Exception as exc:
+        raise FreshContractIntegrityError(
+            "Fresh planning response is not mechanically recoverable: its execution "
+            "recommendation is incomplete or inconsistent; start a new planner turn."
+        ) from exc
 
 
 def execute_repair(
@@ -1682,6 +1734,7 @@ def attempt_repair(
     allowed_prior_item_ids: Sequence[str] | None = None,
     unknown_prior_item_ids: Sequence[str] | None = None,
     same_round_context: str | None = None,
+    require_execution_strategy_contract: bool = False,
 ) -> str | None:
     """Call gemini-3.1-flash-lite via the Gemini CLI to reformat a malformed review response.
 
@@ -1699,6 +1752,7 @@ def attempt_repair(
         allowed_prior_item_ids=allowed_prior_item_ids,
         unknown_prior_item_ids=unknown_prior_item_ids,
         same_round_context=same_round_context,
+        require_execution_strategy_contract=require_execution_strategy_contract,
     )
     try:
         oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES

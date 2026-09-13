@@ -113,7 +113,11 @@ from coding_review_agent_loop.config import (
     ensure_temp_checkout,
     sync_checkout_to_pr,
 )
-from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
+from coding_review_agent_loop.errors import (
+    AgentLoopError,
+    FreshContractIntegrityError,
+    UnknownPriorItemDispositionError,
+)
 from coding_review_agent_loop.decomposition import (
     PHASE_IDENTITY_MARKER_RE,
     _decode_json_payload,
@@ -176,6 +180,7 @@ from coding_review_agent_loop.unresolved_items import (
 from coding_review_agent_loop.repair import (
     attempt_envelope_normalization,
     attempt_repair,
+    require_recoverable_fresh_execution_contract,
     strip_unknown_prior_item_dispositions,
 )
 from helpers.validate_response import _deserialize_human_requirements, validate_response_text
@@ -463,11 +468,26 @@ def _recover_structured_response(
     response_evidence: dict[str, object] | None = None,
     gemini_cmd: str = "gemini",
     reviewer_normalization: bool = False,
+    require_execution_strategy_contract: bool = False,
 ) -> tuple[str, object]:
     """Run deterministic-to-Gemini recovery without mutating the saved raw artifact."""
     candidate = original_text
     if reviewer_normalization:
         candidate = _normalize_disposition_values(_normalize_raw_response(candidate))
+
+    # Normalize only deterministic envelope material before checking fresh
+    # planning provenance. This permits a complete reviewed object in a JSON
+    # fence while still refusing absent or partial recommendations before any
+    # model-backed repair can invent topology.
+    if require_execution_strategy_contract and expected_kind in {"plan_state", "plan_revision"}:
+        normalized_source = attempt_envelope_normalization(
+            candidate, expected_kind=expected_kind
+        )
+        if normalized_source is not None:
+            candidate = normalized_source
+        require_recoverable_fresh_execution_contract(
+            candidate, expected_kind=expected_kind
+        )
 
     try:
         return candidate, validate(candidate)
@@ -1976,6 +1996,11 @@ def _complete_reviewer_turn(
             raw_text = _normalize_disposition_values(_normalize_raw_response(raw_text))
             validate(raw_text)
         raw_output.write_text(raw_text, encoding="utf-8")
+    except FreshContractIntegrityError:
+        # The source cannot prove a reviewed v1 topology.  Keep the raw repair
+        # artifact, but do not route it through retry-validate: the next skill
+        # invocation must obtain a fresh planner response.
+        raise
     except (AgentLoopError, ValueError) as exc:
         raise _ValidationError(
             f"skill_runner: {agent} review validation failed: {exc}\n"
@@ -2547,6 +2572,8 @@ def _save_coder_raw_to_repair_dir(
     response_evidence_file: Path | None = None,
     architecture_identity: dict | None = None,
     architecture_contract_version: int | None = None,
+    execution_strategy_contract_version: int | None = None,
+    execution_strategy_contract_required: bool = False,
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy the coder's raw response + context to a stable repair dir.
@@ -2573,6 +2600,10 @@ def _save_coder_raw_to_repair_dir(
         manifest["architecture_identity"] = architecture_identity
     if architecture_contract_version is not None:
         manifest["architecture_contract_version"] = architecture_contract_version
+    if execution_strategy_contract_version is not None:
+        manifest["execution_strategy_contract_version"] = execution_strategy_contract_version
+    if execution_strategy_contract_required:
+        manifest["execution_strategy_contract_required"] = True
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -2596,6 +2627,7 @@ def _complete_coder_turn(
     surfaced_requirement_ids: Sequence[str] = (),
     requires_direct_discussion_ack: bool = False,
     required_architecture_impact_contract: int = 0,
+    require_execution_strategy_contract: int = 0,
     architecture_identity: dict | None = None,
     architecture_contract_version: int | None = None,
 ) -> dict:
@@ -2615,6 +2647,7 @@ def _complete_coder_turn(
             kind=kind,
             prior_items=next_prior_items_raw,
             required_architecture_impact_contract=required_architecture_impact_contract,
+            require_execution_strategy_contract=require_execution_strategy_contract,
         )
         if kind == "plan_revision" and (
             surfaced_requirement_ids or requires_direct_discussion_ack
@@ -2630,7 +2663,7 @@ def _complete_coder_turn(
             )
         return parsed
     try:
-        if auto_recover and kind == "plan_revision":
+        if auto_recover and kind in {"plan_state", "plan_revision"}:
             raw_text, _ = _recover_structured_response(
                 raw_text,
                 expected_kind=kind,
@@ -2644,11 +2677,18 @@ def _complete_coder_turn(
                 requires_direct_discussion_ack=requires_direct_discussion_ack,
                 response_evidence=response_evidence,
                 gemini_cmd=gemini_cmd,
+                require_execution_strategy_contract=bool(
+                    require_execution_strategy_contract
+                ),
             )
             validated_result = validate(raw_text)
         else:
             validated_result = validate(raw_text)
         raw_output.write_text(raw_text, encoding="utf-8")
+    except FreshContractIntegrityError:
+        # Preserve the dedicated outcome so the caller can request a fresh
+        # planner turn instead of suggesting format repair for unproven data.
+        raise
     except (AgentLoopError, ValueError) as exc:
         raise _ValidationError(
             f"skill_runner: {coder_cap} {kind} validation failed: {exc}\n"
@@ -2660,9 +2700,15 @@ def _complete_coder_turn(
 
     if kind == "plan_state":
         canonical_text = raw_text
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
         from coding_review_agent_loop.protocol import validate_structured_plan_state
 
-        parsed_plan = validate_structured_plan_state(raw_text)
+        parsed_plan = validate_structured_plan_state(
+            raw_text,
+            require_execution_strategy_contract=require_execution_strategy_contract,
+        )
+        if parsed_plan is not None and parsed_plan.execution_recommendation is not None:
+            canonical_text = render_canonical_plan_state(parsed_plan)
         if parsed_plan is None:
             public_file = raw_output
         else:
@@ -2674,6 +2720,11 @@ def _complete_coder_turn(
                 "--kind", "plan_state",
                 "--reviewer", coder_cap,
                 "--output", str(public_file),
+                *(
+                    ["--require-execution-strategy-contract"]
+                    if require_execution_strategy_contract
+                    else []
+                ),
                 *(["--model", coder_model] if coder_model else []),
             )
             raw_structured_file = work_dir / "coder-raw-structured.json"
@@ -2683,7 +2734,10 @@ def _complete_coder_turn(
         from coding_review_agent_loop.comment_rendering import render_canonical_plan_revision
         from coding_review_agent_loop.protocol import validate_structured_plan_revision
 
-        parsed = validate_structured_plan_revision(raw_text)
+        parsed = validate_structured_plan_revision(
+            raw_text,
+            require_execution_strategy_contract=require_execution_strategy_contract,
+        )
         if parsed is None:
             raise _ValidationError(
                 f"skill_runner: {coder_cap} plan_revision did not parse\n"
@@ -2705,6 +2759,11 @@ def _complete_coder_turn(
             "--reviewer", coder_cap,
             "--context-file", str(render_context_file),
             "--output", str(public_file),
+            *(
+                ["--require-execution-strategy-contract"]
+                if require_execution_strategy_contract
+                else []
+            ),
             *(["--model", coder_model] if coder_model else []),
         )
         raw_structured_file = work_dir / "coder-raw-structured.json"
@@ -2747,6 +2806,10 @@ def _complete_coder_turn(
         ("--architecture-contract-version", str(contract_version))
         if contract_version is not None else ()
     )
+    execution_contract_args = (
+        ("--execution-strategy-contract-version", "1")
+        if require_execution_strategy_contract == 1 else ()
+    )
     _run_helper(
         "helpers.state_manager", "attach-metadata",
         "--body-file", str(public_file),
@@ -2763,6 +2826,7 @@ def _complete_coder_turn(
         *usage_args,
         *architecture_args,
         *contract_args,
+        *execution_contract_args,
     )
 
     if not dry_run:
@@ -2942,6 +3006,7 @@ def _run_external_coder_phase(
                 if hasattr(coder_architecture, "identity") else None
             ),
             architecture_contract_version=1,
+            execution_strategy_contract_required=True,
             gemini_cmd=gemini_cmd,
         )
 
@@ -2963,12 +3028,24 @@ def _run_external_coder_phase(
                 surfaced_requirement_ids=human_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
                 required_architecture_impact_contract=1,
+                require_execution_strategy_contract=1,
                 architecture_identity=(
                     coder_architecture.identity()
                     if hasattr(coder_architecture, "identity") else None
                 ),
                 architecture_contract_version=1,
             )
+        except FreshContractIntegrityError as exc:
+            print(
+                f"skill_runner: fresh planning contract integrity failure: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                "skill_runner: raw response was retained for diagnostics; do not run "
+                "retry-validate. Re-run run-plan-round to start a fresh planner turn.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
             dry_run_flag = " --dry-run" if dry_run else ""
@@ -3328,8 +3405,28 @@ def _run_host_coder_phase(
     issue: int = args.issue
     repo: str = args.repo
 
-    # New-round vs resume detection
-    plan_subject = _plan_subject_of_file(plan_file)
+    # New-round vs resume detection must use the same canonical plan text that
+    # attach-metadata persists. Host plan files are structured JSON, while the
+    # round record stores the deterministic markdown rendering; hashing the
+    # source file here would fork an unchanged plan on every invocation.
+    raw_plan_text = plan_file.read_text(encoding="utf-8")
+    canonical_plan_text = raw_plan_text
+    try:
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        parsed_plan = validate_structured_plan_state(
+            raw_plan_text,
+            require_execution_strategy_contract=1,
+        )
+        if parsed_plan is not None:
+            canonical_plan_text = render_canonical_plan_state(parsed_plan)
+    except (AgentLoopError, ValueError, TypeError):
+        # The normal validation command below remains the authoritative
+        # diagnostic for an invalid host plan. Keep the raw text here so a
+        # failed first invocation is not hidden by subject preparation.
+        canonical_plan_text = raw_plan_text
+    plan_subject = _plan_subject(canonical_plan_text)
     current_plan_subject = resume.get("current_plan_subject")
     is_new_round = current_plan_subject != plan_subject
 
@@ -3355,6 +3452,7 @@ def _run_host_coder_phase(
             "helpers.validate_response",
             "--file", str(plan_file),
             "--kind", "plan_state",
+            "--require-execution-strategy-contract",
         )
         if result.returncode != 0:
             print(f"skill_runner: plan validation failed: {result.stderr.strip()}", file=sys.stderr)
@@ -3379,6 +3477,7 @@ def _run_host_coder_phase(
                     "--subject-plan-file", str(plan_file),
                     "--canonical-plan-file", str(plan_file),
                     "--prior-items-file", str(prior_items_file),
+                    "--execution-strategy-contract-version", "1",
                 )
                 _run_helper(
                     "helpers.state_manager", "write-pending-comment",
@@ -3397,7 +3496,7 @@ def _run_host_coder_phase(
             print(f"[dry-run] would post plan for {repo}#{issue} (round {new_round_number})")
 
     return {
-        "plan_text": plan_file.read_text(encoding="utf-8"),
+        "plan_text": canonical_plan_text,
         "plan_subject": plan_subject,
         "new_round_number": new_round_number,
         "next_prior_items_raw": next_prior_items_raw,
@@ -4035,7 +4134,20 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                 required_architecture_impact_contract=(
                     1 if manifest.get("architecture_contract_version") == 1 else 0
                 ),
+                require_execution_strategy_contract=(
+                    1
+                    if manifest.get("execution_strategy_contract_required")
+                    or manifest.get("execution_strategy_contract_version") == 1
+                    else 0
+                ),
             )
+        except FreshContractIntegrityError as exc:
+            print(
+                f"skill_runner: fresh planning contract integrity failure: {exc}; "
+                "start a fresh planner turn instead of retry-validate.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
             sys.exit(1)
@@ -5299,7 +5411,8 @@ def _run_decomposition_for_skill(
             parsed_plan = None
         typed_stages = (
             parsed_plan.typed_stages.child_stages
-            if parsed_plan is not None and mode == "decompose-only"
+            if parsed_plan is not None
+            and mode == "decompose-only"
             else ()
         )
         if typed_stages:

@@ -1635,6 +1635,81 @@ Structured responses must start with one top-level JSON object, place the
 `AGENT_PLAN_STATE` footer immediately after that payload, and end with only
 your standalone signature. Do not include prose or code fences before the JSON
 object.
+""" + "\n" + _execution_strategy_review_guidance()
+
+
+def _execution_strategy_review_guidance() -> str:
+    return """
+For a generation-1 plan, review the complete execution recommendation rather
+than treating its child stages as executable instructions. Check staging
+feasibility, exact scope ownership, coupled work, earlier-only dependencies,
+automation class, rollout risk, compatibility and migration/recovery
+constraints, retained-parent work, final integration, caveats, security
+boundaries, and meaningful test combinations. Reject missing, duplicated,
+unknown, uncovered, or split scope IDs and any mismatch between strategy and
+conditional delivery fields. This recommendation does not select the current
+execution mode or change issue count in Stage 1.
+"""
+
+
+def _execution_strategy_contract_guidance() -> str:
+    """Shared generation-1 planning contract for full and compact prompts."""
+    return """
+Every newly invoked `plan_state` and `plan_revision` must include
+`execution_strategy_contract_version`: `1` and a complete
+`execution_recommendation`. Historical unversioned records are legacy-undecided
+and must not be upgraded by inference. The recommendation contains stable scope
+items, coupling constraints, conditional one-shot delivery, enriched child
+stages, retained-parent and final-integration allocations, and caveats.
+
+Its exact required keys are `strategy`, `rationale`, `staging_feasibility`,
+`scope_items`, `coupling_constraints`, `child_stages`,
+`retained_parent_work`, `final_integration_work`, and `caveats`, plus
+`one_shot_delivery` only for one-shot. Scope items are exactly
+`{scope_item_id, requirement, acceptance_criteria}`. Coupling entries are
+exactly `{constraint_id, scope_item_ids, rationale}`. Allocations are exactly
+`{status, deliverables, acceptance_criteria, covered_scope_item_ids}`; child
+stages are exactly `{stage_id, position, title, summary, deliverables,
+non_goals, acceptance_criteria, depends_on_stage_ids, dependency_notes,
+automation, rollout_risk, compatibility_constraints, covered_scope_item_ids}`.
+
+For one-shot, set `child_stages` to an empty array, use a delivery covering
+every scope-item ID exactly once, and set retained-parent and final-integration
+work to `none`.
+`staging_feasibility` may be `inseparable`. For staged, omit one-shot delivery,
+use safe feasibility, order dependencies by earlier stage position, allocate
+every scope item exactly once across children and required retained/final work,
+keep coupling groups together, and provide at least two real allocations. A
+single child with no retained or final work is invalid; recommend one-shot.
+`none` allocations have three empty arrays; `required` allocations have all
+three arrays non-empty. Automation is exactly `agent-pr`, `human-action`, or
+`manual-close`. Preserve issue references and tracker actions in existing
+non-child typed categories. Do not include non-empty top-level legacy
+`child_stages` in a v1 response: a versioned response has exactly one
+reviewed topology. The enriched v1 stages under `execution_recommendation`
+are review/audit data only in this phase, and historical unversioned
+`child_stages` remain the only legacy materialization input.
+
+Minimal valid one-shot example (the recommendation is complete even when the
+legacy typed categories are omitted):
+
+```json
+{
+  "execution_strategy_contract_version": 1,
+  "execution_recommendation": {
+    "strategy": "one-shot",
+    "rationale": "The coupled deliverables must ship together.",
+    "staging_feasibility": "inseparable",
+    "scope_items": [{"scope_item_id": "scope-1", "requirement": "Deliver the request.", "acceptance_criteria": ["The request is complete."]}],
+    "coupling_constraints": [],
+    "one_shot_delivery": {"deliverables": ["Complete implementation"], "acceptance_criteria": ["The implementation passes its focused tests."], "covered_scope_item_ids": ["scope-1"]},
+    "child_stages": [],
+    "retained_parent_work": {"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []},
+    "final_integration_work": {"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []},
+    "caveats": []
+  }
+}
+```
 """
 
 
@@ -1670,9 +1745,20 @@ Use this mandatory structured JSON response format:
     "Normalize structured plan rendering and metadata-backed resume behavior in `src/coding_review_agent_loop/orchestrator.py`.",
     "Extend prompts and targeted tests for structured planning flows."
   ],
-  "child_stages": [
-    {"title": "New implementation stage", "summary": "Bounded work eligible for a new child issue."}
-  ],
+  "execution_strategy_contract_version": 1,
+  "execution_recommendation": {
+    "strategy": "one-shot",
+    "rationale": "The coupled deliverables must ship together.",
+    "staging_feasibility": "inseparable",
+    "scope_items": [{"scope_item_id": "scope-1", "requirement": "Deliver the request.", "acceptance_criteria": ["The request is complete."]}],
+    "coupling_constraints": [],
+    "one_shot_delivery": {"deliverables": ["Complete implementation"], "acceptance_criteria": ["The implementation passes its focused tests."], "covered_scope_item_ids": ["scope-1"]},
+    "child_stages": [],
+    "retained_parent_work": {"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []},
+    "final_integration_work": {"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []},
+    "caveats": []
+  },
+  "child_stages": [],
   "external_dependencies": [{"title": "#481", "summary": "Existing issue to link, never create."}],
   "deferred_work": [{"title": "Future work", "summary": "Recorded only."}],
   "plan_actions": [{"title": "Post-approval materialization", "summary": "Tracker action, never an issue."}],
@@ -1681,12 +1767,17 @@ Use this mandatory structured JSON response format:
 <!-- AGENT_PLAN_STATE: blocking -->
 -- coder signature shown in the volatile tail
 
-If the plan intentionally narrows scope (mentions a later stage, follow-up
-issue, or explicitly out-of-scope work), declare EVERY such stage in the
-typed categories instead of overloading `deferred_stages`: only `child_stages`
-are eligible for filing. Put existing `#N`, issue URLs, or `owner/repo#N`
-references in `external_dependencies`; use `deferred_work` and `plan_actions`
-for record-only entries. Legacy `deferred_stages` remains record-only.
+If an unversioned historical plan intentionally narrows scope (mentions a
+later stage, follow-up issue, or explicitly out-of-scope work), declare EVERY
+such stage in the legacy typed categories instead of overloading
+`deferred_stages`: only historical top-level `child_stages` are eligible for
+filing. Put existing `#N`, issue URLs, or `owner/repo#N` references in
+`external_dependencies`; use `deferred_work` and `plan_actions` for record-only
+entries. Legacy `deferred_stages` remains record-only. A fresh generation-1
+plan must put reviewed delivery stages only under
+`execution_recommendation.child_stages`; those stages are audit-only in this
+phase, while record-only entries still use `external_dependencies`,
+`deferred_work`, and `plan_actions`.
 
 The orchestrator will normalize structured plan revisions into canonical
 markdown for stored plan state, reviewer prompts, subject hashing, and resume.
@@ -1697,7 +1788,7 @@ after the JSON object and before the `AGENT_PLAN_STATE` footer. Otherwise, put
 the `AGENT_PLAN_STATE` footer immediately after the JSON. Make the footer state
 match the JSON state, and include only your standalone signature after the
 footer.
-"""
+""" + "\n" + _execution_strategy_contract_guidance()
 
 
 def _compact_plan_stable_prefix(
@@ -1955,12 +2046,27 @@ branch, commit, push, or open a pull request during this planning stage.
 For a plan (rather than a clarification), respond with exactly one structured JSON
 `plan_state` object. It must have this complete contract:
 
+{_execution_strategy_contract_guidance()}
+
 {{
   "schema_version": 1,
   "kind": "plan_state",
   "state": "blocking",
   "summary": "<non-empty concise implementation summary>",
   "plan_steps": ["<non-empty step>"],
+  "execution_strategy_contract_version": 1,
+  "execution_recommendation": {{
+    "strategy": "one-shot",
+    "rationale": "The coupled deliverables must ship together.",
+    "staging_feasibility": "inseparable",
+    "scope_items": [{{"scope_item_id": "scope-1", "requirement": "Deliver the request.", "acceptance_criteria": ["The request is complete."]}}],
+    "coupling_constraints": [],
+    "one_shot_delivery": {{"deliverables": ["Complete implementation"], "acceptance_criteria": ["The implementation passes its focused tests."], "covered_scope_item_ids": ["scope-1"]}},
+    "child_stages": [],
+    "retained_parent_work": {{"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []}},
+    "final_integration_work": {{"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []}},
+    "caveats": []
+  }},
   "additional_closing_issue_ids": [],
   "human_requirement_dispositions": [],
   "architecture_impact": {{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}
@@ -1975,10 +2081,14 @@ dependencies, staged parents, unselected stages, deferred work, or plan actions.
 Absence means no declaration; an explicit empty array means no additional issue.
 When signed requirements are surfaced, the disposition array must contain every
 generated surfaced requirement label exactly once; when none are surfaced, it must be empty.
-Use the optional typed `child_stages`, `external_dependencies`, `deferred_work`,
+For an unversioned historical response, use the optional typed `child_stages`, `external_dependencies`, `deferred_work`,
 and `plan_actions` arrays (each has non-empty `title` and `summary` strings).
-Only `child_stages` may be materialized; existing issue references belong in
-`external_dependencies`, not a child title or summary.
+Only historical top-level
+`child_stages` may be materialized; existing issue references belong in
+`external_dependencies`, not a child title or summary. For every fresh
+generation-1 response, put reviewed delivery stages under
+`execution_recommendation.child_stages` and leave top-level legacy
+`child_stages` empty; those v1 stages are audit-only in this phase.
 Do not substitute a generic `implementation_plan` object or markdown plan for this
 schema. If signed human-requirements acknowledgement is required, put its
 `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` marker and `### Human requirements` section
@@ -2385,6 +2495,8 @@ current-round refinements.
 
 Use this mandatory structured JSON response format:
 
+{_execution_strategy_contract_guidance()}
+
 {{
   "schema_version": 1,
   "kind": "plan_revision",
@@ -2398,6 +2510,19 @@ Use this mandatory structured JSON response format:
     "Normalize structured plan rendering and metadata-backed resume behavior in `src/coding_review_agent_loop/orchestrator.py`.",
     "Extend prompts and targeted tests for structured planning flows."
   ],
+  "execution_strategy_contract_version": 1,
+  "execution_recommendation": {{
+    "strategy": "one-shot",
+    "rationale": "The coupled deliverables must ship together.",
+    "staging_feasibility": "inseparable",
+    "scope_items": [{{"scope_item_id": "scope-1", "requirement": "Deliver the request.", "acceptance_criteria": ["The request is complete."]}}],
+    "coupling_constraints": [],
+    "one_shot_delivery": {{"deliverables": ["Complete implementation"], "acceptance_criteria": ["The implementation passes its focused tests."], "covered_scope_item_ids": ["scope-1"]}},
+    "child_stages": [],
+    "retained_parent_work": {{"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []}},
+    "final_integration_work": {{"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []}},
+    "caveats": []
+  }},
   "additional_closing_issue_ids": [],
   "architecture_impact": {{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}
 }}

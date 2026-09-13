@@ -14,6 +14,10 @@ from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .errors import AgentLoopError
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, encode_mapping, hydrate_mapping
+from .comment_rendering import (
+    EXECUTION_RECOMMENDATION_MARKER_RE,
+    decode_execution_recommendation_marker,
+)
 from .local_test_evidence import canonicalize_bounded_evidence
 from .protocol_markers import TrustedBody, scan_reserved_markers
 from .workdir_guard import validate_checkout_inspected_evidence
@@ -145,10 +149,21 @@ class PostedRoundMetadata:
     architecture_identity: dict | None = None
     architecture_impact: dict | None = None
     architecture_contract_version: int | None = None
+    # Planning generation discriminator.  Absent is intentionally legacy
+    # undecided; generation 1 is required to resume a fresh recommendation.
+    execution_strategy_contract_version: int | None = None
+    execution_strategy_identity: dict | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
+        if self.execution_strategy_contract_version not in (None, 1):
+            raise ValueError("invalid execution strategy contract version")
+        if (
+            self.execution_strategy_identity is not None
+            and not isinstance(self.execution_strategy_identity, dict)
+        ):
+            raise ValueError("invalid execution strategy identity")
         # Programmatically-created scheduler checkpoints (including tests and
         # callers that have not round-tripped through the transport) are valid
         # when they carry scheduler fields. Decoded malformed payloads pass an
@@ -681,6 +696,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "architecture_identity": metadata.architecture_identity,
         "architecture_impact": metadata.architecture_impact,
         "architecture_contract_version": metadata.architecture_contract_version,
+        "execution_strategy_contract_version": metadata.execution_strategy_contract_version,
+        "execution_strategy_identity": metadata.execution_strategy_identity,
         "compact_prior_summaries": list(metadata.compact_prior_summaries),
         "usage": metadata.usage,
         "model_used": metadata.model_used,
@@ -786,6 +803,14 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             architecture_contract_version=(
                 int(payload["architecture_contract_version"])
                 if payload.get("architecture_contract_version") is not None else None
+            ),
+            execution_strategy_contract_version=(
+                int(payload["execution_strategy_contract_version"])
+                if payload.get("execution_strategy_contract_version") is not None else None
+            ),
+            execution_strategy_identity=(
+                payload.get("execution_strategy_identity")
+                if isinstance(payload.get("execution_strategy_identity"), dict) else None
             ),
             compact_prior_summaries=tuple(
                 str(summary) for summary in payload.get("compact_prior_summaries", [])
@@ -1781,6 +1806,122 @@ def _resume_plan_round(
     anchor_metadata = selection.anchor_record.metadata
     current_plan = latest_coder_record.metadata.canonical_plan or latest_coder_record.body
     coder_output = latest_coder_record.metadata.raw_structured_coder_response or current_plan
+    metadata_version = latest_coder_record.metadata.execution_strategy_contract_version
+    if metadata_version == 1:
+        # A generation-1 plan is identified by its canonical rendered text.
+        # Never resume a record whose subject was computed from a different
+        # representation (for example, raw host JSON versus rendered plan
+        # markdown); doing so would make the next skill invocation fork the
+        # same plan into a new round.
+        if latest_coder_record.metadata.canonical_plan is None:
+            raise AgentLoopError(
+                "Generation-1 planning metadata has no canonical plan text; "
+                "repair the handoff or start a new plan round."
+            )
+        if _plan_subject(current_plan) != latest_coder_record.metadata.subject:
+            raise AgentLoopError(
+                "Generation-1 planning metadata subject does not match its canonical plan; "
+                "repair the handoff or start a new plan round."
+            )
+    all_bodies = tuple(
+        body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
+    )
+    fresh_artifact = False
+    try:
+        raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
+        fresh_artifact = (
+            isinstance(raw_payload, dict)
+            and (
+                "execution_strategy_contract_version" in raw_payload
+                or "execution_recommendation" in raw_payload
+            )
+        ) or "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+    except (AttributeError, json.JSONDecodeError):
+        fresh_artifact = "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+    if fresh_artifact and metadata_version != 1:
+        raise AgentLoopError(
+            "Fresh generation-1 planning data is present but its round metadata is "
+            "missing or not generation 1; restart the planning handoff instead of "
+            "downgrading it to legacy-undecided."
+        )
+    if metadata_version == 1:
+        # A generation-1 round is never downgraded to legacy on resume.  The
+        # raw response is the provenance source; the visible canonical plan is
+        # intentionally markdown and cannot substitute for it.
+        from .protocol import (
+            validate_structured_plan_revision,
+            validate_structured_plan_state,
+        )
+
+        try:
+            raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
+            response_kind = raw_payload.get("kind") if isinstance(raw_payload, dict) else None
+            if response_kind == "plan_revision":
+                parsed_revision = validate_structured_plan_revision(
+                    coder_output,
+                    require_execution_strategy_contract=1,
+                )
+                if parsed_revision is None:
+                    raise AgentLoopError(
+                        "Generation-1 planning metadata has no recoverable structured response."
+                    )
+                parsed_recommendation = parsed_revision.execution_recommendation
+            elif response_kind == "plan_state":
+                parsed = validate_structured_plan_state(
+                    coder_output,
+                    require_execution_strategy_contract=1,
+                )
+                if parsed is None:
+                    raise AgentLoopError(
+                        "Generation-1 planning metadata has no recoverable structured response."
+                    )
+                parsed_recommendation = parsed.execution_recommendation
+            else:
+                raise AgentLoopError(
+                    "Generation-1 planning metadata has an unknown structured response kind."
+                )
+            if parsed_recommendation is None:
+                raise AgentLoopError(
+                    "Generation-1 planning metadata has no execution recommendation."
+                )
+
+            # The canonical plan is the public, hashed rendering.  Recover the
+            # recommendation sidecar from it (including transport sidecars) and
+            # compare it with both the raw response and durable metadata.  This
+            # prevents a restart from accepting a changed recommendation that
+            # retained only the old short topology summary.
+            marker_match = EXECUTION_RECOMMENDATION_MARKER_RE.search(current_plan)
+            if marker_match is None:
+                marker_match = EXECUTION_RECOMMENDATION_MARKER_RE.search(
+                    latest_coder_record.body
+                )
+            if marker_match is None:
+                raise AgentLoopError(
+                    "Generation-1 planning metadata has no canonical execution recommendation sidecar."
+                )
+            from .protocol import parse_execution_recommendation_payload
+
+            sidecar_payload = decode_execution_recommendation_marker(
+                marker_match.group("payload"), bodies=all_bodies
+            )
+            sidecar_recommendation = parse_execution_recommendation_payload(
+                sidecar_payload, context="canonical execution_recommendation"
+            )
+            if (
+                not isinstance(latest_coder_record.metadata.execution_strategy_identity, dict)
+                or latest_coder_record.metadata.execution_strategy_identity
+                != parsed_recommendation.identity()
+                or sidecar_recommendation.identity() != parsed_recommendation.identity()
+            ):
+                raise AgentLoopError(
+                    "Generation-1 planning metadata has a missing or mismatched complete "
+                    "strategy/topology identity across raw response, canonical sidecar, and metadata."
+                )
+        except (AgentLoopError, AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AgentLoopError(
+                "Generation-1 planning round metadata is missing or has a malformed "
+                "execution strategy contract; repair the handoff or start a new plan round."
+            ) from exc
     ledger_may_be_incomplete = (
         len(anchor_metadata.prior_items) == 0
         and any(
@@ -1811,6 +1952,7 @@ def _resume_plan_round(
             ledger_may_be_incomplete=ledger_may_be_incomplete,
             compact_prior_summaries=latest_coder_record.metadata.compact_prior_summaries,
             reconciled=any(record.metadata.role == "summary" for record in current_round_records),
+            coder_metadata=latest_coder_record.metadata,
             local_test_evidence=latest_coder_record.metadata.local_test_evidence,
         ),
     )
