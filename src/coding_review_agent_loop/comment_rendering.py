@@ -313,8 +313,9 @@ def _render_prior_dispositions_section(
                 f"Renderer encountered unknown prior item ID {disposition.item_id!r}; "
                 f"allowed IDs: {sorted(item_by_id)}"
             )
+        # A colon after [item-id] makes bare statuses hidden Markdown link definitions.
         lines.append(
-            f"- [{disposition.item_id}]: {_render_disposition_status(disposition)}"
+            f"- [{disposition.item_id}] {_render_disposition_status(disposition)}"
         )
         lines.append(f"  Original finding: {_format_unresolved_item_label(item, config)}")
     return "\n".join(lines)
