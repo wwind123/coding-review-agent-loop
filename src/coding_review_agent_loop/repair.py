@@ -1284,14 +1284,26 @@ def _build_repair_prompt(
         "topology data.\n"
         if require_execution_strategy_contract else ""
     )
+    detected_markers = scan_reserved_markers(raw)
+    detected_tokens = sorted({item.definition.token for item in detected_markers})
+    safe_labels = {
+        token: next(
+            item.definition.safe_label
+            for item in detected_markers
+            if item.definition.token == token
+        )
+        for token in detected_tokens
+    }
     prompt = _REPAIR_PROMPT.replace("{expected_kind_instruction}", expected_kind_instruction, 1)
     replacements = (
         ("{reserved_marker_instruction}", (
             "## Registry-detected reserved syntax in this source:\n"
-            + json.dumps(sorted({item.definition.token for item in scan_reserved_markers(raw)}))
+            + json.dumps(detected_tokens)
+            + "\nUse the exact safe label mapped to each detected family:\n"
+            + json.dumps(safe_labels, sort_keys=True)
             + "\nNeutralize only unsafe occurrences of these detected marker families in prose/JSON values. "
             "When a marker is embedded in a finding or other prose, replace only that marker occurrence "
-            "with its safe label and preserve every surrounding word on the line. "
+            "with the mapped safe label and preserve every surrounding word on the line. "
             "Do not rename other bare code identifiers merely because they start with AGENT_. "
             "The complete-marker grammar and a bare identifier are not interchangeable. "
             "Keep the required response footer and signature intact.\n"

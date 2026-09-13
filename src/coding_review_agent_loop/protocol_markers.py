@@ -460,6 +460,39 @@ def sanitize_historical_text(text: str) -> str:
     return safe
 
 
+def historical_text_fragments(text: str) -> tuple[str, ...]:
+    """Return substantive text outside spans that historical repair may replace.
+
+    Preservation checks must not require a repair backend to reproduce this
+    registry's label or punctuation around a quoted marker.  They do still
+    need to retain the prose on either side of the marker.  Complete records
+    and strict fallback mentions use the same replacement spans as
+    :func:`sanitize_historical_text`, so malformed name-bearing lines retain
+    their surrounding prose as well.
+    """
+    if not isinstance(text, str):
+        raise TypeError("historical text must be a string")
+    occurrences = _historical_replacement_occurrences(text)
+    if not occurrences:
+        return (text,) if text.strip() else ()
+
+    fragments: list[str] = []
+    cursor = 0
+    for occurrence in occurrences:
+        fragment = text[cursor:occurrence.start]
+        if text[occurrence.start - 1:occurrence.start] in {"`", "'", '"'}:
+            fragment = fragment[:-1]
+        if fragment.strip() and re.search(r"\w", fragment):
+            fragments.append(fragment)
+        cursor = occurrence.end
+    fragment = text[cursor:]
+    if text[cursor:cursor + 1] in {"`", "'", '"'}:
+        fragment = fragment[1:]
+    if fragment.strip() and re.search(r"\w", fragment):
+        fragments.append(fragment)
+    return tuple(fragments)
+
+
 @dataclass(frozen=True)
 class _BodySegment:
     text: str

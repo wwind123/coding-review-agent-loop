@@ -4,7 +4,6 @@ import json
 import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.protocol_markers import sanitize_historical_text
 from coding_review_agent_loop.repair import _build_repair_prompt
 from coding_review_agent_loop.repair_preservation import validate_repair_preservation
 
@@ -40,19 +39,34 @@ def test_marker_only_repair_cannot_drop_architecture_assessment():
         },
     }
     repaired = copy.deepcopy(original)
-    repaired['blocking_items'] = [sanitize_historical_text(original['blocking_items'][0])]
-    assert repaired['blocking_items'] == [
-        'Keep the `[protocol split-warning record]` warning for one-shot plans.'
+    repaired['blocking_items'] = [
+        'Keep the split-warning protocol record warning for one-shot plans.'
     ]
     raw = json.dumps(original)
     validate_repair_preservation(raw, json.dumps(repaired))
-    repaired['blocking_items'] = ['[protocol split-warning record]']
+    repaired['blocking_items'] = ['split-warning protocol record']
     with pytest.raises(AgentLoopError, match='blocking_items'):
         validate_repair_preservation(raw, json.dumps(repaired))
-    repaired['blocking_items'] = [sanitize_historical_text(original['blocking_items'][0])]
+    repaired['blocking_items'] = [
+        'Keep the split-warning protocol record warning for one-shot plans.'
+    ]
     del repaired['architecture_impact']
     with pytest.raises(AgentLoopError, match='architecture_impact'):
         validate_repair_preservation(raw, json.dumps(repaired))
+
+
+def test_marker_only_text_accepts_arbitrary_safe_repair_wording():
+    original = {
+        'schema_version': 1,
+        'kind': 'coder_followup',
+        'summary': 'AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1',
+    }
+    repaired = {
+        'schema_version': 1,
+        'kind': 'coder_followup',
+        'summary': 'Managed CI override record.',
+    }
+    validate_repair_preservation(json.dumps(original), json.dumps(repaired))
 
 
 def test_repair_prompt_distinguishes_reserved_syntax_from_bare_identifiers():
@@ -61,4 +75,5 @@ def test_repair_prompt_distinguishes_reserved_syntax_from_bare_identifiers():
     section = prompt.split('## Registry-detected reserved syntax in this source:\n')[1]
     detected = json.loads(section.splitlines()[0])
     assert detected == ['AGENT_SPLIT_UNFILED_WARNING']
+    assert 'protocol split-warning record' in section
     assert 'Do not rename other bare code identifiers' in section
