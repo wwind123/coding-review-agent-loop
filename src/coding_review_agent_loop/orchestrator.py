@@ -269,6 +269,7 @@ from .protocol import (
     serialize_discuss_round_synthesis,
     serialize_discuss_final_synthesis,
     parse_architecture_impact,
+    sanitize_architecture_impact,
 )
 from .protocol import parse_review
 from .repair import (
@@ -561,7 +562,7 @@ def _architecture_metadata_fields(
     identity = context.identity() if hasattr(context, "identity") else None
     return {
         "architecture_identity": identity,
-        "architecture_impact": dataclasses.asdict(impact) if dataclasses.is_dataclass(impact) else None,
+        "architecture_impact": sanitize_architecture_impact(impact),
         # This records the response-contract generation, not document
         # availability. A fresh turn must remain distinguishable from a
         # legacy record even when architecture acquisition is opted out or

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import dataclasses
 from dataclasses import dataclass, field
 
 from .errors import AgentLoopError, IssueImplementationConflictError
+from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
 
 PUBLIC_RESPONSE_MARKER = "=== AGENT_LOOP_PUBLIC_RESPONSE_BELOW ==="
@@ -424,6 +425,34 @@ def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureIm
 def parse_architecture_impact(value: object, *, context: str = "architecture_impact") -> ArchitectureImpact:
     """Validate an impact object for protocol extensions outside response envelopes."""
     return _parse_architecture_impact(value, context=context)
+
+
+def sanitize_architecture_impact(value: object | None) -> dict[str, object] | None:
+    """Return a marker-safe JSON payload for an agent-supplied impact assessment.
+
+    The parsed dataclass and the JSON sidecar both contain untrusted prose.  Keep
+    the transport shape intact while neutralizing reserved protocol markers in
+    every string before the value can reach durable metadata, handoffs, or
+    host-request artifacts.
+    """
+    if value is None:
+        return None
+    if dataclasses.is_dataclass(value):
+        value = dataclasses.asdict(value)
+    if not isinstance(value, Mapping):
+        raise AgentLoopError("architecture_impact must be a mapping or parsed impact object.")
+
+    def clean(item: object) -> object:
+        if isinstance(item, str):
+            return sanitize_historical_text(item)
+        if isinstance(item, Mapping):
+            return {str(key): clean(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [clean(child) for child in item]
+        return item
+
+    sanitized = clean(value)
+    return sanitized if isinstance(sanitized, dict) else None
 
 
 HUMAN_REQUIREMENT_DISPOSITION_VALUES = frozenset(

@@ -73,7 +73,11 @@ from coding_review_agent_loop.round_state import (
     _serialize_disposition,
     _serialize_unresolved_item,
 )
-from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
+from coding_review_agent_loop.protocol import (
+    ReviewItemDisposition,
+    UnresolvedReviewItem,
+    sanitize_architecture_impact,
+)
 from coding_review_agent_loop.local_test_evidence import canonicalize_bounded_evidence
 
 
@@ -386,7 +390,7 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             )
             if not isinstance(raw_impact, dict):
                 raise ValueError("expected a JSON object")
-            architecture_impact = raw_impact
+            architecture_impact = sanitize_architecture_impact(raw_impact)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             print(f"state_manager: cannot read architecture impact: {exc}", file=sys.stderr)
             sys.exit(1)

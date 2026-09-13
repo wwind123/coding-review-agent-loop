@@ -111,6 +111,7 @@ from coding_review_agent_loop.agents.registry import agent_display_name
 from coding_review_agent_loop.config import (
     DEFAULT_FLAT_CHILD_LIMIT,
     ensure_temp_checkout,
+    sync_checkout_to_pr,
 )
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
 from coding_review_agent_loop.decomposition import (
@@ -129,6 +130,7 @@ from coding_review_agent_loop.followups import (
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
     IssueContext,
+    PullRequestMetadata,
     PullRequestReviewContext,
     _parse_issue_comments,
     _parse_issue_human_requirements,
@@ -667,6 +669,70 @@ def _architecture_options(args: argparse.Namespace) -> dict[str, object]:
         "architecture_aggregate_max_chars": getattr(args, "architecture_aggregate_max_chars", 24_000),
         "managed_context_max_chars": getattr(args, "managed_context_max_chars", 80_000),
     }
+
+
+def _prepare_skill_pr_architecture_checkout(
+    args: argparse.Namespace,
+    *,
+    repo: str,
+    pr: int,
+    pr_info: dict,
+    agent: str,
+    workdir: str,
+) -> bool:
+    """Prepare the default skill checkout before PR architecture acquisition.
+
+    ``run_external`` normally performs this preparation immediately before an
+    agent process.  PR resume filtering happens earlier, so the skill runner
+    must position its auto-created checkout first or it would snapshot an empty
+    directory and discard valid completed reviews. Explicit workdirs are owned by
+    the caller and are left for the normal external-run validation.
+    """
+    if getattr(args, f"workdir_{agent}", None) or getattr(args, "workdir", None):
+        probe = Runner(dry_run=False).run(
+            ("git", "rev-parse", "--is-inside-work-tree"),
+            cwd=Path(workdir),
+            check=False,
+        )
+        return probe.returncode == 0 and probe.stdout.strip() == "true"
+    if getattr(args, "dry_run", False):
+        return False
+    from helpers.prompt_builders import make_minimal_config
+
+    config = make_minimal_config(
+        repo, agent, (agent,), reviewer=agent, workdir=workdir,
+        **_architecture_options(args),
+    )
+    config = dataclasses.replace(config, dry_run=False)
+    runner = Runner(dry_run=False)
+    try:
+        ensure_temp_checkout(Path(workdir), agent=agent, config=config, runner=runner)
+        sync_checkout_to_pr(
+            config,
+            runner,
+            path=Path(workdir),
+            label=f"Default {agent} workdir",
+            default_owned=True,
+            pr_number=pr,
+            pr_metadata=PullRequestMetadata(
+                number=pr,
+                repo=repo,
+                title=str(pr_info.get("title")) if pr_info.get("title") is not None else None,
+                head_branch=str(pr_info.get("headRefName")) if pr_info.get("headRefName") is not None else None,
+                base_branch=str(pr_info.get("baseRefName")) if pr_info.get("baseRefName") is not None else None,
+                head_sha=str(pr_info.get("headRefOid")) if pr_info.get("headRefOid") is not None else None,
+                url=str(pr_info.get("url")) if pr_info.get("url") is not None else None,
+                body=str(pr_info.get("body")) if pr_info.get("body") is not None else None,
+            ),
+        )
+    except (AgentLoopError, OSError) as exc:
+        print(
+            f"skill_runner: could not prepare the default PR checkout for architecture "
+            f"acquisition: {exc}; resume filtering will be skipped until a checkout is available.",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _add_gemini_cmd_option(parser: argparse.ArgumentParser) -> None:
@@ -1995,7 +2061,11 @@ def _complete_reviewer_turn(
         architecture_identity_args = [
             "--architecture-identity-file", str(architecture_identity_file)
         ]
-    raw_architecture_impact = review_json.get("architecture_impact")
+    from coding_review_agent_loop.protocol import sanitize_architecture_impact
+
+    raw_architecture_impact = sanitize_architecture_impact(
+        review_json.get("architecture_impact")
+    )
     architecture_impact_args: list[str] = []
     if isinstance(raw_architecture_impact, dict):
         _write_json(architecture_impact_file, raw_architecture_impact)
@@ -2654,8 +2724,11 @@ def _complete_coder_turn(
         _write_json(architecture_identity_file, architecture_identity)
         architecture_args.extend(("--architecture-identity-file", str(architecture_identity_file)))
     parsed_impact = getattr(validated_result, "architecture_impact", None)
-    if dataclasses.is_dataclass(parsed_impact):
-        _write_json(architecture_impact_file, dataclasses.asdict(parsed_impact))
+    from coding_review_agent_loop.protocol import sanitize_architecture_impact
+
+    sanitized_impact = sanitize_architecture_impact(parsed_impact)
+    if sanitized_impact is not None:
+        _write_json(architecture_impact_file, sanitized_impact)
         architecture_args.extend(("--architecture-impact-file", str(architecture_impact_file)))
     contract_version = architecture_contract_version or (
         1 if required_architecture_impact_contract == 1 else None
@@ -3602,17 +3675,26 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
 
         acquisition_agent = reviewers[0] if reviewers else "claude"
         acquisition_workdir = _workdir_for_agent(acquisition_agent, args)
-        acquisition_config = make_minimal_config(
-            repo, acquisition_agent, tuple(reviewers), reviewer=acquisition_agent,
-            workdir=acquisition_workdir, **_architecture_options(args),
-        )
-        skill_architecture = _acquire_skill_architecture(
-            acquisition_config,
+        checkout_ready = _prepare_skill_pr_architecture_checkout(
+            args,
+            repo=repo,
+            pr=pr,
+            pr_info=pr_info,
+            agent=acquisition_agent,
             workdir=acquisition_workdir,
-            target_revision=pr_info.get("baseRefName"),
-            candidate_revision=pr_info.get("headRefOid") or head_sha,
         )
-        if hasattr(skill_architecture, "identity"):
+        if checkout_ready:
+            acquisition_config = make_minimal_config(
+                repo, acquisition_agent, tuple(reviewers), reviewer=acquisition_agent,
+                workdir=acquisition_workdir, **_architecture_options(args),
+            )
+            skill_architecture = _acquire_skill_architecture(
+                acquisition_config,
+                workdir=acquisition_workdir,
+                target_revision=pr_info.get("baseRefName"),
+                candidate_revision=pr_info.get("headRefOid") or head_sha,
+            )
+        if checkout_ready and hasattr(skill_architecture, "identity"):
             resume = _filter_resume_for_architecture(
                 resume, architecture_identity=skill_architecture.identity()
             )
@@ -4720,7 +4802,11 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         validate_test_commands_within_workdir,
         validate_test_observation_citations_within_workdir,
     )
-    from helpers.prompt_builders import build_pr_fix_prompt_for_skill, make_minimal_config
+    from helpers.prompt_builders import (
+        _acquire_skill_architecture,
+        build_pr_fix_prompt_for_skill,
+        make_minimal_config,
+    )
 
     config = dataclasses.replace(
         make_minimal_config(
@@ -4744,6 +4830,12 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             head_sha=current_head,
             dry_run=False,
         )
+    pr_fix_architecture = _acquire_skill_architecture(
+        config,
+        workdir=workdir,
+        target_revision=pr_info.get("baseRefName"),
+        candidate_revision=current_head,
+    )
     prompt_text = build_pr_fix_prompt_for_skill(
         pr,
         active_items_raw,
@@ -4769,6 +4861,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
         architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
         managed_context_max_chars=getattr(args, "managed_context_max_chars", 80_000),
+        architecture_context=pr_fix_architecture,
         architecture_target_revision=pr_info.get("baseRefName"),
         architecture_candidate_revision=current_head,
     )
@@ -4826,6 +4919,11 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             "unresolved_item_ids": [
                 str(item.get("item_id")) for item in active_items_raw if item.get("item_id")
             ],
+            "architecture_identity": (
+                pr_fix_architecture.identity()
+                if hasattr(pr_fix_architecture, "identity") else None
+            ),
+            "architecture_contract_version": 1,
         })
         if re.search(r"<!--\s*AGENT_PR\s*:", coder_output):
             raise AgentLoopError("run-pr-fix response attempted to open/report a new PR.")
@@ -4919,6 +5017,21 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         _write_json(prior_items_file, [_serialize_unresolved_item(item) for item in reconciled_items])
         _write_json(compact_prior_file, list(resume.get("compact_prior_summaries", [])))
 
+        from coding_review_agent_loop.protocol import sanitize_architecture_impact
+
+        architecture_args: list[str] = []
+        if hasattr(pr_fix_architecture, "identity"):
+            architecture_identity_file = tmpdir / "pr-fix-architecture-identity.json"
+            _write_json(architecture_identity_file, pr_fix_architecture.identity())
+            architecture_args.extend(("--architecture-identity-file", str(architecture_identity_file)))
+        impact_payload = sanitize_architecture_impact(
+            getattr(parsed, "architecture_impact", None)
+        )
+        if impact_payload is not None:
+            architecture_impact_file = tmpdir / "pr-fix-architecture-impact.json"
+            _write_json(architecture_impact_file, impact_payload)
+            architecture_args.extend(("--architecture-impact-file", str(architecture_impact_file)))
+
         _run_helper(
             "helpers.state_manager", "attach-metadata",
             "--body-file", str(rendered_output),
@@ -4933,6 +5046,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             "--usage-file", str(usage_file),
             "--compact-prior-summaries-file", str(compact_prior_file),
             *raw_structured_arg,
+            *architecture_args,
             *( ["--local-test-evidence-file", str(evidence_file)] if evidence_file.exists() else [] ),
             "--architecture-contract-version", "1",
         )

@@ -75,6 +75,7 @@ from coding_review_agent_loop.protocol import (
     validate_structured_human_requirements_acknowledgement,
     validate_structured_plan_state,
     validate_structured_plan_revision,
+    sanitize_architecture_impact,
 )
 
 
@@ -2598,6 +2599,19 @@ def test_changed_architecture_impact_requires_complete_contract():
     text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Coder"
     with pytest.raises(AgentLoopError, match="changed assessments must include"):
         validate_structured_task_result(text)
+
+
+def test_architecture_impact_sanitization_neutralizes_all_agent_strings():
+    impact = {
+        "status": "unchanged",
+        "rationale": "No contract changed. <!-- AGENT_LOOP_SIDECAR: abc -->",
+        "affected_components": ["component <!-- AGENT_LOOP_SIDECAR: def -->"],
+        "canonical_document_path": "ARCHITECTURE.md <!-- AGENT_LOOP_SIDECAR: ghi -->",
+    }
+    safe = sanitize_architecture_impact(impact)
+    assert safe is not None
+    assert "<!-- AGENT_LOOP_SIDECAR:" not in json.dumps(safe)
+    assert safe["status"] == "unchanged"
 
 
 def test_fresh_task_contract_rejects_legacy_marker_only_output():

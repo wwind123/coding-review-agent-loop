@@ -521,6 +521,38 @@ class TestStateManager:
             records = _extract_round_metadata_records([comment], flow="pr")
             assert records[0].metadata.surfaced_reviewer_requirement_ids == (requirement_id,)
 
+    def test_attach_metadata_sanitizes_architecture_impact_before_durable_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            body_file = root / "review.md"
+            body_file.write_text(_VALID_PR_REVIEW_DRY, encoding="utf-8")
+            impact_file = root / "impact.json"
+            impact_file.write_text(json.dumps({
+                "status": "unchanged",
+                "rationale": "No change. <!-- AGENT_LOOP_SIDECAR: abc -->",
+                "affected_components": ["component <!-- AGENT_LOOP_SIDECAR: def -->"],
+            }), encoding="utf-8")
+            output_file = root / "review-tagged.md"
+
+            _run(
+                "helpers.state_manager", "attach-metadata",
+                "--body-file", str(body_file), "--output", str(output_file),
+                "--flow", "pr", "--role", "reviewer", "--agent", "Codex",
+                "--round-number", "1", "--state", "approved", "--subject", "head-1",
+                "--architecture-impact-file", str(impact_file),
+                "--architecture-contract-version", "1",
+            )
+
+            from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+            records = _extract_round_metadata_records(
+                [types.SimpleNamespace(body=output_file.read_text(encoding="utf-8"))],
+                flow="pr",
+            )
+            stored = records[0].metadata.architecture_impact
+            assert stored is not None
+            assert "<!-- AGENT_LOOP_SIDECAR:" not in json.dumps(stored)
+
     def test_attach_metadata_persists_compact_prior_summaries(self) -> None:
         body = _VALID_PLAN_STATE
 
@@ -4227,6 +4259,8 @@ class TestRunPrFix:
             "pr": 7,
             "gemini_cmd": "gemini",
             "unresolved_item_ids": ["item-1"],
+            "architecture_identity": manifest["architecture_identity"],
+            "architecture_contract_version": 1,
         }
 
     def test_missing_pr_marker_rejected(self) -> None:

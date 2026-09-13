@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,36 @@ def test_skill_pr_resume_rejects_stale_architecture_identity() -> None:
     filtered = _filter_resume_for_architecture(resume, architecture_identity=identity)
     assert filtered["completed_reviewer_names"] == ["Gemini"]
     assert filtered["completed_reviewer_data"] == [current]
+
+
+def test_default_pr_round_prepares_auto_checkout_before_architecture_acquisition(
+    monkeypatch, tmp_path
+) -> None:
+    import helpers.skill_runner as skill_runner
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        skill_runner,
+        "ensure_temp_checkout",
+        lambda path, **kwargs: calls.append(f"ensure:{path}"),
+    )
+    monkeypatch.setattr(
+        skill_runner,
+        "sync_checkout_to_pr",
+        lambda config, runner, **kwargs: calls.append(f"sync:{kwargs['path']}"),
+    )
+    args = SimpleNamespace(dry_run=False, workdir=None, workdir_gemini=None)
+    workdir = str(tmp_path / "skill-runner-gemini")
+
+    assert skill_runner._prepare_skill_pr_architecture_checkout(
+        args,
+        repo="owner/repo",
+        pr=781,
+        pr_info={"headRefOid": "h" * 40, "baseRefName": "main"},
+        agent="gemini",
+        workdir=workdir,
+    ) is True
+    assert calls == [f"ensure:{workdir}", f"sync:{workdir}"]
 
 
 def test_build_resume_preserves_architecture_identity_for_resume_filter(
