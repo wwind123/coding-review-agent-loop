@@ -413,9 +413,38 @@ def scan_reserved_markers(text: str) -> tuple[MarkerOccurrence, ...]:
     return _all_occurrences(text)
 
 
+def _historical_replacement_occurrences(text: str) -> tuple[MarkerOccurrence, ...]:
+    """Return safe replacement spans without discarding surrounding prose.
+
+    A name-bearing-line fallback is deliberately broad while scanning so a
+    malformed marker cannot pass unnoticed. Historical text still needs to
+    retain the prose around that mention, though, so replace the token itself
+    unless the complete marker grammar matched the occurrence.
+    """
+    replacements: list[MarkerOccurrence] = []
+    for occurrence in _all_occurrences(text):
+        definition = occurrence.definition
+        if (
+            definition.strictness == "name-bearing-line"
+            and definition.pattern.fullmatch(occurrence.text) is None
+        ):
+            for match in re.finditer(re.escape(definition.token), occurrence.text, re.I):
+                replacements.append(
+                    MarkerOccurrence(
+                        definition,
+                        occurrence.start + match.start(),
+                        occurrence.start + match.end(),
+                        match.group(0),
+                    )
+                )
+        else:
+            replacements.append(occurrence)
+    return tuple(sorted(replacements, key=lambda item: item.start))
+
+
 def sanitize_historical_text(text: str) -> str:
     """Replace reserved spans with stable labels, preserving surrounding prose."""
-    occurrences = _all_occurrences(text)
+    occurrences = _historical_replacement_occurrences(text)
     if not occurrences:
         return text
     pieces: list[str] = []

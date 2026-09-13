@@ -9,7 +9,7 @@ from .protocol import (
     _normalize_requirement_label,
     normalize_response_file_structured_text,
 )
-from .protocol_markers import scan_reserved_markers
+from .protocol_markers import sanitize_historical_text
 
 
 _KINDS = {
@@ -64,8 +64,11 @@ def _normalized_requirement_id(text: str) -> str | None:
 
 def _fragments(value: object) -> list[str]:
     if isinstance(value, str):
-        # Reserved protocol syntax must be removable; its safety validator wins.
-        return [value] if value.strip() and not scan_reserved_markers(value) else []
+        # Compare marker-bearing prose after the same narrow neutralization
+        # that repair output is allowed to perform. This retains all text
+        # around the marker instead of treating the entire finding as unsafe.
+        safe = sanitize_historical_text(value)
+        return [safe] if safe.strip() else []
     if isinstance(value, list):
         return [text for child in value for text in _fragments(child)]
     if isinstance(value, dict):
@@ -109,15 +112,16 @@ def validate_repair_preservation(
         target_impact = target.get("architecture_impact")
         require(isinstance(target_impact, dict), "architecture_impact")
         for key, value in impact.items():
-            if isinstance(value, str) and _fragments(value):
+            fragments = _fragments(value)
+            if isinstance(value, str) and fragments:
                 candidate = target_impact.get(key)
                 exact = key in {"status", "canonical_document_action"}
                 require(
                     isinstance(candidate, str)
                     and (
-                        _normalized(value) == _normalized(candidate)
+                        _normalized(fragments[0]) == _normalized(candidate)
                         if exact
-                        else _normalized(value) in _normalized(candidate)
+                        else _normalized(fragments[0]) in _normalized(candidate)
                     ),
                     f"architecture_impact.{key}",
                 )
@@ -125,8 +129,9 @@ def validate_repair_preservation(
                 candidate = target_impact.get(key)
                 require(isinstance(candidate, list), f"architecture_impact.{key}")
                 for entry in value:
-                    if isinstance(entry, str) and _fragments(entry):
-                        require(entry in candidate, f"architecture_impact.{key}")
+                    fragments = _fragments(entry)
+                    if isinstance(entry, str) and fragments:
+                        require(fragments[0] in candidate, f"architecture_impact.{key}")
 
     if source["kind"] in {"plan_state", "plan_revision"} and (
         "execution_strategy_contract_version" in source
@@ -166,10 +171,11 @@ def validate_repair_preservation(
         )
 
     summary = source.get("summary")
-    if isinstance(summary, str) and _fragments(summary):
+    summary_fragments = _fragments(summary)
+    if isinstance(summary, str) and summary_fragments:
         require(
             isinstance(target.get("summary"), str)
-            and _normalized(summary) in _normalized(target["summary"]),
+            and _normalized(summary_fragments[0]) in _normalized(target["summary"]),
             "summary",
         )
 
@@ -181,7 +187,11 @@ def validate_repair_preservation(
     for field in fields:
         entries = source.get(field)
         if isinstance(entries, list) and all(isinstance(e, str) for e in entries):
-            required = [_normalized(e) for e in entries if _fragments(e)]
+            required = [
+                _normalized(fragments[0])
+                for e in entries
+                if (fragments := _fragments(e))
+            ]
             actual = target.get(field, [])
             require(isinstance(actual, list), field)
             available = [_normalized(e) for e in actual if isinstance(e, str)]
@@ -217,7 +227,8 @@ def validate_repair_preservation(
                     for bucket in ("addressed_item_notes", "remaining_item_notes")
                     if isinstance(target.get(bucket), dict)
                 ]
-                require(any(isinstance(c, str) and _normalized(note) in _normalized(c)
+                safe_note = _fragments(note)[0]
+                require(any(isinstance(c, str) and _normalized(safe_note) in _normalized(c)
                             for c in candidates), field)
 
         disputed_items = source.get("disputed_items")
@@ -241,9 +252,10 @@ def validate_repair_preservation(
                 if not isinstance(evidence, str) or not _fragments(evidence):
                     continue
                 candidate = target_evidence.get(item_id)
+                safe_evidence = _fragments(evidence)[0]
                 require(
                     isinstance(candidate, str)
-                    and _normalized(evidence) in _normalized(candidate),
+                    and _normalized(safe_evidence) in _normalized(candidate),
                     "dispute_evidence",
                 )
 
@@ -295,9 +307,10 @@ def validate_repair_preservation(
             evidence = entry.get("evidence")
             if isinstance(evidence, str) and _fragments(evidence):
                 candidate_evidence = match.get("evidence")
+                safe_evidence = _fragments(evidence)[0]
                 require(
                     isinstance(candidate_evidence, str)
-                    and _normalized(evidence) in _normalized(candidate_evidence),
+                    and _normalized(safe_evidence) in _normalized(candidate_evidence),
                     "human_requirement_dispositions",
                 )
 

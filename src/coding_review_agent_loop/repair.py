@@ -1290,6 +1290,8 @@ def _build_repair_prompt(
             "## Registry-detected reserved syntax in this source:\n"
             + json.dumps(sorted({item.definition.token for item in scan_reserved_markers(raw)}))
             + "\nNeutralize only unsafe occurrences of these detected marker families in prose/JSON values. "
+            "When a marker is embedded in a finding or other prose, replace only that marker occurrence "
+            "with its safe label and preserve every surrounding word on the line. "
             "Do not rename other bare code identifiers merely because they start with AGENT_. "
             "The complete-marker grammar and a bare identifier are not interchangeable. "
             "Keep the required response footer and signature intact.\n"

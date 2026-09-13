@@ -41,8 +41,15 @@ def test_marker_only_repair_cannot_drop_architecture_assessment():
     }
     repaired = copy.deepcopy(original)
     repaired['blocking_items'] = [sanitize_historical_text(original['blocking_items'][0])]
+    assert repaired['blocking_items'] == [
+        'Keep the `[protocol split-warning record]` warning for one-shot plans.'
+    ]
     raw = json.dumps(original)
     validate_repair_preservation(raw, json.dumps(repaired))
+    repaired['blocking_items'] = ['[protocol split-warning record]']
+    with pytest.raises(AgentLoopError, match='blocking_items'):
+        validate_repair_preservation(raw, json.dumps(repaired))
+    repaired['blocking_items'] = [sanitize_historical_text(original['blocking_items'][0])]
     del repaired['architecture_impact']
     with pytest.raises(AgentLoopError, match='architecture_impact'):
         validate_repair_preservation(raw, json.dumps(repaired))
