@@ -144,9 +144,17 @@ phase identities, and handoffs use the canonical `staged` strategy and fixed
 their exact requested-mode/source lookup and historical serialization. Stable
 string stage IDs accompany one-based ordinals. Plan-only keeps its existing
 approved-follow-up, requested split, and unfiled-scope behavior but does not
-create a fresh execution decision or topology. Automatic strategy selection
-remains a downstream concern. Repair may preserve a complete v1 source, but
-cannot synthesize missing recommendation data.
+create a fresh execution decision or topology. The opt-in `auto` policy is
+resolved only after approval: a fresh one-shot recommendation becomes
+`implement-one-shot`, and a fresh staged recommendation becomes
+`implement-by-phase`. Legacy-undecided plans and incompatible explicit pairs
+fail closed before mutation. A typed resolved action drives follow-ups,
+topology, handoffs, and dispatch; dry-run reports that action without
+persistence or GitHub writes. The durable decision is written before any
+follow-up, child, handoff, coder, or PR mutation, and staged execution is
+bounded to the first eligible `agent-pr` child while the parent remains open.
+Repair may preserve a complete v1 source, but cannot synthesize missing
+recommendation data.
 
 ### Review and Feedback
 

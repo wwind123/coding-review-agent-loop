@@ -37,8 +37,9 @@ child creation or implementation. Fresh staged decomposition and phase
 handoffs use strategy `staged`, source `approved-plan-v1`, the recommendation
 digest, an ordinal, and a stable stage ID; fresh one-shot handoffs use
 `one-shot`. Historical unversioned plans stay legacy-undecided, and repair must
-recover a complete v1 source before applying format-only correction. Automatic
-strategy selection remains downstream.
+recover a complete v1 source before applying format-only correction. The
+`auto` policy is not a supported interactive skill-mode surface for #787; the
+existing explicit skill helpers remain unchanged.
 
 ### Containment and test gates
 
@@ -239,6 +240,10 @@ has already been approved:
   across `decompose-only` and `implement-by-phase`.
 - `run-implement-by-phase` decomposes with mode `implement-by-phase`, then
   implements phase 1 only when that phase is `agent-pr`.
+
+The `auto` policy is not a supported interactive skill-mode surface for #787;
+the existing explicit one-shot, decomposition, and by-phase helpers are
+unchanged.
 
 Both helpers use the shared parent-wide flat child cap (default 15, configurable
 with `--flat-child-limit`), preflight every draft before mutation, and recover

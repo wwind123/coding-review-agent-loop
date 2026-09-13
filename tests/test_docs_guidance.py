@@ -56,6 +56,7 @@ def test_local_agent_loop_doc_has_decision_heading_and_table():
     assert f"### {HEADING_TEXT}" in text
     assert "`--plan-execution-mode decompose-only`" in text
     assert "`--plan-execution-mode implement-by-phase`" in text
+    assert "`--plan-execution-mode auto`" in text
     assert "`--materialize-split-issues`" in text
 
 
@@ -68,6 +69,7 @@ def test_local_agent_loop_doc_warns_about_combining_mechanisms():
     assert "Do not combine" in section
     assert "decompose-only" in section
     assert "implement-by-phase" in section
+    assert "auto" in section
     assert "duplicate" in section.lower()
 
 
@@ -80,6 +82,7 @@ def test_readme_links_to_decision_section_with_derived_anchor():
     normalized_readme_text = " ".join(readme_text.split())
     assert f"docs/local_agent_loop.md#{expected_anchor}" in readme_text
     assert "`--plan-execution-mode decompose-only`" in readme_text
+    assert "`auto`" in readme_text
     assert "`--materialize-split-issues`" in readme_text
     assert "duplicate children" in normalized_readme_text
 

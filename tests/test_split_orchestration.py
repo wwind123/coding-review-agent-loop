@@ -14,7 +14,11 @@ from coding_review_agent_loop.decomposition import (
     format_phase_issue_body,
     normalize_execution_recommendation,
 )
-from coding_review_agent_loop.github import IssueContext, validate_pr_body_does_not_close_issue
+from coding_review_agent_loop.github import (
+    IssueComment,
+    IssueContext,
+    validate_pr_body_does_not_close_issue,
+)
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
@@ -121,7 +125,7 @@ def _fresh_v1_plan_for_isolation(strategy: str) -> str:
 @pytest.mark.parametrize("strategy", ["one-shot", "staged"])
 @pytest.mark.parametrize(
     "execution_mode",
-    ["plan-only", "implement-one-shot", "decompose-only", "implement-by-phase"],
+    ["plan-only", "implement-one-shot", "decompose-only", "implement-by-phase", "auto"],
 )
 @pytest.mark.parametrize("materialize", [False, True])
 def test_fresh_v1_recommendation_is_inert_at_legacy_split_seam(
@@ -162,7 +166,7 @@ def test_fresh_v1_recommendation_is_inert_at_legacy_split_seam(
 )
 @pytest.mark.parametrize("materialize", [False, True])
 def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
-    tmp_path, monkeypatch, strategy, execution_mode, expected_events, materialize
+    tmp_path, monkeypatch, capsys, strategy, execution_mode, expected_events, materialize
 ):
     """Exercise the approval-bound policy matrix before downstream mutation."""
     events = []
@@ -196,12 +200,26 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
 
     compatible = (
         execution_mode == "plan-only"
-        or strategy == "one-shot" and execution_mode == "implement-one-shot"
-        or strategy == "staged" and execution_mode in {"decompose-only", "implement-by-phase"}
+        or strategy == "one-shot" and execution_mode in {"implement-one-shot", "auto"}
+        or strategy == "staged" and execution_mode in {"decompose-only", "implement-by-phase", "auto"}
     )
     if compatible:
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
-        assert tuple(events) == expected_events if execution_mode != "plan-only" else tuple(events) == ()
+        expected = expected_events
+        if execution_mode == "auto":
+            expected = ("implement",) if strategy == "one-shot" else ("decompose", "implement")
+        assert tuple(events) == expected if execution_mode != "plan-only" else tuple(events) == ()
+        output = capsys.readouterr().out
+        expected_action = (
+            "implement-one-shot"
+            if execution_mode == "auto" and strategy == "one-shot"
+            else "implement-by-phase"
+            if execution_mode == "auto"
+            else execution_mode
+        )
+        assert f"requested policy `{execution_mode}`" in output
+        assert f"resolved action `{expected_action}`" in output
+        assert "Remaining child work:" in output
         assert runner.issues == []
         assert not any("AGENT_PLAN_TOPOLOGY_CHECKPOINT" in comment for comment in runner.comments)
         assert not any("AGENT_DISCUSS_SPLIT" in comment for comment in runner.comments)
@@ -214,6 +232,172 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
         assert not any("AGENT_PLAN_DECOMPOSITION" in comment for comment in runner.comments)
         assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("execution_mode", ["plan-only", "implement-one-shot"])
+def test_one_shot_recommendation_keeps_legacy_split_materialization_live(
+    tmp_path, execution_mode
+):
+    plan = _fresh_v1_plan_for_isolation("one-shot")
+    split_comment = _attach_round_metadata(
+        "Split consensus recorded.",
+        PostedRoundMetadata(
+            flow="discuss",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="discuss-subject",
+            is_final=True,
+            split_proposals=("Legacy follow-up",),
+        ),
+    )
+    context = IssueContext(
+        783,
+        "OWNER/REPO",
+        "Title",
+        "Body",
+        "https://github.com/OWNER/REPO/issues/783",
+        (IssueComment(author="bot", created_at=None, body=split_comment),),
+    )
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/99"])
+    config = make_config(
+        tmp_path,
+        plan_execution_mode=execution_mode,
+        materialize_split_issues=True,
+    )
+    recommendation = validate_structured_plan_state(plan).execution_recommendation
+    assert recommendation is not None
+    resolved = orchestrator_module._resolve_execution_policy(
+        config,
+        requested_policy=execution_mode,
+        recommendation=recommendation,
+    )
+
+    assert _handle_plan_first_split_scope(
+        runner,
+        issue_number=783,
+        config=config,
+        current_plan=plan,
+        plan_subject=_plan_subject(plan),
+        issue_context=context,
+        resolved_execution=resolved,
+    ) is True
+    assert len(runner.issues) == 1
+    assert runner.issues[0]["title"] == "[#783 stage] Legacy follow-up"
+
+
+def test_fresh_one_shot_materialization_rerun_reuses_split_child_and_pr(
+    tmp_path,
+):
+    """A split child created beside a fresh one-shot plan is recoverable.
+
+    The child belongs to the approved request because its normalized stage key
+    comes from the prior discuss split that the one-shot run materializes.
+    A rerun must adopt that exact materialization before resuming the existing
+    one-shot PR, without creating another child or invoking the coder again.
+    """
+    plan = _fresh_v1_plan_for_isolation("one-shot")
+    payload, end = json.JSONDecoder().raw_decode(plan.lstrip())
+    payload["deferred_stages"] = [
+        {"title": "Legacy follow-up", "summary": "Keep this follow-up as a child issue."}
+    ]
+    plan = json.dumps(payload) + plan.lstrip()[end:]
+    split_comment = _attach_round_metadata(
+        "Split consensus recorded.",
+        PostedRoundMetadata(
+            flow="discuss",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="discuss-subject",
+            is_final=True,
+            split_proposals=("Legacy follow-up",),
+        ),
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            plan,
+            "Implemented the approved one-shot plan.\n"
+            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_pr_review(state="approved", summary="LGTM."),
+        ],
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:00Z",
+                "body": split_comment,
+            }
+        ],
+        issue_urls=["https://github.com/OWNER/REPO/issues/101"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(
+        tmp_path,
+        plan_execution_mode="implement-one-shot",
+        materialize_split_issues=True,
+        execution_strategy_contract_required=True,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert len(runner.issues) == 1
+    coder_count = sum(command[:1] == ["claude"] for command, _cwd in runner.commands)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert len(runner.issues) == 1
+    assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == coder_count
+    assert sum("AGENT_DISCUSS_SPLIT" in comment for comment in runner.comments) == 1
+
+
+@pytest.mark.parametrize("strategy", ["one-shot", "staged"])
+def test_auto_dry_run_previews_without_approval_bound_mutation(tmp_path, capsys, strategy):
+    plan = _fresh_v1_plan_for_isolation(strategy)
+    runner = FakeRunner(
+        claude_outputs=[plan],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(
+            tmp_path,
+            dry_run=True,
+            plan_execution_mode="auto",
+            execution_strategy_contract_required=True,
+        ),
+        plan_first=True,
+    ) == 0
+
+    assert "dry-run preview" in capsys.readouterr().out
+    assert runner.issues == []
+    assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
+    assert not any("AGENT_PLAN_DECOMPOSITION" in comment for comment in runner.comments)
+    assert not any("AGENT_PLAN_ONE_SHOT_IMPL" in comment for comment in runner.comments)
+    assert not any("AGENT_PLAN_PHASE_IMPLEMENTATION" in comment for comment in runner.comments)
+    assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+
+def test_auto_refuses_legacy_undecided_approved_plan_before_mutation(tmp_path):
+    runner = FakeRunner(
+        claude_outputs=[structured_plan_state(summary="Historical plan without a strategy.")],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+
+    with pytest.raises(AgentLoopError, match="legacy-undecided"):
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, plan_execution_mode="auto"),
+            plan_first=True,
+        )
+
+    assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
+    assert not any("AGENT_PLAN_ONE_SHOT_IMPL" in comment for comment in runner.comments)
+    assert runner.issues == []
 
 
 def test_fresh_staged_recovery_conflict_is_rejected_before_decision_record(tmp_path):

@@ -1541,7 +1541,7 @@ def _compact_prior_ledger_block(compact_prior: CompactPriorContext | None) -> st
 
 
 def _phased_plan_guard(config: AgentLoopConfig) -> str:
-    if config.plan_execution_mode in {"decompose-only", "implement-by-phase"}:
+    if config.plan_execution_mode in {"decompose-only", "implement-by-phase", "auto"}:
         return ""
     return (
         "Phased-delivery guard: if the plan defers any implementation to future PRs, "

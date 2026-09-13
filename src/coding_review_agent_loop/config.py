@@ -78,6 +78,13 @@ DEFAULT_FLAT_CHILD_LIMIT: int = 15
 # validation, and the prompt builders all derive from this set.
 DISCUSS_RESEARCH_MODES: frozenset[str] = frozenset({"none", "required", "auto"})
 
+# The issue plan-first policy is intentionally separate from the reviewed
+# execution strategy.  ``auto`` is only a request to select one of the two
+# canonical post-approval actions after the reviewed recommendation exists.
+PLAN_EXECUTION_MODES: frozenset[str] = frozenset(
+    {"plan-only", "decompose-only", "implement-one-shot", "implement-by-phase", "auto"}
+)
+
 # Discuss-mode debater failure policy values (#475).
 DISCUSS_DEBATER_FAILURE_MODES: frozenset[str] = frozenset({"fail", "partial"})
 DISCUSS_RESULT_MODES: frozenset[str] = frozenset({"triage", "answer"})
@@ -439,6 +446,9 @@ class AgentLoopConfig:
         ensure_no_model_arg_conflicts(self)
         if self.planning_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--planning-context-mode must be either 'full' or 'compact'.")
+        if self.plan_execution_mode not in PLAN_EXECUTION_MODES:
+            rendered = ", ".join(f"'{mode}'" for mode in sorted(PLAN_EXECUTION_MODES))
+            raise AgentLoopError(f"--plan-execution-mode must be one of: {rendered}.")
         if self.pr_review_context_mode not in {"full", "compact"}:
             raise AgentLoopError("--pr-review-context-mode must be either 'full' or 'compact'.")
         if self.pr_review_policy not in PR_REVIEW_POLICIES:

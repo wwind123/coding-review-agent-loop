@@ -238,6 +238,7 @@ from .protocol import (
     failed_discuss_answer_placeholder,
     is_failed_discuss_response,
     ParsedPlanReview,
+    ExecutionStrategyRecommendation,
     PlanReviewItems,
     ParsedReview,
     PUBLIC_RESPONSE_MARKER,
@@ -3695,6 +3696,25 @@ class _TerminalIssueImplementationConflict:
     parsed: StructuredIssueImplementation
 
 
+@dataclass(frozen=True)
+class ResolvedExecution:
+    """The single post-approval routing decision.
+
+    ``requested_policy`` records the caller's intent, while ``action`` is the
+    canonical downstream action.  In particular, ``auto`` is never itself a
+    topology or dispatch mode after this boundary.
+    """
+
+    requested_policy: str
+    action: str
+    strategy: str | None
+    recommendation: ExecutionStrategyRecommendation | None
+
+    @property
+    def is_automatic(self) -> bool:
+        return self.requested_policy == "auto"
+
+
 def _validate_issue_implementation_contract(
     parsed: StructuredIssueImplementation,
     *,
@@ -4593,37 +4613,193 @@ def _current_execution_recommendation(
     )
 
 
+def _normalize_requested_execution_policy(
+    config: AgentLoopConfig,
+    *,
+    requested_policy: str | None = None,
+    implement_after_approval: bool = False,
+) -> str:
+    """Return the one requested policy before any reviewed strategy exists.
+
+    The historical boolean remains accepted at the Python API boundary for
+    callers that have not migrated, but it is only an alias for one-shot
+    execution.  It cannot become a second routing input alongside ``auto``.
+    """
+    requested = requested_policy or config.plan_execution_mode or "plan-only"
+    if implement_after_approval:
+        if requested not in {"plan-only", "implement-one-shot"}:
+            raise AgentLoopError(
+                "--implement-after-approval is only a one-shot alias and cannot be "
+                f"combined with requested policy `{requested}`."
+            )
+        return "implement-one-shot"
+    return requested
+
+
 def _resolve_execution_policy(
     config: AgentLoopConfig,
     *,
-    implement_after_approval: bool,
-    recommendation,
-) -> tuple[str, str | None]:
-    """Resolve requested policy against the one reviewed fresh strategy."""
-    requested = (
-        "implement-one-shot"
-        if implement_after_approval
-        else config.plan_execution_mode
+    requested_policy: str | None = None,
+    implement_after_approval: bool = False,
+    recommendation: ExecutionStrategyRecommendation | None,
+) -> ResolvedExecution:
+    """Resolve one requested policy against one reviewed recommendation.
+
+    This is the approval-bound routing seam.  Before approval, ``auto`` is
+    only metadata in the prompt/configuration; after approval it must resolve
+    to one of the concrete actions consumed by every downstream branch.
+    """
+    requested = _normalize_requested_execution_policy(
+        config,
+        requested_policy=requested_policy,
+        implement_after_approval=implement_after_approval,
     )
     if recommendation is None:
-        return requested, None
+        if requested == "auto":
+            raise AgentLoopError(
+                "Automatic execution policy requires a fresh reviewed execution "
+                "recommendation; the approved plan is legacy-undecided. Re-run plan-first "
+                "planning to produce a reviewed revision. No approval-bound work was published."
+            )
+        return ResolvedExecution(
+            requested_policy=requested,
+            action=requested,
+            strategy=None,
+            recommendation=None,
+        )
+    if requested == "auto":
+        action = (
+            "implement-one-shot"
+            if recommendation.strategy == "one-shot"
+            else "implement-by-phase"
+        )
+        return ResolvedExecution(
+            requested_policy=requested,
+            action=action,
+            strategy=recommendation.strategy,
+            recommendation=recommendation,
+        )
     if requested == "plan-only":
-        # Plan-only remains a non-executing audit/split mode for both
-        # recommendations and deliberately does not create a decision record.
-        return requested, recommendation.strategy
+        # Plan-only remains a non-executing audit mode for both strategies.
+        return ResolvedExecution(
+            requested_policy=requested,
+            action=requested,
+            strategy=recommendation.strategy,
+            recommendation=recommendation,
+        )
     allowed = (
         {"implement-one-shot"}
         if recommendation.strategy == "one-shot"
         else {"decompose-only", "implement-by-phase"}
     )
     if requested not in allowed:
-        expected = "implement-one-shot" if recommendation.strategy == "one-shot" else "decompose-only or implement-by-phase"
+        expected = (
+            "implement-one-shot"
+            if recommendation.strategy == "one-shot"
+            else "decompose-only or implement-by-phase"
+        )
         raise AgentLoopError(
             "Fresh execution policy is incompatible with the approved execution strategy: "
             f"strategy `{recommendation.strategy}` cannot run requested policy `{requested}`; "
             f"use `{expected}` or rerun plan-only. No approval-bound work was published."
         )
-    return requested, recommendation.strategy
+    return ResolvedExecution(
+        requested_policy=requested,
+        action=requested,
+        strategy=recommendation.strategy,
+        recommendation=recommendation,
+    )
+
+
+def _print_dry_run_execution_preview(
+    *,
+    issue_number: int,
+    resolved: ResolvedExecution,
+    normalized_topology,
+) -> None:
+    """Render an approval-bound preview without entering a mutation branch."""
+    print(
+        f"Issue #{issue_number} dry-run preview: requested policy "
+        f"`{resolved.requested_policy}` resolves to `{resolved.action}`."
+    )
+    if resolved.action == "implement-one-shot":
+        print(
+            "One-shot implementation would be selected; no approval record, follow-up, "
+            "handoff, coder, or PR work was performed."
+        )
+        return
+    if resolved.action != "implement-by-phase" or normalized_topology is None:
+        print("No implementation dispatch is selected by this preview.")
+        return
+
+    decomposition, retained_parent_scope = normalized_topology
+    print("Approved child topology (preview only; no child issues will be created):")
+    for phase in decomposition.phases:
+        dependencies = ", ".join(phase.depends_on_stage_ids) or "none"
+        covered = ", ".join(phase.covered_scope_item_ids) or "none"
+        print(
+            f"{phase.position}. {phase.stage_id}: {phase.title} "
+            f"[{phase.automation}]; depends on: {dependencies}; covers: {covered}"
+        )
+    first = decomposition.phases[0] if decomposition.phases else None
+    if first is None:
+        print("No first phase is available; dispatch is skipped.")
+    elif first.automation == "agent-pr":
+        print(
+            f"First-phase dispatch for `{first.stage_id}` is skipped in dry-run; "
+            "the parent remains open."
+        )
+    else:
+        print(
+            f"First-phase dispatch is skipped because `{first.stage_id}` requires "
+            f"{first.automation}; the parent remains open."
+        )
+    remaining = [phase.stage_id for phase in decomposition.phases[1:]]
+    print(f"Remaining child work: {', '.join(remaining) or 'none'}.")
+    print(
+        "Retained-parent obligations: "
+        f"{retained_parent_scope.status}; final-integration obligations: "
+        f"{decomposition.final_integration_work.status}."
+    )
+
+
+def _print_execution_resolution_summary(
+    *,
+    issue_number: int,
+    resolved: ResolvedExecution,
+    normalized_topology,
+) -> None:
+    """Report the approval-bound action and the work it leaves behind."""
+    print(
+        f"Issue #{issue_number}: requested policy `{resolved.requested_policy}`; "
+        f"resolved action `{resolved.action}`."
+    )
+    if normalized_topology is None:
+        print("Remaining child work: none.")
+        recommendation = resolved.recommendation
+        retained_status = (
+            recommendation.retained_parent_work.status
+            if recommendation is not None
+            else "none"
+        )
+        final_status = (
+            recommendation.final_integration_work.status
+            if recommendation is not None
+            else "none"
+        )
+        print(
+            "Retained-parent obligations: "
+            f"{retained_status}; final-integration obligations: {final_status}."
+        )
+        return
+    decomposition, retained_parent_scope = normalized_topology
+    remaining = [phase.stage_id or str(phase.position) for phase in decomposition.phases]
+    print(f"Remaining child work: {', '.join(remaining) or 'none'}.")
+    print(
+        "Retained-parent obligations: "
+        f"{retained_parent_scope.status}; final-integration obligations: "
+        f"{decomposition.final_integration_work.status}."
+    )
 
 
 def _persist_execution_decision_if_needed(
@@ -4635,7 +4811,14 @@ def _persist_execution_decision_if_needed(
     issue_comments: Sequence[object],
     recommendation,
     requested_policy: str,
+    resolved_execution: ResolvedExecution | None = None,
 ) -> None:
+    if resolved_execution is not None:
+        recommendation = resolved_execution.recommendation
+        requested_policy = resolved_execution.requested_policy
+        current_action = resolved_execution.action
+    else:
+        current_action = requested_policy
     if recommendation is None or requested_policy == "plan-only" or config.dry_run:
         return
     plan_hash = approved_plan_hash(current_plan)
@@ -4650,7 +4833,7 @@ def _persist_execution_decision_if_needed(
         topology_source=str(identity["topology_source"]),
         recommendation_digest=str(identity["recommendation_sha256"]),
         requested_policy=requested_policy,
-        current_action=requested_policy,
+        current_action=current_action,
         stage_ids=tuple(stage.stage_id for stage in recommendation.child_stages),
         scope_item_ids=tuple(item.scope_item_id for item in recommendation.scope_items),
         retained_parent_status=recommendation.retained_parent_work.status,
@@ -4698,6 +4881,24 @@ def _preflight_fresh_staged_topology(
         strategy="staged",
         recommendation_digest=decomposition.recommendation_digest,
     )
+    existing_pr = resolve_canonical_pr_for_issue(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        issue_context=issue_context,
+        expected_fallback_scope=IssuePrProvenanceScope(
+            repository=config.repo,
+            issue_number=issue_number,
+            flow="approved",
+            approved_plan_hash=plan_hash,
+        ),
+    )
+    if existing_pr is not None:
+        raise AgentLoopError(
+            "Fresh staged execution conflicts with an existing implementation PR "
+            f"#{existing_pr.pr_number}; resume that one-shot implementation or repair "
+            "the staged topology before rerunning."
+        )
     reject_legacy_topology_collision(
         issue_context.comments,
         parent_issue=issue_number,
@@ -4884,39 +5085,54 @@ def _preflight_fresh_split_topology(
     issue_number: int,
     config: AgentLoopConfig,
     issue_context: IssueContext,
+    allowed_keys: frozenset[str] = frozenset(),
 ) -> None:
-    """Reject split state before a fresh one-shot decision can be published.
+    """Reject unrelated split state before a fresh one-shot decision is used.
 
     The parent comment is the normal materialization record, but a crash can
     occur after a split child is filed and before that cumulative record is
     posted.  Search both historical child-title forms as a read-only recovery
     pass so one-shot execution cannot race an orphaned split child into a
-    second topology.
+    second topology.  A one-shot plan may intentionally retain the historical
+    split-materialization option; in that case only children whose normalized
+    stage keys are part of this approved request are recoverable.
     """
     materialization = find_existing_split_materialization(
         issue_context.comments,
         parent_issue=issue_number,
     )
     if materialization is not None and materialization.children:
-        raise AgentLoopError(
-            "Fresh one-shot execution conflicts with an existing split materialization; "
-            "resume the split topology or repair it before rerunning."
-        )
+        materialized_keys = tuple(child.key for child in materialization.children)
+        if (
+            len(set(materialized_keys)) != len(materialized_keys)
+            or any(key not in allowed_keys for key in materialized_keys)
+        ):
+            raise AgentLoopError(
+                "Fresh one-shot execution conflicts with an existing split materialization "
+                "that is unrelated or ambiguous; resume the split topology or repair it "
+                "before rerunning."
+            )
 
+    comment_keys: set[str] = set()
     for comment in issue_context.comments:
         body = getattr(comment, "body", None)
         if isinstance(body, str):
             marker = SPLIT_CHILD_MARKER_RE.search(body)
             if marker is not None and int(marker.group("parent")) == issue_number:
-                raise AgentLoopError(
-                    "Fresh one-shot execution conflicts with an existing split child; "
-                    "resume the split topology or repair it before rerunning."
-                )
+                key = marker.group("key")
+                if key not in allowed_keys or key in comment_keys:
+                    raise AgentLoopError(
+                        "Fresh one-shot execution conflicts with an existing split child "
+                        "that is unrelated or ambiguous; resume the split topology or repair "
+                        "it before rerunning."
+                    )
+                comment_keys.add(key)
 
     searches = (
         f'"(from #{issue_number})" in:title',
         f'"[#{issue_number} stage]" in:title',
     )
+    found_keys: dict[str, tuple[int | None, str | None]] = {}
     for search in searches:
         for candidate in search_issues(
             runner,
@@ -4933,10 +5149,60 @@ def _preflight_fresh_split_topology(
                 and candidate.title.startswith(f"[#{issue_number} stage] ")
             )
             if marker_matches or title_matches:
-                raise AgentLoopError(
-                    "Fresh one-shot execution conflicts with an existing split child; "
-                    "resume the split topology or repair it before rerunning."
+                key = (
+                    marker.group("key")
+                    if marker_matches
+                    else split_stage_proposal_from_text(
+                        candidate.title[len(f"[#{issue_number} stage] ") :]
+                    ).key
                 )
+                if key not in allowed_keys:
+                    raise AgentLoopError(
+                        "Fresh one-shot execution conflicts with an existing split child "
+                        "that is unrelated; resume the split topology or repair it before "
+                        "rerunning."
+                    )
+                identity = (candidate.number, candidate.url)
+                previous = found_keys.get(key)
+                if previous is not None and previous != identity:
+                    raise AgentLoopError(
+                        "Ambiguous split-child recovery: multiple child issues match an "
+                        "approved one-shot split stage."
+                    )
+                found_keys[key] = identity
+
+
+def _approved_one_shot_split_keys(
+    current_plan: str,
+    *,
+    issue_context: IssueContext,
+    config: AgentLoopConfig,
+) -> frozenset[str]:
+    """Return the legacy split identities owned by this approved one-shot.
+
+    Fresh execution recommendations intentionally do not use the legacy split
+    seam for their own child topology.  They can, however, coexist with the
+    explicitly supported ``--materialize-split-issues`` option, which handles
+    legacy deferred stages and prior discuss split proposals.  Keep this
+    derivation in lockstep with ``_handle_plan_first_split_scope`` so a rerun
+    adopts exactly what the first run was allowed to materialize.
+    """
+    current_child_stages = _extract_current_child_stages(current_plan)
+    current_deferred_stages = _extract_current_deferred_stages(current_plan)
+    prior_discuss_proposals = _prior_discuss_split_proposals(issue_context, config=config)
+    if current_child_stages or current_deferred_stages:
+        plan_own_key = split_stage_proposal_from_text(_plan_first_line(current_plan)).key
+        prior_discuss_proposals = [
+            proposal
+            for proposal in prior_discuss_proposals
+            if split_stage_proposal_from_text(proposal).key != plan_own_key
+        ]
+    proposals = dedupe_split_stage_proposals(
+        [split_stage_proposal_from_deferred_stage(stage) for stage in current_child_stages]
+        + [split_stage_proposal_from_deferred_stage(stage) for stage in current_deferred_stages]
+        + [split_stage_proposal_from_text(proposal) for proposal in prior_discuss_proposals]
+    )
+    return frozenset(proposal.key for proposal in proposals)
 
 
 def _preflight_fresh_one_shot_recovery(
@@ -4970,6 +5236,11 @@ def _preflight_fresh_one_shot_recovery(
         issue_number=issue_number,
         config=config,
         issue_context=issue_context,
+        allowed_keys=_approved_one_shot_split_keys(
+            approved_plan,
+            issue_context=issue_context,
+            config=config,
+        ),
     )
     parent_summaries = find_decompositions_for_parent(
         issue_context.comments, parent_issue=issue_number
@@ -5116,6 +5387,7 @@ def _handle_plan_first_split_scope(
     plan_subject: str,
     issue_context: IssueContext,
     execution_mode: str | None = None,
+    resolved_execution: ResolvedExecution | None = None,
 ) -> bool | NeedsHumanDecision:
     """Materialize (or warn about) split/deferred stages before implementation
     handoff (#476), so a plan-first run that narrows scope to one stage cannot
@@ -5128,10 +5400,38 @@ def _handle_plan_first_split_scope(
     `issue_context.comments` snapshot predates this call and would otherwise
     look stale and hide children materialized moments earlier in this same run.
     """
+    # Only a fresh staged recommendation owns this seam.  Fresh one-shot plans
+    # still need the historical discuss/deferred split guard: those proposals
+    # are not represented by the one-shot topology and must not be silently
+    # dropped when materialization was explicitly requested.
+    recommendation = (
+        resolved_execution.recommendation
+        if resolved_execution is not None
+        else None
+    )
+    if resolved_execution is None:
+        try:
+            recommendation = _current_execution_recommendation(
+                current_plan, issue_context.comments
+            )
+            if recommendation is not None and recommendation.strategy == "staged":
+                return False
+        except AgentLoopError:
+            # The approval boundary performs the authoritative recommendation
+            # validation.  Preserve the historical split warning behavior if a
+            # direct legacy caller supplies malformed, non-fresh text.
+            pass
+    elif recommendation is not None and recommendation.strategy == "staged":
+        return False
+
     # Decomposition modes have exactly one topology source and are dispatched
     # below.  Keeping split materialization out of this seam prevents typed
     # stages from being filed once here and again by the decomposition path.
-    effective_mode = execution_mode or config.plan_execution_mode
+    effective_mode = (
+        resolved_execution.action
+        if resolved_execution is not None
+        else execution_mode or config.plan_execution_mode
+    )
     if effective_mode in {"decompose-only", "implement-by-phase"}:
         return False
 
@@ -6112,7 +6412,8 @@ def _run_plan_first_loop(
     config: AgentLoopConfig,
     memory,
     issue_context: IssueContext,
-    implement_after_approval: bool,
+    requested_policy: str | None = None,
+    implement_after_approval: bool = False,
     usage_context: RunUsageContext,
 ) -> int:
     if config.review_parallel:
@@ -6926,15 +7227,17 @@ def _run_plan_first_loop(
                 expected_hash=plan_hash,
                 expected_subject=plan_subject,
             )
-            mode = config.plan_execution_mode
             recommendation = _current_execution_recommendation(
                 current_plan, issue_context.comments
             )
-            mode, canonical_strategy = _resolve_execution_policy(
+            resolved_execution = _resolve_execution_policy(
                 config,
+                requested_policy=requested_policy,
                 implement_after_approval=implement_after_approval,
                 recommendation=recommendation,
             )
+            mode = resolved_execution.action
+            canonical_strategy = resolved_execution.strategy
             normalized_topology = None
             if recommendation is not None and canonical_strategy == "staged":
                 normalized_topology = normalize_execution_recommendation(
@@ -6981,6 +7284,19 @@ def _run_plan_first_loop(
                     "carried through split/decomposition materialization. Invoke the actual "
                     "child issue with a child-scoped --expected-closing-issue declaration."
                 )
+            if recommendation is not None:
+                _print_execution_resolution_summary(
+                    issue_number=issue_number,
+                    resolved=resolved_execution,
+                    normalized_topology=normalized_topology,
+                )
+            if config.dry_run and resolved_execution.is_automatic:
+                _print_dry_run_execution_preview(
+                    issue_number=issue_number,
+                    resolved=resolved_execution,
+                    normalized_topology=normalized_topology,
+                )
+                return 0
             _persist_execution_decision_if_needed(
                 runner,
                 config=config,
@@ -6988,7 +7304,8 @@ def _run_plan_first_loop(
                 current_plan=current_plan,
                 issue_comments=issue_context.comments,
                 recommendation=recommendation,
-                requested_policy=mode,
+                requested_policy=resolved_execution.requested_policy,
+                resolved_execution=resolved_execution,
             )
             _publish_plan_approved_followups(
                 runner,
@@ -7017,6 +7334,7 @@ def _run_plan_first_loop(
                 plan_subject=plan_subject,
                 issue_context=issue_context,
                 execution_mode=mode,
+                resolved_execution=resolved_execution,
             )
             if isinstance(split_scope_materialized, NeedsHumanDecision):
                 print(json.dumps(split_scope_materialized.as_dict(), sort_keys=True))
@@ -7060,6 +7378,14 @@ def _run_plan_first_loop(
                         f"{', '.join(final_integration.acceptance_criteria) or 'none'}; "
                         "covered scope items: "
                         f"{', '.join(final_integration.covered_scope_item_ids) or 'none'}"
+                    )
+                    remaining_stage_ids = tuple(
+                        phase.stage_id or str(phase.position)
+                        for phase in normalized_topology[0].phases[1:]
+                    )
+                    print(
+                        "Remaining child work after the first phase: "
+                        f"{', '.join(remaining_stage_ids) or 'none'}"
                     )
                 if mode == "decompose-only":
                     print(f"Issue #{issue_number} approved plan decomposed into child issues.")
@@ -7551,11 +7877,22 @@ def run_issue_loop(
     config: AgentLoopConfig,
     plan_first: bool = False,
     implement_after_approval: bool = False,
+    requested_policy: str | None = None,
     usage_context: RunUsageContext | None = None,
 ) -> int:
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     try:
+        requested_policy = _normalize_requested_execution_policy(
+            config,
+            requested_policy=requested_policy,
+            implement_after_approval=implement_after_approval,
+        )
+        if config.plan_execution_mode != requested_policy:
+            # Keep prompt construction and all pre-approval reads aligned with
+            # the one normalized requested policy.  The reviewed recommendation
+            # is still resolved only at the approval boundary.
+            config = dataclasses_replace(config, plan_execution_mode=requested_policy)
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(runner, config)
@@ -7637,6 +7974,64 @@ def run_issue_loop(
             ),
         )
         if resolved_pr is not None:
+            recovered_execution: ResolvedExecution | None = None
+            recovered_topology = None
+            if plan_first:
+                recovered_recommendation = None
+                if recovered_plan_context is not None and recovered_plan_context.canonical_text:
+                    recovered_recommendation = _current_execution_recommendation(
+                        recovered_plan_context.canonical_text,
+                        issue_context.comments,
+                    )
+                # Existing explicit modes retain their historical recovery for
+                # legacy plans.  A fresh recommendation, however, is an
+                # approval-bound contract and must pass the same policy and
+                # topology checks as the initial implementation route.
+                recovered_execution = _resolve_execution_policy(
+                    config,
+                    requested_policy=requested_policy,
+                    recommendation=recovered_recommendation,
+                )
+                if (
+                    recovered_execution.recommendation is not None
+                    and recovered_execution.strategy == "staged"
+                ):
+                    if recovered_plan_context is None or not recovered_plan_context.canonical_text:
+                        raise AgentLoopError(
+                            "Fresh staged execution recovery has no reconstructable approved plan; "
+                            "repair the handoff or rerun plan-first planning before resuming."
+                        )
+                    recovered_topology = normalize_execution_recommendation(
+                        recovered_execution.recommendation,
+                        approved_plan=recovered_plan_context.canonical_text or "",
+                        plan_subject=_plan_subject(recovered_plan_context.canonical_text or ""),
+                    )
+                    _preflight_fresh_staged_topology(
+                        runner,
+                        issue_number=issue_number,
+                        approved_plan=recovered_plan_context.canonical_text or "",
+                        config=config,
+                        issue_context=issue_context,
+                        mode=recovered_execution.action,
+                        normalized_topology=recovered_topology,
+                    )
+                elif (
+                    recovered_execution.recommendation is not None
+                    and recovered_execution.strategy == "one-shot"
+                ):
+                    if recovered_plan_context is None or not recovered_plan_context.canonical_text:
+                        raise AgentLoopError(
+                            "Fresh one-shot execution recovery has no reconstructable approved plan; "
+                            "repair the handoff or rerun plan-first planning before resuming."
+                        )
+                    _preflight_fresh_one_shot_recovery(
+                        runner,
+                        issue_number=issue_number,
+                        approved_plan=recovered_plan_context.canonical_text or "",
+                        config=config,
+                        issue_context=issue_context,
+                        recommendation=recovered_execution.recommendation,
+                    )
             closing_contract = resolve_issue_contract(
                 primary_issue=issue_number,
                 cli_additions=config.expected_closing_issue_ids,
@@ -7655,19 +8050,47 @@ def run_issue_loop(
                 expected_closing_contract_resolved=True,
             )
             resolved_metadata = resolved_pr.metadata
-            if plan_first and resolved_pr.source == "canonical" and resolved_metadata is not None:
-                if (
-                    resolved_metadata.flow == "approved-plan-implementation"
-                    and recovered_plan_hash is not None
-                    and resolved_metadata.plan_hash != recovered_plan_hash
-                ):
-                    raise AgentLoopError(
-                        f"Canonical approved-plan handoff for issue #{issue_number} points to "
-                        f"PR #{resolved_pr.pr_number} with plan hash {resolved_metadata.plan_hash}, "
-                        f"but the reconstructable approved plan has hash {recovered_plan_hash}. "
-                        f"Review the recorded PR with `agent-loop pr {resolved_pr.pr_number}` or "
-                        "remove the stale handoff marker before rerunning issue mode."
+            if (
+                plan_first
+                and resolved_pr.source == "canonical"
+                and resolved_metadata is not None
+                and resolved_metadata.flow == "approved-plan-implementation"
+                and recovered_plan_hash is not None
+                and resolved_metadata.plan_hash != recovered_plan_hash
+            ):
+                raise AgentLoopError(
+                    f"Canonical approved-plan handoff for issue #{issue_number} points to "
+                    f"PR #{resolved_pr.pr_number} with plan hash {resolved_metadata.plan_hash}, "
+                    f"but the reconstructable approved plan has hash {recovered_plan_hash}. "
+                    f"Review the recorded PR with `agent-loop pr {resolved_pr.pr_number}` or "
+                    "remove the stale handoff marker before rerunning issue mode."
+                )
+            if recovered_execution is not None:
+                if recovered_execution.recommendation is not None:
+                    _print_execution_resolution_summary(
+                        issue_number=issue_number,
+                        resolved=recovered_execution,
+                        normalized_topology=recovered_topology,
                     )
+                if config.dry_run:
+                    _print_dry_run_execution_preview(
+                        issue_number=issue_number,
+                        resolved=recovered_execution,
+                        normalized_topology=recovered_topology,
+                    )
+                    return 0
+                if recovered_plan_context is not None and recovered_plan_context.canonical_text:
+                    _persist_execution_decision_if_needed(
+                        runner,
+                        config=config,
+                        issue_number=issue_number,
+                        current_plan=recovered_plan_context.canonical_text,
+                        issue_comments=issue_context.comments,
+                        recommendation=recovered_execution.recommendation,
+                        requested_policy=recovered_execution.requested_policy,
+                        resolved_execution=recovered_execution,
+                    )
+            if plan_first and resolved_pr.source == "canonical" and resolved_metadata is not None:
                 if resolved_metadata.flow == "approved-plan-implementation" and recovered_plan_hash is None:
                     log(
                         config,
@@ -7682,6 +8105,16 @@ def run_issue_loop(
                     "Issue-mode plan-first recovery cannot invent plan provenance; review the PR "
                     f"directly with `agent-loop pr {resolved_pr.pr_number}` or rerun direct issue mode."
                 )
+            if (
+                recovered_execution is not None
+                and recovered_execution.recommendation is not None
+                and recovered_execution.action == "plan-only"
+            ):
+                print(
+                    f"Issue #{issue_number} plan-first recovery resolved to plan-only; "
+                    f"PR #{resolved_pr.pr_number} review was not started."
+                )
+                return 0
             log(
                 config,
                 f"Issue #{issue_number}: resuming PR #{resolved_pr.pr_number} review instead of "
@@ -7765,6 +8198,7 @@ def run_issue_loop(
                 config=config,
                 memory=memory,
                 issue_context=issue_context,
+                requested_policy=requested_policy,
                 implement_after_approval=implement_after_approval,
                 usage_context=usage_context,
             )

@@ -25,8 +25,11 @@ compatibility constraints, and caveats.
 
 The recommendation is executable only through an explicit policy compatible
 with its canonical strategy. `one-shot` permits `implement-one-shot`; `staged`
-permits `decompose-only` or `implement-by-phase`. Incompatible fresh pairs stop
-before approval-bound writes. A compact execution decision records the approved
+permits `decompose-only` or `implement-by-phase`. The opt-in `auto` policy is
+resolved only after approval: `one-shot` selects `implement-one-shot`, while
+`staged` selects `implement-by-phase`. Legacy-undecided plans stop with an
+actionable request for a reviewed revision, and incompatible explicit pairs
+fail closed before approval-bound writes. A compact execution decision records the approved
 plan identity and full recommendation digest, while the complete recommendation
 and any bounded transport sidecars remain the recovery source. Fresh topology
 summaries, child identities, and handoffs are keyed by strategy `staged`, source
@@ -34,8 +37,7 @@ summaries, child identities, and handoffs are keyed by strategy `staged`, source
 legacy records keep their exact historical mode/source lookup and serializer.
 Plan-only retains its existing approved-follow-up audit record, explicit split
 materialization, and unfiled-scope warning, but creates no fresh decision,
-canonical topology, phase-child handoff, or dispatch. Automatic strategy
-selection remains downstream in #787. Old unversioned comments and two-field
+canonical topology, phase-child handoff, or dispatch. Old unversioned comments and two-field
 typed stages remain legacy-undecided. A bounded repair can only reformat a
 complete recoverable v1 source; missing or partial strategy data requires a new
 planner turn.
@@ -353,6 +355,7 @@ agent-loop issue 56 --repo OWNER/REPO --plan-first --plan-execution-mode plan-on
 agent-loop issue 56 --repo OWNER/REPO --plan-first --plan-execution-mode decompose-only
 agent-loop issue 56 --repo OWNER/REPO --plan-first --plan-execution-mode implement-one-shot
 agent-loop issue 56 --repo OWNER/REPO --plan-first --plan-execution-mode implement-by-phase
+agent-loop issue 56 --repo OWNER/REPO --plan-first --plan-execution-mode auto
 ```
 
 The modes are:
@@ -371,10 +374,34 @@ The modes are:
   after that handoff do not re-run the child and should be resumed directly with
   `agent-loop issue <child>`. Older decomposition summaries without this marker
   are treated as not yet handed off, so the first child handoff is recorded once.
+- `auto`: after approval, resolve a fresh reviewed recommendation to
+  `implement-one-shot` or `implement-by-phase`. A legacy-undecided plan is
+  refused, and the CLI rejects `--materialize-split-issues` and `--split-stage`
+  because neither topology is known before approval. With `--dry-run`, the
+  resolved action and normalized staged topology are previewed without a
+  decision record, child issue, handoff, coder, PR, or follow-up mutation.
 
 `decompose-only` and `implement-by-phase` already select one detailed child
 topology. The CLI rejects `--materialize-split-issues` with either mode before
-any GitHub write.
+any GitHub write, and rejects both split flags with `auto` before planning.
+
+At the approval boundary, routing follows this matrix:
+
+| Requested policy | Fresh one-shot recommendation | Fresh staged recommendation | Legacy-undecided plan |
+| --- | --- | --- | --- |
+| `plan-only` | Stop without execution | Stop without execution | Stop without execution |
+| `implement-one-shot` | Implement one shot | Reject before mutation | Use the historical explicit path only |
+| `decompose-only` | Reject before mutation | Decompose and stop | Use the historical explicit path only |
+| `implement-by-phase` | Reject before mutation | Create topology and dispatch only the first eligible phase | Use the historical explicit path only |
+| `auto` | Resolve to `implement-one-shot` | Resolve to `implement-by-phase` | Stop and request a reviewed revision |
+
+For a non-dry run, read-only recovery and expected-closing validation complete
+before the durable execution decision is posted. Follow-ups, split or phase
+children, handoffs, coder dispatch, and PR work occur only after that decision.
+The same identity checks apply when resuming a decision, partial topology,
+handoff, or PR association; a mismatch fails closed. `--dry-run` resolves and
+reports `auto` using the same checks, but persists no decision and performs no
+approval-bound mutation.
 
 Before invoking a coder for an issue — in direct `agent-loop issue <n>` mode or
 approved-plan implementation alike — the orchestrator resolves the canonical
@@ -1153,11 +1180,12 @@ before any write. Pick the row that matches your situation:
 | Approved detailed staged plan with phase contracts | `--plan-execution-mode decompose-only` |
 | Same plan, but implement only the first phase now | `--plan-execution-mode implement-by-phase` |
 | Approved plan you want implemented as a single PR, no phase breakdown | `--plan-execution-mode implement-one-shot` (or `--implement-after-approval`) |
+| Approved plan whose reviewed recommendation should choose the topology | `--plan-execution-mode auto` |
 | Plan review only, no implementation, no detailed child issues | `--plan-execution-mode plan-only` (the default) |
 | Discuss `split` consensus, or plan-only deferred work with no detailed phase decomposition | `--materialize-split-issues` |
 
 **Do not combine `--materialize-split-issues` with `--plan-execution-mode
-decompose-only` or `implement-by-phase`.** The CLI rejects the combination
+decompose-only`, `implement-by-phase`, or `auto`.** The CLI rejects the combination
 before a checkpoint or child create. `decompose-only` uses typed child stages
 directly when present and otherwise invokes one model decomposition; it never
 materializes a competing topology.
@@ -1169,7 +1197,10 @@ What each mechanism produces and where the run stops:
   `--materialize-split-issues` is also passed, generic split children are
   still filed even in `plan-only`, because that materialization step runs
   before the mode is dispatched — `plan-only` only skips decomposition and
-  implementation, not split materialization.
+  implementation, not legacy split materialization. A fresh v1 staged
+  recommendation owns its complete topology, so it remains inert at that
+  legacy seam; a fresh v1 one-shot recommendation preserves the historical
+  split-materialization behavior.
 - **`decompose-only`**: uses typed `child_stages` directly when present;
   otherwise it validates one model decomposition. The complete topology is
   checked against the shared default cap of 15 (override with
@@ -1182,7 +1213,14 @@ What each mechanism produces and where the run stops:
   compact canonical execution decision before child creation, and reuses the
   same summary when a later explicit staged policy resumes. A one-shot
   recommendation cannot be sent through a decomposition policy, and a staged
-  recommendation cannot be sent through one-shot implementation.
+  recommendation cannot be sent through one-shot implementation. `auto` maps
+  these strategies to their compatible concrete actions after approval.
+- **`auto` dry-run**: performs read-only reconciliation and prints the resolved
+  action. Staged previews list the normalized children, first-phase eligibility,
+  remaining work, and retained/final-integration obligations; one-shot previews
+  state that implementation would be selected. It does not persist approval,
+  file follow-ups or children, create handoffs, invoke a coder, or open/update a
+  PR. A later non-dry run performs the persistence-first path once.
 - **`implement-by-phase`**: creates every phase child issue, records a
   one-time `AGENT_PLAN_PHASE_IMPLEMENTATION` handoff, then implements only the
   first `agent-pr` phase and stops after that phase's PR review loop. If the
@@ -1250,7 +1288,8 @@ Two worked examples:
 supported split-stage handoff flow described in [Split issue
 materialization](#split-issue-materialization) below. The warning here is
 scoped to `decompose-only` and `implement-by-phase` specifically, since only
-those two modes already create detailed per-phase children.
+those two modes already create detailed per-phase children. It cannot be
+combined with `auto`.
 
 Skill mode's `run-decompose` and `run-implement-by-phase` helper commands
 (see [`docs/skill_mode.md`](skill_mode.md)) drive the same

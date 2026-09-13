@@ -1,13 +1,23 @@
 import json
 import re
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
-from coding_review_agent_loop.comment_rendering import _render_public_issue_implementation_comment
-from coding_review_agent_loop.decomposition import approved_plan_hash, format_one_shot_impl_handoff_comment
+from coding_review_agent_loop.comment_rendering import (
+    _render_public_issue_implementation_comment,
+    render_canonical_plan_state,
+)
+from coding_review_agent_loop.decomposition import (
+    CreatedPhaseIssue,
+    RecordedPhase,
+    approved_plan_hash,
+    format_decomposition_parent_summary,
+    format_one_shot_impl_handoff_comment,
+)
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
@@ -53,6 +63,7 @@ from coding_review_agent_loop.protocol import (
     PlanReviewItems,
     ReviewItemDisposition,
     UnresolvedReviewItem,
+    validate_structured_plan_state,
     validate_structured_issue_implementation,
 )
 from coding_review_agent_loop.salvage import (
@@ -74,6 +85,274 @@ from agent_loop_helpers import (
     structured_pr_review,
     structured_issue_implementation,
 )
+
+
+def test_auto_execution_resolves_one_shot_after_approval(tmp_path):
+    config = make_config(tmp_path, plan_execution_mode="auto")
+    recommendation = validate_structured_plan_state(
+        structured_v1_plan_state()
+    ).execution_recommendation
+
+    resolved = orchestrator_module._resolve_execution_policy(
+        config,
+        recommendation=recommendation,
+    )
+
+    assert resolved.requested_policy == "auto"
+    assert resolved.action == "implement-one-shot"
+    assert resolved.strategy == "one-shot"
+
+
+def test_auto_execution_resolves_staged_after_approval(tmp_path):
+    config = make_config(tmp_path, plan_execution_mode="auto")
+    recommendation = validate_structured_plan_state(
+        structured_v1_plan_state()
+    ).execution_recommendation
+    staged_recommendation = replace(recommendation, strategy="staged")
+
+    resolved = orchestrator_module._resolve_execution_policy(
+        config,
+        recommendation=staged_recommendation,
+    )
+
+    assert resolved.requested_policy == "auto"
+    assert resolved.action == "implement-by-phase"
+    assert resolved.strategy == "staged"
+
+
+def test_auto_execution_rejects_legacy_undecided_plan(tmp_path):
+    config = make_config(tmp_path, plan_execution_mode="auto")
+
+    with pytest.raises(AgentLoopError, match="legacy-undecided"):
+        orchestrator_module._resolve_execution_policy(
+            config,
+            recommendation=None,
+        )
+
+
+def test_auto_legacy_plan_round_reaches_review_before_legacy_refusal(tmp_path):
+    """An in-flight legacy round must be revisable into the fresh contract."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_plan_state(summary="Historical plan without a strategy.")],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+
+    with pytest.raises(AgentLoopError, match="legacy-undecided"):
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, plan_execution_mode="auto"),
+            plan_first=True,
+        )
+
+    assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+
+
+def _fresh_staged_plan_for_recovery() -> tuple[str, str]:
+    raw = structured_v1_plan_state()
+    payload, end = json.JSONDecoder().raw_decode(raw.lstrip())
+    recommendation = payload["execution_recommendation"]
+    recommendation.update(
+        {
+            "strategy": "staged",
+            "staging_feasibility": "safe",
+            "scope_items": [
+                {
+                    "scope_item_id": "scope-1",
+                    "requirement": "Deliver the first stage.",
+                    "acceptance_criteria": ["The first stage passes."],
+                },
+                {
+                    "scope_item_id": "scope-2",
+                    "requirement": "Deliver the second stage.",
+                    "acceptance_criteria": ["The second stage passes."],
+                },
+            ],
+            "child_stages": [
+                {
+                    "stage_id": "stage-1",
+                    "position": 1,
+                    "title": "First stage",
+                    "summary": "Deliver the first stage.",
+                    "deliverables": ["First stage implementation."],
+                    "non_goals": [],
+                    "acceptance_criteria": ["The first stage passes."],
+                    "depends_on_stage_ids": [],
+                    "dependency_notes": "No dependencies.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "low",
+                    "compatibility_constraints": [],
+                    "covered_scope_item_ids": ["scope-1"],
+                },
+                {
+                    "stage_id": "stage-2",
+                    "position": 2,
+                    "title": "Second stage",
+                    "summary": "Deliver the second stage.",
+                    "deliverables": ["Second stage implementation."],
+                    "non_goals": [],
+                    "acceptance_criteria": ["The second stage passes."],
+                    "depends_on_stage_ids": ["stage-1"],
+                    "dependency_notes": "After stage-1.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "low",
+                    "compatibility_constraints": [],
+                    "covered_scope_item_ids": ["scope-2"],
+                },
+            ],
+        }
+    )
+    recommendation.pop("one_shot_delivery", None)
+    staged_raw = json.dumps(payload) + raw.lstrip()[end:]
+    parsed = validate_structured_plan_state(staged_raw, require_execution_strategy_contract=1)
+    canonical = render_canonical_plan_state(parsed)
+    return staged_raw, canonical
+
+
+@pytest.mark.parametrize(
+    "requested_policy, expected_error",
+    [
+        ("auto", "existing implementation PR"),
+        ("implement-one-shot", "incompatible"),
+        ("plan-only", "existing implementation PR"),
+    ],
+)
+def test_plan_first_pr_recovery_reconciles_fresh_strategy_before_resume(
+    tmp_path, requested_policy, expected_error
+):
+    raw_plan, canonical_plan = _fresh_staged_plan_for_recovery()
+    parsed = validate_structured_plan_state(raw_plan, require_execution_strategy_contract=1)
+    recommendation = parsed.execution_recommendation
+    assert recommendation is not None
+    plan_comment = _attach_round_metadata(
+        canonical_plan + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject=_plan_subject(canonical_plan),
+            canonical_plan=canonical_plan,
+            raw_structured_coder_response=raw_plan,
+            execution_strategy_contract_version=1,
+            execution_strategy_identity=recommendation.identity(),
+        ),
+    )
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=approved_plan_hash(canonical_plan),
+    )
+    runner = _FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:00Z", "body": plan_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:01Z", "body": handoff},
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+
+    with pytest.raises(AgentLoopError, match=expected_error):
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, plan_execution_mode=requested_policy),
+            plan_first=True,
+        )
+
+    assert not any(cmd[:1] == ["claude"] or cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
+
+
+def test_plan_first_plan_only_legacy_pr_recovery_still_reviews_without_plan_round(tmp_path):
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="issue-implementation",
+        plan_hash=None,
+    )
+    runner = _FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:00Z", "body": handoff}
+        ],
+        pr_payload={"body": "Fixes #56"},
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(tmp_path, plan_execution_mode="plan-only"),
+        plan_first=True,
+    ) == 0
+
+    assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+def test_plan_first_plan_only_reconciles_one_shot_against_staged_state(tmp_path):
+    canonical_plan = render_canonical_plan_state(
+        validate_structured_plan_state(structured_v1_plan_state())
+    )
+    plan_comment = _attach_round_metadata(
+        canonical_plan + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- Anthropic Claude",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject=_plan_subject(canonical_plan),
+            canonical_plan=canonical_plan,
+            raw_structured_coder_response=structured_v1_plan_state(),
+            execution_strategy_contract_version=1,
+            execution_strategy_identity=(
+                validate_structured_plan_state(structured_v1_plan_state())
+                .execution_recommendation.identity()
+            ),
+        ),
+    )
+    staged_summary = format_decomposition_parent_summary(
+        parent_issue=56,
+        mode="decompose-only",
+        plan_hash="old-plan-hash",
+        created=(
+            CreatedPhaseIssue(
+                phase=RecordedPhase(title="Existing stage", automation="agent-pr"),
+                issue_url="https://github.com/OWNER/REPO/issues/101",
+                issue_number=101,
+            ),
+        ),
+    )
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56,
+        pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha="abc123",
+        flow="approved-plan-implementation",
+        plan_hash=approved_plan_hash(canonical_plan),
+    )
+    runner = _FakeRunner(
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:00Z", "body": plan_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:01Z", "body": staged_summary},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:02Z", "body": handoff},
+        ],
+        pr_payload={"body": "Fixes #56"},
+    )
+
+    with pytest.raises(AgentLoopError, match="existing decomposition summary"):
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, plan_execution_mode="plan-only"),
+            plan_first=True,
+        )
+
+    assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
 
 
 def test_issue_resume_prompt_retains_configured_command_when_wrapper_probe_fails(
@@ -3040,7 +3319,12 @@ def test_issue_loop_plan_first_resume_uses_handoff_bound_plan_when_later_plan_ex
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
 
-    assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path), plan_first=True) == 0
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(tmp_path, plan_execution_mode="implement-one-shot"),
+        plan_first=True,
+    ) == 0
 
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
@@ -3133,7 +3417,12 @@ def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path,
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
 
-    assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path), plan_first=True) == 0
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+        plan_first=True,
+    ) == 0
 
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])

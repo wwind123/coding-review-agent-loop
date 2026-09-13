@@ -3012,7 +3012,7 @@ def test_plan_review_prompt_includes_phased_plan_guard_in_non_decompose_mode(tmp
         assert guard.strip() in prompt
 
 
-@pytest.mark.parametrize("mode", ["decompose-only", "implement-by-phase"])
+@pytest.mark.parametrize("mode", ["decompose-only", "implement-by-phase", "auto"])
 def test_plan_review_prompt_omits_phased_plan_guard_in_decompose_mode(tmp_path, mode):
     config = make_config(tmp_path, plan_execution_mode=mode)
     guard = _phased_plan_guard(config)
