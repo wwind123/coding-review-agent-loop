@@ -1819,6 +1819,7 @@ def _complete_reviewer_turn(
     approved_plan_hash: str | None = None,
     approved_plan_subject: str | None = None,
     gemini_cmd: str = "gemini",
+    architecture_identity: dict | None = None,
 ) -> dict:
     """Normalize, validate, render, parse, mint IDs, attach metadata, and post.
 
@@ -1955,6 +1956,21 @@ def _complete_reviewer_turn(
         if surfaced_requirement_ids
         else []
     )
+    architecture_identity_file = work_dir / f"{agent}-architecture-identity.json"
+    architecture_impact_file = work_dir / f"{agent}-architecture-impact.json"
+    architecture_identity_args: list[str] = []
+    if isinstance(architecture_identity, dict):
+        _write_json(architecture_identity_file, architecture_identity)
+        architecture_identity_args = [
+            "--architecture-identity-file", str(architecture_identity_file)
+        ]
+    raw_architecture_impact = review_json.get("architecture_impact")
+    architecture_impact_args: list[str] = []
+    if isinstance(raw_architecture_impact, dict):
+        _write_json(architecture_impact_file, raw_architecture_impact)
+        architecture_impact_args = [
+            "--architecture-impact-file", str(architecture_impact_file)
+        ]
 
     # --- Attach metadata ---
     _run_helper(
@@ -1973,6 +1989,8 @@ def _complete_reviewer_turn(
         *usage_args,
         *approved_plan_args,
         *requirement_args,
+        *architecture_identity_args,
+        *architecture_impact_args,
         "--architecture-contract-version", "1",
     )
 
@@ -2157,6 +2175,10 @@ def _run_reviewer(
                 else None
             ),
             gemini_cmd=gemini_cmd,
+            architecture_identity=(
+                context.get("architecture_identity")
+                if isinstance(context.get("architecture_identity"), dict) else None
+            ),
         )
     except _ValidationError as exc:
         # Distinguish an agent/CLI failure (no usable review -> skip this reviewer
@@ -3202,6 +3224,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
             # Build prompt
             issue_dict = _fetch_issue_json(repo, issue)
             workdir = _workdir_for_agent(reviewer, args)
+            skill_architecture = None
             try:
                 from helpers.prompt_builders import build_plan_review_prompt_for_skill
                 prompt_text = build_plan_review_prompt_for_skill(
@@ -3444,7 +3467,21 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
 
             workdir = _workdir_for_agent(reviewer, args)
             try:
-                from helpers.prompt_builders import build_review_prompt_for_skill
+                from helpers.prompt_builders import (
+                    _acquire_skill_architecture,
+                    build_review_prompt_for_skill,
+                    make_minimal_config,
+                )
+                skill_architecture_config = make_minimal_config(
+                    repo, reviewer, [reviewer], reviewer=reviewer, workdir=workdir,
+                    **_architecture_options(args),
+                )
+                skill_architecture = _acquire_skill_architecture(
+                    skill_architecture_config,
+                    workdir=workdir,
+                    target_revision=issue_dict.get("baseRefName"),
+                    candidate_revision=issue_dict.get("headRefOid"),
+                )
                 prompt_text = build_review_prompt_for_skill(
                     issue_dict,
                     pr_diff,
@@ -3468,6 +3505,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                     ),
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
                     architecture_options=_architecture_options(args),
+                    architecture_context=skill_architecture,
                 )
             except Exception as exc:  # noqa: BLE001
                 if (
@@ -3492,6 +3530,11 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 "prior_items": next_prior_items_raw,
                 "current_round_items": current_round_items,
                 "human_requirements": _serialize_human_requirements(human_requirements),
+                "architecture_identity": (
+                    skill_architecture.identity()
+                    if 'skill_architecture' in locals()
+                    and hasattr(skill_architecture, "identity") else None
+                ),
             }
 
             item_id_offset = _max_item_number([next_prior_items_raw, current_round_items])
@@ -4209,6 +4252,7 @@ def _run_child_or_one_shot_implementation(
             "--state", "approved",
             "--raw-structured-coder-response-file", str(raw_output),
             *( ["--local-test-evidence-file", str(evidence_file)] if evidence_file.exists() else [] ),
+            "--architecture-contract-version", "1",
         )
         tagged_with_contract = tmpdir / "impl-tagged-with-contract.md"
         _write_text(
@@ -4647,6 +4691,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             "--compact-prior-summaries-file", str(compact_prior_file),
             *raw_structured_arg,
             *( ["--local-test-evidence-file", str(evidence_file)] if evidence_file.exists() else [] ),
+            "--architecture-contract-version", "1",
         )
         if not dry_run:
             _run_helper(
