@@ -125,6 +125,71 @@ _VALID_PLAN_STATE = json.dumps({
     },
 }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
 
+
+def _fresh_staged_plan_state() -> str:
+    """Build a two-child fresh topology for live skill recovery tests."""
+    payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+    recommendation = payload["execution_recommendation"]
+    recommendation.update({
+        "strategy": "staged",
+        "rationale": "The two deliveries have independently verifiable boundaries.",
+        "staging_feasibility": "safe",
+        "scope_items": [
+            {
+                "scope_item_id": "scope-one",
+                "requirement": "Deliver the first boundary.",
+                "acceptance_criteria": ["The first boundary is verified."],
+            },
+            {
+                "scope_item_id": "scope-two",
+                "requirement": "Deliver the second boundary.",
+                "acceptance_criteria": ["The second boundary is verified."],
+            },
+        ],
+        "child_stages": [
+            {
+                "stage_id": "stage-one",
+                "position": 1,
+                "title": "First boundary",
+                "summary": "Deliver the first independently verifiable boundary.",
+                "deliverables": ["The first boundary."],
+                "non_goals": [],
+                "acceptance_criteria": ["The first boundary is verified."],
+                "depends_on_stage_ids": [],
+                "dependency_notes": "No dependencies.",
+                "automation": "agent-pr",
+                "rollout_risk": "low",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-one"],
+            },
+            {
+                "stage_id": "stage-two",
+                "position": 2,
+                "title": "Second boundary",
+                "summary": "Deliver the second independently verifiable boundary.",
+                "deliverables": ["The second boundary."],
+                "non_goals": [],
+                "acceptance_criteria": ["The second boundary is verified."],
+                "depends_on_stage_ids": ["stage-one"],
+                "dependency_notes": "After the first boundary.",
+                "automation": "agent-pr",
+                "rollout_risk": "medium",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-two"],
+            },
+        ],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+    })
+    recommendation.pop("one_shot_delivery", None)
+    return json.dumps(payload) + _VALID_PLAN_STATE[end:]
+
 _VALID_LEGACY_PLAN_STATE = json.dumps({
     "schema_version": 1,
     "kind": "plan_state",
@@ -4624,6 +4689,118 @@ class TestRunImplement:
             # Launcher base behavior is observable (not only the prompt text).
             assert "release-x" in result.stdout
 
+    def test_fresh_one_shot_entry_point_reuses_handoff_and_decision(self, monkeypatch, tmp_path, capsys) -> None:
+        """The live skill command must be idempotent across a fresh rerun."""
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.config as config_module
+        from agent_loop_helpers import FakeRunner
+        from coding_review_agent_loop.github import IssueComment, IssueContext
+
+        runner = FakeRunner(
+            issue_payload={"number": 77},
+            pr_payload={
+                "number": 5,
+                "state": "OPEN",
+                "body": "Fixes #77",
+                "headRefOid": "head-after",
+            },
+            git_head="head-before",
+        )
+        parent_bodies: list[str] = []
+        helper_calls: list[tuple[str, ...]] = []
+
+        def fake_fetch_comments(_repo: str, _issue: int) -> list[str]:
+            return [
+                *(entry["body"] if isinstance(entry, dict) else entry for entry in runner.issue_comments),
+                *parent_bodies,
+            ]
+
+        def fake_run_helper(*args: str, **_kwargs):
+            helper_calls.append(args)
+            if args[0] == "helpers.run_external":
+                Path(args[args.index("--output") + 1]).write_text(
+                    _IMPL_WITH_PR, encoding="utf-8"
+                )
+            elif args[:2] == ("helpers.state_manager", "attach-metadata"):
+                source = Path(args[args.index("--body-file") + 1])
+                Path(args[args.index("--output") + 1]).write_text(
+                    source.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+            elif args[:2] == ("helpers.gh_ops", "post-issue-comment"):
+                body = Path(args[args.index("--file") + 1]).read_text(encoding="utf-8")
+                if int(args[args.index("--issue") + 1]) == 77:
+                    parent_bodies.append(body)
+            return subprocess.CompletedProcess(args, 0)
+
+        monkeypatch.setattr(sr, "Runner", lambda dry_run=False: runner)
+        monkeypatch.setattr(sr, "_fetch_issue_comments_raw", fake_fetch_comments)
+        monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
+        # The implementation helper imports this function locally, so patch
+        # the owning module rather than adding a seam to the skill command.
+        monkeypatch.setattr(
+            config_module,
+            "sync_coder_base_before_implementation",
+            lambda *_args, **_kwargs: None,
+        )
+
+        # Use a stateful head probe: first invocation advances the assigned
+        # checkout; a reuse invocation must return before probing it again.
+        heads = iter(("head-before", "head-after"))
+        monkeypatch.setattr(sr, "_git_head", lambda _workdir: next(heads))
+        monkeypatch.setattr(
+            "coding_review_agent_loop.github.get_issue_context",
+            lambda _runner, *, config, issue_number: IssueContext(
+                number=issue_number,
+                repo=config.repo,
+                title="Issue",
+                body="Issue body",
+                url="https://github.com/test/skill-repo/issues/77",
+                comments=tuple(
+                    IssueComment(author="bot", created_at=None, body=body)
+                    for body in fake_fetch_comments(config.repo, issue_number)
+                ),
+                human_requirements=(),
+            ),
+        )
+        plan_file = tmp_path / "fresh-one-shot.md"
+        plan_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        args = types.SimpleNamespace(
+            issue=77,
+            repo="test/skill-repo",
+            coder="codex",
+            plan_file=str(plan_file),
+            workdir=str(tmp_path),
+            workdir_codex=None,
+            workdir_gemini=None,
+            workdir_antigravity=None,
+            base="main",
+            dry_run=False,
+        )
+
+        sr.cmd_run_implement(args)
+        first_output = self._last_json(capsys.readouterr().out)
+        assert first_output["pr"] == 5
+        assert sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments) == 1
+        assert sum("AGENT_PLAN_ONE_SHOT_IMPL" in body for body in parent_bodies) == 1
+        helper_external_calls = [call for call in helper_calls if call[0] == "helpers.run_external"]
+        helper_handoff_calls = [
+            call for call in helper_calls
+            if call[:2] == ("helpers.gh_ops", "post-issue-comment")
+            and int(call[call.index("--issue") + 1]) == 77
+        ]
+
+        sr.cmd_run_implement(args)
+        second_output = self._last_json(capsys.readouterr().out)
+        assert second_output == {"pr": 5, "head_sha": "head-after", "issue": 77, "reused": True}
+        assert len([call for call in helper_calls if call[0] == "helpers.run_external"]) == len(helper_external_calls) == 1
+        assert len([
+            call for call in helper_calls
+            if call[:2] == ("helpers.gh_ops", "post-issue-comment")
+            and int(call[call.index("--issue") + 1]) == 77
+        ]) == len(helper_handoff_calls) == 1
+        assert sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments) == 1
+        assert sum("AGENT_PLAN_ONE_SHOT_IMPL" in body for body in parent_bodies) == 1
+
     def test_invalid_coder_rejected(self) -> None:
         result = _run(
             "helpers.skill_runner", "run-implement",
@@ -5179,6 +5356,108 @@ class TestRunDecompose:
                 base="main",
                 dry_run=False,
             ))
+
+    def test_fresh_decompose_recovers_partial_children_without_duplicates(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        """A crash after child one is filed is recovered by the skill entry point."""
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        from agent_loop_helpers import FakeRunner
+        from coding_review_agent_loop.github import FoundIssue, IssueComment, IssueContext
+
+        class PartialRunner(FakeRunner):
+            def __init__(self):
+                super().__init__(
+                    issue_payload={"number": 77},
+                    issue_urls=[
+                        "https://github.com/test/skill-repo/issues/101",
+                        "https://github.com/test/skill-repo/issues/102",
+                    ],
+                )
+                self.fail_after_first = True
+
+            def run(self, args, *, cwd, input_text=None, check=True, env=None):
+                if (
+                    list(args)[:3] == ["gh", "issue", "create"]
+                    and self.fail_after_first
+                    and self.issues
+                ):
+                    raise RuntimeError("simulated crash after first child")
+                return super().run(
+                    args, cwd=cwd, input_text=input_text, check=check, env=env
+                )
+
+        runner = PartialRunner()
+        plan_file = tmp_path / "fresh-staged-plan.md"
+        plan_file.write_text(_fresh_staged_plan_state(), encoding="utf-8")
+
+        def current_comments() -> tuple[IssueComment, ...]:
+            return tuple(
+                IssueComment(
+                    author="bot",
+                    created_at=None,
+                    body=entry["body"] if isinstance(entry, dict) else entry,
+                )
+                for entry in runner.issue_comments
+            )
+
+        def fake_get_issue_context(_runner, *, config, issue_number):
+            return IssueContext(
+                number=issue_number,
+                repo=config.repo,
+                title="Parent",
+                body="Parent body",
+                url="https://github.com/test/skill-repo/issues/77",
+                comments=current_comments(),
+                human_requirements=(),
+            )
+
+        def fake_search(_runner, *, config, search, state="all", limit=100):
+            if not runner.issues:
+                return ()
+            created = runner.issues[0]
+            return (
+                FoundIssue(
+                    number=101,
+                    title=created["title"],
+                    url="https://github.com/test/skill-repo/issues/101",
+                    body=created["body"],
+                ),
+            )
+
+        monkeypatch.setattr(sr, "Runner", lambda dry_run=False: runner)
+        monkeypatch.setattr(gh, "get_issue_context", fake_get_issue_context)
+        monkeypatch.setattr(decomp, "search_issues", fake_search)
+        args = types.SimpleNamespace(
+            issue=77,
+            repo="test/skill-repo",
+            coder="codex",
+            plan_file=str(plan_file),
+            workdir=str(tmp_path),
+            workdir_codex=None,
+            workdir_gemini=None,
+            workdir_antigravity=None,
+            dry_run=False,
+            flat_child_limit=15,
+        )
+
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            sr.cmd_run_decompose(args)
+        assert len(runner.issues) == 1
+        assert sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments) == 1
+        assert not any("AGENT_PLAN_DECOMPOSITION" in body for body in runner.comments)
+
+        runner.fail_after_first = False
+        sr.cmd_run_decompose(args)
+        result = self._last_json(capsys.readouterr().out)
+
+        assert result["adopted_children"][0]["issue_number"] == 101
+        assert result["created_children"][0]["issue_number"] == 102
+        assert len(runner.issues) == 2
+        assert sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments) == 1
+        assert sum("AGENT_PLAN_DECOMPOSITION" in body for body in runner.comments) == 1
 
 
 # ---------------------------------------------------------------------------

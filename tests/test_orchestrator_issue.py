@@ -2942,6 +2942,55 @@ def test_issue_loop_fresh_one_shot_publishes_decision_before_handoff(tmp_path):
     assert decision_indexes[0] < handoff_indexes[0]
 
 
+def test_issue_loop_fresh_one_shot_rerun_reuses_decision_and_handoff(tmp_path):
+    """A real issue entry-point rerun must not rematerialize fresh state."""
+    plan = structured_v1_plan_state()
+    runner = FakeRunner(
+        claude_outputs=[
+            plan,
+            "Implemented the approved fresh plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        plan_execution_mode="implement-one-shot",
+        execution_strategy_contract_required=True,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    durable_counts = {
+        "decision": sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments),
+        "handoff": sum("AGENT_PLAN_ONE_SHOT_IMPL" in body for body in runner.comments),
+    }
+    agent_command_count = sum(
+        command[:1] in (["claude"], ["gemini"], ["agy"])
+        or command[:2] == ["codex", "exec"]
+        for command, _cwd in runner.commands
+    )
+    issue_count = len(runner.issues)
+
+    # The second invocation consumes the issue-side handoff and resumes the
+    # existing PR review.  It must not ask the coder for another implementation
+    # or publish another decision/handoff.
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert {
+        "decision": sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments),
+        "handoff": sum("AGENT_PLAN_ONE_SHOT_IMPL" in body for body in runner.comments),
+    } == durable_counts == {"decision": 1, "handoff": 1}
+    assert sum(
+        command[:1] in (["claude"], ["gemini"], ["agy"])
+        or command[:2] == ["codex", "exec"]
+        for command, _cwd in runner.commands
+    ) == agent_command_count
+    assert len(runner.issues) == issue_count == 0
+
+
 def test_issue_loop_plan_first_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_path):
     old_plan = "Approved old plan.\n\n### Scope\n- Preserve the old API."
     later_plan = "Unrelated later plan.\n\n### Scope\n- Replace the old API."
