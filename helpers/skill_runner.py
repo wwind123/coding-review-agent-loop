@@ -1973,6 +1973,7 @@ def _complete_reviewer_turn(
         *usage_args,
         *approved_plan_args,
         *requirement_args,
+        "--architecture-contract-version", "1",
     )
 
     # --- Post ---
@@ -4867,7 +4868,18 @@ def _run_decomposition_for_skill(
     if checkpoint is not None:
         from coding_review_agent_loop.decomposition import PlanDecomposition
 
-        decomposition = PlanDecomposition(phases=checkpoint.phases)
+        from coding_review_agent_loop.protocol import parse_architecture_impact
+
+        decomposition = PlanDecomposition(
+            phases=checkpoint.phases,
+            architecture_impact=(
+                parse_architecture_impact(
+                    checkpoint.architecture_impact,
+                    context="checkpoint.architecture_impact",
+                )
+                if checkpoint.architecture_impact is not None else None
+            ),
+        )
         topology_source = checkpoint.topology_source
         retained_parent_scope = checkpoint.retained_parent_scope
     else:

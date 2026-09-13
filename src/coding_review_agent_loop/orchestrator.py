@@ -268,6 +268,7 @@ from .protocol import (
     validate_structured_discuss_semantic_comparison,
     serialize_discuss_round_synthesis,
     serialize_discuss_final_synthesis,
+    parse_architecture_impact,
 )
 from .protocol import parse_review
 from .repair import (
@@ -5266,7 +5267,16 @@ def _decompose_approved_plan(
     if checkpoint is not None:
         # A checkpoint is the normalized model/typed output.  Reuse it before
         # invoking a coder so a create-before-summary failure is resumable.
-        decomposition = PlanDecomposition(phases=checkpoint.phases)
+        decomposition = PlanDecomposition(
+            phases=checkpoint.phases,
+            architecture_impact=(
+                parse_architecture_impact(
+                    checkpoint.architecture_impact,
+                    context="checkpoint.architecture_impact",
+                )
+                if checkpoint.architecture_impact is not None else None
+            ),
+        )
         topology_source = checkpoint.topology_source
         retained_parent_scope = checkpoint.retained_parent_scope
     elif mode == "decompose-only":

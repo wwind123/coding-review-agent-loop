@@ -162,6 +162,21 @@ def _architecture_context_block(
     return rendered
 
 
+def _coder_requirements_context(
+    config: AgentLoopConfig,
+    human_requirements: Sequence[HumanReviewRequirement] | None,
+    existing: CoderHumanRequirementsPromptContext | None,
+) -> CoderHumanRequirementsPromptContext:
+    """Choose the exact requirements block reserved by active architecture budgeting."""
+    if architecture_material(config.architecture_context):
+        return render_coder_human_requirements_prompt_context(
+            human_requirements or (), max_chars=None
+        )
+    if existing is not None:
+        return existing
+    return render_coder_human_requirements_prompt_context(human_requirements)
+
+
 def _with_architecture_context(config: AgentLoopConfig, context: object | None) -> AgentLoopConfig:
     if context is None:
         return config
@@ -2759,8 +2774,8 @@ structured result; `pr_number` and `clarification` are the sole outcome data.
 {_agent_unavailable_guidance(coder_signature)}
 If you cannot safely proceed and cannot create a PR, use the structured no-PR
 blocking envelope above and put the exact command and timeout in its `summary`.
-Do not add prose between that JSON object and its footer, and do not emit
-without an `AGENT_PR` marker or `AGENT_CLARIFY` marker. Do not place your signature before the
+Do not add prose between that JSON object and its footer, and do not emit an
+`AGENT_PR` or `AGENT_CLARIFY` marker. Do not place your signature before the
 AGENT_STATE marker. Your response must end with, in this exact order:
 
 For implementation or clarification:
@@ -3459,12 +3474,9 @@ def build_followup_prompt(
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
-    if human_requirements_context is None:
-        human_requirements_context = render_coder_human_requirements_prompt_context(human_requirements)
-    elif architecture_material(config.architecture_context) and human_requirements is not None:
-        human_requirements_context = render_coder_human_requirements_prompt_context(
-            human_requirements, max_chars=None
-        )
+    human_requirements_context = _coder_requirements_context(
+        config, human_requirements, human_requirements_context
+    )
     return f"""{reviewer_name} reviewed pull request #{pr_number} in {config.repo} and found blocking issues.
 
 Address the review below in this local checkout. Pull/sync the PR branch if
@@ -3517,12 +3529,9 @@ def build_same_pr_followup_prompt(
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
-    if human_requirements_context is None:
-        human_requirements_context = render_coder_human_requirements_prompt_context(human_requirements)
-    elif architecture_material(config.architecture_context) and human_requirements is not None:
-        human_requirements_context = render_coder_human_requirements_prompt_context(
-            human_requirements, max_chars=None
-        )
+    human_requirements_context = _coder_requirements_context(
+        config, human_requirements, human_requirements_context
+    )
     return f"""{reviewer_name} requested same-PR follow-ups on pull request #{pr_number} in {config.repo}.
 
 Address the follow-up items below in this local checkout. Pull/sync the PR
@@ -3582,12 +3591,9 @@ def build_merge_conflict_prompt(
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
-    if human_requirements_context is None:
-        human_requirements_context = render_coder_human_requirements_prompt_context(human_requirements)
-    elif architecture_material(config.architecture_context) and human_requirements is not None:
-        human_requirements_context = render_coder_human_requirements_prompt_context(
-            human_requirements, max_chars=None
-        )
+    human_requirements_context = _coder_requirements_context(
+        config, human_requirements, human_requirements_context
+    )
     head_description = f"`{head_sha}`" if head_sha else "the current PR head"
     return f"""GitHub reports that pull request #{pr_number} in {config.repo} has a merge conflict \
 with its base branch `{base_branch}` ({merge_state_detail}) at {head_description}.

@@ -8,7 +8,7 @@ import json
 import re
 import zlib
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from .config import AgentLoopConfig
 from .child_topology import (
@@ -115,6 +115,9 @@ class TopologyCheckpoint:
     topology_source: str
     phases: tuple[PlanPhase, ...]
     retained_parent_scope: RetainedParentScope | None = None
+    architecture_identity: dict | None = None
+    architecture_impact: dict | None = None
+    architecture_contract_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -377,6 +380,9 @@ def _checkpoint_payload(checkpoint: TopologyCheckpoint) -> dict[str, object]:
         "shared_parent_context": shared_context,
         "phases": phase_payloads,
         "retained_parent_scope": retained_payload,
+        "architecture_identity": checkpoint.architecture_identity,
+        "architecture_impact": checkpoint.architecture_impact,
+        "architecture_contract_version": checkpoint.architecture_contract_version,
     }
 
 
@@ -441,6 +447,17 @@ def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
             excerpt=str(retained_payload.get("excerpt") or shared_parent_context or ""),
         )
     try:
+        architecture_identity = payload.get("architecture_identity")
+        if architecture_identity is not None and not isinstance(architecture_identity, dict):
+            raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+        raw_impact = payload.get("architecture_impact")
+        architecture_impact = (
+            asdict(parse_architecture_impact(raw_impact, context="checkpoint.architecture_impact"))
+            if raw_impact is not None else None
+        )
+        raw_contract = payload.get("architecture_contract_version")
+        if raw_contract is not None and raw_contract != 1:
+            raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT architecture contract.")
         return TopologyCheckpoint(
             parent_issue=int(payload["parent_issue"]),
             plan_hash=str(payload["plan_hash"]),
@@ -451,6 +468,9 @@ def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
                 for item in phases_payload
             ),
             retained_parent_scope=retained,
+            architecture_identity=architecture_identity,
+            architecture_impact=architecture_impact,
+            architecture_contract_version=raw_contract,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.") from exc
@@ -793,6 +813,17 @@ def create_decomposition_child_issues(
                 topology_source=topology_source,
                 phases=phases,
                 retained_parent_scope=retained_parent_scope,
+                architecture_identity=(
+                    config.architecture_context.identity()
+                    if hasattr(config.architecture_context, "identity") else None
+                ),
+                architecture_impact=(
+                    asdict(decomposition.architecture_impact)
+                    if decomposition.architecture_impact is not None else None
+                ),
+                architecture_contract_version=(
+                    1 if decomposition.architecture_impact is not None else None
+                ),
             ),
         )
 

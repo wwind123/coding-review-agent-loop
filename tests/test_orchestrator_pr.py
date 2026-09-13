@@ -63,6 +63,7 @@ from coding_review_agent_loop.orchestrator import (
     _strip_round_metadata,
     _ensure_finalization_ready,
     _latest_pr_architecture_observation,
+    _latest_pr_approved_reviews_for_head,
 )
 from coding_review_agent_loop.prompts import (
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
@@ -116,6 +117,24 @@ def test_latest_pr_architecture_observation_uses_new_checkpoint_once():
     )
     comments = (SimpleNamespace(body=approval), SimpleNamespace(body=checkpoint))
     assert _latest_pr_architecture_observation(comments, head_sha="head") == new_identity
+
+
+def test_legacy_same_head_approval_remains_reusable_with_fresh_architecture_gate():
+    approval = _attach_round_metadata(
+        "approved review",
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=1,
+            subject="head", state="approved",
+        ),
+    )
+    comments = (SimpleNamespace(body=approval),)
+    reused = _latest_pr_approved_reviews_for_head(
+        comments,
+        head_sha="head",
+        configured_reviewers=("codex",),
+        require_architecture_contract=True,
+    )
+    assert set(reused) == {"Codex"}
 
 
 def _advance_head_after_coder(monkeypatch, runner, head_sha="repaired-head"):

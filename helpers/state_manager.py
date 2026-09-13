@@ -381,6 +381,10 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             getattr(args, "surfaced_reviewer_requirement_ids", ()) or ()
         ),
         local_test_evidence=local_test_evidence,
+        architecture_contract_version=(
+            1 if getattr(args, "architecture_contract_version", None) is not None
+            else None
+        ),
     )
     augmented = _attach_round_metadata(body, metadata)
 
@@ -468,6 +472,10 @@ def main() -> None:
                         help="Stable signed-requirement IDs surfaced to a PR reviewer.")
     p_meta.add_argument("--local-test-evidence-file", default=None,
                         help="JSON sidecar containing bounded local test evidence.")
+    p_meta.add_argument(
+        "--architecture-contract-version", type=int, default=None,
+        help="Fresh architecture-impact contract generation carried by this record.",
+    )
 
     # build-resume
     p_resume = subparsers.add_parser("build-resume", help="Build a resume descriptor from GitHub comments.")

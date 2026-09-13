@@ -2255,9 +2255,11 @@ def test_task_prompts_document_no_pr_blocking_branch(tmp_path):
         build_task_clarification_prompt("Fix the bug.", [], config).split()
     )
 
-    for prompt in (task_prompt, clarification_prompt):
-        assert "For a no-PR blocking result:" in prompt
-        assert "without an `AGENT_PR` marker" in prompt
+    assert "For a no-PR blocking result:" in task_prompt
+    assert "without an `AGENT_PR` marker" in task_prompt
+    assert "For a no-PR blocking result:" in clarification_prompt
+    assert "Do not add an `AGENT_PR` or `AGENT_CLARIFY` marker" in clarification_prompt
+    assert "do not emit without an `AGENT_PR` marker" not in clarification_prompt
 
 
 def test_task_prompt_structured_clarification_footer_matches_validator(tmp_path):
@@ -2303,6 +2305,25 @@ def test_active_architecture_uses_lossless_requirements_and_omits_architecture_f
     assert "The architecture overview" not in prompt
 
 
+@pytest.mark.parametrize("builder", [build_followup_prompt, build_same_pr_followup_prompt])
+def test_direct_feedback_call_with_architecture_uses_lossless_requirements(tmp_path, builder):
+    architecture = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available",
+        size=20, content="# System\n", heading_index=("System",),
+    )
+    requirement = HumanReviewRequirement(
+        source_type="PR comment", author="reviewer", created_at="2026-01-01T00:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep " + ("the compatibility contract " * 900) + ".",
+    )
+    config = make_config(
+        tmp_path, architecture_context=architecture, managed_context_max_chars=40_000
+    )
+    prompt = builder(77, 2, "Fix the bug.", config, human_requirements=(requirement,))
+    assert requirement.body in prompt
+
+
 def test_followup_prompt_documents_and_validates_fresh_architecture_impact(tmp_path):
     config = make_config(tmp_path)
     prompt = build_followup_prompt(77, 2, "Fix the bug.", config)
@@ -2325,6 +2346,12 @@ def test_explicit_managed_cap_fails_closed_when_protected_context_has_no_room(tm
     )
     with pytest.raises(AgentLoopError, match="Managed prompt context cap"):
         prompts_module._architecture_context_block(config, protected_context=("x" * 32,))
+
+
+def test_task_clarification_forbids_legacy_markers(tmp_path):
+    prompt = build_task_clarification_prompt("Fix the bug.", [], make_config(tmp_path))
+    assert "Do not add an `AGENT_PR` or `AGENT_CLARIFY` marker" in prompt
+    assert "do not emit without an `AGENT_PR` marker" not in prompt
 
 
 @pytest.mark.parametrize("compact_context", [False, True])

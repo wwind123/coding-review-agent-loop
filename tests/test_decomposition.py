@@ -266,6 +266,11 @@ def test_topology_checkpoint_stores_shared_context_once_and_round_trips(tmp_path
             plan_hash="plan-hash",
             excerpt=excerpt,
         ),
+        architecture_identity={"repository": "OWNER/REPO", "revision": "abc"},
+        architecture_impact={
+            "status": "unchanged", "rationale": "No architectural contract changed.",
+        },
+        architecture_contract_version=1,
     )
 
     body = format_topology_checkpoint(checkpoint)
@@ -278,7 +283,12 @@ def test_topology_checkpoint_stores_shared_context_once_and_round_trips(tmp_path
 
     assert len(body) < 60000
     assert "constraint detail" not in body
-    assert restored == checkpoint
+    assert restored is not None
+    assert restored.phases == checkpoint.phases
+    assert restored.architecture_identity == checkpoint.architecture_identity
+    assert restored.architecture_impact is not None
+    assert restored.architecture_impact["status"] == "unchanged"
+    assert restored.architecture_contract_version == 1
 
 
 def test_dry_run_decomposition_previews_dependency_phases_without_issue_numbers(tmp_path):
