@@ -23,18 +23,22 @@ final-integration allocations, with exact-once coverage and at least two real
 allocations. It also records automation, dependencies, rollout risk,
 compatibility constraints, and caveats.
 
-This is a review/audit contract in the first phase of the rollout. Its v1
-children are not legacy typed child stages and do not cause issue creation,
-split handling, decomposition, follow-up filing, or dispatch. Explicit
-execution modes continue to control those paths. Old unversioned comments and
-two-field typed stages remain legacy-undecided and are decoded without
-inventing v1 data. A bounded repair can only reformat a complete recoverable v1
-source; missing or partial strategy data requires a new planner turn.
-
-Issue #785 is the first PR in the sequential #785 -> #786 -> #787 queue. This
-phase does not change recommendation-driven execution policy or route work from
-the reviewed recommendation; those decisions remain with the existing
-explicit execution modes until the later phases consume the contract.
+The recommendation is executable only through an explicit policy compatible
+with its canonical strategy. `one-shot` permits `implement-one-shot`; `staged`
+permits `decompose-only` or `implement-by-phase`. Incompatible fresh pairs stop
+before approval-bound writes. A compact execution decision records the approved
+plan identity and full recommendation digest, while the complete recommendation
+and any bounded transport sidecars remain the recovery source. Fresh topology
+summaries, child identities, and handoffs are keyed by strategy `staged`, source
+`approved-plan-v1`, contract version, digest, ordinal, and stable stage ID;
+legacy records keep their exact historical mode/source lookup and serializer.
+Plan-only retains its existing approved-follow-up audit record, explicit split
+materialization, and unfiled-scope warning, but creates no fresh decision,
+canonical topology, phase-child handoff, or dispatch. Automatic strategy
+selection remains downstream in #787. Old unversioned comments and two-field
+typed stages remain legacy-undecided. A bounded repair can only reformat a
+complete recoverable v1 source; missing or partial strategy data requires a new
+planner turn.
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
@@ -467,9 +471,14 @@ reruns take the fast path. If more than one open PR references the issue, the
 orchestrator raises an error instead of guessing which one to resume; close or
 merge the extra PR and rerun `agent-loop pr <number>` directly.
 
-`--implement-after-approval` is a compatibility shortcut for
-`--plan-execution-mode implement-one-shot`. It requires `--plan-first` and is
-not compatible with any other explicit `--plan-execution-mode` value.
+`--implement-after-approval` is a compatibility alias that requests
+`--plan-execution-mode implement-one-shot`. It requires `--plan-first`; fresh
+approval-bound compatibility is resolved against the reviewed recommendation,
+so a staged recommendation stops actionably before mutation rather than being
+silently routed as one-shot. If `--plan-execution-mode` is supplied as well, the
+alias is accepted only with `implement-one-shot`; combining it with
+`plan-only`, `decompose-only`, or `implement-by-phase` is rejected before
+recommendation recovery or any approval-bound write.
 
 Approved-plan implementation can switch to a different coder after planning:
 
@@ -1168,6 +1177,12 @@ What each mechanism produces and where the run stops:
   result creates nothing and returns a structured decision to consolidate or
   use hierarchical decomposition tracked in #720. Typed stages remain the
   parent-owned plan remainder and are represented in the parent summary.
+- **Fresh v1 recommendation**: uses the reviewed staged allocation directly;
+  it preserves every enriched field and exact automation class, records a
+  compact canonical execution decision before child creation, and reuses the
+  same summary when a later explicit staged policy resumes. A one-shot
+  recommendation cannot be sent through a decomposition policy, and a staged
+  recommendation cannot be sent through one-shot implementation.
 - **`implement-by-phase`**: creates every phase child issue, records a
   one-time `AGENT_PLAN_PHASE_IMPLEMENTATION` handoff, then implements only the
   first `agent-pr` phase and stops after that phase's PR review loop. If the

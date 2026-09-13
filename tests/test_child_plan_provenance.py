@@ -1,12 +1,18 @@
 import base64
+import dataclasses
 import json
 
 import pytest
 
-from agent_loop_helpers import FakeRunner, make_config
+from agent_loop_helpers import FakeRunner, make_config, structured_v1_plan_state
 from coding_review_agent_loop import orchestrator
+from coding_review_agent_loop.comment_rendering import render_execution_recommendation_section
 from coding_review_agent_loop.decomposition import (
-    PlanPhase, TopologyCheckpoint, approved_plan_hash, format_phase_issue_body,
+    CreatedPhaseIssue, PlanPhase, TopologyCheckpoint, approved_plan_hash,
+    format_decomposition_parent_summary, format_phase_issue_body,
+    format_phase_implementation_handoff_comment,
+    PHASE_IMPLEMENTATION_MARKER_RE,
+    normalize_execution_recommendation,
     format_topology_checkpoint, phase_identity,
 )
 from coding_review_agent_loop.errors import AgentLoopError
@@ -37,6 +43,184 @@ def replace_phase_plan_hash(body, plan_hash):
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ).decode("ascii")
     return body[:marker.start("payload")] + encoded + body[marker.end("payload"):]
+
+
+def replace_phase_handoff_payload(body, **updates):
+    marker = PHASE_IMPLEMENTATION_MARKER_RE.search(body)
+    assert marker is not None
+    payload = json.loads(
+        base64.urlsafe_b64decode(marker.group("payload").encode("ascii")).decode("utf-8")
+    )
+    payload.update(updates)
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+    return body[:marker.start("payload")] + encoded + body[marker.end("payload"):]
+
+
+def fresh_staged_plan():
+    raw = structured_v1_plan_state()
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["summary"] = "Fresh staged parent plan."
+    payload["execution_recommendation"] = {
+        "strategy": "staged",
+        "rationale": "The two contracts are independently verifiable in order.",
+        "staging_feasibility": "safe",
+        "scope_items": [
+            {
+                "scope_item_id": "scope-1",
+                "requirement": "Deliver the first contract.",
+                "acceptance_criteria": ["The first contract is verified."],
+            },
+            {
+                "scope_item_id": "scope-2",
+                "requirement": "Deliver the second contract.",
+                "acceptance_criteria": ["The second contract is verified."],
+            },
+        ],
+        "coupling_constraints": [],
+        "child_stages": [
+            {
+                "stage_id": "stage-one",
+                "position": 1,
+                "title": "First contract",
+                "summary": "Deliver the first contract.",
+                "deliverables": ["First contract."],
+                "non_goals": [],
+                "acceptance_criteria": ["The first contract is verified."],
+                "depends_on_stage_ids": [],
+                "dependency_notes": "No dependencies.",
+                "automation": "agent-pr",
+                "rollout_risk": "low",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-1"],
+            },
+            {
+                "stage_id": "stage-two",
+                "position": 2,
+                "title": "Second contract",
+                "summary": "Deliver the second contract.",
+                "deliverables": ["Second contract."],
+                "non_goals": [],
+                "acceptance_criteria": ["The second contract is verified."],
+                "depends_on_stage_ids": ["stage-one"],
+                "dependency_notes": "After the first contract.",
+                "automation": "agent-pr",
+                "rollout_risk": "medium",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-2"],
+            },
+        ],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "caveats": [],
+    }
+    plan = json.dumps(payload) + raw[end:]
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+    recommendation = validate_structured_plan_state(plan).execution_recommendation
+    assert recommendation is not None
+    json_part, footer = plan.split("\n<!-- AGENT_PLAN_STATE:", 1)
+    return (
+        json_part
+        + "\n\n"
+        + render_execution_recommendation_section(recommendation)
+        + "\n<!-- AGENT_PLAN_STATE:"
+        + footer
+    )
+
+
+def fresh_child_contexts(
+    plan,
+    *,
+    stable_stage_id="stage-one",
+    summary_mode="implement-by-phase",
+    handoff_mode="implement-by-phase",
+):
+    raw_payload, _ = json.JSONDecoder().raw_decode(plan)
+    from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
+
+    recommendation = parse_execution_recommendation_payload(
+        raw_payload["execution_recommendation"], context="test recommendation"
+    )
+    assert recommendation is not None
+    normalized, retained = normalize_execution_recommendation(
+        recommendation, approved_plan=plan, plan_subject=orchestrator._plan_subject(plan)
+    )
+    phase = normalized.phases[0]
+    parent_hash = approved_plan_hash(plan)
+    identity = phase_identity(
+        parent_issue=55,
+        plan_hash=parent_hash,
+        topology_source="approved-plan-v1",
+        phase_index=1,
+        phase=phase,
+        stage_id=phase.stage_id,
+        execution_strategy_contract_version=1,
+    )
+    child_body = format_phase_issue_body(
+        repo="OWNER/REPO", parent_issue=55, approved_plan=plan, phase=phase,
+        created_so_far=(), phase_identity_value=identity,
+        topology_source="approved-plan-v1", phase_index=1,
+        phase_plan_hash=parent_hash, strategy="staged",
+        recommendation_digest=normalized.recommendation_digest,
+        execution_strategy_contract_version=1,
+    )
+    if stable_stage_id != phase.stage_id:
+        marker = orchestrator.PHASE_IDENTITY_MARKER_RE.search(child_body)
+        assert marker is not None
+        marker_payload = json.loads(
+            base64.urlsafe_b64decode(marker.group("payload").encode("ascii")).decode("utf-8")
+        )
+        marker_payload["stage_id"] = stable_stage_id
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(marker_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).decode("ascii")
+        child_body = child_body[:marker.start("payload")] + encoded + child_body[marker.end("payload"):]
+    child = IssueContext(
+        number=56, repo="OWNER/REPO", title="First contract", body=child_body,
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(comment(format_issue_pr_handoff_comment(
+            issue_number=56, pr_number=77,
+            pr_url="https://github.com/OWNER/REPO/pull/77",
+            pr_head_sha="abc123", flow="approved-plan-implementation", plan_hash=parent_hash,
+        )),),
+    )
+    parent_children = (
+        CreatedPhaseIssue(phase=normalized.phases[0], issue_url=child.url, issue_number=56),
+        CreatedPhaseIssue(
+            phase=normalized.phases[1],
+            issue_url="https://github.com/OWNER/REPO/issues/57",
+            issue_number=57,
+        ),
+    )
+    summary = format_decomposition_parent_summary(
+        parent_issue=55, mode=summary_mode, plan_hash=parent_hash,
+        created=parent_children, topology_source="approved-plan-v1",
+        retained_parent_scope=retained, final_integration_work=normalized.final_integration_work,
+        strategy="staged", execution_strategy_contract_version=1,
+        recommendation_digest=normalized.recommendation_digest,
+        plan_subject=orchestrator._plan_subject(plan),
+    )
+    handoff = format_phase_implementation_handoff_comment(
+        parent_issue=55, mode=handoff_mode, plan_hash=parent_hash,
+        phase_index=1, created=parent_children[0], strategy="staged",
+        topology_source="approved-plan-v1", execution_strategy_contract_version=1,
+        recommendation_digest=normalized.recommendation_digest,
+        plan_subject=orchestrator._plan_subject(plan),
+    )
+    parent = IssueContext(
+        number=55, repo="OWNER/REPO", title="Parent", body="Parent scope.",
+        url="https://github.com/OWNER/REPO/issues/55",
+        comments=(comment(plan_record(plan)), comment(summary), comment(handoff)),
+    )
+    return child, parent
 
 
 @pytest.mark.parametrize("entry", ["issue", "pr"])
@@ -109,3 +293,142 @@ def test_separately_planned_child_preserves_both_plan_bindings(tmp_path, monkeyp
         )[0]
         assert "Implement only the reviewed strategy schema." in plan_block
         assert "Deliver three sequential stages." not in plan_block
+
+
+@pytest.mark.parametrize("stable_stage_id, should_fail", [("stage-one", False), ("wrong-stage", True)])
+def test_cli_run_pr_loop_validates_fresh_child_phase_identity(
+    tmp_path, monkeypatch, stable_stage_id, should_fail
+):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan, stable_stage_id=stable_stage_id)
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77,
+            "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    if should_fail:
+        with pytest.raises(AgentLoopError, match="stable ID disagrees with its ordinal"):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    else:
+        assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize(
+    "handoff_updates",
+    [
+        {},
+        {"plan_hash": "different-plan"},
+        {"phase_index": 2},
+        {"stage_id": "stage-two"},
+    ],
+)
+def test_cli_run_pr_loop_validates_parent_handoff_after_decompose_only_transition(
+    tmp_path, monkeypatch, handoff_updates
+):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(
+        plan,
+        summary_mode="decompose-only",
+        handoff_mode="implement-by-phase",
+    )
+    if handoff_updates:
+        parent = dataclasses.replace(
+            parent,
+            comments=parent.comments[:-1]
+            + (comment(replace_phase_handoff_payload(parent.comments[-1].body, **handoff_updates)),),
+        )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77,
+            "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    if handoff_updates:
+        with pytest.raises(AgentLoopError, match="implementation handoff"):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    else:
+        assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+def test_cli_run_pr_loop_rejects_mismatched_parent_handoff_after_decompose_only_transition(
+    tmp_path, monkeypatch
+):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(
+        plan,
+        summary_mode="decompose-only",
+        handoff_mode="decompose-only",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77,
+            "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="implementation handoff"):
+        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+def test_cli_run_pr_loop_requires_child_plan_without_parent_phase_handoff(
+    tmp_path, monkeypatch
+):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(
+        plan,
+        summary_mode="decompose-only",
+        handoff_mode="implement-by-phase",
+    )
+    # The child handoff deliberately carries the parent topology hash, but the
+    # parent phase handoff is absent and the child has no approved plan.
+    parent = dataclasses.replace(parent, comments=parent.comments[:-1])
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77,
+            "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="approved child plan"):
+        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)

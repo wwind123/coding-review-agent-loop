@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 import subprocess
 import sys
@@ -44,6 +45,21 @@ def _make_fake_gh_env(fake_gh_dir: Path) -> dict:
     env = os.environ.copy()
     env["PATH"] = str(fake_gh_dir) + ":" + env.get("PATH", "")
     return env
+
+
+def _replace_phase_handoff_payload(body: str, **updates: object) -> str:
+    from coding_review_agent_loop.decomposition import PHASE_IMPLEMENTATION_MARKER_RE
+
+    marker = PHASE_IMPLEMENTATION_MARKER_RE.search(body)
+    assert marker is not None
+    payload = json.loads(
+        base64.urlsafe_b64decode(marker.group("payload").encode("ascii")).decode("utf-8")
+    )
+    payload.update(updates)
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+    return body[:marker.start("payload")] + encoded + body[marker.end("payload"):]
 
 
 def _write_fake_gh(directory: Path) -> Path:
@@ -123,6 +139,79 @@ _VALID_PLAN_STATE = json.dumps({
         "canonical_document_path": None,
         "canonical_document_rationale": "",
     },
+}) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
+
+
+def _fresh_staged_plan_state() -> str:
+    """Build a two-child fresh topology for live skill recovery tests."""
+    payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+    recommendation = payload["execution_recommendation"]
+    recommendation.update({
+        "strategy": "staged",
+        "rationale": "The two deliveries have independently verifiable boundaries.",
+        "staging_feasibility": "safe",
+        "scope_items": [
+            {
+                "scope_item_id": "scope-one",
+                "requirement": "Deliver the first boundary.",
+                "acceptance_criteria": ["The first boundary is verified."],
+            },
+            {
+                "scope_item_id": "scope-two",
+                "requirement": "Deliver the second boundary.",
+                "acceptance_criteria": ["The second boundary is verified."],
+            },
+        ],
+        "child_stages": [
+            {
+                "stage_id": "stage-one",
+                "position": 1,
+                "title": "First boundary",
+                "summary": "Deliver the first independently verifiable boundary.",
+                "deliverables": ["The first boundary."],
+                "non_goals": [],
+                "acceptance_criteria": ["The first boundary is verified."],
+                "depends_on_stage_ids": [],
+                "dependency_notes": "No dependencies.",
+                "automation": "agent-pr",
+                "rollout_risk": "low",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-one"],
+            },
+            {
+                "stage_id": "stage-two",
+                "position": 2,
+                "title": "Second boundary",
+                "summary": "Deliver the second independently verifiable boundary.",
+                "deliverables": ["The second boundary."],
+                "non_goals": [],
+                "acceptance_criteria": ["The second boundary is verified."],
+                "depends_on_stage_ids": ["stage-one"],
+                "dependency_notes": "After the first boundary.",
+                "automation": "agent-pr",
+                "rollout_risk": "medium",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-two"],
+            },
+        ],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+    })
+    recommendation.pop("one_shot_delivery", None)
+    return json.dumps(payload) + _VALID_PLAN_STATE[end:]
+
+_VALID_LEGACY_PLAN_STATE = json.dumps({
+    "schema_version": 1,
+    "kind": "plan_state",
+    "state": "blocking",
+    "summary": "Legacy plan is ready for review.",
+    "plan_steps": ["Step one"],
 }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
 
 _INVALID_PLAN_STATE = "This has no marker at all."
@@ -2201,6 +2290,252 @@ class TestSkillApprovedPlanRecovery:
 
         assert context is not None and context.is_available
         assert context.canonical_text == plan
+        assert context.plan_hash == plan_hash
+
+    @pytest.mark.parametrize(
+        ("handoff_mode", "handoff_updates", "should_fail", "error_match"),
+        [
+            ("implement-by-phase", {}, False, ""),
+            ("implement-by-phase", {"plan_hash": "different-plan"}, True, "implementation handoff"),
+            ("implement-by-phase", {"phase_index": 1}, True, "implementation handoff"),
+            ("implement-by-phase", {"stage_id": "stage-api"}, True, "implementation handoff"),
+            ("decompose-only", {}, True, "implementation handoff"),
+            (None, {}, True, "approved child plan"),
+        ],
+    )
+    def test_fresh_decomposition_child_handoff_recovers_matching_stage_by_ordinal(
+        self, monkeypatch, handoff_mode, handoff_updates, should_fail, error_match
+    ) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.decomposition import (
+            CreatedPhaseIssue,
+            ExecutionAllocation,
+            ExecutionChildStage,
+            ExecutionScopeItem,
+            ExecutionStrategyRecommendation,
+            PlanPhase,
+            format_decomposition_parent_summary,
+            format_phase_issue_body,
+            format_phase_implementation_handoff_comment,
+            normalize_execution_recommendation,
+            phase_identity,
+        )
+        from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+        from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+        from coding_review_agent_loop.round_state import (
+            PostedRoundMetadata,
+            _attach_round_metadata,
+            _plan_subject,
+        )
+
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["summary"] = "Fresh staged parent plan."
+        payload["plan_steps"] = ["Implement the reviewed staged behavior."]
+        payload["execution_recommendation"] = {
+            "strategy": "staged",
+            "rationale": "The API and its integration verification are independently reviewable.",
+            "staging_feasibility": "safe",
+            "scope_items": [
+                {
+                    "scope_item_id": "scope-api",
+                    "requirement": "Implement the API.",
+                    "acceptance_criteria": ["The API tests pass."],
+                },
+                {
+                    "scope_item_id": "scope-integration",
+                    "requirement": "Verify integration.",
+                    "acceptance_criteria": ["The integration tests pass."],
+                },
+            ],
+            "coupling_constraints": [],
+            "child_stages": [
+                {
+                    "stage_id": "stage-api",
+                    "position": 1,
+                    "title": "API contract",
+                    "summary": "Implement the reviewed API contract.",
+                    "deliverables": ["API implementation."],
+                    "non_goals": ["No rollout."],
+                    "acceptance_criteria": ["The API tests pass."],
+                    "depends_on_stage_ids": [],
+                    "dependency_notes": "No dependencies.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "low.",
+                    "compatibility_constraints": [],
+                    "covered_scope_item_ids": ["scope-api"],
+                },
+                {
+                    "stage_id": "stage-integration",
+                    "position": 2,
+                    "title": "Integration verification",
+                    "summary": "Verify the integrated behavior.",
+                    "deliverables": ["Integration verification."],
+                    "non_goals": ["No new API surface."],
+                    "acceptance_criteria": ["The integration tests pass."],
+                    "depends_on_stage_ids": ["stage-api"],
+                    "dependency_notes": "After the API contract.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "medium.",
+                    "compatibility_constraints": [],
+                    "covered_scope_item_ids": ["scope-integration"],
+                },
+            ],
+            "retained_parent_work": {
+                "status": "none",
+                "deliverables": [],
+                "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "final_integration_work": {
+                "status": "none",
+                "deliverables": [],
+                "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "caveats": [],
+        }
+        plan = json.dumps(payload) + _VALID_PLAN_STATE[end:]
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        recommendation = validate_structured_plan_state(plan).execution_recommendation
+        assert recommendation is not None
+        normalized, retained = normalize_execution_recommendation(
+            recommendation,
+            approved_plan=plan,
+            plan_subject=_plan_subject(plan),
+        )
+        phase = normalized.phases[1]
+        plan_hash = sr.approved_plan_hash(plan)
+        identity = phase_identity(
+            parent_issue=56,
+            plan_hash=plan_hash,
+            topology_source="approved-plan-v1",
+            phase_index=2,
+            phase=phase,
+            stage_id=phase.stage_id,
+            execution_strategy_contract_version=1,
+        )
+        child_body = format_phase_issue_body(
+            repo="owner/repo",
+            parent_issue=56,
+            approved_plan=plan,
+            phase=phase,
+            created_so_far=(),
+            phase_identity_value=identity,
+            topology_source="approved-plan-v1",
+            phase_index=2,
+            phase_plan_hash=plan_hash,
+            strategy="staged",
+            recommendation_digest=normalized.recommendation_digest,
+            execution_strategy_contract_version=1,
+        )
+        child = CreatedPhaseIssue(
+            phase=phase,
+            issue_url="https://github.com/owner/repo/issues/99",
+            issue_number=99,
+        )
+        plan_comment = _attach_round_metadata(
+            plan,
+            PostedRoundMetadata(
+                flow="plan",
+                role="coder",
+                agent="Claude",
+                round_number=1,
+                subject=_plan_subject(plan),
+                canonical_plan=plan,
+                raw_structured_coder_response=plan,
+            ),
+        )
+        summary = format_decomposition_parent_summary(
+            parent_issue=56,
+            mode="decompose-only",
+            plan_hash=plan_hash,
+            created=(
+                CreatedPhaseIssue(
+                    phase=normalized.phases[0],
+                    issue_url="https://github.com/owner/repo/issues/98",
+                    issue_number=98,
+                ),
+                child,
+            ),
+            topology_source="approved-plan-v1",
+            retained_parent_scope=retained,
+            strategy="staged",
+            execution_strategy_contract_version=1,
+            recommendation_digest=normalized.recommendation_digest,
+            plan_subject=_plan_subject(plan),
+        )
+        parent_comments = [
+            plan_comment,
+            summary,
+        ]
+        if handoff_mode is not None:
+            parent_comments.append(
+                format_phase_implementation_handoff_comment(
+                    parent_issue=56,
+                    mode=handoff_mode,
+                    plan_hash=plan_hash,
+                    phase_index=2,
+                    created=child,
+                    strategy="staged",
+                    topology_source="approved-plan-v1",
+                    execution_strategy_contract_version=1,
+                    recommendation_digest=normalized.recommendation_digest,
+                    plan_subject=_plan_subject(plan),
+                )
+            )
+        if handoff_updates:
+            parent_comments[-1] = _replace_phase_handoff_payload(
+                parent_comments[-1], **handoff_updates
+            )
+        child_comments = [
+            format_issue_pr_handoff_comment(
+                issue_number=99,
+                pr_number=7,
+                pr_url="https://github.com/owner/repo/pull/7",
+                pr_head_sha="head-7",
+                flow="approved-plan-implementation",
+                plan_hash=plan_hash,
+            )
+        ]
+        monkeypatch.setattr(
+            sr,
+            "_fetch_issue_comments_raw",
+            lambda repo, issue: child_comments if issue == 99 else parent_comments,
+        )
+        monkeypatch.setattr(sr, "_fetch_issue_json", lambda repo, issue: {"body": child_body})
+        contract = make_pr_contract(
+            repository="owner/repo",
+            pr_number=7,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=99,
+            expected_closing_issue_ids=(99,),
+        )
+
+        if should_fail:
+            with pytest.raises(AgentLoopError, match=error_match):
+                sr._recover_skill_pr_plan_context(
+                    "owner/repo",
+                    7,
+                    {
+                        "body": "Fixes #99",
+                        "comments": [{"body": format_pr_contract_comment(contract)}],
+                    },
+                )
+            return
+
+        context = sr._recover_skill_pr_plan_context(
+            "owner/repo",
+            7,
+            {
+                "body": "Fixes #99",
+                "comments": [{"body": format_pr_contract_comment(contract)}],
+            },
+        )
+
+        assert context is not None and context.is_available
+        assert context.canonical_text.rstrip() == plan.rstrip()
         assert context.plan_hash == plan_hash
 
     @pytest.mark.parametrize("fault", [None, "missing_handoff", "wrong_key", "missing_plan", "missing_topology"])
@@ -4417,6 +4752,118 @@ class TestRunImplement:
             # Launcher base behavior is observable (not only the prompt text).
             assert "release-x" in result.stdout
 
+    def test_fresh_one_shot_entry_point_reuses_handoff_and_decision(self, monkeypatch, tmp_path, capsys) -> None:
+        """The live skill command must be idempotent across a fresh rerun."""
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.config as config_module
+        from agent_loop_helpers import FakeRunner
+        from coding_review_agent_loop.github import IssueComment, IssueContext
+
+        runner = FakeRunner(
+            issue_payload={"number": 77},
+            pr_payload={
+                "number": 5,
+                "state": "OPEN",
+                "body": "Fixes #77",
+                "headRefOid": "head-after",
+            },
+            git_head="head-before",
+        )
+        parent_bodies: list[str] = []
+        helper_calls: list[tuple[str, ...]] = []
+
+        def fake_fetch_comments(_repo: str, _issue: int) -> list[str]:
+            return [
+                *(entry["body"] if isinstance(entry, dict) else entry for entry in runner.issue_comments),
+                *parent_bodies,
+            ]
+
+        def fake_run_helper(*args: str, **_kwargs):
+            helper_calls.append(args)
+            if args[0] == "helpers.run_external":
+                Path(args[args.index("--output") + 1]).write_text(
+                    _IMPL_WITH_PR, encoding="utf-8"
+                )
+            elif args[:2] == ("helpers.state_manager", "attach-metadata"):
+                source = Path(args[args.index("--body-file") + 1])
+                Path(args[args.index("--output") + 1]).write_text(
+                    source.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+            elif args[:2] == ("helpers.gh_ops", "post-issue-comment"):
+                body = Path(args[args.index("--file") + 1]).read_text(encoding="utf-8")
+                if int(args[args.index("--issue") + 1]) == 77:
+                    parent_bodies.append(body)
+            return subprocess.CompletedProcess(args, 0)
+
+        monkeypatch.setattr(sr, "Runner", lambda dry_run=False: runner)
+        monkeypatch.setattr(sr, "_fetch_issue_comments_raw", fake_fetch_comments)
+        monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
+        # The implementation helper imports this function locally, so patch
+        # the owning module rather than adding a seam to the skill command.
+        monkeypatch.setattr(
+            config_module,
+            "sync_coder_base_before_implementation",
+            lambda *_args, **_kwargs: None,
+        )
+
+        # Use a stateful head probe: first invocation advances the assigned
+        # checkout; a reuse invocation must return before probing it again.
+        heads = iter(("head-before", "head-after"))
+        monkeypatch.setattr(sr, "_git_head", lambda _workdir: next(heads))
+        monkeypatch.setattr(
+            "coding_review_agent_loop.github.get_issue_context",
+            lambda _runner, *, config, issue_number: IssueContext(
+                number=issue_number,
+                repo=config.repo,
+                title="Issue",
+                body="Issue body",
+                url="https://github.com/test/skill-repo/issues/77",
+                comments=tuple(
+                    IssueComment(author="bot", created_at=None, body=body)
+                    for body in fake_fetch_comments(config.repo, issue_number)
+                ),
+                human_requirements=(),
+            ),
+        )
+        plan_file = tmp_path / "fresh-one-shot.md"
+        plan_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        args = types.SimpleNamespace(
+            issue=77,
+            repo="test/skill-repo",
+            coder="codex",
+            plan_file=str(plan_file),
+            workdir=str(tmp_path),
+            workdir_codex=None,
+            workdir_gemini=None,
+            workdir_antigravity=None,
+            base="main",
+            dry_run=False,
+        )
+
+        sr.cmd_run_implement(args)
+        first_output = self._last_json(capsys.readouterr().out)
+        assert first_output["pr"] == 5
+        assert sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments) == 1
+        assert sum("AGENT_PLAN_ONE_SHOT_IMPL" in body for body in parent_bodies) == 1
+        helper_external_calls = [call for call in helper_calls if call[0] == "helpers.run_external"]
+        helper_handoff_calls = [
+            call for call in helper_calls
+            if call[:2] == ("helpers.gh_ops", "post-issue-comment")
+            and int(call[call.index("--issue") + 1]) == 77
+        ]
+
+        sr.cmd_run_implement(args)
+        second_output = self._last_json(capsys.readouterr().out)
+        assert second_output == {"pr": 5, "head_sha": "head-after", "issue": 77, "reused": True}
+        assert len([call for call in helper_calls if call[0] == "helpers.run_external"]) == len(helper_external_calls) == 1
+        assert len([
+            call for call in helper_calls
+            if call[:2] == ("helpers.gh_ops", "post-issue-comment")
+            and int(call[call.index("--issue") + 1]) == 77
+        ]) == len(helper_handoff_calls) == 1
+        assert sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments) == 1
+        assert sum("AGENT_PLAN_ONE_SHOT_IMPL" in body for body in parent_bodies) == 1
+
     def test_invalid_coder_rejected(self) -> None:
         result = _run(
             "helpers.skill_runner", "run-implement",
@@ -4550,7 +4997,7 @@ class TestRunDecompose:
             _write_fake_gh(tmppath)
             env = _make_fake_gh_env(tmppath)
             plan = tmppath / "plan.md"
-            plan.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            plan.write_text(_VALID_LEGACY_PLAN_STATE, encoding="utf-8")
             result = _run(
                 "helpers.skill_runner", "run-decompose",
                 "--issue", "9992", "--repo", "test/skill-repo",
@@ -4611,6 +5058,7 @@ class TestRunDecompose:
         import helpers.skill_runner as sr
         import coding_review_agent_loop.decomposition as decomp
         import coding_review_agent_loop.github as gh
+        import coding_review_agent_loop.orchestrator as orchestrator_module
         from coding_review_agent_loop.github import IssueContext
 
         raw_outputs: list[str] = []
@@ -4806,6 +5254,273 @@ class TestRunDecompose:
         assert output["reused"] is True
         assert output["phase_count"] == 1
         assert output["phases"][0]["issue_number"] == 123
+
+    def test_fresh_decompose_rejects_older_parent_summary_before_any_skill_write(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        import coding_review_agent_loop.orchestrator as orchestrator_module
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.github import IssueComment, IssueContext
+
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        recommendation = payload["execution_recommendation"]
+        recommendation["strategy"] = "staged"
+        recommendation["staging_feasibility"] = "safe"
+        recommendation.pop("one_shot_delivery")
+        recommendation["scope_items"] = [
+            {
+                "scope_item_id": "scope-api",
+                "requirement": "Implement the API.",
+                "acceptance_criteria": ["The API tests pass."],
+            },
+            {
+                "scope_item_id": "scope-integration",
+                "requirement": "Verify integration.",
+                "acceptance_criteria": ["The integration tests pass."],
+            },
+        ]
+        recommendation["child_stages"] = [
+            {
+                "stage_id": "stage-api",
+                "position": 1,
+                "title": "API contract",
+                "summary": "Implement the API.",
+                "deliverables": ["API implementation."],
+                "non_goals": [],
+                "acceptance_criteria": ["The API tests pass."],
+                "depends_on_stage_ids": [],
+                "dependency_notes": "No dependencies.",
+                "automation": "agent-pr",
+                "rollout_risk": "low",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-api"],
+            },
+            {
+                "stage_id": "stage-integration",
+                "position": 2,
+                "title": "Integration verification",
+                "summary": "Verify integration.",
+                "deliverables": ["Integration verification."],
+                "non_goals": [],
+                "acceptance_criteria": ["The integration tests pass."],
+                "depends_on_stage_ids": ["stage-api"],
+                "dependency_notes": "After the API contract.",
+                "automation": "agent-pr",
+                "rollout_risk": "medium",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-integration"],
+            },
+        ]
+        recommendation["retained_parent_work"] = {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        }
+        recommendation["final_integration_work"] = {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        }
+        plan = json.dumps(payload) + _VALID_PLAN_STATE[_VALID_PLAN_STATE.find("\n<!--") :]
+        plan_file = tmp_path / "fresh-plan.md"
+        plan_file.write_text(plan, encoding="utf-8")
+        stale_summary = decomp.format_decomposition_parent_summary(
+            parent_issue=77,
+            mode="decompose-only",
+            plan_hash="older-plan",
+            created=(decomp.CreatedPhaseIssue(
+                phase=decomp.RecordedPhase(title="Older phase", automation="agent-pr"),
+                issue_url="https://github.com/test/skill-repo/issues/123",
+                issue_number=123,
+            ),),
+            topology_source="model",
+        )
+
+        def fake_get_issue_context(_runner, *, config, issue_number):
+            return IssueContext(
+                number=issue_number,
+                repo=config.repo,
+                title="Parent",
+                body="Body",
+                url="u",
+                comments=(IssueComment(author="bot", created_at=None, body=stale_summary),),
+                human_requirements=(),
+            )
+
+        monkeypatch.setattr(gh, "get_issue_context", fake_get_issue_context)
+        monkeypatch.setattr(orchestrator_module, "search_issues", lambda *_args, **_kwargs: ())
+        monkeypatch.setattr(sr, "_run_helper", lambda *_args, **_kwargs: pytest.fail("coder must not run"))
+
+        with pytest.raises(AgentLoopError, match="older-plan|recorded topology"):
+            sr.cmd_run_decompose(types.SimpleNamespace(
+                issue=77,
+                repo="test/skill-repo",
+                coder="codex",
+                plan_file=str(plan_file),
+                workdir=str(tmp_path),
+                workdir_codex=None,
+                workdir_gemini=None,
+                workdir_antigravity=None,
+                dry_run=False,
+            ))
+
+    def test_fresh_implement_rejects_older_parent_summary_before_any_skill_write(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        import coding_review_agent_loop.orchestrator as orchestrator_module
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.github import IssueComment, IssueContext
+
+        stale_summary = decomp.format_decomposition_parent_summary(
+            parent_issue=77,
+            mode="decompose-only",
+            plan_hash="older-plan",
+            created=(decomp.CreatedPhaseIssue(
+                phase=decomp.RecordedPhase(title="Older phase", automation="agent-pr"),
+                issue_url="https://github.com/test/skill-repo/issues/123",
+                issue_number=123,
+            ),),
+            topology_source="model",
+        )
+        plan_file = tmp_path / "fresh-one-shot.md"
+        plan_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+
+        monkeypatch.setattr(sr, "_fetch_issue_comments_raw", lambda _repo, _issue: [stale_summary])
+        monkeypatch.setattr(
+            gh,
+            "get_issue_context",
+            lambda _runner, *, config, issue_number: IssueContext(
+                number=issue_number,
+                repo=config.repo,
+                title="Parent",
+                body="Body",
+                url="u",
+                comments=(IssueComment(author="bot", created_at=None, body=stale_summary),),
+                human_requirements=(),
+            ),
+        )
+        monkeypatch.setattr(orchestrator_module, "search_issues", lambda *_args, **_kwargs: ())
+        monkeypatch.setattr(sr, "_run_helper", lambda *_args, **_kwargs: pytest.fail("coder must not run"))
+
+        with pytest.raises(AgentLoopError, match="older-plan|existing decomposition"):
+            sr.cmd_run_implement(types.SimpleNamespace(
+                issue=77,
+                repo="test/skill-repo",
+                coder="codex",
+                plan_file=str(plan_file),
+                workdir=str(tmp_path),
+                workdir_codex=None,
+                workdir_gemini=None,
+                workdir_antigravity=None,
+                base="main",
+                dry_run=False,
+            ))
+
+    def test_fresh_decompose_recovers_partial_children_without_duplicates(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        """A crash after child one is filed is recovered by the skill entry point."""
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        from agent_loop_helpers import FakeRunner
+        from coding_review_agent_loop.github import FoundIssue, IssueComment, IssueContext
+
+        class PartialRunner(FakeRunner):
+            def __init__(self):
+                super().__init__(
+                    issue_payload={"number": 77},
+                    issue_urls=[
+                        "https://github.com/test/skill-repo/issues/101",
+                        "https://github.com/test/skill-repo/issues/102",
+                    ],
+                )
+                self.fail_after_first = True
+
+            def run(self, args, *, cwd, input_text=None, check=True, env=None):
+                if (
+                    list(args)[:3] == ["gh", "issue", "create"]
+                    and self.fail_after_first
+                    and self.issues
+                ):
+                    raise RuntimeError("simulated crash after first child")
+                return super().run(
+                    args, cwd=cwd, input_text=input_text, check=check, env=env
+                )
+
+        runner = PartialRunner()
+        plan_file = tmp_path / "fresh-staged-plan.md"
+        plan_file.write_text(_fresh_staged_plan_state(), encoding="utf-8")
+
+        def current_comments() -> tuple[IssueComment, ...]:
+            return tuple(
+                IssueComment(
+                    author="bot",
+                    created_at=None,
+                    body=entry["body"] if isinstance(entry, dict) else entry,
+                )
+                for entry in runner.issue_comments
+            )
+
+        def fake_get_issue_context(_runner, *, config, issue_number):
+            return IssueContext(
+                number=issue_number,
+                repo=config.repo,
+                title="Parent",
+                body="Parent body",
+                url="https://github.com/test/skill-repo/issues/77",
+                comments=current_comments(),
+                human_requirements=(),
+            )
+
+        def fake_search(_runner, *, config, search, state="all", limit=100):
+            if not runner.issues:
+                return ()
+            created = runner.issues[0]
+            return (
+                FoundIssue(
+                    number=101,
+                    title=created["title"],
+                    url="https://github.com/test/skill-repo/issues/101",
+                    body=created["body"],
+                ),
+            )
+
+        monkeypatch.setattr(sr, "Runner", lambda dry_run=False: runner)
+        monkeypatch.setattr(gh, "get_issue_context", fake_get_issue_context)
+        monkeypatch.setattr(decomp, "search_issues", fake_search)
+        args = types.SimpleNamespace(
+            issue=77,
+            repo="test/skill-repo",
+            coder="codex",
+            plan_file=str(plan_file),
+            workdir=str(tmp_path),
+            workdir_codex=None,
+            workdir_gemini=None,
+            workdir_antigravity=None,
+            dry_run=False,
+            flat_child_limit=15,
+        )
+
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            sr.cmd_run_decompose(args)
+        assert len(runner.issues) == 1
+        assert sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments) == 1
+        assert not any("AGENT_PLAN_DECOMPOSITION" in body for body in runner.comments)
+
+        runner.fail_after_first = False
+        sr.cmd_run_decompose(args)
+        result = self._last_json(capsys.readouterr().out)
+
+        assert result["adopted_children"][0]["issue_number"] == 101
+        assert result["created_children"][0]["issue_number"] == 102
+        assert len(runner.issues) == 2
+        assert sum("AGENT_PLAN_EXECUTION_DECISION" in body for body in runner.comments) == 1
+        assert sum("AGENT_PLAN_DECOMPOSITION" in body for body in runner.comments) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -5036,7 +5751,7 @@ class TestRunImplementByPhase:
             _write_fake_gh(tmppath)
             env = _make_fake_gh_env(tmppath)
             plan = tmppath / "plan.md"
-            plan.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            plan.write_text(_VALID_LEGACY_PLAN_STATE, encoding="utf-8")
             result = _run(
                 "helpers.skill_runner", "run-implement-by-phase",
                 "--issue", "9992", "--repo", "test/skill-repo",

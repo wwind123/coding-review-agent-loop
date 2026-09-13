@@ -119,9 +119,18 @@ from coding_review_agent_loop.errors import (
     UnknownPriorItemDispositionError,
 )
 from coding_review_agent_loop.decomposition import (
+    EXECUTION_TOPOLOGY_SOURCE,
+    ExecutionDecision,
+    approved_plan_hash,
+    find_existing_execution_decision,
+    normalize_execution_recommendation,
+    post_execution_decision,
+    reject_legacy_topology_collision,
     PHASE_IDENTITY_MARKER_RE,
     _decode_json_payload,
     find_existing_phase_implementation_handoff,
+    find_phase_implementation_handoffs_for_parent,
+    find_existing_decomposition,
     find_existing_topology_checkpoint,
     find_latest_one_shot_impl_handoff,
     phase_identity,
@@ -160,7 +169,12 @@ from coding_review_agent_loop.test_runtime import (
     resolve_timeout_seconds,
 )
 from coding_review_agent_loop.usage import RunUsageContext, UsageMetadata
-from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
+from coding_review_agent_loop.protocol import (
+    ReviewItemDisposition,
+    UnresolvedReviewItem,
+    parse_execution_recommendation_payload,
+    validate_structured_plan_state,
+)
 from coding_review_agent_loop.round_state import (
     ApprovedPlanContext,
     PostedRoundMetadata,
@@ -1477,15 +1491,38 @@ def _recover_skill_pr_plan_context(
         parent_issue = payload.get("parent_issue")
         plan_hash = payload.get("plan_hash")
         stage_id = payload.get("stage_id")
+        phase_index = payload.get("phase_index")
         source = payload.get("source")
         identity = payload.get("identity")
+        fresh_phase = source == EXECUTION_TOPOLOGY_SOURCE
         if (
             not isinstance(parent_issue, int)
             or isinstance(parent_issue, bool)
             or not isinstance(plan_hash, str)
             or not plan_hash.strip()
-            or not isinstance(stage_id, int)
-            or isinstance(stage_id, bool)
+            or (
+                fresh_phase
+                and (
+                    not isinstance(stage_id, str)
+                    or not stage_id.strip()
+                    or not isinstance(phase_index, int)
+                    or isinstance(phase_index, bool)
+                    or phase_index < 1
+                    or not isinstance(payload.get("strategy"), str)
+                    or payload.get("strategy") not in {"one-shot", "staged"}
+                    or payload.get("execution_strategy_contract_version") != 1
+                    or not isinstance(payload.get("recommendation_digest"), str)
+                    or not payload.get("recommendation_digest")
+                )
+            )
+            or (
+                not fresh_phase
+                and (
+                    not isinstance(stage_id, int)
+                    or isinstance(stage_id, bool)
+                    or stage_id < 1
+                )
+            )
             or not isinstance(source, str)
             or not source.strip()
             or not isinstance(identity, str)
@@ -1496,7 +1533,7 @@ def _recover_skill_pr_plan_context(
             )
         if authoritative_parent_out is not None:
             authoritative_parent_out.append(parent_issue)
-        if expected_hash is not None and expected_hash != plan_hash:
+        if expected_hash is not None and expected_hash != plan_hash and not fresh_phase:
             raise AgentLoopError(
                 f"PR #{pr} child issue handoff has plan hash {expected_hash}, but its "
                 f"staged phase identity names {plan_hash}; repair the handoff provenance."
@@ -1506,6 +1543,143 @@ def _recover_skill_pr_plan_context(
             types.SimpleNamespace(body=body)
             for body in _fetch_issue_comments_raw(repo, parent_issue)
         ]
+        if fresh_phase:
+            context = recover_approved_plan_context(
+                parent_comments,
+                expected_hash=plan_hash,
+                expected_subject=expected_subject,
+            )
+            if not context.is_available or not context.canonical_text:
+                raise AgentLoopError(
+                    f"PR #{pr} is bound to approved plan {plan_hash}, but the canonical "
+                    "parent plan could not be recovered: "
+                    f"{context.diagnostic or 'no diagnostic available'}."
+                )
+            recommendation = _skill_execution_recommendation(
+                context.canonical_text, parent_comments
+            )
+            if recommendation is None or recommendation.strategy != "staged":
+                raise AgentLoopError(
+                    f"PR #{pr} fresh phase identity requires a staged approved recommendation."
+                )
+            normalized, _retained = normalize_execution_recommendation(
+                recommendation,
+                approved_plan=context.canonical_text,
+                plan_subject=context.plan_subject or _plan_subject(context.canonical_text),
+            )
+            assert isinstance(phase_index, int)
+            if phase_index > len(normalized.phases):
+                raise AgentLoopError(
+                    f"PR #{pr} references staged phase {phase_index}, but the approved "
+                    "recommendation has no such phase."
+                )
+            phase = normalized.phases[phase_index - 1]
+            if phase.stage_id != stage_id:
+                raise AgentLoopError(
+                    f"PR #{pr} fresh phase stable ID does not match its ordinal."
+                )
+            expected_identity = phase_identity(
+                parent_issue=parent_issue,
+                plan_hash=plan_hash,
+                topology_source=EXECUTION_TOPOLOGY_SOURCE,
+                phase_index=phase_index,
+                phase=phase,
+                stage_id=phase.stage_id,
+                execution_strategy_contract_version=1,
+            )
+            if (
+                source != EXECUTION_TOPOLOGY_SOURCE
+                or identity != expected_identity
+                or payload.get("strategy") != normalized.strategy
+                or payload.get("recommendation_digest") != normalized.recommendation_digest
+            ):
+                raise AgentLoopError(
+                    f"PR #{pr} fresh staged phase identity does not match the authoritative parent recommendation."
+                )
+            summary = find_existing_decomposition(
+                parent_comments,
+                parent_issue=parent_issue,
+                plan_hash=plan_hash,
+                strategy=normalized.strategy,
+                topology_source=EXECUTION_TOPOLOGY_SOURCE,
+                recommendation_digest=normalized.recommendation_digest,
+                plan_subject=context.plan_subject,
+            )
+            if summary is None or summary.mode not in {"decompose-only", "implement-by-phase"}:
+                raise AgentLoopError(
+                    f"PR #{pr} fresh phase has no matching canonical parent topology summary."
+                )
+            if (
+                len(summary.phase_identities) != len(normalized.phases)
+                or summary.phase_identities[phase_index - 1] != expected_identity
+                or summary.stage_ids[phase_index - 1] != phase.stage_id
+            ):
+                raise AgentLoopError(
+                    f"PR #{pr} fresh phase identity disagrees with the parent topology summary."
+                )
+            # The decomposition summary records how the topology was first
+            # materialized and is intentionally not rewritten when a later
+            # implement-by-phase invocation dispatches a child. Inventory the
+            # parent handoff independently of that immutable summary mode so a
+            # parent-owned child cannot be treated as independently planned.
+            phase_handoffs = tuple(
+                handoff
+                for handoff in find_phase_implementation_handoffs_for_parent(
+                    parent_comments,
+                    parent_issue=parent_issue,
+                )
+                if (
+                    handoff.phase_index == phase_index
+                    or handoff.stage_id == stage_id
+                    or handoff.child_issue_number == issue_number
+                )
+            )
+            if len(phase_handoffs) > 1:
+                raise AgentLoopError(
+                    f"PR #{pr} has multiple parent phase implementation handoffs for staged phase "
+                    f"{phase_index}; repair the handoff provenance before reviewing."
+                )
+            phase_handoff = phase_handoffs[0] if phase_handoffs else None
+            if phase_handoff is not None and (
+                phase_handoff.plan_hash != plan_hash
+                or phase_handoff.mode != "implement-by-phase"
+                or phase_handoff.child_issue_number != issue_number
+                or (expected_hash is not None and expected_hash != plan_hash)
+                or phase_handoff.phase_index != phase_index
+                or phase_handoff.strategy != normalized.strategy
+                or phase_handoff.topology_source != EXECUTION_TOPOLOGY_SOURCE
+                or phase_handoff.execution_strategy_contract_version != 1
+                or phase_handoff.recommendation_digest != normalized.recommendation_digest
+                or phase_handoff.stage_id != phase.stage_id
+                or phase_handoff.plan_subject != context.plan_subject
+                or phase_handoff.phase_title != phase.title
+                or phase_handoff.automation != phase.automation
+            ):
+                raise AgentLoopError(
+                    f"PR #{pr} fresh phase implementation handoff disagrees with the parent topology."
+                )
+            if summary.mode == "implement-by-phase" and phase_handoff is None:
+                raise AgentLoopError(
+                    f"PR #{pr} has a fresh phase identity but no matching parent phase handoff."
+                )
+            # With no parent-owned handoff, a separately planned child must
+            # use its own issue-side approved-plan provenance. Do not let a
+            # child issue-to-PR handoff that copied the parent topology hash
+            # fall through to the parent plan.
+            if phase_handoff is None:
+                child_context = recover_approved_plan_context(
+                    comments,
+                    expected_hash=expected_hash,
+                    expected_subject=expected_subject,
+                )
+                if not child_context.is_available or not child_context.canonical_text:
+                    raise AgentLoopError(
+                        f"PR #{pr} child issue #{issue_number} has no recoverable approved "
+                        f"child plan {expected_hash}; repair the issue-to-PR handoff."
+                    )
+                return child_context
+            return context
+
         matching_mode: str | None = None
         matching_checkpoint = None
         for mode in ("decompose-only", "implement-by-phase"):
@@ -4510,6 +4684,7 @@ def _run_child_or_one_shot_implementation(
     runner: Runner,
     post_one_shot_handoff: bool,
     one_shot_mode: str = "implement-one-shot",
+    execution_recommendation=None,
     external_args: tuple[str, ...] = (),
     coder_test_command_timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_options: dict[str, object] | None = None,
@@ -4519,6 +4694,10 @@ def _run_child_or_one_shot_implementation(
     from coding_review_agent_loop.decomposition import (
         approved_plan_hash,
         format_one_shot_impl_handoff_comment,
+    )
+    execution_identity = (
+        execution_recommendation.identity()
+        if execution_recommendation is not None else None
     )
     from coding_review_agent_loop.github import (
         get_pr_review_context,
@@ -4721,6 +4900,21 @@ def _run_child_or_one_shot_implementation(
                     plan_subject=_plan_subject(approved_plan),
                     pr_number=pr_number,
                     pr_head_sha=head_sha,
+                    strategy=(
+                        execution_recommendation.strategy
+                        if execution_recommendation is not None else None
+                    ),
+                    topology_source=(
+                        str(execution_identity["topology_source"])
+                        if execution_identity is not None else None
+                    ),
+                    execution_strategy_contract_version=(
+                        1 if execution_recommendation is not None else None
+                    ),
+                    recommendation_digest=(
+                        str(execution_identity["recommendation_sha256"])
+                        if execution_identity is not None else None
+                    ),
                 ))
                 _run_helper(
                     "helpers.gh_ops", "post-issue-comment",
@@ -4780,10 +4974,47 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
 
     # Idempotency — reuse the durable one-shot handoff marker (no duplicate PRs).
     comments = [types.SimpleNamespace(body=b) for b in _fetch_issue_comments_raw(repo, issue)]
+    execution_recommendation = _skill_execution_recommendation(approved_plan, comments)
+    if (
+        execution_recommendation is not None
+        and execution_recommendation.strategy != "one-shot"
+    ):
+        raise AgentLoopError(
+            "run-implement requires a one-shot approved execution recommendation; "
+            "staged plans must use run-decompose or run-implement-by-phase."
+        )
     existing = find_existing_one_shot_impl_handoff(
         comments, parent_issue=issue, plan_hash=plan_hash, mode=mode,
     )
+    if execution_recommendation is not None and not dry_run:
+        from coding_review_agent_loop.orchestrator import _preflight_fresh_one_shot_recovery
+
+        issue_context = get_issue_context(runner, config=config, issue_number=issue)
+        _preflight_fresh_one_shot_recovery(
+            runner,
+            issue_number=issue,
+            approved_plan=approved_plan,
+            config=config,
+            issue_context=issue_context,
+            recommendation=execution_recommendation,
+        )
     if existing is not None:
+        if execution_recommendation is not None:
+            identity = execution_recommendation.identity()
+            if (
+                existing.strategy != execution_recommendation.strategy
+                or existing.topology_source != identity["topology_source"]
+                or existing.execution_strategy_contract_version != 1
+                or existing.recommendation_digest != identity["recommendation_sha256"]
+            ):
+                raise AgentLoopError(
+                    "Existing one-shot handoff does not match the approved fresh execution identity; "
+                    "refusing to reuse or recreate the implementation PR."
+                )
+        elif existing.topology_source == EXECUTION_TOPOLOGY_SOURCE:
+            raise AgentLoopError(
+                "Existing fresh one-shot handoff cannot be recovered without the approved execution recommendation."
+            )
         # Only reuse a recorded PR that is still open AND still references this issue
         # — a stale/injected same-plan-hash marker must not return an unrelated PR.
         reusable = True
@@ -4795,6 +5026,15 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         except AgentLoopError:
             reusable = False
         if reusable:
+            _persist_skill_execution_decision(
+                runner,
+                config=config,
+                issue=issue,
+                plan=approved_plan,
+                comments=comments,
+                recommendation=execution_recommendation,
+                requested_policy=mode,
+            )
             print(json.dumps({
                 "pr": existing.pr_number,
                 "head_sha": existing.pr_head_sha,
@@ -4808,6 +5048,15 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
             )
             return
 
+    _persist_skill_execution_decision(
+        runner,
+        config=config,
+        issue=issue,
+        plan=approved_plan,
+        comments=comments,
+        recommendation=execution_recommendation,
+        requested_policy=mode,
+    )
     issue_context = get_issue_context(runner, config=config, issue_number=issue)
     result_json = _run_child_or_one_shot_implementation(
         issue=issue,
@@ -4822,6 +5071,7 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         runner=runner,
         post_one_shot_handoff=True,
         one_shot_mode=mode,
+        execution_recommendation=execution_recommendation,
         external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
         architecture_options=_architecture_options(args),
@@ -5263,6 +5513,19 @@ def _decomposition_phase_json(index: int, phase, *, issue_url: str | None = None
     }
     if origin is not None:
         result["origin"] = origin
+    if getattr(phase, "stage_id", None) is not None:
+        result.update(
+            {
+                "stage_id": phase.stage_id,
+                "position": phase.position,
+                "deliverables": list(getattr(phase, "deliverables", ()) or ()),
+                "non_goals_items": list(getattr(phase, "non_goals_items", ()) or ()),
+                "acceptance_criteria": list(getattr(phase, "acceptance_criteria", ()) or ()),
+                "depends_on_stage_ids": list(getattr(phase, "depends_on_stage_ids", ()) or ()),
+                "compatibility_constraints": list(getattr(phase, "compatibility_constraints", ()) or ()),
+                "covered_scope_item_ids": list(getattr(phase, "covered_scope_item_ids", ()) or ()),
+            }
+        )
     return result
 
 
@@ -5280,18 +5543,109 @@ def _existing_decomposition_json(existing) -> list[dict]:
     return phases
 
 
-def _created_phase_issues_from_existing(existing):
+def _created_phase_issues_from_existing(existing, decomposition=None):
     from coding_review_agent_loop.decomposition import CreatedPhaseIssue, RecordedPhase
 
     return tuple(
         CreatedPhaseIssue(
-            phase=RecordedPhase(title=title, automation=automation),
+            phase=(
+                decomposition.phases[index]
+                if decomposition is not None and index < len(decomposition.phases)
+                else RecordedPhase(title=title, automation=automation)
+            ),
             issue_url=url,
             issue_number=number,
             origin="adopted",
         )
-        for (title, url, number), automation in zip(existing.children, existing.automation, strict=False)
+        for index, ((title, url, number), automation) in enumerate(
+            zip(existing.children, existing.automation, strict=False)
+        )
     )
+
+
+def _skill_execution_recommendation(approved_plan: str, issue_comments: Sequence[object]):
+    """Recover a fresh recommendation from a plan file and bounded sidecars."""
+    parsed = None
+    try:
+        parsed = validate_structured_plan_state(approved_plan)
+    except AgentLoopError:
+        try:
+            raw_payload, _ = json.JSONDecoder().raw_decode(approved_plan.lstrip())
+        except (json.JSONDecodeError, AttributeError):
+            raw_payload = None
+        if isinstance(raw_payload, dict) and (
+            "execution_strategy_contract_version" in raw_payload
+            or "execution_recommendation" in raw_payload
+        ):
+            raise
+        parsed = None
+    if parsed is not None and parsed.execution_recommendation is not None:
+        return parsed.execution_recommendation
+
+    from coding_review_agent_loop.comment_rendering import (
+        EXECUTION_RECOMMENDATION_MARKER_RE,
+        decode_execution_recommendation_marker,
+    )
+
+    marker = EXECUTION_RECOMMENDATION_MARKER_RE.search(approved_plan)
+    if marker is None:
+        return None
+    bodies = [approved_plan]
+    bodies.extend(
+        body for comment in issue_comments
+        if isinstance((body := getattr(comment, "body", None)), str)
+    )
+    payload = decode_execution_recommendation_marker(
+        marker.group("payload"), bodies=bodies
+    )
+    return parse_execution_recommendation_payload(
+        payload, context="approved execution_recommendation"
+    )
+
+
+def _persist_skill_execution_decision(
+    runner: Runner,
+    *,
+    config,
+    issue: int,
+    plan: str,
+    comments: Sequence[object],
+    recommendation,
+    requested_policy: str,
+) -> None:
+    if recommendation is None or config.dry_run:
+        return
+    plan_hash = approved_plan_hash(plan)
+    plan_subject = _plan_subject(plan)
+    identity = recommendation.identity()
+    decision = ExecutionDecision(
+        parent_issue=issue,
+        plan_hash=plan_hash,
+        plan_subject=plan_subject,
+        execution_strategy_contract_version=1,
+        strategy=recommendation.strategy,
+        topology_source=str(identity["topology_source"]),
+        recommendation_digest=str(identity["recommendation_sha256"]),
+        requested_policy=requested_policy,
+        current_action=requested_policy,
+        stage_ids=tuple(stage.stage_id for stage in recommendation.child_stages),
+        scope_item_ids=tuple(item.scope_item_id for item in recommendation.scope_items),
+        retained_parent_status=recommendation.retained_parent_work.status,
+        final_integration_status=recommendation.final_integration_work.status,
+        architecture_identity=(
+            config.architecture_context.identity()
+            if hasattr(config.architecture_context, "identity") else None
+        ),
+    )
+    if find_existing_execution_decision(
+        comments,
+        parent_issue=issue,
+        plan_hash=plan_hash,
+        plan_subject=plan_subject,
+        strategy=recommendation.strategy,
+        recommendation_digest=str(identity["recommendation_sha256"]),
+    ) is None:
+        post_execution_decision(runner, config=config, decision=decision)
 
 
 def _run_decomposition_for_skill(
@@ -5321,7 +5675,6 @@ def _run_decomposition_for_skill(
         post_decomposition_parent_summary,
     )
     from coding_review_agent_loop.child_topology import NeedsHumanDecision
-    from coding_review_agent_loop.protocol import validate_structured_plan_state
     from coding_review_agent_loop.github import get_issue_context
     from helpers.prompt_builders import (
         build_plan_decomposition_prompt_for_skill,
@@ -5345,14 +5698,72 @@ def _run_decomposition_for_skill(
     else:
         issue_context = get_issue_context(runner, config=config, issue_number=issue)
 
+    plan_subject = _plan_subject(approved_plan)
+    recommendation = _skill_execution_recommendation(
+        approved_plan, issue_context.comments
+    )
+    normalized_topology = None
+    canonical_strategy = None
+    recommendation_digest = None
+    execution_contract_version = None
+    topology_source = "model"
+    retained_parent_scope = None
+    fresh_staged_preflight = None
+    if recommendation is not None:
+        if recommendation.strategy != "staged":
+            raise AgentLoopError(
+                "run-decompose and run-implement-by-phase require a staged approved execution recommendation; "
+                "one-shot plans must use run-implement."
+            )
+        normalized_topology = normalize_execution_recommendation(
+            recommendation,
+            approved_plan=approved_plan,
+            plan_subject=plan_subject,
+        )
+        reject_legacy_topology_collision(
+            issue_context.comments,
+            parent_issue=issue,
+            plan_hash=plan_hash,
+        )
+        decomposition, retained_parent_scope = normalized_topology
+        topology_source = EXECUTION_TOPOLOGY_SOURCE
+        canonical_strategy = decomposition.strategy
+        recommendation_digest = decomposition.recommendation_digest
+        execution_contract_version = decomposition.execution_strategy_contract_version
+
+        if not dry_run:
+            from coding_review_agent_loop.orchestrator import _preflight_fresh_staged_topology
+
+            fresh_staged_preflight = _preflight_fresh_staged_topology(
+                runner,
+                issue_number=issue,
+                approved_plan=approved_plan,
+                config=config,
+                issue_context=issue_context,
+                mode=mode,
+                normalized_topology=normalized_topology,
+            )
+
     existing = find_existing_decomposition(
         issue_context.comments,
         parent_issue=issue,
         plan_hash=plan_hash,
-        mode=mode,
+        **(
+            {
+                "strategy": canonical_strategy,
+                "topology_source": topology_source,
+                "recommendation_digest": recommendation_digest,
+                "plan_subject": plan_subject,
+            }
+            if normalized_topology is not None
+            else {"mode": mode}
+        ),
     )
-    if existing is not None:
-        created = _created_phase_issues_from_existing(existing)
+    if existing is not None and not isinstance(fresh_staged_preflight, NeedsHumanDecision):
+        created = _created_phase_issues_from_existing(
+            existing,
+            decomposition=decomposition if normalized_topology is not None else None,
+        )
         result = {
             "issue": issue,
             "plan_hash": plan_hash,
@@ -5361,6 +5772,10 @@ def _run_decomposition_for_skill(
             "reused": True,
             "state": "reused",
             "topology_source": existing.topology_source,
+            "strategy": existing.strategy,
+            "execution_strategy_contract_version": existing.execution_strategy_contract_version,
+            "recommendation_digest": existing.recommendation_digest,
+            "plan_subject": existing.plan_subject,
             "phase_count": existing.phase_count,
             "phases": _existing_decomposition_json(existing),
             "adopted_children": _existing_decomposition_json(existing),
@@ -5372,21 +5787,42 @@ def _run_decomposition_for_skill(
                 "plan_hash": existing.retained_parent_scope.plan_hash,
                 "excerpt": existing.retained_parent_scope.excerpt,
             }
+        if existing.final_integration_work is not None:
+            result["final_integration_work"] = {
+                "status": existing.final_integration_work.status,
+                "deliverables": list(existing.final_integration_work.deliverables),
+                "acceptance_criteria": list(existing.final_integration_work.acceptance_criteria),
+                "covered_scope_item_ids": list(existing.final_integration_work.covered_scope_item_ids),
+            }
+        _persist_skill_execution_decision(
+            runner,
+            config=config,
+            issue=issue,
+            plan=approved_plan,
+            comments=issue_context.comments,
+            recommendation=recommendation,
+            requested_policy=mode,
+        )
         print(
             f"hint: issue #{issue} already has a {mode} decomposition for this plan.",
             file=sys.stderr,
         )
         return result, created, issue_context, config, runner, plan_hash, approved_plan, str(workdir)
 
-    topology_source = "model"
-    retained_parent_scope = None
-    checkpoint = find_existing_topology_checkpoint(
-        issue_context.comments,
-        parent_issue=issue,
-        plan_hash=plan_hash,
-        mode=mode,
-    )
-    decomposition = None
+    checkpoint = None
+    if normalized_topology is None:
+        checkpoint = find_existing_topology_checkpoint(
+            issue_context.comments,
+            parent_issue=issue,
+            plan_hash=plan_hash,
+            mode=mode,
+        )
+    if normalized_topology is not None:
+        # Fresh recommendations are lossless in the approved-plan round and
+        # use the bounded decision/summary identity.  Do not fall back to a
+        # mode-shaped full checkpoint or invoke a second decomposition model.
+        checkpoint = None
+    decomposition = decomposition if normalized_topology is not None else None
     if checkpoint is not None:
         from coding_review_agent_loop.decomposition import PlanDecomposition
 
@@ -5482,6 +5918,17 @@ def _run_decomposition_for_skill(
     else:
         coder_usage = None
 
+    if not isinstance(fresh_staged_preflight, NeedsHumanDecision):
+        _persist_skill_execution_decision(
+            runner,
+            config=config,
+            issue=issue,
+            plan=approved_plan,
+            comments=issue_context.comments,
+            recommendation=recommendation,
+            requested_policy=mode,
+        )
+
     result_json: dict = {
         "issue": issue,
         "plan_hash": plan_hash,
@@ -5490,7 +5937,11 @@ def _run_decomposition_for_skill(
         "reused": False,
         "state": "planned",
         "topology_source": topology_source,
-        "would_post_checkpoint": True,
+        "strategy": canonical_strategy,
+        "execution_strategy_contract_version": execution_contract_version,
+        "recommendation_digest": recommendation_digest,
+        "plan_subject": plan_subject if normalized_topology is not None else None,
+        "would_post_checkpoint": normalized_topology is None,
         "would_post_parent_summary": True,
     }
     if retained_parent_scope is not None:
@@ -5498,7 +5949,29 @@ def _run_decomposition_for_skill(
             "plan_subject": retained_parent_scope.plan_subject,
             "plan_hash": retained_parent_scope.plan_hash,
             "excerpt": retained_parent_scope.excerpt,
+            "status": retained_parent_scope.status,
+            "deliverables": list(retained_parent_scope.deliverables),
+            "acceptance_criteria": list(retained_parent_scope.acceptance_criteria),
+            "covered_scope_item_ids": list(retained_parent_scope.covered_scope_item_ids),
         }
+    if normalized_topology is not None:
+        final_integration = decomposition.final_integration_work
+        result_json["final_integration_work"] = {
+            "status": final_integration.status,
+            "deliverables": list(final_integration.deliverables),
+            "acceptance_criteria": list(final_integration.acceptance_criteria),
+            "covered_scope_item_ids": list(final_integration.covered_scope_item_ids),
+        }
+    fresh_topology_kwargs = (
+        {
+            "strategy": canonical_strategy,
+            "execution_strategy_contract_version": execution_contract_version,
+            "recommendation_digest": recommendation_digest,
+            "plan_subject": plan_subject,
+        }
+        if normalized_topology is not None
+        else {}
+    )
     created = create_decomposition_child_issues(
         runner,
         config=config,
@@ -5509,6 +5982,7 @@ def _run_decomposition_for_skill(
         issue_comments=issue_context.comments,
         mode=mode,
         retained_parent_scope=retained_parent_scope,
+        **fresh_topology_kwargs,
     )
     if isinstance(created, NeedsHumanDecision):
         result_json["state"] = "needs-human"
@@ -5521,6 +5995,11 @@ def _run_decomposition_for_skill(
         result_json["phase_count"] = 0
         return result_json, (), issue_context, config, runner, plan_hash, approved_plan, str(workdir)
     if not dry_run:
+        summary_allocation_kwargs = (
+            {"final_integration_work": decomposition.final_integration_work}
+            if topology_source == EXECUTION_TOPOLOGY_SOURCE
+            else {}
+        )
         post_decomposition_parent_summary(
             runner,
             config=config,
@@ -5530,6 +6009,8 @@ def _run_decomposition_for_skill(
             created=created,
             topology_source=topology_source,
             retained_parent_scope=retained_parent_scope,
+            **fresh_topology_kwargs,
+            **summary_allocation_kwargs,
         )
     result_json["phases"] = [
         _decomposition_phase_json(
@@ -5626,9 +6107,16 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         "dry_run": dry_run,
         "state": "ready",
         "topology_source": decomposition_result.get("topology_source", "model"),
+        "strategy": decomposition_result.get("strategy"),
+        "execution_strategy_contract_version": decomposition_result.get(
+            "execution_strategy_contract_version"
+        ),
+        "recommendation_digest": decomposition_result.get("recommendation_digest"),
+        "plan_subject": decomposition_result.get("plan_subject"),
         "decomposition_reused": bool(decomposition_result.get("reused")),
         "adopted_children": decomposition_result.get("adopted_children", []),
         "created_children": decomposition_result.get("created_children", []),
+        "final_integration_work": decomposition_result.get("final_integration_work"),
         "phase": _decomposition_phase_json(
             1,
             first_phase.phase,
@@ -5722,6 +6210,18 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         child_issue_number=first_phase.issue_number,
     )
     if handoff is not None:
+        if decomposition_result.get("topology_source") == EXECUTION_TOPOLOGY_SOURCE:
+            if (
+                handoff.strategy != decomposition_result.get("strategy")
+                or handoff.topology_source != EXECUTION_TOPOLOGY_SOURCE
+                or handoff.execution_strategy_contract_version != 1
+                or handoff.recommendation_digest != decomposition_result.get("recommendation_digest")
+                or handoff.stage_id != first_phase.phase.stage_id
+                or handoff.plan_subject != decomposition_result.get("plan_subject")
+            ):
+                raise AgentLoopError(
+                    "Existing phase implementation handoff does not match the approved fresh topology identity."
+                )
         result_json.update({
             "state": "handoff-exists",
             "handoff_reused": True,
@@ -5786,6 +6286,13 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         plan_hash=plan_hash,
         phase_index=1,
         created=first_phase,
+        strategy=decomposition_result.get("strategy"),
+        topology_source=decomposition_result.get("topology_source"),
+        execution_strategy_contract_version=decomposition_result.get(
+            "execution_strategy_contract_version"
+        ),
+        recommendation_digest=decomposition_result.get("recommendation_digest"),
+        plan_subject=decomposition_result.get("plan_subject"),
     )
     result_json.update({
         "state": "implemented",

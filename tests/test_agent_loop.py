@@ -2185,6 +2185,20 @@ def test_plan_first_post_approval_options_require_plan_first(capsys):
     assert "--plan-execution-mode requires --plan-first" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("mode", ["plan-only", "decompose-only", "implement-by-phase"])
+def test_cli_rejects_alias_with_conflicting_explicit_execution_mode(tmp_path, capsys, mode):
+    result = main([
+        "issue", "56", "--repo", "OWNER/REPO", "--plan-first",
+        "--plan-execution-mode", mode, "--implement-after-approval",
+        "--claude-dir", str(tmp_path / "claude"),
+        "--codex-dir", str(tmp_path / "codex"),
+        "--gemini-dir", str(tmp_path / "gemini"),
+    ])
+
+    assert result == 1
+    assert "--implement-after-approval is only compatible" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("mode", ["decompose-only", "implement-by-phase"])
 def test_cli_rejects_split_materialization_with_decomposition_modes(tmp_path, capsys, mode):
     result = main([
