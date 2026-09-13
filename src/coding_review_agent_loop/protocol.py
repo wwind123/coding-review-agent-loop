@@ -3041,11 +3041,13 @@ def _parse_unresolved_item_dispositions(
     dispositions: list[ReviewItemDisposition] = []
     active = False
     section_heading: str | None = None
+    parent_indent: int | None = None
 
     for line_number, line in enumerate(text.splitlines(), start=1):
         if heading_re.match(line):
             active = True
             section_heading = line.strip()
+            parent_indent = None
             continue
         if not active:
             continue
@@ -3058,6 +3060,14 @@ def _parse_unresolved_item_dispositions(
         if not bullet:
             continue
         entry = bullet.group("text")
+        indent = len(line.expandtabs()) - len(line.expandtabs().lstrip())
+        # Canonical nested history describes the parent, not a new disposition.
+        if (
+            parent_indent is not None
+            and indent > parent_indent
+            and entry.startswith("Original finding:")
+        ):
+            continue
         if empty_item_re.match(entry):
             continue
         match = disposition_re.match(entry)
@@ -3087,6 +3097,7 @@ def _parse_unresolved_item_dispositions(
                 note=normalized_note,
             )
         )
+        parent_indent = indent
 
     return tuple(dispositions)
 

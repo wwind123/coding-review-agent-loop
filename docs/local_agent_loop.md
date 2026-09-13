@@ -2336,10 +2336,10 @@ Published prior-item dispositions put the current status immediately after the
 item ID, before evidence and the original finding:
 
 ```text
-- [item-3]: RESOLVED
-  Original finding: Blocking issue from Anthropic Claude, round 1: Add coverage.
-- [item-16]: SAME-PR: The error diagnostic still needs correction.
-  Original finding: Same-PR follow-up from Anthropic Claude, round 2: Preserve diagnostics.
+- [item-3] RESOLVED
+  - Original finding: Blocking issue from Anthropic Claude, round 1: Add coverage.
+- [item-16] SAME-PR: The error diagnostic still needs correction.
+  - Original finding: Same-PR follow-up from Anthropic Claude, round 2: Preserve diagnostics.
 ```
 
 `BLOCKING`, `SAME-PR`, and `SAME-PLAN` remain active dispositions; `RESOLVED`
@@ -2347,6 +2347,8 @@ and `FUTURE FOLLOW-UP` have their existing meanings. These are the publishing
 reviewer's dispositions, not a substitute for the aggregate reviewer gate.
 The original finding retains its historical severity and attribution; it does
 not override the status at the start of the bullet.
+There is deliberately no colon immediately after the bracketed ID: Markdown
+can interpret `[item-3]: RESOLVED` as a hidden link-reference definition.
 
 Coder follow-up and plan-revision rounds are structured too. A PR follow-up
 response must classify every carried reviewer item exactly once:
