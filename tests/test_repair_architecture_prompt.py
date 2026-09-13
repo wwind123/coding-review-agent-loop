@@ -69,6 +69,25 @@ def test_marker_only_text_accepts_arbitrary_safe_repair_wording():
     validate_repair_preservation(json.dumps(original), json.dumps(repaired))
 
 
+def test_two_quoted_markers_allow_rewording_without_delimiters():
+    original = {
+        'schema_version': 1,
+        'kind': 'coder_followup',
+        'summary': (
+            'Discuss `AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1` and '
+            '`AGENT_MANAGED_PR_SOURCE_V1` here.'
+        ),
+    }
+    repaired = {
+        'schema_version': 1,
+        'kind': 'coder_followup',
+        'summary': (
+            'Discuss the managed-CI override record and managed-PR origin record here.'
+        ),
+    }
+    validate_repair_preservation(json.dumps(original), json.dumps(repaired))
+
+
 def test_repair_prompt_distinguishes_reserved_syntax_from_bare_identifiers():
     raw = json.dumps({'summary': 'AGENT_SPLIT_UNFILED_WARNING; AGENT_PLAN_EXECUTION_DECISION'})
     prompt = _build_repair_prompt(raw, expected_kind='pr_review')

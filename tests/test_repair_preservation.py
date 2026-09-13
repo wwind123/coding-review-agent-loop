@@ -457,6 +457,24 @@ def test_reserved_grammar_safety_correction_is_not_blocked():
           {"kind": "coder_followup", "summary": "Managed CI override."})
 
 
+def test_embedded_managed_ci_identifier_preserves_following_prose():
+    original = {
+        "kind": "coder_followup",
+        "summary": (
+            "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1 followed by substantive evidence."
+        ),
+    }
+    repaired = {
+        "kind": "coder_followup",
+        "summary": "Managed CI override record. followed by substantive evidence.",
+    }
+    check(original, repaired)
+
+    repaired["summary"] = "Managed CI override record."
+    with pytest.raises(AgentLoopError, match="summary"):
+        check(original, repaired)
+
+
 def test_no_reviewer_ids_become_signed_requirements():
     from coding_review_agent_loop.protocol import _expect_human_requirement_dispositions
 

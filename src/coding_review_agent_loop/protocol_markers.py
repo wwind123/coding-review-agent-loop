@@ -424,10 +424,17 @@ def _historical_replacement_occurrences(text: str) -> tuple[MarkerOccurrence, ..
     replacements: list[MarkerOccurrence] = []
     for occurrence in _all_occurrences(text):
         definition = occurrence.definition
+        line_match = definition.pattern.fullmatch(occurrence.text)
+        invalid_line_record = False
+        if definition.codec == "key-value-line" and line_match is not None:
+            try:
+                definition.canonicalizer(line_match)
+            except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, zlib.error):
+                invalid_line_record = True
         if (
             definition.strictness == "name-bearing-line"
             and definition.pattern.fullmatch(occurrence.text) is None
-        ):
+        ) or invalid_line_record:
             for match in re.finditer(re.escape(definition.token), occurrence.text, re.I):
                 replacements.append(
                     MarkerOccurrence(
@@ -485,9 +492,9 @@ def historical_text_fragments(text: str) -> tuple[str, ...]:
         if fragment.strip() and re.search(r"\w", fragment):
             fragments.append(fragment)
         cursor = occurrence.end
+        if text[cursor:cursor + 1] in {"`", "'", '"'}:
+            cursor += 1
     fragment = text[cursor:]
-    if text[cursor:cursor + 1] in {"`", "'", '"'}:
-        fragment = fragment[1:]
     if fragment.strip() and re.search(r"\w", fragment):
         fragments.append(fragment)
     return tuple(fragments)
