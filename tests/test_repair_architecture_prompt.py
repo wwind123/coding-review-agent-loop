@@ -46,3 +46,12 @@ def test_marker_only_repair_cannot_drop_architecture_assessment():
     del repaired['architecture_impact']
     with pytest.raises(AgentLoopError, match='architecture_impact'):
         validate_repair_preservation(raw, json.dumps(repaired))
+
+
+def test_repair_prompt_distinguishes_reserved_syntax_from_bare_identifiers():
+    raw = json.dumps({'summary': 'AGENT_SPLIT_UNFILED_WARNING; AGENT_PLAN_EXECUTION_DECISION'})
+    prompt = _build_repair_prompt(raw, expected_kind='pr_review')
+    section = prompt.split('## Registry-detected reserved syntax in this source:\n')[1]
+    detected = json.loads(section.splitlines()[0])
+    assert detected == ['AGENT_SPLIT_UNFILED_WARNING']
+    assert 'Do not rename other bare code identifiers' in section

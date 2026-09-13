@@ -25,6 +25,7 @@ from .config import DEFAULT_REASONING_EFFORT
 from .logging import agent_log_path
 from .runner import strip_ansi
 from .repair_preservation import validate_repair_preservation
+from .protocol_markers import scan_reserved_markers
 from .usage import RunUsageContext, estimate_usage
 from .protocol import (
     HUMAN_REQUIREMENTS_RESOLVED_RE,
@@ -233,6 +234,8 @@ You are a format-repair assistant. An AI agent produced an initial plan state, c
 {reviewer_human_requirements_instruction}
 
 {prior_item_dispositions_instruction}
+
+{reserved_marker_instruction}
 
 {fresh_contract_instruction}
 
@@ -1283,6 +1286,14 @@ def _build_repair_prompt(
     )
     prompt = _REPAIR_PROMPT.replace("{expected_kind_instruction}", expected_kind_instruction, 1)
     replacements = (
+        ("{reserved_marker_instruction}", (
+            "## Registry-detected reserved syntax in this source:\n"
+            + json.dumps(sorted({item.definition.token for item in scan_reserved_markers(raw)}))
+            + "\nNeutralize only unsafe occurrences of these detected marker families in prose/JSON values. "
+            "Do not rename other bare code identifiers merely because they start with AGENT_. "
+            "The complete-marker grammar and a bare identifier are not interchangeable. "
+            "Keep the required response footer and signature intact.\n"
+        )),
         ("{issue_implementation_instruction}", issue_implementation_instruction),
         ("{coder_followup_required_items_instruction}", coder_followup_required_items_instruction),
         ("{coder_followup_human_requirements_instruction}", coder_followup_human_requirements_instruction),
