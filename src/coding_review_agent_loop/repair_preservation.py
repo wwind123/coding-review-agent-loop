@@ -160,27 +160,38 @@ def validate_repair_preservation(
         target_impact = target.get("architecture_impact")
         require(isinstance(target_impact, dict), "architecture_impact")
         for key, value in impact.items():
+            field = f"architecture_impact.{key}"
+            require(key in target_impact, field)
+            candidate = target_impact[key]
             fragments = _fragments(value)
-            if isinstance(value, str) and fragments:
-                candidate = target_impact.get(key)
-                exact = key in {"status", "canonical_document_action"} and len(fragments) == 1
-                require(
-                    (
-                        isinstance(candidate, str)
-                        and _normalized(fragments[0]) == _normalized(candidate)
-                        if exact
-                        else _contains_fragments(candidate, fragments)
-                    ),
-                    f"architecture_impact.{key}",
-                )
+            if isinstance(value, str):
+                if fragments:
+                    exact = key in {"status", "canonical_document_action"} and len(fragments) == 1
+                    require(
+                        (
+                            isinstance(candidate, str)
+                            and _normalized(fragments[0]) == _normalized(candidate)
+                            if exact
+                            else _contains_fragments(candidate, fragments)
+                        ),
+                        field,
+                    )
+                elif not value:
+                    require(candidate == value, field)
+                else:
+                    # Marker-only prose may be neutralized, but it must not
+                    # change the architecture field's scalar type.
+                    require(isinstance(candidate, str), field)
             elif isinstance(value, list):
-                candidate = target_impact.get(key)
                 _preserve_architecture_list(
                     value,
                     candidate,
-                    field=f"architecture_impact.{key}",
+                    field=field,
                     require=require,
                 )
+            else:
+                # Preserve schema-valid scalar values such as null exactly.
+                require(type(candidate) is type(value) and candidate == value, field)
 
     if source["kind"] in {"plan_state", "plan_revision"} and (
         "execution_strategy_contract_version" in source

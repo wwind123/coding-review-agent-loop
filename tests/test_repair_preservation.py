@@ -224,6 +224,48 @@ def test_architecture_entries_require_distinct_one_to_one_matches():
         })
 
 
+def test_architecture_scalar_fields_cannot_be_omitted_or_type_changed():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "rationale": "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "rationale": "Managed CI override record.",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+    check(source, repaired)
+
+    for key in source["architecture_impact"]:
+        omitted = deepcopy(repaired)
+        del omitted["architecture_impact"][key]
+        with pytest.raises(AgentLoopError, match=f"architecture_impact\\.{key}"):
+            check(source, omitted)
+
+    wrong_type = deepcopy(repaired)
+    wrong_type["architecture_impact"]["rationale"] = None
+    with pytest.raises(AgentLoopError, match="architecture_impact.rationale"):
+        check(source, wrong_type)
+
+    changed_null = deepcopy(repaired)
+    changed_null["architecture_impact"]["canonical_document_path"] = "ARCHITECTURE.md"
+    with pytest.raises(AgentLoopError, match="architecture_impact.canonical_document_path"):
+        check(source, changed_null)
+
+    changed_empty = deepcopy(repaired)
+    changed_empty["architecture_impact"]["canonical_document_rationale"] = "Added a default."
+    with pytest.raises(AgentLoopError, match="architecture_impact.canonical_document_rationale"):
+        check(source, changed_empty)
+
+
 def test_case06_object_to_string_keeps_every_detail():
     detail = "Wire the capability getter in app.js:42; add a two-round test; no mutation on 503."
     source = {"kind": "plan_review", "blocking_plan_issues": [
