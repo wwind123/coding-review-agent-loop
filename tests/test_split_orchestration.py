@@ -286,6 +286,72 @@ def test_one_shot_recommendation_keeps_legacy_split_materialization_live(
     assert runner.issues[0]["title"] == "[#783 stage] Legacy follow-up"
 
 
+def test_fresh_one_shot_materialization_rerun_reuses_split_child_and_pr(
+    tmp_path,
+):
+    """A split child created beside a fresh one-shot plan is recoverable.
+
+    The child belongs to the approved request because its normalized stage key
+    comes from the prior discuss split that the one-shot run materializes.
+    A rerun must adopt that exact materialization before resuming the existing
+    one-shot PR, without creating another child or invoking the coder again.
+    """
+    plan = _fresh_v1_plan_for_isolation("one-shot")
+    payload, end = json.JSONDecoder().raw_decode(plan.lstrip())
+    payload["deferred_stages"] = [
+        {"title": "Legacy follow-up", "summary": "Keep this follow-up as a child issue."}
+    ]
+    plan = json.dumps(payload) + plan.lstrip()[end:]
+    split_comment = _attach_round_metadata(
+        "Split consensus recorded.",
+        PostedRoundMetadata(
+            flow="discuss",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="discuss-subject",
+            is_final=True,
+            split_proposals=("Legacy follow-up",),
+        ),
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            plan,
+            "Implemented the approved one-shot plan.\n"
+            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_pr_review(state="approved", summary="LGTM."),
+        ],
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:00Z",
+                "body": split_comment,
+            }
+        ],
+        issue_urls=["https://github.com/OWNER/REPO/issues/101"],
+        pr_payload={"body": "Fixes #56"},
+    )
+    config = make_config(
+        tmp_path,
+        plan_execution_mode="implement-one-shot",
+        materialize_split_issues=True,
+        execution_strategy_contract_required=True,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert len(runner.issues) == 1
+    coder_count = sum(command[:1] == ["claude"] for command, _cwd in runner.commands)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert len(runner.issues) == 1
+    assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == coder_count
+    assert sum("AGENT_DISCUSS_SPLIT" in comment for comment in runner.comments) == 1
+
+
 @pytest.mark.parametrize("strategy", ["one-shot", "staged"])
 def test_auto_dry_run_previews_without_approval_bound_mutation(tmp_path, capsys, strategy):
     plan = _fresh_v1_plan_for_isolation(strategy)

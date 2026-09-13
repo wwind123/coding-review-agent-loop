@@ -266,7 +266,7 @@ def test_plan_first_pr_recovery_reconciles_fresh_strategy_before_resume(
     assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
 
 
-def test_plan_first_plan_only_does_not_review_canonical_pr_without_plan_round(tmp_path, capsys):
+def test_plan_first_plan_only_legacy_pr_recovery_still_reviews_without_plan_round(tmp_path):
     handoff = format_issue_pr_handoff_comment(
         issue_number=56,
         pr_number=77,
@@ -280,6 +280,7 @@ def test_plan_first_plan_only_does_not_review_canonical_pr_without_plan_round(tm
             {"author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:00Z", "body": handoff}
         ],
         pr_payload={"body": "Fixes #56"},
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
 
     assert run_issue_loop(
@@ -289,8 +290,7 @@ def test_plan_first_plan_only_does_not_review_canonical_pr_without_plan_round(tm
         plan_first=True,
     ) == 0
 
-    assert "review was not started" in capsys.readouterr().out
-    assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+    assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 

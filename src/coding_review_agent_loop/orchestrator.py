@@ -5085,39 +5085,54 @@ def _preflight_fresh_split_topology(
     issue_number: int,
     config: AgentLoopConfig,
     issue_context: IssueContext,
+    allowed_keys: frozenset[str] = frozenset(),
 ) -> None:
-    """Reject split state before a fresh one-shot decision can be published.
+    """Reject unrelated split state before a fresh one-shot decision is used.
 
     The parent comment is the normal materialization record, but a crash can
     occur after a split child is filed and before that cumulative record is
     posted.  Search both historical child-title forms as a read-only recovery
     pass so one-shot execution cannot race an orphaned split child into a
-    second topology.
+    second topology.  A one-shot plan may intentionally retain the historical
+    split-materialization option; in that case only children whose normalized
+    stage keys are part of this approved request are recoverable.
     """
     materialization = find_existing_split_materialization(
         issue_context.comments,
         parent_issue=issue_number,
     )
     if materialization is not None and materialization.children:
-        raise AgentLoopError(
-            "Fresh one-shot execution conflicts with an existing split materialization; "
-            "resume the split topology or repair it before rerunning."
-        )
+        materialized_keys = tuple(child.key for child in materialization.children)
+        if (
+            len(set(materialized_keys)) != len(materialized_keys)
+            or any(key not in allowed_keys for key in materialized_keys)
+        ):
+            raise AgentLoopError(
+                "Fresh one-shot execution conflicts with an existing split materialization "
+                "that is unrelated or ambiguous; resume the split topology or repair it "
+                "before rerunning."
+            )
 
+    comment_keys: set[str] = set()
     for comment in issue_context.comments:
         body = getattr(comment, "body", None)
         if isinstance(body, str):
             marker = SPLIT_CHILD_MARKER_RE.search(body)
             if marker is not None and int(marker.group("parent")) == issue_number:
-                raise AgentLoopError(
-                    "Fresh one-shot execution conflicts with an existing split child; "
-                    "resume the split topology or repair it before rerunning."
-                )
+                key = marker.group("key")
+                if key not in allowed_keys or key in comment_keys:
+                    raise AgentLoopError(
+                        "Fresh one-shot execution conflicts with an existing split child "
+                        "that is unrelated or ambiguous; resume the split topology or repair "
+                        "it before rerunning."
+                    )
+                comment_keys.add(key)
 
     searches = (
         f'"(from #{issue_number})" in:title',
         f'"[#{issue_number} stage]" in:title',
     )
+    found_keys: dict[str, tuple[int | None, str | None]] = {}
     for search in searches:
         for candidate in search_issues(
             runner,
@@ -5134,10 +5149,60 @@ def _preflight_fresh_split_topology(
                 and candidate.title.startswith(f"[#{issue_number} stage] ")
             )
             if marker_matches or title_matches:
-                raise AgentLoopError(
-                    "Fresh one-shot execution conflicts with an existing split child; "
-                    "resume the split topology or repair it before rerunning."
+                key = (
+                    marker.group("key")
+                    if marker_matches
+                    else split_stage_proposal_from_text(
+                        candidate.title[len(f"[#{issue_number} stage] ") :]
+                    ).key
                 )
+                if key not in allowed_keys:
+                    raise AgentLoopError(
+                        "Fresh one-shot execution conflicts with an existing split child "
+                        "that is unrelated; resume the split topology or repair it before "
+                        "rerunning."
+                    )
+                identity = (candidate.number, candidate.url)
+                previous = found_keys.get(key)
+                if previous is not None and previous != identity:
+                    raise AgentLoopError(
+                        "Ambiguous split-child recovery: multiple child issues match an "
+                        "approved one-shot split stage."
+                    )
+                found_keys[key] = identity
+
+
+def _approved_one_shot_split_keys(
+    current_plan: str,
+    *,
+    issue_context: IssueContext,
+    config: AgentLoopConfig,
+) -> frozenset[str]:
+    """Return the legacy split identities owned by this approved one-shot.
+
+    Fresh execution recommendations intentionally do not use the legacy split
+    seam for their own child topology.  They can, however, coexist with the
+    explicitly supported ``--materialize-split-issues`` option, which handles
+    legacy deferred stages and prior discuss split proposals.  Keep this
+    derivation in lockstep with ``_handle_plan_first_split_scope`` so a rerun
+    adopts exactly what the first run was allowed to materialize.
+    """
+    current_child_stages = _extract_current_child_stages(current_plan)
+    current_deferred_stages = _extract_current_deferred_stages(current_plan)
+    prior_discuss_proposals = _prior_discuss_split_proposals(issue_context, config=config)
+    if current_child_stages or current_deferred_stages:
+        plan_own_key = split_stage_proposal_from_text(_plan_first_line(current_plan)).key
+        prior_discuss_proposals = [
+            proposal
+            for proposal in prior_discuss_proposals
+            if split_stage_proposal_from_text(proposal).key != plan_own_key
+        ]
+    proposals = dedupe_split_stage_proposals(
+        [split_stage_proposal_from_deferred_stage(stage) for stage in current_child_stages]
+        + [split_stage_proposal_from_deferred_stage(stage) for stage in current_deferred_stages]
+        + [split_stage_proposal_from_text(proposal) for proposal in prior_discuss_proposals]
+    )
+    return frozenset(proposal.key for proposal in proposals)
 
 
 def _preflight_fresh_one_shot_recovery(
@@ -5171,6 +5236,11 @@ def _preflight_fresh_one_shot_recovery(
         issue_number=issue_number,
         config=config,
         issue_context=issue_context,
+        allowed_keys=_approved_one_shot_split_keys(
+            approved_plan,
+            issue_context=issue_context,
+            config=config,
+        ),
     )
     parent_summaries = find_decompositions_for_parent(
         issue_context.comments, parent_issue=issue_number
@@ -8035,7 +8105,11 @@ def run_issue_loop(
                     "Issue-mode plan-first recovery cannot invent plan provenance; review the PR "
                     f"directly with `agent-loop pr {resolved_pr.pr_number}` or rerun direct issue mode."
                 )
-            if recovered_execution is not None and recovered_execution.action == "plan-only":
+            if (
+                recovered_execution is not None
+                and recovered_execution.recommendation is not None
+                and recovered_execution.action == "plan-only"
+            ):
                 print(
                     f"Issue #{issue_number} plan-first recovery resolved to plan-only; "
                     f"PR #{resolved_pr.pr_number} review was not started."
