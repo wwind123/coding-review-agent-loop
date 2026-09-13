@@ -475,7 +475,10 @@ merge the extra PR and rerun `agent-loop pr <number>` directly.
 `--plan-execution-mode implement-one-shot`. It requires `--plan-first`; fresh
 approval-bound compatibility is resolved against the reviewed recommendation,
 so a staged recommendation stops actionably before mutation rather than being
-silently routed as one-shot.
+silently routed as one-shot. If `--plan-execution-mode` is supplied as well, the
+alias is accepted only with `implement-one-shot`; combining it with
+`plan-only`, `decompose-only`, or `implement-by-phase` is rejected before
+recommendation recovery or any approval-bound write.
 
 Approved-plan implementation can switch to a different coder after planning:
 

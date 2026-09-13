@@ -776,6 +776,8 @@ def build_parser() -> argparse.ArgumentParser:
             "With --plan-first, choose what happens after approval: plan-only, "
             "decompose-only, implement-one-shot, or implement-by-phase. "
             "Defaults to plan-only unless --implement-after-approval is used. "
+            "--implement-after-approval is a one-shot alias and cannot be combined "
+            "with any explicit non-one-shot mode. "
             "decompose-only/implement-by-phase already create one detailed child "
             "issue per phase; do not also pass --materialize-split-issues for the "
             "same run. See docs/local_agent_loop.md#phased-decomposition-versus-split-materialization."

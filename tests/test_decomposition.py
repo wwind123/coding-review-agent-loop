@@ -359,6 +359,58 @@ def test_execution_decision_format_is_reused_for_same_identity():
     assert recovered == decision
 
 
+def test_fresh_parent_summary_round_trips_final_integration_obligation():
+    phase = PlanPhase(
+        title="First stage",
+        scope="Deliver the first stage.",
+        non_goals="No final integration.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low",
+        validation="The first stage passes.",
+        parent_context="Approved parent plan.",
+        automation="agent-pr",
+        stage_id="stage-1",
+        position=1,
+        deliverables=("First stage.",),
+        non_goals_items=("No final integration.",),
+        acceptance_criteria=("The first stage passes.",),
+        covered_scope_item_ids=("scope-1",),
+    )
+    final = ExecutionAllocation(
+        "required",
+        ("Run the final integration verification.",),
+        ("The integrated behavior passes.",),
+        ("scope-final",),
+    )
+    body = format_decomposition_parent_summary(
+        parent_issue=56,
+        mode="implement-by-phase",
+        plan_hash="a" * 16,
+        created=(CreatedPhaseIssue(phase=phase, issue_url="https://example/issues/99", issue_number=99),),
+        topology_source="approved-plan-v1",
+        retained_parent_scope=RetainedParentScope(
+            plan_subject="b" * 64,
+            plan_hash="a" * 16,
+            excerpt="Approved parent plan.",
+            status="none",
+        ),
+        final_integration_work=final,
+        strategy="staged",
+        execution_strategy_contract_version=1,
+        recommendation_digest="c" * 64,
+        plan_subject="b" * 64,
+    )
+    restored = find_existing_decomposition(
+        [IssueComment(author="bot", created_at=None, body=body)],
+        parent_issue=56,
+        plan_hash="a" * 16,
+    )
+    assert restored is not None
+    assert restored.final_integration_work == final
+    assert "## Final integration work" in body
+    assert "scope-final" in body
+
+
 def test_fresh_plan_decomposition_requires_architecture_impact():
     payload = plan_decomposition_json(
         {

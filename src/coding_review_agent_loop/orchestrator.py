@@ -42,8 +42,10 @@ from .decomposition import (
     create_decomposition_child_issues,
     find_existing_decomposition,
     find_existing_one_shot_impl_handoff,
+    find_one_shot_impl_handoffs,
     find_latest_one_shot_impl_handoff,
     find_existing_phase_implementation_handoff,
+    find_phase_implementation_handoffs,
     parse_plan_decomposition,
     post_decomposition_parent_summary,
     post_one_shot_impl_handoff_comment,
@@ -4726,7 +4728,7 @@ def _preflight_fresh_staged_topology(
             "Fresh staged execution conflicts with an existing one-shot handoff; "
             "resume the recorded implementation or repair the conflicting topology first."
         )
-    return create_decomposition_child_issues(
+    preflight_children = create_decomposition_child_issues(
         runner,
         config=config,
         parent_issue=issue_number,
@@ -4742,6 +4744,88 @@ def _preflight_fresh_staged_topology(
         plan_subject=plan_subject,
         preflight_only=True,
     )
+    if isinstance(preflight_children, NeedsHumanDecision):
+        return preflight_children
+
+    expected_children = tuple(
+        (item.phase.title, item.issue_url, item.issue_number)
+        for item in preflight_children
+    )
+    if existing_summary is not None:
+        expected_phases = decomposition.phases
+        expected_stage_ids = tuple(phase.stage_id or str(index) for index, phase in enumerate(expected_phases, 1))
+        expected_phase_identities = tuple(
+            phase_identity(
+                parent_issue=issue_number,
+                plan_hash=plan_hash,
+                topology_source=EXECUTION_TOPOLOGY_SOURCE,
+                phase_index=index,
+                phase=phase,
+                stage_id=phase.stage_id,
+                execution_strategy_contract_version=decomposition.execution_strategy_contract_version,
+            )
+            for index, phase in enumerate(expected_phases, 1)
+        )
+        if (
+            existing_summary.phase_count != len(expected_phases)
+            or existing_summary.phase_titles != tuple(phase.title for phase in expected_phases)
+            or existing_summary.automation != tuple(phase.automation for phase in expected_phases)
+            or existing_summary.stage_ids != expected_stage_ids
+            or existing_summary.phase_identities != expected_phase_identities
+            or existing_summary.children != expected_children
+            or existing_summary.execution_strategy_contract_version
+            != decomposition.execution_strategy_contract_version
+            or existing_summary.final_integration_work
+            != decomposition.final_integration_work
+            or existing_summary.retained_parent_scope != retained_parent_scope
+        ):
+            raise AgentLoopError(
+                "Fresh staged execution summary disagrees with the approved normalized topology; "
+                "repair the recorded stage allocation, child references, or integration obligations before rerunning."
+            )
+
+    handoffs = find_phase_implementation_handoffs(
+        issue_context.comments,
+        parent_issue=issue_number,
+        plan_hash=plan_hash,
+    )
+    seen_handoff_phases: set[int] = set()
+    for handoff in handoffs:
+        if handoff.phase_index in seen_handoff_phases:
+            raise AgentLoopError(
+                "Ambiguous staged recovery: multiple phase implementation handoffs exist for one phase."
+            )
+        seen_handoff_phases.add(handoff.phase_index)
+        if (
+            handoff.mode != "implement-by-phase"
+            or handoff.strategy != "staged"
+            or handoff.topology_source != EXECUTION_TOPOLOGY_SOURCE
+            or handoff.execution_strategy_contract_version
+            != decomposition.execution_strategy_contract_version
+            or handoff.recommendation_digest != decomposition.recommendation_digest
+            or handoff.plan_subject != plan_subject
+        ):
+            raise AgentLoopError(
+                "Fresh staged phase implementation handoff disagrees with the approved topology; "
+                "repair the handoff before rerunning."
+            )
+        if not 1 <= handoff.phase_index <= len(decomposition.phases):
+            raise AgentLoopError(
+                "Fresh staged phase implementation handoff names a phase outside the approved topology."
+            )
+        phase = decomposition.phases[handoff.phase_index - 1]
+        adopted = preflight_children[handoff.phase_index - 1]
+        if (
+            handoff.stage_id != phase.stage_id
+            or handoff.phase_title != phase.title
+            or handoff.automation != phase.automation
+            or handoff.child_issue_number != adopted.issue_number
+            or handoff.child_issue_url != adopted.issue_url
+        ):
+            raise AgentLoopError(
+                "Fresh staged phase implementation handoff does not match its canonical child phase."
+            )
+    return preflight_children
 
 
 def _preflight_fresh_one_shot_recovery(
@@ -4751,6 +4835,7 @@ def _preflight_fresh_one_shot_recovery(
     approved_plan: str,
     config: AgentLoopConfig,
     issue_context: IssueContext,
+    recommendation=None,
 ) -> None:
     """Validate existing one-shot handoffs before the decision record is posted."""
     plan_hash = approved_plan_hash(approved_plan)
@@ -4763,6 +4848,15 @@ def _preflight_fresh_one_shot_recovery(
         raise AgentLoopError(
             "Fresh one-shot execution conflicts with an existing decomposition summary; "
             "resume the staged topology or revise the approved plan before rerunning."
+        )
+    if find_phase_implementation_handoffs(
+        issue_context.comments,
+        parent_issue=issue_number,
+        plan_hash=plan_hash,
+    ):
+        raise AgentLoopError(
+            "Fresh one-shot execution conflicts with an existing phase implementation handoff; "
+            "resume the staged topology or repair the conflicting handoff first."
         )
     for checkpoint_mode in ("decompose-only", "implement-by-phase"):
         checkpoint = find_existing_topology_checkpoint(
@@ -4808,6 +4902,16 @@ def _preflight_fresh_one_shot_recovery(
         plan_hash=plan_hash,
         mode="implement-one-shot",
     )
+    all_handoffs = find_one_shot_impl_handoffs(
+        issue_context.comments,
+        parent_issue=issue_number,
+        mode="implement-one-shot",
+    )
+    same_plan_handoffs = tuple(item for item in all_handoffs if item.plan_hash == plan_hash)
+    if len(same_plan_handoffs) > 1 and len(set(same_plan_handoffs)) != 1:
+        raise AgentLoopError(
+            "Ambiguous one-shot recovery: multiple divergent handoffs exist for the approved plan."
+        )
     any_handoff = find_latest_one_shot_impl_handoff(
         issue_context.comments,
         parent_issue=issue_number,
@@ -4833,7 +4937,41 @@ def _preflight_fresh_one_shot_recovery(
                 f"Review the recorded PR with `agent-loop pr {any_handoff.pr_number}` or remove "
                 "the stale handoff before creating another implementation PR."
             )
+    for older_handoff in all_handoffs:
+        if older_handoff.plan_hash == plan_hash:
+            continue
+        if any_handoff is not None and older_handoff.pr_number == any_handoff.pr_number:
+            continue
+        try:
+            older_state = get_pr_state(
+                runner,
+                config=config,
+                pr_number=older_handoff.pr_number,
+            )
+        except AgentLoopError as exc:
+            raise AgentLoopError(
+                f"Older one-shot handoff for PR #{older_handoff.pr_number} cannot be validated "
+                f"({exc}); review the recorded PR or remove the stale handoff."
+            ) from exc
+        if older_state == "OPEN":
+            raise AgentLoopError(
+                f"Open one-shot handoff for PR #{older_handoff.pr_number} has older plan hash "
+                f"{older_handoff.plan_hash}; repair the stale handoff before creating another PR."
+            )
     if existing_handoff is not None:
+        if recommendation is not None:
+            identity = recommendation.identity()
+            if (
+                existing_handoff.strategy != "one-shot"
+                or existing_handoff.topology_source != identity["topology_source"]
+                or existing_handoff.execution_strategy_contract_version != 1
+                or existing_handoff.recommendation_digest != identity["recommendation_sha256"]
+                or existing_handoff.plan_subject != _plan_subject(approved_plan)
+            ):
+                raise AgentLoopError(
+                    "Fresh one-shot handoff disagrees with the approved recommendation; "
+                    "repair the handoff before rerunning."
+                )
         try:
             get_pr_state(runner, config=config, pr_number=existing_handoff.pr_number)
         except AgentLoopError as exc:
@@ -5762,6 +5900,11 @@ def _decompose_approved_plan(
     )
     if isinstance(created, NeedsHumanDecision):
         return created
+    summary_allocation_kwargs = (
+        {"final_integration_work": decomposition.final_integration_work}
+        if topology_source == EXECUTION_TOPOLOGY_SOURCE
+        else {}
+    )
     post_decomposition_parent_summary(
         runner,
         config=config,
@@ -5775,6 +5918,7 @@ def _decompose_approved_plan(
         execution_strategy_contract_version=execution_contract_version,
         recommendation_digest=recommendation_digest,
         plan_subject=plan_subject,
+        **summary_allocation_kwargs,
     )
     return created
 
@@ -6698,6 +6842,7 @@ def _run_plan_first_loop(
                     approved_plan=current_plan,
                     config=config,
                     issue_context=issue_context,
+                    recommendation=recommendation,
                 )
             plan_additions = _extract_current_expected_closing_issue_ids(current_plan)
             split_topology = bool(
@@ -6781,6 +6926,17 @@ def _run_plan_first_loop(
                 if isinstance(created, NeedsHumanDecision):
                     print(json.dumps(created.as_dict(), sort_keys=True))
                     return 2
+                if normalized_topology is not None:
+                    final_integration = normalized_topology[0].final_integration_work
+                    print(
+                        "Final integration work: "
+                        f"{final_integration.status}; deliverables: "
+                        f"{', '.join(final_integration.deliverables) or 'none'}; "
+                        "acceptance criteria: "
+                        f"{', '.join(final_integration.acceptance_criteria) or 'none'}; "
+                        "covered scope items: "
+                        f"{', '.join(final_integration.covered_scope_item_ids) or 'none'}"
+                    )
                 if mode == "decompose-only":
                     print(f"Issue #{issue_number} approved plan decomposed into child issues.")
                     return 0

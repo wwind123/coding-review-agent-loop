@@ -4954,6 +4954,18 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
     existing = find_existing_one_shot_impl_handoff(
         comments, parent_issue=issue, plan_hash=plan_hash, mode=mode,
     )
+    if execution_recommendation is not None and not dry_run:
+        from coding_review_agent_loop.orchestrator import _preflight_fresh_one_shot_recovery
+
+        issue_context = get_issue_context(runner, config=config, issue_number=issue)
+        _preflight_fresh_one_shot_recovery(
+            runner,
+            issue_number=issue,
+            approved_plan=approved_plan,
+            config=config,
+            issue_context=issue_context,
+            recommendation=execution_recommendation,
+        )
     if existing is not None:
         if execution_recommendation is not None:
             identity = execution_recommendation.identity()
@@ -4982,6 +4994,15 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         except AgentLoopError:
             reusable = False
         if reusable:
+            _persist_skill_execution_decision(
+                runner,
+                config=config,
+                issue=issue,
+                plan=approved_plan,
+                comments=comments,
+                recommendation=execution_recommendation,
+                requested_policy=mode,
+            )
             print(json.dumps({
                 "pr": existing.pr_number,
                 "head_sha": existing.pr_head_sha,
@@ -5655,6 +5676,7 @@ def _run_decomposition_for_skill(
     execution_contract_version = None
     topology_source = "model"
     retained_parent_scope = None
+    fresh_staged_preflight = None
     if recommendation is not None:
         if recommendation.strategy != "staged":
             raise AgentLoopError(
@@ -5677,6 +5699,19 @@ def _run_decomposition_for_skill(
         recommendation_digest = decomposition.recommendation_digest
         execution_contract_version = decomposition.execution_strategy_contract_version
 
+        if not dry_run:
+            from coding_review_agent_loop.orchestrator import _preflight_fresh_staged_topology
+
+            fresh_staged_preflight = _preflight_fresh_staged_topology(
+                runner,
+                issue_number=issue,
+                approved_plan=approved_plan,
+                config=config,
+                issue_context=issue_context,
+                mode=mode,
+                normalized_topology=normalized_topology,
+            )
+
     existing = find_existing_decomposition(
         issue_context.comments,
         parent_issue=issue,
@@ -5692,7 +5727,7 @@ def _run_decomposition_for_skill(
             else {"mode": mode}
         ),
     )
-    if existing is not None:
+    if existing is not None and not isinstance(fresh_staged_preflight, NeedsHumanDecision):
         created = _created_phase_issues_from_existing(
             existing,
             decomposition=decomposition if normalized_topology is not None else None,
@@ -5720,6 +5755,22 @@ def _run_decomposition_for_skill(
                 "plan_hash": existing.retained_parent_scope.plan_hash,
                 "excerpt": existing.retained_parent_scope.excerpt,
             }
+        if existing.final_integration_work is not None:
+            result["final_integration_work"] = {
+                "status": existing.final_integration_work.status,
+                "deliverables": list(existing.final_integration_work.deliverables),
+                "acceptance_criteria": list(existing.final_integration_work.acceptance_criteria),
+                "covered_scope_item_ids": list(existing.final_integration_work.covered_scope_item_ids),
+            }
+        _persist_skill_execution_decision(
+            runner,
+            config=config,
+            issue=issue,
+            plan=approved_plan,
+            comments=issue_context.comments,
+            recommendation=recommendation,
+            requested_policy=mode,
+        )
         print(
             f"hint: issue #{issue} already has a {mode} decomposition for this plan.",
             file=sys.stderr,
@@ -5835,15 +5886,16 @@ def _run_decomposition_for_skill(
     else:
         coder_usage = None
 
-    _persist_skill_execution_decision(
-        runner,
-        config=config,
-        issue=issue,
-        plan=approved_plan,
-        comments=issue_context.comments,
-        recommendation=recommendation,
-        requested_policy=mode,
-    )
+    if not isinstance(fresh_staged_preflight, NeedsHumanDecision):
+        _persist_skill_execution_decision(
+            runner,
+            config=config,
+            issue=issue,
+            plan=approved_plan,
+            comments=issue_context.comments,
+            recommendation=recommendation,
+            requested_policy=mode,
+        )
 
     result_json: dict = {
         "issue": issue,
@@ -5869,6 +5921,14 @@ def _run_decomposition_for_skill(
             "deliverables": list(retained_parent_scope.deliverables),
             "acceptance_criteria": list(retained_parent_scope.acceptance_criteria),
             "covered_scope_item_ids": list(retained_parent_scope.covered_scope_item_ids),
+        }
+    if normalized_topology is not None:
+        final_integration = decomposition.final_integration_work
+        result_json["final_integration_work"] = {
+            "status": final_integration.status,
+            "deliverables": list(final_integration.deliverables),
+            "acceptance_criteria": list(final_integration.acceptance_criteria),
+            "covered_scope_item_ids": list(final_integration.covered_scope_item_ids),
         }
     fresh_topology_kwargs = (
         {
@@ -5903,6 +5963,11 @@ def _run_decomposition_for_skill(
         result_json["phase_count"] = 0
         return result_json, (), issue_context, config, runner, plan_hash, approved_plan, str(workdir)
     if not dry_run:
+        summary_allocation_kwargs = (
+            {"final_integration_work": decomposition.final_integration_work}
+            if topology_source == EXECUTION_TOPOLOGY_SOURCE
+            else {}
+        )
         post_decomposition_parent_summary(
             runner,
             config=config,
@@ -5913,6 +5978,7 @@ def _run_decomposition_for_skill(
             topology_source=topology_source,
             retained_parent_scope=retained_parent_scope,
             **fresh_topology_kwargs,
+            **summary_allocation_kwargs,
         )
     result_json["phases"] = [
         _decomposition_phase_json(
@@ -6018,6 +6084,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         "decomposition_reused": bool(decomposition_result.get("reused")),
         "adopted_children": decomposition_result.get("adopted_children", []),
         "created_children": decomposition_result.get("created_children", []),
+        "final_integration_work": decomposition_result.get("final_integration_work"),
         "phase": _decomposition_phase_json(
             1,
             first_phase.phase,

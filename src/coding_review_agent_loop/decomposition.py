@@ -148,6 +148,7 @@ class DecompositionMetadata:
     children: tuple[tuple[str, str | None, int | None], ...]
     topology_source: str = "model"
     retained_parent_scope: RetainedParentScope | None = None
+    final_integration_work: ExecutionAllocation | None = None
     strategy: str | None = None
     execution_strategy_contract_version: int | None = None
     recommendation_digest: str | None = None
@@ -1348,6 +1349,11 @@ def create_decomposition_child_issues(
         else:
             legacy = LEGACY_SPLIT_IDENTITY_RE.search(candidate.body or "")
             if legacy and int(legacy.group("parent")) == parent_issue:
+                if fresh:
+                    raise AgentLoopError(
+                        "Fresh decomposition recovery conflicts with an existing split child; "
+                        "repair or resume the legacy split topology before creating approved phases."
+                    )
                 recognized.add("legacy:" + legacy.group("key").lower())
             elif candidate.body and f"#{parent_issue}" in candidate.body and candidate.title:
                 # Count a parent-linked canonical child from another workflow
@@ -1736,6 +1742,15 @@ def _encode_metadata(metadata: DecompositionMetadata) -> str:
                     "covered_scope_item_ids": list(metadata.retained_parent_scope.covered_scope_item_ids),
                 }
             )
+        final_integration = metadata.final_integration_work or ExecutionAllocation(
+            "none", (), (), ()
+        )
+        payload["final_integration_work"] = {
+            "status": final_integration.status,
+            "deliverables": list(final_integration.deliverables),
+            "acceptance_criteria": list(final_integration.acceptance_criteria),
+            "covered_scope_item_ids": list(final_integration.covered_scope_item_ids),
+        }
     return _encode_json_payload(payload)
 
 
@@ -1758,6 +1773,7 @@ def _decode_metadata(encoded: str) -> DecompositionMetadata:
             )
         )
     try:
+        fresh = str(payload.get("topology_source")) == EXECUTION_TOPOLOGY_SOURCE
         retained_payload = payload.get("retained_parent_scope")
         retained = None
         if isinstance(retained_payload, dict):
@@ -1779,6 +1795,26 @@ def _decode_metadata(encoded: str) -> DecompositionMetadata:
                     if isinstance(item, str)
                 ),
             )
+        final_payload = payload.get("final_integration_work")
+        final_integration_work = None
+        if isinstance(final_payload, dict):
+            final_integration_work = ExecutionAllocation(
+                status=str(final_payload.get("status") or "none"),
+                deliverables=tuple(
+                    str(item) for item in final_payload.get("deliverables", [])
+                    if isinstance(item, str)
+                ),
+                acceptance_criteria=tuple(
+                    str(item) for item in final_payload.get("acceptance_criteria", [])
+                    if isinstance(item, str)
+                ),
+                covered_scope_item_ids=tuple(
+                    str(item) for item in final_payload.get("covered_scope_item_ids", [])
+                    if isinstance(item, str)
+                ),
+            )
+        elif fresh:
+            final_integration_work = ExecutionAllocation("none", (), (), ())
         metadata = DecompositionMetadata(
             parent_issue=int(payload["parent_issue"]),
             plan_hash=str(payload["plan_hash"]),
@@ -1789,6 +1825,7 @@ def _decode_metadata(encoded: str) -> DecompositionMetadata:
             children=tuple(children),
             topology_source=str(payload.get("topology_source") or "model"),
             retained_parent_scope=retained,
+            final_integration_work=final_integration_work,
             strategy=(str(payload["strategy"]) if payload.get("strategy") is not None else None),
             execution_strategy_contract_version=(
                 int(payload["execution_strategy_contract_version"])
@@ -2006,6 +2043,31 @@ def find_existing_phase_implementation_handoff(
     return found
 
 
+def find_phase_implementation_handoffs(
+    comments: Sequence[object],
+    *,
+    parent_issue: int,
+    plan_hash: str,
+) -> tuple[PhaseImplementationHandoffMetadata, ...]:
+    """Return every phase handoff for a parent/plan identity.
+
+    Recovery must inspect mismatched mode/source/stage records too; the
+    single-phase lookup intentionally cannot do that because it is used by
+    legacy resume paths.  Keeping this inventory beside the marker decoder
+    gives CLI and skill preflight the same fail-closed view.
+    """
+    found: list[PhaseImplementationHandoffMetadata] = []
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in PHASE_IMPLEMENTATION_MARKER_RE.finditer(body):
+            metadata = _decode_phase_implementation_handoff_metadata(match.group("payload"))
+            if metadata.parent_issue == parent_issue and metadata.plan_hash == plan_hash:
+                found.append(metadata)
+    return tuple(found)
+
+
 def format_decomposition_parent_summary(
     *,
     parent_issue: int,
@@ -2014,6 +2076,7 @@ def format_decomposition_parent_summary(
     created: Sequence[CreatedPhaseIssue],
     topology_source: str = "model",
     retained_parent_scope: RetainedParentScope | None = None,
+    final_integration_work: ExecutionAllocation | None = None,
     strategy: str | None = None,
     execution_strategy_contract_version: int | None = None,
     recommendation_digest: str | None = None,
@@ -2044,6 +2107,11 @@ def format_decomposition_parent_summary(
         ),
         topology_source=topology_source,
         retained_parent_scope=retained_parent_scope,
+        final_integration_work=(
+            final_integration_work
+            if topology_source == EXECUTION_TOPOLOGY_SOURCE
+            else None
+        ),
         strategy=strategy,
         execution_strategy_contract_version=execution_strategy_contract_version,
         recommendation_digest=recommendation_digest,
@@ -2074,6 +2142,26 @@ def format_decomposition_parent_summary(
                 "the typed stages below are its declared remainder.",
                 "",
                 retained_parent_scope.excerpt,
+                "",
+            ]
+        )
+    if topology_source == EXECUTION_TOPOLOGY_SOURCE:
+        final = final_integration_work or ExecutionAllocation("none", (), (), ())
+        lines.extend(
+            [
+                "## Final integration work",
+                f"Status: {sanitize_historical_text(final.status)}",
+                "Deliverables:",
+                *(
+                    [f"- {sanitize_historical_text(value)}" for value in final.deliverables]
+                    or ["- None."]
+                ),
+                "Acceptance criteria:",
+                *(
+                    [f"- {sanitize_historical_text(value)}" for value in final.acceptance_criteria]
+                    or ["- None."]
+                ),
+                "Covered scope items: " + ", ".join(final.covered_scope_item_ids),
                 "",
             ]
         )
@@ -2206,6 +2294,7 @@ def post_decomposition_parent_summary(
     created: Sequence[CreatedPhaseIssue],
     topology_source: str = "model",
     retained_parent_scope: RetainedParentScope | None = None,
+    final_integration_work: ExecutionAllocation | None = None,
     strategy: str | None = None,
     execution_strategy_contract_version: int | None = None,
     recommendation_digest: str | None = None,
@@ -2223,6 +2312,7 @@ def post_decomposition_parent_summary(
                 created=created,
                 topology_source=topology_source,
                 retained_parent_scope=retained_parent_scope,
+                final_integration_work=final_integration_work,
                 strategy=strategy,
                 execution_strategy_contract_version=execution_strategy_contract_version,
                 recommendation_digest=recommendation_digest,
@@ -2341,6 +2431,25 @@ def find_latest_one_shot_impl_handoff(
             if metadata.parent_issue == parent_issue and metadata.mode == mode:
                 found = metadata
     return found
+
+
+def find_one_shot_impl_handoffs(
+    comments: Sequence[object],
+    *,
+    parent_issue: int,
+    mode: str,
+) -> tuple[OneShotImplementationHandoffMetadata, ...]:
+    """Return all one-shot handoffs so fresh recovery can detect ambiguity."""
+    found: list[OneShotImplementationHandoffMetadata] = []
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for match in ONE_SHOT_IMPL_HANDOFF_MARKER_RE.finditer(body):
+            metadata = _decode_one_shot_impl_handoff_metadata(match.group("payload"))
+            if metadata.parent_issue == parent_issue and metadata.mode == mode:
+                found.append(metadata)
+    return tuple(found)
 
 
 def format_one_shot_impl_handoff_comment(
