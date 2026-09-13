@@ -31,11 +31,14 @@ but not the host turns already running in the current skill session.
 Skill-mode planning emits the same generation-1 execution-strategy contract as
 headless planning: stable scope IDs, coupling constraints, exact-once
 allocations, enriched staged fields, and retained-parent/final-integration
-work. The full recommendation is stored in canonical plan text and round
-metadata. During this first phase the recommendation is review data only; it
-does not enter legacy decomposition, split materialization, child creation, or
-dispatch. Historical unversioned plans stay legacy-undecided, and repair must
-recover a complete v1 source before applying format-only correction.
+work. The full recommendation is stored in canonical plan text and bounded
+sidecars. Explicit skill policies resolve against its canonical strategy before
+child creation or implementation. Fresh staged decomposition and phase
+handoffs use strategy `staged`, source `approved-plan-v1`, the recommendation
+digest, an ordinal, and a stable stage ID; fresh one-shot handoffs use
+`one-shot`. Historical unversioned plans stay legacy-undecided, and repair must
+recover a complete v1 source before applying format-only correction. Automatic
+strategy selection remains downstream.
 
 ### Containment and test gates
 
@@ -223,15 +226,17 @@ responses do not retry or fall back.
 Skill mode also exposes the external-coder execution helpers used after a plan
 has already been approved:
 
-- `run-implement` performs the existing one-shot reverse implementation. It
+- `run-implement` performs the one-shot reverse implementation. It
   validates and renders the external coder's `issue_implementation` result,
   validates structured test commands inside the assigned workdir, preserves the
   raw payload in accepted PR metadata, and stops before handoff for null-PR or
   rejected-conflict terminal results. It keeps using the durable
-  `AGENT_PLAN_ONE_SHOT_IMPL` marker and is unchanged by by-phase support.
-- `run-decompose` uses typed `child_stages` directly when present, otherwise
-  decomposes an approved plan into child phase issues with mode
-  `decompose-only`.
+  durable one-shot handoff record and reuses it only when its fresh canonical
+  identity matches the approved recommendation.
+- `run-decompose` consumes a fresh staged recommendation through the shared
+  normalizer, or uses the legacy typed/model path for historical plans. It
+  records a compact decision/summary identity and reuses the same topology
+  across `decompose-only` and `implement-by-phase`.
 - `run-implement-by-phase` decomposes with mode `implement-by-phase`, then
   implements phase 1 only when that phase is `agent-pr`.
 

@@ -6,6 +6,10 @@ from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
+    ExecutionAllocation,
+    ExecutionCouplingConstraint,
+    ExecutionScopeItem,
+    ExecutionStrategyRecommendation,
     PlanDecomposition,
     PlanPhase,
     RecordedPhase,
@@ -14,6 +18,7 @@ from coding_review_agent_loop.decomposition import (
     approved_plan_hash,
     format_phase_issue_body,
     find_existing_phase_implementation_handoff,
+    find_existing_decomposition,
     find_existing_topology_checkpoint,
     format_decomposition_parent_summary,
     format_phase_implementation_handoff_comment,
@@ -22,6 +27,7 @@ from coding_review_agent_loop.decomposition import (
     parse_plan_decomposition,
     create_decomposition_child_issues,
     adapt_typed_child_stages,
+    normalize_execution_recommendation,
 )
 from coding_review_agent_loop.protocol import ExecutionChildStage
 from coding_review_agent_loop.github import IssueComment
@@ -93,6 +99,83 @@ def test_legacy_typed_adapter_rejects_reviewed_generation_one_children():
         adapt_typed_child_stages(
             (stage,), approved_plan="Approved plan.", plan_subject="subject"
         )
+
+
+def test_fresh_recommendation_normalizer_preserves_reviewed_allocation_and_identity():
+    recommendation = ExecutionStrategyRecommendation(
+        strategy="staged",
+        rationale="The API and its compatibility tests have a safe boundary.",
+        staging_feasibility="safe",
+        scope_items=(
+            ExecutionScopeItem("scope-api", "Preserve the API.", ("Callers still work.",)),
+            ExecutionScopeItem("scope-tests", "Cover the behavior.", ("The focused test passes.",)),
+        ),
+        coupling_constraints=(),
+        one_shot_delivery=None,
+        child_stages=(
+            ExecutionChildStage(
+                stage_id="stage-api",
+                position=1,
+                title="API change",
+                summary="Implement the compatibility-preserving API change.",
+                deliverables=("API implementation.",),
+                non_goals=("No rollout.",),
+                acceptance_criteria=("The API remains compatible.",),
+                depends_on_stage_ids=(),
+                dependency_notes="This is the first stage.",
+                automation="agent-pr",
+                rollout_risk="low",
+                compatibility_constraints=("Preserve existing callers.",),
+                covered_scope_item_ids=("scope-api",),
+            ),
+        ),
+        retained_parent_work=ExecutionAllocation("none", (), (), ()),
+        final_integration_work=ExecutionAllocation(
+            "required", ("Compatibility tests." ,), ("The focused test passes.",), ("scope-tests",)
+        ),
+        caveats=("Run the focused suite.",),
+    )
+    plan = "Approved fresh plan."
+    decomposition, retained = normalize_execution_recommendation(
+        recommendation,
+        approved_plan=plan,
+        plan_subject="fresh-subject",
+    )
+
+    phase = decomposition.phases[0]
+    assert decomposition.strategy == "staged"
+    assert decomposition.topology_source == "approved-plan-v1"
+    assert phase.stage_id == "stage-api"
+    assert phase.position == 1
+    assert phase.deliverables == ("API implementation.",)
+    assert phase.non_goals_items == ("No rollout.",)
+    assert phase.acceptance_criteria == ("The API remains compatible.",)
+    assert phase.compatibility_constraints == ("Preserve existing callers.",)
+    assert phase.covered_scope_item_ids == ("scope-api",)
+    assert retained.status == "none"
+    assert retained.deliverables == ()
+    assert retained.covered_scope_item_ids == ()
+
+
+def test_legacy_phase_identity_digest_remains_byte_stable():
+    phase = PlanPhase(
+        title="Legacy phase",
+        scope="Keep old behavior.",
+        non_goals="No new path.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low.",
+        validation="Run tests.",
+        parent_context="Approved context.",
+        automation="agent-pr",
+        depends_on=(),
+    )
+    assert phase_identity(
+        parent_issue=56,
+        plan_hash="0123456789abcdef",
+        topology_source="model",
+        phase_index=1,
+        phase=phase,
+    ) == "445715b616bf8e71572a804c6172dc6645d2ed97d040c0be5110a60c115403fd"
 
 
 def test_fresh_plan_decomposition_requires_architecture_impact():

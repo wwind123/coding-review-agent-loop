@@ -125,6 +125,14 @@ _VALID_PLAN_STATE = json.dumps({
     },
 }) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
 
+_VALID_LEGACY_PLAN_STATE = json.dumps({
+    "schema_version": 1,
+    "kind": "plan_state",
+    "state": "blocking",
+    "summary": "Legacy plan is ready for review.",
+    "plan_steps": ["Step one"],
+}) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
+
 _INVALID_PLAN_STATE = "This has no marker at all."
 
 _VALID_PLAN_REVIEW = json.dumps(
@@ -4550,7 +4558,7 @@ class TestRunDecompose:
             _write_fake_gh(tmppath)
             env = _make_fake_gh_env(tmppath)
             plan = tmppath / "plan.md"
-            plan.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            plan.write_text(_VALID_LEGACY_PLAN_STATE, encoding="utf-8")
             result = _run(
                 "helpers.skill_runner", "run-decompose",
                 "--issue", "9992", "--repo", "test/skill-repo",
@@ -5036,7 +5044,7 @@ class TestRunImplementByPhase:
             _write_fake_gh(tmppath)
             env = _make_fake_gh_env(tmppath)
             plan = tmppath / "plan.md"
-            plan.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+            plan.write_text(_VALID_LEGACY_PLAN_STATE, encoding="utf-8")
             result = _run(
                 "helpers.skill_runner", "run-implement-by-phase",
                 "--issue", "9992", "--repo", "test/skill-repo",

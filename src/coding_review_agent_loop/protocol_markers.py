@@ -227,6 +227,7 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
         _b64_definition("AGENT_EXECUTION_RECOMMENDATION", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_DEFERRED_STAGES", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_PLAN_DECOMPOSITION", surfaces=_ISSUE_ONLY),
+        _b64_definition("AGENT_PLAN_EXECUTION_DECISION", surfaces=_ISSUE_ONLY),
         MarkerDefinition(
             token="AGENT_PLAN_TOPOLOGY_CHECKPOINT",
             pattern=re.compile(

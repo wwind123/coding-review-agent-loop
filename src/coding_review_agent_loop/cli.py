@@ -1394,11 +1394,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 plan_execution_mode = (
                     "implement-one-shot" if args.implement_after_approval else "plan-only"
                 )
-            elif args.implement_after_approval and plan_execution_mode != "implement-one-shot":
-                raise AgentLoopError(
-                    "--implement-after-approval is only compatible with "
-                    "--plan-execution-mode implement-one-shot."
-                )
+            elif args.implement_after_approval:
+                # The historical alias is a requested one-shot policy.  The
+                # approval-bound recommendation resolver performs the fresh
+                # strategy compatibility check before durable mutation.
+                plan_execution_mode = "implement-one-shot"
             if (
                 plan_execution_mode in {"decompose-only", "implement-by-phase"}
                 and getattr(args, "materialize_split_issues", False)

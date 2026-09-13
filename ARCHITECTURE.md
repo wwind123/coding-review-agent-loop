@@ -133,12 +133,19 @@ remain legacy-undecided and are never upgraded by inference or repair.
 
 The recommendation is canonicalized into a bounded sidecar and round metadata,
 so its strategy, topology, allocations, compatibility constraints, and caveats
-participate in plan subject/hash identity and restart validation. Stage 1 keeps
-this reviewed topology separate from legacy `ChildStage(title, summary)`:
-v1 children do not drive split materialization, decomposition, follow-up
-filing, expected-closure checks, issue creation, or coder dispatch. Execution
-policy remains selected by the existing explicit mode until the subsequent
-stages consume this contract. Repair may preserve a complete v1 source, but
+participate in plan subject/hash identity and restart validation. A compact
+execution decision records the parent, approved-plan identity, contract version,
+canonical strategy/source, and complete recommendation digest; the lossless
+recommendation remains in the approved plan record and its existing sidecars.
+Explicit policies are checked against that recommendation before closure,
+follow-up, split, child, handoff, or dispatch effects. Fresh staged summaries,
+phase identities, and handoffs use the canonical `staged` strategy and fixed
+`approved-plan-v1` source, while legacy summaries and phase identities retain
+their exact requested-mode/source lookup and historical serialization. Stable
+string stage IDs accompany one-based ordinals. Plan-only keeps its existing
+approved-follow-up, requested split, and unfiled-scope behavior but does not
+create a fresh execution decision or topology. Automatic strategy selection
+remains a downstream concern. Repair may preserve a complete v1 source, but
 cannot synthesize missing recommendation data.
 
 ### Review and Feedback

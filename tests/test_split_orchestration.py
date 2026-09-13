@@ -161,13 +161,7 @@ def test_fresh_v1_recommendation_is_inert_at_legacy_split_seam(
 def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
     tmp_path, monkeypatch, strategy, execution_mode, expected_events, materialize
 ):
-    """Exercise the approval boundary, not only the split helper.
-
-    Explicit execution modes remain responsible for their historical
-    downstream path. The v1 recommendation must not add a second split,
-    checkpoint, child, or dispatch path, regardless of its recommendation or
-    split-materialization setting.
-    """
+    """Exercise the approval-bound policy matrix before downstream mutation."""
     events = []
     runner = FakeRunner(
         claude_outputs=[_fresh_v1_plan_for_isolation(strategy)],
@@ -197,12 +191,26 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
     monkeypatch.setattr(orchestrator_module, "_decompose_approved_plan", fake_decompose)
     monkeypatch.setattr(orchestrator_module, "_implement_approved_issue", fake_implement)
 
-    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
-    assert tuple(events) == expected_events
-    assert runner.issues == []
-    assert not any("AGENT_PLAN_TOPOLOGY_CHECKPOINT" in comment for comment in runner.comments)
-    assert not any("AGENT_DISCUSS_SPLIT" in comment for comment in runner.comments)
-    assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+    compatible = (
+        execution_mode == "plan-only"
+        or strategy == "one-shot" and execution_mode == "implement-one-shot"
+        or strategy == "staged" and execution_mode in {"decompose-only", "implement-by-phase"}
+    )
+    if compatible:
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+        assert tuple(events) == expected_events if execution_mode != "plan-only" else tuple(events) == ()
+        assert runner.issues == []
+        assert not any("AGENT_PLAN_TOPOLOGY_CHECKPOINT" in comment for comment in runner.comments)
+        assert not any("AGENT_DISCUSS_SPLIT" in comment for comment in runner.comments)
+        assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+    else:
+        with pytest.raises(AgentLoopError, match="incompatible"):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        assert events == []
+        assert runner.issues == []
+        assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
+        assert not any("AGENT_PLAN_DECOMPOSITION" in comment for comment in runner.comments)
+        assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
 
 
 def _existing_split_children_comment() -> dict:
