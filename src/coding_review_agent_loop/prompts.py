@@ -1767,12 +1767,17 @@ Use this mandatory structured JSON response format:
 <!-- AGENT_PLAN_STATE: blocking -->
 -- coder signature shown in the volatile tail
 
-If the plan intentionally narrows scope (mentions a later stage, follow-up
-issue, or explicitly out-of-scope work), declare EVERY such stage in the
-typed categories instead of overloading `deferred_stages`: only `child_stages`
-are eligible for filing. Put existing `#N`, issue URLs, or `owner/repo#N`
-references in `external_dependencies`; use `deferred_work` and `plan_actions`
-for record-only entries. Legacy `deferred_stages` remains record-only.
+If an unversioned historical plan intentionally narrows scope (mentions a
+later stage, follow-up issue, or explicitly out-of-scope work), declare EVERY
+such stage in the legacy typed categories instead of overloading
+`deferred_stages`: only historical top-level `child_stages` are eligible for
+filing. Put existing `#N`, issue URLs, or `owner/repo#N` references in
+`external_dependencies`; use `deferred_work` and `plan_actions` for record-only
+entries. Legacy `deferred_stages` remains record-only. A fresh generation-1
+plan must put reviewed delivery stages only under
+`execution_recommendation.child_stages`; those stages are audit-only in this
+phase, while record-only entries still use `external_dependencies`,
+`deferred_work`, and `plan_actions`.
 
 The orchestrator will normalize structured plan revisions into canonical
 markdown for stored plan state, reviewer prompts, subject hashing, and resume.
@@ -2076,10 +2081,14 @@ dependencies, staged parents, unselected stages, deferred work, or plan actions.
 Absence means no declaration; an explicit empty array means no additional issue.
 When signed requirements are surfaced, the disposition array must contain every
 generated surfaced requirement label exactly once; when none are surfaced, it must be empty.
-Use the optional typed `child_stages`, `external_dependencies`, `deferred_work`,
+For an unversioned historical response, use the optional typed `child_stages`, `external_dependencies`, `deferred_work`,
 and `plan_actions` arrays (each has non-empty `title` and `summary` strings).
-Only `child_stages` may be materialized; existing issue references belong in
-`external_dependencies`, not a child title or summary.
+Only historical top-level
+`child_stages` may be materialized; existing issue references belong in
+`external_dependencies`, not a child title or summary. For every fresh
+generation-1 response, put reviewed delivery stages under
+`execution_recommendation.child_stages` and leave top-level legacy
+`child_stages` empty; those v1 stages are audit-only in this phase.
 Do not substitute a generic `implementation_plan` object or markdown plan for this
 schema. If signed human-requirements acknowledgement is required, put its
 `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` marker and `### Human requirements` section

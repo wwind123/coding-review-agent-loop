@@ -19,6 +19,7 @@ from coding_review_agent_loop.prompts import (
     build_task_clarification_prompt,
     format_pr_checks,
 )
+from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
 from coding_review_agent_loop.protocol import (
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
@@ -78,6 +79,108 @@ def test_fresh_plan_prompts_show_the_exact_one_shot_contract_shape(tmp_path):
         assert '"final_integration_work": {"status": "none"' in prompt
         assert "Do not include non-empty top-level legacy" in prompt
     assert "omit child stages" not in initial.lower()
+
+
+def test_plan_review_prompts_expose_complete_one_shot_and_staged_recommendations(tmp_path):
+    config = make_config(tmp_path)
+    one_shot = validate_structured_plan_state(
+        structured_v1_plan_state(), require_execution_strategy_contract=1
+    )
+    one_shot_plan = render_canonical_plan_state(one_shot, config)
+
+    staged_payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    recommendation = staged_payload["execution_recommendation"]
+    recommendation.pop("one_shot_delivery", None)
+    recommendation.update(
+        {
+            "strategy": "staged",
+            "staging_feasibility": "safe",
+            "scope_items": [
+                {
+                    "scope_item_id": "scope-api",
+                    "requirement": "Preserve the API.",
+                    "acceptance_criteria": ["Existing callers continue to work."],
+                },
+                {
+                    "scope_item_id": "scope-tests",
+                    "requirement": "Cover the behavior.",
+                    "acceptance_criteria": ["The focused test passes."],
+                },
+                {
+                    "scope_item_id": "scope-integration",
+                    "requirement": "Verify the integrated delivery.",
+                    "acceptance_criteria": ["The stages work together."],
+                },
+            ],
+            "child_stages": [
+                {
+                    "stage_id": "stage-api",
+                    "position": 1,
+                    "title": "API change",
+                    "summary": "Implement the API change.",
+                    "deliverables": ["API implementation."],
+                    "non_goals": ["No migration."],
+                    "acceptance_criteria": ["The API remains compatible."],
+                    "depends_on_stage_ids": [],
+                    "dependency_notes": "First stage.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "low",
+                    "compatibility_constraints": ["Preserve callers."],
+                    "covered_scope_item_ids": ["scope-api"],
+                },
+                {
+                    "stage_id": "stage-tests",
+                    "position": 2,
+                    "title": "Regression coverage",
+                    "summary": "Add the focused test.",
+                    "deliverables": ["Regression test."],
+                    "non_goals": [],
+                    "acceptance_criteria": ["The focused test passes."],
+                    "depends_on_stage_ids": ["stage-api"],
+                    "dependency_notes": "Run after the API stage.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "low",
+                    "compatibility_constraints": [],
+                    "covered_scope_item_ids": ["scope-tests"],
+                },
+            ],
+            "coupling_constraints": [],
+            "retained_parent_work": {
+                "status": "none",
+                "deliverables": [],
+                "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "final_integration_work": {
+                "status": "required",
+                "deliverables": ["Verify integration."],
+                "acceptance_criteria": ["The stages work together."],
+                "covered_scope_item_ids": ["scope-integration"],
+            },
+            "caveats": ["Roll out gradually."],
+        }
+    )
+    staged = validate_structured_plan_state(
+        json.dumps(staged_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder",
+        require_execution_strategy_contract=1,
+    )
+    staged_plan = render_canonical_plan_state(staged, config)
+
+    for compact in (False, True):
+        for plan_text, expected in (
+            (one_shot_plan, ("Implement the reviewed scope.", "The reviewed scope is complete.")),
+            (staged_plan, ("API implementation.", "Run after the API stage.")),
+        ):
+            prompt = build_plan_review_prompt(
+                783,
+                1,
+                plan_text,
+                config,
+                reviewer="codex",
+                compact_context=compact,
+            )
+            for field in expected:
+                assert field in prompt
 
 _EXPECTED_FOLLOWUP_FIX_AND = """For small, localized, low-risk cleanup that must still be fixed in this PR
 before merge, return `<!-- AGENT_STATE: blocking -->` and list those items

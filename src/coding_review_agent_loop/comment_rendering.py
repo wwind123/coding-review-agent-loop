@@ -526,25 +526,164 @@ def render_execution_recommendation_section(
     encoded = _encode_json_payload(payload)
     lines = [
         "### Execution strategy recommendation (v1)",
-        f"Topology source: `{EXECUTION_TOPOLOGY_SOURCE}`; strategy: `{recommendation.strategy}`.",
-        f"Staging feasibility: `{recommendation.staging_feasibility}`.",
-        f"Rationale: {sanitize_historical_text(recommendation.rationale)}",
-        "Scope ownership: " + ", ".join(
-            sanitize_historical_text(item.scope_item_id) for item in recommendation.scope_items
-        ),
+        f"- `topology_source`: `{EXECUTION_TOPOLOGY_SOURCE}`",
+        f"- `strategy`: `{sanitize_historical_text(recommendation.strategy)}`",
+        f"- `staging_feasibility`: `{sanitize_historical_text(recommendation.staging_feasibility)}`",
+        f"- `rationale`: {sanitize_historical_text(recommendation.rationale)}",
+        "",
+        "#### `scope_items`",
     ]
+    for item in recommendation.scope_items:
+        lines.extend(
+            [
+                f"- `{sanitize_historical_text(item.scope_item_id)}`",
+                f"  - `requirement`: {sanitize_historical_text(item.requirement)}",
+                "  - `acceptance_criteria`:",
+            ]
+        )
+        if item.acceptance_criteria:
+            lines.extend(
+                f"    - {sanitize_historical_text(value)}"
+                for value in item.acceptance_criteria
+            )
+        else:
+            lines.append("    - None")
+
+    lines.extend(["", "#### `coupling_constraints`"])
+    if recommendation.coupling_constraints:
+        for constraint in recommendation.coupling_constraints:
+            lines.extend(
+                [
+                    f"- `{sanitize_historical_text(constraint.constraint_id)}`",
+                    "  - `scope_item_ids`: "
+                    + ", ".join(
+                        f"`{sanitize_historical_text(value)}`"
+                        for value in constraint.scope_item_ids
+                    ),
+                    f"  - `rationale`: {sanitize_historical_text(constraint.rationale)}",
+                ]
+            )
+    else:
+        lines.append("- None")
+
+    if recommendation.one_shot_delivery is not None:
+        delivery = recommendation.one_shot_delivery
+        lines.extend(["", "#### `one_shot_delivery`"])
+        lines.extend(
+            [
+                "- `deliverables`:",
+                *(
+                    [f"  - {sanitize_historical_text(value)}" for value in delivery.deliverables]
+                    or ["  - None"]
+                ),
+                "- `acceptance_criteria`:",
+                *(
+                    [
+                        f"  - {sanitize_historical_text(value)}"
+                        for value in delivery.acceptance_criteria
+                    ]
+                    or ["  - None"]
+                ),
+                "- `covered_scope_item_ids`: "
+                + ", ".join(
+                    f"`{sanitize_historical_text(value)}`"
+                    for value in delivery.covered_scope_item_ids
+                ),
+            ]
+        )
+
+    lines.extend(["", "#### `child_stages`"])
     if recommendation.child_stages:
+        for stage in recommendation.child_stages:
+            lines.extend(
+                [
+                    f"- `{sanitize_historical_text(stage.stage_id)}` (`position`: {stage.position})",
+                    f"  - `title`: {sanitize_historical_text(stage.title)}",
+                    f"  - `summary`: {sanitize_historical_text(stage.summary)}",
+                    "  - `deliverables`:",
+                    *(
+                        [f"    - {sanitize_historical_text(value)}" for value in stage.deliverables]
+                        or ["    - None"]
+                    ),
+                    "  - `non_goals`:",
+                    *(
+                        [f"    - {sanitize_historical_text(value)}" for value in stage.non_goals]
+                        or ["    - None"]
+                    ),
+                    "  - `acceptance_criteria`:",
+                    *(
+                        [
+                            f"    - {sanitize_historical_text(value)}"
+                            for value in stage.acceptance_criteria
+                        ]
+                        or ["    - None"]
+                    ),
+                    "  - `depends_on_stage_ids`: "
+                    + ", ".join(
+                        f"`{sanitize_historical_text(value)}`"
+                        for value in stage.depends_on_stage_ids
+                    )
+                    if stage.depends_on_stage_ids
+                    else "  - `depends_on_stage_ids`: None",
+                    f"  - `dependency_notes`: {sanitize_historical_text(stage.dependency_notes)}",
+                    f"  - `automation`: `{sanitize_historical_text(stage.automation)}`",
+                    f"  - `rollout_risk`: {sanitize_historical_text(stage.rollout_risk)}",
+                    "  - `compatibility_constraints`:",
+                    *(
+                        [
+                            f"    - {sanitize_historical_text(value)}"
+                            for value in stage.compatibility_constraints
+                        ]
+                        or ["    - None"]
+                    ),
+                    "  - `covered_scope_item_ids`: "
+                    + ", ".join(
+                        f"`{sanitize_historical_text(value)}`"
+                        for value in stage.covered_scope_item_ids
+                    ),
+                ]
+            )
+    else:
+        lines.append("- None")
+
+    def render_allocation(title: str, allocation: object) -> None:
+        lines.extend(["", f"#### {title}"])
+        lines.append(f"- `status`: `{sanitize_historical_text(allocation.status)}`")
+        lines.append("- `deliverables`:")
+        lines.extend(
+            f"  - {sanitize_historical_text(value)}" for value in allocation.deliverables
+        )
+        if not allocation.deliverables:
+            lines.append("  - None")
+        lines.append("- `acceptance_criteria`:")
+        lines.extend(
+            f"  - {sanitize_historical_text(value)}"
+            for value in allocation.acceptance_criteria
+        )
+        if not allocation.acceptance_criteria:
+            lines.append("  - None")
         lines.append(
-            "Delivery stages: "
-            + "; ".join(
-                f"{stage.stage_id} ({stage.automation})"
-                for stage in recommendation.child_stages
+            "- `covered_scope_item_ids`: "
+            + (
+                ", ".join(
+                    f"`{sanitize_historical_text(value)}`"
+                    for value in allocation.covered_scope_item_ids
+                )
+                if allocation.covered_scope_item_ids
+                else "None"
             )
         )
-    else:
-        lines.append("Delivery stages: none; the approved recommendation is one-shot.")
+
+    render_allocation("`retained_parent_work`", recommendation.retained_parent_work)
+    render_allocation("`final_integration_work`", recommendation.final_integration_work)
+    lines.extend(["", "#### `caveats`"])
+    lines.extend(
+        f"- {sanitize_historical_text(value)}" for value in recommendation.caveats
+    )
+    if not recommendation.caveats:
+        lines.append("- None")
     lines.append(
-        "The complete reviewed recommendation is retained in the bounded sidecar below."
+        "The same complete recommendation is retained in the bounded sidecar below for lossless resume."
     )
     lines.append(f"<!-- {EXECUTION_RECOMMENDATION_MARKER}: {encoded} -->")
     return "\n".join(lines)
