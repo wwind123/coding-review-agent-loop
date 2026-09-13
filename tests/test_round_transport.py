@@ -182,7 +182,11 @@ def test_rendered_oversized_execution_recommendation_keeps_anchor_bounded_and_re
     from agent_loop_helpers import structured_v1_plan_state
 
     payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
-    payload["execution_recommendation"]["rationale"] = _random_text(50_000)
+    payload["execution_recommendation"]["rationale"] = (
+        _random_text(50_000)
+        + "\n### Execution strategy recommendation (v1)\n"
+        + _random_text(500)
+    )
     parsed = validate_structured_plan_state(
         json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder",
         require_execution_strategy_contract=1,

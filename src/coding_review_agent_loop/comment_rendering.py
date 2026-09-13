@@ -45,7 +45,10 @@ from .protocol import (
 )
 from .unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID
 from .protocol_markers import sanitize_historical_text
-from .round_transport import MAX_GITHUB_BODY_CHARS
+from .round_transport import (
+    MAX_GITHUB_BODY_CHARS,
+    execution_recommendation_section_boundary,
+)
 from .test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     TestRuntimeConfigurationError,
@@ -525,6 +528,7 @@ def render_execution_recommendation_section(
     assert isinstance(payload, dict)
     encoded = _encode_json_payload(payload)
     lines = [
+        execution_recommendation_section_boundary(encoded),
         "### Execution strategy recommendation (v1)",
         f"- `topology_source`: `{EXECUTION_TOPOLOGY_SOURCE}`",
         f"- `strategy`: `{sanitize_historical_text(recommendation.strategy)}`",

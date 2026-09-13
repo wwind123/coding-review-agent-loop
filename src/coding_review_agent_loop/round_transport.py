@@ -24,8 +24,9 @@ _EXECUTION_RECOMMENDATION_RE = re.compile(
     r"(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
     re.I,
 )
-_EXECUTION_RECOMMENDATION_HEADING_RE = re.compile(
-    r"(?m)^###\s+Execution strategy recommendation \(v1\)\s*$",
+_EXECUTION_RECOMMENDATION_SECTION_BOUNDARY_RE = re.compile(
+    r"(?m)^<!--\s*execution-recommendation-section:\s*"
+    r"(?P<digest>[0-9a-f]{64})\s*-->\r?$",
     re.I,
 )
 # Spill reviewer checkpoints first: they are often the largest metadata field
@@ -45,6 +46,12 @@ _SPILL_FIELDS = (
 _MAX_COMPRESSED = 8_000_000
 _MAX_DECOMPRESSED = 16_000_000
 _PART_CHARS = 40_000
+
+
+def execution_recommendation_section_boundary(encoded: str) -> str:
+    """Return the renderer-owned boundary for one recommendation marker."""
+    digest = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+    return f"<!-- execution-recommendation-section: {digest} -->"
 
 
 def _b64(data: bytes) -> str:
@@ -187,14 +194,21 @@ def _prepare_execution_recommendation_transport(
     # section with a bounded, explicit summary.  The canonical plan in round
     # metadata remains lossless, and the marker below lets readers hydrate the
     # same structured object from the sidecars.
-    headings = [
-        heading
-        for heading in _EXECUTION_RECOMMENDATION_HEADING_RE.finditer(body_text)
-        if heading.end() <= match.start()
+    boundaries = [
+        boundary
+        for boundary in _EXECUTION_RECOMMENDATION_SECTION_BOUNDARY_RE.finditer(body_text)
+        if (
+            boundary.end() <= match.start()
+            and boundary.group("digest")
+            == hashlib.sha256(match.group("payload").encode("ascii")).hexdigest()
+            and body_text[boundary.end() :].lstrip("\r\n").startswith(
+                "### Execution strategy recommendation (v1)"
+            )
+        )
     ]
-    if not headings:
+    if not boundaries:
         return transformed, sidecars, None
-    heading = headings[-1]
+    section_boundary = boundaries[-1]
     transported_matches = list(_EXECUTION_RECOMMENDATION_RE.finditer(transformed))
     if not transported_matches:
         raise AgentLoopError(
@@ -205,7 +219,7 @@ def _prepare_execution_recommendation_transport(
         occurrence.text
         for occurrence in scan_reserved_markers(body_text)
         if (
-            heading.start() <= occurrence.start < match.end()
+            section_boundary.start() <= occurrence.start < match.end()
             and occurrence.definition.token != "AGENT_EXECUTION_RECOMMENDATION"
         )
     ]
@@ -229,13 +243,17 @@ def _prepare_execution_recommendation_transport(
     )
     compact_section = "\n".join(compact_lines)
     compacted = (
-        transformed[: heading.start()]
+        transformed[: section_boundary.start()]
         + compact_section
         + transformed[transported_match.end() :]
     )
     # The range is expressed in the original carrier so the caller can retain
     # authorization for every marker outside the rewritten recommendation.
-    return compacted, sidecars, (heading.start(), match.end(), compact_section)
+    return compacted, sidecars, (
+        section_boundary.start(),
+        match.end(),
+        compact_section,
+    )
 
 
 def _replace_authorized_range(
