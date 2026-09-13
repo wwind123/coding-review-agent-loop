@@ -546,6 +546,156 @@ class TypedPlanStages:
     plan_actions: tuple[DeferredStage, ...] = ()
 
 
+# Generation-1 planning is intentionally a separate wire model.  The legacy
+# ``ChildStage`` type above is still used for historical, unversioned plans and
+# must not silently acquire fields that would alter decomposition semantics.
+EXECUTION_STRATEGY_CONTRACT_VERSION = 1
+EXECUTION_TOPOLOGY_SOURCE = "approved-plan-v1"
+EXECUTION_AUTOMATION_CLASSES = frozenset({"agent-pr", "human-action", "manual-close"})
+
+
+@dataclass(frozen=True)
+class ExecutionScopeItem:
+    scope_item_id: str
+    requirement: str
+    acceptance_criteria: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExecutionCouplingConstraint:
+    constraint_id: str
+    scope_item_ids: tuple[str, ...]
+    rationale: str
+
+
+@dataclass(frozen=True)
+class ExecutionAllocation:
+    status: str
+    deliverables: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+    covered_scope_item_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExecutionChildStage:
+    stage_id: str
+    position: int
+    title: str
+    summary: str
+    deliverables: tuple[str, ...]
+    non_goals: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+    depends_on_stage_ids: tuple[str, ...]
+    dependency_notes: str
+    automation: str
+    rollout_risk: str
+    compatibility_constraints: tuple[str, ...]
+    covered_scope_item_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExecutionOneShotDelivery:
+    deliverables: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+    covered_scope_item_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExecutionStrategyRecommendation:
+    strategy: str
+    rationale: str
+    staging_feasibility: str
+    scope_items: tuple[ExecutionScopeItem, ...]
+    coupling_constraints: tuple[ExecutionCouplingConstraint, ...]
+    one_shot_delivery: ExecutionOneShotDelivery | None
+    child_stages: tuple[ExecutionChildStage, ...]
+    retained_parent_work: ExecutionAllocation
+    final_integration_work: ExecutionAllocation
+    caveats: tuple[str, ...]
+
+    @property
+    def is_fresh(self) -> bool:
+        return True
+
+    def to_payload(self) -> dict[str, object]:
+        """Return the exact v1 wire shape for canonical rendering/storage."""
+        def allocation(value: ExecutionAllocation) -> dict[str, object]:
+            return {
+                "status": value.status,
+                "deliverables": list(value.deliverables),
+                "acceptance_criteria": list(value.acceptance_criteria),
+                "covered_scope_item_ids": list(value.covered_scope_item_ids),
+            }
+
+        payload: dict[str, object] = {
+            "strategy": self.strategy,
+            "rationale": self.rationale,
+            "staging_feasibility": self.staging_feasibility,
+            "scope_items": [
+                {
+                    "scope_item_id": item.scope_item_id,
+                    "requirement": item.requirement,
+                    "acceptance_criteria": list(item.acceptance_criteria),
+                }
+                for item in self.scope_items
+            ],
+            "coupling_constraints": [
+                {
+                    "constraint_id": item.constraint_id,
+                    "scope_item_ids": list(item.scope_item_ids),
+                    "rationale": item.rationale,
+                }
+                for item in self.coupling_constraints
+            ],
+            "child_stages": [
+                {
+                    "stage_id": stage.stage_id,
+                    "position": stage.position,
+                    "title": stage.title,
+                    "summary": stage.summary,
+                    "deliverables": list(stage.deliverables),
+                    "non_goals": list(stage.non_goals),
+                    "acceptance_criteria": list(stage.acceptance_criteria),
+                    "depends_on_stage_ids": list(stage.depends_on_stage_ids),
+                    "dependency_notes": stage.dependency_notes,
+                    "automation": stage.automation,
+                    "rollout_risk": stage.rollout_risk,
+                    "compatibility_constraints": list(stage.compatibility_constraints),
+                    "covered_scope_item_ids": list(stage.covered_scope_item_ids),
+                }
+                for stage in self.child_stages
+            ],
+            "retained_parent_work": allocation(self.retained_parent_work),
+            "final_integration_work": allocation(self.final_integration_work),
+            "caveats": list(self.caveats),
+        }
+        if self.one_shot_delivery is not None:
+            payload["one_shot_delivery"] = {
+                "deliverables": list(self.one_shot_delivery.deliverables),
+                "acceptance_criteria": list(self.one_shot_delivery.acceptance_criteria),
+                "covered_scope_item_ids": list(self.one_shot_delivery.covered_scope_item_ids),
+            }
+        return payload
+
+    def identity(self) -> dict[str, object]:
+        """Stable mode-independent identity used by canonical plan consumers."""
+        return {
+            "contract_version": EXECUTION_STRATEGY_CONTRACT_VERSION,
+            "strategy": self.strategy,
+            "topology_source": EXECUTION_TOPOLOGY_SOURCE,
+            "scope_item_ids": [item.scope_item_id for item in self.scope_items],
+            "stage_ids": [stage.stage_id for stage in self.child_stages],
+            "retained_parent_status": self.retained_parent_work.status,
+            "final_integration_status": self.final_integration_work.status,
+        }
+
+
+# Descriptive aliases make the model discoverable to helper and integration
+# callers without exposing the legacy ChildStage as a v1 type.
+ExecutionRecommendation = ExecutionStrategyRecommendation
+ExecutionStrategyContract = ExecutionStrategyRecommendation
+
+
 # Shared classification rules for typed plan validation and materialization.
 ISSUE_REFERENCE_RE = re.compile(
     r"(?:\B#[1-9]\d*\b|github\.com/[^/\s]+/[^/\s]+/issues/[1-9]\d*\b|[\w.-]+/[\w.-]+#[1-9]\d*\b)",
@@ -572,6 +722,8 @@ class StructuredPlanRevision:
     typed_stages: TypedPlanStages = TypedPlanStages()
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
     architecture_impact: ArchitectureImpact | None = None
+    execution_strategy_contract_version: int | None = None
+    execution_recommendation: ExecutionStrategyRecommendation | None = None
 
 
 @dataclass(frozen=True)
@@ -588,6 +740,12 @@ class StructuredPlanState:
     typed_stages: TypedPlanStages = TypedPlanStages()
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
     architecture_impact: ArchitectureImpact | None = None
+    execution_strategy_contract_version: int | None = None
+    execution_recommendation: ExecutionStrategyRecommendation | None = None
+
+    @property
+    def legacy_undecided(self) -> bool:
+        return self.execution_strategy_contract_version is None
 
 
 @dataclass(frozen=True)
@@ -1535,6 +1693,277 @@ def _expect_typed_plan_stages(payload: dict[str, object], *, context: str) -> Ty
                 )
             seen[key] = category
     return TypedPlanStages(child_stages, dependencies, deferred, actions)
+
+
+def _expect_execution_allocation(
+    value: object, *, context: str
+) -> ExecutionAllocation:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(
+        payload,
+        context=context,
+        required={"status", "deliverables", "acceptance_criteria", "covered_scope_item_ids"},
+    )
+    status = _expect_non_empty_string(payload["status"], context=f"{context}.status")
+    if status not in {"none", "required"}:
+        raise AgentLoopError(f"{context}.status must be `none` or `required`.")
+    deliverables = _expect_string_list(
+        payload["deliverables"], context=f"{context}.deliverables",
+        item_context=f"{context}.deliverables",
+    )
+    criteria = _expect_string_list(
+        payload["acceptance_criteria"], context=f"{context}.acceptance_criteria",
+        item_context=f"{context}.acceptance_criteria",
+    )
+    covered = _expect_item_id_list(
+        payload["covered_scope_item_ids"], context=f"{context}.covered_scope_item_ids"
+    )
+    if status == "none" and (deliverables or criteria or covered):
+        raise AgentLoopError(f"{context} with status `none` must have empty arrays.")
+    if status == "required" and (not deliverables or not criteria or not covered):
+        raise AgentLoopError(
+            f"{context} with status `required` needs non-empty deliverables, "
+            "acceptance_criteria, and covered_scope_item_ids."
+        )
+    return ExecutionAllocation(status, deliverables, criteria, covered)
+
+
+def _expect_execution_recommendation(
+    value: object, *, context: str
+) -> ExecutionStrategyRecommendation:
+    payload = _expect_object(value, context=context)
+    required = {
+        "strategy", "rationale", "staging_feasibility", "scope_items",
+        "coupling_constraints", "child_stages", "retained_parent_work",
+        "final_integration_work", "caveats",
+    }
+    _expect_exact_keys(payload, context=context, required=required, optional={"one_shot_delivery"})
+    strategy = _expect_non_empty_string(payload["strategy"], context=f"{context}.strategy")
+    if strategy not in {"one-shot", "staged"}:
+        raise AgentLoopError(f"{context}.strategy must be `one-shot` or `staged`.")
+    rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")
+    feasibility = _expect_non_empty_string(
+        payload["staging_feasibility"], context=f"{context}.staging_feasibility"
+    )
+    if feasibility not in {"safe", "inseparable"}:
+        raise AgentLoopError(
+            f"{context}.staging_feasibility must be `safe` or `inseparable`."
+        )
+
+    scope_payload = payload["scope_items"]
+    if not isinstance(scope_payload, list) or not scope_payload:
+        raise AgentLoopError(f"{context}.scope_items must be a non-empty JSON array.")
+    scope_items: list[ExecutionScopeItem] = []
+    scope_ids: set[str] = set()
+    for index, raw_item in enumerate(scope_payload):
+        item_context = f"{context}.scope_items[{index}]"
+        item = _expect_object(raw_item, context=item_context)
+        _expect_exact_keys(item, context=item_context, required={"scope_item_id", "requirement", "acceptance_criteria"})
+        item_id = _expect_item_id(item["scope_item_id"], context=f"{item_context}.scope_item_id")
+        if item_id in scope_ids:
+            raise AgentLoopError(f"{context}.scope_items has duplicate ID `{item_id}`.")
+        criteria = _expect_string_list(
+            item["acceptance_criteria"], context=f"{item_context}.acceptance_criteria",
+            item_context=f"{item_context}.acceptance_criteria", min_length=1,
+        )
+        scope_ids.add(item_id)
+        scope_items.append(
+            ExecutionScopeItem(
+                scope_item_id=item_id,
+                requirement=_expect_non_empty_string(item["requirement"], context=f"{item_context}.requirement"),
+                acceptance_criteria=criteria,
+            )
+        )
+
+    coupling_payload = payload["coupling_constraints"]
+    if not isinstance(coupling_payload, list):
+        raise AgentLoopError(f"{context}.coupling_constraints must be a JSON array.")
+    coupling_constraints: list[ExecutionCouplingConstraint] = []
+    coupling_ids: set[str] = set()
+    for index, raw_constraint in enumerate(coupling_payload):
+        item_context = f"{context}.coupling_constraints[{index}]"
+        item = _expect_object(raw_constraint, context=item_context)
+        _expect_exact_keys(item, context=item_context, required={"constraint_id", "scope_item_ids", "rationale"})
+        constraint_id = _expect_item_id(item["constraint_id"], context=f"{item_context}.constraint_id")
+        if constraint_id in coupling_ids:
+            raise AgentLoopError(f"{context}.coupling_constraints has duplicate ID `{constraint_id}`.")
+        ids = _expect_item_id_list(item["scope_item_ids"], context=f"{item_context}.scope_item_ids")
+        if len(ids) < 2 or len(set(ids)) != len(ids):
+            raise AgentLoopError(f"{item_context}.scope_item_ids must contain at least two unique IDs.")
+        unknown = sorted(set(ids) - scope_ids)
+        if unknown:
+            raise AgentLoopError(f"{item_context}.scope_item_ids contains unknown IDs: {', '.join(unknown)}.")
+        coupling_ids.add(constraint_id)
+        coupling_constraints.append(
+            ExecutionCouplingConstraint(
+                constraint_id=constraint_id,
+                scope_item_ids=ids,
+                rationale=_expect_non_empty_string(item["rationale"], context=f"{item_context}.rationale"),
+            )
+        )
+
+    child_payload = payload["child_stages"]
+    if not isinstance(child_payload, list):
+        raise AgentLoopError(f"{context}.child_stages must be a JSON array.")
+    child_stages: list[ExecutionChildStage] = []
+    stage_ids: set[str] = set()
+    for index, raw_stage in enumerate(child_payload):
+        item_context = f"{context}.child_stages[{index}]"
+        item = _expect_object(raw_stage, context=item_context)
+        _expect_exact_keys(
+            item,
+            context=item_context,
+            required={
+                "stage_id", "position", "title", "summary", "deliverables", "non_goals",
+                "acceptance_criteria", "depends_on_stage_ids", "dependency_notes", "automation",
+                "rollout_risk", "compatibility_constraints", "covered_scope_item_ids",
+            },
+        )
+        stage_id = _expect_item_id(item["stage_id"], context=f"{item_context}.stage_id")
+        if stage_id in stage_ids:
+            raise AgentLoopError(f"{context}.child_stages has duplicate stage ID `{stage_id}`.")
+        position = _expect_int(item["position"], context=f"{item_context}.position")
+        if position != index + 1:
+            raise AgentLoopError(f"{item_context}.position must be contiguous and ordered starting at 1.")
+        depends = _expect_item_id_list(item["depends_on_stage_ids"], context=f"{item_context}.depends_on_stage_ids")
+        unknown_dependencies = sorted(set(depends) - stage_ids)
+        if unknown_dependencies:
+            raise AgentLoopError(
+                f"{item_context}.depends_on_stage_ids must reference earlier stages; "
+                f"unknown/later IDs: {', '.join(unknown_dependencies)}."
+            )
+        automation = _expect_non_empty_string(item["automation"], context=f"{item_context}.automation")
+        if automation not in EXECUTION_AUTOMATION_CLASSES:
+            raise AgentLoopError(
+                f"{item_context}.automation must be one of: {', '.join(sorted(EXECUTION_AUTOMATION_CLASSES))}."
+            )
+        covered = _expect_item_id_list(item["covered_scope_item_ids"], context=f"{item_context}.covered_scope_item_ids")
+        if not covered:
+            raise AgentLoopError(f"{item_context}.covered_scope_item_ids must be non-empty.")
+        unknown_coverage = sorted(set(covered) - scope_ids)
+        if unknown_coverage:
+            raise AgentLoopError(f"{item_context}.covered_scope_item_ids contains unknown IDs: {', '.join(unknown_coverage)}.")
+        stage_ids.add(stage_id)
+        child_stages.append(
+            ExecutionChildStage(
+                stage_id=stage_id,
+                position=position,
+                title=_expect_non_empty_string(item["title"], context=f"{item_context}.title"),
+                summary=_expect_non_empty_string(item["summary"], context=f"{item_context}.summary"),
+                deliverables=_expect_string_list(item["deliverables"], context=f"{item_context}.deliverables", item_context=f"{item_context}.deliverables", min_length=1),
+                non_goals=_expect_string_list(item["non_goals"], context=f"{item_context}.non_goals", item_context=f"{item_context}.non_goals"),
+                acceptance_criteria=_expect_string_list(item["acceptance_criteria"], context=f"{item_context}.acceptance_criteria", item_context=f"{item_context}.acceptance_criteria", min_length=1),
+                depends_on_stage_ids=depends,
+                dependency_notes=_expect_non_empty_string(item["dependency_notes"], context=f"{item_context}.dependency_notes"),
+                automation=automation,
+                rollout_risk=_expect_non_empty_string(item["rollout_risk"], context=f"{item_context}.rollout_risk"),
+                compatibility_constraints=_expect_string_list(item["compatibility_constraints"], context=f"{item_context}.compatibility_constraints", item_context=f"{item_context}.compatibility_constraints"),
+                covered_scope_item_ids=covered,
+            )
+        )
+
+    retained = _expect_execution_allocation(payload["retained_parent_work"], context=f"{context}.retained_parent_work")
+    final = _expect_execution_allocation(payload["final_integration_work"], context=f"{context}.final_integration_work")
+    caveats = _expect_string_list(payload["caveats"], context=f"{context}.caveats", item_context=f"{context}.caveats")
+    one_shot: ExecutionOneShotDelivery | None = None
+    if strategy == "one-shot":
+        if "one_shot_delivery" not in payload:
+            raise AgentLoopError(f"{context}.one_shot_delivery is required for one-shot recommendations.")
+        if child_stages:
+            raise AgentLoopError("one-shot recommendations must not contain child stages.")
+        if retained.status != "none" or final.status != "none":
+            raise AgentLoopError("one-shot recommendations require none retained-parent and final-integration work.")
+        delivery = _expect_object(payload["one_shot_delivery"], context=f"{context}.one_shot_delivery")
+        _expect_exact_keys(delivery, context=f"{context}.one_shot_delivery", required={"deliverables", "acceptance_criteria", "covered_scope_item_ids"})
+        one_shot = ExecutionOneShotDelivery(
+            deliverables=_expect_string_list(delivery["deliverables"], context=f"{context}.one_shot_delivery.deliverables", item_context=f"{context}.one_shot_delivery.deliverables", min_length=1),
+            acceptance_criteria=_expect_string_list(delivery["acceptance_criteria"], context=f"{context}.one_shot_delivery.acceptance_criteria", item_context=f"{context}.one_shot_delivery.acceptance_criteria", min_length=1),
+            covered_scope_item_ids=_expect_item_id_list(delivery["covered_scope_item_ids"], context=f"{context}.one_shot_delivery.covered_scope_item_ids"),
+        )
+        allocations = [one_shot.covered_scope_item_ids]
+    else:
+        if "one_shot_delivery" in payload:
+            raise AgentLoopError("staged recommendations must not contain one_shot_delivery.")
+        if feasibility != "safe":
+            raise AgentLoopError("staged recommendations require staging_feasibility `safe`.")
+        if not child_stages:
+            raise AgentLoopError("staged recommendations require at least one child stage.")
+        required_allocations = sum(
+            allocation.status == "required" for allocation in (retained, final)
+        ) + sum(bool(stage.covered_scope_item_ids) for stage in child_stages)
+        if required_allocations < 2:
+            raise AgentLoopError(
+                "staged recommendations require at least two real delivery allocations; "
+                "recommend `one-shot` when one child has no retained or final integration work."
+            )
+        allocations = [stage.covered_scope_item_ids for stage in child_stages]
+        allocations.extend(
+            allocation.covered_scope_item_ids
+            for allocation in (retained, final)
+            if allocation.status == "required"
+        )
+
+    allocation_owner: dict[str, int] = {}
+    for allocation_index, covered_ids in enumerate(allocations):
+        for scope_id in covered_ids:
+            if scope_id not in scope_ids:
+                raise AgentLoopError(f"{context} covers unknown scope item `{scope_id}`.")
+            if scope_id in allocation_owner:
+                raise AgentLoopError(f"{context} covers scope item `{scope_id}` more than once.")
+            allocation_owner[scope_id] = allocation_index
+    missing = sorted(scope_ids - set(allocation_owner))
+    if missing:
+        raise AgentLoopError(f"{context} leaves scope items uncovered: {', '.join(missing)}.")
+    for constraint in coupling_constraints:
+        owners = {allocation_owner[item_id] for item_id in constraint.scope_item_ids}
+        if len(owners) != 1:
+            raise AgentLoopError(
+                f"{context}.{constraint.constraint_id} splits coupled scope items across allocations."
+            )
+    return ExecutionStrategyRecommendation(
+        strategy=strategy,
+        rationale=rationale,
+        staging_feasibility=feasibility,
+        scope_items=tuple(scope_items),
+        coupling_constraints=tuple(coupling_constraints),
+        one_shot_delivery=one_shot,
+        child_stages=tuple(child_stages),
+        retained_parent_work=retained,
+        final_integration_work=final,
+        caveats=caveats,
+    )
+
+
+def _parse_execution_contract_fields(
+    payload: dict[str, object], *, context: str, required: bool
+) -> tuple[int | None, ExecutionStrategyRecommendation | None]:
+    has_version = "execution_strategy_contract_version" in payload
+    has_recommendation = "execution_recommendation" in payload
+    if has_version != has_recommendation:
+        raise AgentLoopError(
+            f"{context} must include execution_strategy_contract_version and "
+            "execution_recommendation together."
+        )
+    if not has_version:
+        if required:
+            raise AgentLoopError(
+                f"Fresh {context} responses require execution_strategy_contract_version: 1 "
+                "and a complete execution_recommendation."
+            )
+        return None, None
+    version = _expect_int(payload["execution_strategy_contract_version"], context=f"{context}.execution_strategy_contract_version")
+    if version != EXECUTION_STRATEGY_CONTRACT_VERSION:
+        raise AgentLoopError(f"{context}.execution_strategy_contract_version must be 1.")
+    return version, _expect_execution_recommendation(
+        payload["execution_recommendation"], context=f"{context}.execution_recommendation"
+    )
+
+
+def parse_execution_recommendation_payload(
+    value: object, *, context: str = "execution_recommendation"
+) -> ExecutionStrategyRecommendation:
+    """Validate a recovered recommendation before any bounded repair."""
+    return _expect_execution_recommendation(value, context=context)
 
 
 def _expect_state(value: object, *, context: str) -> str:
@@ -2623,6 +3052,7 @@ def validate_structured_plan_revision(
     text: str,
     *,
     required_architecture_impact_contract: int = 0,
+    require_execution_strategy_contract: int = 0,
 ) -> StructuredPlanRevision | None:
     payload = _extract_structured_plan_revision_payload(text)
     if payload is None:
@@ -2651,8 +3081,19 @@ def validate_structured_plan_revision(
             "plan_actions",
             "human_requirement_dispositions",
             "architecture_impact",
+            "execution_strategy_contract_version",
+            "execution_recommendation",
         },
     )
+    execution_version, execution_recommendation = _parse_execution_contract_fields(
+        payload,
+        context="plan_revision",
+        required=require_execution_strategy_contract == 1,
+    )
+    if execution_recommendation is not None and "child_stages" in payload:
+        raise AgentLoopError(
+            "plan_revision cannot mix v1 execution child stages with legacy typed `child_stages`."
+        )
     state = _expect_non_empty_string(payload["state"], context="plan_revision.state")
     if state != "blocking":
         raise AgentLoopError("plan_revision.state must be `blocking`.")
@@ -2700,6 +3141,8 @@ def validate_structured_plan_revision(
         typed_stages=_expect_typed_plan_stages(payload, context="plan_revision"),
         human_requirement_dispositions=human_requirement_dispositions,
         architecture_impact=architecture_impact,
+        execution_strategy_contract_version=execution_version,
+        execution_recommendation=execution_recommendation,
     )
 
 
@@ -2707,6 +3150,7 @@ def validate_structured_plan_state(
     text: str,
     *,
     required_architecture_impact_contract: int = 0,
+    require_execution_strategy_contract: int = 0,
 ) -> StructuredPlanState | None:
     payload = _extract_structured_plan_state_payload(text)
     if payload is None:
@@ -2728,8 +3172,19 @@ def validate_structured_plan_state(
             "plan_actions",
             "human_requirement_dispositions",
             "architecture_impact",
+            "execution_strategy_contract_version",
+            "execution_recommendation",
         },
     )
+    execution_version, execution_recommendation = _parse_execution_contract_fields(
+        payload,
+        context="plan_state",
+        required=require_execution_strategy_contract == 1,
+    )
+    if execution_recommendation is not None and "child_stages" in payload:
+        raise AgentLoopError(
+            "plan_state cannot mix v1 execution child stages with legacy typed `child_stages`."
+        )
     state = _expect_state(payload["state"], context="plan_state.state")
     if state != "blocking":
         raise AgentLoopError("plan_state.state must be `blocking`.")
@@ -2764,6 +3219,8 @@ def validate_structured_plan_state(
             context="plan_state.human_requirement_dispositions",
         ),
         architecture_impact=architecture_impact,
+        execution_strategy_contract_version=execution_version,
+        execution_recommendation=execution_recommendation,
     )
 
 

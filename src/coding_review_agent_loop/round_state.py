@@ -145,10 +145,21 @@ class PostedRoundMetadata:
     architecture_identity: dict | None = None
     architecture_impact: dict | None = None
     architecture_contract_version: int | None = None
+    # Planning generation discriminator.  Absent is intentionally legacy
+    # undecided; generation 1 is required to resume a fresh recommendation.
+    execution_strategy_contract_version: int | None = None
+    execution_strategy_identity: dict | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
+        if self.execution_strategy_contract_version not in (None, 1):
+            raise ValueError("invalid execution strategy contract version")
+        if (
+            self.execution_strategy_identity is not None
+            and not isinstance(self.execution_strategy_identity, dict)
+        ):
+            raise ValueError("invalid execution strategy identity")
         # Programmatically-created scheduler checkpoints (including tests and
         # callers that have not round-tripped through the transport) are valid
         # when they carry scheduler fields. Decoded malformed payloads pass an
@@ -681,6 +692,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "architecture_identity": metadata.architecture_identity,
         "architecture_impact": metadata.architecture_impact,
         "architecture_contract_version": metadata.architecture_contract_version,
+        "execution_strategy_contract_version": metadata.execution_strategy_contract_version,
+        "execution_strategy_identity": metadata.execution_strategy_identity,
         "compact_prior_summaries": list(metadata.compact_prior_summaries),
         "usage": metadata.usage,
         "model_used": metadata.model_used,
@@ -786,6 +799,14 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             architecture_contract_version=(
                 int(payload["architecture_contract_version"])
                 if payload.get("architecture_contract_version") is not None else None
+            ),
+            execution_strategy_contract_version=(
+                int(payload["execution_strategy_contract_version"])
+                if payload.get("execution_strategy_contract_version") is not None else None
+            ),
+            execution_strategy_identity=(
+                payload.get("execution_strategy_identity")
+                if isinstance(payload.get("execution_strategy_identity"), dict) else None
             ),
             compact_prior_summaries=tuple(
                 str(summary) for summary in payload.get("compact_prior_summaries", [])
@@ -1781,6 +1802,67 @@ def _resume_plan_round(
     anchor_metadata = selection.anchor_record.metadata
     current_plan = latest_coder_record.metadata.canonical_plan or latest_coder_record.body
     coder_output = latest_coder_record.metadata.raw_structured_coder_response or current_plan
+    metadata_version = latest_coder_record.metadata.execution_strategy_contract_version
+    fresh_artifact = False
+    try:
+        raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
+        fresh_artifact = (
+            isinstance(raw_payload, dict)
+            and (
+                "execution_strategy_contract_version" in raw_payload
+                or "execution_recommendation" in raw_payload
+            )
+        ) or "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+    except (AttributeError, json.JSONDecodeError):
+        fresh_artifact = "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+    if fresh_artifact and metadata_version != 1:
+        raise AgentLoopError(
+            "Fresh generation-1 planning data is present but its round metadata is "
+            "missing or not generation 1; restart the planning handoff instead of "
+            "downgrading it to legacy-undecided."
+        )
+    if metadata_version == 1:
+        # A generation-1 round is never downgraded to legacy on resume.  The
+        # raw response is the provenance source; the visible canonical plan is
+        # intentionally markdown and cannot substitute for it.
+        from .protocol import (
+            validate_structured_plan_revision,
+            validate_structured_plan_state,
+        )
+
+        try:
+            parsed = validate_structured_plan_state(
+                coder_output,
+                require_execution_strategy_contract=1,
+            )
+            parsed_recommendation = (
+                parsed.execution_recommendation if parsed is not None else None
+            )
+            if parsed is None:
+                parsed_revision = validate_structured_plan_revision(
+                    coder_output,
+                    require_execution_strategy_contract=1,
+                )
+                if parsed_revision is None:
+                    raise AgentLoopError(
+                        "Generation-1 planning metadata has no recoverable structured response."
+                    )
+                parsed_recommendation = parsed_revision.execution_recommendation
+            if (
+                not isinstance(latest_coder_record.metadata.execution_strategy_identity, dict)
+                or parsed_recommendation is None
+                or latest_coder_record.metadata.execution_strategy_identity
+                != parsed_recommendation.identity()
+            ):
+                raise AgentLoopError(
+                    "Generation-1 planning metadata has a missing or mismatched "
+                    "strategy/topology identity."
+                )
+        except AgentLoopError as exc:
+            raise AgentLoopError(
+                "Generation-1 planning round metadata is missing or has a malformed "
+                "execution strategy contract; repair the handoff or start a new plan round."
+            ) from exc
     ledger_may_be_incomplete = (
         len(anchor_metadata.prior_items) == 0
         and any(

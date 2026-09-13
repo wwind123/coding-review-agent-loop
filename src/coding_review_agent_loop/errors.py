@@ -12,6 +12,10 @@ class AgentLoopError(RuntimeError):
     """Raised for expected orchestration failures."""
 
 
+class FreshContractIntegrityError(AgentLoopError):
+    """A fresh plan cannot be format-repaired without recoverable v1 data."""
+
+
 class UnknownPriorItemDispositionError(AgentLoopError):
     """Raised when an agent dispositions a non-carried prior item ID."""
 

@@ -128,6 +128,43 @@ def validate_repair_preservation(
                     if isinstance(entry, str) and _fragments(entry):
                         require(entry in candidate, f"architecture_impact.{key}")
 
+    if source["kind"] in {"plan_state", "plan_revision"} and (
+        "execution_strategy_contract_version" in source
+        or "execution_recommendation" in source
+    ):
+        require(source.get("execution_strategy_contract_version") == 1, "execution_strategy_contract_version")
+        require(target.get("execution_strategy_contract_version") == 1, "execution_strategy_contract_version")
+        source_recommendation = source.get("execution_recommendation")
+        target_recommendation = target.get("execution_recommendation")
+        require(isinstance(source_recommendation, dict), "execution_recommendation")
+        require(isinstance(target_recommendation, dict), "execution_recommendation")
+
+        def preserve_execution_value(source_value: object, target_value: object, field: str) -> None:
+            if isinstance(source_value, str):
+                require(
+                    isinstance(target_value, str)
+                    and _normalized(source_value) == _normalized(target_value),
+                    field,
+                )
+                return
+            if isinstance(source_value, list):
+                require(isinstance(target_value, list) and len(source_value) == len(target_value), field)
+                for index, (source_item, target_item) in enumerate(zip(source_value, target_value)):
+                    preserve_execution_value(source_item, target_item, f"{field}[{index}]")
+                return
+            if isinstance(source_value, dict):
+                require(isinstance(target_value, dict) and set(source_value) == set(target_value), field)
+                for key, child in source_value.items():
+                    preserve_execution_value(child, target_value[key], f"{field}.{key}")
+                return
+            require(source_value == target_value, field)
+
+        preserve_execution_value(
+            source_recommendation,
+            target_recommendation,
+            "execution_recommendation",
+        )
+
     summary = source.get("summary")
     if isinstance(summary, str) and _fragments(summary):
         require(

@@ -11,6 +11,26 @@ The default flow is:
 3. If any reviewer finds blockers, the coder fixes the PR.
 4. The loop repeats until every reviewer approves in the same round or `--max-rounds` is reached (default: 10).
 
+### Reviewed execution strategy contract
+
+New planning and plan-revision turns must emit generation 1 with an
+`execution_recommendation`. Its scope ledger gives every requirement a stable
+ID and acceptance criteria; coupling constraints keep inseparable work in one
+delivery. A `one-shot` recommendation has one exact-once delivery and explicit
+`none` retained-parent and final-integration allocations. A `staged`
+recommendation has ordered enriched child stages plus independent retained and
+final-integration allocations, with exact-once coverage and at least two real
+allocations. It also records automation, dependencies, rollout risk,
+compatibility constraints, and caveats.
+
+This is a review/audit contract in the first phase of the rollout. Its v1
+children are not legacy typed child stages and do not cause issue creation,
+split handling, decomposition, follow-up filing, or dispatch. Explicit
+execution modes continue to control those paths. Old unversioned comments and
+two-field typed stages remain legacy-undecided and are decoded without
+inventing v1 data. A bounded repair can only reformat a complete recoverable v1
+source; missing or partial strategy data requires a new planner turn.
+
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
 ### Machine obligations and resumable qualification

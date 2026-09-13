@@ -139,6 +139,10 @@ class AgentLoopConfig:
     semantic_followup_max_candidates: int = DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES
     semantic_followup_prompt_char_limit: int = DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT
     plan_execution_mode: str = "plan-only"
+    # Fresh planning is generation-1 by default.  A caller that is explicitly
+    # decoding historical transcripts may set this false so unversioned plans
+    # remain distinguishable as legacy-undecided.
+    execution_strategy_contract_required: bool = True
     planning_context_mode: str = "compact"
     pr_review_context_mode: str = "full"
     # PR-only intermediate scheduling.  ``all-reviewers`` preserves the
@@ -1408,6 +1412,7 @@ def config_from_args(
             args, "semantic_followup_prompt_char_limit", DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT
         ),
         plan_execution_mode=getattr(args, "plan_execution_mode", None) or "plan-only",
+        execution_strategy_contract_required=True,
         planning_context_mode=getattr(args, "planning_context_mode", None) or "compact",
         pr_review_context_mode=getattr(args, "pr_review_context_mode", None) or "full",
         architecture_context_enabled=getattr(args, "architecture_context_enabled", True),

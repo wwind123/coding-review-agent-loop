@@ -278,6 +278,7 @@ from .repair import (
     attempt_repair,
     execute_repair,
     strip_unknown_prior_item_dispositions,
+    _require_recoverable_fresh_execution_contract,
 )
 from .runner import Runner
 from .salvage import (
@@ -344,6 +345,7 @@ from .comment_rendering import (
     render_public_agent_comment,
     render_agent_unavailable_comment,
     render_canonical_plan_revision,
+    render_canonical_plan_state,
     render_canonical_plan_steps,
     PLAN_EXPECTED_CLOSING_MARKER_RE,
     decode_expected_closing_issue_declaration,
@@ -2189,16 +2191,24 @@ def _run_structured_repair(
     repair_kwargs: dict[str, object],
 ) -> tuple[str | None, object | None, list[RepairAttemptResult]]:
     """Run configured repair, retaining compatibility with patched legacy test hooks."""
+    if repair_kwargs.get("require_execution_strategy_contract"):
+        expected_kind = repair_kwargs.get("expected_kind")
+        if isinstance(expected_kind, str):
+            _require_recoverable_fresh_execution_contract(raw, expected_kind=expected_kind)
     if attempt_repair is not _ORIGINAL_ATTEMPT_REPAIR:
         try:
             repaired = attempt_repair(raw, config.gemini_cmd, **repair_kwargs)
         except TypeError as exc:
             # Keep older test/integration hooks callable while the reviewer-ID
             # context is rolled out. The real repair API accepts this keyword.
-            if "reviewer_requirement_ids" not in str(exc):
+            if not any(
+                name in str(exc)
+                for name in ("reviewer_requirement_ids", "require_execution_strategy_contract")
+            ):
                 raise
             legacy_kwargs = dict(repair_kwargs)
             legacy_kwargs.pop("reviewer_requirement_ids", None)
+            legacy_kwargs.pop("require_execution_strategy_contract", None)
             repaired = attempt_repair(raw, config.gemini_cmd, **legacy_kwargs)
         if repaired is None:
             return None, None, []
@@ -2583,6 +2593,7 @@ def _run_validated_agent(
     repair_surfaced_requirement_ids: Sequence[str] | None = None,
     repair_reviewer_requirement_ids: Sequence[str] | None = None,
     repair_requires_direct_discussion_ack: bool = False,
+    require_execution_strategy_contract: bool = False,
     repair_allowed_prior_item_ids: Sequence[str] | None = None,
     ledger_incomplete: bool = False,
     role: str | None = None,
@@ -3395,6 +3406,11 @@ def _run_validated_agent(
                         repair_kwargs["requires_direct_discussion_ack"] = (
                             repair_requires_direct_discussion_ack
                         )
+                        if (
+                            require_execution_strategy_contract
+                            and repair_expected_kind in {"plan_state", "plan_revision"}
+                        ):
+                            repair_kwargs["require_execution_strategy_contract"] = True
                     elif (
                         repair_expected_kind == "coder_followup"
                         and (
@@ -3795,13 +3811,15 @@ def _require_task_implementation_result(
 
 
 def _require_plan_state_or_clarification(
-    text: str, *, required_architecture_impact_contract: int = 0
+    text: str, *, required_architecture_impact_contract: int = 0,
+    require_execution_strategy_contract: int = 0,
 ) -> StructuredPlanState | str:
     if is_clarification_request(text):
         return "clarification"
     structured_plan = validate_structured_plan_state(
         text,
         required_architecture_impact_contract=required_architecture_impact_contract,
+        require_execution_strategy_contract=require_execution_strategy_contract,
     )
     if structured_plan is None:
         raise AgentLoopError(
@@ -3987,9 +4005,12 @@ def _validate_plan_revision_response(
     *,
     unresolved_items: Sequence[UnresolvedReviewItem] = (),
     require_architecture_impact: bool = False,
+    require_execution_strategy_contract: bool = False,
 ) -> StructuredPlanRevision | str:
     parsed = validate_structured_plan_revision(
-        text, required_architecture_impact_contract=(1 if require_architecture_impact else 0)
+        text,
+        required_architecture_impact_contract=(1 if require_architecture_impact else 0),
+        require_execution_strategy_contract=(1 if require_execution_strategy_contract else 0),
     )
     if parsed is not None:
         allowed_ids = {item.item_id for item in unresolved_items}
@@ -4365,6 +4386,11 @@ def _extract_current_child_stages(current_plan: str) -> tuple[ChildStage, ...]:
     except AgentLoopError:
         structured = None
     if structured is not None:
+        if structured.execution_recommendation is not None:
+            # Generation-1 topology is review/audit data only in Stage 1.
+            # Never let its enriched child stages fall through the legacy
+            # adapter or create GitHub side effects.
+            return ()
         return structured.typed_stages.child_stages
     marker = re.search(r"<!--\s*AGENT_TYPED_PLAN_STAGES:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", current_plan, re.I)
     if not marker:
@@ -5417,6 +5443,9 @@ def _run_plan_first_loop(
     )
     coder_name = agent_display_name(config.coder)
     configured_reviewers = reviewers(config)
+    require_fresh_execution_contract = bool(
+        getattr(config, "execution_strategy_contract_required", False)
+    )
     coder_session_id: str | None = None
     reviewer_session_ids: dict[AgentName, str | None] = {}
     unresolved_items: list[UnresolvedReviewItem] = []
@@ -5444,6 +5473,9 @@ def _run_plan_first_loop(
                     # Document availability controls prompt material, not the
                     # response protocol or the assessment requirement.
                     required_architecture_impact_contract=1,
+                    require_execution_strategy_contract=(
+                        1 if require_fresh_execution_contract else 0
+                    ),
                 ),
                 human_requirements=human_requirements,
                 requirement_scope="planning requirements",
@@ -5454,6 +5486,7 @@ def _run_plan_first_loop(
             repair_expected_kind="plan_state",
             repair_surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
             repair_requires_direct_discussion_ack=plan_human_requirements_context.requires_direct_discussion_ack,
+            require_execution_strategy_contract=require_fresh_execution_contract,
             operation_description="planning",
         )
         plan_output = plan_response.text
@@ -5467,10 +5500,19 @@ def _run_plan_first_loop(
         public_plan_output = plan_output
         raw_structured_coder_response: str | None = None
         canonical_plan: str | None = None
-        structured_plan = validate_structured_plan_state(plan_output)
+        structured_plan = validate_structured_plan_state(
+            plan_output,
+            require_execution_strategy_contract=(
+                1 if require_fresh_execution_contract else 0
+            ),
+        )
         if isinstance(structured_plan, StructuredPlanState):
             raw_structured_coder_response = plan_output
-            canonical_plan = plan_output
+            if structured_plan.execution_recommendation is not None:
+                canonical_plan = render_canonical_plan_state(structured_plan, config)
+            else:
+                canonical_plan = plan_output
+            current_plan = canonical_plan
             public_plan_output = render_public_agent_comment(
                 kind="plan_state",
                 parsed=structured_plan,
@@ -5508,6 +5550,18 @@ def _run_plan_first_loop(
                     acquisition_returncode=plan_response.acquisition_returncode,
                     **_architecture_metadata_fields(
                         config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
+                    ),
+                    execution_strategy_contract_version=(
+                        1
+                        if structured_plan is not None
+                        and structured_plan.execution_recommendation is not None
+                        else None
+                    ),
+                    execution_strategy_identity=(
+                        structured_plan.execution_recommendation.identity()
+                        if structured_plan is not None
+                        and structured_plan.execution_recommendation is not None
+                        else None
                     ),
                 ),
             ),
@@ -6633,6 +6687,7 @@ def _run_plan_first_loop(
                     revised_text,
                     unresolved_items=items,
                     require_architecture_impact=True,
+                    require_execution_strategy_contract=require_fresh_execution_contract,
                 ),
                 human_requirements=human_requirements,
                 requirement_scope="planning requirements",
@@ -6647,6 +6702,7 @@ def _run_plan_first_loop(
             repair_requires_direct_discussion_ack=(
                 plan_revision_human_requirements_context.requires_direct_discussion_ack
             ),
+            require_execution_strategy_contract=require_fresh_execution_contract,
             repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
             ledger_incomplete=round_ledger_incomplete,
             operation_description="plan revision",
@@ -6698,6 +6754,18 @@ def _run_plan_first_loop(
                     compact_prior_summaries=tuple(compact_prior_summaries),
                     model_used=plan_response.model_used,
                     **_metadata_identity_fields(plan_response),
+                    execution_strategy_contract_version=(
+                        1
+                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                        and plan_response.marker_value.execution_recommendation is not None
+                        else None
+                    ),
+                    execution_strategy_identity=(
+                        plan_response.marker_value.execution_recommendation.identity()
+                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                        and plan_response.marker_value.execution_recommendation is not None
+                        else None
+                    ),
                     **_architecture_metadata_fields(
                         config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
                     ),

@@ -26,6 +26,17 @@ skill mode performs host turns in the already-running Claude Code session.
 Replacing or updating the executable on disk therefore affects a later CLI turn
 but not the host turns already running in the current skill session.
 
+### Generation-1 planning boundary
+
+Skill-mode planning emits the same generation-1 execution-strategy contract as
+headless planning: stable scope IDs, coupling constraints, exact-once
+allocations, enriched staged fields, and retained-parent/final-integration
+work. The full recommendation is stored in canonical plan text and round
+metadata. During this first phase the recommendation is review data only; it
+does not enter legacy decomposition, split materialization, child creation, or
+dispatch. Historical unversioned plans stay legacy-undecided, and repair must
+recover a complete v1 source before applying format-only correction.
+
 ### Containment and test gates
 
 External skill agents and the skill-mode test gate use the same shared

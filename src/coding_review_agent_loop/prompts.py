@@ -1635,6 +1635,55 @@ Structured responses must start with one top-level JSON object, place the
 `AGENT_PLAN_STATE` footer immediately after that payload, and end with only
 your standalone signature. Do not include prose or code fences before the JSON
 object.
+""" + "\n" + _execution_strategy_review_guidance()
+
+
+def _execution_strategy_review_guidance() -> str:
+    return """
+For a generation-1 plan, review the complete execution recommendation rather
+than treating its child stages as executable instructions. Check staging
+feasibility, exact scope ownership, coupled work, earlier-only dependencies,
+automation class, rollout risk, compatibility and migration/recovery
+constraints, retained-parent work, final integration, caveats, security
+boundaries, and meaningful test combinations. Reject missing, duplicated,
+unknown, uncovered, or split scope IDs and any mismatch between strategy and
+conditional delivery fields. This recommendation does not select the current
+execution mode or change issue count in Stage 1.
+"""
+
+
+def _execution_strategy_contract_guidance() -> str:
+    """Shared generation-1 planning contract for full and compact prompts."""
+    return """
+Every newly invoked `plan_state` and `plan_revision` must include
+`execution_strategy_contract_version`: `1` and a complete
+`execution_recommendation`. Historical unversioned records are legacy-undecided
+and must not be upgraded by inference. The recommendation contains stable scope
+items, coupling constraints, conditional one-shot delivery, enriched child
+stages, retained-parent and final-integration allocations, and caveats.
+
+Its exact required keys are `strategy`, `rationale`, `staging_feasibility`,
+`scope_items`, `coupling_constraints`, `child_stages`,
+`retained_parent_work`, `final_integration_work`, and `caveats`, plus
+`one_shot_delivery` only for one-shot. Scope items are exactly
+`{scope_item_id, requirement, acceptance_criteria}`. Coupling entries are
+exactly `{constraint_id, scope_item_ids, rationale}`. Allocations are exactly
+`{status, deliverables, acceptance_criteria, covered_scope_item_ids}`; child
+stages are exactly `{stage_id, position, title, summary, deliverables,
+non_goals, acceptance_criteria, depends_on_stage_ids, dependency_notes,
+automation, rollout_risk, compatibility_constraints, covered_scope_item_ids}`.
+
+For one-shot, omit child stages, use a delivery covering every scope-item ID
+exactly once, and set retained-parent and final-integration work to `none`.
+`staging_feasibility` may be `inseparable`. For staged, omit one-shot delivery,
+use safe feasibility, order dependencies by earlier stage position, allocate
+every scope item exactly once across children and required retained/final work,
+keep coupling groups together, and provide at least two real allocations. A
+single child with no retained or final work is invalid; recommend one-shot.
+`none` allocations have three empty arrays; `required` allocations have all
+three arrays non-empty. Automation is exactly `agent-pr`, `human-action`, or
+`manual-close`. Preserve issue references and tracker actions in existing
+non-child typed categories.
 """
 
 
@@ -1697,7 +1746,7 @@ after the JSON object and before the `AGENT_PLAN_STATE` footer. Otherwise, put
 the `AGENT_PLAN_STATE` footer immediately after the JSON. Make the footer state
 match the JSON state, and include only your standalone signature after the
 footer.
-"""
+""" + "\n" + _execution_strategy_contract_guidance()
 
 
 def _compact_plan_stable_prefix(
@@ -1954,6 +2003,8 @@ branch, commit, push, or open a pull request during this planning stage.
 {_architecture_impact_guidance(required=True)}
 For a plan (rather than a clarification), respond with exactly one structured JSON
 `plan_state` object. It must have this complete contract:
+
+{_execution_strategy_contract_guidance()}
 
 {{
   "schema_version": 1,

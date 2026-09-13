@@ -23,6 +23,7 @@ from .runner import Runner
 from .protocol_markers import TrustedBody, sanitize_historical_text
 from .protocol import (
     ArchitectureImpact,
+    ChildStage,
     parse_architecture_impact,
     sanitize_architecture_impact,
 )
@@ -314,6 +315,11 @@ def adapt_typed_child_stages(
     plan_subject: str,
 ) -> tuple[PlanDecomposition, RetainedParentScope]:
     """Adapt the two-field typed remainder into the decomposition contract."""
+    if any(not isinstance(stage, ChildStage) for stage in stages):
+        raise AgentLoopError(
+            "Generation-1 execution child stages cannot reach the legacy typed-stage adapter; "
+            "Stage 2 must consume the reviewed recommendation directly."
+        )
     excerpt = sanitize_historical_text(approved_plan.strip())
     retained = RetainedParentScope(
         plan_subject=sanitize_historical_text(plan_subject),

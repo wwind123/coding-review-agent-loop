@@ -38,6 +38,8 @@ from .protocol import (
     StructuredIssueImplementation,
     StructuredPlanState,
     StructuredPlanRevision,
+    ExecutionStrategyRecommendation,
+    EXECUTION_TOPOLOGY_SOURCE,
     UnresolvedReviewItem,
     review_freeform_summary_text,
 )
@@ -60,6 +62,11 @@ ITEM_SUMMARY_LIMIT = 100
 PLAN_EXPECTED_CLOSING_MARKER = "AGENT_PLAN_EXPECTED_CLOSING_ISSUES"
 PLAN_EXPECTED_CLOSING_MARKER_RE = re.compile(
     rf"<!--\s*{PLAN_EXPECTED_CLOSING_MARKER}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.IGNORECASE,
+)
+EXECUTION_RECOMMENDATION_MARKER = "AGENT_EXECUTION_RECOMMENDATION"
+EXECUTION_RECOMMENDATION_MARKER_RE = re.compile(
+    rf"<!--\s*{EXECUTION_RECOMMENDATION_MARKER}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
     re.IGNORECASE,
 )
 # Reverse map display-name -> agent. agent_display_name is config-independent, so
@@ -496,6 +503,48 @@ def render_typed_plan_stages_section(stages: TypedPlanStages) -> str | None:
     return "\n".join(lines)
 
 
+def _sanitize_execution_payload(value: object) -> object:
+    if isinstance(value, str):
+        return sanitize_historical_text(value)
+    if isinstance(value, dict):
+        return {str(key): _sanitize_execution_payload(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_execution_payload(child) for child in value]
+    return value
+
+
+def render_execution_recommendation_section(
+    recommendation: ExecutionStrategyRecommendation,
+) -> str:
+    """Render the complete v1 recommendation and its lossless sidecar.
+
+    The sidecar is a distinct marker so legacy typed-stage extraction cannot
+    accidentally treat reviewed v1 topology as executable child issues.
+    """
+    payload = _sanitize_execution_payload(recommendation.to_payload())
+    assert isinstance(payload, dict)
+    encoded = _encode_json_payload(payload)
+    return "\n".join(
+        [
+            "### Execution strategy recommendation (v1)",
+            f"Topology source: `{EXECUTION_TOPOLOGY_SOURCE}`; strategy: `{recommendation.strategy}`.",
+            "```json",
+            json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False),
+            "```",
+            f"<!-- {EXECUTION_RECOMMENDATION_MARKER}: {encoded} -->",
+        ]
+    )
+
+
+def decode_execution_recommendation_marker(encoded: str) -> dict[str, object]:
+    payload = _decode_json_payload(encoded, marker_name=EXECUTION_RECOMMENDATION_MARKER)
+    if _encode_json_payload(payload) != encoded:
+        raise AgentLoopError(
+            f"Invalid {EXECUTION_RECOMMENDATION_MARKER} payload: non-canonical encoding."
+        )
+    return payload
+
+
 def _encode_deferred_stages_marker(deferred_stages: Sequence[DeferredStage]) -> str:
     return _encode_json_payload(
         {"stages": [{"title": stage.title, "summary": stage.summary} for stage in deferred_stages]}
@@ -564,6 +613,31 @@ def render_canonical_plan_revision(
     typed_section = render_typed_plan_stages_section(parsed_revision.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    if parsed_revision.execution_recommendation is not None:
+        sections.append(render_execution_recommendation_section(parsed_revision.execution_recommendation))
+    return "\n\n".join(sections)
+
+
+def render_canonical_plan_state(
+    parsed_plan: StructuredPlanState,
+    config: AgentLoopConfig | None = None,
+) -> str:
+    """Render a first-round plan using the same canonical rules as revisions."""
+    sections = [parsed_plan.summary.strip(), "### Plan steps", render_canonical_plan_steps(parsed_plan.plan_steps)]
+    expected_section = render_expected_closing_issue_declaration(parsed_plan.additional_closing_issue_ids)
+    if expected_section:
+        sections.append(expected_section)
+    human_section = render_human_requirement_dispositions(parsed_plan.human_requirement_dispositions)
+    if human_section:
+        sections.append(human_section)
+    deferred_section = render_deferred_stages_section(parsed_plan.deferred_stages)
+    if deferred_section:
+        sections.append(deferred_section)
+    typed_section = render_typed_plan_stages_section(parsed_plan.typed_stages)
+    if typed_section:
+        sections.append(typed_section)
+    if parsed_plan.execution_recommendation is not None:
+        sections.append(render_execution_recommendation_section(parsed_plan.execution_recommendation))
     return "\n\n".join(sections)
 
 
@@ -940,6 +1014,8 @@ def _render_public_plan_state_comment(
     typed_section = render_typed_plan_stages_section(parsed_plan.typed_stages)
     if typed_section:
         sections.append(typed_section)
+    if parsed_plan.execution_recommendation is not None:
+        sections.append(render_execution_recommendation_section(parsed_plan.execution_recommendation))
     sections.append(f"<!-- AGENT_PLAN_STATE: {parsed_plan.state} -->")
     sections.append(f"-- {_comment_signature(agent, config, model_used)}")
     return "\n\n".join(section for section in sections if section)

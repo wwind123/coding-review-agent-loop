@@ -216,6 +216,8 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                         ),
                         "architecture_identity": record.metadata.architecture_identity,
                         "architecture_contract_version": record.metadata.architecture_contract_version,
+                        "execution_strategy_contract_version": record.metadata.execution_strategy_contract_version,
+                        "execution_strategy_identity": record.metadata.execution_strategy_identity,
                     }
                     for record in resumed.completed_reviews
                 ]
@@ -263,6 +265,8 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                         ),
                         "architecture_identity": record.metadata.architecture_identity,
                         "architecture_contract_version": record.metadata.architecture_contract_version,
+                        "execution_strategy_contract_version": record.metadata.execution_strategy_contract_version,
+                        "execution_strategy_identity": record.metadata.execution_strategy_identity,
                     }
                     for record in result.completed_reviews
                 ]
@@ -421,6 +425,10 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             1 if getattr(args, "architecture_contract_version", None) is not None
             else None
         ),
+        execution_strategy_contract_version=(
+            1 if getattr(args, "execution_strategy_contract_version", None) is not None
+            else None
+        ),
     )
     augmented = _attach_round_metadata(body, metadata)
 
@@ -511,6 +519,10 @@ def main() -> None:
     p_meta.add_argument(
         "--architecture-contract-version", type=int, default=None,
         help="Fresh architecture-impact contract generation carried by this record.",
+    )
+    p_meta.add_argument(
+        "--execution-strategy-contract-version", type=int, default=None,
+        help="Fresh execution-strategy contract generation carried by this record.",
     )
     p_meta.add_argument("--architecture-identity-file", default=None)
     p_meta.add_argument("--architecture-impact-file", default=None)

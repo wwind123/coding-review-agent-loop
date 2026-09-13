@@ -2547,6 +2547,7 @@ def _save_coder_raw_to_repair_dir(
     response_evidence_file: Path | None = None,
     architecture_identity: dict | None = None,
     architecture_contract_version: int | None = None,
+    execution_strategy_contract_version: int | None = None,
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy the coder's raw response + context to a stable repair dir.
@@ -2573,6 +2574,8 @@ def _save_coder_raw_to_repair_dir(
         manifest["architecture_identity"] = architecture_identity
     if architecture_contract_version is not None:
         manifest["architecture_contract_version"] = architecture_contract_version
+    if execution_strategy_contract_version is not None:
+        manifest["execution_strategy_contract_version"] = execution_strategy_contract_version
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -2596,6 +2599,7 @@ def _complete_coder_turn(
     surfaced_requirement_ids: Sequence[str] = (),
     requires_direct_discussion_ack: bool = False,
     required_architecture_impact_contract: int = 0,
+    require_execution_strategy_contract: int = 0,
     architecture_identity: dict | None = None,
     architecture_contract_version: int | None = None,
 ) -> dict:
@@ -2615,6 +2619,7 @@ def _complete_coder_turn(
             kind=kind,
             prior_items=next_prior_items_raw,
             required_architecture_impact_contract=required_architecture_impact_contract,
+            require_execution_strategy_contract=require_execution_strategy_contract,
         )
         if kind == "plan_revision" and (
             surfaced_requirement_ids or requires_direct_discussion_ack
@@ -2631,6 +2636,10 @@ def _complete_coder_turn(
         return parsed
     try:
         if auto_recover and kind == "plan_revision":
+            if require_execution_strategy_contract:
+                from coding_review_agent_loop.repair import _require_recoverable_fresh_execution_contract
+
+                _require_recoverable_fresh_execution_contract(raw_text, expected_kind=kind)
             raw_text, _ = _recover_structured_response(
                 raw_text,
                 expected_kind=kind,
@@ -2660,9 +2669,15 @@ def _complete_coder_turn(
 
     if kind == "plan_state":
         canonical_text = raw_text
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
         from coding_review_agent_loop.protocol import validate_structured_plan_state
 
-        parsed_plan = validate_structured_plan_state(raw_text)
+        parsed_plan = validate_structured_plan_state(
+            raw_text,
+            require_execution_strategy_contract=require_execution_strategy_contract,
+        )
+        if parsed_plan is not None and parsed_plan.execution_recommendation is not None:
+            canonical_text = render_canonical_plan_state(parsed_plan)
         if parsed_plan is None:
             public_file = raw_output
         else:
@@ -2674,6 +2689,11 @@ def _complete_coder_turn(
                 "--kind", "plan_state",
                 "--reviewer", coder_cap,
                 "--output", str(public_file),
+                *(
+                    ["--require-execution-strategy-contract"]
+                    if require_execution_strategy_contract
+                    else []
+                ),
                 *(["--model", coder_model] if coder_model else []),
             )
             raw_structured_file = work_dir / "coder-raw-structured.json"
@@ -2683,7 +2703,10 @@ def _complete_coder_turn(
         from coding_review_agent_loop.comment_rendering import render_canonical_plan_revision
         from coding_review_agent_loop.protocol import validate_structured_plan_revision
 
-        parsed = validate_structured_plan_revision(raw_text)
+        parsed = validate_structured_plan_revision(
+            raw_text,
+            require_execution_strategy_contract=require_execution_strategy_contract,
+        )
         if parsed is None:
             raise _ValidationError(
                 f"skill_runner: {coder_cap} plan_revision did not parse\n"
@@ -2705,6 +2728,11 @@ def _complete_coder_turn(
             "--reviewer", coder_cap,
             "--context-file", str(render_context_file),
             "--output", str(public_file),
+            *(
+                ["--require-execution-strategy-contract"]
+                if require_execution_strategy_contract
+                else []
+            ),
             *(["--model", coder_model] if coder_model else []),
         )
         raw_structured_file = work_dir / "coder-raw-structured.json"
@@ -2747,6 +2775,10 @@ def _complete_coder_turn(
         ("--architecture-contract-version", str(contract_version))
         if contract_version is not None else ()
     )
+    execution_contract_args = (
+        ("--execution-strategy-contract-version", "1")
+        if require_execution_strategy_contract == 1 else ()
+    )
     _run_helper(
         "helpers.state_manager", "attach-metadata",
         "--body-file", str(public_file),
@@ -2763,6 +2795,7 @@ def _complete_coder_turn(
         *usage_args,
         *architecture_args,
         *contract_args,
+        *execution_contract_args,
     )
 
     if not dry_run:
@@ -2942,6 +2975,7 @@ def _run_external_coder_phase(
                 if hasattr(coder_architecture, "identity") else None
             ),
             architecture_contract_version=1,
+            execution_strategy_contract_version=1,
             gemini_cmd=gemini_cmd,
         )
 
@@ -2963,6 +2997,7 @@ def _run_external_coder_phase(
                 surfaced_requirement_ids=human_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
                 required_architecture_impact_contract=1,
+                require_execution_strategy_contract=1,
                 architecture_identity=(
                     coder_architecture.identity()
                     if hasattr(coder_architecture, "identity") else None
@@ -3379,6 +3414,7 @@ def _run_host_coder_phase(
                     "--subject-plan-file", str(plan_file),
                     "--canonical-plan-file", str(plan_file),
                     "--prior-items-file", str(prior_items_file),
+                    "--execution-strategy-contract-version", "1",
                 )
                 _run_helper(
                     "helpers.state_manager", "write-pending-comment",
@@ -4034,6 +4070,9 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                 ),
                 required_architecture_impact_contract=(
                     1 if manifest.get("architecture_contract_version") == 1 else 0
+                ),
+                require_execution_strategy_contract=(
+                    1 if manifest.get("execution_strategy_contract_version") == 1 else 0
                 ),
             )
         except _ValidationError as exc:
@@ -5299,7 +5338,9 @@ def _run_decomposition_for_skill(
             parsed_plan = None
         typed_stages = (
             parsed_plan.typed_stages.child_stages
-            if parsed_plan is not None and mode == "decompose-only"
+            if parsed_plan is not None
+            and parsed_plan.execution_recommendation is None
+            and mode == "decompose-only"
             else ()
         )
         if typed_stages:

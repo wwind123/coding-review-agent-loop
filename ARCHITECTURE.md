@@ -121,6 +121,26 @@ distinct workflows, with typed topology and durable checkpoints. They are not
 inferred by creating an issue for every sentence mentioning deferred work.
 See [decomposition boundaries](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization).
 
+#### Generation-1 reviewed execution strategy
+
+Fresh planning and revision turns carry `execution_strategy_contract_version: 1`
+and a complete `execution_recommendation`. The recommendation owns stable
+scope-item IDs, coupling constraints, one-shot or enriched staged deliveries,
+and independent retained-parent/final-integration allocations. Coverage is
+exactly once; dependencies are earlier-only; automation is one of
+`agent-pr`, `human-action`, or `manual-close`. Unversioned historical plans
+remain legacy-undecided and are never upgraded by inference or repair.
+
+The recommendation is canonicalized into a bounded sidecar and round metadata,
+so its strategy, topology, allocations, compatibility constraints, and caveats
+participate in plan subject/hash identity and restart validation. Stage 1 keeps
+this reviewed topology separate from legacy `ChildStage(title, summary)`:
+v1 children do not drive split materialization, decomposition, follow-up
+filing, expected-closure checks, issue creation, or coder dispatch. Execution
+policy remains selected by the existing explicit mode until the subsequent
+stages consume this contract. Repair may preserve a complete v1 source, but
+cannot synthesize missing recommendation data.
+
 ### Review and Feedback
 
 All selected reviewers receive the same pre-round snapshot. Parallel execution

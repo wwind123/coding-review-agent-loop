@@ -63,12 +63,51 @@ _CANNED_PR_REVIEW_FOOTER = (
     "\n<!-- AGENT_STATE: approved -->\n-- Codex (dry-run stub)\n"
 )
 
-_CANNED_PLAN_STATE = """\
-{"schema_version": 1, "kind": "plan_state", "state": "blocking", "summary": "Dry-run stub: plan is ready.", "plan_steps": ["Implement the requested changes."], "human_requirement_dispositions": [], "architecture_impact": {"status": "unchanged", "rationale": "No architectural contract changed.", "affected_components": [], "dependencies": [], "execution_data_flows": [], "persistence": [], "public_contracts": [], "security_boundaries": [], "canonical_document_action": "no-change", "canonical_document_path": null, "canonical_document_rationale": ""}}
-
-<!-- AGENT_PLAN_STATE: blocking -->
--- Codex (dry-run stub)
-"""
+_CANNED_PLAN_STATE = json.dumps(
+    {
+        "schema_version": 1,
+        "kind": "plan_state",
+        "state": "blocking",
+        "summary": "Dry-run stub: plan is ready.",
+        "plan_steps": ["Implement the requested changes."],
+        "execution_strategy_contract_version": 1,
+        "execution_recommendation": {
+            "strategy": "one-shot",
+            "rationale": "The dry-run contains one coherent implementation boundary.",
+            "staging_feasibility": "inseparable",
+            "scope_items": [{
+                "scope_item_id": "scope-1",
+                "requirement": "Implement the requested changes.",
+                "acceptance_criteria": ["The requested changes are implemented."],
+            }],
+            "coupling_constraints": [],
+            "one_shot_delivery": {
+                "deliverables": ["The requested changes."],
+                "acceptance_criteria": ["The requested changes are implemented."],
+                "covered_scope_item_ids": ["scope-1"],
+            },
+            "child_stages": [],
+            "retained_parent_work": {
+                "status": "none", "deliverables": [], "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "final_integration_work": {
+                "status": "none", "deliverables": [], "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "caveats": [],
+        },
+        "human_requirement_dispositions": [],
+        "architecture_impact": {
+            "status": "unchanged", "rationale": "No architectural contract changed.",
+            "affected_components": [], "dependencies": [], "execution_data_flows": [],
+            "persistence": [], "public_contracts": [], "security_boundaries": [],
+            "canonical_document_action": "no-change", "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    },
+    indent=2,
+) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Codex (dry-run stub)\n"
 
 # Coder implementation turn (reversed roles, #316). The dry-run follows the
 # same typed result contract as a live issue implementation.

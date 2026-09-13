@@ -175,6 +175,7 @@ def make_minimal_config(
         refresh_test_profile=False,
         auto_agent_dirs=tuple(reviewer_names),
         approved_followups=approved_followups,
+        execution_strategy_contract_required=True,
         flat_child_limit=flat_child_limit,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_context_enabled=architecture_context_enabled,
