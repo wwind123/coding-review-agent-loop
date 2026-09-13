@@ -400,3 +400,35 @@ def test_cli_run_pr_loop_rejects_mismatched_parent_handoff_after_decompose_only_
     with pytest.raises(AgentLoopError, match="implementation handoff"):
         orchestrator.run_pr_loop(runner, pr_number=77, config=config)
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+def test_cli_run_pr_loop_requires_child_plan_without_parent_phase_handoff(
+    tmp_path, monkeypatch
+):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(
+        plan,
+        summary_mode="decompose-only",
+        handoff_mode="implement-by-phase",
+    )
+    # The child handoff deliberately carries the parent topology hash, but the
+    # parent phase handoff is absent and the child has no approved plan.
+    parent = dataclasses.replace(parent, comments=parent.comments[:-1])
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77,
+            "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="approved child plan"):
+        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)

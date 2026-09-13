@@ -10039,6 +10039,32 @@ def run_pr_loop(
                                         "Fresh decomposition child phase has no matching canonical "
                                         "implementation handoff."
                                     )
+                                if phase_handoff is None:
+                                    # A fresh child phase without a parent-owned
+                                    # implementation handoff is independently
+                                    # planned.  Its issue-to-PR handoff must
+                                    # therefore bind to an approved plan on the
+                                    # child issue itself.  Do not let the later
+                                    # parent-plan recovery fallback turn a
+                                    # copied parent hash into provenance.
+                                    child_plan_context = recover_approved_plan_context(
+                                        issue_context.comments,
+                                        expected_hash=(
+                                            issue_handoff.plan_hash
+                                            if issue_handoff is not None
+                                            else None
+                                        ),
+                                    )
+                                    if (
+                                        not child_plan_context.is_available
+                                        or not child_plan_context.canonical_text
+                                    ):
+                                        raise AgentLoopError(
+                                            "Fresh decomposition child phase has no parent "
+                                            "implementation handoff and no recoverable approved "
+                                            "child plan; repair the child issue-to-PR provenance."
+                                        )
+                                    approved_plan_context = child_plan_context
                             else:
                                 checkpoint = None
                                 for topology_mode in ("decompose-only", "implement-by-phase"):

@@ -2293,17 +2293,18 @@ class TestSkillApprovedPlanRecovery:
         assert context.plan_hash == plan_hash
 
     @pytest.mark.parametrize(
-        ("handoff_mode", "handoff_updates", "should_fail"),
+        ("handoff_mode", "handoff_updates", "should_fail", "error_match"),
         [
-            ("implement-by-phase", {}, False),
-            ("implement-by-phase", {"plan_hash": "different-plan"}, True),
-            ("implement-by-phase", {"phase_index": 1}, True),
-            ("implement-by-phase", {"stage_id": "stage-api"}, True),
-            ("decompose-only", {}, True),
+            ("implement-by-phase", {}, False, ""),
+            ("implement-by-phase", {"plan_hash": "different-plan"}, True, "implementation handoff"),
+            ("implement-by-phase", {"phase_index": 1}, True, "implementation handoff"),
+            ("implement-by-phase", {"stage_id": "stage-api"}, True, "implementation handoff"),
+            ("decompose-only", {}, True, "implementation handoff"),
+            (None, {}, True, "approved child plan"),
         ],
     )
     def test_fresh_decomposition_child_handoff_recovers_matching_stage_by_ordinal(
-        self, monkeypatch, handoff_mode, handoff_updates, should_fail
+        self, monkeypatch, handoff_mode, handoff_updates, should_fail, error_match
     ) -> None:
         import helpers.skill_runner as sr
         from coding_review_agent_loop.errors import AgentLoopError
@@ -2468,19 +2469,22 @@ class TestSkillApprovedPlanRecovery:
         parent_comments = [
             plan_comment,
             summary,
-            format_phase_implementation_handoff_comment(
-                parent_issue=56,
-                mode=handoff_mode,
-                plan_hash=plan_hash,
-                phase_index=2,
-                created=child,
-                strategy="staged",
-                topology_source="approved-plan-v1",
-                execution_strategy_contract_version=1,
-                recommendation_digest=normalized.recommendation_digest,
-                plan_subject=_plan_subject(plan),
-            ),
         ]
+        if handoff_mode is not None:
+            parent_comments.append(
+                format_phase_implementation_handoff_comment(
+                    parent_issue=56,
+                    mode=handoff_mode,
+                    plan_hash=plan_hash,
+                    phase_index=2,
+                    created=child,
+                    strategy="staged",
+                    topology_source="approved-plan-v1",
+                    execution_strategy_contract_version=1,
+                    recommendation_digest=normalized.recommendation_digest,
+                    plan_subject=_plan_subject(plan),
+                )
+            )
         if handoff_updates:
             parent_comments[-1] = _replace_phase_handoff_payload(
                 parent_comments[-1], **handoff_updates
@@ -2510,7 +2514,7 @@ class TestSkillApprovedPlanRecovery:
         )
 
         if should_fail:
-            with pytest.raises(AgentLoopError, match="implementation handoff"):
+            with pytest.raises(AgentLoopError, match=error_match):
                 sr._recover_skill_pr_plan_context(
                     "owner/repo",
                     7,

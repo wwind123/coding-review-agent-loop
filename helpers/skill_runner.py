@@ -1663,19 +1663,16 @@ def _recover_skill_pr_plan_context(
                     f"PR #{pr} has a fresh phase identity but no matching parent phase handoff."
                 )
             # With no parent-owned handoff, a separately planned child must
-            # use its own issue-side approved-plan provenance. Its plan hash
-            # intentionally differs from the parent topology hash.
-            if (
-                phase_handoff is None
-                and expected_hash is not None
-                and expected_hash != plan_hash
-            ):
+            # use its own issue-side approved-plan provenance. Do not let a
+            # child issue-to-PR handoff that copied the parent topology hash
+            # fall through to the parent plan.
+            if phase_handoff is None:
                 child_context = recover_approved_plan_context(
                     comments,
                     expected_hash=expected_hash,
                     expected_subject=expected_subject,
                 )
-                if not child_context.is_available:
+                if not child_context.is_available or not child_context.canonical_text:
                     raise AgentLoopError(
                         f"PR #{pr} child issue #{issue_number} has no recoverable approved "
                         f"child plan {expected_hash}; repair the issue-to-PR handoff."
