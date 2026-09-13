@@ -2912,6 +2912,8 @@ def _write_host_review_request(
     parent_issue_context: IssueContext | None = None,
     human_requirements: Sequence[HumanReviewRequirement] = (),
     architecture_context: object | None = None,
+    architecture_snapshot_max_chars: int = 12_000,
+    architecture_aggregate_max_chars: int = 24_000,
 ) -> Path:
     """Write a review-request dir for the host (Claude) reviewer turn.
 
@@ -3009,9 +3011,13 @@ def _write_host_review_request(
         )
 
         if isinstance(architecture_context, ArchitecturePair):
-            architecture_text = render_architecture_pair(architecture_context)
+            architecture_text = render_architecture_pair(
+                architecture_context, max_chars=architecture_aggregate_max_chars
+            )
         elif isinstance(architecture_context, ArchitectureSnapshot):
-            architecture_text = render_architecture_snapshot(architecture_context)
+            architecture_text = render_architecture_snapshot(
+                architecture_context, max_chars=architecture_snapshot_max_chars
+            )
         else:
             raise AgentLoopError("Host review handoff received an invalid architecture context.")
         architecture_file = request_dir / "architecture-context.md"
@@ -3415,6 +3421,8 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
             current_round_items=current_round_items,
             item_id_offset=item_id_offset, dry_run=dry_run,
             architecture_context=_host_architecture_context(args, repo=repo),
+            architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
+            architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
@@ -3709,6 +3717,8 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 target_revision=pr_info.get("baseRefName"),
                 candidate_revision=head_sha,
             ),
+            architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
+            architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
