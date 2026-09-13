@@ -186,6 +186,44 @@ def test_repair_preserves_architecture_impact_fields():
         check(source, repaired)
 
 
+def test_repair_preserves_marker_only_architecture_entry():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "uncertainty": ["`AGENT_SPLIT_UNFILED_WARNING`"],
+        },
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "uncertainty": ["[protocol split-warning record]"],
+        },
+    }
+    check(source, repaired)
+    with pytest.raises(AgentLoopError, match="architecture_impact.uncertainty"):
+        check(source, {"kind": "task_result", "architecture_impact": {"uncertainty": []}})
+
+
+def test_architecture_entries_require_distinct_one_to_one_matches():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "affected_components": ["shared component", "shared component"],
+        },
+    }
+    check(source, source)
+    with pytest.raises(AgentLoopError, match="architecture_impact.affected_components"):
+        check(source, {
+            "kind": "task_result",
+            "architecture_impact": {"affected_components": ["shared component", "unrelated"]},
+        })
+    with pytest.raises(AgentLoopError, match="architecture_impact.affected_components"):
+        check(source, {
+            "kind": "task_result",
+            "architecture_impact": {"affected_components": ["shared component"]},
+        })
+
+
 def test_case06_object_to_string_keeps_every_detail():
     detail = "Wire the capability getter in app.js:42; add a two-round test; no mutation on 503."
     source = {"kind": "plan_review", "blocking_plan_issues": [

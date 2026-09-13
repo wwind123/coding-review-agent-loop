@@ -1,6 +1,6 @@
 """Bounded loss checks for parseable review and implementation repair inputs."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import re
 
 from .errors import AgentLoopError
@@ -86,6 +86,48 @@ def _contains_fragments(candidate: object, fragments: Sequence[str]) -> bool:
     return all(_normalized(fragment) in normalized for fragment in fragments)
 
 
+def _preserve_architecture_list(
+    source: list[object],
+    target: object,
+    *,
+    field: str,
+    require: Callable[[bool, str], None],
+) -> None:
+    """Match every architecture entry to a distinct repaired entry.
+
+    Marker-only entries have no prose fragments to compare, but their presence
+    is still content.  Treat them as wildcards in the matching graph while
+    retaining the source list's cardinality and one-to-one correspondence.
+    The augmenting-path matcher avoids making the result depend on source
+    ordering when one entry's fragments are a subset of another's.
+    """
+    require(isinstance(target, list), field)
+    require(len(source) == len(target), field)
+
+    matched_source_by_target: dict[int, int] = {}
+
+    def can_match(source_entry: object, target_entry: object) -> bool:
+        fragments = _fragments(source_entry)
+        return not fragments or _contains_fragments(target_entry, fragments)
+
+    def augment(source_index: int, visited_targets: set[int]) -> bool:
+        for target_index, target_entry in enumerate(target):
+            if target_index in visited_targets:
+                continue
+            if not can_match(source[source_index], target_entry):
+                continue
+            visited_targets.add(target_index)
+            previous_source_index = matched_source_by_target.get(target_index)
+            if (previous_source_index is None
+                    or augment(previous_source_index, visited_targets)):
+                matched_source_by_target[target_index] = source_index
+                return True
+        return False
+
+    for source_index in range(len(source)):
+        require(augment(source_index, set()), field)
+
+
 def validate_repair_preservation(
     raw: str,
     repaired: str,
@@ -133,14 +175,12 @@ def validate_repair_preservation(
                 )
             elif isinstance(value, list):
                 candidate = target_impact.get(key)
-                require(isinstance(candidate, list), f"architecture_impact.{key}")
-                for entry in value:
-                    fragments = _fragments(entry)
-                    if isinstance(entry, str) and fragments:
-                        require(
-                            any(_contains_fragments(item, fragments) for item in candidate),
-                            f"architecture_impact.{key}",
-                        )
+                _preserve_architecture_list(
+                    value,
+                    candidate,
+                    field=f"architecture_impact.{key}",
+                    require=require,
+                )
 
     if source["kind"] in {"plan_state", "plan_revision"} and (
         "execution_strategy_contract_version" in source
