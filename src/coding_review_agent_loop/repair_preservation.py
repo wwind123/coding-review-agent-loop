@@ -111,8 +111,14 @@ def validate_repair_preservation(
         for key, value in impact.items():
             if isinstance(value, str) and _fragments(value):
                 candidate = target_impact.get(key)
+                exact = key in {"status", "canonical_document_action"}
                 require(
-                    isinstance(candidate, str) and _normalized(value) in _normalized(candidate),
+                    isinstance(candidate, str)
+                    and (
+                        _normalized(value) == _normalized(candidate)
+                        if exact
+                        else _normalized(value) in _normalized(candidate)
+                    ),
                     f"architecture_impact.{key}",
                 )
             elif isinstance(value, list):

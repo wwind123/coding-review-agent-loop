@@ -17,7 +17,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.agents.base import AgentName
-from coding_review_agent_loop.architecture_context import ArchitecturePair, ArchitectureSnapshot
+from coding_review_agent_loop.architecture_context import (
+    ArchitecturePair,
+    ArchitectureSnapshot,
+    freeze_architecture_context,
+)
 from coding_review_agent_loop.config import (
     AgentLoopConfig,
     DEFAULT_FLAT_CHILD_LIMIT,
@@ -41,6 +45,7 @@ from coding_review_agent_loop.round_state import (
     _deserialize_unresolved_item,
 )
 from coding_review_agent_loop.test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
+from coding_review_agent_loop.runner import Runner
 from coding_review_agent_loop.unresolved_items import (
     _format_same_pr_unresolved_items,
     _format_unresolved_items_for_coder,
@@ -73,6 +78,30 @@ def _local_test_evidence_guidance(value: object, *, current_head: str | None = N
         "\n\nLocal test evidence history (advisory; do not override GitHub CI):\n"
         + json.dumps(parsed.to_dict(), ensure_ascii=False, sort_keys=True)
         + "\n"
+    )
+
+
+def _acquire_skill_architecture(
+    config: AgentLoopConfig,
+    *,
+    workdir: str | None = None,
+    target_revision: str | None = None,
+    candidate_revision: str | None = None,
+) -> ArchitectureSnapshot | ArchitecturePair | None:
+    """Acquire committed architecture context for an actual skill workdir."""
+    if not config.architecture_context_enabled:
+        return None
+    checkout = Path(workdir) if workdir else Path(config.codex_dir if config.coder == "codex" else config.gemini_dir if config.coder == "gemini" else config.antigravity_dir if config.coder == "antigravity" else config.claude_dir)
+    if not checkout.is_dir():
+        return None
+    return freeze_architecture_context(
+        Runner(dry_run=config.dry_run),
+        checkout=checkout,
+        repository=config.repo,
+        path=config.architecture_path,
+        read_size=config.architecture_read_size,
+        target_revision=target_revision,
+        candidate_revision=candidate_revision,
     )
 
 
@@ -174,6 +203,7 @@ def build_plan_review_prompt_for_skill(
     workdir: str | None = None,
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     """Build a plan reviewer prompt from plain dicts.
 
@@ -195,6 +225,9 @@ def build_plan_review_prompt_for_skill(
         repo, coder, reviewers_list, reviewer=reviewer, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
     )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
+    )
     issue_context = _make_issue_context(issue_dict)
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
     return build_plan_review_prompt(
@@ -206,6 +239,7 @@ def build_plan_review_prompt_for_skill(
         memory=memory,
         issue_context=issue_context,
         unresolved_items=unresolved,
+        architecture_context=architecture_context,
     )
 
 
@@ -230,6 +264,7 @@ def build_review_prompt_for_skill(
     approved_plan_max_chars: int | None = None,
     local_test_evidence: str | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
 
@@ -260,6 +295,16 @@ def build_review_prompt_for_skill(
         repo, coder, reviewers_list, reviewer=reviewer, workdir=workdir,
         approved_followups=approved_followups,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context=architecture_context,
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config,
+        workdir=workdir,
+        target_revision=(
+            f"origin/{issue_dict['baseRefName']}"
+            if issue_dict.get("baseRefName") else None
+        ),
+        candidate_revision=issue_dict.get("headRefOid"),
     )
     primary_issue_context = issue_context
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
@@ -288,6 +333,7 @@ def build_review_prompt_for_skill(
         coder_followup_context=_local_test_evidence_guidance(
             local_test_evidence, current_head=issue_dict.get("headRefOid")
         ),
+        architecture_context=architecture_context,
     )
     if pr_diff:
         prompt += f"\n\n## PR diff\n\n```diff\n{pr_diff}\n```\n"
@@ -379,6 +425,9 @@ def build_plan_prompt_for_skill(
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_context=architecture_context,
     )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
+    )
     issue_context = _make_issue_context(issue_dict)
     return _with_containment_guidance(
         build_issue_plan_prompt(issue_context.number, config, memory, issue_context, architecture_context=architecture_context), config
@@ -399,6 +448,7 @@ def build_plan_revision_prompt_for_skill(
     human_requirements: Sequence | None = None,
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     """Build the round-N+1 coder (plan revision) prompt for an external coder (#307).
 
@@ -408,6 +458,9 @@ def build_plan_revision_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
     )
     issue_context = _make_issue_context(issue_dict)
     if human_requirements:
@@ -425,6 +478,7 @@ def build_plan_revision_prompt_for_skill(
         memory,
         issue_context,
         unresolved_items=unresolved,
+        architecture_context=architecture_context,
     ), config)
 
 
@@ -453,6 +507,9 @@ def build_implementation_prompt_for_skill(
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_context=architecture_context,
     )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
+    )
     return _with_containment_guidance(build_issue_implementation_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,
         architecture_context=architecture_context,
@@ -480,6 +537,9 @@ def build_plan_decomposition_prompt_for_skill(
         repo, coder, (coder,), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_context=architecture_context,
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
     )
     return _with_containment_guidance(build_plan_decomposition_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,

@@ -5,9 +5,7 @@ import subprocess
 import pytest
 
 from coding_review_agent_loop.architecture_context import (
-    ArchitectureLocator,
     ArchitecturePair,
-    ArchitectureSnapshot,
     acquire_architecture_pair,
     acquire_architecture_snapshot,
     normalize_architecture_path,
@@ -85,3 +83,21 @@ def test_pair_keeps_base_separate_from_candidate(tmp_path):
     assert "Candidate architecture snapshot" in rendered
     assert "# Base" in rendered and "# Candidate" in rendered
 
+
+def test_pair_does_not_call_unreadable_documents_modified(tmp_path):
+    pair = acquire_architecture_pair(
+        Runner(), checkout=tmp_path, repository="owner/repo",
+        target_revision="0" * 40, candidate_revision="1" * 40,
+    )
+    assert pair.change == "unavailable"
+    assert "candidate edits" not in render_architecture_pair(pair)
+
+
+def test_snapshot_renderer_respects_small_bound(tmp_path):
+    revision = _repo(tmp_path, "# System\n\n" + ("detail " * 200))
+    snapshot = acquire_architecture_snapshot(
+        Runner(), checkout=tmp_path, repository="owner/repo", revision=revision
+    )
+    rendered = render_architecture_snapshot(snapshot, max_chars=180)
+    assert len(rendered) <= 180
+    assert "Repository:" in rendered

@@ -43,6 +43,7 @@ from coding_review_agent_loop.protocol import (
     _extract_structured_coder_followup_payload,
     _extract_structured_plan_review_payload,
     _extract_structured_plan_revision_payload,
+    validate_structured_task_result,
     _extract_structured_pr_review_payload,
     normalize_response_file_structured_text,
     parse_agent_unavailable,
@@ -2555,6 +2556,31 @@ def test_validate_structured_coder_followup_rejects_approved_blocked_requirement
 
     with pytest.raises(AgentLoopError, match="must be `blocking`"):
         validate_structured_coder_followup(payload)
+
+
+def test_validate_structured_task_result_checks_kind_before_exact_keys():
+    payload = json.dumps({
+        "schema_version": 1, "kind": "issue_implementation", "state": "blocking",
+        "summary": "wrong envelope",
+    }) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    with pytest.raises(AgentLoopError, match="kind mismatch"):
+        validate_structured_task_result(payload)
+
+
+def test_validate_structured_task_result_accepts_meaningful_unchanged_impact():
+    from coding_review_agent_loop.protocol import validate_structured_task_result
+
+    payload = json.dumps({
+        "schema_version": 1, "kind": "task_result", "state": "blocking",
+        "outcome": "blocking", "summary": "No PR could be opened.",
+        "architecture_impact": {
+            "status": "unchanged", "rationale": "Only local formatting changed.",
+        },
+    }) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    parsed = validate_structured_task_result(payload)
+    assert parsed is not None
+    assert parsed.architecture_impact is not None
+    assert parsed.architecture_impact.status == "unchanged"
 
 
 def test_validate_structured_human_requirements_acknowledgement_uses_disposition_ledger():

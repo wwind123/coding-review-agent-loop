@@ -360,15 +360,23 @@ def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureIm
     _expect_exact_keys(
         payload,
         context=context,
-        required={"status", "rationale", "affected_components", "dependencies", "persistence", "public_contracts", "security_boundaries", "canonical_document_action", "canonical_document_path", "canonical_document_rationale"},
-        optional={"execution_data_flows", "execution_flows", "data_flows", "uncertainty"},
+        required={"status", "rationale"},
+        optional={
+            "affected_components", "dependencies", "execution_data_flows",
+            "execution_flows", "data_flows", "persistence", "public_contracts",
+            "security_boundaries", "canonical_document_action",
+            "canonical_document_path", "canonical_document_rationale", "uncertainty",
+        },
     )
     status = _expect_non_empty_string(payload["status"], context=f"{context}.status")
     if status not in {"changed", "unchanged"}:
         raise AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
-    action = _expect_non_empty_string(payload["canonical_document_action"], context=f"{context}.canonical_document_action")
+    action = _expect_non_empty_string(
+        payload.get("canonical_document_action", "no-change"),
+        context=f"{context}.canonical_document_action",
+    )
     rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")
-    path_value = payload["canonical_document_path"]
+    path_value = payload.get("canonical_document_path")
     if path_value is not None and (not isinstance(path_value, str) or not path_value.strip()):
         raise AgentLoopError(f"{context}.canonical_document_path must be a non-empty string or null.")
     combined = _expect_string_list(payload.get("execution_data_flows", []), context=f"{context}.execution_data_flows", item_context=context)
@@ -379,17 +387,24 @@ def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureIm
     return ArchitectureImpact(
         status=status,
         rationale=rationale,
-        affected_components=_expect_string_list(payload["affected_components"], context=f"{context}.affected_components", item_context=context),
-        dependencies=_expect_string_list(payload["dependencies"], context=f"{context}.dependencies", item_context=context),
+        affected_components=_expect_string_list(payload.get("affected_components", []), context=f"{context}.affected_components", item_context=context),
+        dependencies=_expect_string_list(payload.get("dependencies", []), context=f"{context}.dependencies", item_context=context),
         execution_data_flows=combined,
         execution_flows=execution,
         data_flows=data,
-        persistence=_expect_string_list(payload["persistence"], context=f"{context}.persistence", item_context=context),
-        public_contracts=_expect_string_list(payload["public_contracts"], context=f"{context}.public_contracts", item_context=context),
-        security_boundaries=_expect_string_list(payload["security_boundaries"], context=f"{context}.security_boundaries", item_context=context),
+        persistence=_expect_string_list(payload.get("persistence", []), context=f"{context}.persistence", item_context=context),
+        public_contracts=_expect_string_list(payload.get("public_contracts", []), context=f"{context}.public_contracts", item_context=context),
+        security_boundaries=_expect_string_list(payload.get("security_boundaries", []), context=f"{context}.security_boundaries", item_context=context),
         canonical_document_action=action,
         canonical_document_path=path_value,
-        canonical_document_rationale=_expect_non_empty_string(payload["canonical_document_rationale"], context=f"{context}.canonical_document_rationale"),
+        canonical_document_rationale=(
+            _expect_non_empty_string(
+                payload["canonical_document_rationale"],
+                context=f"{context}.canonical_document_rationale",
+            )
+            if payload.get("canonical_document_rationale") not in (None, "")
+            else ""
+        ),
         uncertainty=_expect_string_list(payload.get("uncertainty", []), context=f"{context}.uncertainty", item_context=context),
     )
 
@@ -2500,13 +2515,13 @@ def validate_structured_task_result(text: str) -> StructuredTaskResult | None:
         state_marker_name="AGENT_STATE", context_label="Structured task result",
     )
     _require_supported_schema_version(payload)
+    if payload.get("kind") != "task_result":
+        raise AgentLoopError("Structured response kind mismatch: expected `task_result`.")
     _expect_exact_keys(
         payload, context="task_result",
         required={"schema_version", "kind", "state", "outcome", "summary"},
         optional={"pr_number", "clarification", "architecture_impact"},
     )
-    if payload.get("kind") != "task_result":
-        raise AgentLoopError("Structured response kind mismatch: expected `task_result`.")
     state = _expect_non_empty_string(payload["state"], context="task_result.state")
     if state != "blocking":
         raise AgentLoopError("task_result.state must be `blocking`.")

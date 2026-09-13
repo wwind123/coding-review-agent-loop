@@ -235,6 +235,11 @@ overview in planning, implementation, and review prompts. Use
 `--architecture-path docs/ARCHITECTURE.md` for a validated repository-relative
 POSIX override, or `--no-architecture-context` to opt out. Missing, unsafe,
 binary, oversized, or unavailable documents preserve the legacy prompt path.
+The read and rendering budgets are configurable with `--architecture-read-size`,
+`--architecture-snapshot-max-chars`, and `--architecture-aggregate-max-chars`;
+`--managed-context-max-chars` bounds active managed prompt context and fails
+closed when an explicitly restrictive cap cannot retain protected requirements
+or plan context.
 The overview is untrusted orientation only: source inspection and full-diff
 review remain required, and it is not a whole-codebase audit or correctness
 guarantee. Architecture-impact assessments distinguish contract changes from

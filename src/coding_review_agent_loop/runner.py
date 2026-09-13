@@ -104,8 +104,9 @@ def run_binary_capture(
     """Capture bytes without decoding them or following text-file semantics.
 
     ``max_bytes`` is enforced while reading from the child, rather than after
-    an unbounded ``communicate()`` call.  Callers that need to distinguish an
-    oversized object should obtain its size first.
+    an unbounded ``communicate()`` call.  stdout and stderr are drained by
+    separate readers so a noisy Git diagnostic cannot deadlock a bounded
+    object read.
     """
     cmd = [str(value) for value in args]
     proc = subprocess.Popen(
@@ -118,17 +119,32 @@ def run_binary_capture(
     )
     assert proc.stdout is not None
     assert proc.stderr is not None
-    if max_bytes is None:
-        stdout, stderr = proc.communicate()
-    else:
-        stdout = proc.stdout.read(max_bytes + 1)
-        if len(stdout) > max_bytes:
-            proc.terminate()
-            remainder, stderr = proc.communicate()
-            del remainder
-        else:
-            remainder, stderr = proc.communicate()
-            stdout += remainder
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+
+    def _read(stream, target: list[bytes], limit: int | None = None) -> None:
+        remaining = None if limit is None else limit + 1
+        while remaining is None or remaining > 0:
+            chunk = stream.read(65536 if remaining is None else min(65536, remaining))
+            if not chunk:
+                break
+            target.append(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
+                if remaining <= 0:
+                    proc.terminate()
+
+    stdout_thread = threading.Thread(
+        target=_read, args=(proc.stdout, stdout_chunks, max_bytes), daemon=True
+    )
+    stderr_thread = threading.Thread(target=_read, args=(proc.stderr, stderr_chunks), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    stdout_thread.join()
+    stderr_thread.join()
+    proc.wait()
+    stdout = b"".join(stdout_chunks)
+    stderr = b"".join(stderr_chunks)
     result = BinaryCommandResult(cmd, cwd, stdout, stderr, proc.returncode)
     if check and result.returncode != 0:
         raise AgentLoopError(

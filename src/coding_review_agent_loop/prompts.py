@@ -14,6 +14,7 @@ from .agents.registry import agent_display_name, agent_signature
 from .architecture_context import (
     ArchitecturePair,
     ArchitectureSnapshot,
+    DEFAULT_MANAGED_CONTEXT_CHARS,
     architecture_material,
     render_architecture_pair,
     render_architecture_snapshot,
@@ -87,6 +88,8 @@ class CompactPrReviewTailContext:
 def _architecture_context_block(
     config: AgentLoopConfig,
     context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    *,
+    protected_context: Sequence[str] = (),
 ) -> str:
     """Render only allocated material; unavailable docs preserve legacy prompts."""
     if not config.architecture_context_enabled:
@@ -98,13 +101,33 @@ def _architecture_context_block(
     )
     if not architecture_material(context):
         return ""
+    protected_size = sum(len(block) for block in protected_context)
+    configured_limit = config.managed_context_max_chars
+    if configured_limit < DEFAULT_MANAGED_CONTEXT_CHARS and protected_size > configured_limit:
+        raise AgentLoopError(
+            "Managed prompt context cap is smaller than the lossless protected "
+            f"requirements/approved-plan context ({protected_size} > {configured_limit})."
+        )
+    architecture_limit = (
+        config.architecture_aggregate_max_chars
+        if isinstance(context, ArchitecturePair)
+        else config.architecture_snapshot_max_chars
+    )
+    effective_limit = max(configured_limit, protected_size + architecture_limit)
+    available_for_architecture = max(1, effective_limit - protected_size)
+    render_limit = min(architecture_limit, available_for_architecture)
     if isinstance(context, ArchitecturePair):
-        return render_architecture_pair(
-            context, max_chars=config.architecture_aggregate_max_chars
-        ) + "\n"
-    return render_architecture_snapshot(
-        context, max_chars=config.architecture_snapshot_max_chars
-    ) + "\n"
+        rendered = render_architecture_pair(context, max_chars=render_limit)
+    else:
+        rendered = render_architecture_snapshot(context, max_chars=render_limit)
+    if protected_size + len(rendered) > effective_limit:
+        identity = context.identity()
+        rendered = (
+            "Architecture context omitted for managed prompt budget; immutable "
+            "identity retained for checkout inspection:\n"
+            + sanitize_historical_text(json.dumps(identity, sort_keys=True))
+        )
+    return rendered + "\n"
 
 
 def _with_architecture_context(config: AgentLoopConfig, context: object | None) -> AgentLoopConfig:
@@ -117,12 +140,13 @@ def _architecture_impact_guidance(*, required: bool = False) -> str:
     qualifier = "required" if required else "expected when architecture context is available"
     return (
         "Architecture-impact assessment (" + qualifier + "):\n"
-        "Include `architecture_impact` with status `changed` or `unchanged`, a non-empty "
-        "rationale, affected_components, dependencies, execution_data_flows, persistence, "
-        "public_contracts, security_boundaries, canonical_document_action, "
-        "canonical_document_path, and canonical_document_rationale. Use `unchanged` with "
-        "a meaningful no-impact rationale when contracts are unaffected. Source inspection "
-        "remains mandatory; documentation cannot excuse an implementation defect.\n"
+        "When emitting it, use an object with `status` (`changed` or `unchanged`) and a "
+        "non-empty `rationale`; include the component, dependency, execution/data-flow, "
+        "persistence, public-contract, security-boundary, and canonical-document fields "
+        "shown by the response schema as arrays/strings of the documented types. "
+        "For `unchanged`, empty arrays and an empty canonical-document rationale are valid; "
+        "give a meaningful no-impact rationale. Source inspection remains mandatory; "
+        "documentation cannot excuse an implementation defect.\n"
     )
 
 
@@ -679,7 +703,7 @@ def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000
 def format_human_requirements(
     human_requirements: Sequence[HumanReviewRequirement],
     *,
-    max_chars: int = 12_000,
+    max_chars: int | None = 12_000,
     requirement_scope: str = "PR requirements",
     full_omission_fallback: str = "Fetch the PR discussion directly before approving.",
 ) -> str:
@@ -717,7 +741,7 @@ def format_human_requirements(
         for requirement in human_requirements
     ]
     full_text = header + "\n".join(entries)
-    if len(full_text) <= max_chars:
+    if max_chars is None or len(full_text) <= max_chars:
         return full_text
 
     kept_entries: list[str] = []
@@ -1630,6 +1654,7 @@ def _compact_plan_stable_prefix(
     human_requirements_block: str,
     human_requirements_guidance: str,
     response_protocol: str,
+    architecture_context: str = "",
 ) -> str:
     return "\n".join(
         part.rstrip()
@@ -1638,6 +1663,7 @@ def _compact_plan_stable_prefix(
             f"Repository: {config.repo}",
             workdir_guidance,
             _scratch_file_guidance(),
+            architecture_context,
             response_protocol,
             _memory_block(memory, config),
             _compact_issue_context_block(issue_context),
@@ -1947,7 +1973,7 @@ def build_plan_review_prompt(
             compact_prior=compact_prior,
             compact_tail=compact_tail,
         )
-        return compact_prompt + _architecture_context_block(config)
+        return compact_prompt
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
     reviewer_group = format_agent_list(reviewers(config))
@@ -1969,9 +1995,9 @@ Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this planning review.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
 {_architecture_impact_guidance()}
+{_architecture_context_block(config)}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}
-{_architecture_context_block(config)}
 {unresolved_items_block}{_memory_block(memory, config)}
 
 Plan from {coder_name}:
@@ -2084,6 +2110,7 @@ def _build_compact_plan_review_prompt(
             "Signed human issue requirements are approval-critical issue constraints for this plan review.\n"
             f"{human_requirements_guidance}"
         ),
+        architecture_context=_architecture_context_block(config),
         response_protocol=_plan_review_schema_and_rules() + "\n" + unresolved_items_guidance + _phased_plan_guard(config),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
@@ -2209,7 +2236,9 @@ def build_plan_revision_prompt(
     compact_context: bool = False,
     compact_prior: CompactPriorContext | None = None,
     compact_tail: CompactPlanTailContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     if compact_context:
         return _build_compact_plan_revision_prompt(
             issue_number,
@@ -2246,6 +2275,7 @@ branch, commit, push, or open a pull request during this planning stage.
         "Each bullet must explain how the revised plan covers that item or what remains risky or blocked."
     ),
 )}
+{_architecture_context_block(config)}
 {_issue_context_block(issue_context)}
 {unresolved_items_block}{_memory_block(memory, config, include_runtime=True)}
 
@@ -2352,6 +2382,7 @@ def _build_compact_plan_revision_prompt(
                 "Each bullet must explain how the revised plan covers that item or what remains risky or blocked."
             ),
         ),
+        architecture_context=_architecture_context_block(config),
         response_protocol=_plan_revision_schema_and_rules(),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
@@ -2554,12 +2585,18 @@ Use this local checkout as your workspace. Decide between two paths:
     change, run relevant tests, commit, push, and open a pull request against
     {config.base}. Do not wait for {reviewer_name}; this local orchestrator
     will run {reviewer_name} after you create the PR.
-    Finish with exactly one structured `task_result` object:
+    Finish with exactly one structured `task_result` response. The response
+    must start with the JSON object, contain no prose between the object and
+    its footer, and end with the footer plus your standalone signature:
     `{{"schema_version":1,"kind":"task_result","state":"blocking",`
-    `"outcome":"opened_pr","summary":"...","pr_number":123}}`.
+    `"outcome":"opened_pr","summary":"...","pr_number":123}}`
+    `<!-- AGENT_STATE: blocking -->` followed by `-- <signature>`.
     Use `outcome` `blocking` with no `pr_number`, or `clarification` with a
-    non-empty `clarification` array, when those outcomes apply. Include an
-    `architecture_impact` assessment when architecture context is available.
+    non-empty `clarification` array, when those outcomes apply. Do not add an
+    `AGENT_PR` marker to a structured result; `pr_number` is its sole PR value.
+    Include the `architecture_impact` object when architecture context is
+    available; for unchanged work, empty impact lists and an empty canonical
+    document rationale are valid.
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
@@ -2618,6 +2655,13 @@ Clarification so far:
 
 Now proceed. Strongly prefer to implement the task and open a PR. Only ask
 again if a critical detail is still missing.
+If implementing, use exactly the structured `task_result` JSON envelope and
+footer described below: begin with one JSON object, add no prose before the
+`<!-- AGENT_STATE: blocking -->` footer, and put the PR number in `pr_number`
+instead of an `AGENT_PR` marker. If asking another clarification, emit only
+the `<!-- AGENT_CLARIFY -->` marker and your signature after the questions.
+When architecture context is available, include `architecture_impact`; an
+unchanged assessment may use empty lists and an empty canonical-document rationale.
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
@@ -2704,6 +2748,9 @@ def _compact_pr_review_stable_prefix(
     approved_plan_context: ApprovedPlanContext | None,
     approved_plan_max_chars: int | None,
     parent_issue_context: IssueContext | None,
+    architecture_context: str = "",
+    managed_human_block: str | None = None,
+    managed_plan_block: str | None = None,
 ) -> str:
     reviewer_group = format_agent_list(reviewers(config))
     coder_name = agent_display_name(config.coder)
@@ -2718,6 +2765,7 @@ exactly one top-level JSON object and no prose or code fences before it:
   "blocking_items": ["render-only blocking bullet", "..."],
   "same_pr_followups": ["same-PR fix still required", "..."],
   "future_followups": ["future work after approval", "..."],
+  "architecture_impact": {{"status": "unchanged", "rationale": "No architectural contract changed.", "affected_components": [], "dependencies": [], "execution_data_flows": [], "persistence": [], "public_contracts": [], "security_boundaries": [], "canonical_document_action": "no-change", "canonical_document_path": null, "canonical_document_rationale": ""}},
   "prior_item_dispositions": [
     {{"item_id": "item-1", "disposition": "resolved"}},
     {{"item_id": "item-2", "disposition": "future", "note": "brief reason"}}
@@ -2792,18 +2840,19 @@ adds a merge migration.
             _scratch_file_guidance(),
             _review_command_policy(config, pr_metadata),
             _pr_review_scheduling_guidance(config),
+            architecture_context,
             response_schema,
             unresolved_items_guidance,
             followup_guidance,
             human_requirements_guidance,
             _memory_block(memory, config),
-            _approved_plan_review_context_block(
+            managed_plan_block if managed_plan_block is not None else _approved_plan_review_context_block(
                 approved_plan_context,
                 max_chars=approved_plan_max_chars,
             ),
             _labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context"),
             _compact_pr_review_issue_context_block(issue_context, pr_metadata.body),
-            _human_requirements_block(human_requirements),
+            managed_human_block if managed_human_block is not None else _human_requirements_block(human_requirements),
             _canonical_pr_review_ledger_rules(),
             _format_unresolved_review_items(non_future_items)
             or "Prior unresolved review items from earlier rounds\n\n(none)\n",
@@ -2842,6 +2891,20 @@ def _build_compact_pr_review_prompt(
     else:
         unresolved_items_guidance = ""
     followup_guidance = _build_followup_guidance(config)
+    active_architecture = architecture_material(config.architecture_context)
+    managed_human_block = (
+        format_human_requirements(human_requirements, max_chars=None) + "\n"
+        if active_architecture and human_requirements
+        else _human_requirements_block(human_requirements)
+    )
+    managed_plan_block = _approved_plan_review_context_block(
+        approved_plan_context,
+        max_chars=None if active_architecture else approved_plan_max_chars,
+    )
+    managed_architecture_block = _architecture_context_block(
+        config,
+        protected_context=(managed_human_block, managed_plan_block),
+    )
     stable_prefix = _compact_pr_review_stable_prefix(
         config=config,
         workdir_guidance=_coder_workdir_guidance(config, implementation=False, agent=reviewer),
@@ -2857,6 +2920,9 @@ def _build_compact_pr_review_prompt(
         approved_plan_context=approved_plan_context,
         approved_plan_max_chars=approved_plan_max_chars,
         parent_issue_context=parent_issue_context,
+        architecture_context=managed_architecture_block,
+        managed_human_block=managed_human_block,
+        managed_plan_block=managed_plan_block,
     )
     head_sha = (compact_tail.head_sha if compact_tail else None) or pr_metadata.head_sha or "(unknown)"
     volatile_round = (compact_tail.round_number if compact_tail else None) or round_number
@@ -3127,7 +3193,7 @@ def build_review_prompt(
             parent_issue_context=parent_issue_context,
             coder_followup_context=sanitize_historical_text(coder_followup_context),
         )
-        return compact_prompt + _architecture_context_block(config)
+        return compact_prompt
     title = metadata.title or "(unknown)"
     head_branch = metadata.head_branch or "(unknown)"
     base_branch = metadata.base_branch or "(unknown)"
@@ -3141,6 +3207,23 @@ def build_review_prompt(
     else:
         unresolved_items_guidance = ""
     followup_guidance = _build_followup_guidance(config)
+    active_architecture = architecture_material(config.architecture_context)
+    human_requirements_block = (
+        _human_requirements_block(human_requirements)
+        if not active_architecture
+        else (
+            format_human_requirements(human_requirements, max_chars=None) + "\n"
+            if human_requirements else ""
+        )
+    )
+    approved_plan_block = _approved_plan_review_context_block(
+        approved_plan_context,
+        max_chars=None if active_architecture else approved_plan_max_chars,
+    )
+    architecture_block = _architecture_context_block(
+        config,
+        protected_context=(human_requirements_block, approved_plan_block),
+    )
     return f"""Review pull request #{pr_number} in {config.repo} (round {round_number}).
 
 PR metadata:
@@ -3163,8 +3246,9 @@ are present in the PR diff.
 {_review_command_policy(config, metadata)}
 {_pr_review_scheduling_guidance(config)}
 {checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_labeled_issue_context_block(issue_context, label="Primary/child issue context")}
-{_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
-{_human_requirements_block(human_requirements)}
+{approved_plan_block}
+{human_requirements_block}
+{architecture_block}
 {unresolved_items_block}{sanitize_historical_text(coder_followup_context)}
 {_memory_block(memory, config)}
 
@@ -3222,6 +3306,7 @@ exactly one top-level JSON object and no prose or code fences before it:
   "blocking_items": ["render-only blocking bullet", "..."],
   "same_pr_followups": ["same-PR fix still required", "..."],
   "future_followups": ["future work after approval", "..."],
+  "architecture_impact": {{"status": "unchanged", "rationale": "No architectural contract changed.", "affected_components": [], "dependencies": [], "execution_data_flows": [], "persistence": [], "public_contracts": [], "security_boundaries": [], "canonical_document_action": "no-change", "canonical_document_path": null, "canonical_document_rationale": ""}},
   "prior_item_dispositions": [
     {{"item_id": "item-1", "disposition": "resolved"}},
     {{"item_id": "item-2", "disposition": "future", "note": "brief reason"}}

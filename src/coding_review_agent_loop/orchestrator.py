@@ -525,19 +525,23 @@ def _freeze_prompt_architecture(
 ) -> AgentLoopConfig:
     """Attach one acquisition-local architecture snapshot to prompt config.
 
-    Scripted orchestration runners intentionally bypass real Git execution in
-    unit tests; leaving their config untouched preserves deterministic legacy
-    simulations. Production runners acquire only from committed objects.
+    Architecture acquisition is deliberately capability-based: test doubles
+    and wrappers may participate when they implement the normal Runner
+    command surface, while unavailable Git objects simply produce no prompt
+    material and preserve the legacy prompt path.
     """
-    if not config.architecture_context_enabled or type(runner).run is not Runner.run:
+    if not config.architecture_context_enabled:
         return config
     checkout = active_workdir(config)
     if not checkout.is_dir():
         return config
     target = target_revision
-    if pr_pair and target is None and config.base:
-        result = runner.run(("git", "rev-parse", f"origin/{config.base}"), cwd=checkout, check=False)
-        target = result.stdout.strip() if result.returncode == 0 else config.base
+    if pr_pair and target:
+        # PR metadata, not the CLI's default base, is authoritative. Resolve a
+        # branch name against the refreshed checkout without fetching.
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", str(target)):
+            result = runner.run(("git", "rev-parse", f"origin/{target}"), cwd=checkout, check=False)
+            target = result.stdout.strip() if result.returncode == 0 else target
     context = freeze_architecture_context(
         runner,
         checkout=checkout,
@@ -8944,6 +8948,7 @@ def run_pr_loop(
         config = _freeze_prompt_architecture(
             runner,
             config,
+            target_revision=initial_pr_context.metadata.base_branch,
             candidate_revision=initial_pr_context.metadata.head_sha,
             pr_pair=True,
         )

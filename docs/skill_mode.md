@@ -78,6 +78,11 @@ explicitly after validating the repository-relative path. It is bounded,
 advisory, and untrusted orientation; source inspection remains required and
 document links are never fetched automatically. When no safe snapshot is
 available, the legacy prompt path is retained.
+Skill callers should preserve the same bounded controls when constructing their
+config: read size, per-snapshot and aggregate architecture caps, and the
+managed-context cap. The latter reserves protected requirements and approved
+plan context before architecture excerpts; a deliberately restrictive cap is
+reported before the backend is invoked.
 
 ## Structured protocol compatibility
 

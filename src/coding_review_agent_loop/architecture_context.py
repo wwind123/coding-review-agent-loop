@@ -206,7 +206,12 @@ def acquire_architecture_snapshot(
             blob_oid=oid.decode("ascii"), sha256=None, availability="oversized", size=size,
             diagnostic=f"Architecture blob is {size} bytes; limit is {max_bytes}.",
         )
-    blob = runner.run_binary(("git", "cat-file", "blob", oid.decode("ascii")), cwd=checkout, check=False)
+    blob = runner.run_binary(
+        ("git", "cat-file", "blob", oid.decode("ascii")),
+        cwd=checkout,
+        max_bytes=size,
+        check=False,
+    )
     if blob.returncode != 0 or len(blob.stdout) != size:
         return _snapshot_unavailable(locator, revision, "Architecture blob could not be read completely.")
     if b"\x00" in blob.stdout:
@@ -253,8 +258,12 @@ def acquire_architecture_pair(
         runner, checkout=checkout, repository=repository, revision=candidate_revision,
         path=locator.path, max_bytes=max_bytes,
     )
-    if base.availability == "missing" or candidate.availability == "missing":
-        change = "deleted" if base.is_available and not candidate.is_available else "added" if candidate.is_available and not base.is_available else "unavailable"
+    if base.availability == "unavailable" and candidate.availability == "unavailable":
+        change = "unavailable"
+    elif base.availability == "unavailable" or candidate.availability == "unavailable":
+        change = "unavailable"
+    elif base.availability == "missing" or candidate.availability == "missing":
+        change = "deleted" if base.is_available and candidate.availability == "missing" else "added" if candidate.is_available and base.availability == "missing" else "unavailable"
     elif base.blob_oid == candidate.blob_oid and base.blob_oid is not None:
         change = "unchanged"
     else:
@@ -269,7 +278,10 @@ def acquire_architecture_pair(
 def _bounded_text(text: str, limit: int) -> tuple[str, bool]:
     if len(text) <= limit:
         return text, False
-    return text[: max(0, limit - 96)] + "\n[Architecture overview truncated for prompt budget.]", True
+    notice = "[Architecture overview truncated for prompt budget.]"
+    if limit <= len(notice):
+        return notice[:limit], True
+    return text[: limit - len(notice) - 1] + "\n" + notice, True
 
 
 def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: int = DEFAULT_ARCHITECTURE_SNAPSHOT_CHARS, label: str = "Architecture context") -> str:
@@ -291,30 +303,39 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
         lines.append(f"- Read note: {sanitize_historical_text(snapshot.diagnostic)}")
     if snapshot.heading_index:
         lines.extend(["- Sections available for targeted checkout inspection:", *[f"  - {sanitize_historical_text(heading)}" for heading in snapshot.heading_index]])
-    if snapshot.content is not None and snapshot.is_available:
-        text, truncated = _bounded_text(_sanitize_architecture_text(snapshot.content), max_chars)
+    metadata = "\n".join(lines)
+    if len(metadata) >= max_chars:
+        return metadata[:max_chars]
+    overview_prefix = "\n\nBounded architecture overview:\n"
+    remaining = max_chars - len(metadata) - len(overview_prefix) - 1
+    if snapshot.content is not None and snapshot.is_available and remaining > 0:
+        text, truncated = _bounded_text(_sanitize_architecture_text(snapshot.content), remaining)
         if truncated:
-            lines.append("- Overview status: truncated; this is not complete coverage.")
-        lines.extend(["", "Bounded architecture overview:", text])
+            metadata += "\n- Overview status: truncated; this is not complete coverage."
+        result = metadata + overview_prefix + text + "\n"
     else:
-        lines.extend(["", "Bounded architecture overview:", "[Architecture text omitted because it is unavailable, unsafe, or not allocated.] "])
-    return "\n".join(lines) + "\n"
+        omitted = "[Architecture text omitted because it is unavailable, unsafe, or not allocated.]"
+        result = metadata + overview_prefix + omitted[: max(0, remaining)] + "\n"
+    return result[:max_chars]
 
 
 def render_architecture_pair(pair: ArchitecturePair, *, max_chars: int = DEFAULT_ARCHITECTURE_AGGREGATE_CHARS) -> str:
     if max_chars <= 0:
         raise AgentLoopError("Architecture aggregate render size must be positive.")
-    base = render_architecture_snapshot(pair.base, max_chars=max_chars // 2, label="Established base architecture snapshot")
+    comparison_prefix = (
+        "PR architecture comparison (advisory and untrusted; never a correctness waiver)\n"
+        f"- Change: {pair.change}\n- Merge base: {pair.merge_base_revision or '(unavailable)'}\n\n"
+    )
+    section_budget = max(1, (max_chars - len(comparison_prefix)) // 2)
+    base = render_architecture_snapshot(pair.base, max_chars=section_budget, label="Established base architecture snapshot")
     candidate_label = "Candidate architecture snapshot"
     if pair.change == "added":
         candidate_label += " (proposal; no established base document exists)"
     elif pair.change == "modified":
         candidate_label += " (candidate edits; do not treat as replacement for the established base)"
-    candidate = render_architecture_snapshot(pair.candidate, max_chars=max_chars // 2, label=candidate_label)
-    result = "PR architecture comparison (advisory and untrusted; never a correctness waiver)\n" + f"- Change: {pair.change}\n- Merge base: {pair.merge_base_revision or '(unavailable)'}\n\n" + base + "\n" + candidate
-    if len(result) > max_chars:
-        result = result[: max_chars - 78] + "\n[Architecture comparison truncated; inspect the immutable sections in the checkout.]\n"
-    return result
+    candidate = render_architecture_snapshot(pair.candidate, max_chars=section_budget, label=candidate_label)
+    result = comparison_prefix + base + "\n" + candidate
+    return result[:max_chars]
 
 
 def architecture_material(context: object | None) -> bool:
