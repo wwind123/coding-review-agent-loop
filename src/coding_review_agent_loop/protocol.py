@@ -257,6 +257,7 @@ class ParsedReview:
     followups: ApprovedFollowups
     dispositions: tuple[ReviewItemDisposition, ...]
     raw_dispositions_text: str = ""
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -291,6 +292,7 @@ class ParsedPlanReview:
     dispositions: tuple[ReviewItemDisposition, ...]
     raw_dispositions_text: str = ""
     human_requirement_dispositions: tuple["HumanRequirementDisposition", ...] = ()
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -303,6 +305,7 @@ class StructuredPrReview:
     same_pr_followups: tuple[str, ...]
     future_followups: tuple[str, ...]
     prior_item_dispositions: tuple[ReviewItemDisposition, ...]
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +319,7 @@ class StructuredPlanReview:
     future_followups: tuple[str, ...]
     prior_plan_item_dispositions: tuple[ReviewItemDisposition, ...]
     human_requirement_dispositions: tuple["HumanRequirementDisposition", ...] = ()
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -329,6 +333,65 @@ class HumanRequirementDisposition:
     requirement_id: str
     disposition: str
     evidence: str
+
+
+@dataclass(frozen=True)
+class ArchitectureImpact:
+    """Caller-owned architecture-impact assessment, separate from approval."""
+
+    status: str
+    rationale: str
+    affected_components: tuple[str, ...] = ()
+    dependencies: tuple[str, ...] = ()
+    execution_data_flows: tuple[str, ...] = ()
+    execution_flows: tuple[str, ...] = ()
+    data_flows: tuple[str, ...] = ()
+    persistence: tuple[str, ...] = ()
+    public_contracts: tuple[str, ...] = ()
+    security_boundaries: tuple[str, ...] = ()
+    canonical_document_action: str = "no-change"
+    canonical_document_path: str | None = None
+    canonical_document_rationale: str = ""
+    uncertainty: tuple[str, ...] = ()
+
+
+def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureImpact:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(
+        payload,
+        context=context,
+        required={"status", "rationale", "affected_components", "dependencies", "persistence", "public_contracts", "security_boundaries", "canonical_document_action", "canonical_document_path", "canonical_document_rationale"},
+        optional={"execution_data_flows", "execution_flows", "data_flows", "uncertainty"},
+    )
+    status = _expect_non_empty_string(payload["status"], context=f"{context}.status")
+    if status not in {"changed", "unchanged"}:
+        raise AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")
+    action = _expect_non_empty_string(payload["canonical_document_action"], context=f"{context}.canonical_document_action")
+    rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")
+    path_value = payload["canonical_document_path"]
+    if path_value is not None and (not isinstance(path_value, str) or not path_value.strip()):
+        raise AgentLoopError(f"{context}.canonical_document_path must be a non-empty string or null.")
+    combined = _expect_string_list(payload.get("execution_data_flows", []), context=f"{context}.execution_data_flows", item_context=context)
+    execution = _expect_string_list(payload.get("execution_flows", []), context=f"{context}.execution_flows", item_context=context)
+    data = _expect_string_list(payload.get("data_flows", []), context=f"{context}.data_flows", item_context=context)
+    if not combined and (execution or data):
+        combined = (*execution, *data)
+    return ArchitectureImpact(
+        status=status,
+        rationale=rationale,
+        affected_components=_expect_string_list(payload["affected_components"], context=f"{context}.affected_components", item_context=context),
+        dependencies=_expect_string_list(payload["dependencies"], context=f"{context}.dependencies", item_context=context),
+        execution_data_flows=combined,
+        execution_flows=execution,
+        data_flows=data,
+        persistence=_expect_string_list(payload["persistence"], context=f"{context}.persistence", item_context=context),
+        public_contracts=_expect_string_list(payload["public_contracts"], context=f"{context}.public_contracts", item_context=context),
+        security_boundaries=_expect_string_list(payload["security_boundaries"], context=f"{context}.security_boundaries", item_context=context),
+        canonical_document_action=action,
+        canonical_document_path=path_value,
+        canonical_document_rationale=_expect_non_empty_string(payload["canonical_document_rationale"], context=f"{context}.canonical_document_rationale"),
+        uncertainty=_expect_string_list(payload.get("uncertainty", []), context=f"{context}.uncertainty", item_context=context),
+    )
 
 
 HUMAN_REQUIREMENT_DISPOSITION_VALUES = frozenset(
@@ -361,6 +424,7 @@ class StructuredCoderFollowup:
     dispute_evidence: dict[str, str] = field(default_factory=dict)
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
     test_observations: tuple[TestObservationCitation, ...] = ()
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -376,6 +440,19 @@ class StructuredIssueImplementation:
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...]
     tests_run: tuple[str, ...] | None = None
     test_observations: tuple[TestObservationCitation, ...] = ()
+    architecture_impact: ArchitectureImpact | None = None
+
+
+@dataclass(frozen=True)
+class StructuredTaskResult:
+    schema_version: int
+    kind: str
+    state: str
+    outcome: str
+    summary: str
+    pr_number: int | None = None
+    clarification: tuple[str, ...] = ()
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -433,6 +510,7 @@ class StructuredPlanRevision:
     deferred_stages: tuple[DeferredStage, ...] = ()
     typed_stages: TypedPlanStages = TypedPlanStages()
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -448,6 +526,7 @@ class StructuredPlanState:
     deferred_stages: tuple[DeferredStage, ...] = ()
     typed_stages: TypedPlanStages = TypedPlanStages()
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -1906,6 +1985,7 @@ def _finalize_parsed_review(
     followups: ApprovedFollowups,
     dispositions: tuple[ReviewItemDisposition, ...],
     raw_dispositions_text: str = "",
+    architecture_impact: ArchitectureImpact | None = None,
 ) -> ParsedReview:
     if state == "blocking" and followups.future:
         followups = ApprovedFollowups(same_pr=followups.same_pr, future=())
@@ -1930,6 +2010,7 @@ def _finalize_parsed_review(
         followups=followups,
         dispositions=dispositions,
         raw_dispositions_text=raw_dispositions_text,
+        architecture_impact=architecture_impact,
     )
 
 
@@ -1941,6 +2022,7 @@ def _finalize_parsed_plan_review(
     dispositions: tuple[ReviewItemDisposition, ...],
     raw_dispositions_text: str = "",
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = (),
+    architecture_impact: ArchitectureImpact | None = None,
 ) -> ParsedPlanReview:
     if state == "blocking" and items.future:
         items = PlanReviewItems(blocking=items.blocking, same_plan=items.same_plan, future=())
@@ -1965,6 +2047,7 @@ def _finalize_parsed_plan_review(
         dispositions=dispositions,
         raw_dispositions_text=raw_dispositions_text,
         human_requirement_dispositions=human_requirement_dispositions,
+        architecture_impact=architecture_impact,
     )
 
 
@@ -2036,7 +2119,7 @@ def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | No
             "summary",
             "prior_item_dispositions",
         },
-        optional={"blocking_items", "same_pr_followups", "future_followups"},
+        optional={"blocking_items", "same_pr_followups", "future_followups", "architecture_impact"},
     )
     state = _expect_state(payload["state"], context="pr_review.state")
     summary = review_freeform_summary_text(
@@ -2058,6 +2141,10 @@ def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | No
         allowed_same_status="same-pr",
         is_plan_review=False,
     )
+    architecture_impact = (
+        _parse_architecture_impact(payload["architecture_impact"], context="pr_review.architecture_impact")
+        if "architecture_impact" in payload else None
+    )
     structured_blocking_items = blocking_items
     followups = _dedupe_pr_review_items(
         structured_blocking_items,
@@ -2072,6 +2159,7 @@ def parse_structured_pr_review(text: str, *, reviewer: str) -> ParsedReview | No
         blocking_items=structured_blocking_items,
         followups=followups,
         dispositions=dispositions,
+        architecture_impact=architecture_impact,
     )
 
 
@@ -2093,7 +2181,7 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
             "summary",
             "prior_plan_item_dispositions",
         },
-        optional={"blocking_plan_issues", "same_plan_followups", "future_followups", "human_requirement_dispositions"},
+        optional={"blocking_plan_issues", "same_plan_followups", "future_followups", "human_requirement_dispositions", "architecture_impact"},
     )
     state = _expect_state(payload["state"], context="plan_review.state")
     summary = review_freeform_summary_text(
@@ -2128,6 +2216,10 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
         payload.get("human_requirement_dispositions", []),
         context="plan_review.human_requirement_dispositions",
     )
+    architecture_impact = (
+        _parse_architecture_impact(payload["architecture_impact"], context="plan_review.architecture_impact")
+        if "architecture_impact" in payload else None
+    )
     items = _dedupe_plan_review_items(
         PlanReviewItems(
             blocking=_structured_followups(blocking_items, reviewer=reviewer),
@@ -2141,6 +2233,7 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
         items=items,
         dispositions=dispositions,
         human_requirement_dispositions=human_requirement_dispositions,
+        architecture_impact=architecture_impact,
     )
 
 
@@ -2172,6 +2265,7 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
             "test_observations",
             "disputed_items",
             "dispute_evidence",
+            "architecture_impact",
         },
     )
     human_requirements_payload = _expect_object(
@@ -2200,6 +2294,10 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
     test_observations = _expect_test_observations(
         payload.get("test_observations", []),
         context="coder_followup.test_observations",
+    )
+    architecture_impact = (
+        _parse_architecture_impact(payload["architecture_impact"], context="coder_followup.architecture_impact")
+        if "architecture_impact" in payload else None
     )
     addressed_items = _expect_item_id_list(
         payload["addressed_items"],
@@ -2275,6 +2373,7 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
         disputed_items=disputed_items,
         dispute_evidence=dispute_evidence,
         test_observations=test_observations,
+        architecture_impact=architecture_impact,
     )
 
 
@@ -2307,7 +2406,7 @@ def validate_structured_issue_implementation(
             "human_requirements",
             "human_requirement_dispositions",
         },
-        optional={"tests_run", "test_observations"},
+        optional={"tests_run", "test_observations", "architecture_impact"},
     )
     state = _expect_non_empty_string(payload["state"], context="issue_implementation.state")
     if state != "blocking":
@@ -2350,6 +2449,13 @@ def validate_structured_issue_implementation(
         payload.get("test_observations", []),
         context="issue_implementation.test_observations",
     )
+    architecture_impact = (
+        _parse_architecture_impact(
+            payload["architecture_impact"], context="issue_implementation.architecture_impact"
+        )
+        if "architecture_impact" in payload
+        else None
+    )
     parsed = StructuredIssueImplementation(
         schema_version=1,
         kind="issue_implementation",
@@ -2369,6 +2475,7 @@ def validate_structured_issue_implementation(
         human_requirement_dispositions=dispositions,
         tests_run=tests_run,
         test_observations=test_observations,
+        architecture_impact=architecture_impact,
     )
     # Keep this semantic contradiction visible to callers as a dedicated error
     # with the typed payload attached.  The orchestration adapter first
@@ -2379,6 +2486,55 @@ def validate_structured_issue_implementation(
     ):
         raise IssueImplementationConflictError(parsed)
     return parsed
+
+
+def validate_structured_task_result(text: str) -> StructuredTaskResult | None:
+    """Validate the versioned task terminal envelope, when present."""
+    normalized, _status = normalize_response_file_structured_text(text)
+    extracted = _extract_json_object_prefix(normalized)
+    if extracted is None:
+        return None
+    payload, trailing = extracted
+    payload = _consume_structured_footer_and_signature(
+        payload=payload, trailing=trailing, state_re=STATE_RE,
+        state_marker_name="AGENT_STATE", context_label="Structured task result",
+    )
+    _require_supported_schema_version(payload)
+    _expect_exact_keys(
+        payload, context="task_result",
+        required={"schema_version", "kind", "state", "outcome", "summary"},
+        optional={"pr_number", "clarification", "architecture_impact"},
+    )
+    if payload.get("kind") != "task_result":
+        raise AgentLoopError("Structured response kind mismatch: expected `task_result`.")
+    state = _expect_non_empty_string(payload["state"], context="task_result.state")
+    if state != "blocking":
+        raise AgentLoopError("task_result.state must be `blocking`.")
+    outcome = _expect_non_empty_string(payload["outcome"], context="task_result.outcome")
+    if outcome not in {"opened_pr", "blocking", "clarification"}:
+        raise AgentLoopError("task_result.outcome must be opened_pr, blocking, or clarification.")
+    pr_value = payload.get("pr_number")
+    pr_number = None if pr_value is None else _expect_int(pr_value, context="task_result.pr_number")
+    if outcome == "opened_pr" and (pr_number is None or pr_number <= 0):
+        raise AgentLoopError("task_result.opened_pr requires a positive pr_number.")
+    if outcome != "opened_pr" and pr_number is not None:
+        raise AgentLoopError("task_result.pr_number is only valid for opened_pr.")
+    questions = ()
+    if "clarification" in payload:
+        questions = _expect_string_list(payload["clarification"], context="task_result.clarification", item_context="task_result.clarification")
+    if outcome == "clarification" and not questions:
+        raise AgentLoopError("task_result.clarification requires at least one question.")
+    if outcome != "clarification" and questions:
+        raise AgentLoopError("task_result.clarification is only valid for clarification.")
+    return StructuredTaskResult(
+        schema_version=1, kind="task_result", state=state, outcome=outcome,
+        summary=_expect_non_empty_string(payload["summary"], context="task_result.summary"),
+        pr_number=pr_number, clarification=questions,
+        architecture_impact=(
+            _parse_architecture_impact(payload["architecture_impact"], context="task_result.architecture_impact")
+            if "architecture_impact" in payload else None
+        ),
+    )
 
 
 def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | None:
@@ -2408,6 +2564,7 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
             "deferred_work",
             "plan_actions",
             "human_requirement_dispositions",
+            "architecture_impact",
         },
     )
     state = _expect_non_empty_string(payload["state"], context="plan_revision.state")
@@ -2426,6 +2583,10 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
         context="plan_revision.plan_steps",
         item_context="plan_revision.plan_steps",
         min_length=1,
+    )
+    architecture_impact = (
+        _parse_architecture_impact(payload["architecture_impact"], context="plan_revision.architecture_impact")
+        if "architecture_impact" in payload else None
     )
     additional_closing_issue_ids = _expect_optional_issue_id_list(
         payload,
@@ -2450,6 +2611,7 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
         deferred_stages=deferred_stages,
         typed_stages=_expect_typed_plan_stages(payload, context="plan_revision"),
         human_requirement_dispositions=human_requirement_dispositions,
+        architecture_impact=architecture_impact,
     )
 
 
@@ -2473,6 +2635,7 @@ def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
             "deferred_work",
             "plan_actions",
             "human_requirement_dispositions",
+            "architecture_impact",
         },
     )
     state = _expect_state(payload["state"], context="plan_state.state")
@@ -2501,6 +2664,10 @@ def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
         human_requirement_dispositions=_expect_human_requirement_dispositions(
             payload.get("human_requirement_dispositions", []),
             context="plan_state.human_requirement_dispositions",
+        ),
+        architecture_impact=(
+            _parse_architecture_impact(payload["architecture_impact"], context="plan_state.architecture_impact")
+            if "architecture_impact" in payload else None
         ),
     )
 

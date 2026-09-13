@@ -83,6 +83,62 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class BinaryCommandResult:
+    """Small binary subprocess result used for immutable Git object reads."""
+
+    args: list[str]
+    cwd: Path
+    stdout: bytes
+    stderr: bytes = b""
+    returncode: int | None = None
+
+
+def run_binary_capture(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    max_bytes: int | None = None,
+    env: Mapping[str, str] | None = None,
+    check: bool = True,
+) -> BinaryCommandResult:
+    """Capture bytes without decoding them or following text-file semantics.
+
+    ``max_bytes`` is enforced while reading from the child, rather than after
+    an unbounded ``communicate()`` call.  Callers that need to distinguish an
+    oversized object should obtain its size first.
+    """
+    cmd = [str(value) for value in args]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=({**os.environ, **env} if env is not None else None),
+    )
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    if max_bytes is None:
+        stdout, stderr = proc.communicate()
+    else:
+        stdout = proc.stdout.read(max_bytes + 1)
+        if len(stdout) > max_bytes:
+            proc.terminate()
+            remainder, stderr = proc.communicate()
+            del remainder
+        else:
+            remainder, stderr = proc.communicate()
+            stdout += remainder
+    result = BinaryCommandResult(cmd, cwd, stdout, stderr, proc.returncode)
+    if check and result.returncode != 0:
+        raise AgentLoopError(
+            f"Command failed with exit {result.returncode}: {' '.join(cmd)}\n"
+            f"stderr: {stderr.decode('utf-8', 'replace')}"
+        )
+    return result
+
+
+@dataclass(frozen=True)
 class ForegroundTestResult:
     """Result of one visible, bounded foreground test command."""
 
@@ -1086,6 +1142,23 @@ class Runner:
                 f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}"
             )
         return result
+
+    def run_binary(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path,
+        max_bytes: int | None = None,
+        check: bool = True,
+        env: Mapping[str, str] | None = None,
+    ) -> BinaryCommandResult:
+        """Run a bounded byte-preserving command for Git/object inspection."""
+        if self.dry_run:
+            print(f"[dry-run] ({cwd}) {' '.join(map(str, args))}")
+            return BinaryCommandResult([str(value) for value in args], cwd, b"", b"", 0)
+        return run_binary_capture(
+            args, cwd=cwd, max_bytes=max_bytes, env=env, check=check
+        )
 
     def run_test_command(
         self,

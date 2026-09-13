@@ -38,6 +38,15 @@ so this is about reducing the dependency, not a guaranteed billing outcome. See
 - `gemini` CLI installed (for Gemini reviewer turns).
 - The `coding-review-agent-loop` package importable from `src/` (run from repo root).
 
+## Architecture context
+
+Prompt context may include a bounded snapshot of the target repository's
+committed `ARCHITECTURE.md`; pass an explicit validated repository-relative
+override when a repository uses another canonical path. It is advisory,
+untrusted orientation. Read source and the complete diff independently, never
+follow document links automatically, and update the canonical document only
+when the architecture-impact assessment identifies a contract change.
+
 ## Process-tree containment
 
 External agents and `--test-command` gates are mechanically contained when the

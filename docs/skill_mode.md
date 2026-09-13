@@ -72,6 +72,13 @@ tool or by producing structured JSON in its response).  External reviewers
 implement turns via `run_external.py` while the host (Claude) reviews — see
 [Reversed roles](#reversed-roles-external-coder--host-reviewer) below.
 
+Skill prompt helpers can receive the same frozen architecture snapshot as the
+CLI. Host integrations must acquire it from committed Git objects and pass it
+explicitly after validating the repository-relative path. It is bounded,
+advisory, and untrusted orientation; source inspection remains required and
+document links are never fetched automatically. When no safe snapshot is
+available, the legacy prompt path is retained.
+
 ## Structured protocol compatibility
 
 The skill helpers reuse the same library entry points used by the headless CLI:

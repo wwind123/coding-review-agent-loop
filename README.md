@@ -227,6 +227,19 @@ metadata, so a later run can reconstruct the active review state. When the PR
 number is known, resume with `agent-loop pr <number>` instead of starting issue
 implementation again.
 
+### Advisory architecture context
+
+By default, workflows read the conventional repository-local `ARCHITECTURE.md`
+from committed Git objects and include a bounded, revision- and hash-labeled
+overview in planning, implementation, and review prompts. Use
+`--architecture-path docs/ARCHITECTURE.md` for a validated repository-relative
+POSIX override, or `--no-architecture-context` to opt out. Missing, unsafe,
+binary, oversized, or unavailable documents preserve the legacy prompt path.
+The overview is untrusted orientation only: source inspection and full-diff
+review remain required, and it is not a whole-codebase audit or correctness
+guarantee. Architecture-impact assessments distinguish contract changes from
+meaningfully unchanged work and guide updates to the canonical document.
+
 ### Machine obligations and CI repair
 
 Selective review keeps reviewer-owned findings separate from machine-owned

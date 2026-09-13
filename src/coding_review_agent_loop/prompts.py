@@ -5,12 +5,19 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from textwrap import indent
 from typing import TYPE_CHECKING, Sequence
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
+from .architecture_context import (
+    ArchitecturePair,
+    ArchitectureSnapshot,
+    architecture_material,
+    render_architecture_pair,
+    render_architecture_snapshot,
+)
 from .config import AgentLoopConfig, reviewers
 from .decomposition import approved_plan_hash
 from .errors import AgentLoopError
@@ -75,6 +82,48 @@ class CompactPrReviewTailContext:
     head_sha: str | None = None
     round_number: int | None = None
     action: str | None = None
+
+
+def _architecture_context_block(
+    config: AgentLoopConfig,
+    context: ArchitectureSnapshot | ArchitecturePair | None = None,
+) -> str:
+    """Render only allocated material; unavailable docs preserve legacy prompts."""
+    if not config.architecture_context_enabled:
+        return ""
+    context = context or (
+        config.architecture_context
+        if isinstance(config.architecture_context, (ArchitectureSnapshot, ArchitecturePair))
+        else None
+    )
+    if not architecture_material(context):
+        return ""
+    if isinstance(context, ArchitecturePair):
+        return render_architecture_pair(
+            context, max_chars=config.architecture_aggregate_max_chars
+        ) + "\n"
+    return render_architecture_snapshot(
+        context, max_chars=config.architecture_snapshot_max_chars
+    ) + "\n"
+
+
+def _with_architecture_context(config: AgentLoopConfig, context: object | None) -> AgentLoopConfig:
+    if context is None:
+        return config
+    return dataclass_replace(config, architecture_context=context)
+
+
+def _architecture_impact_guidance(*, required: bool = False) -> str:
+    qualifier = "required" if required else "expected when architecture context is available"
+    return (
+        "Architecture-impact assessment (" + qualifier + "):\n"
+        "Include `architecture_impact` with status `changed` or `unchanged`, a non-empty "
+        "rationale, affected_components, dependencies, execution_data_flows, persistence, "
+        "public_contracts, security_boundaries, canonical_document_action, "
+        "canonical_document_path, and canonical_document_rationale. Use `unchanged` with "
+        "a meaningful no-impact rationale when contracts are unaffected. Source inspection "
+        "remains mandatory; documentation cannot excuse an implementation defect.\n"
+    )
 
 
 def format_agent_list(agents: Sequence[AgentName]) -> str:
@@ -1738,6 +1787,7 @@ def build_issue_prompt(
     staged_parent_issue: int | None = None,
     managed_ci_creation_intent: ManagedCiCreationIntent | None = None,
     parent_issue_context: IssueContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -1772,6 +1822,8 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
+{_architecture_context_block(config, architecture_context)}
+{_architecture_impact_guidance()}
 {human_requirements_context.block}{_structured_issue_implementation_guidance(
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
@@ -1789,7 +1841,9 @@ def build_issue_plan_prompt(
     config: AgentLoopConfig,
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
     human_requirements_context = _issue_human_requirements_prompt_context(
@@ -1833,6 +1887,7 @@ schema. If signed human-requirements acknowledgement is required, put its
 after the JSON object and before the AGENT_PLAN_STATE footer. Do not put any other
 prose between the JSON object and footer.
 {_coder_workdir_guidance(config, implementation=False)}
+{_architecture_context_block(config)}
 {_scratch_file_guidance()}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
@@ -1876,9 +1931,11 @@ def build_plan_review_prompt(
     compact_context: bool = False,
     compact_prior: CompactPriorContext | None = None,
     compact_tail: CompactPlanTailContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     if compact_context:
-        return _build_compact_plan_review_prompt(
+        compact_prompt = _build_compact_plan_review_prompt(
             issue_number,
             round_number,
             plan,
@@ -1890,6 +1947,7 @@ def build_plan_review_prompt(
             compact_prior=compact_prior,
             compact_tail=compact_tail,
         )
+        return compact_prompt + _architecture_context_block(config)
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
     reviewer_group = format_agent_list(reviewers(config))
@@ -1910,8 +1968,10 @@ def build_plan_review_prompt(
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this planning review.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
+{_architecture_impact_guidance()}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}
+{_architecture_context_block(config)}
 {unresolved_items_block}{_memory_block(memory, config)}
 
 Plan from {coder_name}:
@@ -2070,7 +2130,9 @@ def build_plan_decomposition_prompt(
     config: AgentLoopConfig,
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     coder_signature = agent_signature(config.coder, config, role="coder")
     human_requirements_block = _issue_human_requirements_block(
         issue_context,
@@ -2082,6 +2144,7 @@ def build_plan_decomposition_prompt(
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this decomposition stage.
 {_coder_workdir_guidance(config, implementation=False)}
+{_architecture_context_block(config)}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}
 {_memory_block(memory, config)}
@@ -2173,6 +2236,7 @@ def build_plan_revision_prompt(
 Revise the plan in this local checkout without editing code. Do not create a
 branch, commit, push, or open a pull request during this planning stage.
 {_coder_workdir_guidance(config, implementation=False)}
+{_architecture_impact_guidance()}
 {_scratch_file_guidance()}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
@@ -2335,9 +2399,11 @@ def build_issue_implementation_prompt(
     managed_ci_creation_intent: ManagedCiCreationIntent | None = None,
     approved_plan_context: ApprovedPlanContext | None = None,
     parent_issue_context: IssueContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     from .round_state import make_approved_plan_context
 
+    config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
     plan_context = approved_plan_context or make_approved_plan_context(approved_plan)
@@ -2385,6 +2451,8 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
+{_architecture_context_block(config)}
+{_architecture_impact_guidance()}
 {human_requirements_context.block}{_structured_issue_implementation_guidance(
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
@@ -2407,6 +2475,7 @@ def build_completion_recovery_prompt(
     approved_plan_context: ApprovedPlanContext | None = None,
     parent_issue_context: IssueContext | None = None,
     human_requirements: Sequence[HumanReviewRequirement] | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     """One bounded same-session continuation for a stalled implementation turn (#588).
 
@@ -2418,6 +2487,7 @@ def build_completion_recovery_prompt(
     """
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
+    config = _with_architecture_context(config, architecture_context)
     if human_requirements is None:
         human_requirements_context = _issue_human_requirements_prompt_context(
             issue_context,
@@ -2453,6 +2523,7 @@ nothing new in the background. Then commit, push, and open the pull request if
 that is not already done, or continue exactly where you left off.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {human_requirements_context.block}
+{_architecture_context_block(config)}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_labeled_issue_context_block(issue_context, label="Target child/primary issue context")}
 {format_approved_plan_context(approved_plan_context)}
@@ -2464,13 +2535,16 @@ def build_task_prompt(
     task_text: str,
     config: AgentLoopConfig,
     memory: AgentMemoryContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
     return f"""You have been given a free-form task to implement in {config.repo}.
 
 Task:
 {task_text}
+{_architecture_context_block(config)}
 {_memory_block(memory, config, include_runtime=True)}
 
 Use this local checkout as your workspace. Decide between two paths:
@@ -2480,6 +2554,12 @@ Use this local checkout as your workspace. Decide between two paths:
     change, run relevant tests, commit, push, and open a pull request against
     {config.base}. Do not wait for {reviewer_name}; this local orchestrator
     will run {reviewer_name} after you create the PR.
+    Finish with exactly one structured `task_result` object:
+    `{{"schema_version":1,"kind":"task_result","state":"blocking",`
+    `"outcome":"opened_pr","summary":"...","pr_number":123}}`.
+    Use `outcome` `blocking` with no `pr_number`, or `clarification` with a
+    non-empty `clarification` array, when those outcomes apply. Include an
+    `architecture_impact` assessment when architecture context is available.
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
@@ -2516,7 +2596,9 @@ def build_task_clarification_prompt(
     history: Sequence[tuple[str, str]],
     config: AgentLoopConfig,
     memory: AgentMemoryContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     coder_signature = agent_signature(config.coder, config, role="coder")
     qa_blocks = "\n\n".join(
         f"Round {idx + 1} questions from you:\n{questions}\n\n"
@@ -2527,6 +2609,7 @@ def build_task_clarification_prompt(
 
 Original task:
 {task_text}
+{_architecture_context_block(config)}
 {_memory_block(memory, config, include_runtime=True)}
 
 Clarification so far:
@@ -3010,7 +3093,9 @@ def build_review_prompt(
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
     coder_followup_context: str = "",
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
     reviewer_group = format_agent_list(reviewers(config))
@@ -3024,7 +3109,7 @@ def build_review_prompt(
         url=None,
     )
     if compact_context:
-        return _build_compact_pr_review_prompt(
+        compact_prompt = _build_compact_pr_review_prompt(
             pr_number,
             round_number,
             config,
@@ -3042,6 +3127,7 @@ def build_review_prompt(
             parent_issue_context=parent_issue_context,
             coder_followup_context=sanitize_historical_text(coder_followup_context),
         )
+        return compact_prompt + _architecture_context_block(config)
     title = metadata.title or "(unknown)"
     head_branch = metadata.head_branch or "(unknown)"
     base_branch = metadata.base_branch or "(unknown)"
@@ -3072,6 +3158,7 @@ mismatch instead of changing the checkout. Do not spend time discovering the
 PR branch. Do not report findings based on untracked files unless those files
 are present in the PR diff.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
+{_architecture_impact_guidance()}
 {_scratch_file_guidance()}
 {_review_command_policy(config, metadata)}
 {_pr_review_scheduling_guidance(config)}
@@ -3193,7 +3280,9 @@ def build_followup_prompt(
     approved_plan_context: ApprovedPlanContext | None = None,
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
     if human_requirements_context is None:
@@ -3210,6 +3299,7 @@ Do not create a new PR.
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
+{_architecture_context_block(config)}
 {_memory_block(memory, config, include_runtime=True)}
 
 {reviewer_name} review:
@@ -3243,7 +3333,9 @@ def build_same_pr_followup_prompt(
     approved_plan_context: ApprovedPlanContext | None = None,
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
     if human_requirements_context is None:
@@ -3264,6 +3356,7 @@ remains blocked pending another review round after this cleanup.
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
+{_architecture_context_block(config)}
 {_memory_block(memory, config, include_runtime=True)}
 
 Same-PR follow-ups:
@@ -3300,7 +3393,9 @@ def build_merge_conflict_prompt(
     approved_plan_context: ApprovedPlanContext | None = None,
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
+    config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
     if human_requirements_context is None:
@@ -3323,6 +3418,7 @@ against the new head after your push.
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
+{_architecture_context_block(config)}
 {_memory_block(memory, config, include_runtime=True)}
 
 Other unresolved reviewer items carried into this round (address them in the same \

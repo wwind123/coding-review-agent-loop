@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.agents.base import AgentName
+from coding_review_agent_loop.architecture_context import ArchitecturePair, ArchitectureSnapshot
 from coding_review_agent_loop.config import (
     AgentLoopConfig,
     DEFAULT_FLAT_CHILD_LIMIT,
@@ -89,6 +90,9 @@ def make_minimal_config(
     refresh_agent_memory: bool = False,
     flat_child_limit: int = DEFAULT_FLAT_CHILD_LIMIT,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context_enabled: bool = True,
+    architecture_path: str = "ARCHITECTURE.md",
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> AgentLoopConfig:
     tmp_base = Path(tempfile.gettempdir()) / "coding-review-agent-loop"
     legacy = tmp_base / "skill-runner"
@@ -140,6 +144,9 @@ def make_minimal_config(
         approved_followups=approved_followups,
         flat_child_limit=flat_child_limit,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context_enabled=architecture_context_enabled,
+        architecture_path=architecture_path,
+        architecture_context=architecture_context,
     )
 
 
@@ -360,6 +367,7 @@ def build_plan_prompt_for_skill(
     workdir: str,
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     """Build the round-1 coder (plan) prompt for an external coder (#307).
 
@@ -369,10 +377,11 @@ def build_plan_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context=architecture_context,
     )
     issue_context = _make_issue_context(issue_dict)
     return _with_containment_guidance(
-        build_issue_plan_prompt(issue_context.number, config, memory, issue_context), config
+        build_issue_plan_prompt(issue_context.number, config, memory, issue_context, architecture_context=architecture_context), config
     )
 
 
@@ -429,6 +438,7 @@ def build_implementation_prompt_for_skill(
     base: str = "main",
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     """Build the external-coder implementation prompt (reversed roles, #316).
 
@@ -441,9 +451,11 @@ def build_implementation_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, (coder,), reviewer=coder, workdir=workdir, base=base,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context=architecture_context,
     )
     return _with_containment_guidance(build_issue_implementation_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,
+        architecture_context=architecture_context,
     ), config)
 
 
@@ -456,6 +468,7 @@ def build_plan_decomposition_prompt_for_skill(
     workdir: str,
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     """Build the external-coder plan decomposition prompt (#318).
 
@@ -466,7 +479,9 @@ def build_plan_decomposition_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, (coder,), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context=architecture_context,
     )
     return _with_containment_guidance(build_plan_decomposition_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,
+        architecture_context=architecture_context,
     ), config)

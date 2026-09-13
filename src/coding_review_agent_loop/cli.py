@@ -660,6 +660,53 @@ def build_parser() -> argparse.ArgumentParser:
                 "(default: full)."
             ),
         )
+        architecture_group = subparser.add_mutually_exclusive_group()
+        architecture_group.add_argument(
+            "--architecture-context",
+            dest="architecture_context_enabled",
+            action="store_true",
+            default=True,
+            help="Include bounded advisory ARCHITECTURE.md context when available (default).",
+        )
+        architecture_group.add_argument(
+            "--no-architecture-context",
+            dest="architecture_context_enabled",
+            action="store_false",
+            help="Opt out of repository architecture context.",
+        )
+        subparser.add_argument(
+            "--architecture-path",
+            default="ARCHITECTURE.md",
+            help="Repository-relative POSIX architecture document path.",
+        )
+        subparser.add_argument(
+            "--architecture-read-size",
+            type=int,
+            default=64 * 1024,
+            metavar="BYTES",
+            help="Maximum committed architecture blob size to read (default: 65536).",
+        )
+        subparser.add_argument(
+            "--architecture-snapshot-max-chars",
+            type=int,
+            default=12_000,
+            metavar="CHARS",
+            help="Per-snapshot architecture prompt cap (default: 12000).",
+        )
+        subparser.add_argument(
+            "--architecture-aggregate-max-chars",
+            type=int,
+            default=24_000,
+            metavar="CHARS",
+            help="Aggregate architecture prompt cap (default: 24000).",
+        )
+        subparser.add_argument(
+            "--managed-context-max-chars",
+            type=int,
+            default=80_000,
+            metavar="CHARS",
+            help="Managed prompt context cap when architecture material is active (default: 80000).",
+        )
         subparser.add_argument(
             "--pr-review-policy",
             choices=("all-reviewers", "selective-intermediate"),

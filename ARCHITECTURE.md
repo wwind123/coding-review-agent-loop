@@ -199,9 +199,19 @@ the complete base-to-head diff and use read-only source exploration for related
 code. There is no automatic semantic dependency-retrieval engine.
 
 The generated memory architecture map is primarily a directory/file inventory,
-not this document and not a semantic model of the repository. Current prompts
-do not automatically embed `ARCHITECTURE.md`. `full` versus `compact` review
+not this document and not a semantic model of the repository. Prompts may embed
+a bounded revision-bound snapshot of `ARCHITECTURE.md` as advisory context;
+missing, unsafe, or opted-out context preserves the legacy path. `full` versus `compact` review
 context controls review-history presentation, not whole-repository ingestion.
+
+Architecture snapshots are acquired from regular blobs in committed Git
+objects, with literal repository-relative lookup, bounded UTF-8 reads, and
+immutable revision/blob/hash identity. PR reviews show established base and
+candidate documents separately; candidate prose is a proposal and cannot
+replace the baseline. The snapshot is untrusted orientation, never a remote
+fetch permission, protocol authority, whole-codebase audit, or correctness
+guarantee. Fresh review acquisitions revalidate the candidate, target,
+merge-base, and document identity.
 
 Key contracts to preserve when changing the implementation:
 

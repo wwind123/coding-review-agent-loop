@@ -19,6 +19,7 @@ from typing import Literal
 from .agents.base import AgentName, AgentResult
 from .agents.antigravity import AntigravityAttemptState
 from .agents.registry import agent_display_name, agent_signature, get_backend, run_agent_result
+from .architecture_context import freeze_architecture_context
 from .config import (
     AgentLoopConfig,
     configured_model_for,
@@ -231,6 +232,7 @@ from .protocol import (
     StructuredIssueImplementation,
     StructuredPlanState,
     StructuredPlanRevision,
+    StructuredTaskResult,
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
     human_requirements_resolved,
@@ -253,6 +255,7 @@ from .protocol import (
     validate_structured_issue_implementation,
     validate_structured_plan_state,
     validate_structured_plan_revision,
+    validate_structured_task_result,
     validate_structured_discuss_agenda,
     parse_structured_discuss_final_synthesis,
     validate_structured_discuss_final_synthesis,
@@ -510,6 +513,41 @@ MODEL_PARENTHESES_SUFFIX_RE = re.compile(r"\s+\([^)]*\)\s*$")
 FAILURE_CLASSIFICATION_TEXT_LIMIT = 12000
 ISSUE_IMPLEMENTATION_SALVAGE_SCOPE = "issue-implementation"
 APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE = "approved-plan-implementation"
+
+
+def _freeze_prompt_architecture(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    target_revision: str | None = None,
+    candidate_revision: str | None = None,
+    pr_pair: bool = False,
+) -> AgentLoopConfig:
+    """Attach one acquisition-local architecture snapshot to prompt config.
+
+    Scripted orchestration runners intentionally bypass real Git execution in
+    unit tests; leaving their config untouched preserves deterministic legacy
+    simulations. Production runners acquire only from committed objects.
+    """
+    if not config.architecture_context_enabled or type(runner).run is not Runner.run:
+        return config
+    checkout = active_workdir(config)
+    if not checkout.is_dir():
+        return config
+    target = target_revision
+    if pr_pair and target is None and config.base:
+        result = runner.run(("git", "rev-parse", f"origin/{config.base}"), cwd=checkout, check=False)
+        target = result.stdout.strip() if result.returncode == 0 else config.base
+    context = freeze_architecture_context(
+        runner,
+        checkout=checkout,
+        repository=config.repo,
+        path=config.architecture_path,
+        read_size=config.architecture_read_size,
+        target_revision=target,
+        candidate_revision=candidate_revision,
+    )
+    return dataclasses_replace(config, architecture_context=context)
 TASK_IMPLEMENTATION_SALVAGE_SCOPE = "task-implementation"
 PR_FOLLOWUP_SALVAGE_SCOPE = "pr-followup"
 
@@ -3594,6 +3632,13 @@ def _require_pr_number_or_clarification(text: str) -> int | str:
 
 def _require_task_implementation_result(text: str) -> int | str | _TerminalNoPrImplementation:
     """Accept a positive PR, a clarification request, or a terminal no-PR blocking result (#604)."""
+    structured = validate_structured_task_result(text)
+    if structured is not None:
+        if structured.outcome == "opened_pr":
+            return structured
+        if structured.outcome == "clarification":
+            return "clarification"
+        return _TerminalNoPrImplementation("blocking")
     pr_number = parse_pr_number(text)
     if pr_number is not None:
         return pr_number
@@ -6505,6 +6550,7 @@ def run_issue_loop(
     try:
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
+        config = _freeze_prompt_architecture(runner, config)
         log(config, f"Validating issue #{issue_number}")
         validate_open_issue(runner, config=config, issue_number=issue_number)
         issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
@@ -7045,6 +7091,7 @@ def run_task_loop(
             raise AgentLoopError("--max-clarification-rounds must be zero or positive.")
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
+        config = _freeze_prompt_architecture(runner, config)
         memory = prepare_agent_memory(runner, config)
 
         history: list[tuple[str, str]] = []
@@ -7079,14 +7126,25 @@ def run_task_loop(
             coder_output = coder_response.text
             session_id = coder_response.session_id
 
+            structured_task = (
+                coder_response.marker_value
+                if isinstance(coder_response.marker_value, StructuredTaskResult)
+                else None
+            )
+
             if isinstance(coder_response.marker_value, _TerminalNoPrImplementation):
                 raise AgentLoopError(
                     "Coder did not create a valid PR; task implementation is "
                     f"{coder_response.marker_value.state}.\n\n{coder_output}"
                 )
 
-            if isinstance(coder_response.marker_value, int):
-                pr_number = coder_response.marker_value
+            if isinstance(coder_response.marker_value, int) or structured_task is not None:
+                pr_number = (
+                    structured_task.pr_number
+                    if structured_task is not None
+                    else coder_response.marker_value
+                )
+                assert isinstance(pr_number, int)
                 _validate_response_tests_with_post_pr_context(
                     coder_output,
                     runner=runner,
@@ -8883,6 +8941,12 @@ def run_pr_loop(
                 )
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)
+        config = _freeze_prompt_architecture(
+            runner,
+            config,
+            candidate_revision=initial_pr_context.metadata.head_sha,
+            pr_pair=True,
+        )
         if config.review_parallel:
             _ensure_parallel_reviewer_workdirs(config, flag_name="--review-parallel", role_label="reviewer")
         # Select managed activation before any PR-side contract/comment write.
