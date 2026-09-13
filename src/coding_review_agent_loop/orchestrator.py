@@ -9059,7 +9059,8 @@ def run_pr_loop(
                                 or not isinstance(phase_payload.get("stage_id"), int)
                             ):
                                 raise AgentLoopError(
-                                    "Decomposition child phase identity does not match the PR handoff or parent."
+                                    "Decomposition child phase identity must name the validated parent issue, "
+                                    "a non-empty plan hash, and an integer stage id."
                                 )
                             checkpoint = None
                             for topology_mode in ("decompose-only", "implement-by-phase"):

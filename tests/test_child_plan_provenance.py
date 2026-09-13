@@ -1,3 +1,6 @@
+import base64
+import json
+
 import pytest
 
 from agent_loop_helpers import FakeRunner, make_config
@@ -23,8 +26,23 @@ def comment(body):
     return IssueComment(author="bot", created_at="2026-09-13T00:00:00Z", body=body)
 
 
+def replace_phase_plan_hash(body, plan_hash):
+    marker = orchestrator.PHASE_IDENTITY_MARKER_RE.search(body)
+    assert marker is not None
+    payload = json.loads(
+        base64.urlsafe_b64decode(marker.group("payload").encode("ascii")).decode("utf-8")
+    )
+    payload["plan_hash"] = plan_hash
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+    return body[:marker.start("payload")] + encoded + body[marker.end("payload"):]
+
+
 @pytest.mark.parametrize("entry", ["issue", "pr"])
-@pytest.mark.parametrize("fault", [None, "parent_checkpoint", "phase_identity", "child_plan"])
+@pytest.mark.parametrize(
+    "fault", [None, "parent_checkpoint", "phase_identity", "phase_plan_hash", "child_plan"]
+)
 def test_separately_planned_child_preserves_both_plan_bindings(tmp_path, monkeypatch, entry, fault):
     parent_plan = "Approved parent plan.\n\n## Scope\n- Deliver three sequential stages."
     child_plan = "Approved child plan.\n\n## Scope\n- Implement only the reviewed strategy schema."
@@ -43,6 +61,8 @@ def test_separately_planned_child_preserves_both_plan_bindings(tmp_path, monkeyp
         created_so_far=(), phase_identity_value="wrong" if fault == "phase_identity" else identity,
         topology_source="typed", phase_index=1, phase_plan_hash=parent_hash,
     )
+    if fault == "phase_plan_hash":
+        child_body = replace_phase_plan_hash(child_body, "")
     handoff = format_issue_pr_handoff_comment(
         issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
         pr_head_sha="abc123", flow="approved-plan-implementation", plan_hash=child_hash,
