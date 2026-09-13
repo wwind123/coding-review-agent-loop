@@ -245,6 +245,16 @@ partial-coverage, and unresolved-work caveats. Do not replace detailed evidence
 with a shorter conclusion, remove code paths or line references, combine distinct
 findings, or invent tests, results, explanations, item IDs, or requirement IDs.
 
+The format examples below are minimal illustrations, not exhaustive allowlists.
+For plan_state, plan_revision, plan_review, pr_review, coder_followup, and
+issue_implementation, `architecture_impact` is an allowed optional object.
+When present in the source, copy the COMPLETE `architecture_impact` object,
+including every nested field, array entry, path, rationale, and uncertainty.
+Do not omit it because an example lacks it, replace a changed assessment with
+unchanged, or invent an assessment when the source has none. A marker-only
+repair must keep this object and every other valid source field unchanged
+except for the specific unsafe marker text that needs neutralization.
+
 When a finding object must become a string, concatenate its complete title,
 detail, evidence, and other substantive text, in order. Do not keep just the title.
 Example: {"title":"Add regression coverage", "detail":"Wire the capability getter in app.js; add a two-round claim test and assert no mutation on 503."}
@@ -263,6 +273,8 @@ human_requirements.addressed_ids must be empty (including no not-applicable rows
 Before responding, compare source and output: every retained finding needs its
 full supporting text, every test needs its original status/caveat, and every ID
 must stay in its correct ledger. Do not silently fill gaps with invented facts.
+Specifically compare `architecture_impact` recursively when present: repairing
+a finding's quoted protocol syntax does not authorize dropping this assessment.
 
 ## APPROVED-PLAN RECONCILIATION (coder follow-ups):
 
