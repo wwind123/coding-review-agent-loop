@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 import subprocess
 import sys
@@ -44,6 +45,21 @@ def _make_fake_gh_env(fake_gh_dir: Path) -> dict:
     env = os.environ.copy()
     env["PATH"] = str(fake_gh_dir) + ":" + env.get("PATH", "")
     return env
+
+
+def _replace_phase_handoff_payload(body: str, **updates: object) -> str:
+    from coding_review_agent_loop.decomposition import PHASE_IMPLEMENTATION_MARKER_RE
+
+    marker = PHASE_IMPLEMENTATION_MARKER_RE.search(body)
+    assert marker is not None
+    payload = json.loads(
+        base64.urlsafe_b64decode(marker.group("payload").encode("ascii")).decode("utf-8")
+    )
+    payload.update(updates)
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+    return body[:marker.start("payload")] + encoded + body[marker.end("payload"):]
 
 
 def _write_fake_gh(directory: Path) -> Path:
@@ -2277,11 +2293,17 @@ class TestSkillApprovedPlanRecovery:
         assert context.plan_hash == plan_hash
 
     @pytest.mark.parametrize(
-        ("handoff_mode", "should_fail"),
-        [("implement-by-phase", False), ("decompose-only", True)],
+        ("handoff_mode", "handoff_updates", "should_fail"),
+        [
+            ("implement-by-phase", {}, False),
+            ("implement-by-phase", {"plan_hash": "different-plan"}, True),
+            ("implement-by-phase", {"phase_index": 1}, True),
+            ("implement-by-phase", {"stage_id": "stage-api"}, True),
+            ("decompose-only", {}, True),
+        ],
     )
     def test_fresh_decomposition_child_handoff_recovers_matching_stage_by_ordinal(
-        self, monkeypatch, handoff_mode, should_fail
+        self, monkeypatch, handoff_mode, handoff_updates, should_fail
     ) -> None:
         import helpers.skill_runner as sr
         from coding_review_agent_loop.errors import AgentLoopError
@@ -2459,6 +2481,10 @@ class TestSkillApprovedPlanRecovery:
                 plan_subject=_plan_subject(plan),
             ),
         ]
+        if handoff_updates:
+            parent_comments[-1] = _replace_phase_handoff_payload(
+                parent_comments[-1], **handoff_updates
+            )
         child_comments = [
             format_issue_pr_handoff_comment(
                 issue_number=99,

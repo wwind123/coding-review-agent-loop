@@ -129,7 +129,7 @@ from coding_review_agent_loop.decomposition import (
     PHASE_IDENTITY_MARKER_RE,
     _decode_json_payload,
     find_existing_phase_implementation_handoff,
-    find_phase_implementation_handoffs,
+    find_phase_implementation_handoffs_for_parent,
     find_existing_decomposition,
     find_existing_topology_checkpoint,
     find_latest_one_shot_impl_handoff,
@@ -1624,10 +1624,9 @@ def _recover_skill_pr_plan_context(
             # parent-owned child cannot be treated as independently planned.
             phase_handoffs = tuple(
                 handoff
-                for handoff in find_phase_implementation_handoffs(
+                for handoff in find_phase_implementation_handoffs_for_parent(
                     parent_comments,
                     parent_issue=parent_issue,
-                    plan_hash=plan_hash,
                 )
                 if (
                     handoff.phase_index == phase_index
@@ -1642,9 +1641,11 @@ def _recover_skill_pr_plan_context(
                 )
             phase_handoff = phase_handoffs[0] if phase_handoffs else None
             if phase_handoff is not None and (
-                phase_handoff.mode != "implement-by-phase"
+                phase_handoff.plan_hash != plan_hash
+                or phase_handoff.mode != "implement-by-phase"
                 or phase_handoff.child_issue_number != issue_number
                 or (expected_hash is not None and expected_hash != plan_hash)
+                or phase_handoff.phase_index != phase_index
                 or phase_handoff.strategy != normalized.strategy
                 or phase_handoff.topology_source != EXECUTION_TOPOLOGY_SOURCE
                 or phase_handoff.execution_strategy_contract_version != 1

@@ -1,4 +1,5 @@
 import base64
+import dataclasses
 import json
 
 import pytest
@@ -10,6 +11,7 @@ from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue, PlanPhase, TopologyCheckpoint, approved_plan_hash,
     format_decomposition_parent_summary, format_phase_issue_body,
     format_phase_implementation_handoff_comment,
+    PHASE_IMPLEMENTATION_MARKER_RE,
     normalize_execution_recommendation,
     format_topology_checkpoint, phase_identity,
 )
@@ -37,6 +39,19 @@ def replace_phase_plan_hash(body, plan_hash):
         base64.urlsafe_b64decode(marker.group("payload").encode("ascii")).decode("utf-8")
     )
     payload["plan_hash"] = plan_hash
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+    return body[:marker.start("payload")] + encoded + body[marker.end("payload"):]
+
+
+def replace_phase_handoff_payload(body, **updates):
+    marker = PHASE_IMPLEMENTATION_MARKER_RE.search(body)
+    assert marker is not None
+    payload = json.loads(
+        base64.urlsafe_b64decode(marker.group("payload").encode("ascii")).decode("utf-8")
+    )
+    payload.update(updates)
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ).decode("ascii")
@@ -310,8 +325,17 @@ def test_cli_run_pr_loop_validates_fresh_child_phase_identity(
         assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
+@pytest.mark.parametrize(
+    "handoff_updates",
+    [
+        {},
+        {"plan_hash": "different-plan"},
+        {"phase_index": 2},
+        {"stage_id": "stage-two"},
+    ],
+)
 def test_cli_run_pr_loop_validates_parent_handoff_after_decompose_only_transition(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, handoff_updates
 ):
     plan = fresh_staged_plan()
     child, parent = fresh_child_contexts(
@@ -319,6 +343,12 @@ def test_cli_run_pr_loop_validates_parent_handoff_after_decompose_only_transitio
         summary_mode="decompose-only",
         handoff_mode="implement-by-phase",
     )
+    if handoff_updates:
+        parent = dataclasses.replace(
+            parent,
+            comments=parent.comments[:-1]
+            + (comment(replace_phase_handoff_payload(parent.comments[-1].body, **handoff_updates)),),
+        )
     monkeypatch.setattr(
         orchestrator,
         "get_issue_context",
@@ -334,8 +364,13 @@ def test_cli_run_pr_loop_validates_parent_handoff_after_decompose_only_transitio
     )
     config = make_config(tmp_path)
 
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    if handoff_updates:
+        with pytest.raises(AgentLoopError, match="implementation handoff"):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    else:
+        assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
 def test_cli_run_pr_loop_rejects_mismatched_parent_handoff_after_decompose_only_transition(

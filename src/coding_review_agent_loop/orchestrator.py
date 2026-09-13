@@ -60,7 +60,6 @@ from .decomposition import (
     find_existing_topology_checkpoint,
     find_topology_checkpoints_for_parent,
     find_decompositions_for_parent,
-    find_phase_implementation_handoffs,
     find_phase_implementation_handoffs_for_parent,
     PHASE_IDENTITY_MARKER_RE,
     phase_identity,
@@ -9997,10 +9996,9 @@ def run_pr_loop(
                                 # instead of using that immutable mode.
                                 phase_handoffs = tuple(
                                     handoff
-                                    for handoff in find_phase_implementation_handoffs(
+                                    for handoff in find_phase_implementation_handoffs_for_parent(
                                         parent_issue_context.comments,
                                         parent_issue=parent_issue_context.number,
-                                        plan_hash=phase_plan_hash,
                                     )
                                     if (
                                         handoff.phase_index == phase_index
@@ -10015,8 +10013,10 @@ def run_pr_loop(
                                     )
                                 phase_handoff = phase_handoffs[0] if phase_handoffs else None
                                 if phase_handoff is not None and (
-                                    phase_handoff.mode != "implement-by-phase"
+                                    phase_handoff.plan_hash != phase_plan_hash
+                                    or phase_handoff.mode != "implement-by-phase"
                                     or phase_handoff.child_issue_number != issue_context.number
+                                    or phase_handoff.phase_index != phase_index
                                     or (
                                         issue_handoff is not None
                                         and issue_handoff.plan_hash != phase_plan_hash
