@@ -100,6 +100,7 @@ def run_binary_capture(
     max_bytes: int | None = None,
     env: Mapping[str, str] | None = None,
     check: bool = True,
+    timeout_seconds: float = 30.0,
 ) -> BinaryCommandResult:
     """Capture bytes without decoding them or following text-file semantics.
 
@@ -108,6 +109,8 @@ def run_binary_capture(
     separate readers so a noisy Git diagnostic cannot deadlock a bounded
     object read.
     """
+    if timeout_seconds <= 0:
+        raise AgentLoopError("Binary command timeout must be positive.")
     cmd = [str(value) for value in args]
     proc = subprocess.Popen(
         cmd,
@@ -140,12 +143,37 @@ def run_binary_capture(
     stderr_thread = threading.Thread(target=_read, args=(proc.stderr, stderr_chunks), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
-    stdout_thread.join()
-    stderr_thread.join()
-    proc.wait()
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    while stdout_thread.is_alive() or stderr_thread.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            break
+        stdout_thread.join(timeout=min(0.05, remaining))
+        stderr_thread.join(timeout=0)
+    stdout_thread.join(timeout=1)
+    stderr_thread.join(timeout=1)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
     stdout = b"".join(stdout_chunks)
     stderr = b"".join(stderr_chunks)
     result = BinaryCommandResult(cmd, cwd, stdout, stderr, proc.returncode)
+    if timed_out:
+        raise AgentLoopError(
+            f"Command timed out after {timeout_seconds:g} seconds: {' '.join(cmd)}"
+        )
     if check and result.returncode != 0:
         raise AgentLoopError(
             f"Command failed with exit {result.returncode}: {' '.join(cmd)}\n"
@@ -1173,7 +1201,8 @@ class Runner:
             print(f"[dry-run] ({cwd}) {' '.join(map(str, args))}")
             return BinaryCommandResult([str(value) for value in args], cwd, b"", b"", 0)
         return run_binary_capture(
-            args, cwd=cwd, max_bytes=max_bytes, env=env, check=check
+            args, cwd=cwd, max_bytes=max_bytes, env=env, check=check,
+            timeout_seconds=30.0,
         )
 
     def run_test_command(

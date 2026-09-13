@@ -13,7 +13,7 @@ from coding_review_agent_loop.architecture_context import (
     render_architecture_snapshot,
 )
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.runner import Runner
+from coding_review_agent_loop.runner import Runner, run_binary_capture
 
 
 def _git(cwd, *args: str) -> str:
@@ -64,6 +64,63 @@ def test_missing_and_binary_documents_are_not_worktree_authority(tmp_path):
         Runner(), checkout=tmp_path, repository="owner/repo", revision=_git(tmp_path, "rev-parse", "HEAD")
     )
     assert binary.availability == "binary"
+
+
+def test_symlink_document_is_unavailable(tmp_path):
+    revision = _repo(tmp_path)
+    (tmp_path / "ARCHITECTURE.md").unlink()
+    (tmp_path / "ARCHITECTURE.md").symlink_to("README.md")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "symlink")
+    snapshot = acquire_architecture_snapshot(
+        Runner(), checkout=tmp_path, repository="owner/repo", revision=_git(tmp_path, "rev-parse", "HEAD")
+    )
+    assert snapshot.availability == "unavailable"
+    assert "regular blob" in (snapshot.diagnostic or "")
+
+
+def test_pair_marks_both_missing_as_absent(tmp_path):
+    _repo(tmp_path)
+    (tmp_path / "ARCHITECTURE.md").unlink()
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "without architecture")
+    base = _git(tmp_path, "rev-parse", "HEAD")
+    _git(tmp_path, "checkout", "-qb", "candidate")
+    candidate = _git(tmp_path, "rev-parse", "HEAD")
+    pair = acquire_architecture_pair(
+        Runner(), checkout=tmp_path, repository="owner/repo",
+        target_revision=base, candidate_revision=candidate,
+    )
+    assert pair.change == "absent"
+
+
+def test_pair_does_not_use_target_tip_without_merge_base(tmp_path):
+    base = _repo(tmp_path, "# Base\n")
+    _git(tmp_path, "checkout", "--orphan", "unrelated")
+    _git(tmp_path, "rm", "-rf", ".")
+    (tmp_path / "ARCHITECTURE.md").write_text("# Unrelated\n", encoding="utf-8")
+    _git(tmp_path, "add", "ARCHITECTURE.md")
+    _git(tmp_path, "commit", "-qm", "unrelated")
+    candidate = _git(tmp_path, "rev-parse", "HEAD")
+    pair = acquire_architecture_pair(
+        Runner(), checkout=tmp_path, repository="owner/repo",
+        target_revision=base, candidate_revision=candidate,
+    )
+    assert pair.merge_base_revision is None
+    assert pair.base.availability == "unavailable"
+    assert pair.change == "unavailable"
+    rendered = render_architecture_pair(pair)
+    assert "# Unrelated" in rendered
+    assert "candidate edits" not in rendered
+
+
+def test_binary_capture_timeout_is_bounded(tmp_path):
+    with pytest.raises(AgentLoopError, match="timed out"):
+        run_binary_capture(
+            ("python3", "-c", "import time; time.sleep(2)"),
+            cwd=tmp_path,
+            timeout_seconds=0.05,
+        )
 
 
 def test_pair_keeps_base_separate_from_candidate(tmp_path):

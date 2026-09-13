@@ -376,6 +376,18 @@ def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureIm
         context=f"{context}.canonical_document_action",
     )
     rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")
+    if status == "changed":
+        required_changed = {
+            "affected_components", "dependencies", "execution_data_flows",
+            "persistence", "public_contracts", "security_boundaries",
+            "canonical_document_action", "canonical_document_path",
+            "canonical_document_rationale",
+        }
+        missing = sorted(required_changed - set(payload))
+        if missing:
+            raise AgentLoopError(
+                f"{context} changed assessments must include: {', '.join(missing)}."
+            )
     path_value = payload.get("canonical_document_path")
     if path_value is not None and (not isinstance(path_value, str) or not path_value.strip()):
         raise AgentLoopError(f"{context}.canonical_document_path must be a non-empty string or null.")
@@ -2394,6 +2406,8 @@ def validate_structured_coder_followup(text: str) -> StructuredCoderFollowup | N
 
 def validate_structured_issue_implementation(
     text: str,
+    *,
+    required_architecture_impact_contract: int = 0,
 ) -> StructuredIssueImplementation | None:
     """Parse and validate the strict issue-implementation result envelope.
 
@@ -2471,6 +2485,10 @@ def validate_structured_issue_implementation(
         if "architecture_impact" in payload
         else None
     )
+    if required_architecture_impact_contract == 1 and architecture_impact is None:
+        raise AgentLoopError(
+            "issue_implementation must include architecture_impact for this fresh contract turn."
+        )
     parsed = StructuredIssueImplementation(
         schema_version=1,
         kind="issue_implementation",
@@ -2503,7 +2521,11 @@ def validate_structured_issue_implementation(
     return parsed
 
 
-def validate_structured_task_result(text: str) -> StructuredTaskResult | None:
+def validate_structured_task_result(
+    text: str,
+    *,
+    required_architecture_impact_contract: int = 0,
+) -> StructuredTaskResult | None:
     """Validate the versioned task terminal envelope, when present."""
     normalized, _status = normalize_response_file_structured_text(text)
     extracted = _extract_json_object_prefix(normalized)
@@ -2541,18 +2563,27 @@ def validate_structured_task_result(text: str) -> StructuredTaskResult | None:
         raise AgentLoopError("task_result.clarification requires at least one question.")
     if outcome != "clarification" and questions:
         raise AgentLoopError("task_result.clarification is only valid for clarification.")
+    architecture_impact = (
+        _parse_architecture_impact(payload["architecture_impact"], context="task_result.architecture_impact")
+        if "architecture_impact" in payload else None
+    )
+    if required_architecture_impact_contract == 1 and architecture_impact is None:
+        raise AgentLoopError(
+            "task_result must include architecture_impact for this fresh contract turn."
+        )
     return StructuredTaskResult(
         schema_version=1, kind="task_result", state=state, outcome=outcome,
         summary=_expect_non_empty_string(payload["summary"], context="task_result.summary"),
         pr_number=pr_number, clarification=questions,
-        architecture_impact=(
-            _parse_architecture_impact(payload["architecture_impact"], context="task_result.architecture_impact")
-            if "architecture_impact" in payload else None
-        ),
+        architecture_impact=architecture_impact,
     )
 
 
-def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | None:
+def validate_structured_plan_revision(
+    text: str,
+    *,
+    required_architecture_impact_contract: int = 0,
+) -> StructuredPlanRevision | None:
     payload = _extract_structured_plan_revision_payload(text)
     if payload is None:
         return None
@@ -2603,6 +2634,8 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
         _parse_architecture_impact(payload["architecture_impact"], context="plan_revision.architecture_impact")
         if "architecture_impact" in payload else None
     )
+    if required_architecture_impact_contract == 1 and architecture_impact is None:
+        raise AgentLoopError("plan_revision must include architecture_impact for this fresh contract turn.")
     additional_closing_issue_ids = _expect_optional_issue_id_list(
         payload,
         "additional_closing_issue_ids",
@@ -2630,7 +2663,11 @@ def validate_structured_plan_revision(text: str) -> StructuredPlanRevision | Non
     )
 
 
-def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
+def validate_structured_plan_state(
+    text: str,
+    *,
+    required_architecture_impact_contract: int = 0,
+) -> StructuredPlanState | None:
     payload = _extract_structured_plan_state_payload(text)
     if payload is None:
         return None
@@ -2656,6 +2693,12 @@ def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
     state = _expect_state(payload["state"], context="plan_state.state")
     if state != "blocking":
         raise AgentLoopError("plan_state.state must be `blocking`.")
+    architecture_impact = (
+        _parse_architecture_impact(payload["architecture_impact"], context="plan_state.architecture_impact")
+        if "architecture_impact" in payload else None
+    )
+    if required_architecture_impact_contract == 1 and architecture_impact is None:
+        raise AgentLoopError("plan_state must include architecture_impact for this fresh contract turn.")
     return StructuredPlanState(
         schema_version=int(payload.get("schema_version", 1)),
         kind="plan_state",
@@ -2680,10 +2723,7 @@ def validate_structured_plan_state(text: str) -> StructuredPlanState | None:
             payload.get("human_requirement_dispositions", []),
             context="plan_state.human_requirement_dispositions",
         ),
-        architecture_impact=(
-            _parse_architecture_impact(payload["architecture_impact"], context="plan_state.architecture_impact")
-            if "architecture_impact" in payload else None
-        ),
+        architecture_impact=architecture_impact,
     )
 
 

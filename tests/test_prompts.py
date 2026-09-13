@@ -343,6 +343,22 @@ def test_issue_plan_prompt_requires_complete_structured_plan_state_contract(tmp_
     assert "after the JSON object and before the AGENT_PLAN_STATE footer" in prompt
 
 
+def test_architecture_impact_guidance_matches_all_coder_and_plan_schemas(tmp_path):
+    config = make_config(tmp_path)
+    prompts = (
+        build_issue_plan_prompt(56, config),
+        build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex"),
+        build_plan_revision_prompt(56, 2, "Plan.", "Fix it.", config),
+        build_task_prompt("Add a health endpoint.", config),
+    )
+    for prompt in prompts:
+        assert '"architecture_impact"' in prompt
+    task_prompt = prompts[-1]
+    assert "must start with the JSON object" in task_prompt
+    assert "Do not add an" in task_prompt
+    assert "`AGENT_PR` or `AGENT_CLARIFY`" in task_prompt
+
+
 def test_issue_prompts_include_salvage_guardrail_block(tmp_path):
     config = make_config(tmp_path)
     salvage_summary = (

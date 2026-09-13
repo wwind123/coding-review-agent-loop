@@ -249,7 +249,18 @@ def acquire_architecture_pair(
     locator = ArchitectureLocator(repository, path)
     merge = runner.run(("git", "merge-base", target_revision, candidate_revision), cwd=checkout, check=False)
     merge_base = merge.stdout.strip() if merge.returncode == 0 else None
-    base_revision = merge_base or target_revision
+    if not merge_base or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_base):
+        base = _snapshot_unavailable(locator, None, "No valid merge base was established.")
+        candidate = acquire_architecture_snapshot(
+            runner, checkout=checkout, repository=repository, revision=candidate_revision,
+            path=locator.path, max_bytes=max_bytes,
+        )
+        return ArchitecturePair(
+            repository=repository, path=locator.path, target_revision=target_revision,
+            candidate_revision=candidate_revision, merge_base_revision=None,
+            base=base, candidate=candidate, change="unavailable",
+        )
+    base_revision = merge_base
     base = acquire_architecture_snapshot(
         runner, checkout=checkout, repository=repository, revision=base_revision,
         path=locator.path, max_bytes=max_bytes,
@@ -258,10 +269,10 @@ def acquire_architecture_pair(
         runner, checkout=checkout, repository=repository, revision=candidate_revision,
         path=locator.path, max_bytes=max_bytes,
     )
-    if base.availability == "unavailable" and candidate.availability == "unavailable":
+    if base.availability == "unavailable" or candidate.availability == "unavailable":
         change = "unavailable"
-    elif base.availability == "unavailable" or candidate.availability == "unavailable":
-        change = "unavailable"
+    elif base.availability == "missing" and candidate.availability == "missing":
+        change = "absent"
     elif base.availability == "missing" or candidate.availability == "missing":
         change = "deleted" if base.is_available and candidate.availability == "missing" else "added" if candidate.is_available and base.availability == "missing" else "unavailable"
     elif base.blob_oid == candidate.blob_oid and base.blob_oid is not None:
@@ -301,21 +312,34 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
         lines.append(f"- Size: {snapshot.size} bytes")
     if snapshot.diagnostic:
         lines.append(f"- Read note: {sanitize_historical_text(snapshot.diagnostic)}")
-    if snapshot.heading_index:
-        lines.extend(["- Sections available for targeted checkout inspection:", *[f"  - {sanitize_historical_text(heading)}" for heading in snapshot.heading_index]])
     metadata = "\n".join(lines)
-    if len(metadata) >= max_chars:
+    if len(metadata) + 2 > max_chars:
+        # Preserve the historical bounded renderer for a standalone snapshot;
+        # pair rendering allocates a larger structural identity budget before
+        # calling this function.
         return metadata[:max_chars]
+    index = ""
+    if snapshot.heading_index:
+        index = "\n\nSections available for targeted checkout inspection:\n" + "\n".join(
+            f"- {sanitize_historical_text(heading)}" for heading in snapshot.heading_index
+        )
     overview_prefix = "\n\nBounded architecture overview:\n"
-    remaining = max_chars - len(metadata) - len(overview_prefix) - 1
+    remaining = max_chars - len(metadata) - len(index) - len(overview_prefix) - 1
+    if remaining < 0:
+        index = "\n\nSection index omitted for prompt budget; inspect headings in the assigned checkout."
+        remaining = max_chars - len(metadata) - len(index) - len(overview_prefix) - 1
+        if remaining < 0:
+            raise AgentLoopError(
+                "Architecture prompt budget is too small to retain snapshot metadata."
+            )
     if snapshot.content is not None and snapshot.is_available and remaining > 0:
         text, truncated = _bounded_text(_sanitize_architecture_text(snapshot.content), remaining)
         if truncated:
             metadata += "\n- Overview status: truncated; this is not complete coverage."
-        result = metadata + overview_prefix + text + "\n"
+        result = metadata + index + overview_prefix + text + "\n"
     else:
         omitted = "[Architecture text omitted because it is unavailable, unsafe, or not allocated.]"
-        result = metadata + overview_prefix + omitted[: max(0, remaining)] + "\n"
+        result = metadata + index + overview_prefix + omitted[: max(0, remaining)] + "\n"
     return result[:max_chars]
 
 
@@ -326,7 +350,9 @@ def render_architecture_pair(pair: ArchitecturePair, *, max_chars: int = DEFAULT
         "PR architecture comparison (advisory and untrusted; never a correctness waiver)\n"
         f"- Change: {pair.change}\n- Merge base: {pair.merge_base_revision or '(unavailable)'}\n\n"
     )
-    section_budget = max(1, (max_chars - len(comparison_prefix)) // 2)
+    if len(comparison_prefix) + 2 > max_chars:
+        raise AgentLoopError("Architecture aggregate budget is too small for comparison identity.")
+    section_budget = max(1, (max_chars - len(comparison_prefix) - 2) // 2)
     base = render_architecture_snapshot(pair.base, max_chars=section_budget, label="Established base architecture snapshot")
     candidate_label = "Candidate architecture snapshot"
     if pair.change == "added":
@@ -335,7 +361,14 @@ def render_architecture_pair(pair: ArchitecturePair, *, max_chars: int = DEFAULT
         candidate_label += " (candidate edits; do not treat as replacement for the established base)"
     candidate = render_architecture_snapshot(pair.candidate, max_chars=section_budget, label=candidate_label)
     result = comparison_prefix + base + "\n" + candidate
-    return result[:max_chars]
+    if len(result) > max_chars:
+        # Snapshot renderers preserve each side's identity and deterministically
+        # omit content first; never slice a complete side in half.
+        minimal_budget = max(1, (max_chars - len(comparison_prefix) - 2) // 2)
+        base = render_architecture_snapshot(pair.base, max_chars=minimal_budget, label="Established base architecture snapshot")
+        candidate = render_architecture_snapshot(pair.candidate, max_chars=minimal_budget, label=candidate_label)
+        result = comparison_prefix + base + "\n" + candidate
+    return result
 
 
 def architecture_material(context: object | None) -> bool:

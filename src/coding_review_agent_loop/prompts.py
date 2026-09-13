@@ -113,9 +113,20 @@ def _architecture_context_block(
         if isinstance(context, ArchitecturePair)
         else config.architecture_snapshot_max_chars
     )
-    effective_limit = max(configured_limit, protected_size + architecture_limit)
+    effective_limit = (
+        max(configured_limit, protected_size + architecture_limit)
+        if configured_limit == DEFAULT_MANAGED_CONTEXT_CHARS
+        else configured_limit
+    )
     available_for_architecture = max(1, effective_limit - protected_size)
     render_limit = min(architecture_limit, available_for_architecture)
+    minimum_identity_budget = 900 if isinstance(context, ArchitecturePair) else 450
+    if render_limit < minimum_identity_budget:
+        notice = (
+            "Architecture context omitted for managed prompt budget; inspect the "
+            "immutable snapshot identity in the assigned checkout.\n"
+        )
+        return notice[:available_for_architecture]
     if isinstance(context, ArchitecturePair):
         rendered = render_architecture_pair(context, max_chars=render_limit)
     else:
@@ -1095,6 +1106,13 @@ def _structured_issue_implementation_guidance(
         "human_requirement_dispositions": disposition_example,
         "tests_run": ["python -m pytest tests/test_protocol.py -q"],
         "test_observations": [{"command": "python -m pytest tests/test_protocol.py -q", "receipt_id": "<opaque receipt from agent-loop run-tests>", "claim": "current-result"}],
+        "architecture_impact": {
+            "status": "unchanged", "rationale": "No architectural contract changed.",
+            "affected_components": [], "dependencies": [], "execution_data_flows": [],
+            "persistence": [], "public_contracts": [], "security_boundaries": [],
+            "canonical_document_action": "no-change", "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
     }
     return f"""Use this mandatory structured `issue_implementation` result so the orchestrator can validate the implementation deterministically:
 
@@ -1527,7 +1545,8 @@ Use this mandatory structured JSON response format:
   "prior_plan_item_dispositions": [
     {"item_id": "item-1", "disposition": "resolved", "note": "Covered by the revised tests."}
   ],
-  "human_requirement_dispositions": []
+  "human_requirement_dispositions": [],
+  "architecture_impact": {{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}
 }
 <!-- AGENT_PLAN_STATE: approved -->
 -- reviewer signature shown in the volatile tail
@@ -1848,7 +1867,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
-{_architecture_context_block(config, architecture_context)}
+{_architecture_context_block(config, architecture_context, protected_context=(human_requirements_context.block,))}
 {_architecture_impact_guidance()}
 {human_requirements_context.block}{_structured_issue_implementation_guidance(
     human_requirements_context=human_requirements_context,
@@ -1891,7 +1910,8 @@ For a plan (rather than a clarification), respond with exactly one structured JS
   "summary": "<non-empty concise implementation summary>",
   "plan_steps": ["<non-empty step>"],
   "additional_closing_issue_ids": [],
-  "human_requirement_dispositions": []
+  "human_requirement_dispositions": [],
+  "architecture_impact": {{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}
 }}
 
 `plan_steps` must be a non-empty list of non-empty strings and should cover the
@@ -1913,7 +1933,7 @@ schema. If signed human-requirements acknowledgement is required, put its
 after the JSON object and before the AGENT_PLAN_STATE footer. Do not put any other
 prose between the JSON object and footer.
 {_coder_workdir_guidance(config, implementation=False)}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block,))}
 {_scratch_file_guidance()}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
@@ -1995,7 +2015,7 @@ Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this planning review.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
 {_architecture_impact_guidance()}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(human_requirements_block,))}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}
 {unresolved_items_block}{_memory_block(memory, config)}
@@ -2018,7 +2038,8 @@ strategy, and ambiguity. Use this mandatory structured JSON response format:
   "prior_plan_item_dispositions": [
     {{"item_id": "item-1", "disposition": "resolved", "note": "Covered by the revised tests."}}
   ],
-  "human_requirement_dispositions": []
+  "human_requirement_dispositions": [],
+  "architecture_impact": {{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}
 }}
 <!-- AGENT_PLAN_STATE: approved -->
 -- {reviewer_signature}
@@ -2110,7 +2131,9 @@ def _build_compact_plan_review_prompt(
             "Signed human issue requirements are approval-critical issue constraints for this plan review.\n"
             f"{human_requirements_guidance}"
         ),
-        architecture_context=_architecture_context_block(config),
+            architecture_context=_architecture_context_block(
+                config, protected_context=(human_requirements_block,)
+            ),
         response_protocol=_plan_review_schema_and_rules() + "\n" + unresolved_items_guidance + _phased_plan_guard(config),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
@@ -2171,7 +2194,7 @@ def build_plan_decomposition_prompt(
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this decomposition stage.
 {_coder_workdir_guidance(config, implementation=False)}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(human_requirements_block, approved_plan))}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}
 {_memory_block(memory, config)}
@@ -2275,7 +2298,7 @@ branch, commit, push, or open a pull request during this planning stage.
         "Each bullet must explain how the revised plan covers that item or what remains risky or blocked."
     ),
 )}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block,))}
 {_issue_context_block(issue_context)}
 {unresolved_items_block}{_memory_block(memory, config, include_runtime=True)}
 
@@ -2317,7 +2340,8 @@ Use this mandatory structured JSON response format:
     "Normalize structured plan rendering and metadata-backed resume behavior in `src/coding_review_agent_loop/orchestrator.py`.",
     "Extend prompts and targeted tests for structured planning flows."
   ],
-  "additional_closing_issue_ids": []
+  "additional_closing_issue_ids": [],
+      "architecture_impact": {{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}
 }}
 <!-- AGENT_PLAN_STATE: blocking -->
 -- {coder_signature}
@@ -2382,7 +2406,9 @@ def _build_compact_plan_revision_prompt(
                 "Each bullet must explain how the revised plan covers that item or what remains risky or blocked."
             ),
         ),
-        architecture_context=_architecture_context_block(config),
+        architecture_context=_architecture_context_block(
+            config, protected_context=(human_requirements_context.block,)
+        ),
         response_protocol=_plan_revision_schema_and_rules(),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
@@ -2482,7 +2508,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block, format_approved_plan_context(plan_context, max_chars=None)))}
 {_architecture_impact_guidance()}
 {human_requirements_context.block}{_structured_issue_implementation_guidance(
     human_requirements_context=human_requirements_context,
@@ -2554,7 +2580,7 @@ nothing new in the background. Then commit, push, and open the pull request if
 that is not already done, or continue exactly where you left off.
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {human_requirements_context.block}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block,))}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_labeled_issue_context_block(issue_context, label="Target child/primary issue context")}
 {format_approved_plan_context(approved_plan_context)}
@@ -2575,7 +2601,7 @@ def build_task_prompt(
 
 Task:
 {task_text}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(task_text,))}
 {_memory_block(memory, config, include_runtime=True)}
 
 Use this local checkout as your workspace. Decide between two paths:
@@ -2589,14 +2615,14 @@ Use this local checkout as your workspace. Decide between two paths:
     must start with the JSON object, contain no prose between the object and
     its footer, and end with the footer plus your standalone signature:
     `{{"schema_version":1,"kind":"task_result","state":"blocking",`
-    `"outcome":"opened_pr","summary":"...","pr_number":123}}`
-    `<!-- AGENT_STATE: blocking -->` followed by `-- <signature>`.
+    `"outcome":"opened_pr","summary":"...","pr_number":123,`
+    `"architecture_impact":{{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}}}`
+    followed immediately by `<!-- AGENT_STATE: blocking -->` and `-- <signature>`.
     Use `outcome` `blocking` with no `pr_number`, or `clarification` with a
     non-empty `clarification` array, when those outcomes apply. Do not add an
-    `AGENT_PR` marker to a structured result; `pr_number` is its sole PR value.
-    Include the `architecture_impact` object when architecture context is
-    available; for unchanged work, empty impact lists and an empty canonical
-    document rationale are valid.
+    `AGENT_PR` or `AGENT_CLARIFY` marker to a structured result; `pr_number` is
+    its sole PR value and `clarification` is its sole question value. Include
+    the complete `architecture_impact` object in every fresh result.
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
@@ -2612,9 +2638,8 @@ timeout — explain the blocker, naming the exact command and the timeout, and
 end with `AGENT_STATE: blocking` without an `AGENT_PR` marker instead of
 inventing a placeholder like `AGENT_PR: 0`. Do not place your signature before
 the AGENT_STATE or AGENT_CLARIFY marker. Your response must end with, in this
-exact order — for a completed implementation:
+    exact order:
 
-<!-- AGENT_PR: <number> -->
 <!-- AGENT_STATE: blocking -->
 -- {coder_signature}
 
@@ -2622,8 +2647,9 @@ For a no-PR blocking result:
 <!-- AGENT_STATE: blocking -->
 -- {coder_signature}
 
-For clarification:
-<!-- AGENT_CLARIFY -->
+For clarification, use the same JSON envelope with `outcome: "clarification"`
+and a non-empty `clarification` array, followed by:
+<!-- AGENT_STATE: blocking -->
 -- {coder_signature}
 """
 
@@ -2646,7 +2672,7 @@ def build_task_clarification_prompt(
 
 Original task:
 {task_text}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(task_text,))}
 {_memory_block(memory, config, include_runtime=True)}
 
 Clarification so far:
@@ -2655,13 +2681,13 @@ Clarification so far:
 
 Now proceed. Strongly prefer to implement the task and open a PR. Only ask
 again if a critical detail is still missing.
-If implementing, use exactly the structured `task_result` JSON envelope and
+If implementing or asking another clarification, use exactly the structured
+`task_result` JSON envelope and
 footer described below: begin with one JSON object, add no prose before the
 `<!-- AGENT_STATE: blocking -->` footer, and put the PR number in `pr_number`
-instead of an `AGENT_PR` marker. If asking another clarification, emit only
-the `<!-- AGENT_CLARIFY -->` marker and your signature after the questions.
-When architecture context is available, include `architecture_impact`; an
-unchanged assessment may use empty lists and an empty canonical-document rationale.
+instead of an `AGENT_PR` marker. For clarification set `outcome` to
+`clarification` and provide a non-empty `clarification` array. Include the
+complete `architecture_impact` object in every fresh result.
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
@@ -2673,8 +2699,7 @@ exact command and the timeout, and end with `AGENT_STATE: blocking` without an
 place your signature before the AGENT_STATE or AGENT_CLARIFY marker. Your
 response must end with, in this exact order:
 
-For implementation:
-<!-- AGENT_PR: <number> -->
+For implementation or clarification:
 <!-- AGENT_STATE: blocking -->
 -- {coder_signature}
 
@@ -3384,7 +3409,7 @@ Do not create a new PR.
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and format_approved_plan_context(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
 
 {reviewer_name} review:
@@ -3441,7 +3466,7 @@ remains blocked pending another review round after this cleanup.
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and format_approved_plan_context(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
 
 Same-PR follow-ups:
@@ -3503,7 +3528,7 @@ against the new head after your push.
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=approved_plan_max_chars)}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
-{_architecture_context_block(config)}
+{_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and format_approved_plan_context(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
 
 Other unresolved reviewer items carried into this round (address them in the same \

@@ -209,6 +209,40 @@ def test_round_metadata_decode_uses_mapping_without_reencoding() -> None:
     assert _decode_round_metadata(_encode_round_metadata(metadata)) == metadata
 
 
+def test_round_metadata_round_trips_architecture_identity_and_impact() -> None:
+    identity = {
+        "repository": "OWNER/REPO",
+        "path": "ARCHITECTURE.md",
+        "revision": "a" * 40,
+        "blob_oid": "b" * 40,
+        "sha256": "c" * 64,
+        "availability": "available",
+        "size": 128,
+    }
+    impact = {
+        "status": "unchanged",
+        "rationale": "Only an internal test helper changed.",
+        "affected_components": [],
+        "dependencies": [],
+        "execution_data_flows": [],
+        "persistence": [],
+        "public_contracts": [],
+        "security_boundaries": [],
+        "canonical_document_action": "no-change",
+        "canonical_document_path": None,
+        "canonical_document_rationale": "No canonical update is needed.",
+    }
+    metadata = PostedRoundMetadata(
+        flow="pr", role="reviewer", agent="codex", round_number=1, subject="head",
+        architecture_identity=identity, architecture_impact=impact,
+        architecture_contract_version=1,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.architecture_identity == identity
+    assert decoded.architecture_impact == impact
+    assert decoded.architecture_contract_version == 1
+
+
 def test_round_metadata_round_trips_bounded_local_test_evidence() -> None:
     from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
 

@@ -275,5 +275,7 @@ guide in the same PR. An internal refactor or ordinary bug fix need not change
 the document if those contracts stay the same. Keep diagrams textual and paths
 relative; avoid copying volatile CLI defaults or protocol schemas here.
 
-Automatic architecture-context injection and mandatory architecture-impact
-reporting are follow-up work, not functionality added by this document.
+Architecture-context injection is bounded and advisory on the supported prompt
+paths, and fresh turns with an acquired architecture snapshot use the versioned
+architecture-impact assessment. Legacy records remain decodable without
+inventing a snapshot or assessment; source inspection remains required.

@@ -2583,6 +2583,32 @@ def test_validate_structured_task_result_accepts_meaningful_unchanged_impact():
     assert parsed.architecture_impact.status == "unchanged"
 
 
+def test_changed_architecture_impact_requires_complete_contract():
+    payload = {
+        "schema_version": 1,
+        "kind": "task_result",
+        "state": "blocking",
+        "outcome": "blocking",
+        "summary": "The implementation is blocked.",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The public execution boundary changed.",
+        },
+    }
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Coder"
+    with pytest.raises(AgentLoopError, match="changed assessments must include"):
+        validate_structured_task_result(text)
+
+
+def test_fresh_task_contract_rejects_legacy_marker_only_output():
+    with pytest.raises(AgentLoopError, match="Fresh task implementation"):
+        from coding_review_agent_loop.orchestrator import _require_task_implementation_result
+        _require_task_implementation_result(
+            "Implemented.\n<!-- AGENT_PR: 12 -->\n<!-- AGENT_STATE: blocking -->",
+            required_architecture_impact_contract=1,
+        )
+
+
 def test_validate_structured_human_requirements_acknowledgement_uses_disposition_ledger():
     from coding_review_agent_loop.protocol import HumanRequirementDisposition
 

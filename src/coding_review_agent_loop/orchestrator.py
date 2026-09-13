@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import dataclasses
 import hashlib
 import json
 import re
@@ -19,7 +20,7 @@ from typing import Literal
 from .agents.base import AgentName, AgentResult
 from .agents.antigravity import AntigravityAttemptState
 from .agents.registry import agent_display_name, agent_signature, get_backend, run_agent_result
-from .architecture_context import freeze_architecture_context
+from .architecture_context import architecture_material, freeze_architecture_context
 from .config import (
     AgentLoopConfig,
     configured_model_for,
@@ -552,6 +553,46 @@ def _freeze_prompt_architecture(
         candidate_revision=candidate_revision,
     )
     return dataclasses_replace(config, architecture_context=context)
+
+
+def _architecture_metadata_fields(
+    config: AgentLoopConfig, *, impact: object | None = None
+) -> dict[str, object]:
+    """Persist the complete acquisition identity, including unavailable states."""
+    context = config.architecture_context
+    identity = context.identity() if hasattr(context, "identity") else None
+    return {
+        "architecture_identity": identity,
+        "architecture_impact": dataclasses.asdict(impact) if dataclasses.is_dataclass(impact) else None,
+        "architecture_contract_version": 1 if identity is not None else None,
+    }
+
+
+def _revalidate_pr_architecture_identity(
+    runner: Runner, *, config: AgentLoopConfig, metadata: PullRequestMetadata
+) -> None:
+    """Reacquire the live PR pair at every qualification/merge snapshot."""
+    stored = config.architecture_context
+    if not config.architecture_context_enabled or not hasattr(stored, "identity"):
+        return
+    fresh_config = _freeze_prompt_architecture(
+        runner,
+        config,
+        target_revision=metadata.base_branch,
+        candidate_revision=metadata.head_sha,
+        pr_pair=True,
+    )
+    fresh = fresh_config.architecture_context
+    if not architecture_material(stored) and not architecture_material(fresh):
+        # Missing or unreadable documents retain the legacy no-material path.
+        # A later unavailable-to-available transition is still observable and
+        # invalidates the frozen identity below.
+        return
+    if hasattr(fresh, "identity") and fresh.identity() != stored.identity():
+        raise AgentLoopError(
+            "PR architecture identity changed during qualification or merge gate; "
+            "stale approval cannot be reused and a fresh review is required."
+        )
 TASK_IMPLEMENTATION_SALVAGE_SCOPE = "task-implementation"
 PR_FOLLOWUP_SALVAGE_SCOPE = "pr-followup"
 
@@ -3545,12 +3586,15 @@ def _validate_issue_implementation_response(
     text: str,
     *,
     human_requirements,
+    require_architecture_impact: bool = False,
 ) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
         return _TerminalNoPrImplementation("clarification")
     try:
-        parsed = validate_structured_issue_implementation(text)
+        parsed = validate_structured_issue_implementation(
+            text, required_architecture_impact_contract=(1 if require_architecture_impact else 0)
+        )
     except IssueImplementationConflictError as exc:
         parsed = exc.payload
         if not isinstance(parsed, StructuredIssueImplementation):
@@ -3634,15 +3678,27 @@ def _require_pr_number_or_clarification(text: str) -> int | str:
     )
 
 
-def _require_task_implementation_result(text: str) -> int | str | _TerminalNoPrImplementation:
-    """Accept a positive PR, a clarification request, or a terminal no-PR blocking result (#604)."""
-    structured = validate_structured_task_result(text)
+def _require_task_implementation_result(
+    text: str,
+    *,
+    required_architecture_impact_contract: int = 0,
+) -> int | str | StructuredTaskResult | _TerminalNoPrImplementation:
+    """Validate the fresh structured task envelope, with legacy recovery opt-in."""
+    structured = validate_structured_task_result(
+        text,
+        required_architecture_impact_contract=required_architecture_impact_contract,
+    )
     if structured is not None:
         if structured.outcome == "opened_pr":
             return structured
         if structured.outcome == "clarification":
-            return "clarification"
+            return structured
         return _TerminalNoPrImplementation("blocking")
+    if required_architecture_impact_contract == 1:
+        raise AgentLoopError(
+            "Fresh task implementation responses must use the structured "
+            "task_result contract with architecture_impact."
+        )
     pr_number = parse_pr_number(text)
     if pr_number is not None:
         return pr_number
@@ -3660,10 +3716,15 @@ def _require_task_implementation_result(text: str) -> int | str | _TerminalNoPrI
     )
 
 
-def _require_plan_state_or_clarification(text: str) -> StructuredPlanState | str:
+def _require_plan_state_or_clarification(
+    text: str, *, required_architecture_impact_contract: int = 0
+) -> StructuredPlanState | str:
     if is_clarification_request(text):
         return "clarification"
-    structured_plan = validate_structured_plan_state(text)
+    structured_plan = validate_structured_plan_state(
+        text,
+        required_architecture_impact_contract=required_architecture_impact_contract,
+    )
     if structured_plan is None:
         raise AgentLoopError(
             "Initial planning response must include a structured `plan_state` JSON object."
@@ -3847,8 +3908,11 @@ def _validate_plan_revision_response(
     text: str,
     *,
     unresolved_items: Sequence[UnresolvedReviewItem] = (),
+    require_architecture_impact: bool = False,
 ) -> StructuredPlanRevision | str:
-    parsed = validate_structured_plan_revision(text)
+    parsed = validate_structured_plan_revision(
+        text, required_architecture_impact_contract=(1 if require_architecture_impact else 0)
+    )
     if parsed is not None:
         allowed_ids = {item.item_id for item in unresolved_items}
         unknown = {
@@ -4825,6 +4889,7 @@ def _implement_approved_issue(
         approved_plan_hash=plan_hash,
     )
     sync_coder_base_before_implementation(implementation_config, runner)
+    implementation_config = _freeze_prompt_architecture(runner, implementation_config)
     managed_ci_creation_intent = preflight_managed_ci_creation(
         runner, config=implementation_config, issue_number=issue_number
     )
@@ -4857,6 +4922,9 @@ def _implement_approved_issue(
         validate=lambda text: _validate_issue_implementation_response(
             text,
             human_requirements=implementation_requirements,
+            require_architecture_impact=architecture_material(
+                implementation_config.architecture_context
+            ),
         ),
         usage_context=usage_context,
         role="coder",
@@ -5279,7 +5347,12 @@ def _run_plan_first_loop(
             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking --> or <!-- AGENT_CLARIFY -->",
             validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
                 text,
-                marker_validator=_require_plan_state_or_clarification,
+                marker_validator=lambda text: _require_plan_state_or_clarification(
+                    text,
+                    required_architecture_impact_contract=(
+                        1 if architecture_material(config.architecture_context) else 0
+                    ),
+                ),
                 human_requirements=human_requirements,
                 requirement_scope="planning requirements",
                 full_omission_fallback="Fetch the issue discussion directly before finalizing the plan.",
@@ -5341,6 +5414,9 @@ def _run_plan_first_loop(
                     **_metadata_identity_fields(plan_response),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
+                    **_architecture_metadata_fields(
+                        config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
+                    ),
                 ),
             ),
         )
@@ -5455,6 +5531,7 @@ def _run_plan_first_loop(
                         **(_metadata_identity_fields(identity) if identity is not None else {}),
                         acquisition_outcome=acquisition_outcome,
                         acquisition_returncode=acquisition_returncode,
+                        **_architecture_metadata_fields(config, impact=parsed.architecture_impact),
                         canonical_reviewer_response=(review_output if phase == "publication" else None),
                     ),
                 ),
@@ -6462,6 +6539,9 @@ def _run_plan_first_loop(
                 marker_validator=lambda revised_text: _validate_plan_revision_response(
                     revised_text,
                     unresolved_items=items,
+                    require_architecture_impact=architecture_material(
+                        config.architecture_context
+                    ),
                 ),
                 human_requirements=human_requirements,
                 requirement_scope="planning requirements",
@@ -6796,6 +6876,7 @@ def run_issue_loop(
             implementation_requirements,
         )
         sync_coder_base_before_implementation(config, runner)
+        config = _freeze_prompt_architecture(runner, config)
         managed_ci_creation_intent = None
         if config.managed_ci:
             # Direct issue mode is intentionally the only new creation path.
@@ -6836,6 +6917,9 @@ def run_issue_loop(
             validate=lambda text: _validate_issue_implementation_response(
                 text,
                 human_requirements=implementation_requirements,
+                require_architecture_impact=architecture_material(
+                    config.architecture_context
+                ),
             ),
             usage_context=usage_context,
             use_repair=True,
@@ -7034,6 +7118,7 @@ def run_issue_loop(
                 **_metadata_identity_fields(coder_response),
                 acquisition_outcome=coder_response.acquisition_outcome,
                 acquisition_returncode=coder_response.acquisition_returncode,
+                **_architecture_metadata_fields(config, impact=getattr(implementation_result, "architecture_impact", None)),
             ),
         )
         post_trusted_pr_comment(
@@ -7095,11 +7180,9 @@ def run_task_loop(
             raise AgentLoopError("--max-clarification-rounds must be zero or positive.")
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
-        config = _freeze_prompt_architecture(runner, config)
         memory = prepare_agent_memory(runner, config)
 
         history: list[tuple[str, str]] = []
-        prompt = build_task_prompt(task_text, config, memory)
         read_clarification = clarification_input or _read_clarification_from_stdin
         coder_name = agent_display_name(config.coder)
         session_id: str | None = None
@@ -7107,6 +7190,8 @@ def run_task_loop(
         for attempt in range(max_clarification_rounds + 1):
             if attempt == 0:
                 sync_coder_base_before_implementation(config, runner)
+                config = _freeze_prompt_architecture(runner, config)
+                prompt = build_task_prompt(task_text, config, memory)
             assigned_head_before = _read_assigned_workdir_head(runner, config)
             log(config, f"Task attempt {attempt + 1}: invoking {coder_name}")
             coder_response = _run_validated_agent(
@@ -7115,8 +7200,13 @@ def run_task_loop(
                 config=config,
                 prompt=prompt,
                 session_id=session_id,
-                marker_description="<!-- AGENT_PR: <number> -->, PR URL, blocking, or <!-- AGENT_CLARIFY -->",
-                validate=_require_task_implementation_result,
+                marker_description="structured task_result JSON, blocking, or clarification outcome",
+                validate=lambda text: _require_task_implementation_result(
+                    text,
+                    required_architecture_impact_contract=(
+                        1 if architecture_material(config.architecture_context) else 0
+                    ),
+                ),
                 usage_context=usage_context,
                 salvage_context=SalvageContext(
                     repo=config.repo,
@@ -7142,7 +7232,9 @@ def run_task_loop(
                     f"{coder_response.marker_value.state}.\n\n{coder_output}"
                 )
 
-            if isinstance(coder_response.marker_value, int) or structured_task is not None:
+            if isinstance(coder_response.marker_value, int) or (
+                structured_task is not None and structured_task.outcome == "opened_pr"
+            ):
                 pr_number = (
                     structured_task.pr_number
                     if structured_task is not None
@@ -7180,6 +7272,7 @@ def run_task_loop(
                             **_metadata_identity_fields(coder_response),
                             acquisition_outcome=coder_response.acquisition_outcome,
                             acquisition_returncode=coder_response.acquisition_returncode,
+                            **_architecture_metadata_fields(config, impact=getattr(structured_task, "architecture_impact", None)),
                         ),
                     ),
                 )
@@ -7191,6 +7284,12 @@ def run_task_loop(
                     workdirs_ready=True,
                     usage_context=usage_context,
                     pre_review_test_pending=True,
+                )
+
+            if structured_task is not None and structured_task.outcome == "blocking":
+                raise AgentLoopError(
+                    "Coder returned a structured task blocking result without a PR.\n\n"
+                    + coder_output
                 )
 
             if not interactive:
@@ -7958,6 +8057,7 @@ def _persist_qualification_checkpoint(
                 state="blocking",
                 phase="qualification-checkpoint",
                 qualification_checkpoint=checkpoint,
+                **_architecture_metadata_fields(config),
             ),
         ),
     )
@@ -8312,6 +8412,9 @@ def _fresh_pr_qualification_snapshot(
 ]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    _revalidate_pr_architecture_identity(
+        runner, config=config, metadata=context.metadata
+    )
     if scheduler_contract is not None:
         # Scheduler metadata is an optimization over the immutable required
         # reviewer contract. A fresh qualification read must never silently
@@ -9808,6 +9911,7 @@ def run_pr_loop(
                             acquisition_outcome=acquisition_outcome,
                             acquisition_returncode=acquisition_returncode,
                             surfaced_reviewer_requirement_ids=surfaced_reviewer_requirement_ids,
+                            **_architecture_metadata_fields(config, impact=parsed.architecture_impact),
                             approved_plan_hash=(
                                 approved_plan_context.plan_hash
                                 if approved_plan_context is not None
@@ -12484,6 +12588,9 @@ def run_pr_loop(
                 scheduler_force_full=(scheduler_force_full if selective_policy else None),
                 scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
                 qualification_checkpoint=qualification_checkpoint,
+                **_architecture_metadata_fields(
+                    config, impact=getattr(coder_response.marker_value, "architecture_impact", None)
+                ),
             )
             post_pr_comment(
                 runner,

@@ -121,6 +121,10 @@ def make_minimal_config(
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context_enabled: bool = True,
     architecture_path: str = "ARCHITECTURE.md",
+    architecture_read_size: int = 64 * 1024,
+    architecture_snapshot_max_chars: int = 12_000,
+    architecture_aggregate_max_chars: int = 24_000,
+    managed_context_max_chars: int = 80_000,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> AgentLoopConfig:
     tmp_base = Path(tempfile.gettempdir()) / "coding-review-agent-loop"
@@ -175,6 +179,10 @@ def make_minimal_config(
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_context_enabled=architecture_context_enabled,
         architecture_path=architecture_path,
+        architecture_read_size=architecture_read_size,
+        architecture_snapshot_max_chars=architecture_snapshot_max_chars,
+        architecture_aggregate_max_chars=architecture_aggregate_max_chars,
+        managed_context_max_chars=managed_context_max_chars,
         architecture_context=architecture_context,
     )
 
@@ -358,6 +366,9 @@ def build_pr_fix_prompt_for_skill(
     approved_plan_max_chars: int | None = None,
     local_test_evidence: str | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context_enabled: bool = True,
+    architecture_path: str = "ARCHITECTURE.md",
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> str:
     """Build the external-coder PR-fix prompt from skill-mode ledger items.
 
@@ -367,7 +378,11 @@ def build_pr_fix_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context_enabled=architecture_context_enabled,
+        architecture_path=architecture_path,
+        architecture_context=architecture_context,
     )
+    architecture_context = architecture_context or _acquire_skill_architecture(config, workdir=workdir)
     unresolved = [_deserialize_unresolved_item(item) for item in active_items_raw]
     evidence_guidance = _local_test_evidence_guidance(local_test_evidence)
     human_requirements_context = render_coder_human_requirements_prompt_context(
@@ -387,6 +402,7 @@ def build_pr_fix_prompt_for_skill(
             human_requirements_context=human_requirements_context,
             approved_plan_context=approved_plan_context,
             approved_plan_max_chars=approved_plan_max_chars,
+            architecture_context=architecture_context,
         ), config)
     review_text = _format_unresolved_items_for_coder(unresolved) + evidence_guidance
     return _with_containment_guidance(build_followup_prompt(
@@ -401,6 +417,7 @@ def build_pr_fix_prompt_for_skill(
         human_requirements_context=human_requirements_context,
         approved_plan_context=approved_plan_context,
         approved_plan_max_chars=approved_plan_max_chars,
+        architecture_context=architecture_context,
     ), config)
 
 
