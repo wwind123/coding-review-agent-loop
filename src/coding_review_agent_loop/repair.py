@@ -25,6 +25,7 @@ from .config import DEFAULT_REASONING_EFFORT
 from .logging import agent_log_path
 from .runner import strip_ansi
 from .repair_preservation import validate_repair_preservation
+from .protocol_markers import scan_reserved_markers
 from .usage import RunUsageContext, estimate_usage
 from .protocol import (
     HUMAN_REQUIREMENTS_RESOLVED_RE,
@@ -234,6 +235,8 @@ You are a format-repair assistant. An AI agent produced an initial plan state, c
 
 {prior_item_dispositions_instruction}
 
+{reserved_marker_instruction}
+
 {fresh_contract_instruction}
 
 ## LOSSLESS CONTENT CONTRACT (all response kinds):
@@ -244,6 +247,16 @@ verbatim where their fields are valid. Retain failure, timeout, skipped-test,
 partial-coverage, and unresolved-work caveats. Do not replace detailed evidence
 with a shorter conclusion, remove code paths or line references, combine distinct
 findings, or invent tests, results, explanations, item IDs, or requirement IDs.
+
+The format examples below are minimal illustrations, not exhaustive allowlists.
+For plan_state, plan_revision, plan_review, pr_review, coder_followup, and
+issue_implementation, `architecture_impact` is an allowed optional object.
+When present in the source, copy the COMPLETE `architecture_impact` object,
+including every nested field, array entry, path, rationale, and uncertainty.
+Do not omit it because an example lacks it, replace a changed assessment with
+unchanged, or invent an assessment when the source has none. A marker-only
+repair must keep this object and every other valid source field unchanged
+except for the specific unsafe marker text that needs neutralization.
 
 When a finding object must become a string, concatenate its complete title,
 detail, evidence, and other substantive text, in order. Do not keep just the title.
@@ -263,6 +276,8 @@ human_requirements.addressed_ids must be empty (including no not-applicable rows
 Before responding, compare source and output: every retained finding needs its
 full supporting text, every test needs its original status/caveat, and every ID
 must stay in its correct ledger. Do not silently fill gaps with invented facts.
+Specifically compare `architecture_impact` recursively when present: repairing
+a finding's quoted protocol syntax does not authorize dropping this assessment.
 
 ## APPROVED-PLAN RECONCILIATION (coder follow-ups):
 
@@ -1269,8 +1284,30 @@ def _build_repair_prompt(
         "topology data.\n"
         if require_execution_strategy_contract else ""
     )
+    detected_markers = scan_reserved_markers(raw)
+    detected_tokens = sorted({item.definition.token for item in detected_markers})
+    safe_labels = {
+        token: next(
+            item.definition.safe_label
+            for item in detected_markers
+            if item.definition.token == token
+        )
+        for token in detected_tokens
+    }
     prompt = _REPAIR_PROMPT.replace("{expected_kind_instruction}", expected_kind_instruction, 1)
     replacements = (
+        ("{reserved_marker_instruction}", (
+            "## Registry-detected reserved syntax in this source:\n"
+            + json.dumps(detected_tokens)
+            + "\nUse the exact safe label mapped to each detected family:\n"
+            + json.dumps(safe_labels, sort_keys=True)
+            + "\nNeutralize only unsafe occurrences of these detected marker families in prose/JSON values. "
+            "When a marker is embedded in a finding or other prose, replace only that marker occurrence "
+            "with the mapped safe label and preserve every surrounding word on the line. "
+            "Do not rename other bare code identifiers merely because they start with AGENT_. "
+            "The complete-marker grammar and a bare identifier are not interchangeable. "
+            "Keep the required response footer and signature intact.\n"
+        )),
         ("{issue_implementation_instruction}", issue_implementation_instruction),
         ("{coder_followup_required_items_instruction}", coder_followup_required_items_instruction),
         ("{coder_followup_human_requirements_instruction}", coder_followup_human_requirements_instruction),

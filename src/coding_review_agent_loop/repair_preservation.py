@@ -1,6 +1,6 @@
 """Bounded loss checks for parseable review and implementation repair inputs."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import re
 
 from .errors import AgentLoopError
@@ -9,7 +9,7 @@ from .protocol import (
     _normalize_requirement_label,
     normalize_response_file_structured_text,
 )
-from .protocol_markers import scan_reserved_markers
+from .protocol_markers import historical_text_fragments
 
 
 _KINDS = {
@@ -26,6 +26,23 @@ _FINDING_METADATA_KEYS = {
     "id", "item_id", "severity", "category", "state", "disposition", "verdict",
 }
 _HUMAN_REQUIREMENT_DISPOSITIONS = {"addressed", "blocked", "not-applicable"}
+_ARCHITECTURE_IMPACT_KEYS = frozenset({
+    "status", "rationale", "affected_components", "dependencies",
+    "execution_data_flows", "execution_flows", "data_flows", "persistence",
+    "public_contracts", "security_boundaries", "canonical_document_action",
+    "canonical_document_path", "canonical_document_rationale", "uncertainty",
+})
+_ARCHITECTURE_LIST_KEYS = frozenset({
+    "affected_components", "dependencies", "execution_data_flows",
+    "execution_flows", "data_flows", "persistence", "public_contracts",
+    "security_boundaries", "uncertainty",
+})
+_ARCHITECTURE_FLOW_ALIAS_KEYS = ("execution_flows", "data_flows")
+
+
+def _schema_valid_architecture_entry(value: object) -> bool:
+    """Return whether one architecture-list entry can pass schema validation."""
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _payload(text: str) -> dict | None:
@@ -64,8 +81,10 @@ def _normalized_requirement_id(text: str) -> str | None:
 
 def _fragments(value: object) -> list[str]:
     if isinstance(value, str):
-        # Reserved protocol syntax must be removable; its safety validator wins.
-        return [value] if value.strip() and not scan_reserved_markers(value) else []
+        # A repair may use any safe neutralization. Require the substantive
+        # prose around a marker, not the registry's particular replacement
+        # label, and allow marker-only text to be replaced freely.
+        return list(historical_text_fragments(value))
     if isinstance(value, list):
         return [text for child in value for text in _fragments(child)]
     if isinstance(value, dict):
@@ -75,6 +94,91 @@ def _fragments(value: object) -> list[str]:
             for text in _fragments(child)
         ]
     return []
+
+
+def _contains_fragments(candidate: object, fragments: Sequence[str]) -> bool:
+    if not isinstance(candidate, str):
+        return False
+    normalized = _normalized(candidate)
+    return all(_normalized(fragment) in normalized for fragment in fragments)
+
+
+def _schema_valid_architecture_field(key: str, value: object) -> bool:
+    """Return whether a raw architecture field can be preserved safely.
+
+    Repair preservation also sees malformed source JSON.  Only pin fields whose
+    source value could have passed the architecture schema; otherwise the repair
+    must be allowed to correct that field into a schema-valid representation.
+    """
+    if key not in _ARCHITECTURE_IMPACT_KEYS:
+        return False
+    if key == "status":
+        return isinstance(value, str) and value.strip() in {"changed", "unchanged"}
+    if key in {"rationale", "canonical_document_action"}:
+        return isinstance(value, str) and bool(value.strip())
+    if key == "canonical_document_path":
+        return value is None or (isinstance(value, str) and bool(value.strip()))
+    if key == "canonical_document_rationale":
+        # The protocol permits an omitted/empty rationale as its default.  A
+        # raw null is normalized to that default and is therefore not pinned.
+        return isinstance(value, str) and (not value or bool(value.strip()))
+    if key in _ARCHITECTURE_LIST_KEYS:
+        # A partially malformed list still contains recoverable content.  Pin
+        # the field when it has at least one schema-valid entry, while allowing
+        # invalid entries to be removed or corrected by the ordinary schema
+        # repair.  Keep empty lists pinned because an empty list is valid.
+        return isinstance(value, list) and (
+            not value or any(_schema_valid_architecture_entry(item) for item in value)
+        )
+    return False
+
+
+def _preserve_architecture_list(
+    source: list[object],
+    target: object,
+    *,
+    field: str,
+    require: Callable[[bool, str], None],
+) -> None:
+    """Match every architecture entry to a distinct repaired entry.
+
+    Marker-only entries have no prose fragments to compare, but their presence
+    is still content.  Treat them as wildcards in the matching graph while
+    retaining the source list's cardinality and one-to-one correspondence.
+    The augmenting-path matcher avoids making the result depend on source
+    ordering when one entry's fragments are a subset of another's.
+    """
+    require(isinstance(target, list), field)
+    valid_source = [
+        entry for entry in source if _schema_valid_architecture_entry(entry)
+    ]
+    # Valid source entries must survive one-for-one.  Invalid source entries
+    # may be corrected into a schema-valid entry or removed, so the repaired
+    # list may be shorter than the source but cannot grow beyond it.
+    require(len(valid_source) <= len(target) <= len(source), field)
+
+    matched_source_by_target: dict[int, int] = {}
+
+    def can_match(source_entry: str, target_entry: object) -> bool:
+        fragments = _fragments(source_entry)
+        return not fragments or _contains_fragments(target_entry, fragments)
+
+    def augment(source_index: int, visited_targets: set[int]) -> bool:
+        for target_index, target_entry in enumerate(target):
+            if target_index in visited_targets:
+                continue
+            if not can_match(valid_source[source_index], target_entry):
+                continue
+            visited_targets.add(target_index)
+            previous_source_index = matched_source_by_target.get(target_index)
+            if (previous_source_index is None
+                    or augment(previous_source_index, visited_targets)):
+                matched_source_by_target[target_index] = source_index
+                return True
+        return False
+
+    for source_index in range(len(valid_source)):
+        require(augment(source_index, set()), field)
 
 
 def validate_repair_preservation(
@@ -106,27 +210,105 @@ def validate_repair_preservation(
 
     impact = source.get("architecture_impact")
     if isinstance(impact, dict):
+        valid_impact_fields = [
+            (key, value) for key, value in impact.items()
+            if _schema_valid_architecture_field(key, value)
+        ]
         target_impact = target.get("architecture_impact")
-        require(isinstance(target_impact, dict), "architecture_impact")
-        for key, value in impact.items():
-            if isinstance(value, str) and _fragments(value):
-                candidate = target_impact.get(key)
-                exact = key in {"status", "canonical_document_action"}
-                require(
-                    isinstance(candidate, str)
-                    and (
-                        _normalized(value) == _normalized(candidate)
-                        if exact
-                        else _normalized(value) in _normalized(candidate)
-                    ),
-                    f"architecture_impact.{key}",
+        require(
+            not valid_impact_fields or isinstance(target_impact, dict),
+            "architecture_impact",
+        )
+        if not valid_impact_fields:
+            target_impact = {}
+        else:
+            assert isinstance(target_impact, dict)
+
+        # The parser treats execution_flows/data_flows as aliases for the
+        # canonical execution_data_flows list when the latter is omitted.  A
+        # repair may normalize either pair, so compare missing aliases as one
+        # list instead of requiring each raw spelling to survive.
+        aliased_source_flows: list[object] = []
+        aliased_flow_keys: set[str] = set()
+        for key in _ARCHITECTURE_FLOW_ALIAS_KEYS:
+            value = impact.get(key)
+            if not _schema_valid_architecture_field(key, value):
+                continue
+            if key in target_impact:
+                if "execution_data_flows" not in target_impact or all(
+                    other_key in target_impact
+                    for other_key in _ARCHITECTURE_FLOW_ALIAS_KEYS
+                    if _schema_valid_architecture_field(other_key, impact.get(other_key))
+                ):
+                    _preserve_architecture_list(
+                        value,
+                        target_impact[key],
+                        field=f"architecture_impact.{key}",
+                        require=require,
+                    )
+                    aliased_flow_keys.add(key)
+                    continue
+            if "execution_data_flows" in target_impact:
+                aliased_source_flows.extend(value)
+                aliased_flow_keys.add(key)
+        if aliased_source_flows:
+            _preserve_architecture_list(
+                aliased_source_flows,
+                target_impact["execution_data_flows"],
+                field="architecture_impact.execution_data_flows",
+                require=require,
+            )
+
+        for key, value in valid_impact_fields:
+            if key in aliased_flow_keys:
+                continue
+            field = f"architecture_impact.{key}"
+            if key == "execution_data_flows" and key not in target_impact and any(
+                alias in target_impact for alias in _ARCHITECTURE_FLOW_ALIAS_KEYS
+            ):
+                target_flow_aliases: list[object] = []
+                for alias in _ARCHITECTURE_FLOW_ALIAS_KEYS:
+                    alias_value = target_impact.get(alias, [])
+                    require(isinstance(alias_value, list), field)
+                    target_flow_aliases.extend(alias_value)
+                _preserve_architecture_list(
+                    value,
+                    target_flow_aliases,
+                    field=field,
+                    require=require,
                 )
+                continue
+            require(key in target_impact, field)
+            candidate = target_impact[key]
+            fragments = _fragments(value)
+            if isinstance(value, str):
+                if fragments:
+                    exact = key in {"status", "canonical_document_action"} and len(fragments) == 1
+                    require(
+                        (
+                            isinstance(candidate, str)
+                            and _normalized(fragments[0]) == _normalized(candidate)
+                            if exact
+                            else _contains_fragments(candidate, fragments)
+                        ),
+                        field,
+                    )
+                elif not value:
+                    require(candidate == value, field)
+                else:
+                    # Marker-only prose may be neutralized, but it must not
+                    # change the architecture field's scalar type.
+                    require(isinstance(candidate, str), field)
             elif isinstance(value, list):
-                candidate = target_impact.get(key)
-                require(isinstance(candidate, list), f"architecture_impact.{key}")
-                for entry in value:
-                    if isinstance(entry, str) and _fragments(entry):
-                        require(entry in candidate, f"architecture_impact.{key}")
+                _preserve_architecture_list(
+                    value,
+                    candidate,
+                    field=field,
+                    require=require,
+                )
+            else:
+                # Preserve schema-valid scalar values such as null exactly.
+                require(type(candidate) is type(value) and candidate == value, field)
 
     if source["kind"] in {"plan_state", "plan_revision"} and (
         "execution_strategy_contract_version" in source
@@ -166,10 +348,10 @@ def validate_repair_preservation(
         )
 
     summary = source.get("summary")
-    if isinstance(summary, str) and _fragments(summary):
+    summary_fragments = _fragments(summary)
+    if isinstance(summary, str) and summary_fragments:
         require(
-            isinstance(target.get("summary"), str)
-            and _normalized(summary) in _normalized(target["summary"]),
+            _contains_fragments(target.get("summary"), summary_fragments),
             "summary",
         )
 
@@ -181,13 +363,20 @@ def validate_repair_preservation(
     for field in fields:
         entries = source.get(field)
         if isinstance(entries, list) and all(isinstance(e, str) for e in entries):
-            required = [_normalized(e) for e in entries if _fragments(e)]
             actual = target.get(field, [])
             require(isinstance(actual, list), field)
-            available = [_normalized(e) for e in actual if isinstance(e, str)]
-            for entry in required:
-                require(entry in available, field)
-                available.remove(entry)
+            available = list(actual)
+            for entry in entries:
+                fragments = _fragments(entry)
+                if not fragments:
+                    continue
+                match = next(
+                    (index for index, candidate in enumerate(available)
+                     if _contains_fragments(candidate, fragments)),
+                    None,
+                )
+                require(match is not None, field)
+                available.pop(match)
 
     if source["kind"] in {"coder_followup", "issue_implementation"}:
         source_observations = source.get("test_observations")
@@ -217,8 +406,7 @@ def validate_repair_preservation(
                     for bucket in ("addressed_item_notes", "remaining_item_notes")
                     if isinstance(target.get(bucket), dict)
                 ]
-                require(any(isinstance(c, str) and _normalized(note) in _normalized(c)
-                            for c in candidates), field)
+                require(any(_contains_fragments(c, _fragments(note)) for c in candidates), field)
 
         disputed_items = source.get("disputed_items")
         if isinstance(disputed_items, list) and all(
@@ -242,8 +430,7 @@ def validate_repair_preservation(
                     continue
                 candidate = target_evidence.get(item_id)
                 require(
-                    isinstance(candidate, str)
-                    and _normalized(evidence) in _normalized(candidate),
+                    _contains_fragments(candidate, _fragments(evidence)),
                     "dispute_evidence",
                 )
 
@@ -296,8 +483,7 @@ def validate_repair_preservation(
             if isinstance(evidence, str) and _fragments(evidence):
                 candidate_evidence = match.get("evidence")
                 require(
-                    isinstance(candidate_evidence, str)
-                    and _normalized(evidence) in _normalized(candidate_evidence),
+                    _contains_fragments(candidate_evidence, _fragments(evidence)),
                     "human_requirement_dispositions",
                 )
 
@@ -319,12 +505,12 @@ def validate_repair_preservation(
         if not isinstance(entries, list):
             continue
         for entry in entries:
-            fragments = [_normalized(text) for text in _fragments(entry)]
+            fragments = _fragments(entry)
             if not fragments:
                 continue
             match = next(
                 (i for i, candidate in enumerate(available)
-                 if all(text in candidate for text in fragments)), None,
+                 if _contains_fragments(candidate, fragments)), None,
             )
             require(match is not None, field)
             available.pop(match)

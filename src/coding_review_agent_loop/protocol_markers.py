@@ -413,9 +413,85 @@ def scan_reserved_markers(text: str) -> tuple[MarkerOccurrence, ...]:
     return _all_occurrences(text)
 
 
+def _is_complete_historical_occurrence(occurrence: MarkerOccurrence) -> bool:
+    match = occurrence.definition.pattern.fullmatch(occurrence.text)
+    if match is None:
+        return False
+    if occurrence.definition.codec != "key-value-line":
+        return True
+    try:
+        occurrence.definition.canonicalizer(match)
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, zlib.error):
+        return False
+    return True
+
+
+def _historical_replacement_occurrences(text: str) -> tuple[MarkerOccurrence, ...]:
+    """Return safe replacement spans without discarding surrounding prose.
+
+    A name-bearing-line fallback is deliberately broad while scanning so a
+    malformed marker cannot pass unnoticed. Historical text still needs to
+    retain the prose around that mention, though, so replace the token itself
+    unless the complete marker grammar matched the occurrence.
+    """
+    occurrences = _all_occurrences(text)
+    complete_occurrences = tuple(
+        occurrence for occurrence in occurrences
+        if _is_complete_historical_occurrence(occurrence)
+    )
+    replacements: list[MarkerOccurrence] = []
+    for occurrence in occurrences:
+        definition = occurrence.definition
+        line_match = definition.pattern.fullmatch(occurrence.text)
+        invalid_line_record = False
+        if definition.codec == "key-value-line" and line_match is not None:
+            try:
+                definition.canonicalizer(line_match)
+            except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, zlib.error):
+                invalid_line_record = True
+        if (
+            definition.strictness == "name-bearing-line"
+            and definition.pattern.fullmatch(occurrence.text) is None
+        ) or invalid_line_record:
+            for match in re.finditer(re.escape(definition.token), occurrence.text, re.I):
+                replacements.append(
+                    MarkerOccurrence(
+                        definition,
+                        occurrence.start + match.start(),
+                        occurrence.start + match.end(),
+                        match.group(0),
+                    )
+                )
+        else:
+            replacements.append(occurrence)
+
+    # The scanner deliberately returns non-overlapping spans, so a broad
+    # name-bearing-line fallback can hide another strict token on the same
+    # line. Historical text must neutralize both mentions unless a complete
+    # record already covers the nested token.
+    seen = {(item.definition.token, item.start, item.end) for item in replacements}
+    for definition in RESERVED_MARKER_REGISTRY:
+        if definition.strictness == "well-formed-only":
+            continue
+        for match in re.finditer(re.escape(definition.token), text, re.I):
+            if any(
+                complete.start <= match.start() and match.end() <= complete.end
+                for complete in complete_occurrences
+            ):
+                continue
+            key = (definition.token, match.start(), match.end())
+            if key in seen:
+                continue
+            replacements.append(
+                MarkerOccurrence(definition, match.start(), match.end(), match.group(0))
+            )
+            seen.add(key)
+    return tuple(sorted(replacements, key=lambda item: item.start))
+
+
 def sanitize_historical_text(text: str) -> str:
     """Replace reserved spans with stable labels, preserving surrounding prose."""
-    occurrences = _all_occurrences(text)
+    occurrences = _historical_replacement_occurrences(text)
     if not occurrences:
         return text
     pieces: list[str] = []
@@ -429,6 +505,39 @@ def sanitize_historical_text(text: str) -> str:
     if _all_occurrences(safe):
         raise AgentLoopError("Historical marker neutralization produced a reserved marker.")
     return safe
+
+
+def historical_text_fragments(text: str) -> tuple[str, ...]:
+    """Return substantive text outside spans that historical repair may replace.
+
+    Preservation checks must not require a repair backend to reproduce this
+    registry's label or punctuation around a quoted marker.  They do still
+    need to retain the prose on either side of the marker.  Complete records
+    and strict fallback mentions use the same replacement spans as
+    :func:`sanitize_historical_text`, so malformed name-bearing lines retain
+    their surrounding prose as well.
+    """
+    if not isinstance(text, str):
+        raise TypeError("historical text must be a string")
+    occurrences = _historical_replacement_occurrences(text)
+    if not occurrences:
+        return (text,) if text.strip() else ()
+
+    fragments: list[str] = []
+    cursor = 0
+    for occurrence in occurrences:
+        fragment = text[cursor:occurrence.start]
+        if text[occurrence.start - 1:occurrence.start] in {"`", "'", '"'}:
+            fragment = fragment[:-1]
+        if fragment.strip() and re.search(r"\w", fragment):
+            fragments.append(fragment)
+        cursor = occurrence.end
+        if text[cursor:cursor + 1] in {"`", "'", '"'}:
+            cursor += 1
+    fragment = text[cursor:]
+    if fragment.strip() and re.search(r"\w", fragment):
+        fragments.append(fragment)
+    return tuple(fragments)
 
 
 @dataclass(frozen=True)

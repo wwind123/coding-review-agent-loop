@@ -4,6 +4,7 @@ from copy import deepcopy
 import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.protocol import validate_structured_task_result
 from coding_review_agent_loop.repair import _build_repair_prompt
 from coding_review_agent_loop.repair_preservation import validate_repair_preservation
 from agent_loop_helpers import structured_v1_plan_state
@@ -11,6 +12,18 @@ from agent_loop_helpers import structured_v1_plan_state
 
 def check(source, target):
     validate_repair_preservation(json.dumps(source), json.dumps(target))
+
+
+def valid_task_result(impact):
+    payload = {
+        "schema_version": 1,
+        "kind": "task_result",
+        "state": "blocking",
+        "outcome": "blocking",
+        "summary": "The task is blocked.",
+        "architecture_impact": impact,
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Coder"
 
 
 def _execution_source(*, strategy: str) -> dict:
@@ -184,6 +197,212 @@ def test_repair_preserves_architecture_impact_fields():
     repaired["architecture_impact"]["uncertainty"] = []
     with pytest.raises(AgentLoopError, match="architecture_impact.uncertainty"):
         check(source, repaired)
+
+
+def test_repair_preserves_marker_only_architecture_entry():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "uncertainty": ["`AGENT_SPLIT_UNFILED_WARNING`"],
+        },
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "uncertainty": ["[protocol split-warning record]"],
+        },
+    }
+    check(source, repaired)
+    with pytest.raises(AgentLoopError, match="architecture_impact.uncertainty"):
+        check(source, {"kind": "task_result", "architecture_impact": {"uncertainty": []}})
+
+
+def test_architecture_entries_require_distinct_one_to_one_matches():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "affected_components": ["shared component", "shared component"],
+        },
+    }
+    check(source, source)
+    with pytest.raises(AgentLoopError, match="architecture_impact.affected_components"):
+        check(source, {
+            "kind": "task_result",
+            "architecture_impact": {"affected_components": ["shared component", "unrelated"]},
+        })
+    with pytest.raises(AgentLoopError, match="architecture_impact.affected_components"):
+        check(source, {
+            "kind": "task_result",
+            "architecture_impact": {"affected_components": ["shared component"]},
+        })
+
+
+def test_malformed_architecture_list_cannot_drop_valid_entries():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "affected_components": ["orchestrator.py", 123],
+        },
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "affected_components": ["orchestrator.py"],
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
+
+    dropped = deepcopy(repaired)
+    dropped["architecture_impact"]["affected_components"] = []
+    with pytest.raises(AgentLoopError, match="architecture_impact.affected_components"):
+        check(source, dropped)
+
+
+def test_architecture_scalar_fields_cannot_be_omitted_or_type_changed():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "rationale": "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "rationale": "Managed CI override record.",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+    check(source, repaired)
+
+    for key in source["architecture_impact"]:
+        omitted = deepcopy(repaired)
+        del omitted["architecture_impact"][key]
+        with pytest.raises(AgentLoopError, match=f"architecture_impact\\.{key}"):
+            check(source, omitted)
+
+    wrong_type = deepcopy(repaired)
+    wrong_type["architecture_impact"]["rationale"] = None
+    with pytest.raises(AgentLoopError, match="architecture_impact.rationale"):
+        check(source, wrong_type)
+
+    changed_null = deepcopy(repaired)
+    changed_null["architecture_impact"]["canonical_document_path"] = "ARCHITECTURE.md"
+    with pytest.raises(AgentLoopError, match="architecture_impact.canonical_document_path"):
+        check(source, changed_null)
+
+    changed_empty = deepcopy(repaired)
+    changed_empty["architecture_impact"]["canonical_document_rationale"] = "Added a default."
+    with pytest.raises(AgentLoopError, match="architecture_impact.canonical_document_rationale"):
+        check(source, changed_empty)
+
+
+def test_invalid_architecture_source_key_does_not_deadlock_repair():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The source rationale remains relevant.",
+            "componets": ["Malformed source key."],
+        },
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The source rationale remains relevant.",
+            "affected_components": [],
+            "dependencies": [],
+            "execution_data_flows": [],
+            "persistence": [],
+            "public_contracts": [],
+            "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
+
+
+def test_invalid_architecture_empty_rationale_does_not_deadlock_repair():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {"status": "changed", "rationale": ""},
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The corrected assessment is complete.",
+            "affected_components": [],
+            "dependencies": [],
+            "execution_data_flows": [],
+            "persistence": [],
+            "public_contracts": [],
+            "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
+
+
+def test_invalid_architecture_status_does_not_deadlock_repair():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {"status": 123, "rationale": "The rationale remains."},
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The rationale remains.",
+            "affected_components": [],
+            "dependencies": [],
+            "execution_data_flows": [],
+            "persistence": [],
+            "public_contracts": [],
+            "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
+
+
+def test_architecture_flow_aliases_can_be_normalized_to_combined_field():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "execution_flows": ["agent -> round metadata"],
+            "data_flows": ["round metadata -> review"],
+        },
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "execution_data_flows": [
+                "agent -> round metadata",
+                "round metadata -> review",
+            ],
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
 
 
 def test_case06_object_to_string_keeps_every_detail():
@@ -455,6 +674,24 @@ def test_fenced_source_does_not_disable_loss_checks(fence):
 def test_reserved_grammar_safety_correction_is_not_blocked():
     check({"kind": "coder_followup", "summary": "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"},
           {"kind": "coder_followup", "summary": "Managed CI override."})
+
+
+def test_embedded_managed_ci_identifier_preserves_following_prose():
+    original = {
+        "kind": "coder_followup",
+        "summary": (
+            "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1 followed by substantive evidence."
+        ),
+    }
+    repaired = {
+        "kind": "coder_followup",
+        "summary": "Managed CI override record. followed by substantive evidence.",
+    }
+    check(original, repaired)
+
+    repaired["summary"] = "Managed CI override record."
+    with pytest.raises(AgentLoopError, match="summary"):
+        check(original, repaired)
 
 
 def test_no_reviewer_ids_become_signed_requirements():
