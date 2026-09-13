@@ -3354,6 +3354,7 @@ class TestHostReviewerPR:
     def test_pr_host_handoff_carries_separate_architecture_pair(self, monkeypatch, tmp_path) -> None:
         import helpers.skill_runner as sr
         from coding_review_agent_loop.architecture_context import ArchitecturePair, ArchitectureSnapshot
+        from coding_review_agent_loop.errors import AgentLoopError
 
         monkeypatch.setattr(sr, "_REPAIR_BASE", tmp_path)
         base = ArchitectureSnapshot(
@@ -3381,8 +3382,17 @@ class TestHostReviewerPR:
         rendered = (request_dir / "architecture-context.md").read_text(encoding="utf-8")
         assert "Established base architecture snapshot" in rendered
         assert "Candidate architecture snapshot" in rendered
+        manifest = json.loads((request_dir / "manifest.json").read_text(encoding="utf-8"))
         context = json.loads((request_dir / "context.json").read_text(encoding="utf-8"))
         assert context["architecture_identity"] == pair.identity()
+        assert context["architecture_render_sha256"] == manifest["architecture_render_sha256"]
+        assert manifest["architecture_context_file"] == "architecture-context.md"
+        assert sr._validate_host_architecture_artifact(
+            request_dir, manifest, context
+        ) == pair.identity()
+        (request_dir / "architecture-context.md").write_text("tampered\n", encoding="utf-8")
+        with pytest.raises(AgentLoopError, match="does not match its recorded digest"):
+            sr._validate_host_architecture_artifact(request_dir, manifest, context)
 
     def test_host_handoff_removes_stale_plan_guidance_for_direct_pr(self, monkeypatch, tmp_path) -> None:
         import helpers.skill_runner as sr

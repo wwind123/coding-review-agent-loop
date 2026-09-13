@@ -1129,11 +1129,10 @@ def _latest_pr_approved_reviews_for_head(
             or metadata.agent in latest_by_reviewer
         ):
             continue
-        # None is the legacy/skill-compatible absence of this feature field.
-        # Only an explicitly different generation is ineligible; otherwise a
-        # same-head approval from before architecture context was introduced
-        # remains reusable and is not silently re-reviewed forever.
-        if require_architecture_contract and metadata.architecture_contract_version not in (None, 1):
+        # A fresh architecture-aware resume must be explicitly bound to the
+        # current response contract.  Legacy records remain decodable, but
+        # their missing discriminator cannot satisfy a newly prompted turn.
+        if require_architecture_contract and metadata.architecture_contract_version != 1:
             continue
         latest_by_reviewer[metadata.agent] = record
 

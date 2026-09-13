@@ -1665,6 +1665,31 @@ def _filter_resume_for_approved_plan(
     return filtered
 
 
+def _filter_resume_for_architecture(
+    resume: dict,
+    *,
+    architecture_identity: dict,
+) -> dict:
+    """Keep only same-head reviewer records bound to this architecture snapshot."""
+    matching_data = [
+        record
+        for record in resume.get("completed_reviewer_data", [])
+        if (
+            record.get("architecture_contract_version") == 1
+            and record.get("architecture_identity") == architecture_identity
+        )
+    ]
+    matching_names = {str(record.get("reviewer_name", "")) for record in matching_data}
+    filtered = dict(resume)
+    filtered["completed_reviewer_data"] = matching_data
+    filtered["completed_reviewer_names"] = [
+        str(name)
+        for name in resume.get("completed_reviewer_names", [])
+        if str(name) in matching_names
+    ]
+    return filtered
+
+
 def _fetch_pr_comments_raw(repo: str, pr: int, gh_cmd: str = "gh") -> list[str]:
     # PR conversation comments live behind `gh pr view` (not `gh issue view`,
     # which rejects PR numbers). Used for the approved-followups idempotency marker.
@@ -2540,9 +2565,9 @@ def _complete_coder_turn(
                 response_evidence=response_evidence,
                 gemini_cmd=gemini_cmd,
             )
+            validated_result = validate(raw_text)
         else:
-            validate(raw_text)
-        validated_result = validate(raw_text)
+            validated_result = validate(raw_text)
         raw_output.write_text(raw_text, encoding="utf-8")
     except (AgentLoopError, ValueError) as exc:
         raise _ValidationError(
@@ -3002,6 +3027,7 @@ def _write_host_review_request(
         "current_round_items": current_round_items,
         "human_requirements": _serialize_human_requirements(human_requirements),
     }
+    architecture_render_sha256: str | None = None
     if architecture_context is not None:
         from coding_review_agent_loop.architecture_context import (
             ArchitecturePair,
@@ -3022,7 +3048,11 @@ def _write_host_review_request(
             raise AgentLoopError("Host review handoff received an invalid architecture context.")
         architecture_file = request_dir / "architecture-context.md"
         _write_text(architecture_file, architecture_text)
+        architecture_render_sha256 = hashlib.sha256(
+            architecture_text.encode("utf-8")
+        ).hexdigest()
         context_payload["architecture_identity"] = architecture_context.identity()
+        context_payload["architecture_render_sha256"] = architecture_render_sha256
         manifest_architecture_file = architecture_file.name
     else:
         try:
@@ -3081,6 +3111,7 @@ def _write_host_review_request(
     if manifest_architecture_file is not None:
         manifest["architecture_context_file"] = manifest_architecture_file
         manifest["architecture_identity"] = context_payload["architecture_identity"]
+        manifest["architecture_render_sha256"] = architecture_render_sha256
         manifest["architecture_contract_version"] = 1
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return request_dir
@@ -3128,6 +3159,48 @@ def _validate_host_review_plan_artifact(
             f"{context.diagnostic or 'unknown validation error'}. Regenerate the handoff."
         )
     return context
+
+
+def _validate_host_architecture_artifact(
+    request_dir: Path,
+    manifest: dict,
+    context: dict,
+) -> dict | None:
+    """Validate the immutable identity and exact rendered host artifact."""
+    expected_identity = manifest.get("architecture_identity")
+    artifact_name = manifest.get("architecture_context_file")
+    expected_digest = manifest.get("architecture_render_sha256")
+    if expected_identity is None and artifact_name is None:
+        return None
+    if (
+        not isinstance(expected_identity, dict)
+        or not isinstance(artifact_name, str)
+        or not isinstance(expected_digest, str)
+        or context.get("architecture_identity") != expected_identity
+        or context.get("architecture_render_sha256") != expected_digest
+    ):
+        raise AgentLoopError(
+            "Host review handoff has an incomplete architecture identity; regenerate the handoff."
+        )
+    request_root = request_dir.resolve()
+    artifact_path = (request_dir / artifact_name).resolve()
+    if request_root not in artifact_path.parents:
+        raise AgentLoopError(
+            "Host review handoff architecture artifact must remain inside its request directory."
+        )
+    try:
+        artifact_text = artifact_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AgentLoopError(
+            f"Host review handoff is missing its architecture artifact: {artifact_path}."
+        ) from exc
+    actual_digest = hashlib.sha256(artifact_text.encode("utf-8")).hexdigest()
+    if actual_digest != expected_digest:
+        raise AgentLoopError(
+            "Host review handoff architecture artifact does not match its recorded digest; "
+            "regenerate the handoff."
+        )
+    return expected_identity
 
 
 def _host_architecture_context(
@@ -3426,9 +3499,14 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
+        architecture_hint = (
+            f" Read the labeled architecture context at {request_dir}/architecture-context.md."
+            if (request_dir / "architecture-context.md").exists() else ""
+        )
         print(
             f"skill_runner: host review pending — read the plan in {request_dir}/plan.md, "
-            f"write your plan_review JSON to {request_dir}/host-review.md, then run: "
+            f"write your plan_review JSON after inspecting the requested context{architecture_hint}, "
+            f"to {request_dir}/host-review.md, then run: "
             f"python -m helpers.skill_runner complete-host-review --dir {request_dir}{dry_run_flag}",
             file=sys.stderr,
         )
@@ -3514,6 +3592,31 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         human_requirements=human_requirements,
     )
 
+    # Acquire one PR-bound architecture pair before deciding which completed
+    # reviewers are reusable. A same-head retarget or availability transition
+    # must invalidate stale approvals exactly once; the resulting reviewer
+    # metadata carries this identity so the next identical resume is stable.
+    skill_architecture = None
+    if getattr(args, "architecture_context_enabled", True):
+        from helpers.prompt_builders import _acquire_skill_architecture, make_minimal_config
+
+        acquisition_agent = reviewers[0] if reviewers else "claude"
+        acquisition_workdir = _workdir_for_agent(acquisition_agent, args)
+        acquisition_config = make_minimal_config(
+            repo, acquisition_agent, tuple(reviewers), reviewer=acquisition_agent,
+            workdir=acquisition_workdir, **_architecture_options(args),
+        )
+        skill_architecture = _acquire_skill_architecture(
+            acquisition_config,
+            workdir=acquisition_workdir,
+            target_revision=pr_info.get("baseRefName"),
+            candidate_revision=pr_info.get("headRefOid") or head_sha,
+        )
+        if hasattr(skill_architecture, "identity"):
+            resume = _filter_resume_for_architecture(
+                resume, architecture_identity=skill_architecture.identity()
+            )
+
     # Step 2 — pending-comment reconciliation
     _reconcile_pending_comment(resume, pr, repo, dry_run)
 
@@ -3588,21 +3691,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
 
             workdir = _workdir_for_agent(reviewer, args)
             try:
-                from helpers.prompt_builders import (
-                    _acquire_skill_architecture,
-                    build_review_prompt_for_skill,
-                    make_minimal_config,
-                )
-                skill_architecture_config = make_minimal_config(
-                    repo, reviewer, [reviewer], reviewer=reviewer, workdir=workdir,
-                    **_architecture_options(args),
-                )
-                skill_architecture = _acquire_skill_architecture(
-                    skill_architecture_config,
-                    workdir=workdir,
-                    target_revision=issue_dict.get("baseRefName"),
-                    candidate_revision=issue_dict.get("headRefOid"),
-                )
+                from helpers.prompt_builders import build_review_prompt_for_skill
                 prompt_text = build_review_prompt_for_skill(
                     issue_dict,
                     pr_diff,
@@ -3653,8 +3742,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 "human_requirements": _serialize_human_requirements(human_requirements),
                 "architecture_identity": (
                     skill_architecture.identity()
-                    if 'skill_architecture' in locals()
-                    and hasattr(skill_architecture, "identity") else None
+                    if hasattr(skill_architecture, "identity") else None
                 ),
             }
 
@@ -3722,13 +3810,17 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
+        architecture_hint = (
+            f" Read the labeled architecture context at {request_dir}/architecture-context.md."
+            if (request_dir / "architecture-context.md").exists() else ""
+        )
         print(
             f"skill_runner: host review pending — read the PR-bound approved plan in "
             f"{request_dir}/approved-plan.md when present, the labeled issue context "
             f"artifacts, the approved-plan reconciliation guidance in "
             f"{request_dir}/approved-plan-reconciliation.md when present, and the "
             f"signed requirement contract in "
-            f"{request_dir}/signed-human-requirements.md when present; then read the "
+            f"{request_dir}/signed-human-requirements.md when present;{architecture_hint} Then read the "
             f"PR diff in "
             f"{request_dir}/pr-diff.diff, "
             f"write your pr_review JSON to {request_dir}/host-review.md, then run: "
@@ -3966,6 +4058,9 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
     prior_items_raw  = json.loads((request_dir / "prior_items.json").read_text(encoding="utf-8"))
     host_context = json.loads((request_dir / "context.json").read_text(encoding="utf-8"))
     _validate_host_review_plan_artifact(request_dir, manifest)
+    host_architecture_identity = _validate_host_architecture_artifact(
+        request_dir, manifest, host_context
+    )
 
     try:
         result = _complete_reviewer_turn(
@@ -3988,8 +4083,7 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
                 else None
             ),
             architecture_identity=(
-                host_context.get("architecture_identity")
-                if isinstance(host_context.get("architecture_identity"), dict) else None
+                host_architecture_identity
             ),
         )
     except _ValidationError as exc:

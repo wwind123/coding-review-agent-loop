@@ -2348,6 +2348,40 @@ def test_explicit_managed_cap_fails_closed_when_protected_context_has_no_room(tm
         prompts_module._architecture_context_block(config, protected_context=("x" * 32,))
 
 
+def test_architecture_opt_out_preserves_legacy_prompt_rendering(tmp_path):
+    architecture = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available",
+        size=20, content="# System\n", heading_index=("System",),
+    )
+    legacy = build_task_prompt("Implement the requested change.", make_config(tmp_path))
+    opted_out = build_task_prompt(
+        "Implement the requested change.",
+        make_config(
+            tmp_path,
+            architecture_context=architecture,
+            architecture_context_enabled=False,
+        ),
+    )
+    assert opted_out == legacy
+    assert "advisory repository context" not in opted_out
+
+
+def test_non_material_architecture_preserves_legacy_prompt_rendering(tmp_path):
+    unavailable = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid=None, sha256=None, availability="unavailable",
+        diagnostic="Git object is unavailable.",
+    )
+    legacy = build_task_prompt("Implement the requested change.", make_config(tmp_path))
+    unavailable_prompt = build_task_prompt(
+        "Implement the requested change.",
+        make_config(tmp_path, architecture_context=unavailable),
+    )
+    assert unavailable_prompt == legacy
+    assert "advisory repository context" not in unavailable_prompt
+
+
 def test_task_clarification_forbids_legacy_markers(tmp_path):
     prompt = build_task_clarification_prompt("Fix the bug.", [], make_config(tmp_path))
     assert "Do not add an `AGENT_PR` or `AGENT_CLARIFY` marker" in prompt

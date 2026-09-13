@@ -119,7 +119,7 @@ def test_latest_pr_architecture_observation_uses_new_checkpoint_once():
     assert _latest_pr_architecture_observation(comments, head_sha="head") == new_identity
 
 
-def test_legacy_same_head_approval_remains_reusable_with_fresh_architecture_gate():
+def test_legacy_same_head_approval_is_not_reusable_with_fresh_architecture_gate():
     approval = _attach_round_metadata(
         "approved review",
         PostedRoundMetadata(
@@ -134,7 +134,7 @@ def test_legacy_same_head_approval_remains_reusable_with_fresh_architecture_gate
         configured_reviewers=("codex",),
         require_architecture_contract=True,
     )
-    assert set(reused) == {"Codex"}
+    assert reused == {}
 
 
 def _advance_head_after_coder(monkeypatch, runner, head_sha="repaired-head"):

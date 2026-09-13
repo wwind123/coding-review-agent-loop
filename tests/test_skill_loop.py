@@ -85,3 +85,26 @@ def test_skill_review_builder_accepts_frozen_architecture_snapshot(tmp_path) -> 
     )
     assert "advisory repository context" in prompt
     assert snapshot.blob_oid in prompt
+
+
+def test_skill_pr_resume_rejects_stale_architecture_identity() -> None:
+    from helpers.skill_runner import _filter_resume_for_architecture
+
+    identity = {"repository": "owner/repo", "path": "ARCHITECTURE.md", "revision": "new"}
+    stale = {
+        "reviewer_name": "Codex",
+        "architecture_identity": {"repository": "owner/repo", "path": "ARCHITECTURE.md", "revision": "old"},
+        "architecture_contract_version": 1,
+    }
+    current = {
+        "reviewer_name": "Gemini",
+        "architecture_identity": identity,
+        "architecture_contract_version": 1,
+    }
+    resume = {
+        "completed_reviewer_data": [stale, current],
+        "completed_reviewer_names": ["Codex", "Gemini"],
+    }
+    filtered = _filter_resume_for_architecture(resume, architecture_identity=identity)
+    assert filtered["completed_reviewer_names"] == ["Gemini"]
+    assert filtered["completed_reviewer_data"] == [current]
