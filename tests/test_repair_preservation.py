@@ -4,6 +4,7 @@ from copy import deepcopy
 import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.protocol import validate_structured_task_result
 from coding_review_agent_loop.repair import _build_repair_prompt
 from coding_review_agent_loop.repair_preservation import validate_repair_preservation
 from agent_loop_helpers import structured_v1_plan_state
@@ -11,6 +12,18 @@ from agent_loop_helpers import structured_v1_plan_state
 
 def check(source, target):
     validate_repair_preservation(json.dumps(source), json.dumps(target))
+
+
+def valid_task_result(impact):
+    payload = {
+        "schema_version": 1,
+        "kind": "task_result",
+        "state": "blocking",
+        "outcome": "blocking",
+        "summary": "The task is blocked.",
+        "architecture_impact": impact,
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Coder"
 
 
 def _execution_source(*, strategy: str) -> dict:
@@ -264,6 +277,108 @@ def test_architecture_scalar_fields_cannot_be_omitted_or_type_changed():
     changed_empty["architecture_impact"]["canonical_document_rationale"] = "Added a default."
     with pytest.raises(AgentLoopError, match="architecture_impact.canonical_document_rationale"):
         check(source, changed_empty)
+
+
+def test_invalid_architecture_source_key_does_not_deadlock_repair():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The source rationale remains relevant.",
+            "componets": ["Malformed source key."],
+        },
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The source rationale remains relevant.",
+            "affected_components": [],
+            "dependencies": [],
+            "execution_data_flows": [],
+            "persistence": [],
+            "public_contracts": [],
+            "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
+
+
+def test_invalid_architecture_empty_rationale_does_not_deadlock_repair():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {"status": "changed", "rationale": ""},
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The corrected assessment is complete.",
+            "affected_components": [],
+            "dependencies": [],
+            "execution_data_flows": [],
+            "persistence": [],
+            "public_contracts": [],
+            "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
+
+
+def test_invalid_architecture_status_does_not_deadlock_repair():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {"status": 123, "rationale": "The rationale remains."},
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The rationale remains.",
+            "affected_components": [],
+            "dependencies": [],
+            "execution_data_flows": [],
+            "persistence": [],
+            "public_contracts": [],
+            "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
+
+
+def test_architecture_flow_aliases_can_be_normalized_to_combined_field():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "execution_flows": ["agent -> round metadata"],
+            "data_flows": ["round metadata -> review"],
+        },
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "execution_data_flows": [
+                "agent -> round metadata",
+                "round metadata -> review",
+            ],
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
 
 
 def test_case06_object_to_string_keeps_every_detail():
