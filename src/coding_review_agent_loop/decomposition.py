@@ -479,14 +479,14 @@ def _phase_payload(phase: PlanPhase) -> dict[str, object]:
     """Historical phase serializer; keep this key set byte-stable."""
     return {
         "title": phase.title,
-        "scope": getattr(phase, "scope", ""),
-        "non_goals": getattr(phase, "non_goals", ""),
-        "dependency_notes": getattr(phase, "dependency_notes", ""),
+        "scope": phase.scope,
+        "non_goals": phase.non_goals,
+        "dependency_notes": phase.dependency_notes,
         "rollout_risk": phase.rollout_risk,
-        "validation": getattr(phase, "validation", ""),
-        "parent_context": getattr(phase, "parent_context", None),
+        "validation": phase.validation,
+        "parent_context": phase.parent_context,
         "automation": phase.automation,
-        "depends_on": list(getattr(phase, "depends_on", ()) or ()),
+        "depends_on": list(phase.depends_on or ()),
     }
 
 
@@ -518,13 +518,15 @@ def phase_identity(
     plan_hash: str,
     topology_source: str,
     phase_index: int,
-    phase: PlanPhase,
+    phase: PlanPhase | RecordedPhase,
     stage_id: str | None = None,
     execution_strategy_contract_version: int | None = None,
 ) -> str:
     """Return a stable identity independent of the display title truncation."""
     fresh = topology_source == EXECUTION_TOPOLOGY_SOURCE
     if fresh:
+        if not isinstance(phase, PlanPhase):
+            raise AgentLoopError("Fresh phase identity requires a reviewed phase model.")
         stable_stage_id = stage_id or phase.stage_id
         if not isinstance(stable_stage_id, str) or not stable_stage_id:
             raise AgentLoopError("Fresh phase identity requires a stable string stage ID.")
@@ -542,12 +544,28 @@ def phase_identity(
     else:
         # Do not add fresh fields or a contract discriminator to this branch:
         # old child issues must recompute their historical digest exactly.
+        legacy_phase = phase
+        if isinstance(phase, RecordedPhase):
+            # Summary-only recovery records predate PlanPhase's detailed
+            # fields.  Materialize the same empty historical values explicitly
+            # before using the byte-stable PlanPhase serializer.
+            legacy_phase = PlanPhase(
+                title=phase.title,
+                scope="",
+                non_goals="",
+                dependency_notes="",
+                rollout_risk=phase.rollout_risk,
+                validation="",
+                parent_context=phase.parent_context,
+                automation=phase.automation,
+                depends_on=(),
+            )
         material = {
             "parent_issue": parent_issue,
             "plan_hash": plan_hash,
             "source": topology_source,
             "stage_id": phase_index,
-            "phase": _phase_payload(phase),
+            "phase": _phase_payload(legacy_phase),
         }
     encoded = json.dumps(material, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -1203,6 +1221,7 @@ def create_decomposition_child_issues(
     execution_strategy_contract_version: int | None = None,
     recommendation_digest: str | None = None,
     plan_subject: str | None = None,
+    preflight_only: bool = False,
 ) -> tuple[CreatedPhaseIssue, ...] | NeedsHumanDecision:
     """Preflight, recover, and create one immutable decomposition topology."""
     plan_hash = approved_plan_hash(approved_plan)
@@ -1286,7 +1305,8 @@ def create_decomposition_child_issues(
             for index, expected in expected_ids.items():
                 if candidate_identity == expected:
                     matched_expected = True
-                    expected_stage_id = phase.stage_id if fresh else index
+                    expected_phase = phases[index - 1]
+                    expected_stage_id = expected_phase.stage_id if fresh else index
                     metadata_matches = (
                         candidate_plan_hash == plan_hash
                         and candidate_source == topology_source
@@ -1306,7 +1326,7 @@ def create_decomposition_child_issues(
                     if fresh and not _fresh_phase_content_matches(
                         candidate,
                         parent_issue=parent_issue,
-                        phase=phase,
+                        phase=expected_phase,
                     ):
                         raise AgentLoopError(
                             f"Fresh decomposition recovery content does not match phase {index}."
@@ -1383,6 +1403,27 @@ def create_decomposition_child_issues(
             execution_strategy_contract_version=execution_strategy_contract_version,
         )
         TrustedBody.canonical(draft, expected_tokens=("AGENT_PLAN_PHASE_IDENTITY",))
+
+    if preflight_only:
+        # The approval boundary uses this read-only result to validate all
+        # existing identities, content, and child-cap accounting before the
+        # canonical execution decision is published.  Missing phases are
+        # represented as planned placeholders; the normal call below will
+        # create them after the decision is durable.
+        return tuple(
+            CreatedPhaseIssue(
+                phase=phase,
+                issue_url=(exact[expected_ids[index]].url if expected_ids[index] in exact else None),
+                issue_number=(
+                    exact[expected_ids[index]].number
+                    or _issue_number_from_url(exact[expected_ids[index]].url)
+                    if expected_ids[index] in exact
+                    else None
+                ),
+                origin="adopted" if expected_ids[index] in exact else "planned",
+            )
+            for index, phase in enumerate(phases, start=1)
+        )
 
     # Legacy topologies need their historical full checkpoint for recovery.
     # Fresh v1 recommendations already have a lossless approved-plan record

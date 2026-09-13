@@ -2211,6 +2211,205 @@ class TestSkillApprovedPlanRecovery:
         assert context.canonical_text == plan
         assert context.plan_hash == plan_hash
 
+    def test_fresh_decomposition_child_handoff_recovers_matching_stage_by_ordinal(
+        self, monkeypatch
+    ) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.decomposition import (
+            CreatedPhaseIssue,
+            ExecutionAllocation,
+            ExecutionChildStage,
+            ExecutionScopeItem,
+            ExecutionStrategyRecommendation,
+            PlanPhase,
+            format_decomposition_parent_summary,
+            format_phase_issue_body,
+            normalize_execution_recommendation,
+            phase_identity,
+        )
+        from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+        from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+        from coding_review_agent_loop.round_state import (
+            PostedRoundMetadata,
+            _attach_round_metadata,
+            _plan_subject,
+        )
+
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["summary"] = "Fresh staged parent plan."
+        payload["plan_steps"] = ["Implement the reviewed staged behavior."]
+        payload["execution_recommendation"] = {
+            "strategy": "staged",
+            "rationale": "The API and its integration verification are independently reviewable.",
+            "staging_feasibility": "safe",
+            "scope_items": [
+                {
+                    "scope_item_id": "scope-api",
+                    "requirement": "Implement the API.",
+                    "acceptance_criteria": ["The API tests pass."],
+                },
+                {
+                    "scope_item_id": "scope-integration",
+                    "requirement": "Verify integration.",
+                    "acceptance_criteria": ["The integration tests pass."],
+                },
+            ],
+            "coupling_constraints": [],
+            "child_stages": [
+                {
+                    "stage_id": "stage-api",
+                    "position": 1,
+                    "title": "API contract",
+                    "summary": "Implement the reviewed API contract.",
+                    "deliverables": ["API implementation."],
+                    "non_goals": ["No rollout."],
+                    "acceptance_criteria": ["The API tests pass."],
+                    "depends_on_stage_ids": [],
+                    "dependency_notes": "No dependencies.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "low.",
+                    "compatibility_constraints": [],
+                    "covered_scope_item_ids": ["scope-api"],
+                },
+                {
+                    "stage_id": "stage-integration",
+                    "position": 2,
+                    "title": "Integration verification",
+                    "summary": "Verify the integrated behavior.",
+                    "deliverables": ["Integration verification."],
+                    "non_goals": ["No new API surface."],
+                    "acceptance_criteria": ["The integration tests pass."],
+                    "depends_on_stage_ids": ["stage-api"],
+                    "dependency_notes": "After the API contract.",
+                    "automation": "agent-pr",
+                    "rollout_risk": "medium.",
+                    "compatibility_constraints": [],
+                    "covered_scope_item_ids": ["scope-integration"],
+                },
+            ],
+            "retained_parent_work": {
+                "status": "none",
+                "deliverables": [],
+                "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "final_integration_work": {
+                "status": "none",
+                "deliverables": [],
+                "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "caveats": [],
+        }
+        plan = json.dumps(payload) + _VALID_PLAN_STATE[end:]
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        recommendation = validate_structured_plan_state(plan).execution_recommendation
+        assert recommendation is not None
+        normalized, retained = normalize_execution_recommendation(
+            recommendation,
+            approved_plan=plan,
+            plan_subject=_plan_subject(plan),
+        )
+        phase = normalized.phases[1]
+        plan_hash = sr.approved_plan_hash(plan)
+        identity = phase_identity(
+            parent_issue=56,
+            plan_hash=plan_hash,
+            topology_source="approved-plan-v1",
+            phase_index=2,
+            phase=phase,
+            stage_id=phase.stage_id,
+            execution_strategy_contract_version=1,
+        )
+        child_body = format_phase_issue_body(
+            repo="owner/repo",
+            parent_issue=56,
+            approved_plan=plan,
+            phase=phase,
+            created_so_far=(),
+            phase_identity_value=identity,
+            topology_source="approved-plan-v1",
+            phase_index=2,
+            phase_plan_hash=plan_hash,
+            strategy="staged",
+            recommendation_digest=normalized.recommendation_digest,
+            execution_strategy_contract_version=1,
+        )
+        child = CreatedPhaseIssue(
+            phase=phase,
+            issue_url="https://github.com/owner/repo/issues/99",
+            issue_number=99,
+        )
+        plan_comment = _attach_round_metadata(
+            plan,
+            PostedRoundMetadata(
+                flow="plan",
+                role="coder",
+                agent="Claude",
+                round_number=1,
+                subject=_plan_subject(plan),
+                canonical_plan=plan,
+                raw_structured_coder_response=plan,
+            ),
+        )
+        summary = format_decomposition_parent_summary(
+            parent_issue=56,
+            mode="decompose-only",
+            plan_hash=plan_hash,
+            created=(
+                CreatedPhaseIssue(
+                    phase=normalized.phases[0],
+                    issue_url="https://github.com/owner/repo/issues/98",
+                    issue_number=98,
+                ),
+                child,
+            ),
+            topology_source="approved-plan-v1",
+            retained_parent_scope=retained,
+            strategy="staged",
+            execution_strategy_contract_version=1,
+            recommendation_digest=normalized.recommendation_digest,
+            plan_subject=_plan_subject(plan),
+        )
+        parent_comments = [plan_comment, summary]
+        child_comments = [
+            format_issue_pr_handoff_comment(
+                issue_number=99,
+                pr_number=7,
+                pr_url="https://github.com/owner/repo/pull/7",
+                pr_head_sha="head-7",
+                flow="approved-plan-implementation",
+                plan_hash=plan_hash,
+            )
+        ]
+        monkeypatch.setattr(
+            sr,
+            "_fetch_issue_comments_raw",
+            lambda repo, issue: child_comments if issue == 99 else parent_comments,
+        )
+        monkeypatch.setattr(sr, "_fetch_issue_json", lambda repo, issue: {"body": child_body})
+        contract = make_pr_contract(
+            repository="owner/repo",
+            pr_number=7,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=99,
+            expected_closing_issue_ids=(99,),
+        )
+
+        context = sr._recover_skill_pr_plan_context(
+            "owner/repo",
+            7,
+            {
+                "body": "Fixes #99",
+                "comments": [{"body": format_pr_contract_comment(contract)}],
+            },
+        )
+
+        assert context is not None and context.is_available
+        assert context.canonical_text.rstrip() == plan.rstrip()
+        assert context.plan_hash == plan_hash
+
     @pytest.mark.parametrize("fault", [None, "missing_handoff", "wrong_key", "missing_plan", "missing_topology"])
     def test_materialized_split_child_handoff_recovers_plan_from_parent(self, monkeypatch, fault) -> None:
         import helpers.skill_runner as sr

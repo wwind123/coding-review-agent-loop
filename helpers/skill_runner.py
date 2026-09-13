@@ -5862,14 +5862,14 @@ def _run_decomposition_for_skill(
     }
     if retained_parent_scope is not None:
         result_json["retained_parent_scope"] = {
-                "plan_subject": retained_parent_scope.plan_subject,
-                "plan_hash": retained_parent_scope.plan_hash,
-                "excerpt": retained_parent_scope.excerpt,
-                "status": retained_parent_scope.status,
-                "deliverables": list(retained_parent_scope.deliverables),
-                "acceptance_criteria": list(retained_parent_scope.acceptance_criteria),
-                "covered_scope_item_ids": list(retained_parent_scope.covered_scope_item_ids),
-            }
+            "plan_subject": retained_parent_scope.plan_subject,
+            "plan_hash": retained_parent_scope.plan_hash,
+            "excerpt": retained_parent_scope.excerpt,
+            "status": retained_parent_scope.status,
+            "deliverables": list(retained_parent_scope.deliverables),
+            "acceptance_criteria": list(retained_parent_scope.acceptance_criteria),
+            "covered_scope_item_ids": list(retained_parent_scope.covered_scope_item_ids),
+        }
     fresh_topology_kwargs = (
         {
             "strategy": canonical_strategy,

@@ -11,6 +11,8 @@ from coding_review_agent_loop.decomposition import (
     RecordedPhase,
     approved_plan_hash,
     format_one_shot_impl_handoff_comment,
+    format_phase_issue_body,
+    normalize_execution_recommendation,
 )
 from coding_review_agent_loop.github import IssueContext, validate_pr_body_does_not_close_issue
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
@@ -40,6 +42,7 @@ from agent_loop_helpers import (
     structured_v1_plan_state,
     structured_pr_review,
 )
+from coding_review_agent_loop.protocol import validate_structured_plan_state
 
 
 def test_v1_recommendation_rejects_legacy_typed_split_input():
@@ -211,6 +214,57 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
         assert not any("AGENT_PLAN_DECOMPOSITION" in comment for comment in runner.comments)
         assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+
+def test_fresh_staged_recovery_conflict_is_rejected_before_decision_record(tmp_path):
+    plan = _fresh_v1_plan_for_isolation("staged")
+    recommendation = validate_structured_plan_state(plan).execution_recommendation
+    assert recommendation is not None
+    normalized, _retained = normalize_execution_recommendation(
+        recommendation,
+        approved_plan=plan,
+        plan_subject=_plan_subject(plan),
+    )
+    phase = normalized.phases[0]
+    conflicting_body = format_phase_issue_body(
+        repo="OWNER/REPO",
+        parent_issue=56,
+        approved_plan=plan,
+        phase=phase,
+        created_so_far=(),
+        phase_identity_value="0" * 64,
+        topology_source="approved-plan-v1",
+        phase_index=1,
+        phase_plan_hash=approved_plan_hash(plan),
+        strategy="staged",
+        recommendation_digest=normalized.recommendation_digest,
+        execution_strategy_contract_version=1,
+    )
+    runner = FakeRunner(
+        claude_outputs=[plan],
+        codex_outputs=[structured_plan_review(state="approved")],
+        search_issues_payload=[{
+            "number": 101,
+            "title": "Phase 1: Intermediate behavior (from #56)",
+            "url": "https://github.com/OWNER/REPO/issues/101",
+            "body": conflicting_body,
+        }],
+    )
+
+    with pytest.raises(AgentLoopError, match="conflicting fresh phase identity"):
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(
+                tmp_path,
+                plan_execution_mode="decompose-only",
+                execution_strategy_contract_required=True,
+            ),
+            plan_first=True,
+        )
+
+    assert runner.issues == []
+    assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
 
 
 def _existing_split_children_comment() -> dict:

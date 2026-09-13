@@ -6,6 +6,7 @@ from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
+    ExecutionDecision,
     ExecutionAllocation,
     ExecutionCouplingConstraint,
     ExecutionScopeItem,
@@ -21,6 +22,7 @@ from coding_review_agent_loop.decomposition import (
     find_existing_decomposition,
     find_existing_topology_checkpoint,
     format_decomposition_parent_summary,
+    format_execution_decision,
     format_phase_implementation_handoff_comment,
     format_topology_checkpoint,
     phase_identity,
@@ -28,6 +30,7 @@ from coding_review_agent_loop.decomposition import (
     create_decomposition_child_issues,
     adapt_typed_child_stages,
     normalize_execution_recommendation,
+    find_existing_execution_decision,
 )
 from coding_review_agent_loop.protocol import ExecutionChildStage
 from coding_review_agent_loop.github import IssueComment
@@ -176,6 +179,184 @@ def test_legacy_phase_identity_digest_remains_byte_stable():
         phase_index=1,
         phase=phase,
     ) == "445715b616bf8e71572a804c6172dc6645d2ed97d040c0be5110a60c115403fd"
+
+
+def _fresh_recovery_topology(plan: str = "Approved fresh staged plan"):
+    first = PlanPhase(
+        title="API contract",
+        scope="Implement the reviewed API contract.",
+        non_goals="No rollout.",
+        dependency_notes="No dependencies.",
+        rollout_risk="low.",
+        validation="The API contract tests pass.",
+        parent_context=plan,
+        automation="agent-pr",
+        stage_id="stage-api",
+        position=1,
+        deliverables=("API contract implementation.",),
+        non_goals_items=("No rollout.",),
+        acceptance_criteria=("The API contract tests pass.",),
+        depends_on_stage_ids=(),
+        compatibility_constraints=("Keep existing callers working.",),
+        covered_scope_item_ids=("scope-api",),
+    )
+    second = PlanPhase(
+        title="Integration verification",
+        scope="Verify the integrated behavior.",
+        non_goals="No new API surface.",
+        dependency_notes="After the API contract phase.",
+        rollout_risk="medium.",
+        validation="The integration tests pass.",
+        parent_context=plan,
+        automation="human-action",
+        depends_on=("API contract",),
+        stage_id="stage-integration",
+        position=2,
+        deliverables=("Integration verification record.",),
+        non_goals_items=("No new API surface.",),
+        acceptance_criteria=("The integration tests pass.",),
+        depends_on_stage_ids=("stage-api",),
+        compatibility_constraints=(),
+        covered_scope_item_ids=("scope-integration",),
+    )
+    return PlanDecomposition(
+        phases=(first, second),
+        strategy="staged",
+        topology_source="approved-plan-v1",
+        execution_strategy_contract_version=1,
+        recommendation_digest="recommendation-digest",
+        scope_items=(
+            ExecutionScopeItem("scope-api", "Implement the API.", ("The API contract tests pass.",)),
+            ExecutionScopeItem(
+                "scope-integration", "Verify integration.", ("The integration tests pass.",)
+            ),
+        ),
+        retained_parent_work=ExecutionAllocation("none", (), (), ()),
+        final_integration_work=ExecutionAllocation("none", (), (), ()),
+    )
+
+
+def _fresh_child_issue(phase: PlanPhase, plan: str, issue_number: int) -> dict[str, object]:
+    plan_hash = approved_plan_hash(plan)
+    identity = phase_identity(
+        parent_issue=56,
+        plan_hash=plan_hash,
+        topology_source="approved-plan-v1",
+        phase_index=phase.position or 0,
+        phase=phase,
+        stage_id=phase.stage_id,
+        execution_strategy_contract_version=1,
+    )
+    body = format_phase_issue_body(
+        repo="OWNER/REPO",
+        parent_issue=56,
+        approved_plan=plan,
+        phase=phase,
+        created_so_far=(),
+        phase_identity_value=identity,
+        topology_source="approved-plan-v1",
+        phase_index=phase.position or 0,
+        phase_plan_hash=plan_hash,
+        strategy="staged",
+        recommendation_digest="recommendation-digest",
+        execution_strategy_contract_version=1,
+    )
+    return {
+        "number": issue_number,
+        "title": _phase_issue_title_for_test(56, phase),
+        "url": f"https://github.com/OWNER/REPO/issues/{issue_number}",
+        "body": body,
+    }
+
+
+def _phase_issue_title_for_test(parent_issue: int, phase: PlanPhase) -> str:
+    prefix = "[Human] " if phase.automation in {"human-action", "manual-close"} else ""
+    return f"{prefix}Phase {phase.position}: {phase.title} (from #{parent_issue})"
+
+
+def test_fresh_child_recovery_adopts_each_matching_stage_without_unbound_phase(tmp_path):
+    plan = "Approved fresh staged plan"
+    topology = _fresh_recovery_topology(plan)
+    candidates = [
+        _fresh_child_issue(phase, plan, 100 + index)
+        for index, phase in enumerate(topology.phases, start=1)
+    ]
+    runner = FakeRunner(search_issues_payload=candidates)
+
+    recovered = create_decomposition_child_issues(
+        runner,
+        config=make_config(tmp_path),
+        parent_issue=56,
+        approved_plan=plan,
+        decomposition=topology,
+        topology_source="approved-plan-v1",
+        issue_comments=(),
+        mode="implement-by-phase",
+        strategy="staged",
+        execution_strategy_contract_version=1,
+        recommendation_digest="recommendation-digest",
+        preflight_only=True,
+    )
+
+    assert [item.origin for item in recovered] == ["adopted", "adopted"]
+    assert [item.issue_number for item in recovered] == [101, 102]
+
+
+def test_fresh_child_recovery_adopts_partial_topology_and_creates_remainder(tmp_path):
+    plan = "Approved fresh staged plan"
+    topology = _fresh_recovery_topology(plan)
+    runner = FakeRunner(
+        search_issues_payload=[_fresh_child_issue(topology.phases[0], plan, 101)],
+        issue_urls=["https://github.com/OWNER/REPO/issues/102"],
+    )
+
+    recovered = create_decomposition_child_issues(
+        runner,
+        config=make_config(tmp_path),
+        parent_issue=56,
+        approved_plan=plan,
+        decomposition=topology,
+        topology_source="approved-plan-v1",
+        issue_comments=(),
+        mode="implement-by-phase",
+        strategy="staged",
+        execution_strategy_contract_version=1,
+        recommendation_digest="recommendation-digest",
+    )
+
+    assert [item.origin for item in recovered] == ["adopted", "created"]
+    assert [item.issue_number for item in recovered] == [101, 102]
+    assert len(runner.issues) == 1
+
+
+def test_execution_decision_format_is_reused_for_same_identity():
+    from types import SimpleNamespace
+
+    decision = ExecutionDecision(
+        parent_issue=56,
+        plan_hash="0123456789abcdef",
+        plan_subject="subject",
+        execution_strategy_contract_version=1,
+        strategy="one-shot",
+        topology_source="approved-plan-v1",
+        recommendation_digest="digest",
+        requested_policy="implement-one-shot",
+        current_action="implement-one-shot",
+        scope_item_ids=("scope-1",),
+    )
+    body = format_execution_decision(decision)
+    comments = (SimpleNamespace(body=body),)
+
+    recovered = find_existing_execution_decision(
+        comments,
+        parent_issue=56,
+        plan_hash="0123456789abcdef",
+        plan_subject="subject",
+        strategy="one-shot",
+        recommendation_digest="digest",
+    )
+
+    assert recovered == decision
 
 
 def test_fresh_plan_decomposition_requires_architecture_impact():

@@ -4667,6 +4667,184 @@ def _persist_execution_decision_if_needed(
         post_execution_decision(runner, config=config, decision=decision)
 
 
+def _preflight_fresh_staged_topology(
+    runner: Runner,
+    *,
+    issue_number: int,
+    approved_plan: str,
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    mode: str,
+    normalized_topology,
+) -> tuple[CreatedPhaseIssue, ...] | NeedsHumanDecision:
+    """Validate fresh staged recovery without publishing or creating anything."""
+    decomposition, retained_parent_scope = normalized_topology
+    plan_hash = approved_plan_hash(approved_plan)
+    plan_subject = _plan_subject(approved_plan)
+    reject_legacy_topology_collision(
+        issue_context.comments,
+        parent_issue=issue_number,
+        plan_hash=plan_hash,
+    )
+    existing_summary = find_existing_decomposition(
+        issue_context.comments,
+        parent_issue=issue_number,
+        plan_hash=plan_hash,
+    )
+    if existing_summary is not None and (
+        existing_summary.topology_source != EXECUTION_TOPOLOGY_SOURCE
+        or existing_summary.strategy != "staged"
+        or existing_summary.recommendation_digest != decomposition.recommendation_digest
+        or existing_summary.plan_subject != plan_subject
+    ):
+        raise AgentLoopError(
+            "Fresh staged execution conflicts with an existing decomposition summary; "
+            "repair the recorded topology identity before rerunning."
+        )
+    for checkpoint_mode in ("decompose-only", "implement-by-phase"):
+        checkpoint = find_existing_topology_checkpoint(
+            issue_context.comments,
+            parent_issue=issue_number,
+            plan_hash=plan_hash,
+            mode=checkpoint_mode,
+        )
+        if checkpoint is not None and (
+            checkpoint.topology_source != EXECUTION_TOPOLOGY_SOURCE
+            or checkpoint.strategy != "staged"
+            or checkpoint.recommendation_digest != decomposition.recommendation_digest
+        ):
+            raise AgentLoopError(
+                "Fresh staged execution conflicts with an existing topology checkpoint; "
+                "repair the recorded topology identity before rerunning."
+            )
+    if find_latest_one_shot_impl_handoff(
+        issue_context.comments,
+        parent_issue=issue_number,
+        mode="implement-one-shot",
+    ) is not None:
+        raise AgentLoopError(
+            "Fresh staged execution conflicts with an existing one-shot handoff; "
+            "resume the recorded implementation or repair the conflicting topology first."
+        )
+    return create_decomposition_child_issues(
+        runner,
+        config=config,
+        parent_issue=issue_number,
+        approved_plan=approved_plan,
+        decomposition=decomposition,
+        topology_source=EXECUTION_TOPOLOGY_SOURCE,
+        issue_comments=issue_context.comments,
+        mode=mode,
+        retained_parent_scope=retained_parent_scope,
+        strategy=decomposition.strategy,
+        execution_strategy_contract_version=decomposition.execution_strategy_contract_version,
+        recommendation_digest=decomposition.recommendation_digest,
+        plan_subject=plan_subject,
+        preflight_only=True,
+    )
+
+
+def _preflight_fresh_one_shot_recovery(
+    runner: Runner,
+    *,
+    issue_number: int,
+    approved_plan: str,
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+) -> None:
+    """Validate existing one-shot handoffs before the decision record is posted."""
+    plan_hash = approved_plan_hash(approved_plan)
+    existing_summary = find_existing_decomposition(
+        issue_context.comments,
+        parent_issue=issue_number,
+        plan_hash=plan_hash,
+    )
+    if existing_summary is not None:
+        raise AgentLoopError(
+            "Fresh one-shot execution conflicts with an existing decomposition summary; "
+            "resume the staged topology or revise the approved plan before rerunning."
+        )
+    for checkpoint_mode in ("decompose-only", "implement-by-phase"):
+        checkpoint = find_existing_topology_checkpoint(
+            issue_context.comments,
+            parent_issue=issue_number,
+            plan_hash=plan_hash,
+            mode=checkpoint_mode,
+        )
+        if checkpoint is not None:
+            raise AgentLoopError(
+                "Fresh one-shot execution conflicts with an existing staged topology checkpoint; "
+                "resume the staged topology or revise the approved plan before rerunning."
+            )
+    resolved_pr = resolve_canonical_pr_for_issue(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        issue_context=issue_context,
+        expected_fallback_scope=IssuePrProvenanceScope(
+            repository=config.repo,
+            issue_number=issue_number,
+            flow="approved",
+            approved_plan_hash=plan_hash,
+        ),
+    )
+    if (
+        resolved_pr is not None
+        and resolved_pr.source == "canonical"
+        and resolved_pr.metadata is not None
+        and resolved_pr.metadata.flow == "approved-plan-implementation"
+        and resolved_pr.metadata.plan_hash != plan_hash
+    ):
+        raise AgentLoopError(
+            f"Canonical approved-plan handoff for issue #{issue_number} points to PR "
+            f"#{resolved_pr.pr_number} with plan hash {resolved_pr.metadata.plan_hash}, "
+            f"but the current approved plan has hash {plan_hash}. Review the recorded PR "
+            f"with `agent-loop pr {resolved_pr.pr_number}` or remove the stale handoff marker."
+        )
+
+    existing_handoff = find_existing_one_shot_impl_handoff(
+        issue_context.comments,
+        parent_issue=issue_number,
+        plan_hash=plan_hash,
+        mode="implement-one-shot",
+    )
+    any_handoff = find_latest_one_shot_impl_handoff(
+        issue_context.comments,
+        parent_issue=issue_number,
+        mode="implement-one-shot",
+    )
+    if existing_handoff is None and any_handoff is not None and any_handoff.plan_hash != plan_hash:
+        try:
+            older_state = get_pr_state(
+                runner,
+                config=config,
+                pr_number=any_handoff.pr_number,
+            )
+        except AgentLoopError as exc:
+            raise AgentLoopError(
+                f"Older one-shot handoff for PR #{any_handoff.pr_number} cannot be validated "
+                f"({exc}). Review it directly with `agent-loop pr {any_handoff.pr_number}` "
+                "or remove the stale handoff."
+            ) from exc
+        if older_state == "OPEN":
+            raise AgentLoopError(
+                f"Open one-shot handoff for PR #{any_handoff.pr_number} has older plan hash "
+                f"{any_handoff.plan_hash}, but the current approved plan has hash {plan_hash}. "
+                f"Review the recorded PR with `agent-loop pr {any_handoff.pr_number}` or remove "
+                "the stale handoff before creating another implementation PR."
+            )
+    if existing_handoff is not None:
+        try:
+            get_pr_state(runner, config=config, pr_number=existing_handoff.pr_number)
+        except AgentLoopError as exc:
+            raise AgentLoopError(
+                f"PR #{existing_handoff.pr_number} recorded in the one-shot handoff for issue "
+                f"#{issue_number} cannot be found in {config.repo}. Verify the PR exists and "
+                f"rerun `agent-loop pr {existing_handoff.pr_number}` directly to continue, or "
+                "remove the handoff comment from the issue and rerun to re-implement."
+            ) from exc
+
+
 def _handle_plan_first_split_scope(
     runner: Runner,
     *,
@@ -6495,6 +6673,31 @@ def _run_plan_first_loop(
                     recommendation,
                     approved_plan=current_plan,
                     plan_subject=plan_subject,
+                )
+            if (
+                normalized_topology is not None
+                and canonical_strategy == "staged"
+                and mode != "plan-only"
+            ):
+                staged_preflight = _preflight_fresh_staged_topology(
+                    runner,
+                    issue_number=issue_number,
+                    approved_plan=current_plan,
+                    config=config,
+                    issue_context=issue_context,
+                    mode=mode,
+                    normalized_topology=normalized_topology,
+                )
+                if isinstance(staged_preflight, NeedsHumanDecision):
+                    print(json.dumps(staged_preflight.as_dict(), sort_keys=True))
+                    return 2
+            elif recommendation is not None and canonical_strategy == "one-shot" and mode != "plan-only":
+                _preflight_fresh_one_shot_recovery(
+                    runner,
+                    issue_number=issue_number,
+                    approved_plan=current_plan,
+                    config=config,
+                    issue_context=issue_context,
                 )
             plan_additions = _extract_current_expected_closing_issue_ids(current_plan)
             split_topology = bool(
