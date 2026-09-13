@@ -9049,20 +9049,25 @@ def run_pr_loop(
                                 phase_marker.group("payload"),
                                 marker_name="AGENT_PLAN_PHASE_IDENTITY",
                             )
+                            # A separately planned child has its own implementation
+                            # hash; phase membership remains bound to the parent plan.
+                            phase_plan_hash = phase_payload.get("plan_hash")
                             if (
                                 phase_payload.get("parent_issue") != parent_issue_context.number
-                                or phase_payload.get("plan_hash") != issue_handoff.plan_hash
+                                or not isinstance(phase_plan_hash, str)
+                                or not phase_plan_hash
                                 or not isinstance(phase_payload.get("stage_id"), int)
                             ):
                                 raise AgentLoopError(
-                                    "Decomposition child phase identity does not match the PR handoff or parent."
+                                    "Decomposition child phase identity must name the validated parent issue, "
+                                    "a non-empty plan hash, and an integer stage id."
                                 )
                             checkpoint = None
                             for topology_mode in ("decompose-only", "implement-by-phase"):
                                 checkpoint = find_existing_topology_checkpoint(
                                     parent_issue_context.comments,
                                     parent_issue=parent_issue_context.number,
-                                    plan_hash=issue_handoff.plan_hash,
+                                    plan_hash=phase_plan_hash,
                                     mode=topology_mode,
                                 )
                                 if checkpoint is not None:
