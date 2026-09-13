@@ -21,7 +21,11 @@ from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .runner import Runner
 from .protocol_markers import TrustedBody, sanitize_historical_text
-from .protocol import ArchitectureImpact, parse_architecture_impact
+from .protocol import (
+    ArchitectureImpact,
+    parse_architecture_impact,
+    sanitize_architecture_impact,
+)
 from .round_transport import MAX_GITHUB_BODY_CHARS
 
 AUTOMATION_CLASSES = {"agent-pr", "human-action", "manual-close"}
@@ -372,6 +376,10 @@ def _checkpoint_payload(checkpoint: TopologyCheckpoint) -> dict[str, object]:
             and checkpoint.retained_parent_scope.excerpt == shared_context
         ):
             retained_payload.pop("excerpt")
+    # Checkpoint comments are durable host-visible transport. Impact prose is
+    # agent-supplied and must be marker-safe even when a caller constructed a
+    # TopologyCheckpoint directly rather than going through the orchestrator.
+    architecture_impact = sanitize_architecture_impact(checkpoint.architecture_impact)
     return {
         "parent_issue": checkpoint.parent_issue,
         "plan_hash": checkpoint.plan_hash,
@@ -381,7 +389,7 @@ def _checkpoint_payload(checkpoint: TopologyCheckpoint) -> dict[str, object]:
         "phases": phase_payloads,
         "retained_parent_scope": retained_payload,
         "architecture_identity": checkpoint.architecture_identity,
-        "architecture_impact": checkpoint.architecture_impact,
+        "architecture_impact": architecture_impact,
         "architecture_contract_version": checkpoint.architecture_contract_version,
     }
 
@@ -818,7 +826,7 @@ def create_decomposition_child_issues(
                     if hasattr(config.architecture_context, "identity") else None
                 ),
                 architecture_impact=(
-                    asdict(decomposition.architecture_impact)
+                    sanitize_architecture_impact(asdict(decomposition.architecture_impact))
                     if decomposition.architecture_impact is not None else None
                 ),
                 architecture_contract_version=(

@@ -685,16 +685,10 @@ def _prepare_skill_pr_architecture_checkout(
     ``run_external`` normally performs this preparation immediately before an
     agent process.  PR resume filtering happens earlier, so the skill runner
     must position its auto-created checkout first or it would snapshot an empty
-    directory and discard valid completed reviews. Explicit workdirs are owned by
-    the caller and are left for the normal external-run validation.
+    directory and discard valid completed reviews. Explicit workdirs are also
+    refreshed here because resume filtering needs the live PR head before the
+    normal external-agent invocation occurs.
     """
-    if getattr(args, f"workdir_{agent}", None) or getattr(args, "workdir", None):
-        probe = Runner(dry_run=False).run(
-            ("git", "rev-parse", "--is-inside-work-tree"),
-            cwd=Path(workdir),
-            check=False,
-        )
-        return probe.returncode == 0 and probe.stdout.strip() == "true"
     if getattr(args, "dry_run", False):
         return False
     from helpers.prompt_builders import make_minimal_config
@@ -705,26 +699,42 @@ def _prepare_skill_pr_architecture_checkout(
     )
     config = dataclasses.replace(config, dry_run=False)
     runner = Runner(dry_run=False)
+    explicit_workdir = bool(
+        getattr(args, f"workdir_{agent}", None) or getattr(args, "workdir", None)
+    )
+    pr_metadata = PullRequestMetadata(
+        number=pr,
+        repo=repo,
+        title=str(pr_info.get("title")) if pr_info.get("title") is not None else None,
+        head_branch=str(pr_info.get("headRefName")) if pr_info.get("headRefName") is not None else None,
+        base_branch=str(pr_info.get("baseRefName")) if pr_info.get("baseRefName") is not None else None,
+        head_sha=str(pr_info.get("headRefOid")) if pr_info.get("headRefOid") is not None else None,
+        url=str(pr_info.get("url")) if pr_info.get("url") is not None else None,
+        body=str(pr_info.get("body")) if pr_info.get("body") is not None else None,
+    )
     try:
-        ensure_temp_checkout(Path(workdir), agent=agent, config=config, runner=runner)
-        sync_checkout_to_pr(
-            config,
-            runner,
-            path=Path(workdir),
-            label=f"Default {agent} workdir",
-            default_owned=True,
-            pr_number=pr,
-            pr_metadata=PullRequestMetadata(
-                number=pr,
-                repo=repo,
-                title=str(pr_info.get("title")) if pr_info.get("title") is not None else None,
-                head_branch=str(pr_info.get("headRefName")) if pr_info.get("headRefName") is not None else None,
-                base_branch=str(pr_info.get("baseRefName")) if pr_info.get("baseRefName") is not None else None,
-                head_sha=str(pr_info.get("headRefOid")) if pr_info.get("headRefOid") is not None else None,
-                url=str(pr_info.get("url")) if pr_info.get("url") is not None else None,
-                body=str(pr_info.get("body")) if pr_info.get("body") is not None else None,
-            ),
-        )
+        if explicit_workdir:
+            # The normal external-agent invocation refreshes an explicit
+            # workdir immediately before running the agent.  Architecture
+            # acquisition happens earlier for resume filtering, so perform the
+            # same PR-head synchronization here or the frozen pair could be
+            # based on stale refs (or an unavailable candidate).
+            sync_checkout_to_pr(
+                config,
+                runner,
+                path=Path(workdir),
+                label=f"Explicit {agent} workdir",
+                default_owned=False,
+                pr_number=pr,
+                pr_metadata=pr_metadata,
+            )
+        else:
+            ensure_temp_checkout(Path(workdir), agent=agent, config=config, runner=runner)
+            sync_checkout_to_pr(
+                config, runner, path=Path(workdir),
+                label=f"Default {agent} workdir", default_owned=True,
+                pr_number=pr, pr_metadata=pr_metadata,
+            )
     except (AgentLoopError, OSError) as exc:
         print(
             f"skill_runner: could not prepare the default PR checkout for architecture "
@@ -3881,12 +3891,10 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             primary_issue_context=primary_issue_context,
             parent_issue_context=parent_issue_context,
             human_requirements=human_requirements,
-            architecture_context=_host_architecture_context(
-                args,
-                repo=repo,
-                target_revision=pr_info.get("baseRefName"),
-                candidate_revision=head_sha,
-            ),
+            # Reuse the pair acquired before resume filtering. Re-acquiring
+            # from Claude's separate workdir could observe a different head,
+            # target, or availability state than the external reviewers.
+            architecture_context=skill_architecture,
             architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
             architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
         )

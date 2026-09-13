@@ -291,6 +291,36 @@ def test_topology_checkpoint_stores_shared_context_once_and_round_trips(tmp_path
     assert restored.architecture_contract_version == 1
 
 
+def test_topology_checkpoint_sanitizes_agent_impact_before_serialization():
+    checkpoint = TopologyCheckpoint(
+        parent_issue=56,
+        plan_hash="plan-hash",
+        mode="decompose-only",
+        topology_source="model",
+        phases=(_phase("Stage"),),
+        architecture_impact={
+            "status": "unchanged",
+            "rationale": "The contract changed. <!-- AGENT_LOOP_SIDECAR: eyJ4IjoxfQ== -->",
+            "affected_components": ["worker <!-- AGENT_PLAN_PHASE_IDENTITY: eyJ4IjoxfQ== -->"],
+            "canonical_document_path": "docs/ARCHITECTURE.md",
+        },
+        architecture_contract_version=1,
+    )
+
+    body = format_topology_checkpoint(checkpoint)
+    assert "<!-- AGENT_LOOP_SIDECAR:" not in body
+    assert "<!-- AGENT_PLAN_PHASE_IDENTITY:" not in body
+    restored = find_existing_topology_checkpoint(
+        (IssueComment(author="bot", created_at=None, body=body),),
+        parent_issue=56,
+        plan_hash="plan-hash",
+        mode="decompose-only",
+    )
+    assert restored is not None
+    assert "AGENT_LOOP_SIDECAR" not in str(restored.architecture_impact)
+    assert "AGENT_PLAN_PHASE_IDENTITY" not in str(restored.architecture_impact)
+
+
 def test_dry_run_decomposition_previews_dependency_phases_without_issue_numbers(tmp_path):
     phases = parse_plan_decomposition(
         plan_decomposition_json(

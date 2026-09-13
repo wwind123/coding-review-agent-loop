@@ -141,6 +141,194 @@ def test_default_pr_round_prepares_auto_checkout_before_architecture_acquisition
     assert calls == [f"ensure:{workdir}", f"sync:{workdir}"]
 
 
+def test_explicit_pr_round_checkout_is_synced_before_architecture_acquisition(
+    monkeypatch, tmp_path
+) -> None:
+    import helpers.skill_runner as skill_runner
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        skill_runner,
+        "ensure_temp_checkout",
+        lambda *args, **kwargs: calls.append(("ensure", kwargs)),
+    )
+
+    def fake_sync(config, runner, **kwargs):
+        calls.append(("sync", kwargs))
+
+    monkeypatch.setattr(skill_runner, "sync_checkout_to_pr", fake_sync)
+    args = SimpleNamespace(
+        dry_run=False,
+        workdir=str(tmp_path / "explicit"),
+        workdir_gemini=None,
+    )
+    workdir = str(tmp_path / "explicit")
+
+    assert skill_runner._prepare_skill_pr_architecture_checkout(
+        args,
+        repo="owner/repo",
+        pr=781,
+        pr_info={"headRefOid": "h" * 40, "baseRefName": "main"},
+        agent="gemini",
+        workdir=workdir,
+    ) is True
+    assert [kind for kind, _details in calls] == ["sync"]
+    assert calls[0][1]["path"] == Path(workdir)
+    assert calls[0][1]["default_owned"] is False
+
+
+def test_pr_round_reuses_frozen_architecture_for_host_handoff(
+    monkeypatch, capsys
+) -> None:
+    import helpers.prompt_builders as prompt_builders
+    import helpers.skill_runner as skill_runner
+    pair = object()
+    captured: list[object] = []
+    args = SimpleNamespace(
+        pr=781,
+        repo="owner/repo",
+        reviewers=["claude"],
+        dry_run=True,
+        head_sha="h" * 40,
+        architecture_context_enabled=True,
+        workdir=None,
+        workdir_claude=None,
+    )
+    monkeypatch.setattr(
+        skill_runner, "_fetch_pr_json",
+        lambda *_args, **_kwargs: {"headRefOid": "h" * 40, "baseRefName": "main"},
+    )
+    monkeypatch.setattr(
+        skill_runner,
+        "_recover_skill_pr_review_contexts",
+        lambda *_args, **_kwargs: (None, None, None, None, ()),
+    )
+    monkeypatch.setattr(
+        skill_runner,
+        "_build_resume",
+        lambda *_args, **_kwargs: {
+            "current_plan_subject": "h" * 40,
+            "round_number": 1,
+            "completed_round_number": 1,
+            "completed_reviewer_names": [],
+            "completed_reviewer_data": [],
+            "prior_items": [],
+        },
+    )
+    monkeypatch.setattr(skill_runner, "_reconcile_pending_comment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(skill_runner, "_fetch_pr_diff", lambda *args, **kwargs: "diff")
+    monkeypatch.setattr(skill_runner, "_authoritative_issue_number_from_pr", lambda *args, **kwargs: 781)
+    monkeypatch.setattr(skill_runner, "_prepare_skill_memory", lambda *args, **kwargs: None)
+    monkeypatch.setattr(skill_runner, "_prepare_skill_pr_architecture_checkout", lambda *args, **kwargs: True)
+    monkeypatch.setattr(prompt_builders, "_acquire_skill_architecture", lambda *args, **kwargs: pair)
+    monkeypatch.setattr(
+        skill_runner,
+        "_write_host_review_request",
+        lambda **kwargs: captured.append(kwargs["architecture_context"]) or Path("/tmp/request"),
+    )
+
+    skill_runner.cmd_run_pr_round(args)
+    capsys.readouterr()
+    assert captured == [pair]
+
+
+def test_pr_round_reacquires_architecture_once_and_reuses_identical_resume(
+    monkeypatch, capsys
+) -> None:
+    import helpers.prompt_builders as prompt_builders
+    import helpers.skill_runner as skill_runner
+
+    old = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="o" * 40,
+        blob_oid="p" * 40, sha256="q" * 64, availability="available",
+        size=8, content="# Old\n", heading_index=("Old",),
+    )
+    current = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="n" * 40,
+        blob_oid="r" * 40, sha256="s" * 64, availability="available",
+        size=12, content="# Current\n", heading_index=("Current",),
+    )
+    resume = {
+        "current_plan_subject": "h" * 40,
+        "round_number": 1,
+        "completed_round_number": 1,
+        "completed_reviewer_names": ["Codex"],
+        "completed_reviewer_data": [{
+            "reviewer_name": "Codex",
+            "state": "approved",
+            "new_items": [],
+            "blocking_items": [],
+            "dispositions": [],
+            "architecture_identity": old.identity(),
+            "architecture_contract_version": 1,
+        }],
+        "prior_items": [],
+    }
+    args = SimpleNamespace(
+        pr=781, repo="owner/repo", reviewers=["codex"], dry_run=True,
+        head_sha="h" * 40, architecture_context_enabled=True,
+        workdir=None, workdir_codex=None,
+    )
+    preparation_order: list[str] = []
+    prompts: list[object] = []
+    reviewer_calls = 0
+
+    monkeypatch.setattr(
+        skill_runner, "_fetch_pr_json",
+        lambda *_args, **_kwargs: {"headRefOid": "h" * 40, "baseRefName": "main"},
+    )
+    monkeypatch.setattr(
+        skill_runner, "_recover_skill_pr_review_contexts",
+        lambda *_args, **_kwargs: (None, None, None, None, ()),
+    )
+    monkeypatch.setattr(skill_runner, "_build_resume", lambda *_args, **_kwargs: resume)
+    monkeypatch.setattr(skill_runner, "_reconcile_pending_comment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(skill_runner, "_fetch_pr_diff", lambda *args, **kwargs: "diff")
+    monkeypatch.setattr(skill_runner, "_authoritative_issue_number_from_pr", lambda *args, **kwargs: 781)
+    monkeypatch.setattr(skill_runner, "_prepare_skill_memory", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        skill_runner,
+        "_prepare_skill_pr_architecture_checkout",
+        lambda *args, **kwargs: preparation_order.append("prepare") or True,
+    )
+    monkeypatch.setattr(
+        prompt_builders,
+        "_acquire_skill_architecture",
+        lambda *args, **kwargs: preparation_order.append("acquire") or current,
+    )
+    monkeypatch.setattr(
+        prompt_builders,
+        "build_review_prompt_for_skill",
+        lambda *args, **kwargs: prompts.append(kwargs["architecture_context"]) or "prompt",
+    )
+
+    def fake_run_reviewer(**kwargs):
+        nonlocal reviewer_calls
+        reviewer_calls += 1
+        record = {
+            "reviewer_name": "Codex", "state": "approved", "new_items": [],
+            "blocking_items": [], "dispositions": [],
+            "architecture_identity": current.identity(),
+            "architecture_contract_version": 1,
+        }
+        resume["completed_reviewer_data"] = [record]
+        resume["completed_reviewer_names"] = ["Codex"]
+        return record
+
+    monkeypatch.setattr(skill_runner, "_run_reviewer", fake_run_reviewer)
+
+    skill_runner.cmd_run_pr_round(args)
+    capsys.readouterr()
+    assert preparation_order == ["prepare", "acquire"]
+    assert prompts == [current]
+    assert reviewer_calls == 1
+
+    skill_runner.cmd_run_pr_round(args)
+    capsys.readouterr()
+    assert reviewer_calls == 1
+    assert prompts == [current]
+
+
 def test_build_resume_preserves_architecture_identity_for_resume_filter(
     monkeypatch, capsys
 ) -> None:
