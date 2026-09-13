@@ -179,6 +179,33 @@ def _prepare_execution_recommendation_transport(
     return transformed, sidecars
 
 
+def _replace_authorized_marker(
+    carrier: TrustedBody,
+    *,
+    token: str,
+    old_text: str,
+    new_text: str,
+) -> TrustedBody:
+    """Replace one marker while retaining the carrier's segment provenance."""
+    if old_text == new_text:
+        return carrier
+    replaced = False
+    segments = []
+    for segment in carrier._segments:
+        if not replaced and segment.token == token and segment.text == old_text:
+            segments.append(type(segment)(new_text, token))
+            replaced = True
+        else:
+            segments.append(segment)
+    if not replaced:
+        raise AgentLoopError(
+            f"Cannot transport {token}: its authorized marker segment was not found."
+        )
+    return TrustedBody(
+        "".join(segment.text for segment in segments), tuple(segments)
+    )
+
+
 def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
     """Return sidecars followed by an anchor; non-round bodies are strictly bounded."""
     if isinstance(body, TrustedBody):
@@ -195,24 +222,33 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
         )
     body_text = str(carrier)
     body_text, sidecars = _prepare_execution_recommendation_transport(body_text)
+    trusted_anchor = carrier
+    if sidecars:
+        original_execution = _EXECUTION_RECOMMENDATION_RE.search(str(carrier))
+        transported_execution = _EXECUTION_RECOMMENDATION_RE.search(body_text)
+        if original_execution is not None and transported_execution is not None:
+            trusted_anchor = _replace_authorized_marker(
+                trusted_anchor,
+                token="AGENT_EXECUTION_RECOMMENDATION",
+                old_text=original_execution.group(0),
+                new_text=transported_execution.group(0),
+            )
     matches = list(ROUND_RESUME_MARKER_RE.finditer(body_text))
     if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches and not sidecars:
         raise AgentLoopError(
             f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response."
         )
     if not matches:
-        if len(body_text) > MAX_GITHUB_BODY_CHARS and not sidecars:
-            raise AgentLoopError(
-                f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response."
-            )
         if sidecars:
             if len(body_text) > MAX_GITHUB_BODY_CHARS:
                 raise AgentLoopError(
                     f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters after execution sidecar spill."
                 )
-            expected = tuple(item.definition.token for item in scan_reserved_markers(body_text))
-            return (*sidecars, TrustedBody.canonical(body_text, expected_tokens=expected))
-        return (TrustedBody.canonical(body_text, expected_tokens=tuple(item.definition.token for item in scan_reserved_markers(body_text))),)
+            return (*sidecars, trusted_anchor)
+        # Preserve the caller's authorization when no transport rewrite was
+        # needed. Re-scanning this same text would authorize markers that the
+        # caller did not authorize at composition time.
+        return (carrier,)
 
     # Resume reads the last marker when a legacy comment contains more than one.
     match = matches[-1]
@@ -276,8 +312,17 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
         )
     if any(len(item) > MAX_GITHUB_BODY_CHARS for item in sidecars):
         raise AgentLoopError("Round metadata sidecar exceeds GitHub body budget.")
-    expected = tuple(item.definition.token for item in scan_reserved_markers(anchor))
-    return (*sidecars, TrustedBody.canonical(anchor, expected_tokens=expected))
+    original_round = ROUND_RESUME_MARKER_RE.search(str(trusted_anchor))
+    transported_round = ROUND_RESUME_MARKER_RE.search(anchor)
+    if original_round is None or transported_round is None:
+        raise AgentLoopError("Cannot transport AGENT_LOOP_META without its authorized marker segment.")
+    trusted_anchor = _replace_authorized_marker(
+        trusted_anchor,
+        token="AGENT_LOOP_META",
+        old_text=original_round.group(0),
+        new_text=transported_round.group(0),
+    )
+    return (*sidecars, trusted_anchor)
 
 
 def hydrate_mapping(

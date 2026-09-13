@@ -471,13 +471,23 @@ def _recover_structured_response(
     require_execution_strategy_contract: bool = False,
 ) -> tuple[str, object]:
     """Run deterministic-to-Gemini recovery without mutating the saved raw artifact."""
-    if require_execution_strategy_contract and expected_kind in {"plan_state", "plan_revision"}:
-        require_recoverable_fresh_execution_contract(
-            original_text, expected_kind=expected_kind
-        )
     candidate = original_text
     if reviewer_normalization:
         candidate = _normalize_disposition_values(_normalize_raw_response(candidate))
+
+    # Normalize only deterministic envelope material before checking fresh
+    # planning provenance. This permits a complete reviewed object in a JSON
+    # fence while still refusing absent or partial recommendations before any
+    # model-backed repair can invent topology.
+    if require_execution_strategy_contract and expected_kind in {"plan_state", "plan_revision"}:
+        normalized_source = attempt_envelope_normalization(
+            candidate, expected_kind=expected_kind
+        )
+        if normalized_source is not None:
+            candidate = normalized_source
+        require_recoverable_fresh_execution_contract(
+            candidate, expected_kind=expected_kind
+        )
 
     try:
         return candidate, validate(candidate)
@@ -3395,8 +3405,28 @@ def _run_host_coder_phase(
     issue: int = args.issue
     repo: str = args.repo
 
-    # New-round vs resume detection
-    plan_subject = _plan_subject_of_file(plan_file)
+    # New-round vs resume detection must use the same canonical plan text that
+    # attach-metadata persists. Host plan files are structured JSON, while the
+    # round record stores the deterministic markdown rendering; hashing the
+    # source file here would fork an unchanged plan on every invocation.
+    raw_plan_text = plan_file.read_text(encoding="utf-8")
+    canonical_plan_text = raw_plan_text
+    try:
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        parsed_plan = validate_structured_plan_state(
+            raw_plan_text,
+            require_execution_strategy_contract=1,
+        )
+        if parsed_plan is not None:
+            canonical_plan_text = render_canonical_plan_state(parsed_plan)
+    except (AgentLoopError, ValueError, TypeError):
+        # The normal validation command below remains the authoritative
+        # diagnostic for an invalid host plan. Keep the raw text here so a
+        # failed first invocation is not hidden by subject preparation.
+        canonical_plan_text = raw_plan_text
+    plan_subject = _plan_subject(canonical_plan_text)
     current_plan_subject = resume.get("current_plan_subject")
     is_new_round = current_plan_subject != plan_subject
 
@@ -3466,7 +3496,7 @@ def _run_host_coder_phase(
             print(f"[dry-run] would post plan for {repo}#{issue} (round {new_round_number})")
 
     return {
-        "plan_text": plan_file.read_text(encoding="utf-8"),
+        "plan_text": canonical_plan_text,
         "plan_subject": plan_subject,
         "new_round_number": new_round_number,
         "next_prior_items_raw": next_prior_items_raw,

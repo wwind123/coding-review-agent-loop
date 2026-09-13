@@ -1807,6 +1807,22 @@ def _resume_plan_round(
     current_plan = latest_coder_record.metadata.canonical_plan or latest_coder_record.body
     coder_output = latest_coder_record.metadata.raw_structured_coder_response or current_plan
     metadata_version = latest_coder_record.metadata.execution_strategy_contract_version
+    if metadata_version == 1:
+        # A generation-1 plan is identified by its canonical rendered text.
+        # Never resume a record whose subject was computed from a different
+        # representation (for example, raw host JSON versus rendered plan
+        # markdown); doing so would make the next skill invocation fork the
+        # same plan into a new round.
+        if latest_coder_record.metadata.canonical_plan is None:
+            raise AgentLoopError(
+                "Generation-1 planning metadata has no canonical plan text; "
+                "repair the handoff or start a new plan round."
+            )
+        if _plan_subject(current_plan) != latest_coder_record.metadata.subject:
+            raise AgentLoopError(
+                "Generation-1 planning metadata subject does not match its canonical plan; "
+                "repair the handoff or start a new plan round."
+            )
     all_bodies = tuple(
         body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
     )

@@ -102,7 +102,13 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
 
     stripped = raw.lstrip()
     if not stripped.startswith("{"):
-        return None
+        # Deterministic recovery for the common JSON-fence/leading-envelope
+        # shape. The source object is still parsed and validated below; this
+        # only removes material outside the structured response.
+        brace_index = stripped.find("{")
+        if brace_index < 0:
+            return None
+        stripped = stripped[brace_index:]
     try:
         payload, json_end = json.JSONDecoder().raw_decode(stripped)
     except json.JSONDecodeError:
@@ -117,7 +123,11 @@ def attempt_envelope_normalization(raw: str, *, expected_kind: str | None) -> st
     if state_match is None:
         return None
 
-    before_footer = trailing[: state_match.start()]
+    before_footer = re.sub(
+        r"(?im)^\s*(?:`{3,}|~{3,})(?:json)?\s*$\n?",
+        "",
+        trailing[: state_match.start()],
+    )
     after_footer_raw = trailing[state_match.end() :]
     footer = trailing[state_match.start() : state_match.end()].strip()
 
@@ -1147,12 +1157,13 @@ _SUPPORTED_EXPECTED_KINDS = {"plan_state", "pr_review", "plan_review", "coder_fo
 RepairOutcome = Literal[
     "succeeded", "nonzero_exit", "empty_output", "timeout", "spawn_error", "invalid_output",
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
+    "fresh_contract_integrity",
 ]
 
 
 @dataclass
 class RepairAttemptResult:
-    backend: Literal["antigravity", "gemini", "codex", "claude"]
+    backend: Literal["none", "antigravity", "gemini", "codex", "claude"]
     model: str
     prompt: str
     output: str

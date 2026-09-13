@@ -83,6 +83,36 @@ from coding_review_agent_loop.protocol import (
 from coding_review_agent_loop.local_test_evidence import canonicalize_bounded_evidence
 
 
+def _canonicalize_plan_subject_source(
+    text: str, *, prior_items: tuple[UnresolvedReviewItem, ...] = ()
+) -> str:
+    """Use the v1 canonical rendering when a subject file is raw plan JSON."""
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(text.lstrip())
+        kind = payload.get("kind") if isinstance(payload, dict) else None
+        if kind == "plan_state":
+            parsed = validate_structured_plan_state(
+                text, require_execution_strategy_contract=1
+            )
+            if parsed is not None:
+                from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+
+                return render_canonical_plan_state(parsed)
+        elif kind == "plan_revision":
+            parsed = validate_structured_plan_revision(
+                text, require_execution_strategy_contract=1
+            )
+            if parsed is not None:
+                from coding_review_agent_loop.comment_rendering import render_canonical_plan_revision
+
+                return render_canonical_plan_revision(parsed, prior_items)
+    except (AgentLoopError, AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        # The normal caller validation owns malformed plan diagnostics. This
+        # helper only canonicalizes a valid v1 subject source.
+        pass
+    return text
+
+
 def _session_path(repo: str, issue: int) -> Path:
     slug = repo.replace("/", "-").replace(":", "-")
     state_home = Path(
@@ -300,20 +330,6 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         print(f"state_manager: cannot read body file: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Compute subject
-    if args.subject:
-        subject = args.subject
-    elif args.subject_plan_file:
-        try:
-            plan_text = Path(args.subject_plan_file).read_text(encoding="utf-8")
-        except OSError as exc:
-            print(f"state_manager: cannot read subject plan file: {exc}", file=sys.stderr)
-            sys.exit(1)
-        subject = _plan_subject(plan_text)
-    else:
-        print("state_manager attach-metadata: provide --subject or --subject-plan-file", file=sys.stderr)
-        sys.exit(1)
-
     # Load optional item lists
     raw_prior = _load_item_list(args.prior_items_file)
     raw_dispositions = _load_item_list(args.dispositions_file)
@@ -423,17 +439,47 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
     # Host-mode plan files are raw structured responses. Publish the same
     # canonical human-readable representation used by external/skill turns so
     # the recommendation sidecar is available to restart recovery. External
-    # turns already arrive rendered and are left untouched.
+    # turns already arrive rendered and are left untouched. The canonical plan
+    # is deliberately the subject source: hashing the raw host JSON while
+    # storing rendered markdown makes the next resume look like a new round.
     if parsed_strategy is not None and body.lstrip().startswith("{"):
-        from coding_review_agent_loop.comment_rendering import render_public_agent_comment
+        from coding_review_agent_loop.comment_rendering import (
+            render_canonical_plan_revision,
+            render_canonical_plan_state,
+            render_public_agent_comment,
+        )
 
         body = render_public_agent_comment(
             kind=parsed_strategy.kind,
             parsed=parsed_strategy,
             agent=args.agent,
         )
-        if canonical_plan is not None and canonical_plan.lstrip().startswith("{"):
-            canonical_plan = body
+        if parsed_strategy.kind == "plan_state":
+            canonical_plan = render_canonical_plan_state(parsed_strategy)
+        elif parsed_strategy.kind == "plan_revision":
+            canonical_plan = render_canonical_plan_revision(parsed_strategy, prior_items)
+
+    # Compute the subject only after a fresh host plan has been canonicalized.
+    # Explicit callers (for example PR-head metadata) retain their supplied
+    # subject; plan-file callers hash the exact canonical plan persisted above.
+    if args.subject:
+        subject = args.subject
+    elif args.subject_plan_file:
+        try:
+            plan_text = (
+                canonical_plan
+                if parsed_strategy is not None and canonical_plan is not None
+                else Path(args.subject_plan_file).read_text(encoding="utf-8")
+            )
+        except OSError as exc:
+            print(f"state_manager: cannot read subject plan file: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if parsed_strategy is None:
+            plan_text = _canonicalize_plan_subject_source(plan_text, prior_items=prior_items)
+        subject = _plan_subject(plan_text)
+    else:
+        print("state_manager attach-metadata: provide --subject or --subject-plan-file", file=sys.stderr)
+        sys.exit(1)
 
     compact_prior_summaries: tuple[str, ...] = ()
     if getattr(args, "compact_prior_summaries_file", None):

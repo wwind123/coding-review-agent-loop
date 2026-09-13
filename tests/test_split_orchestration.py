@@ -53,6 +53,84 @@ def test_v1_recommendation_keeps_legacy_typed_split_input_separate():
     ]
 
 
+def _fresh_v1_plan_for_isolation(strategy: str) -> str:
+    raw = structured_v1_plan_state()
+    payload, end = json.JSONDecoder().raw_decode(raw.lstrip())
+    if strategy == "staged":
+        recommendation = payload["execution_recommendation"]
+        recommendation.update({
+            "strategy": "staged",
+            "staging_feasibility": "safe",
+            "scope_items": [
+                {
+                    "scope_item_id": "scope-1",
+                    "requirement": "Deliver the intermediate behavior.",
+                    "acceptance_criteria": ["The intermediate behavior passes."],
+                },
+                {
+                    "scope_item_id": "scope-2",
+                    "requirement": "Complete final integration.",
+                    "acceptance_criteria": ["The integrated behavior passes."],
+                },
+            ],
+            "child_stages": [{
+                "stage_id": "stage-1",
+                "position": 1,
+                "title": "Intermediate behavior",
+                "summary": "Deliver the independently verifiable intermediate behavior.",
+                "deliverables": ["The intermediate behavior."],
+                "non_goals": [],
+                "acceptance_criteria": ["The intermediate behavior passes."],
+                "depends_on_stage_ids": [],
+                "dependency_notes": "No dependencies.",
+                "automation": "agent-pr",
+                "rollout_risk": "low",
+                "compatibility_constraints": [],
+                "covered_scope_item_ids": ["scope-1"],
+            }],
+            "final_integration_work": {
+                "status": "required",
+                "deliverables": ["Final integration."],
+                "acceptance_criteria": ["The integrated behavior passes."],
+                "covered_scope_item_ids": ["scope-2"],
+            },
+        })
+        recommendation.pop("one_shot_delivery", None)
+    return json.dumps(payload) + raw.lstrip()[end:]
+
+
+@pytest.mark.parametrize("strategy", ["one-shot", "staged"])
+@pytest.mark.parametrize(
+    "execution_mode",
+    ["plan-only", "implement-one-shot", "decompose-only", "implement-by-phase"],
+)
+@pytest.mark.parametrize("materialize", [False, True])
+def test_fresh_v1_recommendation_is_inert_at_legacy_split_seam(
+    tmp_path, strategy, execution_mode, materialize
+):
+    plan = _fresh_v1_plan_for_isolation(strategy)
+    runner = FakeRunner()
+    config = make_config(
+        tmp_path,
+        plan_execution_mode=execution_mode,
+        materialize_split_issues=materialize,
+    )
+
+    result = _handle_plan_first_split_scope(
+        runner,
+        issue_number=783,
+        config=config,
+        current_plan=plan,
+        plan_subject=_plan_subject(plan),
+        issue_context=IssueContext(783, config.repo, "Title", "Body", None, ()),
+    )
+
+    assert result is False
+    assert runner.comments == []
+    assert runner.issues == []
+    assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+
 def _existing_split_children_comment() -> dict:
     metadata = SplitMaterializationMetadata(
         parent_issue=56,

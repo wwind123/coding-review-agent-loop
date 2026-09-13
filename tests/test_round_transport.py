@@ -27,6 +27,7 @@ from coding_review_agent_loop.protocol import (
 )
 from coding_review_agent_loop.review_scheduling import ReviewSchedulingContract
 from coding_review_agent_loop.unresolved_items import _apply_unresolved_item_dispositions
+from coding_review_agent_loop.protocol_markers import TrustedBody
 
 
 def _random_text(size: int) -> str:
@@ -54,6 +55,64 @@ def test_is_round_transport_sidecar() -> None:
     sidecar = transport._sidecar({"field": "canonical_plan"})
     assert transport.is_round_transport_sidecar(sidecar)
     assert not transport.is_round_transport_sidecar("ordinary agent output")
+
+
+def test_prepare_round_comment_preserves_trusted_carrier_without_spill() -> None:
+    carrier = TrustedBody.join(
+        TrustedBody.current_untrusted_visible("first"),
+        TrustedBody.current_untrusted_visible("second"),
+    )
+
+    prepared = transport.prepare_round_comment(carrier)
+
+    assert prepared == (carrier,)
+    assert prepared[0] is carrier
+    assert prepared[0].segments == carrier.segments
+
+
+def test_prepare_round_comment_spill_keeps_existing_segment_provenance() -> None:
+    recommendation = {
+        "strategy": "one-shot",
+        "rationale": _random_text(50_000),
+        "staging_feasibility": "inseparable",
+        "scope_items": [{
+            "scope_item_id": "scope-1",
+            "requirement": "Implement the requested behavior.",
+            "acceptance_criteria": ["The focused regression passes."],
+        }],
+        "coupling_constraints": [],
+        "one_shot_delivery": {
+            "deliverables": ["Implementation."],
+            "acceptance_criteria": ["The regression passes."],
+            "covered_scope_item_ids": ["scope-1"],
+        },
+        "child_stages": [],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "caveats": [],
+    }
+    encoded = transport._b64(
+        json.dumps(recommendation, separators=(",", ":"), sort_keys=True).encode()
+    )
+    marker_text = f"<!-- AGENT_EXECUTION_RECOMMENDATION: {encoded} -->"
+    carrier = TrustedBody.join(
+        TrustedBody.current_untrusted_visible("first"),
+        TrustedBody.current_untrusted_visible("second"),
+        TrustedBody.marker("AGENT_EXECUTION_RECOMMENDATION", marker_text),
+    )
+
+    prepared = transport.prepare_round_comment(carrier)
+
+    assert len(prepared) > 1
+    assert prepared[-1].segments[0] == ("first", None)
+    assert prepared[-1].segments[1] == ("second", None)
+    assert prepared[-1].segments[2][1] == "AGENT_EXECUTION_RECOMMENDATION"
 
 
 def test_prepare_round_comment_spills_only_until_anchor_fits() -> None:

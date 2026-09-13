@@ -69,6 +69,46 @@ def test_fresh_contract_guard_requires_mechanically_recoverable_source():
         )
 
 
+def test_skill_fresh_contract_normalizes_complete_json_fence_before_guard():
+    from helpers.skill_runner import _recover_structured_response
+    from agent_loop_helpers import structured_v1_plan_state
+
+    raw = structured_v1_plan_state()
+    fenced = f"```json\n{raw}\n```"
+    recovered, parsed = _recover_structured_response(
+        fenced,
+        expected_kind="plan_state",
+        validate=lambda text: validate_structured_plan_state(
+            text, require_execution_strategy_contract=1
+        ),
+        require_execution_strategy_contract=True,
+    )
+
+    assert recovered.startswith("{")
+    assert "```" not in recovered
+    assert parsed.execution_recommendation is not None
+
+
+def test_skill_fresh_contract_still_rejects_partial_normalized_source():
+    from helpers.skill_runner import _recover_structured_response
+    from agent_loop_helpers import structured_v1_plan_state
+
+    raw = structured_v1_plan_state()
+    payload, end = json.JSONDecoder().raw_decode(raw.lstrip())
+    del payload["execution_recommendation"]
+    partial = json.dumps(payload) + raw.lstrip()[end:]
+
+    with pytest.raises(FreshContractIntegrityError, match="new planner turn"):
+        _recover_structured_response(
+            f"```json\n{partial}\n```",
+            expected_kind="plan_state",
+            validate=lambda text: validate_structured_plan_state(
+                text, require_execution_strategy_contract=1
+            ),
+            require_execution_strategy_contract=True,
+        )
+
+
 def test_answer_repair_shape_preserves_answer_and_rejects_triage_fields():
     valid = json.dumps({
         "schema_version": 1, "kind": "discuss_answer", "position": "answer",

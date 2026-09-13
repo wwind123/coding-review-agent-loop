@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 
 import pytest
 
@@ -21,6 +22,68 @@ def test_repair_preserves_every_nested_execution_recommendation_field():
     target["execution_recommendation"]["caveats"] = ["A different caveat."]
     with pytest.raises(AgentLoopError, match="execution_recommendation.caveats"):
         check(source, target)
+
+
+def test_repair_preservation_checks_each_nested_execution_field():
+    source_text = structured_v1_plan_state()
+    source, _ = json.JSONDecoder().raw_decode(source_text.lstrip())
+    recommendation = source["execution_recommendation"]
+    recommendation["coupling_constraints"] = [{
+        "constraint_id": "coupling-1",
+        "scope_item_ids": ["scope-1"],
+        "rationale": "These requirements must ship together.",
+    }]
+    recommendation["child_stages"] = [{
+        "stage_id": "stage-1", "position": 1, "title": "Reviewed stage",
+        "summary": "A reviewed intermediate delivery.",
+        "deliverables": ["The intermediate behavior."],
+        "non_goals": ["No unrelated changes."],
+        "acceptance_criteria": ["The intermediate behavior passes."],
+        "depends_on_stage_ids": [], "dependency_notes": "No dependencies.",
+        "automation": "agent-pr", "rollout_risk": "low",
+        "compatibility_constraints": ["Keep the old entry point."],
+        "covered_scope_item_ids": ["scope-1"],
+    }]
+
+    mutations = [
+        ("strategy", "staged"),
+        ("rationale", "A changed rationale."),
+        ("staging_feasibility", "safe"),
+        ("caveats", ["A changed caveat."]),
+        ("scope_items.0.scope_item_id", "scope-other"),
+        ("scope_items.0.requirement", "A changed requirement."),
+        ("scope_items.0.acceptance_criteria.0", "A changed criterion."),
+        ("coupling_constraints.0.constraint_id", "coupling-other"),
+        ("coupling_constraints.0.scope_item_ids.0", "scope-other"),
+        ("coupling_constraints.0.rationale", "A changed coupling rationale."),
+        ("one_shot_delivery.deliverables.0", "A changed deliverable."),
+        ("one_shot_delivery.acceptance_criteria.0", "A changed delivery criterion."),
+        ("one_shot_delivery.covered_scope_item_ids.0", "scope-other"),
+        ("child_stages.0.stage_id", "stage-other"),
+        ("child_stages.0.position", 2),
+        ("child_stages.0.title", "Changed stage"),
+        ("child_stages.0.summary", "Changed stage summary."),
+        ("child_stages.0.deliverables.0", "Changed stage deliverable."),
+        ("child_stages.0.non_goals.0", "Changed stage non-goal."),
+        ("child_stages.0.acceptance_criteria.0", "Changed stage criterion."),
+        ("child_stages.0.dependency_notes", "Changed dependency notes."),
+        ("child_stages.0.automation", "human-action"),
+        ("child_stages.0.rollout_risk", "high"),
+        ("child_stages.0.compatibility_constraints.0", "Changed compatibility."),
+        ("child_stages.0.covered_scope_item_ids.0", "scope-other"),
+        ("retained_parent_work.status", "required"),
+        ("final_integration_work.status", "required"),
+    ]
+    for path, replacement in mutations:
+        target = deepcopy(source)
+        cursor = target["execution_recommendation"]
+        parts = path.split(".")
+        for part in parts[:-1]:
+            cursor = cursor[int(part)] if part.isdigit() else cursor[part]
+        last = parts[-1]
+        cursor[int(last) if last.isdigit() else last] = replacement
+        with pytest.raises(AgentLoopError, match="execution_recommendation"):
+            check(source, target)
 
 
 def test_prompt_demands_lossless_repair_and_separate_ledgers():
