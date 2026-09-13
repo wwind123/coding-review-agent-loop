@@ -688,10 +688,16 @@ def test_issue_loop_plan_first_decompose_only_summarizes_instead_of_filing_plan_
     assert "mode=summarize" in planning_summary
     assert "mode=issue" not in planning_summary
 
-def test_issue_loop_plan_first_decompose_only_creates_child_issues(tmp_path):
+@pytest.mark.parametrize("additional_closing_ids", [None, []])
+def test_issue_loop_plan_first_decompose_only_creates_child_issues(tmp_path, additional_closing_ids):
+    plan = structured_plan_state(summary="Add schema helpers.")
+    if additional_closing_ids is not None:
+        payload, end = json.JSONDecoder().raw_decode(plan)
+        payload["additional_closing_issue_ids"] = additional_closing_ids
+        plan = json.dumps(payload) + plan[end:]
     runner = FakeRunner(
         claude_outputs=[
-            structured_plan_state(summary="Add schema helpers."),
+            plan,
             plan_decomposition_json(
                 {
                     "title": "Schema helpers",
@@ -741,6 +747,27 @@ def test_issue_loop_plan_first_decompose_only_creates_child_issues(tmp_path):
     assert "Every phase above has a GitHub child issue" in summary
     assert "<!-- AGENT_PLAN_DECOMPOSITION:" in summary
     assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("mode", ["decompose-only", "implement-by-phase"])
+@pytest.mark.parametrize("source", ["plan", "cli"])
+def test_issue_loop_split_rejects_nonempty_closing_ids_before_materialization(tmp_path, mode, source):
+    plan = structured_plan_state(summary="Add schema helpers.")
+    payload, end = json.JSONDecoder().raw_decode(plan)
+    payload["additional_closing_issue_ids"] = [99] if source == "plan" else []
+    plan = json.dumps(payload) + plan[end:]
+    runner = FakeRunner(
+        claude_outputs=[plan],
+        codex_outputs=["Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    config = make_config(
+        tmp_path, plan_execution_mode=mode,
+        expected_closing_issue_ids=(99,) if source == "cli" else None,
+    )
+    with pytest.raises(AgentLoopError, match="Additional expected closing issue IDs are single-PR-only"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert runner.issues == []
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
 
 def test_issue_loop_plan_first_decompose_only_is_idempotent(tmp_path):
     plan = structured_plan_state(summary="Add schema helpers.")

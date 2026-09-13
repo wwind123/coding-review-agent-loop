@@ -6200,7 +6200,7 @@ def _run_plan_first_loop(
                 or _extract_current_child_stages(current_plan)
                 or _extract_current_deferred_stages(current_plan)
             )
-            if split_topology and (config.expected_closing_issue_ids is not None or plan_additions is not None):
+            if split_topology and (config.expected_closing_issue_ids or plan_additions):
                 raise AgentLoopError(
                     "Additional expected closing issue IDs are single-PR-only and cannot be "
                     "carried through split/decomposition materialization. Invoke the actual "
