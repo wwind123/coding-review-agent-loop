@@ -40,6 +40,11 @@ _ARCHITECTURE_LIST_KEYS = frozenset({
 _ARCHITECTURE_FLOW_ALIAS_KEYS = ("execution_flows", "data_flows")
 
 
+def _schema_valid_architecture_entry(value: object) -> bool:
+    """Return whether one architecture-list entry can pass schema validation."""
+    return isinstance(value, str) and bool(value.strip())
+
+
 def _payload(text: str) -> dict | None:
     text, _ = normalize_response_file_structured_text(text)
     stripped = text.lstrip()
@@ -118,8 +123,12 @@ def _schema_valid_architecture_field(key: str, value: object) -> bool:
         # raw null is normalized to that default and is therefore not pinned.
         return isinstance(value, str) and (not value or bool(value.strip()))
     if key in _ARCHITECTURE_LIST_KEYS:
-        return isinstance(value, list) and all(
-            isinstance(item, str) and bool(item.strip()) for item in value
+        # A partially malformed list still contains recoverable content.  Pin
+        # the field when it has at least one schema-valid entry, while allowing
+        # invalid entries to be removed or corrected by the ordinary schema
+        # repair.  Keep empty lists pinned because an empty list is valid.
+        return isinstance(value, list) and (
+            not value or any(_schema_valid_architecture_entry(item) for item in value)
         )
     return False
 
@@ -140,11 +149,17 @@ def _preserve_architecture_list(
     ordering when one entry's fragments are a subset of another's.
     """
     require(isinstance(target, list), field)
-    require(len(source) == len(target), field)
+    valid_source = [
+        entry for entry in source if _schema_valid_architecture_entry(entry)
+    ]
+    # Valid source entries must survive one-for-one.  Invalid source entries
+    # may be corrected into a schema-valid entry or removed, so the repaired
+    # list may be shorter than the source but cannot grow beyond it.
+    require(len(valid_source) <= len(target) <= len(source), field)
 
     matched_source_by_target: dict[int, int] = {}
 
-    def can_match(source_entry: object, target_entry: object) -> bool:
+    def can_match(source_entry: str, target_entry: object) -> bool:
         fragments = _fragments(source_entry)
         return not fragments or _contains_fragments(target_entry, fragments)
 
@@ -152,7 +167,7 @@ def _preserve_architecture_list(
         for target_index, target_entry in enumerate(target):
             if target_index in visited_targets:
                 continue
-            if not can_match(source[source_index], target_entry):
+            if not can_match(valid_source[source_index], target_entry):
                 continue
             visited_targets.add(target_index)
             previous_source_index = matched_source_by_target.get(target_index)
@@ -162,7 +177,7 @@ def _preserve_architecture_list(
                 return True
         return False
 
-    for source_index in range(len(source)):
+    for source_index in range(len(valid_source)):
         require(augment(source_index, set()), field)
 
 

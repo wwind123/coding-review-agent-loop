@@ -237,6 +237,30 @@ def test_architecture_entries_require_distinct_one_to_one_matches():
         })
 
 
+def test_malformed_architecture_list_cannot_drop_valid_entries():
+    source = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "affected_components": ["orchestrator.py", 123],
+        },
+    }
+    repaired = {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "affected_components": ["orchestrator.py"],
+        },
+    }
+    validate_structured_task_result(valid_task_result(repaired["architecture_impact"]))
+    check(source, repaired)
+
+    dropped = deepcopy(repaired)
+    dropped["architecture_impact"]["affected_components"] = []
+    with pytest.raises(AgentLoopError, match="architecture_impact.affected_components"):
+        check(source, dropped)
+
+
 def test_architecture_scalar_fields_cannot_be_omitted_or_type_changed():
     source = {
         "kind": "task_result",
