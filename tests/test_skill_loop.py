@@ -108,3 +108,71 @@ def test_skill_pr_resume_rejects_stale_architecture_identity() -> None:
     filtered = _filter_resume_for_architecture(resume, architecture_identity=identity)
     assert filtered["completed_reviewer_names"] == ["Gemini"]
     assert filtered["completed_reviewer_data"] == [current]
+
+
+def test_build_resume_preserves_architecture_identity_for_resume_filter(
+    monkeypatch, capsys
+) -> None:
+    import helpers.state_manager as state_manager
+    from coding_review_agent_loop.round_state import PostedRoundMetadata
+
+    identity = {
+        "repository": "owner/repo",
+        "path": "ARCHITECTURE.md",
+        "revision": "a" * 40,
+    }
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="reviewer",
+        agent="Gemini",
+        round_number=2,
+        subject="head-7",
+        architecture_identity=identity,
+        architecture_contract_version=1,
+    )
+    resumed = type(
+        "Resumed",
+        (),
+        {
+            "round_number": 2,
+            "prior_items": (),
+            "compact_prior_summaries": (),
+            "completed_reviews": (type("Record", (), {"metadata": metadata})(),),
+            "local_test_evidence": None,
+        },
+    )()
+    monkeypatch.setattr(state_manager, "_fetch_issue_comments", lambda *args, **kwargs: [])
+    monkeypatch.setattr(state_manager, "_resume_pr_round", lambda *args, **kwargs: resumed)
+
+    state_manager.cmd_build_resume(
+        type(
+            "Args",
+            (),
+            {
+                "repo": "owner/repo",
+                "issue": 7,
+                "reviewers": ["gemini"],
+                "flow": "pr",
+                "head_sha": "head-7",
+                "pr": 7,
+                "gh_cmd": "gh",
+            },
+        )()
+    )
+
+    descriptor = json.loads(capsys.readouterr().out)
+    record = descriptor["completed_reviewer_data"][0]
+    assert record["architecture_identity"] == identity
+    assert record["architecture_contract_version"] == 1
+
+    from helpers.skill_runner import _filter_resume_for_architecture
+
+    current = _filter_resume_for_architecture(
+        descriptor, architecture_identity=identity
+    )
+    assert current["completed_reviewer_names"] == ["Gemini"]
+    changed = _filter_resume_for_architecture(
+        descriptor,
+        architecture_identity={**identity, "revision": "b" * 40},
+    )
+    assert changed["completed_reviewer_names"] == []

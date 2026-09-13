@@ -210,6 +210,8 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                         "surfaced_reviewer_requirement_ids": list(
                             record.metadata.surfaced_reviewer_requirement_ids
                         ),
+                        "architecture_identity": record.metadata.architecture_identity,
+                        "architecture_contract_version": record.metadata.architecture_contract_version,
                     }
                     for record in resumed.completed_reviews
                 ]
@@ -255,6 +257,8 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                         "surfaced_reviewer_requirement_ids": list(
                             record.metadata.surfaced_reviewer_requirement_ids
                         ),
+                        "architecture_identity": record.metadata.architecture_identity,
+                        "architecture_contract_version": record.metadata.architecture_contract_version,
                     }
                     for record in result.completed_reviews
                 ]
