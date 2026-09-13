@@ -14,7 +14,11 @@ from coding_review_agent_loop.decomposition import (
     format_phase_issue_body,
     normalize_execution_recommendation,
 )
-from coding_review_agent_loop.github import IssueContext, validate_pr_body_does_not_close_issue
+from coding_review_agent_loop.github import (
+    IssueComment,
+    IssueContext,
+    validate_pr_body_does_not_close_issue,
+)
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
@@ -162,7 +166,7 @@ def test_fresh_v1_recommendation_is_inert_at_legacy_split_seam(
 )
 @pytest.mark.parametrize("materialize", [False, True])
 def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
-    tmp_path, monkeypatch, strategy, execution_mode, expected_events, materialize
+    tmp_path, monkeypatch, capsys, strategy, execution_mode, expected_events, materialize
 ):
     """Exercise the approval-bound policy matrix before downstream mutation."""
     events = []
@@ -205,6 +209,17 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         if execution_mode == "auto":
             expected = ("implement",) if strategy == "one-shot" else ("decompose", "implement")
         assert tuple(events) == expected if execution_mode != "plan-only" else tuple(events) == ()
+        output = capsys.readouterr().out
+        expected_action = (
+            "implement-one-shot"
+            if execution_mode == "auto" and strategy == "one-shot"
+            else "implement-by-phase"
+            if execution_mode == "auto"
+            else execution_mode
+        )
+        assert f"requested policy `{execution_mode}`" in output
+        assert f"resolved action `{expected_action}`" in output
+        assert "Remaining child work:" in output
         assert runner.issues == []
         assert not any("AGENT_PLAN_TOPOLOGY_CHECKPOINT" in comment for comment in runner.comments)
         assert not any("AGENT_DISCUSS_SPLIT" in comment for comment in runner.comments)
@@ -217,6 +232,58 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
         assert not any("AGENT_PLAN_DECOMPOSITION" in comment for comment in runner.comments)
         assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("execution_mode", ["plan-only", "implement-one-shot"])
+def test_one_shot_recommendation_keeps_legacy_split_materialization_live(
+    tmp_path, execution_mode
+):
+    plan = _fresh_v1_plan_for_isolation("one-shot")
+    split_comment = _attach_round_metadata(
+        "Split consensus recorded.",
+        PostedRoundMetadata(
+            flow="discuss",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="discuss-subject",
+            is_final=True,
+            split_proposals=("Legacy follow-up",),
+        ),
+    )
+    context = IssueContext(
+        783,
+        "OWNER/REPO",
+        "Title",
+        "Body",
+        "https://github.com/OWNER/REPO/issues/783",
+        (IssueComment(author="bot", created_at=None, body=split_comment),),
+    )
+    runner = FakeRunner(issue_urls=["https://github.com/OWNER/REPO/issues/99"])
+    config = make_config(
+        tmp_path,
+        plan_execution_mode=execution_mode,
+        materialize_split_issues=True,
+    )
+    recommendation = validate_structured_plan_state(plan).execution_recommendation
+    assert recommendation is not None
+    resolved = orchestrator_module._resolve_execution_policy(
+        config,
+        requested_policy=execution_mode,
+        recommendation=recommendation,
+    )
+
+    assert _handle_plan_first_split_scope(
+        runner,
+        issue_number=783,
+        config=config,
+        current_plan=plan,
+        plan_subject=_plan_subject(plan),
+        issue_context=context,
+        resolved_execution=resolved,
+    ) is True
+    assert len(runner.issues) == 1
+    assert runner.issues[0]["title"] == "[#783 stage] Legacy follow-up"
 
 
 @pytest.mark.parametrize("strategy", ["one-shot", "staged"])

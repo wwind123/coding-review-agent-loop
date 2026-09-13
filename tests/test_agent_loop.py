@@ -1,8 +1,11 @@
+import ast
 import base64
 import datetime
+import inspect
 import json
 import os
 import sys
+import textwrap
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -12,6 +15,7 @@ import pytest
 
 import coding_review_agent_loop.cli as cli_module
 import coding_review_agent_loop.orchestrator as orchestrator_module
+import coding_review_agent_loop.prompts as prompts_module
 
 from coding_review_agent_loop.agents.base import AgentResult, with_public_response_file_instruction
 from coding_review_agent_loop.agents.gemini import PUBLIC_RESPONSE_MARKER
@@ -2183,6 +2187,31 @@ def test_plan_first_post_approval_options_require_plan_first(capsys):
         == 1
     )
     assert "--plan-execution-mode requires --plan-first" in capsys.readouterr().err
+
+
+def test_preapproval_plan_execution_mode_reads_have_explicit_auto_coverage():
+    """Keep every pre-approval mode consumer tied to the automatic policy contract."""
+    from coding_review_agent_loop.config import PLAN_EXECUTION_MODES
+
+    assert "auto" in PLAN_EXECUTION_MODES
+    sources = (
+        inspect.getsource(cli_module.main),
+        inspect.getsource(prompts_module._phased_plan_guard),
+    )
+    for source in sources:
+        tree = ast.parse(textwrap.dedent(source))
+        mode_branches = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            condition = ast.unparse(node.test)
+            if "plan_execution_mode" not in condition:
+                continue
+            if not any(operator in condition for operator in (" == ", " != ", " in ")):
+                continue
+            mode_branches.append(ast.unparse(node))
+        assert mode_branches
+        assert all("auto" in branch for branch in mode_branches)
 
 
 @pytest.mark.parametrize("mode", ["plan-only", "decompose-only", "implement-by-phase", "auto"])

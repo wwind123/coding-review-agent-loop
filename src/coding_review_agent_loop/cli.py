@@ -1401,25 +1401,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 plan_execution_mode = (
                     "implement-one-shot" if args.implement_after_approval else "plan-only"
                 )
-            elif args.implement_after_approval and plan_execution_mode != "implement-one-shot":
+            elif args.implement_after_approval and plan_execution_mode in {
+                "plan-only",
+                "decompose-only",
+                "implement-by-phase",
+                "auto",
+            }:
                 raise AgentLoopError(
                     "--implement-after-approval is only compatible with "
                     "--plan-execution-mode implement-one-shot."
                 )
             if (
-                plan_execution_mode in {"decompose-only", "implement-by-phase"}
+                plan_execution_mode in {"decompose-only", "implement-by-phase", "auto"}
                 and getattr(args, "materialize_split_issues", False)
             ):
                 raise AgentLoopError(
                     "--materialize-split-issues cannot be combined with "
-                    "--plan-execution-mode decompose-only or implement-by-phase; "
+                    "--plan-execution-mode decompose-only, implement-by-phase, or auto; "
                     "those modes select one child topology source."
-                )
-            if plan_execution_mode == "auto" and getattr(args, "materialize_split_issues", False):
-                raise AgentLoopError(
-                    "--materialize-split-issues cannot be combined with "
-                    "--plan-execution-mode auto; automatic routing selects the reviewed "
-                    "topology after approval."
                 )
             if plan_execution_mode == "auto" and getattr(args, "split_stage", None) is not None:
                 raise AgentLoopError(
