@@ -1357,6 +1357,7 @@ def structured_plan_revision(
             [{"requirement_id": "Requirement 1", "disposition": "addressed", "evidence": "The plan covers the signed requirement."}]
             if human_requirements else []
         ),
+        "architecture_impact": dict(_DEFAULT_ARCHITECTURE_IMPACT),
     }
     if deferred_stages is not None:
         payload["deferred_stages"] = deferred_stages
@@ -1397,6 +1398,7 @@ def structured_plan_state(
         "summary": summary,
         "plan_steps": plan_steps or ["Update the code.", "Run the relevant tests."],
         "human_requirement_dispositions": human_requirement_dispositions or [],
+        "architecture_impact": dict(_DEFAULT_ARCHITECTURE_IMPACT),
     }
     if deferred_stages is not None:
         payload["deferred_stages"] = deferred_stages
@@ -1414,6 +1416,21 @@ def structured_plan_state(
         + f"\n<!-- AGENT_PLAN_STATE: {state} -->\n"
         + f"-- {reviewer}"
     )
+
+
+_DEFAULT_ARCHITECTURE_IMPACT = {
+    "status": "unchanged",
+    "rationale": "No architectural contract changed.",
+    "affected_components": [],
+    "dependencies": [],
+    "execution_data_flows": [],
+    "persistence": [],
+    "public_contracts": [],
+    "security_boundaries": [],
+    "canonical_document_action": "no-change",
+    "canonical_document_path": None,
+    "canonical_document_rationale": "",
+}
 
 
 def structured_coder_followup(
@@ -1457,6 +1474,7 @@ def structured_coder_followup(
                 for requirement_id in (human_requirement_ids or [])
             ]
         ),
+        "architecture_impact": dict(_DEFAULT_ARCHITECTURE_IMPACT),
     }
     if tests_run is not None:
         payload["tests_run"] = tests_run
@@ -1501,6 +1519,7 @@ def structured_issue_implementation(
                 for requirement_id in ids
             ]
         ),
+        "architecture_impact": dict(_DEFAULT_ARCHITECTURE_IMPACT),
     }
     if tests_run is not None:
         payload["tests_run"] = tests_run
@@ -1568,6 +1587,7 @@ def plan_decomposition_json(*phases):
         {
             "schema_version": 1,
             "kind": "plan_decomposition",
+            "architecture_impact": dict(_DEFAULT_ARCHITECTURE_IMPACT),
             "phases": list(phases),
         }
     )

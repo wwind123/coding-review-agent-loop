@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
@@ -66,6 +68,29 @@ def test_parse_plan_decomposition_accepts_agent_and_human_phases():
     ]
     assert parsed.phases[1].automation == "human-action"
     assert parsed.phases[1].depends_on == ("Internal schema utilities",)
+
+
+def test_fresh_plan_decomposition_requires_architecture_impact():
+    payload = plan_decomposition_json(
+        {
+            "title": "Internal schema utilities",
+            "scope": "Add helpers.",
+            "non_goals": "No live switch.",
+            "dependency_notes": "First phase.",
+            "rollout_risk": "low - internal only.",
+            "validation": "Run python -m pytest.",
+            "parent_context": "Approved plan slice and invariant details.",
+            "automation": "agent-pr",
+            "depends_on": [],
+        }
+    )
+    payload_dict = json.loads(payload)
+    payload_dict.pop("architecture_impact")
+    payload_without_impact = json.dumps(payload_dict)
+    with pytest.raises(AgentLoopError, match="architecture_impact"):
+        parse_plan_decomposition(
+            payload_without_impact, required_architecture_impact_contract=1
+        )
 
 def test_parse_plan_decomposition_accepts_normalized_earlier_phase_dependency():
     parsed = parse_plan_decomposition(

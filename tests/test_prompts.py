@@ -11,6 +11,7 @@ from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
 import coding_review_agent_loop.test_runtime as runtime
 import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.prompts import (
+    build_followup_prompt,
     build_issue_implementation_prompt,
     build_issue_prompt,
     build_task_clarification_prompt,
@@ -1302,7 +1303,7 @@ def test_issue_loop_includes_issue_comments_in_coder_and_review_prompts(tmp_path
             },
         ],
         claude_outputs=[
-            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
+            structured_issue_implementation(pr_number=77),
         ],
         codex_outputs=[
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
@@ -2300,6 +2301,30 @@ def test_active_architecture_uses_lossless_requirements_and_omits_architecture_f
     prompt = build_task_prompt("Implement the requested change.", config)
     assert "Architecture context omitted for managed prompt budget" in prompt
     assert "The architecture overview" not in prompt
+
+
+def test_followup_prompt_documents_and_validates_fresh_architecture_impact(tmp_path):
+    config = make_config(tmp_path)
+    prompt = build_followup_prompt(77, 2, "Fix the bug.", config)
+    assert '"architecture_impact"' in prompt
+    assert "Required structured fields" in prompt
+    parsed = validate_structured_coder_followup(
+        structured_coder_followup(), required_architecture_impact_contract=1
+    )
+    assert parsed is not None and parsed.architecture_impact is not None
+
+
+def test_explicit_managed_cap_fails_closed_when_protected_context_has_no_room(tmp_path):
+    architecture = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available",
+        size=20, content="# System\n", heading_index=("System",),
+    )
+    config = make_config(
+        tmp_path, architecture_context=architecture, managed_context_max_chars=32
+    )
+    with pytest.raises(AgentLoopError, match="Managed prompt context cap"):
+        prompts_module._architecture_context_block(config, protected_context=("x" * 32,))
 
 
 @pytest.mark.parametrize("compact_context", [False, True])

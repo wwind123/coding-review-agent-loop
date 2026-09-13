@@ -536,20 +536,17 @@ def _freeze_prompt_architecture(
     checkout = active_workdir(config)
     if not checkout.is_dir():
         return config
-    target = target_revision
-    if pr_pair and target:
-        # PR metadata, not the CLI's default base, is authoritative. Resolve a
-        # branch name against the refreshed checkout without fetching.
-        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", str(target)):
-            result = runner.run(("git", "rev-parse", f"origin/{target}"), cwd=checkout, check=False)
-            target = result.stdout.strip() if result.returncode == 0 else target
     context = freeze_architecture_context(
         runner,
         checkout=checkout,
         repository=config.repo,
         path=config.architecture_path,
         read_size=config.architecture_read_size,
-        target_revision=target,
+        # Keep the normalized live target ref in the identity.  The pair's
+        # merge-base is the immutable commit used for document reads; a moving
+        # target tip must not masquerade as a retarget when the ref and
+        # merge-base remain unchanged.
+        target_revision=target_revision,
         candidate_revision=candidate_revision,
     )
     return dataclasses_replace(config, architecture_context=context)
@@ -574,7 +571,7 @@ def _revalidate_pr_architecture_identity(
 ) -> tuple[object | None, bool]:
     """Reacquire the live PR pair at every qualification/merge snapshot."""
     stored = config.architecture_context
-    if not config.architecture_context_enabled or not hasattr(stored, "identity"):
+    if not config.architecture_context_enabled:
         return None, False
     fresh_config = _freeze_prompt_architecture(
         runner,
@@ -584,13 +581,40 @@ def _revalidate_pr_architecture_identity(
         pr_pair=True,
     )
     fresh = fresh_config.architecture_context
-    if not architecture_material(stored) and not architecture_material(fresh):
-        # Missing, opted-out, or unreadable documents retain the legacy
-        # no-material path. A transition to usable material is handled by the
-        # identity comparison below.
-        return fresh, False
-    previous_identity = stored_identity if stored_identity is not None else stored.identity()
-    changed = bool(hasattr(fresh, "identity") and fresh.identity() != previous_identity)
+    previous_identity = stored_identity
+    if previous_identity is None and hasattr(stored, "identity"):
+        previous_identity = stored.identity()
+    fresh_identity = fresh.identity() if hasattr(fresh, "identity") else None
+    changed = bool(fresh_identity is not None and fresh_identity != previous_identity)
+    if changed and isinstance(previous_identity, dict) and isinstance(fresh_identity, dict):
+        # An unavailable/missing document has no architecture content whose
+        # candidate revision can affect a prompt.  Still observe ref, merge
+        # base, and availability transitions, but let the ordinary PR-head
+        # scheduler handle a contentless coder push.
+        def _availability(identity: dict) -> object:
+            if "availability" in identity:
+                return identity.get("availability")
+            return (
+                identity.get("base", {}).get("availability"),
+                identity.get("candidate", {}).get("availability"),
+            )
+
+        if not architecture_material(stored) and not architecture_material(fresh):
+            comparable_previous = dict(previous_identity)
+            comparable_fresh = dict(fresh_identity)
+            comparable_previous.pop("candidate_revision", None)
+            comparable_fresh.pop("candidate_revision", None)
+            for key in ("base", "candidate"):
+                if isinstance(comparable_previous.get(key), dict):
+                    comparable_previous[key] = dict(comparable_previous[key])
+                    comparable_previous[key].pop("revision", None)
+                if isinstance(comparable_fresh.get(key), dict):
+                    comparable_fresh[key] = dict(comparable_fresh[key])
+                    comparable_fresh[key].pop("revision", None)
+            changed = (
+                comparable_previous != comparable_fresh
+                or _availability(previous_identity) != _availability(fresh_identity)
+            )
     # A changed observation is a normal exact-once scheduling transition. The
     # caller marks the fresh context and persists it with the next checkpoint;
     # it must not abort a review/fix/re-review cycle.
@@ -5124,6 +5148,10 @@ def _implement_approved_issue(
             local_test_evidence=initial_local_test_evidence,
             model_used=coder_response.model_used,
             **_metadata_identity_fields(coder_response),
+            **_architecture_metadata_fields(
+                implementation_config,
+                impact=getattr(implementation_result, "architecture_impact", None),
+            ),
             acquisition_outcome=coder_response.acquisition_outcome,
             acquisition_returncode=coder_response.acquisition_returncode,
         ),
@@ -5219,7 +5247,9 @@ def _decompose_approved_plan(
             ),
             session_id=coder_session_id,
             marker_description="plan decomposition JSON",
-            validate=parse_plan_decomposition,
+            validate=lambda text: parse_plan_decomposition(
+                text, required_architecture_impact_contract=1
+            ),
             usage_context=usage_context,
             operation_description="plan decomposition",
         )
@@ -5846,6 +5876,7 @@ def _run_plan_first_loop(
                         dispositions=tuple(
                             disposition for values in prior_dispositions.values() for disposition in values
                         ), new_items=tuple(round_new_unresolved_items), phase="reconciliation",
+                        **_architecture_metadata_fields(config),
                     ),
                 ),
             )
@@ -6609,6 +6640,9 @@ def _run_plan_first_loop(
                     compact_prior_summaries=tuple(compact_prior_summaries),
                     model_used=plan_response.model_used,
                     **_metadata_identity_fields(plan_response),
+                    **_architecture_metadata_fields(
+                        config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
+                    ),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
                 ),
@@ -8409,9 +8443,7 @@ def _fresh_pr_qualification_snapshot(
     approved_plan_context: ApprovedPlanContext | None = None,
     scheduler_contract: ReviewSchedulingContract | None = None,
     allow_plan_handoff_change: bool = False,
-) -> tuple[PullRequestReviewContext, tuple[str, ...]] | tuple[
-    PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None
-]:
+) -> tuple[PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None, AgentLoopConfig]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
     stored_identity = next(
@@ -8425,8 +8457,11 @@ def _fresh_pr_qualification_snapshot(
     fresh_architecture, architecture_changed = _revalidate_pr_architecture_identity(
         runner, config=config, metadata=context.metadata, stored_identity=stored_identity
     )
+    if fresh_architecture is not None:
+        # AgentLoopConfig is frozen and hashable.  Rebind a replacement config
+        # instead of mutating the captured instance during a qualification gate.
+        config = dataclasses_replace(config, architecture_context=fresh_architecture)
     if architecture_changed and fresh_architecture is not None:
-        object.__setattr__(config, "architecture_context", fresh_architecture)
         context = dataclasses_replace(context, architecture_identity_changed=True)
     if scheduler_contract is not None:
         # Scheduler metadata is an optimization over the immutable required
@@ -8574,9 +8609,7 @@ def _fresh_pr_qualification_snapshot(
         for requirement in requirements.effective_requirements
     )
     requirement_ids = tuple(result)
-    if allow_plan_handoff_change:
-        return context, requirement_ids, fresh_approved_plan_context
-    return context, requirement_ids
+    return context, requirement_ids, fresh_approved_plan_context, config
 
 
 def run_pr_loop(
@@ -10936,7 +10969,7 @@ def run_pr_loop(
                     )
 
                 if not must_fix_items and selective_policy:
-                    fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
+                    fresh_context, fresh_requirement_ids, fresh_plan_context, config = _fresh_pr_qualification_snapshot(
                         runner,
                         config=config,
                         pr_number=pr_number,
@@ -11230,6 +11263,7 @@ def run_pr_loop(
                                     prior_items=tuple(unresolved_items),
                                     phase="qualification-checkpoint",
                                     qualification_checkpoint=qualification_checkpoint,
+                                    **_architecture_metadata_fields(config),
                                 ),
                             ),
                         )
@@ -11294,7 +11328,7 @@ def run_pr_loop(
                         )
                         run_optional_tests(runner, config)
                         if selective_policy:
-                            fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
+                            fresh_context, fresh_requirement_ids, fresh_plan_context, config = _fresh_pr_qualification_snapshot(
                                 runner,
                                 config=config,
                                 pr_number=pr_number,
@@ -11668,7 +11702,7 @@ def run_pr_loop(
                     )
                     run_optional_tests(runner, config)
                     if selective_policy:
-                        fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
+                        fresh_context, fresh_requirement_ids, fresh_plan_context, config = _fresh_pr_qualification_snapshot(
                             runner,
                             config=config,
                             pr_number=pr_number,
@@ -11692,7 +11726,7 @@ def run_pr_loop(
                             prefetched_pr_context = fresh_context
                             continue
                     if config.auto_merge or managed_ci_active(pr_metadata):
-                        fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
+                        fresh_context, fresh_requirement_ids, fresh_plan_context, config = _fresh_pr_qualification_snapshot(
                             runner,
                             config=config,
                             pr_number=pr_number,
@@ -11803,6 +11837,7 @@ def run_pr_loop(
                                             prior_items=tuple(unresolved_items),
                                             phase="qualification-checkpoint",
                                             qualification_checkpoint=qualification_checkpoint,
+                                            **_architecture_metadata_fields(config),
                                         ),
                                     ),
                                 )
@@ -11931,7 +11966,7 @@ def run_pr_loop(
                                     )
                                     continue
                                 if selective_policy:
-                                    fresh_context, fresh_requirement_ids, fresh_plan_context = _fresh_pr_qualification_snapshot(
+                                    fresh_context, fresh_requirement_ids, fresh_plan_context, config = _fresh_pr_qualification_snapshot(
                                         runner,
                                         config=config,
                                         pr_number=pr_number,

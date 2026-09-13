@@ -95,6 +95,65 @@ def test_pair_marks_both_missing_as_absent(tmp_path):
     assert pair.change == "absent"
 
 
+def test_pair_marks_added_and_deleted_documents_without_substitution(tmp_path):
+    base = _repo(tmp_path, "# Base\n")
+    _git(tmp_path, "checkout", "-qb", "candidate")
+    (tmp_path / "ARCHITECTURE.md").unlink()
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "delete architecture")
+    deleted_revision = _git(tmp_path, "rev-parse", "HEAD")
+    deleted = acquire_architecture_pair(
+        Runner(), checkout=tmp_path, repository="owner/repo",
+        target_revision=base, candidate_revision=deleted_revision,
+    )
+    assert deleted.change == "deleted"
+    assert "Established base architecture snapshot" in render_architecture_pair(deleted)
+    assert "Candidate architecture snapshot" in render_architecture_pair(deleted)
+
+    _git(tmp_path, "checkout", "-qb", "no-architecture", base)
+    (tmp_path / "ARCHITECTURE.md").unlink()
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "remove architecture for add case")
+    base_without_document = _git(tmp_path, "rev-parse", "HEAD")
+    _git(tmp_path, "checkout", "-qb", "added", base_without_document)
+    (tmp_path / "ARCHITECTURE.md").write_text("# Proposed\n", encoding="utf-8")
+    _git(tmp_path, "add", "ARCHITECTURE.md")
+    _git(tmp_path, "commit", "-qm", "add architecture")
+    added_revision = _git(tmp_path, "rev-parse", "HEAD")
+    added = acquire_architecture_pair(
+        Runner(), checkout=tmp_path, repository="owner/repo",
+        target_revision=base_without_document, candidate_revision=added_revision,
+    )
+    assert added.change == "added"
+    rendered = render_architecture_pair(added)
+    assert "proposal; no established base document exists" in rendered
+    assert "# Proposed" in rendered
+
+
+def test_oversized_architecture_blob_is_unavailable_to_prompt_material(tmp_path):
+    revision = _repo(tmp_path, "# System\n" + ("detail " * 100))
+    snapshot = acquire_architecture_snapshot(
+        Runner(), checkout=tmp_path, repository="owner/repo", revision=revision, max_bytes=8
+    )
+    assert snapshot.availability == "oversized"
+    assert snapshot.content is None
+
+
+def test_ambiguous_tree_entries_are_rejected(tmp_path):
+    class AmbiguousRunner(Runner):
+        def run_binary(self, args, **kwargs):
+            class Result:
+                returncode = 0
+                stdout = b"100644 blob " + b"a" * 40 + b"\tARCHITECTURE.md\x00" + b"100644 blob " + b"b" * 40 + b"\tARCHITECTURE.md\x00"
+                stderr = b""
+            return Result()
+
+    snapshot = acquire_architecture_snapshot(
+        AmbiguousRunner(), checkout=tmp_path, repository="owner/repo", revision="r" * 40
+    )
+    assert snapshot.availability == "missing"
+
+
 def test_pair_does_not_use_target_tip_without_merge_base(tmp_path):
     base = _repo(tmp_path, "# Base\n")
     _git(tmp_path, "checkout", "--orphan", "unrelated")

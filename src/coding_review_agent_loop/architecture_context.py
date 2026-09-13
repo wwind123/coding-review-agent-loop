@@ -111,6 +111,7 @@ class ArchitecturePair:
     def identity(self) -> dict[str, object]:
         return {
             "repository": self.repository, "path": self.path,
+            "target_revision": self.target_revision,
             "candidate_revision": self.candidate_revision,
             "merge_base_revision": self.merge_base_revision,
             "change": self.change, "base": self.base.identity(),

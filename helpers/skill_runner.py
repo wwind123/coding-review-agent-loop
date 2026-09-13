@@ -633,6 +633,36 @@ def _add_antigravity_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_architecture_options(parser: argparse.ArgumentParser) -> None:
+    """Expose the same bounded architecture controls as the main CLI."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--architecture-context", dest="architecture_context_enabled",
+        action="store_true", default=True,
+        help="Include bounded advisory architecture context when available (default).",
+    )
+    group.add_argument(
+        "--no-architecture-context", dest="architecture_context_enabled",
+        action="store_false", help="Opt out of repository architecture context.",
+    )
+    parser.add_argument("--architecture-path", default="ARCHITECTURE.md")
+    parser.add_argument("--architecture-read-size", type=int, default=64 * 1024, metavar="BYTES")
+    parser.add_argument("--architecture-snapshot-max-chars", type=int, default=12_000, metavar="CHARS")
+    parser.add_argument("--architecture-aggregate-max-chars", type=int, default=24_000, metavar="CHARS")
+    parser.add_argument("--managed-context-max-chars", type=int, default=80_000, metavar="CHARS")
+
+
+def _architecture_options(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "architecture_context_enabled": getattr(args, "architecture_context_enabled", True),
+        "architecture_path": getattr(args, "architecture_path", "ARCHITECTURE.md"),
+        "architecture_read_size": getattr(args, "architecture_read_size", 64 * 1024),
+        "architecture_snapshot_max_chars": getattr(args, "architecture_snapshot_max_chars", 12_000),
+        "architecture_aggregate_max_chars": getattr(args, "architecture_aggregate_max_chars", 24_000),
+        "managed_context_max_chars": getattr(args, "managed_context_max_chars", 80_000),
+    }
+
+
 def _add_gemini_cmd_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--gemini-cmd",
@@ -2646,6 +2676,7 @@ def _run_external_coder_phase(
 
         issue_config = make_minimal_config(
             repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
+            **_architecture_options(args),
         )
         human_requirements = get_issue_context(
             Runner(dry_run=False),
@@ -2659,6 +2690,7 @@ def _run_external_coder_phase(
             issue_dict, repo=repo, coder=coder,  # type: ignore[arg-type]
             reviewers=reviewers, workdir=workdir, memory=memory,  # type: ignore[arg-type]
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_options=_architecture_options(args),
         )
         kind = "plan_state"
     else:  # coder-round-next
@@ -2673,6 +2705,7 @@ def _run_external_coder_phase(
             human_requirements=human_requirements,
             memory=memory,
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_options=_architecture_options(args),
         )
         kind = "plan_revision"
 
@@ -3179,6 +3212,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                     workdir=workdir,
                     memory=memory,
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+                    architecture_options=_architecture_options(args),
                 )
             except Exception as exc:  # noqa: BLE001
                 prompt_text = (
@@ -3429,6 +3463,7 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                         else None
                     ),
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+                    architecture_options=_architecture_options(args),
                 )
             except Exception as exc:  # noqa: BLE001
                 if (
@@ -3864,6 +3899,7 @@ def _implementation_config(
     base: str,
     dry_run: bool,
     coder_test_command_timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_options: dict[str, object] | None = None,
 ):
     from helpers.prompt_builders import make_minimal_config
 
@@ -3874,6 +3910,7 @@ def _implementation_config(
         make_minimal_config(
             repo, coder, (coder,), reviewer=coder, workdir=str(workdir), base=base,
             coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+            **(architecture_options or {}),
         ),  # type: ignore[arg-type]
         dry_run=dry_run,
         auto_agent_dirs=(),
@@ -3983,6 +4020,7 @@ def _run_child_or_one_shot_implementation(
     one_shot_mode: str = "implement-one-shot",
     external_args: tuple[str, ...] = (),
     coder_test_command_timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_options: dict[str, object] | None = None,
 ) -> dict:
     from coding_review_agent_loop.config import sync_coder_base_before_implementation
     from coding_review_agent_loop.comment_rendering import render_public_agent_comment
@@ -4013,6 +4051,7 @@ def _run_child_or_one_shot_implementation(
         workdir=str(workdir),
         base=base,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_options=architecture_options,
     )
 
     if dry_run:
@@ -4242,6 +4281,7 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
     config = _implementation_config(
         repo=repo, coder=coder, workdir=str(workdir), base=base, dry_run=dry_run,
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_options=_architecture_options(args),
     )
     runner = Runner(dry_run=dry_run)
 
@@ -4291,6 +4331,7 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         one_shot_mode=mode,
         external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_options=_architecture_options(args),
     )
     print(json.dumps(result_json, indent=2))
     if result_json.get("pr") is None:
@@ -4394,6 +4435,7 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         make_minimal_config(
             repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            **_architecture_options(args),
         ),  # type: ignore[arg-type]
         dry_run=dry_run,
         auto_agent_dirs=(),
@@ -4436,6 +4478,8 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
         architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
         managed_context_max_chars=getattr(args, "managed_context_max_chars", 80_000),
+        architecture_target_revision=pr_info.get("baseRefName"),
+        architecture_candidate_revision=current_head,
     )
 
     if dry_run:
@@ -4758,6 +4802,7 @@ def _run_decomposition_for_skill(
         make_minimal_config(
             repo, coder, (coder,), reviewer=coder, workdir=str(workdir),
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            **_architecture_options(args),
         ),  # type: ignore[arg-type]
         dry_run=dry_run,
         flat_child_limit=getattr(args, "flat_child_limit", DEFAULT_FLAT_CHILD_LIMIT),
@@ -4844,6 +4889,7 @@ def _run_decomposition_for_skill(
             coder=coder,
             workdir=str(workdir),  # type: ignore[arg-type]
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_options=_architecture_options(args),
         )
 
         with tempfile.TemporaryDirectory() as tmpstr:
@@ -5084,6 +5130,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         impl_config = _implementation_config(
             repo=repo, coder=coder, workdir=workdir, base=base, dry_run=True,
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_options=_architecture_options(args),
         )
         impl_runner = Runner(dry_run=True)
         impl_result = _run_child_or_one_shot_implementation(
@@ -5100,6 +5147,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
             post_one_shot_handoff=False,
             external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_options=_architecture_options(args),
         )
         result_json.update({
             "state": "would-implement",
@@ -5148,6 +5196,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
     impl_config = _implementation_config(
         repo=repo, coder=coder, workdir=workdir, base=base, dry_run=False,
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_options=_architecture_options(args),
     )
     impl_runner = Runner(dry_run=False)
     child_issue_context = get_issue_context(
@@ -5169,6 +5218,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         post_one_shot_handoff=False,
         external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_options=_architecture_options(args),
     )
     if impl_result.get("pr") is None:
         result_json.update({
@@ -5244,6 +5294,7 @@ def main() -> None:
     p_plan.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
     _add_test_timeout_option(p_plan)
+    _add_architecture_options(p_plan)
     p_plan.add_argument("--dry-run", action="store_true")
     _add_gemini_cmd_option(p_plan)
     _add_antigravity_options(p_plan)
@@ -5287,6 +5338,7 @@ def main() -> None:
     p_pr.add_argument("--refresh-agent-memory", action="store_true",
                       help="Regenerate the agent-memory cache before this round.")
     _add_test_timeout_option(p_pr)
+    _add_architecture_options(p_pr)
     p_pr.add_argument("--dry-run", action="store_true")
     _add_gemini_cmd_option(p_pr)
     _add_antigravity_options(p_pr)
@@ -5344,6 +5396,7 @@ def main() -> None:
     p_impl.add_argument("--workdir-antigravity", default=None)
     p_impl.add_argument("--dry-run", action="store_true")
     _add_test_timeout_option(p_impl)
+    _add_architecture_options(p_impl)
     _add_antigravity_options(p_impl)
 
     # run-pr-fix
@@ -5372,6 +5425,7 @@ def main() -> None:
     p_pr_fix.add_argument("--workdir-antigravity", default=None)
     p_pr_fix.add_argument("--dry-run", action="store_true")
     _add_test_timeout_option(p_pr_fix)
+    _add_architecture_options(p_pr_fix)
     _add_gemini_cmd_option(p_pr_fix)
     _add_antigravity_options(p_pr_fix)
 
@@ -5402,6 +5456,7 @@ def main() -> None:
     p_impl_phase.add_argument("--workdir-antigravity", default=None)
     p_impl_phase.add_argument("--dry-run", action="store_true")
     _add_test_timeout_option(p_impl_phase)
+    _add_architecture_options(p_impl_phase)
     p_impl_phase.add_argument(
         "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
         help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",
@@ -5428,6 +5483,7 @@ def main() -> None:
     p_decompose.add_argument("--workdir-antigravity", default=None)
     p_decompose.add_argument("--dry-run", action="store_true")
     _add_test_timeout_option(p_decompose)
+    _add_architecture_options(p_decompose)
     p_decompose.add_argument(
         "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
         help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",
@@ -5469,6 +5525,7 @@ def main() -> None:
     p_task.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
     _add_test_timeout_option(p_task)
+    _add_architecture_options(p_task)
     p_task.add_argument("--dry-run", action="store_true")
     _add_gemini_cmd_option(p_task)
     _add_antigravity_options(p_task)

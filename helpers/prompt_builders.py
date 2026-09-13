@@ -212,6 +212,7 @@ def build_plan_review_prompt_for_skill(
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build a plan reviewer prompt from plain dicts.
 
@@ -232,6 +233,7 @@ def build_plan_review_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, reviewers_list, reviewer=reviewer, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        **(architecture_options or {}),
     )
     architecture_context = architecture_context or _acquire_skill_architecture(
         config, workdir=workdir,
@@ -273,6 +275,7 @@ def build_review_prompt_for_skill(
     local_test_evidence: str | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
 
@@ -304,6 +307,7 @@ def build_review_prompt_for_skill(
         approved_followups=approved_followups,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_context=architecture_context,
+        **(architecture_options or {}),
     )
     architecture_context = architecture_context or _acquire_skill_architecture(
         config,
@@ -373,6 +377,8 @@ def build_pr_fix_prompt_for_skill(
     architecture_aggregate_max_chars: int = 24_000,
     managed_context_max_chars: int = 80_000,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_target_revision: str | None = None,
+    architecture_candidate_revision: str | None = None,
 ) -> str:
     """Build the external-coder PR-fix prompt from skill-mode ledger items.
 
@@ -390,7 +396,12 @@ def build_pr_fix_prompt_for_skill(
         managed_context_max_chars=managed_context_max_chars,
         architecture_context=architecture_context,
     )
-    architecture_context = architecture_context or _acquire_skill_architecture(config, workdir=workdir)
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config,
+        workdir=workdir,
+        target_revision=architecture_target_revision,
+        candidate_revision=architecture_candidate_revision,
+    )
     unresolved = [_deserialize_unresolved_item(item) for item in active_items_raw]
     evidence_guidance = _local_test_evidence_guidance(local_test_evidence)
     human_requirements_context = render_coder_human_requirements_prompt_context(
@@ -439,6 +450,7 @@ def build_plan_prompt_for_skill(
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build the round-1 coder (plan) prompt for an external coder (#307).
 
@@ -448,6 +460,7 @@ def build_plan_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        **(architecture_options or {}),
         architecture_context=architecture_context,
     )
     architecture_context = architecture_context or _acquire_skill_architecture(
@@ -474,6 +487,7 @@ def build_plan_revision_prompt_for_skill(
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build the round-N+1 coder (plan revision) prompt for an external coder (#307).
 
@@ -483,6 +497,7 @@ def build_plan_revision_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        **(architecture_options or {}),
     )
     architecture_context = architecture_context or _acquire_skill_architecture(
         config, workdir=workdir,
@@ -518,6 +533,7 @@ def build_implementation_prompt_for_skill(
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build the external-coder implementation prompt (reversed roles, #316).
 
@@ -531,6 +547,7 @@ def build_implementation_prompt_for_skill(
         repo, coder, (coder,), reviewer=coder, workdir=workdir, base=base,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_context=architecture_context,
+        **(architecture_options or {}),
     )
     architecture_context = architecture_context or _acquire_skill_architecture(
         config, workdir=workdir,
@@ -551,6 +568,7 @@ def build_plan_decomposition_prompt_for_skill(
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build the external-coder plan decomposition prompt (#318).
 
@@ -562,6 +580,7 @@ def build_plan_decomposition_prompt_for_skill(
         repo, coder, (coder,), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_context=architecture_context,
+        **(architecture_options or {}),
     )
     architecture_context = architecture_context or _acquire_skill_architecture(
         config, workdir=workdir,

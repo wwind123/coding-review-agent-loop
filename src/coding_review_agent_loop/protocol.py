@@ -421,6 +421,11 @@ def _parse_architecture_impact(value: object, *, context: str) -> ArchitectureIm
     )
 
 
+def parse_architecture_impact(value: object, *, context: str = "architecture_impact") -> ArchitectureImpact:
+    """Validate an impact object for protocol extensions outside response envelopes."""
+    return _parse_architecture_impact(value, context=context)
+
+
 HUMAN_REQUIREMENT_DISPOSITION_VALUES = frozenset(
     {"addressed", "blocked", "not-applicable"}
 )

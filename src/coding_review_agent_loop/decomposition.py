@@ -21,6 +21,7 @@ from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .runner import Runner
 from .protocol_markers import TrustedBody, sanitize_historical_text
+from .protocol import ArchitectureImpact, parse_architecture_impact
 from .round_transport import MAX_GITHUB_BODY_CHARS
 
 AUTOMATION_CLASSES = {"agent-pr", "human-action", "manual-close"}
@@ -67,6 +68,7 @@ class PlanPhase:
 @dataclass(frozen=True)
 class PlanDecomposition:
     phases: tuple[PlanPhase, ...]
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -166,10 +168,20 @@ def _required_text(payload: dict[str, object], key: str, *, phase_title: str) ->
     return value.strip()
 
 
-def parse_plan_decomposition(text: str) -> PlanDecomposition:
+def parse_plan_decomposition(
+    text: str, *, required_architecture_impact_contract: int = 0
+) -> PlanDecomposition:
     payload = _extract_json_object(text)
     if payload.get("kind") not in (None, "plan_decomposition"):
         raise AgentLoopError("Invalid plan decomposition: `kind` must be `plan_decomposition`.")
+    impact = (
+        parse_architecture_impact(payload["architecture_impact"], context="plan_decomposition.architecture_impact")
+        if "architecture_impact" in payload else None
+    )
+    if required_architecture_impact_contract == 1 and impact is None:
+        raise AgentLoopError(
+            "plan_decomposition must include architecture_impact for this fresh contract turn."
+        )
     phases_payload = payload.get("phases")
     if not isinstance(phases_payload, list) or not phases_payload:
         raise AgentLoopError("Invalid plan decomposition: `phases` must be a non-empty list.")
@@ -233,7 +245,7 @@ def parse_plan_decomposition(text: str) -> PlanDecomposition:
                 depends_on=tuple(value.strip() for value in depends_on_payload),
             )
         )
-    return PlanDecomposition(phases=tuple(phases))
+    return PlanDecomposition(phases=tuple(phases), architecture_impact=impact)
 
 
 def _issue_number_from_url(issue_url: str | None) -> int | None:
