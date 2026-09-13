@@ -1,3 +1,6 @@
+import dataclasses
+from types import SimpleNamespace
+
 import pytest
 
 from agent_loop_helpers import FakeRunner, make_config
@@ -31,6 +34,8 @@ from coding_review_agent_loop.orchestrator import (
     _reviewer_needs_fresh_context,
     _reviewer_diff_summary,
 )
+import coding_review_agent_loop.orchestrator as orchestrator
+from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
 from coding_review_agent_loop.round_transport import decode_mapping
 from coding_review_agent_loop.unresolved_items import (
     _advance_machine_obligations_for_head,
@@ -720,6 +725,37 @@ def test_cleared_owner_set_is_not_vacuously_unavailable():
     assert not _all_pending_resolution_owners_unavailable(item, {"Codex"})
     pending = _item(owners=("Codex",), states=(("Codex", "pending"),))
     assert _all_pending_resolution_owners_unavailable(pending, {"Codex"})
+
+
+def test_architecture_revalidation_schedules_once_for_changed_identity(tmp_path, monkeypatch):
+    old = ArchitectureSnapshot(
+        repository="OWNER/REPO", path="ARCHITECTURE.md", revision="a" * 40,
+        blob_oid="b" * 40, sha256="c" * 64, availability="available",
+        size=10, content="# Old\n",
+    )
+    new = ArchitectureSnapshot(
+        repository="OWNER/REPO", path="ARCHITECTURE.md", revision="d" * 40,
+        blob_oid="e" * 40, sha256="f" * 64, availability="available",
+        size=12, content="# New\n",
+    )
+    config = make_config(tmp_path, architecture_context=old, architecture_context_enabled=True)
+    metadata = SimpleNamespace(base_branch="main", head_sha="head")
+    monkeypatch.setattr(
+        orchestrator,
+        "_freeze_prompt_architecture",
+        lambda runner, config, **kwargs: dataclasses.replace(
+            config, architecture_context=new
+        ),
+    )
+
+    fresh, changed = orchestrator._revalidate_pr_architecture_identity(
+        FakeRunner(), config=config, metadata=metadata, stored_identity=old.identity()
+    )
+    assert fresh == new and changed is True
+    _fresh, repeated = orchestrator._revalidate_pr_architecture_identity(
+        FakeRunner(), config=config, metadata=metadata, stored_identity=new.identity()
+    )
+    assert repeated is False
 
 
 def test_fix_scope_rejects_ambiguous_paths():

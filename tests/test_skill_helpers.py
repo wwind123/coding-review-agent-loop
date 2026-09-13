@@ -3269,6 +3269,27 @@ class TestHostReviewer:
             assert result.returncode != 0
             assert "host-review.md" in result.stderr
 
+    def test_coder_repair_manifest_preserves_architecture_contract(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+
+        monkeypatch.setattr(sr, "_REPAIR_BASE", tmp_path)
+        raw = tmp_path / "raw.md"
+        usage = tmp_path / "usage.json"
+        evidence = tmp_path / "evidence.json"
+        raw.write_text("incomplete", encoding="utf-8")
+        usage.write_text("{}", encoding="utf-8")
+        evidence.write_text("{}", encoding="utf-8")
+        identity = {"repository": "owner/repo", "path": "ARCHITECTURE.md", "availability": "missing"}
+        repair_dir = sr._save_coder_raw_to_repair_dir(
+            coder="codex", coder_cap="OpenAI Codex", issue=7, repo="owner/repo",
+            new_round_number=2, kind="plan_revision", next_prior_items_raw=[], dry_run=True,
+            raw_output=raw, usage_file=usage, response_evidence_file=evidence,
+            architecture_identity=identity, architecture_contract_version=1,
+        )
+        manifest = json.loads((repair_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["architecture_identity"] == identity
+        assert manifest["architecture_contract_version"] == 1
+
 
 # ---------------------------------------------------------------------------
 # helpers/skill_runner.py — host-as-reviewer for the PR flow (#314)
@@ -3329,6 +3350,39 @@ class TestHostReviewerPR:
         assert context["approved_plan"]["file"] == "approved-plan.md"
         assert context["approved_plan"]["deferred_work"] == ["- Keep the migration deferred."]
         assert context["approved_plan_reconciliation_guidance_file"] == "approved-plan-reconciliation.md"
+
+    def test_pr_host_handoff_carries_separate_architecture_pair(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.architecture_context import ArchitecturePair, ArchitectureSnapshot
+
+        monkeypatch.setattr(sr, "_REPAIR_BASE", tmp_path)
+        base = ArchitectureSnapshot(
+            repository="owner/repo", path="ARCHITECTURE.md", revision="a" * 40,
+            blob_oid="b" * 40, sha256="c" * 64, availability="available",
+            size=8, content="# Established base\n",
+        )
+        candidate = ArchitectureSnapshot(
+            repository="owner/repo", path="ARCHITECTURE.md", revision="d" * 40,
+            blob_oid="e" * 40, sha256="f" * 64, availability="available",
+            size=11, content="# Candidate proposal\n",
+        )
+        pair = ArchitecturePair(
+            repository="owner/repo", path="ARCHITECTURE.md", target_revision="main",
+            candidate_revision="d" * 40, merge_base_revision="a" * 40,
+            base=base, candidate=candidate, change="modified",
+        )
+        request_dir = sr._write_host_review_request(
+            flow="pr", validate_kind="pr_review", issue=7, repo="owner/repo",
+            new_round_number=1, round_subject="d" * 40,
+            review_material="diff --git a/x b/x", material_filename="pr-diff.diff",
+            next_prior_items_raw=[], current_round_items=[], item_id_offset=0, dry_run=True,
+            architecture_context=pair,
+        )
+        rendered = (request_dir / "architecture-context.md").read_text(encoding="utf-8")
+        assert "Established base architecture snapshot" in rendered
+        assert "Candidate architecture snapshot" in rendered
+        context = json.loads((request_dir / "context.json").read_text(encoding="utf-8"))
+        assert context["architecture_identity"] == pair.identity()
 
     def test_host_handoff_removes_stale_plan_guidance_for_direct_pr(self, monkeypatch, tmp_path) -> None:
         import helpers.skill_runner as sr

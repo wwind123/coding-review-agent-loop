@@ -243,6 +243,18 @@ def test_invalid_utf8_is_classified_as_binary(tmp_path):
     assert "UTF-8" in (snapshot.diagnostic or "")
 
 
+def test_gitlink_document_is_unavailable(tmp_path):
+    revision = _repo(tmp_path, "# System\n")
+    _git(tmp_path, "update-index", "--add", "--cacheinfo", f"160000,{revision},ARCHITECTURE.md")
+    _git(tmp_path, "commit", "-qm", "architecture gitlink")
+    snapshot = acquire_architecture_snapshot(
+        Runner(), checkout=tmp_path, repository="owner/repo",
+        revision=_git(tmp_path, "rev-parse", "HEAD"),
+    )
+    assert snapshot.availability == "unavailable"
+    assert "regular blob" in (snapshot.diagnostic or "")
+
+
 def test_pair_keeps_base_separate_from_candidate(tmp_path):
     base = _repo(tmp_path, "# Base\n")
     _git(tmp_path, "checkout", "-qb", "candidate")

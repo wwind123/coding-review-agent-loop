@@ -556,6 +556,8 @@ def _save_raw_to_repair_dir(
     context_file: Path,
     prior_items_file: Path,
     approved_plan_context: ApprovedPlanContext | None = None,
+    architecture_identity: dict | None = None,
+    architecture_contract_version: int | None = None,
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy raw response + context to a stable repair dir before normalization/validation."""
@@ -574,6 +576,10 @@ def _save_raw_to_repair_dir(
     if approved_plan_context is not None:
         manifest["approved_plan_hash"] = approved_plan_context.plan_hash
         manifest["approved_plan_subject"] = approved_plan_context.plan_subject
+    if architecture_identity is not None:
+        manifest["architecture_identity"] = architecture_identity
+    if architecture_contract_version is not None:
+        manifest["architecture_contract_version"] = architecture_contract_version
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -2143,6 +2149,11 @@ def _run_reviewer(
         raw_output=raw_output, context_file=context_file,
         prior_items_file=prior_items_file,
         approved_plan_context=approved_plan_context,
+        architecture_identity=(
+            context.get("architecture_identity")
+            if isinstance(context.get("architecture_identity"), dict) else None
+        ),
+        architecture_contract_version=1,
         gemini_cmd=gemini_cmd,
     )
 
@@ -2429,6 +2440,8 @@ def _save_coder_raw_to_repair_dir(
     raw_output: Path,
     usage_file: Path,
     response_evidence_file: Path | None = None,
+    architecture_identity: dict | None = None,
+    architecture_contract_version: int | None = None,
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy the coder's raw response + context to a stable repair dir.
@@ -2451,6 +2464,10 @@ def _save_coder_raw_to_repair_dir(
         "new_round_number": new_round_number, "kind": kind,
         "dry_run": dry_run, "gemini_cmd": gemini_cmd,
     }
+    if architecture_identity is not None:
+        manifest["architecture_identity"] = architecture_identity
+    if architecture_contract_version is not None:
+        manifest["architecture_contract_version"] = architecture_contract_version
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -2474,6 +2491,8 @@ def _complete_coder_turn(
     surfaced_requirement_ids: Sequence[str] = (),
     requires_direct_discussion_ack: bool = False,
     required_architecture_impact_contract: int = 0,
+    architecture_identity: dict | None = None,
+    architecture_contract_version: int | None = None,
 ) -> dict:
     """Validate, render, canonicalize, attach (role coder), and post a coder plan.
 
@@ -2523,6 +2542,7 @@ def _complete_coder_turn(
             )
         else:
             validate(raw_text)
+        validated_result = validate(raw_text)
         raw_output.write_text(raw_text, encoding="utf-8")
     except (AgentLoopError, ValueError) as exc:
         raise _ValidationError(
@@ -2602,6 +2622,23 @@ def _complete_coder_turn(
             coder_usage = None
 
     tagged = work_dir / "coder-tagged.md"
+    architecture_identity_file = work_dir / "coder-architecture-identity.json"
+    architecture_impact_file = work_dir / "coder-architecture-impact.json"
+    architecture_args: list[str] = []
+    if isinstance(architecture_identity, dict):
+        _write_json(architecture_identity_file, architecture_identity)
+        architecture_args.extend(("--architecture-identity-file", str(architecture_identity_file)))
+    parsed_impact = getattr(validated_result, "architecture_impact", None)
+    if dataclasses.is_dataclass(parsed_impact):
+        _write_json(architecture_impact_file, dataclasses.asdict(parsed_impact))
+        architecture_args.extend(("--architecture-impact-file", str(architecture_impact_file)))
+    contract_version = architecture_contract_version or (
+        1 if required_architecture_impact_contract == 1 else None
+    )
+    contract_args = (
+        ("--architecture-contract-version", str(contract_version))
+        if contract_version is not None else ()
+    )
     _run_helper(
         "helpers.state_manager", "attach-metadata",
         "--body-file", str(public_file),
@@ -2616,6 +2653,8 @@ def _complete_coder_turn(
         "--prior-items-file", str(prior_file),
         *raw_structured_args,
         *usage_args,
+        *architecture_args,
+        *contract_args,
     )
 
     if not dry_run:
@@ -2709,12 +2748,22 @@ def _run_external_coder_phase(
             issue_number=issue,
         ).human_requirements
 
+    from helpers.prompt_builders import _acquire_skill_architecture, make_minimal_config
+    coder_architecture_config = make_minimal_config(
+        repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
+        **_architecture_options(args),
+    )
+    coder_architecture = _acquire_skill_architecture(
+        coder_architecture_config, workdir=workdir,
+    )
+
     if phase == "coder-round-1":
         next_prior_items_raw: list[dict] = []
         prompt_text = build_plan_prompt_for_skill(
             issue_dict, repo=repo, coder=coder,  # type: ignore[arg-type]
             reviewers=reviewers, workdir=workdir, memory=memory,  # type: ignore[arg-type]
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_context=coder_architecture,
             architecture_options=_architecture_options(args),
         )
         kind = "plan_state"
@@ -2730,6 +2779,7 @@ def _run_external_coder_phase(
             human_requirements=human_requirements,
             memory=memory,
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_context=coder_architecture,
             architecture_options=_architecture_options(args),
         )
         kind = "plan_revision"
@@ -2779,6 +2829,11 @@ def _run_external_coder_phase(
             next_prior_items_raw=next_prior_items_raw, dry_run=dry_run,
             raw_output=raw_output, usage_file=usage_file,
             response_evidence_file=evidence_file,
+            architecture_identity=(
+                coder_architecture.identity()
+                if hasattr(coder_architecture, "identity") else None
+            ),
+            architecture_contract_version=1,
             gemini_cmd=gemini_cmd,
         )
 
@@ -2800,6 +2855,11 @@ def _run_external_coder_phase(
                 surfaced_requirement_ids=human_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
                 required_architecture_impact_contract=1,
+                architecture_identity=(
+                    coder_architecture.identity()
+                    if hasattr(coder_architecture, "identity") else None
+                ),
+                architecture_contract_version=1,
             )
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
@@ -2851,6 +2911,7 @@ def _write_host_review_request(
     primary_issue_context: IssueContext | None = None,
     parent_issue_context: IssueContext | None = None,
     human_requirements: Sequence[HumanReviewRequirement] = (),
+    architecture_context: object | None = None,
 ) -> Path:
     """Write a review-request dir for the host (Claude) reviewer turn.
 
@@ -2939,6 +3000,30 @@ def _write_host_review_request(
         "current_round_items": current_round_items,
         "human_requirements": _serialize_human_requirements(human_requirements),
     }
+    if architecture_context is not None:
+        from coding_review_agent_loop.architecture_context import (
+            ArchitecturePair,
+            ArchitectureSnapshot,
+            render_architecture_pair,
+            render_architecture_snapshot,
+        )
+
+        if isinstance(architecture_context, ArchitecturePair):
+            architecture_text = render_architecture_pair(architecture_context)
+        elif isinstance(architecture_context, ArchitectureSnapshot):
+            architecture_text = render_architecture_snapshot(architecture_context)
+        else:
+            raise AgentLoopError("Host review handoff received an invalid architecture context.")
+        architecture_file = request_dir / "architecture-context.md"
+        _write_text(architecture_file, architecture_text)
+        context_payload["architecture_identity"] = architecture_context.identity()
+        manifest_architecture_file = architecture_file.name
+    else:
+        try:
+            (request_dir / "architecture-context.md").unlink()
+        except FileNotFoundError:
+            pass
+        manifest_architecture_file = None
     if approved_plan_metadata is not None:
         context_payload["approved_plan"] = approved_plan_metadata
     if reconciliation_guidance_file is not None:
@@ -2987,6 +3072,10 @@ def _write_host_review_request(
         manifest["approved_plan_reconciliation_guidance_file"] = reconciliation_guidance_file
     if human_requirements_file is not None:
         manifest["human_requirements_file"] = human_requirements_file
+    if manifest_architecture_file is not None:
+        manifest["architecture_context_file"] = manifest_architecture_file
+        manifest["architecture_identity"] = context_payload["architecture_identity"]
+        manifest["architecture_contract_version"] = 1
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return request_dir
 
@@ -3033,6 +3122,29 @@ def _validate_host_review_plan_artifact(
             f"{context.diagnostic or 'unknown validation error'}. Regenerate the handoff."
         )
     return context
+
+
+def _host_architecture_context(
+    args: argparse.Namespace,
+    *,
+    repo: str,
+    target_revision: str | None = None,
+    candidate_revision: str | None = None,
+) -> object | None:
+    """Acquire the same frozen architecture context for a host handoff."""
+    from helpers.prompt_builders import _acquire_skill_architecture, make_minimal_config
+
+    workdir = _workdir_for_agent("claude", args)
+    config = make_minimal_config(
+        repo, "claude", ("claude",), reviewer="claude", workdir=workdir,
+        **_architecture_options(args),
+    )
+    return _acquire_skill_architecture(
+        config,
+        workdir=workdir,
+        target_revision=target_revision,
+        candidate_revision=candidate_revision,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3302,6 +3414,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
             next_prior_items_raw=next_prior_items_raw,
             current_round_items=current_round_items,
             item_id_offset=item_id_offset, dry_run=dry_run,
+            architecture_context=_host_architecture_context(args, repo=repo),
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
@@ -3590,6 +3703,12 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             primary_issue_context=primary_issue_context,
             parent_issue_context=parent_issue_context,
             human_requirements=human_requirements,
+            architecture_context=_host_architecture_context(
+                args,
+                repo=repo,
+                target_revision=pr_info.get("baseRefName"),
+                candidate_revision=head_sha,
+            ),
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
@@ -3713,6 +3832,17 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                 dry_run=args.dry_run, raw_output=repair_dir / "raw.md",
                 work_dir=repair_dir, usage_file=repair_dir / "coder-usage.json",
                 gemini_cmd=gemini_cmd,
+                architecture_identity=(
+                    manifest.get("architecture_identity")
+                    if isinstance(manifest.get("architecture_identity"), dict) else None
+                ),
+                architecture_contract_version=(
+                    manifest.get("architecture_contract_version")
+                    if isinstance(manifest.get("architecture_contract_version"), int) else None
+                ),
+                required_architecture_impact_contract=(
+                    1 if manifest.get("architecture_contract_version") == 1 else 0
+                ),
             )
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
@@ -3764,6 +3894,10 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                 else None
             ),
             gemini_cmd=gemini_cmd,
+            architecture_identity=(
+                manifest.get("architecture_identity")
+                if isinstance(manifest.get("architecture_identity"), dict) else None
+            ),
         )
     except _ValidationError as exc:
         print(str(exc), file=sys.stderr)
@@ -3820,6 +3954,7 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
     new_round_number = manifest["new_round_number"]
     dry_run          = args.dry_run
     prior_items_raw  = json.loads((request_dir / "prior_items.json").read_text(encoding="utf-8"))
+    host_context = json.loads((request_dir / "context.json").read_text(encoding="utf-8"))
     _validate_host_review_plan_artifact(request_dir, manifest)
 
     try:
@@ -3841,6 +3976,10 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
                 manifest.get("approved_plan_subject")
                 if isinstance(manifest.get("approved_plan_subject"), str)
                 else None
+            ),
+            architecture_identity=(
+                host_context.get("architecture_identity")
+                if isinstance(host_context.get("architecture_identity"), dict) else None
             ),
         )
     except _ValidationError as exc:
