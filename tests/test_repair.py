@@ -1787,7 +1787,11 @@ def test_run_pr_loop_uses_repair_pass_on_coder_followup_format_failure(tmp_path)
         '{"schema_version":1,"kind":"coder_followup","state":"blocking","summary":"Fixed the bug.",'
         '"addressed_items":["item-1"],"remaining_items":[],'
         '"human_requirement_dispositions": [],'
-        '"human_requirements":{"addressed_ids":[],"checked_discussion_directly":false}}'
+        '"human_requirements":{"addressed_ids":[],"checked_discussion_directly":false},'
+        '"architecture_impact":{"status":"unchanged","rationale":"No architectural contract changed.",'
+        '"affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],'
+        '"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change",'
+        '"canonical_document_path":null,"canonical_document_rationale":""}}'
         "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
     )
     runner = FakeRunner(

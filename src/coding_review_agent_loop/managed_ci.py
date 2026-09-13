@@ -1238,6 +1238,8 @@ def authenticate_source_managed_resume(
 
 _RECOVERY_VALUE_OPTIONS = frozenset({
     "--repo", "--base", "--claude-dir", "--codex-dir", "--gemini-dir", "--antigravity-dir",
+    "--architecture-path", "--architecture-read-size", "--architecture-snapshot-max-chars",
+    "--architecture-aggregate-max-chars", "--managed-context-max-chars",
     "--coder", "--reviewer", "--max-rounds", "--managed-ci-trusted-actor",
     "--implementation-coder", "--implementation-coder-model",
     "--implementation-codex-reasoning-effort", "--implementation-claude-effort",

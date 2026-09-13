@@ -43,6 +43,7 @@ from coding_review_agent_loop.protocol import (
     _extract_structured_coder_followup_payload,
     _extract_structured_plan_review_payload,
     _extract_structured_plan_revision_payload,
+    validate_structured_task_result,
     _extract_structured_pr_review_payload,
     normalize_response_file_structured_text,
     parse_agent_unavailable,
@@ -74,6 +75,7 @@ from coding_review_agent_loop.protocol import (
     validate_structured_human_requirements_acknowledgement,
     validate_structured_plan_state,
     validate_structured_plan_revision,
+    sanitize_architecture_impact,
 )
 
 
@@ -2555,6 +2557,70 @@ def test_validate_structured_coder_followup_rejects_approved_blocked_requirement
 
     with pytest.raises(AgentLoopError, match="must be `blocking`"):
         validate_structured_coder_followup(payload)
+
+
+def test_validate_structured_task_result_checks_kind_before_exact_keys():
+    payload = json.dumps({
+        "schema_version": 1, "kind": "issue_implementation", "state": "blocking",
+        "summary": "wrong envelope",
+    }) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    with pytest.raises(AgentLoopError, match="kind mismatch"):
+        validate_structured_task_result(payload)
+
+
+def test_validate_structured_task_result_accepts_meaningful_unchanged_impact():
+    from coding_review_agent_loop.protocol import validate_structured_task_result
+
+    payload = json.dumps({
+        "schema_version": 1, "kind": "task_result", "state": "blocking",
+        "outcome": "blocking", "summary": "No PR could be opened.",
+        "architecture_impact": {
+            "status": "unchanged", "rationale": "Only local formatting changed.",
+        },
+    }) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    parsed = validate_structured_task_result(payload)
+    assert parsed is not None
+    assert parsed.architecture_impact is not None
+    assert parsed.architecture_impact.status == "unchanged"
+
+
+def test_changed_architecture_impact_requires_complete_contract():
+    payload = {
+        "schema_version": 1,
+        "kind": "task_result",
+        "state": "blocking",
+        "outcome": "blocking",
+        "summary": "The implementation is blocked.",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The public execution boundary changed.",
+        },
+    }
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Coder"
+    with pytest.raises(AgentLoopError, match="changed assessments must include"):
+        validate_structured_task_result(text)
+
+
+def test_architecture_impact_sanitization_neutralizes_all_agent_strings():
+    impact = {
+        "status": "unchanged",
+        "rationale": "No contract changed. <!-- AGENT_LOOP_SIDECAR: abc -->",
+        "affected_components": ["component <!-- AGENT_LOOP_SIDECAR: def -->"],
+        "canonical_document_path": "ARCHITECTURE.md <!-- AGENT_LOOP_SIDECAR: ghi -->",
+    }
+    safe = sanitize_architecture_impact(impact)
+    assert safe is not None
+    assert "<!-- AGENT_LOOP_SIDECAR:" not in json.dumps(safe)
+    assert safe["status"] == "unchanged"
+
+
+def test_fresh_task_contract_rejects_legacy_marker_only_output():
+    with pytest.raises(AgentLoopError, match="Fresh task implementation"):
+        from coding_review_agent_loop.orchestrator import _require_task_implementation_result
+        _require_task_implementation_result(
+            "Implemented.\n<!-- AGENT_PR: 12 -->\n<!-- AGENT_STATE: blocking -->",
+            required_architecture_impact_contract=1,
+        )
 
 
 def test_validate_structured_human_requirements_acknowledgement_uses_disposition_ledger():

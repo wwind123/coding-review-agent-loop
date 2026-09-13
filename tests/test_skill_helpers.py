@@ -80,14 +80,23 @@ def _write_fake_gh(directory: Path) -> Path:
 # helpers/validate_response.py
 # ---------------------------------------------------------------------------
 
-_VALID_PLAN_STATE = """\
-## Plan
-
-1. Step one
-
-<!-- AGENT_PLAN_STATE: approved -->
--- Anthropic Claude
-"""
+_VALID_PLAN_STATE = json.dumps({
+    "schema_version": 1,
+    "kind": "plan_state",
+    "state": "blocking",
+    "summary": "Plan is ready for review.",
+    "plan_steps": ["Step one"],
+    "architecture_impact": {
+        "status": "unchanged",
+        "rationale": "No architectural contract changed.",
+        "affected_components": [], "dependencies": [],
+        "execution_data_flows": [], "persistence": [],
+        "public_contracts": [], "security_boundaries": [],
+        "canonical_document_action": "no-change",
+        "canonical_document_path": None,
+        "canonical_document_rationale": "",
+    },
+}) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude\n"
 
 _INVALID_PLAN_STATE = "This has no marker at all."
 
@@ -512,6 +521,38 @@ class TestStateManager:
             records = _extract_round_metadata_records([comment], flow="pr")
             assert records[0].metadata.surfaced_reviewer_requirement_ids == (requirement_id,)
 
+    def test_attach_metadata_sanitizes_architecture_impact_before_durable_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            body_file = root / "review.md"
+            body_file.write_text(_VALID_PR_REVIEW_DRY, encoding="utf-8")
+            impact_file = root / "impact.json"
+            impact_file.write_text(json.dumps({
+                "status": "unchanged",
+                "rationale": "No change. <!-- AGENT_LOOP_SIDECAR: abc -->",
+                "affected_components": ["component <!-- AGENT_LOOP_SIDECAR: def -->"],
+            }), encoding="utf-8")
+            output_file = root / "review-tagged.md"
+
+            _run(
+                "helpers.state_manager", "attach-metadata",
+                "--body-file", str(body_file), "--output", str(output_file),
+                "--flow", "pr", "--role", "reviewer", "--agent", "Codex",
+                "--round-number", "1", "--state", "approved", "--subject", "head-1",
+                "--architecture-impact-file", str(impact_file),
+                "--architecture-contract-version", "1",
+            )
+
+            from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+            records = _extract_round_metadata_records(
+                [types.SimpleNamespace(body=output_file.read_text(encoding="utf-8"))],
+                flow="pr",
+            )
+            stored = records[0].metadata.architecture_impact
+            assert stored is not None
+            assert "<!-- AGENT_LOOP_SIDECAR:" not in json.dumps(stored)
+
     def test_attach_metadata_persists_compact_prior_summaries(self) -> None:
         body = _VALID_PLAN_STATE
 
@@ -653,7 +694,7 @@ class TestRunExternal:
         assert result.returncode == 0
         content = Path(output_path).read_text(encoding="utf-8")
         # Coder dry-run stub must be a valid plan_state (no JSON, just markdown + marker)
-        assert "AGENT_PLAN_STATE: approved" in content
+        assert "AGENT_PLAN_STATE: blocking" in content
         # Must NOT be a plan_review JSON blob
         assert '"kind": "plan_review"' not in content
 
@@ -3127,14 +3168,11 @@ class TestRetryValidateCoder:
 
             match = ROUND_RESUME_MARKER_RE.search(tagged)
             assert match is not None
-            original_prefix, original_suffix = _VALID_PLAN_STATE.strip().split(
-                "<!-- AGENT_PLAN_STATE: approved -->",
-                1,
+            assert tagged[: match.start()].startswith("## Plan\n")
+            assert "Plan is ready for review." in tagged[: match.start()]
+            assert tagged[match.end() :].strip().startswith(
+                "<!-- AGENT_PLAN_STATE: blocking -->"
             )
-            assert tagged[: match.start()].rstrip() == original_prefix.rstrip()
-            assert tagged[match.end() :].strip() == (
-                "<!-- AGENT_PLAN_STATE: approved -->" + original_suffix
-            ).strip()
 
     def test_retry_validate_coder_invalid_plan_state_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3263,6 +3301,27 @@ class TestHostReviewer:
             assert result.returncode != 0
             assert "host-review.md" in result.stderr
 
+    def test_coder_repair_manifest_preserves_architecture_contract(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+
+        monkeypatch.setattr(sr, "_REPAIR_BASE", tmp_path)
+        raw = tmp_path / "raw.md"
+        usage = tmp_path / "usage.json"
+        evidence = tmp_path / "evidence.json"
+        raw.write_text("incomplete", encoding="utf-8")
+        usage.write_text("{}", encoding="utf-8")
+        evidence.write_text("{}", encoding="utf-8")
+        identity = {"repository": "owner/repo", "path": "ARCHITECTURE.md", "availability": "missing"}
+        repair_dir = sr._save_coder_raw_to_repair_dir(
+            coder="codex", coder_cap="OpenAI Codex", issue=7, repo="owner/repo",
+            new_round_number=2, kind="plan_revision", next_prior_items_raw=[], dry_run=True,
+            raw_output=raw, usage_file=usage, response_evidence_file=evidence,
+            architecture_identity=identity, architecture_contract_version=1,
+        )
+        manifest = json.loads((repair_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["architecture_identity"] == identity
+        assert manifest["architecture_contract_version"] == 1
+
 
 # ---------------------------------------------------------------------------
 # helpers/skill_runner.py — host-as-reviewer for the PR flow (#314)
@@ -3323,6 +3382,49 @@ class TestHostReviewerPR:
         assert context["approved_plan"]["file"] == "approved-plan.md"
         assert context["approved_plan"]["deferred_work"] == ["- Keep the migration deferred."]
         assert context["approved_plan_reconciliation_guidance_file"] == "approved-plan-reconciliation.md"
+
+    def test_pr_host_handoff_carries_separate_architecture_pair(self, monkeypatch, tmp_path) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.architecture_context import ArchitecturePair, ArchitectureSnapshot
+        from coding_review_agent_loop.errors import AgentLoopError
+
+        monkeypatch.setattr(sr, "_REPAIR_BASE", tmp_path)
+        base = ArchitectureSnapshot(
+            repository="owner/repo", path="ARCHITECTURE.md", revision="a" * 40,
+            blob_oid="b" * 40, sha256="c" * 64, availability="available",
+            size=8, content="# Established base\n",
+        )
+        candidate = ArchitectureSnapshot(
+            repository="owner/repo", path="ARCHITECTURE.md", revision="d" * 40,
+            blob_oid="e" * 40, sha256="f" * 64, availability="available",
+            size=11, content="# Candidate proposal\n",
+        )
+        pair = ArchitecturePair(
+            repository="owner/repo", path="ARCHITECTURE.md", target_revision="main",
+            candidate_revision="d" * 40, merge_base_revision="a" * 40,
+            base=base, candidate=candidate, change="modified",
+        )
+        request_dir = sr._write_host_review_request(
+            flow="pr", validate_kind="pr_review", issue=7, repo="owner/repo",
+            new_round_number=1, round_subject="d" * 40,
+            review_material="diff --git a/x b/x", material_filename="pr-diff.diff",
+            next_prior_items_raw=[], current_round_items=[], item_id_offset=0, dry_run=True,
+            architecture_context=pair,
+        )
+        rendered = (request_dir / "architecture-context.md").read_text(encoding="utf-8")
+        assert "Established base architecture snapshot" in rendered
+        assert "Candidate architecture snapshot" in rendered
+        manifest = json.loads((request_dir / "manifest.json").read_text(encoding="utf-8"))
+        context = json.loads((request_dir / "context.json").read_text(encoding="utf-8"))
+        assert context["architecture_identity"] == pair.identity()
+        assert context["architecture_render_sha256"] == manifest["architecture_render_sha256"]
+        assert manifest["architecture_context_file"] == "architecture-context.md"
+        assert sr._validate_host_architecture_artifact(
+            request_dir, manifest, context
+        ) == pair.identity()
+        (request_dir / "architecture-context.md").write_text("tampered\n", encoding="utf-8")
+        with pytest.raises(AgentLoopError, match="does not match its recorded digest"):
+            sr._validate_host_architecture_artifact(request_dir, manifest, context)
 
     def test_host_handoff_removes_stale_plan_guidance_for_direct_pr(self, monkeypatch, tmp_path) -> None:
         import helpers.skill_runner as sr
@@ -3828,6 +3930,16 @@ def _structured_pr_fix_output() -> str:
                 "addressed_ids": [_HUMAN_REQUIREMENT.requirement_id],
                 "checked_discussion_directly": False,
             },
+            "architecture_impact": {
+                "status": "unchanged",
+                "rationale": "No architectural contract changed.",
+                "affected_components": [], "dependencies": [],
+                "execution_data_flows": [], "persistence": [],
+                "public_contracts": [], "security_boundaries": [],
+                "canonical_document_action": "no-change",
+                "canonical_document_path": None,
+                "canonical_document_rationale": "",
+            },
         }
     ) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex\n"
 
@@ -4147,6 +4259,8 @@ class TestRunPrFix:
             "pr": 7,
             "gemini_cmd": "gemini",
             "unresolved_item_ids": ["item-1"],
+            "architecture_identity": manifest["architecture_identity"],
+            "architecture_contract_version": 1,
         }
 
     def test_missing_pr_marker_rejected(self) -> None:
@@ -4281,6 +4395,16 @@ _DECOMP_JSON = json.dumps(
     {
         "schema_version": 1,
         "kind": "plan_decomposition",
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "affected_components": [], "dependencies": [],
+            "execution_data_flows": [], "persistence": [],
+            "public_contracts": [], "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
         "phases": [
             {
                 "title": "Schema helpers",

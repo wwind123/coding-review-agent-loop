@@ -17,6 +17,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from coding_review_agent_loop.agents.base import AgentName
+from coding_review_agent_loop.architecture_context import (
+    ArchitecturePair,
+    ArchitectureSnapshot,
+    freeze_architecture_context,
+)
 from coding_review_agent_loop.config import (
     AgentLoopConfig,
     DEFAULT_FLAT_CHILD_LIMIT,
@@ -40,6 +45,7 @@ from coding_review_agent_loop.round_state import (
     _deserialize_unresolved_item,
 )
 from coding_review_agent_loop.test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
+from coding_review_agent_loop.runner import Runner
 from coding_review_agent_loop.unresolved_items import (
     _format_same_pr_unresolved_items,
     _format_unresolved_items_for_coder,
@@ -75,6 +81,30 @@ def _local_test_evidence_guidance(value: object, *, current_head: str | None = N
     )
 
 
+def _acquire_skill_architecture(
+    config: AgentLoopConfig,
+    *,
+    workdir: str | None = None,
+    target_revision: str | None = None,
+    candidate_revision: str | None = None,
+) -> ArchitectureSnapshot | ArchitecturePair | None:
+    """Acquire committed architecture context for an actual skill workdir."""
+    if not config.architecture_context_enabled:
+        return None
+    checkout = Path(workdir) if workdir else Path(config.codex_dir if config.coder == "codex" else config.gemini_dir if config.coder == "gemini" else config.antigravity_dir if config.coder == "antigravity" else config.claude_dir)
+    if not checkout.is_dir():
+        return None
+    return freeze_architecture_context(
+        Runner(dry_run=config.dry_run),
+        checkout=checkout,
+        repository=config.repo,
+        path=config.architecture_path,
+        read_size=config.architecture_read_size,
+        target_revision=target_revision,
+        candidate_revision=candidate_revision,
+    )
+
+
 def make_minimal_config(
     repo: str,
     coder: AgentName,
@@ -89,6 +119,13 @@ def make_minimal_config(
     refresh_agent_memory: bool = False,
     flat_child_limit: int = DEFAULT_FLAT_CHILD_LIMIT,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context_enabled: bool = True,
+    architecture_path: str = "ARCHITECTURE.md",
+    architecture_read_size: int = 64 * 1024,
+    architecture_snapshot_max_chars: int = 12_000,
+    architecture_aggregate_max_chars: int = 24_000,
+    managed_context_max_chars: int = 80_000,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
 ) -> AgentLoopConfig:
     tmp_base = Path(tempfile.gettempdir()) / "coding-review-agent-loop"
     legacy = tmp_base / "skill-runner"
@@ -140,6 +177,13 @@ def make_minimal_config(
         approved_followups=approved_followups,
         flat_child_limit=flat_child_limit,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context_enabled=architecture_context_enabled,
+        architecture_path=architecture_path,
+        architecture_read_size=architecture_read_size,
+        architecture_snapshot_max_chars=architecture_snapshot_max_chars,
+        architecture_aggregate_max_chars=architecture_aggregate_max_chars,
+        managed_context_max_chars=managed_context_max_chars,
+        architecture_context=architecture_context,
     )
 
 
@@ -167,6 +211,8 @@ def build_plan_review_prompt_for_skill(
     workdir: str | None = None,
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build a plan reviewer prompt from plain dicts.
 
@@ -187,6 +233,10 @@ def build_plan_review_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, reviewers_list, reviewer=reviewer, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        **(architecture_options or {}),
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
     )
     issue_context = _make_issue_context(issue_dict)
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
@@ -199,6 +249,7 @@ def build_plan_review_prompt_for_skill(
         memory=memory,
         issue_context=issue_context,
         unresolved_items=unresolved,
+        architecture_context=architecture_context,
     )
 
 
@@ -223,6 +274,8 @@ def build_review_prompt_for_skill(
     approved_plan_max_chars: int | None = None,
     local_test_evidence: str | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build a PR reviewer prompt from plain dicts.
 
@@ -253,6 +306,17 @@ def build_review_prompt_for_skill(
         repo, coder, reviewers_list, reviewer=reviewer, workdir=workdir,
         approved_followups=approved_followups,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context=architecture_context,
+        **(architecture_options or {}),
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config,
+        workdir=workdir,
+        target_revision=(
+            f"origin/{issue_dict['baseRefName']}"
+            if issue_dict.get("baseRefName") else None
+        ),
+        candidate_revision=issue_dict.get("headRefOid"),
     )
     primary_issue_context = issue_context
     unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
@@ -281,6 +345,7 @@ def build_review_prompt_for_skill(
         coder_followup_context=_local_test_evidence_guidance(
             local_test_evidence, current_head=issue_dict.get("headRefOid")
         ),
+        architecture_context=architecture_context,
     )
     if pr_diff:
         prompt += f"\n\n## PR diff\n\n```diff\n{pr_diff}\n```\n"
@@ -305,6 +370,15 @@ def build_pr_fix_prompt_for_skill(
     approved_plan_max_chars: int | None = None,
     local_test_evidence: str | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context_enabled: bool = True,
+    architecture_path: str = "ARCHITECTURE.md",
+    architecture_read_size: int = 64 * 1024,
+    architecture_snapshot_max_chars: int = 12_000,
+    architecture_aggregate_max_chars: int = 24_000,
+    managed_context_max_chars: int = 80_000,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_target_revision: str | None = None,
+    architecture_candidate_revision: str | None = None,
 ) -> str:
     """Build the external-coder PR-fix prompt from skill-mode ledger items.
 
@@ -314,6 +388,19 @@ def build_pr_fix_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context_enabled=architecture_context_enabled,
+        architecture_path=architecture_path,
+        architecture_read_size=architecture_read_size,
+        architecture_snapshot_max_chars=architecture_snapshot_max_chars,
+        architecture_aggregate_max_chars=architecture_aggregate_max_chars,
+        managed_context_max_chars=managed_context_max_chars,
+        architecture_context=architecture_context,
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config,
+        workdir=workdir,
+        target_revision=architecture_target_revision,
+        candidate_revision=architecture_candidate_revision,
     )
     unresolved = [_deserialize_unresolved_item(item) for item in active_items_raw]
     evidence_guidance = _local_test_evidence_guidance(local_test_evidence)
@@ -334,6 +421,7 @@ def build_pr_fix_prompt_for_skill(
             human_requirements_context=human_requirements_context,
             approved_plan_context=approved_plan_context,
             approved_plan_max_chars=approved_plan_max_chars,
+            architecture_context=architecture_context,
         ), config)
     review_text = _format_unresolved_items_for_coder(unresolved) + evidence_guidance
     return _with_containment_guidance(build_followup_prompt(
@@ -348,6 +436,7 @@ def build_pr_fix_prompt_for_skill(
         human_requirements_context=human_requirements_context,
         approved_plan_context=approved_plan_context,
         approved_plan_max_chars=approved_plan_max_chars,
+        architecture_context=architecture_context,
     ), config)
 
 
@@ -360,6 +449,8 @@ def build_plan_prompt_for_skill(
     workdir: str,
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build the round-1 coder (plan) prompt for an external coder (#307).
 
@@ -369,10 +460,15 @@ def build_plan_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        **(architecture_options or {}),
+        architecture_context=architecture_context,
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
     )
     issue_context = _make_issue_context(issue_dict)
     return _with_containment_guidance(
-        build_issue_plan_prompt(issue_context.number, config, memory, issue_context), config
+        build_issue_plan_prompt(issue_context.number, config, memory, issue_context, architecture_context=architecture_context), config
     )
 
 
@@ -390,6 +486,8 @@ def build_plan_revision_prompt_for_skill(
     human_requirements: Sequence | None = None,
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build the round-N+1 coder (plan revision) prompt for an external coder (#307).
 
@@ -399,6 +497,10 @@ def build_plan_revision_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        **(architecture_options or {}),
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
     )
     issue_context = _make_issue_context(issue_dict)
     if human_requirements:
@@ -416,6 +518,7 @@ def build_plan_revision_prompt_for_skill(
         memory,
         issue_context,
         unresolved_items=unresolved,
+        architecture_context=architecture_context,
     ), config)
 
 
@@ -429,6 +532,8 @@ def build_implementation_prompt_for_skill(
     base: str = "main",
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build the external-coder implementation prompt (reversed roles, #316).
 
@@ -441,9 +546,15 @@ def build_implementation_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, (coder,), reviewer=coder, workdir=workdir, base=base,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context=architecture_context,
+        **(architecture_options or {}),
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
     )
     return _with_containment_guidance(build_issue_implementation_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,
+        architecture_context=architecture_context,
     ), config)
 
 
@@ -456,6 +567,8 @@ def build_plan_decomposition_prompt_for_skill(
     workdir: str,
     memory: AgentMemoryContext | None = None,
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
 ) -> str:
     """Build the external-coder plan decomposition prompt (#318).
 
@@ -466,7 +579,13 @@ def build_plan_decomposition_prompt_for_skill(
     config = make_minimal_config(
         repo, coder, (coder,), reviewer=coder, workdir=workdir,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_context=architecture_context,
+        **(architecture_options or {}),
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
     )
     return _with_containment_guidance(build_plan_decomposition_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,
+        architecture_context=architecture_context,
     ), config)

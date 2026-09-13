@@ -38,6 +38,7 @@ from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDisp
 from coding_review_agent_loop.protocol import (
     HUMAN_REQUIREMENTS_RESOLVED_RE,
     parse_plan_state,
+    validate_structured_plan_state,
     validate_structured_plan_revision,
 )
 from coding_review_agent_loop.unresolved_items import (
@@ -95,6 +96,7 @@ def validate_response_text(
     prior_items: list[object] | tuple[object, ...] = (),
     current_round_items: list[object] | tuple[object, ...] = (),
     human_requirements: list[object] | tuple[object, ...] = (),
+    required_architecture_impact_contract: int = 0,
 ) -> object:
     """Validate response text with the same context used by the helper CLI.
 
@@ -137,7 +139,17 @@ def validate_response_text(
     ]
 
     if kind == "plan_state":
-        return parse_plan_state(text)
+        parsed = validate_structured_plan_state(
+            text,
+            required_architecture_impact_contract=required_architecture_impact_contract,
+        )
+        if parsed is None:
+            if required_architecture_impact_contract == 1:
+                raise AgentLoopError(
+                    "Fresh plan_state responses must use the structured architecture-impact contract."
+                )
+            return parse_plan_state(text)
+        return parsed
     if kind == "plan_review":
         return _validate_plan_review_response(
             text,
@@ -170,6 +182,7 @@ def validate_response_text(
             text,
             unresolved_items=deserialized_prior,
             human_requirements=deserialized_requirements or None,
+            required_architecture_impact_contract=required_architecture_impact_contract,
         )
     if kind == "issue_implementation":
         from coding_review_agent_loop.orchestrator import _validate_issue_implementation_response
@@ -177,9 +190,13 @@ def validate_response_text(
         return _validate_issue_implementation_response(
             text,
             human_requirements=deserialized_requirements,
+            require_architecture_impact=(required_architecture_impact_contract == 1),
         )
 
-    parsed = validate_structured_plan_revision(text)
+    parsed = validate_structured_plan_revision(
+        text,
+        required_architecture_impact_contract=required_architecture_impact_contract,
+    )
     if parsed is None:
         raise AgentLoopError("Response did not parse as a structured plan_revision.")
     allowed_ids = {item.item_id for item in deserialized_prior}

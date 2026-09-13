@@ -320,6 +320,15 @@ class AgentLoopConfig:
     containment_test_gate_memory_max: object | None = None
     containment_test_gate_memory_swap_max: object | None = None
     containment_test_gate_tasks_max: object | None = None
+    # Architecture context is advisory and contributes no prompt text unless a
+    # frozen, successfully acquired snapshot is attached by orchestration.
+    architecture_context_enabled: bool = True
+    architecture_path: str = "ARCHITECTURE.md"
+    architecture_read_size: int = 64 * 1024
+    architecture_snapshot_max_chars: int = 12_000
+    architecture_aggregate_max_chars: int = 24_000
+    managed_context_max_chars: int = 80_000
+    architecture_context: object | None = None
 
     @property
     def effective_managed_ci(self) -> bool:
@@ -329,6 +338,17 @@ class AgentLoopConfig:
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
             object.__setattr__(self, "reviewer", (self.reviewer,))
+        from .architecture_context import normalize_architecture_path
+
+        object.__setattr__(self, "architecture_path", normalize_architecture_path(self.architecture_path))
+        for option_name, value in (
+            ("--architecture-read-size", self.architecture_read_size),
+            ("--architecture-snapshot-max-chars", self.architecture_snapshot_max_chars),
+            ("--architecture-aggregate-max-chars", self.architecture_aggregate_max_chars),
+            ("--managed-context-max-chars", self.managed_context_max_chars),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise AgentLoopError(f"{option_name} must be a positive integer.")
         # Reconstructing a normalized frozen config (for example to add an
         # invocation token list) feeds the legacy single model back as its
         # equivalent one-item chain.  Treat that representation as idempotent.
@@ -1390,6 +1410,12 @@ def config_from_args(
         plan_execution_mode=getattr(args, "plan_execution_mode", None) or "plan-only",
         planning_context_mode=getattr(args, "planning_context_mode", None) or "compact",
         pr_review_context_mode=getattr(args, "pr_review_context_mode", None) or "full",
+        architecture_context_enabled=getattr(args, "architecture_context_enabled", True),
+        architecture_path=getattr(args, "architecture_path", "ARCHITECTURE.md"),
+        architecture_read_size=getattr(args, "architecture_read_size", 64 * 1024),
+        architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
+        architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
+        managed_context_max_chars=getattr(args, "managed_context_max_chars", 80_000),
         pr_review_policy=getattr(args, "pr_review_policy", None) or "all-reviewers",
         pr_review_broad_rules=tuple(
             getattr(args, "pr_review_broad_rules", None)

@@ -8,7 +8,7 @@ import json
 import re
 import zlib
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from .config import AgentLoopConfig
 from .child_topology import (
@@ -21,6 +21,11 @@ from .errors import AgentLoopError
 from .github import FoundIssue, create_issue, post_issue_comment, search_issues
 from .runner import Runner
 from .protocol_markers import TrustedBody, sanitize_historical_text
+from .protocol import (
+    ArchitectureImpact,
+    parse_architecture_impact,
+    sanitize_architecture_impact,
+)
 from .round_transport import MAX_GITHUB_BODY_CHARS
 
 AUTOMATION_CLASSES = {"agent-pr", "human-action", "manual-close"}
@@ -67,6 +72,7 @@ class PlanPhase:
 @dataclass(frozen=True)
 class PlanDecomposition:
     phases: tuple[PlanPhase, ...]
+    architecture_impact: ArchitectureImpact | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,9 @@ class TopologyCheckpoint:
     topology_source: str
     phases: tuple[PlanPhase, ...]
     retained_parent_scope: RetainedParentScope | None = None
+    architecture_identity: dict | None = None
+    architecture_impact: dict | None = None
+    architecture_contract_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -166,10 +175,20 @@ def _required_text(payload: dict[str, object], key: str, *, phase_title: str) ->
     return value.strip()
 
 
-def parse_plan_decomposition(text: str) -> PlanDecomposition:
+def parse_plan_decomposition(
+    text: str, *, required_architecture_impact_contract: int = 0
+) -> PlanDecomposition:
     payload = _extract_json_object(text)
     if payload.get("kind") not in (None, "plan_decomposition"):
         raise AgentLoopError("Invalid plan decomposition: `kind` must be `plan_decomposition`.")
+    impact = (
+        parse_architecture_impact(payload["architecture_impact"], context="plan_decomposition.architecture_impact")
+        if "architecture_impact" in payload else None
+    )
+    if required_architecture_impact_contract == 1 and impact is None:
+        raise AgentLoopError(
+            "plan_decomposition must include architecture_impact for this fresh contract turn."
+        )
     phases_payload = payload.get("phases")
     if not isinstance(phases_payload, list) or not phases_payload:
         raise AgentLoopError("Invalid plan decomposition: `phases` must be a non-empty list.")
@@ -233,7 +252,7 @@ def parse_plan_decomposition(text: str) -> PlanDecomposition:
                 depends_on=tuple(value.strip() for value in depends_on_payload),
             )
         )
-    return PlanDecomposition(phases=tuple(phases))
+    return PlanDecomposition(phases=tuple(phases), architecture_impact=impact)
 
 
 def _issue_number_from_url(issue_url: str | None) -> int | None:
@@ -357,6 +376,10 @@ def _checkpoint_payload(checkpoint: TopologyCheckpoint) -> dict[str, object]:
             and checkpoint.retained_parent_scope.excerpt == shared_context
         ):
             retained_payload.pop("excerpt")
+    # Checkpoint comments are durable host-visible transport. Impact prose is
+    # agent-supplied and must be marker-safe even when a caller constructed a
+    # TopologyCheckpoint directly rather than going through the orchestrator.
+    architecture_impact = sanitize_architecture_impact(checkpoint.architecture_impact)
     return {
         "parent_issue": checkpoint.parent_issue,
         "plan_hash": checkpoint.plan_hash,
@@ -365,6 +388,9 @@ def _checkpoint_payload(checkpoint: TopologyCheckpoint) -> dict[str, object]:
         "shared_parent_context": shared_context,
         "phases": phase_payloads,
         "retained_parent_scope": retained_payload,
+        "architecture_identity": checkpoint.architecture_identity,
+        "architecture_impact": architecture_impact,
+        "architecture_contract_version": checkpoint.architecture_contract_version,
     }
 
 
@@ -429,6 +455,17 @@ def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
             excerpt=str(retained_payload.get("excerpt") or shared_parent_context or ""),
         )
     try:
+        architecture_identity = payload.get("architecture_identity")
+        if architecture_identity is not None and not isinstance(architecture_identity, dict):
+            raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+        raw_impact = payload.get("architecture_impact")
+        architecture_impact = (
+            asdict(parse_architecture_impact(raw_impact, context="checkpoint.architecture_impact"))
+            if raw_impact is not None else None
+        )
+        raw_contract = payload.get("architecture_contract_version")
+        if raw_contract is not None and raw_contract != 1:
+            raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT architecture contract.")
         return TopologyCheckpoint(
             parent_issue=int(payload["parent_issue"]),
             plan_hash=str(payload["plan_hash"]),
@@ -439,6 +476,9 @@ def _decode_checkpoint(encoded: str) -> TopologyCheckpoint:
                 for item in phases_payload
             ),
             retained_parent_scope=retained,
+            architecture_identity=architecture_identity,
+            architecture_impact=architecture_impact,
+            architecture_contract_version=raw_contract,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.") from exc
@@ -781,6 +821,17 @@ def create_decomposition_child_issues(
                 topology_source=topology_source,
                 phases=phases,
                 retained_parent_scope=retained_parent_scope,
+                architecture_identity=(
+                    config.architecture_context.identity()
+                    if hasattr(config.architecture_context, "identity") else None
+                ),
+                architecture_impact=(
+                    sanitize_architecture_impact(asdict(decomposition.architecture_impact))
+                    if decomposition.architecture_impact is not None else None
+                ),
+                architecture_contract_version=(
+                    1 if decomposition.architecture_impact is not None else None
+                ),
             ),
         )
 

@@ -132,7 +132,7 @@ class ManagedRunner(FakeRunner):
         self.handoff_completes = handoff_completes
         self.label_applied = False
 
-    def _run_locked(self, args, *, cwd, check):
+    def _run_locked(self, args, *, cwd, check, input_text=None):
         cmd = list(args)
         if (
             cmd[:2] == ["gh", "api"]
@@ -241,7 +241,7 @@ class V2ManagedRunner(ManagedRunner):
                 return part[len(prefix):]
         return None
 
-    def _run_locked(self, args, *, cwd, check):
+    def _run_locked(self, args, *, cwd, check, input_text=None):
         cmd = list(args)
         endpoint = next(
             (part for part in cmd if isinstance(part, str) and part.startswith("repos/")), ""
@@ -350,7 +350,7 @@ class ManualQualificationRunner(V2ManagedRunner):
             return None
         return FakeRunner._gh_argv_error(cmd)
 
-    def _run_locked(self, args, *, cwd, check):
+    def _run_locked(self, args, *, cwd, check, input_text=None):
         cmd = list(args)
         if cmd[:3] == ["gh", "pr", "ready"]:
             cmd, cwd_path = self._record_command(args, cwd)
@@ -3087,7 +3087,7 @@ def test_paginated_array_response_is_flat_and_malformed_entries_are_unavailable(
 
 def test_v2_failed_jobs_decodes_concatenated_cli_pages(tmp_path):
     class PagedJobsRunner(FakeRunner):
-        def _run_locked(self, args, *, cwd, check):
+        def _run_locked(self, args, *, cwd, check, input_text=None):
             if args and str(args[-1]).endswith("/jobs?filter=latest&per_page=100"):
                 cmd, cwd_path = self._record_command(args, cwd)
                 return CommandResult(

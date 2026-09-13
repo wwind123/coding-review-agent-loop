@@ -142,6 +142,9 @@ class PostedRoundMetadata:
     # is intentionally independent of the scheduler optimization so a restart
     # can attach to an existing attempt without minting another one.
     qualification_checkpoint: "QualificationCheckpoint | None" = None
+    architecture_identity: dict | None = None
+    architecture_impact: dict | None = None
+    architecture_contract_version: int | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -675,6 +678,9 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "raw_structured_coder_response": metadata.raw_structured_coder_response,
         "approved_plan_hash": metadata.approved_plan_hash,
         "approved_plan_subject": metadata.approved_plan_subject,
+        "architecture_identity": metadata.architecture_identity,
+        "architecture_impact": metadata.architecture_impact,
+        "architecture_contract_version": metadata.architecture_contract_version,
         "compact_prior_summaries": list(metadata.compact_prior_summaries),
         "usage": metadata.usage,
         "model_used": metadata.model_used,
@@ -768,6 +774,18 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 str(payload["approved_plan_subject"])
                 if payload.get("approved_plan_subject") is not None
                 else None
+            ),
+            architecture_identity=(
+                payload.get("architecture_identity")
+                if isinstance(payload.get("architecture_identity"), dict) else None
+            ),
+            architecture_impact=(
+                payload.get("architecture_impact")
+                if isinstance(payload.get("architecture_impact"), dict) else None
+            ),
+            architecture_contract_version=(
+                int(payload["architecture_contract_version"])
+                if payload.get("architecture_contract_version") is not None else None
             ),
             compact_prior_summaries=tuple(
                 str(summary) for summary in payload.get("compact_prior_summaries", [])
@@ -1095,6 +1113,7 @@ def _latest_pr_approved_reviews_for_head(
     approved_plan_context: ApprovedPlanContext | None = None,
     human_requirements: Sequence[object] = (),
     reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
+    require_architecture_contract: bool = False,
 ) -> dict[str, PostedRoundRecord]:
     """Return each reviewer's latest approval for the current immutable PR head."""
     if not head_sha:
@@ -1109,6 +1128,11 @@ def _latest_pr_approved_reviews_for_head(
             or metadata.agent not in configured_names
             or metadata.agent in latest_by_reviewer
         ):
+            continue
+        # A fresh architecture-aware resume must be explicitly bound to the
+        # current response contract.  Legacy records remain decodable, but
+        # their missing discriminator cannot satisfy a newly prompted turn.
+        if require_architecture_contract and metadata.architecture_contract_version != 1:
             continue
         latest_by_reviewer[metadata.agent] = record
 

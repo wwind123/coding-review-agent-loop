@@ -15,6 +15,7 @@ from .protocol_markers import scan_reserved_markers
 _KINDS = {
     "pr_review", "plan_review", "plan_revision", "plan_state",
     "coder_followup", "issue_implementation",
+    "task_result",
 }
 
 _FENCED_JSON_PREFIX_RE = re.compile(
@@ -102,6 +103,30 @@ def validate_repair_preservation(
                 f"Repair content preservation failed for {field}: preserve original "
                 "wording, evidence, and test caveats; do not summarize or omit content."
             )
+
+    impact = source.get("architecture_impact")
+    if isinstance(impact, dict):
+        target_impact = target.get("architecture_impact")
+        require(isinstance(target_impact, dict), "architecture_impact")
+        for key, value in impact.items():
+            if isinstance(value, str) and _fragments(value):
+                candidate = target_impact.get(key)
+                exact = key in {"status", "canonical_document_action"}
+                require(
+                    isinstance(candidate, str)
+                    and (
+                        _normalized(value) == _normalized(candidate)
+                        if exact
+                        else _normalized(value) in _normalized(candidate)
+                    ),
+                    f"architecture_impact.{key}",
+                )
+            elif isinstance(value, list):
+                candidate = target_impact.get(key)
+                require(isinstance(candidate, list), f"architecture_impact.{key}")
+                for entry in value:
+                    if isinstance(entry, str) and _fragments(entry):
+                        require(entry in candidate, f"architecture_impact.{key}")
 
     summary = source.get("summary")
     if isinstance(summary, str) and _fragments(summary):

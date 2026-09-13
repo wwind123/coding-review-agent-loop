@@ -142,6 +142,16 @@ def test_approved_plan_additional_closing_issue_reaches_implementation_flow(tmp_
                 "plan_steps": ["Implement the change."],
                 "additional_closing_issue_ids": [847],
                 "human_requirement_dispositions": [],
+                "architecture_impact": {
+                    "status": "unchanged",
+                    "rationale": "No architectural contract changed.",
+                    "affected_components": [], "dependencies": [],
+                    "execution_data_flows": [], "persistence": [],
+                    "public_contracts": [], "security_boundaries": [],
+                    "canonical_document_action": "no-change",
+                    "canonical_document_path": None,
+                    "canonical_document_rationale": "",
+                },
             }
         )
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"

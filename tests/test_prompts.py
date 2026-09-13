@@ -1,14 +1,17 @@
 import sys
+import json
 from datetime import datetime as datetime_type, timezone
 
 import pytest
 
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
+from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
 from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
 import coding_review_agent_loop.test_runtime as runtime
 import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.prompts import (
+    build_followup_prompt,
     build_issue_implementation_prompt,
     build_issue_prompt,
     build_task_clarification_prompt,
@@ -341,6 +344,22 @@ def test_issue_plan_prompt_requires_complete_structured_plan_state_contract(tmp_
     assert "typed `child_stages`, `external_dependencies`, `deferred_work`," in prompt
     assert "generic `implementation_plan`" in prompt
     assert "after the JSON object and before the AGENT_PLAN_STATE footer" in prompt
+
+
+def test_architecture_impact_guidance_matches_all_coder_and_plan_schemas(tmp_path):
+    config = make_config(tmp_path)
+    prompts = (
+        build_issue_plan_prompt(56, config),
+        build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex"),
+        build_plan_revision_prompt(56, 2, "Plan.", "Fix it.", config),
+        build_task_prompt("Add a health endpoint.", config),
+    )
+    for prompt in prompts:
+        assert '"architecture_impact"' in prompt
+    task_prompt = prompts[-1]
+    assert "must start with the JSON object" in task_prompt
+    assert "Do not add an" in task_prompt
+    assert "`AGENT_PR` or `AGENT_CLARIFY`" in task_prompt
 
 
 def test_issue_prompts_include_salvage_guardrail_block(tmp_path):
@@ -1284,7 +1303,7 @@ def test_issue_loop_includes_issue_comments_in_coder_and_review_prompts(tmp_path
             },
         ],
         claude_outputs=[
-            "Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->",
+            structured_issue_implementation(pr_number=77),
         ],
         codex_outputs=[
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
@@ -2236,9 +2255,137 @@ def test_task_prompts_document_no_pr_blocking_branch(tmp_path):
         build_task_clarification_prompt("Fix the bug.", [], config).split()
     )
 
+    assert "For a no-PR blocking result:" in task_prompt
+    assert "without an `AGENT_PR` marker" in task_prompt
+    assert "For a no-PR blocking result:" in clarification_prompt
+    assert "Do not add an `AGENT_PR` or `AGENT_CLARIFY` marker" in clarification_prompt
+    assert "do not emit without an `AGENT_PR` marker" not in clarification_prompt
+
+
+def test_task_prompt_structured_clarification_footer_matches_validator(tmp_path):
+    from coding_review_agent_loop.protocol import validate_structured_task_result
+
+    config = make_config(tmp_path)
+    task_prompt = build_task_prompt("Clarify the implementation.", config)
+    clarification_prompt = build_task_clarification_prompt(
+        "Clarify the implementation.", [("Which API?", "The public API.")], config
+    )
+    payload = {
+        "schema_version": 1,
+        "kind": "task_result",
+        "state": "blocking",
+        "outcome": "clarification",
+        "summary": "One API detail is still required.",
+        "clarification": ["Which endpoint should change?"],
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No contract is changed before clarification.",
+        },
+    }
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Coder"
+    assert validate_structured_task_result(text, required_architecture_impact_contract=1)
     for prompt in (task_prompt, clarification_prompt):
-        assert "For a no-PR blocking result:" in prompt
-        assert "without an `AGENT_PR` marker" in prompt
+        assert "structured `task_result`" in prompt
+        assert "AGENT_CLARIFY -->" not in prompt
+
+
+def test_active_architecture_uses_lossless_requirements_and_omits_architecture_first(tmp_path):
+    architecture = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available",
+        size=20, content="# System\n\nThe architecture overview.", heading_index=("System",),
+    )
+    config = make_config(
+        tmp_path,
+        architecture_context=architecture,
+        managed_context_max_chars=300,
+    )
+    prompt = build_task_prompt("Implement the requested change.", config)
+    assert "Architecture context omitted for managed prompt budget" in prompt
+    assert "The architecture overview" not in prompt
+
+
+@pytest.mark.parametrize("builder", [build_followup_prompt, build_same_pr_followup_prompt])
+def test_direct_feedback_call_with_architecture_uses_lossless_requirements(tmp_path, builder):
+    architecture = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available",
+        size=20, content="# System\n", heading_index=("System",),
+    )
+    requirement = HumanReviewRequirement(
+        source_type="PR comment", author="reviewer", created_at="2026-01-01T00:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep " + ("the compatibility contract " * 900) + ".",
+    )
+    config = make_config(
+        tmp_path, architecture_context=architecture, managed_context_max_chars=40_000
+    )
+    prompt = builder(77, 2, "Fix the bug.", config, human_requirements=(requirement,))
+    assert requirement.body in prompt
+
+
+def test_followup_prompt_documents_and_validates_fresh_architecture_impact(tmp_path):
+    config = make_config(tmp_path)
+    prompt = build_followup_prompt(77, 2, "Fix the bug.", config)
+    assert '"architecture_impact"' in prompt
+    assert "Required structured fields" in prompt
+    parsed = validate_structured_coder_followup(
+        structured_coder_followup(), required_architecture_impact_contract=1
+    )
+    assert parsed is not None and parsed.architecture_impact is not None
+
+
+def test_explicit_managed_cap_fails_closed_when_protected_context_has_no_room(tmp_path):
+    architecture = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available",
+        size=20, content="# System\n", heading_index=("System",),
+    )
+    config = make_config(
+        tmp_path, architecture_context=architecture, managed_context_max_chars=32
+    )
+    with pytest.raises(AgentLoopError, match="Managed prompt context cap"):
+        prompts_module._architecture_context_block(config, protected_context=("x" * 32,))
+
+
+def test_architecture_opt_out_preserves_legacy_prompt_rendering(tmp_path):
+    architecture = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available",
+        size=20, content="# System\n", heading_index=("System",),
+    )
+    legacy = build_task_prompt("Implement the requested change.", make_config(tmp_path))
+    opted_out = build_task_prompt(
+        "Implement the requested change.",
+        make_config(
+            tmp_path,
+            architecture_context=architecture,
+            architecture_context_enabled=False,
+        ),
+    )
+    assert opted_out == legacy
+    assert "advisory repository context" not in opted_out
+
+
+def test_non_material_architecture_preserves_legacy_prompt_rendering(tmp_path):
+    unavailable = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid=None, sha256=None, availability="unavailable",
+        diagnostic="Git object is unavailable.",
+    )
+    legacy = build_task_prompt("Implement the requested change.", make_config(tmp_path))
+    unavailable_prompt = build_task_prompt(
+        "Implement the requested change.",
+        make_config(tmp_path, architecture_context=unavailable),
+    )
+    assert unavailable_prompt == legacy
+    assert "advisory repository context" not in unavailable_prompt
+
+
+def test_task_clarification_forbids_legacy_markers(tmp_path):
+    prompt = build_task_clarification_prompt("Fix the bug.", [], make_config(tmp_path))
+    assert "Do not add an `AGENT_PR` or `AGENT_CLARIFY` marker" in prompt
+    assert "do not emit without an `AGENT_PR` marker" not in prompt
 
 
 @pytest.mark.parametrize("compact_context", [False, True])

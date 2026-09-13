@@ -576,6 +576,16 @@ def _plan_with_requirement_disposition(
         "state": state,
         "summary": summary,
         "plan_steps": plan_steps,
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "affected_components": [], "dependencies": [],
+            "execution_data_flows": [], "persistence": [],
+            "public_contracts": [], "security_boundaries": [],
+            "canonical_document_action": "no-change",
+            "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
         "human_requirement_dispositions": [{
             "requirement_id": "Requirement 1",
             "disposition": "addressed",
@@ -1416,6 +1426,16 @@ def test_issue_loop_plan_revision_stores_raw_structured_metadata(tmp_path):
                     {"item_id": "item-1", "disposition": "resolved", "note": "Added the missing test step."}
                 ],
                 "plan_steps": ["Add the regression test.", "Run the focused suite."],
+                "architecture_impact": {
+                    "status": "unchanged",
+                    "rationale": "No architectural contract changed.",
+                    "affected_components": [], "dependencies": [],
+                    "execution_data_flows": [], "persistence": [],
+                    "public_contracts": [], "security_boundaries": [],
+                    "canonical_document_action": "no-change",
+                    "canonical_document_path": None,
+                    "canonical_document_rationale": "",
+                },
             }
         )
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"

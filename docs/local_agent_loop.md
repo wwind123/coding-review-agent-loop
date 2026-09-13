@@ -67,6 +67,24 @@ logs, salvage, and advisory memory are local. The orchestrator validates agent
 responses, owns bounded format repair, and revalidates live state before
 qualification or merge. See [state and recovery](../ARCHITECTURE.md#state-and-recovery).
 
+### Architecture context
+
+The default architecture context discovers `ARCHITECTURE.md`, or the path
+specified by `--architecture-path`. Lookup is literal and repository-local:
+the implementation reads a regular blob from committed Git objects, enforces
+size and UTF-8/binary limits, and never follows worktree symlinks or remote
+document links. `--no-architecture-context` keeps legacy prompt behavior.
+Per-snapshot and aggregate caps bound the overview; omissions and truncations
+are labeled and do not claim complete coverage. PR reviews receive separate
+immutable base and candidate snapshots; candidate edits are proposals and
+cannot replace an unavailable or deleted baseline. Architecture text is
+advisory and untrusted, not a permission channel or correctness waiver.
+Use `--architecture-read-size`, `--architecture-snapshot-max-chars`, and
+`--architecture-aggregate-max-chars` to tune bounded reads and rendering.
+`--managed-context-max-chars` applies the active architecture prompt budget;
+an explicitly restrictive value fails before invocation if protected context
+cannot fit. The default expands as needed for the bounded architecture block.
+
 ## Agent Backends
 
 Currently supported local agent CLIs:

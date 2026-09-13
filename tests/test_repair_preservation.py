@@ -23,6 +23,32 @@ def test_prompt_demands_lossless_repair_and_separate_ledgers():
     assert "Preserve a source `disputed_items` classification" in prompt
 
 
+def test_repair_preserves_architecture_impact_fields():
+    source = {
+        "kind": "task_result",
+        "summary": "Implemented the task.",
+        "architecture_impact": {
+            "status": "changed",
+            "rationale": "The execution flow crosses a new persistence boundary.",
+            "affected_components": ["task loop"],
+            "dependencies": ["round metadata"],
+            "execution_data_flows": ["task -> round metadata"],
+            "persistence": ["architecture impact sidecar"],
+            "public_contracts": ["task_result"],
+            "security_boundaries": ["untrusted prompt context"],
+            "canonical_document_action": "update",
+            "canonical_document_path": "ARCHITECTURE.md",
+            "canonical_document_rationale": "Document the new persistence boundary.",
+            "uncertainty": ["provider behavior remains external"],
+        },
+    }
+    repaired = json.loads(json.dumps(source))
+    check(source, repaired)
+    repaired["architecture_impact"]["uncertainty"] = []
+    with pytest.raises(AgentLoopError, match="architecture_impact.uncertainty"):
+        check(source, repaired)
+
+
 def test_case06_object_to_string_keeps_every_detail():
     detail = "Wire the capability getter in app.js:42; add a two-round test; no mutation on 503."
     source = {"kind": "plan_review", "blocking_plan_issues": [

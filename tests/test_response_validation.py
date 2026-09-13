@@ -1,5 +1,9 @@
 from agent_loop_helpers import *  # noqa: F403
-from coding_review_agent_loop.protocol import StructuredCoderFollowup, classify_pr_reference
+from coding_review_agent_loop.protocol import (
+    StructuredCoderFollowup,
+    classify_pr_reference,
+    validate_structured_coder_followup,
+)
 from coding_review_agent_loop.unresolved_items import (
     CODER_DISPUTE_NOTE_PREFIX,
     MACHINE_AUTHORITY,
@@ -48,6 +52,16 @@ def test_validate_review_response_accepts_structured_pr_review():
     assert [item.text for item in parsed.blocking_items] == [
         "Add the mixed-history regression case to the suite."
     ]
+
+
+def test_fresh_coder_contract_requires_architecture_impact():
+    payload = json.loads(structured_coder_followup().split("\n<!--", 1)[0])
+    payload.pop("architecture_impact")
+    response = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    with pytest.raises(AgentLoopError, match="architecture_impact"):
+        validate_structured_coder_followup(
+            response, required_architecture_impact_contract=1
+        )
 
 
 def test_machine_obligation_must_be_dispositioned_but_resolution_is_advisory():

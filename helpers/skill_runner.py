@@ -111,6 +111,7 @@ from coding_review_agent_loop.agents.registry import agent_display_name
 from coding_review_agent_loop.config import (
     DEFAULT_FLAT_CHILD_LIMIT,
     ensure_temp_checkout,
+    sync_checkout_to_pr,
 )
 from coding_review_agent_loop.errors import AgentLoopError, UnknownPriorItemDispositionError
 from coding_review_agent_loop.decomposition import (
@@ -129,6 +130,7 @@ from coding_review_agent_loop.followups import (
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
     IssueContext,
+    PullRequestMetadata,
     PullRequestReviewContext,
     _parse_issue_comments,
     _parse_issue_human_requirements,
@@ -556,6 +558,8 @@ def _save_raw_to_repair_dir(
     context_file: Path,
     prior_items_file: Path,
     approved_plan_context: ApprovedPlanContext | None = None,
+    architecture_identity: dict | None = None,
+    architecture_contract_version: int | None = None,
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy raw response + context to a stable repair dir before normalization/validation."""
@@ -574,6 +578,10 @@ def _save_raw_to_repair_dir(
     if approved_plan_context is not None:
         manifest["approved_plan_hash"] = approved_plan_context.plan_hash
         manifest["approved_plan_subject"] = approved_plan_context.plan_subject
+    if architecture_identity is not None:
+        manifest["architecture_identity"] = architecture_identity
+    if architecture_contract_version is not None:
+        manifest["architecture_contract_version"] = architecture_contract_version
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -631,6 +639,110 @@ def _add_antigravity_options(parser: argparse.ArgumentParser) -> None:
              "matching the agent-loop CLI). Overrides agy's five-minute "
              "print-mode default.",
     )
+
+
+def _add_architecture_options(parser: argparse.ArgumentParser) -> None:
+    """Expose the same bounded architecture controls as the main CLI."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--architecture-context", dest="architecture_context_enabled",
+        action="store_true", default=True,
+        help="Include bounded advisory architecture context when available (default).",
+    )
+    group.add_argument(
+        "--no-architecture-context", dest="architecture_context_enabled",
+        action="store_false", help="Opt out of repository architecture context.",
+    )
+    parser.add_argument("--architecture-path", default="ARCHITECTURE.md")
+    parser.add_argument("--architecture-read-size", type=int, default=64 * 1024, metavar="BYTES")
+    parser.add_argument("--architecture-snapshot-max-chars", type=int, default=12_000, metavar="CHARS")
+    parser.add_argument("--architecture-aggregate-max-chars", type=int, default=24_000, metavar="CHARS")
+    parser.add_argument("--managed-context-max-chars", type=int, default=80_000, metavar="CHARS")
+
+
+def _architecture_options(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "architecture_context_enabled": getattr(args, "architecture_context_enabled", True),
+        "architecture_path": getattr(args, "architecture_path", "ARCHITECTURE.md"),
+        "architecture_read_size": getattr(args, "architecture_read_size", 64 * 1024),
+        "architecture_snapshot_max_chars": getattr(args, "architecture_snapshot_max_chars", 12_000),
+        "architecture_aggregate_max_chars": getattr(args, "architecture_aggregate_max_chars", 24_000),
+        "managed_context_max_chars": getattr(args, "managed_context_max_chars", 80_000),
+    }
+
+
+def _prepare_skill_pr_architecture_checkout(
+    args: argparse.Namespace,
+    *,
+    repo: str,
+    pr: int,
+    pr_info: dict,
+    agent: str,
+    workdir: str,
+) -> bool:
+    """Prepare the default skill checkout before PR architecture acquisition.
+
+    ``run_external`` normally performs this preparation immediately before an
+    agent process.  PR resume filtering happens earlier, so the skill runner
+    must position its auto-created checkout first or it would snapshot an empty
+    directory and discard valid completed reviews. Explicit workdirs are also
+    refreshed here because resume filtering needs the live PR head before the
+    normal external-agent invocation occurs.
+    """
+    if getattr(args, "dry_run", False):
+        return False
+    from helpers.prompt_builders import make_minimal_config
+
+    config = make_minimal_config(
+        repo, agent, (agent,), reviewer=agent, workdir=workdir,
+        **_architecture_options(args),
+    )
+    config = dataclasses.replace(config, dry_run=False)
+    runner = Runner(dry_run=False)
+    explicit_workdir = bool(
+        getattr(args, f"workdir_{agent}", None) or getattr(args, "workdir", None)
+    )
+    pr_metadata = PullRequestMetadata(
+        number=pr,
+        repo=repo,
+        title=str(pr_info.get("title")) if pr_info.get("title") is not None else None,
+        head_branch=str(pr_info.get("headRefName")) if pr_info.get("headRefName") is not None else None,
+        base_branch=str(pr_info.get("baseRefName")) if pr_info.get("baseRefName") is not None else None,
+        head_sha=str(pr_info.get("headRefOid")) if pr_info.get("headRefOid") is not None else None,
+        url=str(pr_info.get("url")) if pr_info.get("url") is not None else None,
+        body=str(pr_info.get("body")) if pr_info.get("body") is not None else None,
+    )
+    try:
+        if explicit_workdir:
+            # The normal external-agent invocation refreshes an explicit
+            # workdir immediately before running the agent.  Architecture
+            # acquisition happens earlier for resume filtering, so perform the
+            # same PR-head synchronization here or the frozen pair could be
+            # based on stale refs (or an unavailable candidate).
+            sync_checkout_to_pr(
+                config,
+                runner,
+                path=Path(workdir),
+                label=f"Explicit {agent} workdir",
+                default_owned=False,
+                pr_number=pr,
+                pr_metadata=pr_metadata,
+            )
+        else:
+            ensure_temp_checkout(Path(workdir), agent=agent, config=config, runner=runner)
+            sync_checkout_to_pr(
+                config, runner, path=Path(workdir),
+                label=f"Default {agent} workdir", default_owned=True,
+                pr_number=pr, pr_metadata=pr_metadata,
+            )
+    except (AgentLoopError, OSError) as exc:
+        print(
+            f"skill_runner: could not prepare the default PR checkout for architecture "
+            f"acquisition: {exc}; resume filtering will be skipped until a checkout is available.",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _add_gemini_cmd_option(parser: argparse.ArgumentParser) -> None:
@@ -1629,6 +1741,31 @@ def _filter_resume_for_approved_plan(
     return filtered
 
 
+def _filter_resume_for_architecture(
+    resume: dict,
+    *,
+    architecture_identity: dict,
+) -> dict:
+    """Keep only same-head reviewer records bound to this architecture snapshot."""
+    matching_data = [
+        record
+        for record in resume.get("completed_reviewer_data", [])
+        if (
+            record.get("architecture_contract_version") == 1
+            and record.get("architecture_identity") == architecture_identity
+        )
+    ]
+    matching_names = {str(record.get("reviewer_name", "")) for record in matching_data}
+    filtered = dict(resume)
+    filtered["completed_reviewer_data"] = matching_data
+    filtered["completed_reviewer_names"] = [
+        str(name)
+        for name in resume.get("completed_reviewer_names", [])
+        if str(name) in matching_names
+    ]
+    return filtered
+
+
 def _fetch_pr_comments_raw(repo: str, pr: int, gh_cmd: str = "gh") -> list[str]:
     # PR conversation comments live behind `gh pr view` (not `gh issue view`,
     # which rejects PR numbers). Used for the approved-followups idempotency marker.
@@ -1789,6 +1926,7 @@ def _complete_reviewer_turn(
     approved_plan_hash: str | None = None,
     approved_plan_subject: str | None = None,
     gemini_cmd: str = "gemini",
+    architecture_identity: dict | None = None,
 ) -> dict:
     """Normalize, validate, render, parse, mint IDs, attach metadata, and post.
 
@@ -1925,6 +2063,25 @@ def _complete_reviewer_turn(
         if surfaced_requirement_ids
         else []
     )
+    architecture_identity_file = work_dir / f"{agent}-architecture-identity.json"
+    architecture_impact_file = work_dir / f"{agent}-architecture-impact.json"
+    architecture_identity_args: list[str] = []
+    if isinstance(architecture_identity, dict):
+        _write_json(architecture_identity_file, architecture_identity)
+        architecture_identity_args = [
+            "--architecture-identity-file", str(architecture_identity_file)
+        ]
+    from coding_review_agent_loop.protocol import sanitize_architecture_impact
+
+    raw_architecture_impact = sanitize_architecture_impact(
+        review_json.get("architecture_impact")
+    )
+    architecture_impact_args: list[str] = []
+    if isinstance(raw_architecture_impact, dict):
+        _write_json(architecture_impact_file, raw_architecture_impact)
+        architecture_impact_args = [
+            "--architecture-impact-file", str(architecture_impact_file)
+        ]
 
     # --- Attach metadata ---
     _run_helper(
@@ -1943,6 +2100,9 @@ def _complete_reviewer_turn(
         *usage_args,
         *approved_plan_args,
         *requirement_args,
+        *architecture_identity_args,
+        *architecture_impact_args,
+        "--architecture-contract-version", "1",
     )
 
     # --- Post ---
@@ -2094,6 +2254,11 @@ def _run_reviewer(
         raw_output=raw_output, context_file=context_file,
         prior_items_file=prior_items_file,
         approved_plan_context=approved_plan_context,
+        architecture_identity=(
+            context.get("architecture_identity")
+            if isinstance(context.get("architecture_identity"), dict) else None
+        ),
+        architecture_contract_version=1,
         gemini_cmd=gemini_cmd,
     )
 
@@ -2126,6 +2291,10 @@ def _run_reviewer(
                 else None
             ),
             gemini_cmd=gemini_cmd,
+            architecture_identity=(
+                context.get("architecture_identity")
+                if isinstance(context.get("architecture_identity"), dict) else None
+            ),
         )
     except _ValidationError as exc:
         # Distinguish an agent/CLI failure (no usable review -> skip this reviewer
@@ -2376,6 +2545,8 @@ def _save_coder_raw_to_repair_dir(
     raw_output: Path,
     usage_file: Path,
     response_evidence_file: Path | None = None,
+    architecture_identity: dict | None = None,
+    architecture_contract_version: int | None = None,
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy the coder's raw response + context to a stable repair dir.
@@ -2398,6 +2569,10 @@ def _save_coder_raw_to_repair_dir(
         "new_round_number": new_round_number, "kind": kind,
         "dry_run": dry_run, "gemini_cmd": gemini_cmd,
     }
+    if architecture_identity is not None:
+        manifest["architecture_identity"] = architecture_identity
+    if architecture_contract_version is not None:
+        manifest["architecture_contract_version"] = architecture_contract_version
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -2420,6 +2595,9 @@ def _complete_coder_turn(
     gemini_cmd: str = "gemini",
     surfaced_requirement_ids: Sequence[str] = (),
     requires_direct_discussion_ack: bool = False,
+    required_architecture_impact_contract: int = 0,
+    architecture_identity: dict | None = None,
+    architecture_contract_version: int | None = None,
 ) -> dict:
     """Validate, render, canonicalize, attach (role coder), and post a coder plan.
 
@@ -2436,6 +2614,7 @@ def _complete_coder_turn(
             text,
             kind=kind,
             prior_items=next_prior_items_raw,
+            required_architecture_impact_contract=required_architecture_impact_contract,
         )
         if kind == "plan_revision" and (
             surfaced_requirement_ids or requires_direct_discussion_ack
@@ -2466,8 +2645,9 @@ def _complete_coder_turn(
                 response_evidence=response_evidence,
                 gemini_cmd=gemini_cmd,
             )
+            validated_result = validate(raw_text)
         else:
-            validate(raw_text)
+            validated_result = validate(raw_text)
         raw_output.write_text(raw_text, encoding="utf-8")
     except (AgentLoopError, ValueError) as exc:
         raise _ValidationError(
@@ -2547,6 +2727,26 @@ def _complete_coder_turn(
             coder_usage = None
 
     tagged = work_dir / "coder-tagged.md"
+    architecture_identity_file = work_dir / "coder-architecture-identity.json"
+    architecture_impact_file = work_dir / "coder-architecture-impact.json"
+    architecture_args: list[str] = []
+    if isinstance(architecture_identity, dict):
+        _write_json(architecture_identity_file, architecture_identity)
+        architecture_args.extend(("--architecture-identity-file", str(architecture_identity_file)))
+    parsed_impact = getattr(validated_result, "architecture_impact", None)
+    from coding_review_agent_loop.protocol import sanitize_architecture_impact
+
+    sanitized_impact = sanitize_architecture_impact(parsed_impact)
+    if sanitized_impact is not None:
+        _write_json(architecture_impact_file, sanitized_impact)
+        architecture_args.extend(("--architecture-impact-file", str(architecture_impact_file)))
+    contract_version = architecture_contract_version or (
+        1 if required_architecture_impact_contract == 1 else None
+    )
+    contract_args = (
+        ("--architecture-contract-version", str(contract_version))
+        if contract_version is not None else ()
+    )
     _run_helper(
         "helpers.state_manager", "attach-metadata",
         "--body-file", str(public_file),
@@ -2561,6 +2761,8 @@ def _complete_coder_turn(
         "--prior-items-file", str(prior_file),
         *raw_structured_args,
         *usage_args,
+        *architecture_args,
+        *contract_args,
     )
 
     if not dry_run:
@@ -2646,6 +2848,7 @@ def _run_external_coder_phase(
 
         issue_config = make_minimal_config(
             repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
+            **_architecture_options(args),
         )
         human_requirements = get_issue_context(
             Runner(dry_run=False),
@@ -2653,12 +2856,23 @@ def _run_external_coder_phase(
             issue_number=issue,
         ).human_requirements
 
+    from helpers.prompt_builders import _acquire_skill_architecture, make_minimal_config
+    coder_architecture_config = make_minimal_config(
+        repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
+        **_architecture_options(args),
+    )
+    coder_architecture = _acquire_skill_architecture(
+        coder_architecture_config, workdir=workdir,
+    )
+
     if phase == "coder-round-1":
         next_prior_items_raw: list[dict] = []
         prompt_text = build_plan_prompt_for_skill(
             issue_dict, repo=repo, coder=coder,  # type: ignore[arg-type]
             reviewers=reviewers, workdir=workdir, memory=memory,  # type: ignore[arg-type]
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_context=coder_architecture,
+            architecture_options=_architecture_options(args),
         )
         kind = "plan_state"
     else:  # coder-round-next
@@ -2673,6 +2887,8 @@ def _run_external_coder_phase(
             human_requirements=human_requirements,
             memory=memory,
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_context=coder_architecture,
+            architecture_options=_architecture_options(args),
         )
         kind = "plan_revision"
 
@@ -2721,6 +2937,11 @@ def _run_external_coder_phase(
             next_prior_items_raw=next_prior_items_raw, dry_run=dry_run,
             raw_output=raw_output, usage_file=usage_file,
             response_evidence_file=evidence_file,
+            architecture_identity=(
+                coder_architecture.identity()
+                if hasattr(coder_architecture, "identity") else None
+            ),
+            architecture_contract_version=1,
             gemini_cmd=gemini_cmd,
         )
 
@@ -2741,6 +2962,12 @@ def _run_external_coder_phase(
                 gemini_cmd=gemini_cmd,
                 surfaced_requirement_ids=human_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
+                required_architecture_impact_contract=1,
+                architecture_identity=(
+                    coder_architecture.identity()
+                    if hasattr(coder_architecture, "identity") else None
+                ),
+                architecture_contract_version=1,
             )
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
@@ -2792,6 +3019,9 @@ def _write_host_review_request(
     primary_issue_context: IssueContext | None = None,
     parent_issue_context: IssueContext | None = None,
     human_requirements: Sequence[HumanReviewRequirement] = (),
+    architecture_context: object | None = None,
+    architecture_snapshot_max_chars: int = 12_000,
+    architecture_aggregate_max_chars: int = 24_000,
 ) -> Path:
     """Write a review-request dir for the host (Claude) reviewer turn.
 
@@ -2880,6 +3110,39 @@ def _write_host_review_request(
         "current_round_items": current_round_items,
         "human_requirements": _serialize_human_requirements(human_requirements),
     }
+    architecture_render_sha256: str | None = None
+    if architecture_context is not None:
+        from coding_review_agent_loop.architecture_context import (
+            ArchitecturePair,
+            ArchitectureSnapshot,
+            render_architecture_pair,
+            render_architecture_snapshot,
+        )
+
+        if isinstance(architecture_context, ArchitecturePair):
+            architecture_text = render_architecture_pair(
+                architecture_context, max_chars=architecture_aggregate_max_chars
+            )
+        elif isinstance(architecture_context, ArchitectureSnapshot):
+            architecture_text = render_architecture_snapshot(
+                architecture_context, max_chars=architecture_snapshot_max_chars
+            )
+        else:
+            raise AgentLoopError("Host review handoff received an invalid architecture context.")
+        architecture_file = request_dir / "architecture-context.md"
+        _write_text(architecture_file, architecture_text)
+        architecture_render_sha256 = hashlib.sha256(
+            architecture_text.encode("utf-8")
+        ).hexdigest()
+        context_payload["architecture_identity"] = architecture_context.identity()
+        context_payload["architecture_render_sha256"] = architecture_render_sha256
+        manifest_architecture_file = architecture_file.name
+    else:
+        try:
+            (request_dir / "architecture-context.md").unlink()
+        except FileNotFoundError:
+            pass
+        manifest_architecture_file = None
     if approved_plan_metadata is not None:
         context_payload["approved_plan"] = approved_plan_metadata
     if reconciliation_guidance_file is not None:
@@ -2928,6 +3191,11 @@ def _write_host_review_request(
         manifest["approved_plan_reconciliation_guidance_file"] = reconciliation_guidance_file
     if human_requirements_file is not None:
         manifest["human_requirements_file"] = human_requirements_file
+    if manifest_architecture_file is not None:
+        manifest["architecture_context_file"] = manifest_architecture_file
+        manifest["architecture_identity"] = context_payload["architecture_identity"]
+        manifest["architecture_render_sha256"] = architecture_render_sha256
+        manifest["architecture_contract_version"] = 1
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return request_dir
 
@@ -2974,6 +3242,71 @@ def _validate_host_review_plan_artifact(
             f"{context.diagnostic or 'unknown validation error'}. Regenerate the handoff."
         )
     return context
+
+
+def _validate_host_architecture_artifact(
+    request_dir: Path,
+    manifest: dict,
+    context: dict,
+) -> dict | None:
+    """Validate the immutable identity and exact rendered host artifact."""
+    expected_identity = manifest.get("architecture_identity")
+    artifact_name = manifest.get("architecture_context_file")
+    expected_digest = manifest.get("architecture_render_sha256")
+    if expected_identity is None and artifact_name is None:
+        return None
+    if (
+        not isinstance(expected_identity, dict)
+        or not isinstance(artifact_name, str)
+        or not isinstance(expected_digest, str)
+        or context.get("architecture_identity") != expected_identity
+        or context.get("architecture_render_sha256") != expected_digest
+    ):
+        raise AgentLoopError(
+            "Host review handoff has an incomplete architecture identity; regenerate the handoff."
+        )
+    request_root = request_dir.resolve()
+    artifact_path = (request_dir / artifact_name).resolve()
+    if request_root not in artifact_path.parents:
+        raise AgentLoopError(
+            "Host review handoff architecture artifact must remain inside its request directory."
+        )
+    try:
+        artifact_text = artifact_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AgentLoopError(
+            f"Host review handoff is missing its architecture artifact: {artifact_path}."
+        ) from exc
+    actual_digest = hashlib.sha256(artifact_text.encode("utf-8")).hexdigest()
+    if actual_digest != expected_digest:
+        raise AgentLoopError(
+            "Host review handoff architecture artifact does not match its recorded digest; "
+            "regenerate the handoff."
+        )
+    return expected_identity
+
+
+def _host_architecture_context(
+    args: argparse.Namespace,
+    *,
+    repo: str,
+    target_revision: str | None = None,
+    candidate_revision: str | None = None,
+) -> object | None:
+    """Acquire the same frozen architecture context for a host handoff."""
+    from helpers.prompt_builders import _acquire_skill_architecture, make_minimal_config
+
+    workdir = _workdir_for_agent("claude", args)
+    config = make_minimal_config(
+        repo, "claude", ("claude",), reviewer="claude", workdir=workdir,
+        **_architecture_options(args),
+    )
+    return _acquire_skill_architecture(
+        config,
+        workdir=workdir,
+        target_revision=target_revision,
+        candidate_revision=candidate_revision,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3165,6 +3498,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
             # Build prompt
             issue_dict = _fetch_issue_json(repo, issue)
             workdir = _workdir_for_agent(reviewer, args)
+            skill_architecture = None
             try:
                 from helpers.prompt_builders import build_plan_review_prompt_for_skill
                 prompt_text = build_plan_review_prompt_for_skill(
@@ -3179,6 +3513,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
                     workdir=workdir,
                     memory=memory,
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+                    architecture_options=_architecture_options(args),
                 )
             except Exception as exc:  # noqa: BLE001
                 prompt_text = (
@@ -3241,12 +3576,20 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
             next_prior_items_raw=next_prior_items_raw,
             current_round_items=current_round_items,
             item_id_offset=item_id_offset, dry_run=dry_run,
+            architecture_context=_host_architecture_context(args, repo=repo),
+            architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
+            architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
+        architecture_hint = (
+            f" Read the labeled architecture context at {request_dir}/architecture-context.md."
+            if (request_dir / "architecture-context.md").exists() else ""
+        )
         print(
             f"skill_runner: host review pending — read the plan in {request_dir}/plan.md, "
-            f"write your plan_review JSON to {request_dir}/host-review.md, then run: "
+            f"write your plan_review JSON after inspecting the requested context{architecture_hint}, "
+            f"to {request_dir}/host-review.md, then run: "
             f"python -m helpers.skill_runner complete-host-review --dir {request_dir}{dry_run_flag}",
             file=sys.stderr,
         )
@@ -3331,6 +3674,40 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
         approved_plan_context=approved_plan_context,
         human_requirements=human_requirements,
     )
+
+    # Acquire one PR-bound architecture pair before deciding which completed
+    # reviewers are reusable. A same-head retarget or availability transition
+    # must invalidate stale approvals exactly once; the resulting reviewer
+    # metadata carries this identity so the next identical resume is stable.
+    skill_architecture = None
+    if getattr(args, "architecture_context_enabled", True):
+        from helpers.prompt_builders import _acquire_skill_architecture, make_minimal_config
+
+        acquisition_agent = reviewers[0] if reviewers else "claude"
+        acquisition_workdir = _workdir_for_agent(acquisition_agent, args)
+        checkout_ready = _prepare_skill_pr_architecture_checkout(
+            args,
+            repo=repo,
+            pr=pr,
+            pr_info=pr_info,
+            agent=acquisition_agent,
+            workdir=acquisition_workdir,
+        )
+        if checkout_ready:
+            acquisition_config = make_minimal_config(
+                repo, acquisition_agent, tuple(reviewers), reviewer=acquisition_agent,
+                workdir=acquisition_workdir, **_architecture_options(args),
+            )
+            skill_architecture = _acquire_skill_architecture(
+                acquisition_config,
+                workdir=acquisition_workdir,
+                target_revision=pr_info.get("baseRefName"),
+                candidate_revision=pr_info.get("headRefOid") or head_sha,
+            )
+        if checkout_ready and hasattr(skill_architecture, "identity"):
+            resume = _filter_resume_for_architecture(
+                resume, architecture_identity=skill_architecture.identity()
+            )
 
     # Step 2 — pending-comment reconciliation
     _reconcile_pending_comment(resume, pr, repo, dry_run)
@@ -3429,6 +3806,8 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                         else None
                     ),
                     coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+                    architecture_options=_architecture_options(args),
+                    architecture_context=skill_architecture,
                 )
             except Exception as exc:  # noqa: BLE001
                 if (
@@ -3453,6 +3832,10 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
                 "prior_items": next_prior_items_raw,
                 "current_round_items": current_round_items,
                 "human_requirements": _serialize_human_requirements(human_requirements),
+                "architecture_identity": (
+                    skill_architecture.identity()
+                    if hasattr(skill_architecture, "identity") else None
+                ),
             }
 
             item_id_offset = _max_item_number([next_prior_items_raw, current_round_items])
@@ -3508,16 +3891,26 @@ def cmd_run_pr_round(args: argparse.Namespace) -> None:
             primary_issue_context=primary_issue_context,
             parent_issue_context=parent_issue_context,
             human_requirements=human_requirements,
+            # Reuse the pair acquired before resume filtering. Re-acquiring
+            # from Claude's separate workdir could observe a different head,
+            # target, or availability state than the external reviewers.
+            architecture_context=skill_architecture,
+            architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
+            architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
         )
         pending_reviewers.append("Claude")
         dry_run_flag = " --dry-run" if dry_run else ""
+        architecture_hint = (
+            f" Read the labeled architecture context at {request_dir}/architecture-context.md."
+            if (request_dir / "architecture-context.md").exists() else ""
+        )
         print(
             f"skill_runner: host review pending — read the PR-bound approved plan in "
             f"{request_dir}/approved-plan.md when present, the labeled issue context "
             f"artifacts, the approved-plan reconciliation guidance in "
             f"{request_dir}/approved-plan-reconciliation.md when present, and the "
             f"signed requirement contract in "
-            f"{request_dir}/signed-human-requirements.md when present; then read the "
+            f"{request_dir}/signed-human-requirements.md when present;{architecture_hint} Then read the "
             f"PR diff in "
             f"{request_dir}/pr-diff.diff, "
             f"write your pr_review JSON to {request_dir}/host-review.md, then run: "
@@ -3631,6 +4024,17 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                 dry_run=args.dry_run, raw_output=repair_dir / "raw.md",
                 work_dir=repair_dir, usage_file=repair_dir / "coder-usage.json",
                 gemini_cmd=gemini_cmd,
+                architecture_identity=(
+                    manifest.get("architecture_identity")
+                    if isinstance(manifest.get("architecture_identity"), dict) else None
+                ),
+                architecture_contract_version=(
+                    manifest.get("architecture_contract_version")
+                    if isinstance(manifest.get("architecture_contract_version"), int) else None
+                ),
+                required_architecture_impact_contract=(
+                    1 if manifest.get("architecture_contract_version") == 1 else 0
+                ),
             )
         except _ValidationError as exc:
             print(str(exc), file=sys.stderr)
@@ -3682,6 +4086,10 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                 else None
             ),
             gemini_cmd=gemini_cmd,
+            architecture_identity=(
+                manifest.get("architecture_identity")
+                if isinstance(manifest.get("architecture_identity"), dict) else None
+            ),
         )
     except _ValidationError as exc:
         print(str(exc), file=sys.stderr)
@@ -3738,7 +4146,11 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
     new_round_number = manifest["new_round_number"]
     dry_run          = args.dry_run
     prior_items_raw  = json.loads((request_dir / "prior_items.json").read_text(encoding="utf-8"))
+    host_context = json.loads((request_dir / "context.json").read_text(encoding="utf-8"))
     _validate_host_review_plan_artifact(request_dir, manifest)
+    host_architecture_identity = _validate_host_architecture_artifact(
+        request_dir, manifest, host_context
+    )
 
     try:
         result = _complete_reviewer_turn(
@@ -3759,6 +4171,9 @@ def cmd_complete_host_review(args: argparse.Namespace) -> None:
                 manifest.get("approved_plan_subject")
                 if isinstance(manifest.get("approved_plan_subject"), str)
                 else None
+            ),
+            architecture_identity=(
+                host_architecture_identity
             ),
         )
     except _ValidationError as exc:
@@ -3864,6 +4279,7 @@ def _implementation_config(
     base: str,
     dry_run: bool,
     coder_test_command_timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_options: dict[str, object] | None = None,
 ):
     from helpers.prompt_builders import make_minimal_config
 
@@ -3874,6 +4290,7 @@ def _implementation_config(
         make_minimal_config(
             repo, coder, (coder,), reviewer=coder, workdir=str(workdir), base=base,
             coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+            **(architecture_options or {}),
         ),  # type: ignore[arg-type]
         dry_run=dry_run,
         auto_agent_dirs=(),
@@ -3983,6 +4400,7 @@ def _run_child_or_one_shot_implementation(
     one_shot_mode: str = "implement-one-shot",
     external_args: tuple[str, ...] = (),
     coder_test_command_timeout_seconds: object = DEFAULT_TEST_TIMEOUT_SECONDS,
+    architecture_options: dict[str, object] | None = None,
 ) -> dict:
     from coding_review_agent_loop.config import sync_coder_base_before_implementation
     from coding_review_agent_loop.comment_rendering import render_public_agent_comment
@@ -4013,6 +4431,7 @@ def _run_child_or_one_shot_implementation(
         workdir=str(workdir),
         base=base,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
+        architecture_options=architecture_options,
     )
 
     if dry_run:
@@ -4166,6 +4585,7 @@ def _run_child_or_one_shot_implementation(
             "--state", "approved",
             "--raw-structured-coder-response-file", str(raw_output),
             *( ["--local-test-evidence-file", str(evidence_file)] if evidence_file.exists() else [] ),
+            "--architecture-contract-version", "1",
         )
         tagged_with_contract = tmpdir / "impl-tagged-with-contract.md"
         _write_text(
@@ -4242,6 +4662,7 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
     config = _implementation_config(
         repo=repo, coder=coder, workdir=str(workdir), base=base, dry_run=dry_run,
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_options=_architecture_options(args),
     )
     runner = Runner(dry_run=dry_run)
 
@@ -4291,6 +4712,7 @@ def cmd_run_implement(args: argparse.Namespace) -> None:
         one_shot_mode=mode,
         external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_options=_architecture_options(args),
     )
     print(json.dumps(result_json, indent=2))
     if result_json.get("pr") is None:
@@ -4388,12 +4810,17 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         validate_test_commands_within_workdir,
         validate_test_observation_citations_within_workdir,
     )
-    from helpers.prompt_builders import build_pr_fix_prompt_for_skill, make_minimal_config
+    from helpers.prompt_builders import (
+        _acquire_skill_architecture,
+        build_pr_fix_prompt_for_skill,
+        make_minimal_config,
+    )
 
     config = dataclasses.replace(
         make_minimal_config(
             repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            **_architecture_options(args),
         ),  # type: ignore[arg-type]
         dry_run=dry_run,
         auto_agent_dirs=(),
@@ -4402,6 +4829,21 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
 
     same_pr_only = all(item.get("status") == "same-pr" for item in active_items_raw)
     review_round_number = int(resume.get("round_number") or resume.get("completed_round_number") or 1)
+    if not dry_run:
+        _position_pr_fix_workdir(
+            repo=repo,
+            coder=coder,
+            workdir=workdir,
+            branch=pr_branch,
+            head_sha=current_head,
+            dry_run=False,
+        )
+    pr_fix_architecture = _acquire_skill_architecture(
+        config,
+        workdir=workdir,
+        target_revision=pr_info.get("baseRefName"),
+        candidate_revision=current_head,
+    )
     prompt_text = build_pr_fix_prompt_for_skill(
         pr,
         active_items_raw,
@@ -4421,18 +4863,18 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             else None
         ),
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_context_enabled=getattr(args, "architecture_context_enabled", True),
+        architecture_path=getattr(args, "architecture_path", "ARCHITECTURE.md"),
+        architecture_read_size=getattr(args, "architecture_read_size", 64 * 1024),
+        architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
+        architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
+        managed_context_max_chars=getattr(args, "managed_context_max_chars", 80_000),
+        architecture_context=pr_fix_architecture,
+        architecture_target_revision=pr_info.get("baseRefName"),
+        architecture_candidate_revision=current_head,
     )
 
-    if not dry_run:
-        _position_pr_fix_workdir(
-            repo=repo,
-            coder=coder,
-            workdir=workdir,
-            branch=pr_branch,
-            head_sha=current_head,
-            dry_run=False,
-        )
-    else:
+    if dry_run:
         _position_pr_fix_workdir(
             repo=repo,
             coder=coder,
@@ -4485,6 +4927,11 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             "unresolved_item_ids": [
                 str(item.get("item_id")) for item in active_items_raw if item.get("item_id")
             ],
+            "architecture_identity": (
+                pr_fix_architecture.identity()
+                if hasattr(pr_fix_architecture, "identity") else None
+            ),
+            "architecture_contract_version": 1,
         })
         if re.search(r"<!--\s*AGENT_PR\s*:", coder_output):
             raise AgentLoopError("run-pr-fix response attempted to open/report a new PR.")
@@ -4502,6 +4949,10 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             text,
             unresolved_items=unresolved_items,
             human_requirements=human_requirements,
+            # This is a fresh skill coder turn. Architecture availability is
+            # prompt material only and must not downgrade the response
+            # contract.
+            required_architecture_impact_contract=1,
         )
         try:
             coder_output, parsed = _recover_structured_response(
@@ -4574,6 +5025,21 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         _write_json(prior_items_file, [_serialize_unresolved_item(item) for item in reconciled_items])
         _write_json(compact_prior_file, list(resume.get("compact_prior_summaries", [])))
 
+        from coding_review_agent_loop.protocol import sanitize_architecture_impact
+
+        architecture_args: list[str] = []
+        if hasattr(pr_fix_architecture, "identity"):
+            architecture_identity_file = tmpdir / "pr-fix-architecture-identity.json"
+            _write_json(architecture_identity_file, pr_fix_architecture.identity())
+            architecture_args.extend(("--architecture-identity-file", str(architecture_identity_file)))
+        impact_payload = sanitize_architecture_impact(
+            getattr(parsed, "architecture_impact", None)
+        )
+        if impact_payload is not None:
+            architecture_impact_file = tmpdir / "pr-fix-architecture-impact.json"
+            _write_json(architecture_impact_file, impact_payload)
+            architecture_args.extend(("--architecture-impact-file", str(architecture_impact_file)))
+
         _run_helper(
             "helpers.state_manager", "attach-metadata",
             "--body-file", str(rendered_output),
@@ -4588,7 +5054,9 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             "--usage-file", str(usage_file),
             "--compact-prior-summaries-file", str(compact_prior_file),
             *raw_structured_arg,
+            *architecture_args,
             *( ["--local-test-evidence-file", str(evidence_file)] if evidence_file.exists() else [] ),
+            "--architecture-contract-version", "1",
         )
         if not dry_run:
             _run_helper(
@@ -4752,6 +5220,7 @@ def _run_decomposition_for_skill(
         make_minimal_config(
             repo, coder, (coder,), reviewer=coder, workdir=str(workdir),
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            **_architecture_options(args),
         ),  # type: ignore[arg-type]
         dry_run=dry_run,
         flat_child_limit=getattr(args, "flat_child_limit", DEFAULT_FLAT_CHILD_LIMIT),
@@ -4809,7 +5278,18 @@ def _run_decomposition_for_skill(
     if checkpoint is not None:
         from coding_review_agent_loop.decomposition import PlanDecomposition
 
-        decomposition = PlanDecomposition(phases=checkpoint.phases)
+        from coding_review_agent_loop.protocol import parse_architecture_impact
+
+        decomposition = PlanDecomposition(
+            phases=checkpoint.phases,
+            architecture_impact=(
+                parse_architecture_impact(
+                    checkpoint.architecture_impact,
+                    context="checkpoint.architecture_impact",
+                )
+                if checkpoint.architecture_impact is not None else None
+            ),
+        )
         topology_source = checkpoint.topology_source
         retained_parent_scope = checkpoint.retained_parent_scope
     else:
@@ -4838,6 +5318,7 @@ def _run_decomposition_for_skill(
             coder=coder,
             workdir=str(workdir),  # type: ignore[arg-type]
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_options=_architecture_options(args),
         )
 
         with tempfile.TemporaryDirectory() as tmpstr:
@@ -4870,7 +5351,9 @@ def _run_decomposition_for_skill(
                     coder_usage = None
 
             try:
-                decomposition = parse_plan_decomposition(coder_output)
+                decomposition = parse_plan_decomposition(
+                    coder_output, required_architecture_impact_contract=1
+                )
             except AgentLoopError as exc:
                 debug_dir = _REPAIR_BASE / f"{issue}-decompose-debug"
                 debug_dir.mkdir(parents=True, exist_ok=True)
@@ -5078,6 +5561,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         impl_config = _implementation_config(
             repo=repo, coder=coder, workdir=workdir, base=base, dry_run=True,
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_options=_architecture_options(args),
         )
         impl_runner = Runner(dry_run=True)
         impl_result = _run_child_or_one_shot_implementation(
@@ -5094,6 +5578,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
             post_one_shot_handoff=False,
             external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+            architecture_options=_architecture_options(args),
         )
         result_json.update({
             "state": "would-implement",
@@ -5142,6 +5627,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
     impl_config = _implementation_config(
         repo=repo, coder=coder, workdir=workdir, base=base, dry_run=False,
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_options=_architecture_options(args),
     )
     impl_runner = Runner(dry_run=False)
     child_issue_context = get_issue_context(
@@ -5163,6 +5649,7 @@ def cmd_run_implement_by_phase(args: argparse.Namespace) -> None:
         post_one_shot_handoff=False,
         external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
         coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
+        architecture_options=_architecture_options(args),
     )
     if impl_result.get("pr") is None:
         result_json.update({
@@ -5238,6 +5725,7 @@ def main() -> None:
     p_plan.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
     _add_test_timeout_option(p_plan)
+    _add_architecture_options(p_plan)
     p_plan.add_argument("--dry-run", action="store_true")
     _add_gemini_cmd_option(p_plan)
     _add_antigravity_options(p_plan)
@@ -5281,6 +5769,7 @@ def main() -> None:
     p_pr.add_argument("--refresh-agent-memory", action="store_true",
                       help="Regenerate the agent-memory cache before this round.")
     _add_test_timeout_option(p_pr)
+    _add_architecture_options(p_pr)
     p_pr.add_argument("--dry-run", action="store_true")
     _add_gemini_cmd_option(p_pr)
     _add_antigravity_options(p_pr)
@@ -5338,6 +5827,7 @@ def main() -> None:
     p_impl.add_argument("--workdir-antigravity", default=None)
     p_impl.add_argument("--dry-run", action="store_true")
     _add_test_timeout_option(p_impl)
+    _add_architecture_options(p_impl)
     _add_antigravity_options(p_impl)
 
     # run-pr-fix
@@ -5366,6 +5856,7 @@ def main() -> None:
     p_pr_fix.add_argument("--workdir-antigravity", default=None)
     p_pr_fix.add_argument("--dry-run", action="store_true")
     _add_test_timeout_option(p_pr_fix)
+    _add_architecture_options(p_pr_fix)
     _add_gemini_cmd_option(p_pr_fix)
     _add_antigravity_options(p_pr_fix)
 
@@ -5396,6 +5887,7 @@ def main() -> None:
     p_impl_phase.add_argument("--workdir-antigravity", default=None)
     p_impl_phase.add_argument("--dry-run", action="store_true")
     _add_test_timeout_option(p_impl_phase)
+    _add_architecture_options(p_impl_phase)
     p_impl_phase.add_argument(
         "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
         help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",
@@ -5422,6 +5914,7 @@ def main() -> None:
     p_decompose.add_argument("--workdir-antigravity", default=None)
     p_decompose.add_argument("--dry-run", action="store_true")
     _add_test_timeout_option(p_decompose)
+    _add_architecture_options(p_decompose)
     p_decompose.add_argument(
         "--flat-child-limit", type=int, default=DEFAULT_FLAT_CHILD_LIMIT,
         help=f"Maximum flat child issues for the parent (default: {DEFAULT_FLAT_CHILD_LIMIT}).",
@@ -5463,6 +5956,7 @@ def main() -> None:
     p_task.add_argument("--refresh-agent-memory", action="store_true",
                         help="Regenerate the agent-memory cache before this round.")
     _add_test_timeout_option(p_task)
+    _add_architecture_options(p_task)
     p_task.add_argument("--dry-run", action="store_true")
     _add_gemini_cmd_option(p_task)
     _add_antigravity_options(p_task)
