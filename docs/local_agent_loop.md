@@ -2319,9 +2319,9 @@ item ID, before evidence and the original finding:
 
 ```text
 - [item-3] RESOLVED
-  Original finding: Blocking issue from Anthropic Claude, round 1: Add coverage.
+  - Original finding: Blocking issue from Anthropic Claude, round 1: Add coverage.
 - [item-16] SAME-PR: The error diagnostic still needs correction.
-  Original finding: Same-PR follow-up from Anthropic Claude, round 2: Preserve diagnostics.
+  - Original finding: Same-PR follow-up from Anthropic Claude, round 2: Preserve diagnostics.
 ```
 
 `BLOCKING`, `SAME-PR`, and `SAME-PLAN` remain active dispositions; `RESOLVED`
