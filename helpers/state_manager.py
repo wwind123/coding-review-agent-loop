@@ -591,8 +591,20 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         from coding_review_agent_loop.comment_rendering import (
             RISK_TEST_MATRIX_MARKER_RE,
             decode_risk_test_matrix_marker,
+            render_risk_test_matrix_section,
         )
         from coding_review_agent_loop.round_transport import risk_test_matrix_section_boundary
+
+        expected_section = render_risk_test_matrix_section(
+            parsed_strategy.risk_test_matrix,
+            parsed_strategy.risk_test_matrix_changes,
+        )
+        if canonical_plan is None or expected_section not in canonical_plan:
+            print(
+                "state_manager: canonical plan risk matrix section does not match the validated structured payload",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
         if canonical_plan is None or risk_test_matrix_section_boundary(
             risk_test_matrix_identity_value

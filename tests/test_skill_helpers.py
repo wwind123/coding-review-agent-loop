@@ -406,6 +406,54 @@ class TestValidateResponse:
         assert "row-skill-resume" in prompt
         assert "Do not substitute a later plan" in prompt
 
+    def test_attach_metadata_rejects_visible_matrix_tampering_with_valid_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """Skill persistence must validate rendered matrix prose at the write boundary."""
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        raw_plan = _fresh_applicable_plan_state()
+        parsed = validate_structured_plan_state(
+            raw_plan,
+            require_execution_strategy_contract=1,
+            require_risk_test_matrix_contract=1,
+        )
+        canonical = render_canonical_plan_state(parsed)
+        tampered = canonical.replace(
+            "The same row remains enforceable",
+            "A different row is enforceable",
+            1,
+        )
+        assert tampered != canonical
+        assert "AGENT_RISK_TEST_MATRIX" in tampered
+
+        raw_path = tmp_path / "plan.json"
+        raw_path.write_text(raw_plan, encoding="utf-8")
+        body_path = tmp_path / "tampered.md"
+        body_path.write_text(tampered, encoding="utf-8")
+        output_path = tmp_path / "attached.md"
+
+        result = _run(
+            "helpers.state_manager",
+            "attach-metadata",
+            "--body-file", str(body_path),
+            "--output", str(output_path),
+            "--flow", "plan",
+            "--role", "coder",
+            "--agent", "Claude",
+            "--round-number", "1",
+            "--state", "blocking",
+            "--subject-plan-file", str(body_path),
+            "--canonical-plan-file", str(body_path),
+            "--raw-structured-coder-response-file", str(raw_path),
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "risk matrix section does not match" in result.stderr
+        assert not output_path.exists()
+
     def test_missing_plan_state_marker_rejected(self) -> None:
         path = _write_tmp(_INVALID_PLAN_STATE)
         result = _run("helpers.validate_response", "--file", path, "--kind", "plan_state", check=False)
