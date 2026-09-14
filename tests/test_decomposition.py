@@ -1655,7 +1655,7 @@ def test_issue_loop_plan_first_implement_by_phase_implements_first_agent_phase(t
     handoff_index = next(
         index for index, comment in enumerate(runner.comments) if "<!-- AGENT_PLAN_PHASE_IMPLEMENTATION:" in comment
     )
-    assert decomposition_index < implementation_index < handoff_index
+    assert decomposition_index < handoff_index < implementation_index
     claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     assert len(claude_calls) == 3
     assert "GitHub issue #99" in claude_calls[2][-1]
