@@ -6220,6 +6220,65 @@ def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rerevie
     assert "Add broader integration coverage later." in runner.comments[-1]
 
 
+def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_items(tmp_path):
+    """Same-PR dispatch must give repair the same item namespace as its prompt."""
+    malformed_coder_response = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "coder_followup",
+            "state": "approved",
+            "summary": "The visible follow-up is complete.",
+            "addressed_items": ["item-1"],
+            "remaining_items": [],
+            "human_requirements": {
+                "addressed_ids": [],
+                "checked_discussion_directly": False,
+            },
+            "human_requirement_dispositions": [],
+        }
+    )
+    repaired_coder_response = structured_coder_followup(
+        state="approved",
+        summary="The visible follow-up is complete.",
+        addressed_items=["item-1"],
+        remaining_items=[],
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                same_pr_followups=["Fix the current-PR behavior."],
+                future_followups=["Document the broader behavior in a later PR."],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="The current-PR behavior is fixed.",
+                future_followups=["Document the broader behavior in a later PR."],
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[malformed_coder_response],
+    )
+    config = make_config(
+        tmp_path,
+        approved_followups="fix-and-summarize",
+        agent_max_retries=0,
+    )
+    repair_calls = []
+
+    def fake_attempt_repair(raw, gemini_cmd, *, expected_kind=None, **kwargs):
+        repair_calls.append((expected_kind, kwargs.get("unresolved_item_ids")))
+        return repaired_coder_response
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert repair_calls == [("coder_followup", ("item-1",))]
+    followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Fix the current-PR behavior." in followup_prompt
+    assert "Document the broader behavior in a later PR." not in followup_prompt
+
+
 def test_blocking_same_pr_followup_reaches_coder_even_when_approved_followups_ignored(tmp_path):
     runner = FakeRunner(
         codex_outputs=[

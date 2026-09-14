@@ -13928,6 +13928,7 @@ def run_pr_loop(
                 other_items = [
                     item for item in unresolved_items if item.item_id != MERGE_CONFLICT_ITEM_ID
                 ]
+                coder_followup_items = select_coder_followup_items(other_items)
                 combined_review = summary_context + format_coder_followup_context(other_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
@@ -13964,6 +13965,10 @@ def run_pr_loop(
                 )
                 log(config, f"Round {round_number}: {coder_name} resolving merge conflict")
             elif same_pr_items and not blocking_items:
+                # This dispatch intentionally omits retained future work. Keep
+                # the validator and repair pass on the exact same visible
+                # classifiable item set as the same-PR prompt.
+                coder_followup_items = select_coder_followup_items(same_pr_items)
                 combined_review = stall_context + summary_context + _format_same_pr_unresolved_items(same_pr_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
@@ -13982,6 +13987,7 @@ def run_pr_loop(
                 )
                 log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
             else:
+                coder_followup_items = select_coder_followup_items(unresolved_items)
                 combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
@@ -14000,7 +14006,7 @@ def run_pr_loop(
                 )
                 log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
             repair_unresolved_item_ids = tuple(
-                item.item_id for item in select_coder_followup_items(unresolved_items)
+                item.item_id for item in coder_followup_items
             )
             # Persist the exact machine state and any consumed watcher budget
             # before invoking the coder. If the agent process is interrupted
@@ -14051,7 +14057,7 @@ def run_pr_loop(
                 prompt=followup_prompt,
                 session_id=coder_session_id,
                 marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                validate=lambda text, items=tuple(unresolved_items), human_requirements=human_requirements: _validate_coder_followup_response(
+                validate=lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements: _validate_coder_followup_response(
                     text,
                     unresolved_items=items,
                     human_requirements=human_requirements,
