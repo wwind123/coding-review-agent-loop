@@ -191,6 +191,42 @@ board, not a model's statement that CI passed. Head changes invalidate the
 proof. Automatic merge uses `--match-head-commit`; explicit managed CI can
 qualify for manual merging instead.
 
+The installed `CI` workflow is the hosted execution boundary for this
+repository's managed route. Its literal v2 and unlabeled-recovery declarations
+activate a four-event pull-request matrix: trusted same-repository managed
+draft openings may be suppressed before the label race settles,
+`synchronize`/`reopened` suppression requires the active managed label, and
+`unlabeled` always restores ordinary Python 3.12 CI. Forks, malformed or
+unavailable payloads, trust mismatches, non-drafts, and non-managed branches
+fail open. Pushes to `main` and all-empty manual dispatches remain full-suite
+paths; label-addition, readiness, and draft-conversion events are deliberately
+not subscribed to.
+
+Managed dispatch is authorized in base-workflow code. It resolves the
+configured `AGENT_LOOP_MANAGED_ACTOR` to the live identity, requires both the
+initiating and re-run actors to match, validates the live PR and current base
+workflow revision, and accepts exactly one fresh generation-scoped handoff
+record. Freshness is bounded to 15 minutes of age with a 5-minute future-skew
+allowance, and a no-status retry must be the immediate next attempt of the same
+run after its recorded terminal attempt. Only after validation does the
+exact-head job receive the target SHA;
+it verifies checkout, installs editable development dependencies, and runs the
+complete pytest suite once. An always-evaluated publisher writes the
+`final-ci/exact-head` status only for that validated SHA, correlating nonce,
+run ID, attempt, and Actions URL. Authorization failures before target
+establishment produce no status; downstream checkout/test failures cannot
+produce success.
+
+This adds no application persistence or public Python API: the handoff record,
+workflow run metadata, and terminal status remain GitHub audit records, while
+the local producer continues to own lifecycle creation and exact-head merge
+guards. The workflow's read-only validation boundary and narrowly scoped
+status-write permission are separate from the ordinary test job. Until the
+sole-maintainer rollout is completed, the queue stays on ordinary CI; the
+explicit unprotected waiver for `wwind123` is per invocation and is not a
+default change, existing-PR adoption grant, or substitute for head-guarded
+merge enforcement.
+
 Machine-owned CI failures and reviewer-owned findings are different kinds of
 obligation. Their reconciliation must preserve CI authority without preventing
 fresh qualification of an approved correction. This boundary has a known

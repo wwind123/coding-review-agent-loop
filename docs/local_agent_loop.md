@@ -1769,6 +1769,64 @@ Failing GitHub checks always block approval and can route back to the coder. Pen
 
 ### Managed exact-head CI
 
+#### Installed repository contract
+
+The checked-in workflow for `wwind123/coding-review-agent-loop` is the
+base-branch security boundary for managed CI. It declares the literal
+`AGENT_LOOP_MANAGED_CI_V2` and
+`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` capabilities and subscribes to
+exactly `opened`, `synchronize`, `reopened`, and `unlabeled` pull-request
+activities. A trusted same-repository draft on `main` with a reserved
+`agent-loop/managed-*` head may suppress the opening matrix before its label is
+visible; synchronization and reopening additionally require the active
+`agent-loop-managed` label. `unlabeled` always selects ordinary CI. Forks,
+non-drafts, wrong authors or branches, missing trust configuration, and
+malformed or unavailable event data fail open to the Python 3.12 full suite.
+No label-addition, readiness, draft-conversion, or arbitrary existing-PR
+adoption event is part of this installed route.
+
+The manual dispatch inputs are `protocol_version`, `pr_number`,
+`expected_head_sha`, and `managed_nonce`. A managed dispatch is named
+`managed-ci-v2 nonce=<managed_nonce>`; ordinary runs use the workflow name.
+All four empty inputs mean ordinary manual CI; partial inputs are rejected. The base workflow resolves
+`AGENT_LOOP_MANAGED_ACTOR` to the live authenticated identity and requires the
+initiating and re-run actors to agree. It then validates the live repository,
+open draft, trusted author, reserved branch, managed label, `main` base, exact
+head, current workflow revision, and exactly one fresh generation-scoped
+handoff record in one of the paired dispatch-requested, attached, or completed
+states. Prepared-only, duplicate, ambiguous, stale, foreign, and drifted
+records are rejected. The base runner checks `created_at` against its current
+epoch time: the record may be at most 15 minutes old and at most 5 minutes in
+the future for clock skew. A completed no-status retry is accepted only when
+it names the immediately preceding terminal attempt of the same Actions run.
+
+Validation alone exposes the expected SHA. The exact-head job checks out that
+SHA, verifies `git rev-parse HEAD`, installs `.[dev]` on Python 3.12, and runs
+`python -m pytest` once. The publisher writes `final-ci/exact-head` only for
+that validated SHA and correlates its terminal description and Actions URL to
+the managed nonce, run ID, and current attempt. It writes nothing when
+authorization fails before a target exists, and publishes failure when
+checkout or tests fail. Pushes to `main` and ordinary manual dispatch remain
+full-suite paths.
+
+For this sole-maintainer repository, install and qualify the workflow before
+using managed CI: set `AGENT_LOOP_MANAGED_ACTOR` to `wwind123`, authenticate
+`gh` as that account, run the read-only preflight, and pass
+`--managed-ci-trusted-actor wwind123 --allow-unprotected-managed-ci` on every
+applicable issue-created invocation while `main` is unprotected. The waiver is
+never implicit, does not weaken other repositories' defaults, does not enable
+existing-PR adoption, and does not replace a head-guarded merge. Keep the
+serial queue on ordinary CI until live qualification proves suppression,
+exact-head status publication, ordinary recovery, and post-merge `main` CI.
+
+For a plan-first issue implementation, the complete invocation is:
+
+```bash
+agent-loop issue <issue-number> --repo wwind123/coding-review-agent-loop \
+  --plan-first --implement-after-approval --auto-merge --managed-ci \
+  --managed-ci-trusted-actor wwind123 --allow-unprotected-managed-ci
+```
+
 #### Read-only readiness preflight and unprotected override
 
 Run this before starting agents or creating a PR:

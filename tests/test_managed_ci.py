@@ -68,7 +68,7 @@ from coding_review_agent_loop.runner import CommandResult
 from coding_review_agent_loop.cli import build_parser
 from coding_review_agent_loop.config import resolve_base_branch
 
-from fixtures.managed_ci import current_router, historical_router
+from fixtures.managed_ci import current_router, historical_router, local_router
 
 from agent_loop_helpers import FakeRunner, make_config
 
@@ -532,6 +532,7 @@ def test_override_activation_requires_the_preflight_nonce_and_releases_label_on_
     assert contract is not None
     assert contract.audit_nonce == nonce
     assert contract.audit_comment_id == 17
+    assert contract.intent_generation
     assert any(UNPROTECTED_OVERRIDE_TRAILER in " ".join(command) for command, _ in runner.commands)
 
     mismatch = V2ManagedRunner(
@@ -2830,7 +2831,10 @@ def test_v2_emitted_lifecycle_records_are_accepted_by_pinned_consumers(tmp_path)
     revision = "a" * 40
     expected_head = "b" * 40
     runner = V2ManagedRunner()
-    contract = v2_contract(workflow_revision=revision)
+    contract = v2_contract(
+        workflow_revision=revision,
+        intent_generation="auto-merge-generation",
+    )
 
     _ensure_v2_intent(
         runner, config=config, pr_number=7, expected_head_sha=expected_head, contract=contract
@@ -2848,18 +2852,22 @@ def test_v2_emitted_lifecycle_records_are_accepted_by_pinned_consumers(tmp_path)
         "base": {"ref": "main"}, "head": {
             "sha": expected_head, "ref": "agent-loop/managed-7",
             "repo": {"full_name": "OWNER/REPO"},
-        }, "user": {"login": "agent-loop"},
+        }, "user": {"login": "agent-loop", "id": 7},
         "labels": [{"name": MANAGED_LABEL}],
     }
     for snapshot in runner.intent_snapshots:
         pages = [[{
-            "user": {"login": "agent-loop"},
+            "user": {"login": "agent-loop", "id": 7},
             "body": f"<!-- AGENT_MANAGED_CI_INTENT_V2 {json.dumps(snapshot, separators=(',', ':'))} -->",
         }]]
         if snapshot["state"] == "prepared":
             with pytest.raises(ValueError, match="exactly one distinct qualifying intent"):
                 historical_router.validate(
                     pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision
+                )
+            with pytest.raises(ValueError, match="prepared intent"):
+                local_router.validate(
+                    pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision, 7
                 )
             with pytest.raises(ValueError, match="exactly one distinct qualifying intent"):
                 current_router.validate(
@@ -2871,6 +2879,9 @@ def test_v2_emitted_lifecycle_records_are_accepted_by_pinned_consumers(tmp_path)
             )
             current_router.validate(
                 pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision
+            )
+            local_router.validate(
+                pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision, 7
             )
 
 

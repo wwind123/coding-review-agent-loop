@@ -2111,7 +2111,10 @@ def _activate_v2_managed_ci(
             audit_id = None
     workflow_revision = _api_json(runner, config, f"repos/{config.repo}/commits/{base_ref}", quiet=True)
     revision = workflow_revision.get("sha") if isinstance(workflow_revision.get("sha"), str) else None
-    generation = secrets.token_urlsafe(16) if (managed_resume is not None or config.managed_ci) else None
+    # Every v2 activation is generation-scoped.  ``auto_merge`` is an implicit
+    # managed-CI request, so it must mint the same producer field as explicit
+    # ``--managed-ci`` and resume paths.
+    generation = secrets.token_urlsafe(16)
     log(
         config,
         f"PR #{pr_number}: selected managed resume (fresh generation)"
