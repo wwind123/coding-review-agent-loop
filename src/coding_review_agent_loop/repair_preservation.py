@@ -347,6 +347,36 @@ def validate_repair_preservation(
             "execution_recommendation",
         )
 
+    if source["kind"] in {"plan_state", "plan_revision"} and (
+        "risk_test_matrix_contract_version" in source
+        or "risk_test_matrix" in source
+        or "risk_test_matrix_changes" in source
+    ):
+        for field in (
+            "risk_test_matrix_contract_version",
+            "risk_test_matrix",
+            "risk_test_matrix_changes",
+        ):
+            require(field in target, field)
+
+        def preserve_matrix_value(source_value: object, target_value: object, field: str) -> None:
+            if isinstance(source_value, str):
+                require(isinstance(target_value, str) and _normalized(source_value) == _normalized(target_value), field)
+            elif isinstance(source_value, list):
+                require(isinstance(target_value, list) and len(source_value) == len(target_value), field)
+                for index, (source_item, target_item) in enumerate(zip(source_value, target_value)):
+                    preserve_matrix_value(source_item, target_item, f"{field}[{index}]")
+            elif isinstance(source_value, dict):
+                require(isinstance(target_value, dict) and set(source_value) == set(target_value), field)
+                for key, child in source_value.items():
+                    preserve_matrix_value(child, target_value[key], f"{field}.{key}")
+            else:
+                require(type(source_value) is type(target_value) and source_value == target_value, field)
+
+        preserve_matrix_value(source.get("risk_test_matrix_contract_version"), target.get("risk_test_matrix_contract_version"), "risk_test_matrix_contract_version")
+        preserve_matrix_value(source.get("risk_test_matrix"), target.get("risk_test_matrix"), "risk_test_matrix")
+        preserve_matrix_value(source.get("risk_test_matrix_changes"), target.get("risk_test_matrix_changes"), "risk_test_matrix_changes")
+
     summary = source.get("summary")
     summary_fragments = _fragments(summary)
     if isinstance(summary, str) and summary_fragments:
@@ -386,6 +416,11 @@ def validate_repair_preservation(
             for entry in source_observations:
                 if isinstance(entry, dict):
                     require(entry in target_observations, "test_observations")
+        if "risk_test_matrix_evidence" in source:
+            require(
+                target.get("risk_test_matrix_evidence") == source.get("risk_test_matrix_evidence"),
+                "risk_test_matrix_evidence",
+            )
 
     if source["kind"] == "coder_followup":
         allowed_item_ids = (

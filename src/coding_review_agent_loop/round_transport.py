@@ -42,6 +42,8 @@ _SPILL_FIELDS = (
     "raw_synthesis_response",
     "local_test_evidence",
     "execution_recommendation",
+    "risk_test_matrix_payload",
+    "risk_test_matrix_changes_payload",
 )
 _MAX_COMPRESSED = 8_000_000
 _MAX_DECOMPRESSED = 16_000_000
@@ -52,6 +54,18 @@ def execution_recommendation_section_boundary(encoded: str) -> str:
     """Return the renderer-owned boundary for one recommendation marker."""
     digest = hashlib.sha256(encoded.encode("ascii")).hexdigest()
     return f"<!-- execution-recommendation-section: {digest} -->"
+
+
+def risk_test_matrix_section_boundary(identity: str) -> str:
+    """Return a boundary bound to the authenticated structured matrix identity.
+
+    This marker authenticates which structured payload owns the rendered
+    section. Recovery checks the identity only; it never requires historical
+    Markdown to be byte-stable across renderer versions.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", identity):
+        raise AgentLoopError("Risk matrix section boundary requires a SHA-256 identity.")
+    return f"<!-- risk-test-matrix-section: {identity} -->"
 
 
 def _b64(data: bytes) -> str:

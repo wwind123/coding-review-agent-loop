@@ -65,7 +65,7 @@ Source paths below are relative to
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; perform bounded format repair and reject content-loss or semantic rewrites. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head. |
-| Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py` | Reconstruct rounds, spill oversized metadata into sidecars, and render readable comments. |
+| Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. |
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
@@ -115,6 +115,20 @@ Planning, implementation, reviewer, and repair invocations have separately
 resolved model/effort settings. An implementation override must not implicitly
 change the reviewer or repair backend. Issue creation and PR resume converge
 on the shared PR loop after provenance validation.
+
+Stateful or multi-mode planning can add a generation-1 risk-based mode and
+transition matrix. The matrix is a bounded structured contract with explicit
+applicability, meaningful combinations, exclusions, stable matrix-local row IDs,
+and execution ownership. Draft changes are auditable before approval; the
+approved payload is immutable until a newly reviewed substantive replan. Round
+metadata and its existing sidecar authenticate canonical structured bytes and a
+payload-bound section boundary independently of rendered markdown. Prompts,
+repair, skill mode, and PR resume consume the semantic payload first. Renderer
+drift therefore does not invalidate authentic history; malformed, oversized, or
+matrix-only hydration/rendering data closes only the matrix channel and leaves
+an independently valid plan hash/subject available. Legacy records remain
+resumable without fabricated obligations, and implementation evidence preserves
+row-level incomplete and test-receipt caveats.
 
 Decomposition into child phases and materialization of split proposals are
 distinct workflows, with typed topology and durable checkpoints. They are not

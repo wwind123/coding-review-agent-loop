@@ -38,6 +38,12 @@ from .protocol import (
     StructuredIssueImplementation,
     StructuredPlanState,
     StructuredPlanRevision,
+    RiskTestMatrix,
+    RiskTestMatrixChange,
+    RiskTestMatrixEvidence,
+    parse_risk_test_matrix,
+    parse_risk_test_matrix_changes,
+    risk_test_matrix_identity,
     ExecutionStrategyRecommendation,
     EXECUTION_TOPOLOGY_SOURCE,
     UnresolvedReviewItem,
@@ -48,6 +54,7 @@ from .protocol_markers import sanitize_historical_text
 from .round_transport import (
     MAX_GITHUB_BODY_CHARS,
     execution_recommendation_section_boundary,
+    risk_test_matrix_section_boundary,
 )
 from .test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
@@ -391,6 +398,106 @@ def _append_before_trailing_metadata(body: str, section: str) -> str:
 
 def render_canonical_plan_steps(plan_steps: Sequence[str]) -> str:
     return "\n".join(f"{index}. {step}" for index, step in enumerate(plan_steps, start=1))
+
+
+RISK_TEST_MATRIX_MARKER = "AGENT_RISK_TEST_MATRIX"
+RISK_TEST_MATRIX_MARKER_RE = re.compile(
+    rf"<!--\s*{RISK_TEST_MATRIX_MARKER}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.IGNORECASE,
+)
+
+
+def render_risk_test_matrix_section(
+    matrix: RiskTestMatrix,
+    changes: Sequence[RiskTestMatrixChange] = (),
+) -> str:
+    """Render the matrix projection from validated semantics only."""
+    parsed = parse_risk_test_matrix(matrix)
+    identity = risk_test_matrix_identity(parsed, changes)
+    payload = {
+        "contract_version": 1,
+        "matrix": parsed.to_payload(),
+        "changes": [change.to_payload() for change in changes],
+        "identity": identity,
+    }
+    encoded = _encode_json_payload(payload)
+    lines = [
+        risk_test_matrix_section_boundary(identity),
+        "### Risk-based mode and transition test matrix",
+    ]
+    if parsed.applicability == "not-applicable":
+        lines.append(f"- **Applicability:** not applicable — {sanitize_historical_text(parsed.not_applicable_rationale or '')}")
+    else:
+        lines.extend([
+            "- **Applicability:** applicable",
+            "",
+            "| ID | Scenario | Entry path / mode | Initial state | Event | Expected outcome | Forbidden side effects | Proposed test | Owner |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ])
+        for row in parsed.rows:
+            def cell(value: str) -> str:
+                return sanitize_historical_text(value).replace("|", "\\|").replace("\n", " ")
+            forbidden = "; ".join(row.forbidden_side_effects) or "None"
+            proposed = f"{row.proposed_test_level} / {row.proposed_test_location}"
+            lines.append(
+                "| " + " | ".join([
+                    f"`{cell(row.row_id)}`", cell(row.label), cell(row.entry_path_or_mode),
+                    cell(row.initial_state), cell(row.event), cell(row.expected_outcome),
+                    cell(forbidden), cell(proposed), f"`{cell(row.execution_owner)}`",
+                ]) + " |"
+            )
+    if parsed.important_exclusions:
+        lines.extend(["", "**Important exclusions:**", *[f"- {sanitize_historical_text(item)}" for item in parsed.important_exclusions]])
+    if changes:
+        lines.extend(["", "#### Matrix draft change audit"])
+        lines.extend(
+            f"- `{sanitize_historical_text(change.operation)}` `{', '.join(sanitize_historical_text(item) for item in change.row_ids)}` — {sanitize_historical_text(change.rationale)}"
+            for change in changes
+        )
+    lines.append(f"<!-- {RISK_TEST_MATRIX_MARKER}: {encoded} -->")
+    return "\n".join(lines)
+
+
+def decode_risk_test_matrix_marker(encoded: str) -> dict[str, object]:
+    payload = _decode_json_payload(encoded, marker_name=RISK_TEST_MATRIX_MARKER)
+    if _encode_json_payload(payload) != encoded or set(payload) != {"contract_version", "matrix", "changes", "identity"}:
+        raise AgentLoopError(f"Invalid {RISK_TEST_MATRIX_MARKER} payload.")
+    if payload["contract_version"] != 1:
+        raise AgentLoopError(f"Unsupported {RISK_TEST_MATRIX_MARKER} contract version.")
+    matrix = parse_risk_test_matrix(payload["matrix"])
+    changes = parse_risk_test_matrix_changes(payload["changes"])
+    identity = risk_test_matrix_identity(matrix, changes)
+    if payload["identity"] != identity:
+        raise AgentLoopError(f"Invalid {RISK_TEST_MATRIX_MARKER} identity.")
+    return payload
+
+
+def _render_risk_test_matrix_evidence(
+    evidence: RiskTestMatrixEvidence | None,
+) -> str | None:
+    if evidence is None:
+        return None
+    safe = lambda value: sanitize_historical_text(str(value))
+    rows = sorted(evidence.rows, key=lambda row: (row.status == "verified", row.row_id))
+    lines = [
+        "### Risk-based mode and transition test matrix evidence",
+        f"- Matrix identity: `{safe(evidence.matrix_identity)}`",
+    ]
+    for row in rows:
+        lines.append(f"- **{safe(row.row_id)}** — `{safe(row.status)}`")
+        lines.append(f"  - Tests: {', '.join(safe(item) for item in row.test_identifiers) or 'none'}")
+        lines.append(f"  - Locations: {', '.join(safe(item) for item in row.test_locations) or 'none'}")
+        lines.append(f"  - Workflow path: {safe(row.workflow_path_claim)}")
+        lines.append(f"  - Expected outcome assertions: {'; '.join(safe(item) for item in row.outcome_assertions) or 'none'}")
+        lines.append(f"  - Forbidden-effect assertions: {'; '.join(safe(item) for item in row.forbidden_effect_assertions) or 'none'}")
+        if row.evidence_citations:
+            lines.append("  - Evidence citations: " + "; ".join(
+                f"{safe(citation.command)} [{safe(citation.receipt_id)}; {safe(citation.claim)}]"
+                for citation in row.evidence_citations
+            ))
+        if row.caveats:
+            lines.append("  - Caveats: " + "; ".join(safe(item) for item in row.caveats))
+    return "\n".join(lines)
 
 
 def render_expected_closing_issue_declaration(
@@ -777,6 +884,8 @@ def render_canonical_plan_revision(
             ]
         )
     )
+    if parsed_revision.risk_test_matrix is not None:
+        sections.append(render_risk_test_matrix_section(parsed_revision.risk_test_matrix, parsed_revision.risk_test_matrix_changes))
     expected_section = render_expected_closing_issue_declaration(
         parsed_revision.additional_closing_issue_ids
     )
@@ -802,6 +911,8 @@ def render_canonical_plan_state(
 ) -> str:
     """Render a first-round plan using the same canonical rules as revisions."""
     sections = [parsed_plan.summary.strip(), "### Plan steps", render_canonical_plan_steps(parsed_plan.plan_steps)]
+    if parsed_plan.risk_test_matrix is not None:
+        sections.append(render_risk_test_matrix_section(parsed_plan.risk_test_matrix, parsed_plan.risk_test_matrix_changes))
     expected_section = render_expected_closing_issue_declaration(parsed_plan.additional_closing_issue_ids)
     if expected_section:
         sections.append(expected_section)
@@ -1061,6 +1172,9 @@ def _render_public_coder_followup_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
+    matrix_evidence = _render_risk_test_matrix_evidence(parsed_followup.risk_test_matrix_evidence)
+    if matrix_evidence:
+        sections.append(matrix_evidence)
     if parsed_followup.human_requirement_dispositions:
         sections.append(
             "\n".join(
@@ -1119,6 +1233,9 @@ def _render_public_issue_implementation_comment(
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
         ))
+    matrix_evidence = _render_risk_test_matrix_evidence(parsed.risk_test_matrix_evidence)
+    if matrix_evidence:
+        sections.append(matrix_evidence)
     human_section = render_human_requirement_dispositions(
         parsed.human_requirement_dispositions
     )
@@ -1178,6 +1295,8 @@ def _render_public_plan_state_comment(
         parsed_plan.summary.strip(),
         "\n".join(["### Plan steps", render_canonical_plan_steps(parsed_plan.plan_steps)]),
     ]
+    if parsed_plan.risk_test_matrix is not None:
+        sections.append(render_risk_test_matrix_section(parsed_plan.risk_test_matrix, parsed_plan.risk_test_matrix_changes))
     expected_section = render_expected_closing_issue_declaration(
         parsed_plan.additional_closing_issue_ids
     )

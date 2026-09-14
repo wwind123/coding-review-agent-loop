@@ -98,6 +98,9 @@ def validate_response_text(
     human_requirements: list[object] | tuple[object, ...] = (),
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
+    require_risk_test_matrix_contract: int = 0,
+    delivered_risk_test_matrix: object = None,
+    delivered_risk_test_matrix_identity: str | None = None,
 ) -> object:
     """Validate response text with the same context used by the helper CLI.
 
@@ -144,6 +147,7 @@ def validate_response_text(
             text,
             required_architecture_impact_contract=required_architecture_impact_contract,
             require_execution_strategy_contract=require_execution_strategy_contract,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         )
         if parsed is None:
             if required_architecture_impact_contract == 1:
@@ -185,6 +189,9 @@ def validate_response_text(
             unresolved_items=deserialized_prior,
             human_requirements=deserialized_requirements or None,
             required_architecture_impact_contract=required_architecture_impact_contract,
+            delivered_risk_test_matrix=delivered_risk_test_matrix,
+            delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
+            required_risk_test_matrix_contract=require_risk_test_matrix_contract,
         )
     if kind == "issue_implementation":
         from coding_review_agent_loop.orchestrator import _validate_issue_implementation_response
@@ -193,12 +200,16 @@ def validate_response_text(
             text,
             human_requirements=deserialized_requirements,
             require_architecture_impact=(required_architecture_impact_contract == 1),
+            delivered_risk_test_matrix=delivered_risk_test_matrix,
+            delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
+            require_risk_test_matrix_contract=(require_risk_test_matrix_contract == 1),
         )
 
     parsed = validate_structured_plan_revision(
         text,
         required_architecture_impact_contract=required_architecture_impact_contract,
         require_execution_strategy_contract=require_execution_strategy_contract,
+        require_risk_test_matrix_contract=require_risk_test_matrix_contract,
     )
     if parsed is None:
         raise AgentLoopError("Response did not parse as a structured plan_revision.")
@@ -238,6 +249,11 @@ def main() -> None:
         action="store_true",
         help="Require the fresh generation-1 planning execution recommendation.",
     )
+    parser.add_argument(
+        "--require-risk-test-matrix-contract",
+        action="store_true",
+        help="Require the fresh generation-1 risk matrix planning contract.",
+    )
     args = parser.parse_args()
 
     try:
@@ -265,6 +281,11 @@ def main() -> None:
             require_execution_strategy_contract=(
                 1 if args.require_execution_strategy_contract else 0
             ),
+            require_risk_test_matrix_contract=(
+                1 if args.require_risk_test_matrix_contract else 0
+            ),
+            delivered_risk_test_matrix=ctx.get("risk_test_matrix"),
+            delivered_risk_test_matrix_identity=ctx.get("risk_test_matrix_identity"),
         )
     except AgentLoopError as exc:
         print(f"validation failed: {kind}: {exc}", file=sys.stderr)

@@ -760,11 +760,17 @@ def _validate_coder_followup_response(
     unresolved_items: Sequence[UnresolvedReviewItem],
     human_requirements,
     required_architecture_impact_contract: int = 0,
+    delivered_risk_test_matrix=None,
+    delivered_risk_test_matrix_identity: str | None = None,
+    required_risk_test_matrix_contract: int = 0,
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
         text,
         required_architecture_impact_contract=required_architecture_impact_contract,
+        delivered_risk_test_matrix=delivered_risk_test_matrix,
+        delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
+        required_risk_test_matrix_contract=required_risk_test_matrix_contract,
     )
     if structured_followup is not None:
         _validate_structured_coder_followup_items(

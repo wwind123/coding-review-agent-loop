@@ -278,6 +278,11 @@ full supporting text, every test needs its original status/caveat, and every ID
 must stay in its correct ledger. Do not silently fill gaps with invented facts.
 Specifically compare `architecture_impact` recursively when present: repairing
 a finding's quoted protocol syntax does not authorize dropping this assessment.
+When the source contains `risk_test_matrix_contract_version`,
+`risk_test_matrix`, `risk_test_matrix_changes`, or `risk_test_matrix_evidence`,
+preserve those complete structured fields exactly. Do not drop rows, reorder
+them into another identity, weaken expectations, fabricate evidence, or replace
+an incomplete/failed/timed-out/stale status with a passing claim.
 
 ## APPROVED-PLAN RECONCILIATION (coder follow-ups):
 

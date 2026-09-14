@@ -487,6 +487,7 @@ class StructuredCoderFollowup:
     human_requirement_dispositions: tuple[HumanRequirementDisposition, ...] = ()
     test_observations: tuple[TestObservationCitation, ...] = ()
     architecture_impact: ArchitectureImpact | None = None
+    risk_test_matrix_evidence: "RiskTestMatrixEvidence | None" = None
 
 
 @dataclass(frozen=True)
@@ -503,6 +504,7 @@ class StructuredIssueImplementation:
     tests_run: tuple[str, ...] | None = None
     test_observations: tuple[TestObservationCitation, ...] = ()
     architecture_impact: ArchitectureImpact | None = None
+    risk_test_matrix_evidence: "RiskTestMatrixEvidence | None" = None
 
 
 @dataclass(frozen=True)
@@ -727,6 +729,9 @@ class StructuredPlanRevision:
     architecture_impact: ArchitectureImpact | None = None
     execution_strategy_contract_version: int | None = None
     execution_recommendation: ExecutionStrategyRecommendation | None = None
+    risk_test_matrix_contract_version: int | None = None
+    risk_test_matrix: "RiskTestMatrix | None" = None
+    risk_test_matrix_changes: tuple["RiskTestMatrixChange", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -745,6 +750,446 @@ class StructuredPlanState:
     architecture_impact: ArchitectureImpact | None = None
     execution_strategy_contract_version: int | None = None
     execution_recommendation: ExecutionStrategyRecommendation | None = None
+    risk_test_matrix_contract_version: int | None = None
+    risk_test_matrix: "RiskTestMatrix | None" = None
+    risk_test_matrix_changes: tuple["RiskTestMatrixChange", ...] = ()
+
+
+# The matrix is deliberately a structured, generation-gated contract.  It is
+# not a reviewer finding ledger: row IDs live in their own namespace and are
+# never accepted as carried review-item IDs.
+RISK_TEST_MATRIX_CONTRACT_VERSION = 1
+RISK_MATRIX_MAX_ROWS = 24
+RISK_MATRIX_MAX_EXCLUSIONS = 16
+RISK_MATRIX_MAX_CHANGES = 32
+RISK_MATRIX_MAX_LIST_ITEMS = 12
+RISK_MATRIX_MAX_FIELD_BYTES = 1_024
+RISK_MATRIX_MAX_PAYLOAD_BYTES = 96_000
+RISK_MATRIX_APPLICABILITY = frozenset({"applicable", "not-applicable"})
+RISK_MATRIX_CHANGE_OPERATIONS = frozenset({"add", "change", "retire", "split", "merge"})
+RISK_MATRIX_OWNER_NAMES = frozenset({"one-shot", "retained-parent", "final-integration"})
+RISK_MATRIX_EVIDENCE_STATUSES = frozenset(
+    {
+        "verified", "missing", "not-run", "blocked", "failed", "timed-out",
+        "stale/unverified", "incomplete",
+    }
+)
+_RISK_ROW_ID_RE = re.compile(r"^(?!.*(?:^|[-_.])(item|finding|review|blocker)[-_.]?\d)(?!hr-)[A-Za-z0-9][A-Za-z0-9._-]*$")
+_RISK_OWNER_STAGE_RE = re.compile(r"^(?:stage|child)[-_.][A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _risk_bounded_string(value: object, *, context: str, max_bytes: int = RISK_MATRIX_MAX_FIELD_BYTES) -> str:
+    rendered = _expect_non_empty_string(value, context=context)
+    if len(rendered.encode("utf-8")) > max_bytes:
+        raise AgentLoopError(f"{context} exceeds the {max_bytes}-byte bound.")
+    return rendered
+
+
+def _risk_bounded_string_list(value: object, *, context: str, max_items: int = RISK_MATRIX_MAX_LIST_ITEMS) -> tuple[str, ...]:
+    rendered = _expect_string_list(value, context=context, item_context=context)
+    if len(rendered) > max_items:
+        raise AgentLoopError(f"{context} exceeds the {max_items}-item bound.")
+    for index, item in enumerate(rendered):
+        if len(item.encode("utf-8")) > RISK_MATRIX_MAX_FIELD_BYTES:
+            raise AgentLoopError(f"{context}[{index}] exceeds the {RISK_MATRIX_MAX_FIELD_BYTES}-byte bound.")
+    return rendered
+
+
+@dataclass(frozen=True)
+class RiskTestMatrixRow:
+    row_id: str
+    label: str
+    entry_path_or_mode: str
+    initial_state: str
+    event: str
+    expected_outcome: str
+    forbidden_side_effects: tuple[str, ...]
+    proposed_test_level: str
+    proposed_test_location: str
+    applicability: str
+    related_scope_item_ids: tuple[str, ...]
+    execution_owner: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "row_id": sanitize_historical_text(self.row_id),
+            "label": sanitize_historical_text(self.label),
+            "entry_path_or_mode": sanitize_historical_text(self.entry_path_or_mode),
+            "initial_state": sanitize_historical_text(self.initial_state),
+            "event": sanitize_historical_text(self.event),
+            "expected_outcome": sanitize_historical_text(self.expected_outcome),
+            "forbidden_side_effects": [sanitize_historical_text(item) for item in self.forbidden_side_effects],
+            "proposed_test_level": sanitize_historical_text(self.proposed_test_level),
+            "proposed_test_location": sanitize_historical_text(self.proposed_test_location),
+            "applicability": sanitize_historical_text(self.applicability),
+            "related_scope_item_ids": [sanitize_historical_text(item) for item in self.related_scope_item_ids],
+            "execution_owner": sanitize_historical_text(self.execution_owner),
+        }
+
+
+@dataclass(frozen=True)
+class RiskTestMatrix:
+    applicability: str
+    rows: tuple[RiskTestMatrixRow, ...] = ()
+    important_exclusions: tuple[str, ...] = ()
+    not_applicable_rationale: str | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "applicability": self.applicability,
+            "rows": [row.to_payload() for row in self.rows],
+            "important_exclusions": [sanitize_historical_text(item) for item in self.important_exclusions],
+        }
+        if self.not_applicable_rationale is not None:
+            payload["not_applicable_rationale"] = sanitize_historical_text(self.not_applicable_rationale)
+        return payload
+
+    @property
+    def is_applicable(self) -> bool:
+        return self.applicability == "applicable"
+
+
+@dataclass(frozen=True)
+class RiskTestMatrixChange:
+    operation: str
+    row_ids: tuple[str, ...]
+    rationale: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "operation": self.operation,
+            "row_ids": list(self.row_ids),
+            "rationale": sanitize_historical_text(self.rationale),
+        }
+
+
+def _validate_risk_row_id(value: object, *, context: str) -> str:
+    row_id = _risk_bounded_string(value, context=context, max_bytes=128)
+    if not _RISK_ROW_ID_RE.fullmatch(row_id):
+        raise AgentLoopError(
+            f"{context} must be a matrix-specific identifier and may not resemble a reviewer finding ID."
+        )
+    return row_id
+
+
+def _validate_risk_owner(value: object, *, context: str) -> str:
+    owner = _risk_bounded_string(value, context=context, max_bytes=128)
+    if owner not in RISK_MATRIX_OWNER_NAMES and not _RISK_OWNER_STAGE_RE.fullmatch(owner):
+        raise AgentLoopError(
+            f"{context} must be one of one-shot, retained-parent, final-integration, or a reviewed stage ID."
+        )
+    return owner
+
+
+def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix") -> RiskTestMatrix:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(
+        payload,
+        context=context,
+        required={"applicability", "rows", "important_exclusions"},
+        optional={"not_applicable_rationale"},
+    )
+    applicability = _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64)
+    if applicability not in RISK_MATRIX_APPLICABILITY:
+        raise AgentLoopError(f"{context}.applicability must be `applicable` or `not-applicable`.")
+    rows_payload = payload["rows"]
+    if not isinstance(rows_payload, list):
+        raise AgentLoopError(f"{context}.rows must be a JSON array.")
+    if len(rows_payload) > RISK_MATRIX_MAX_ROWS:
+        raise AgentLoopError(f"{context}.rows exceeds the {RISK_MATRIX_MAX_ROWS}-row bound; consolidate scenarios explicitly.")
+    rows: list[RiskTestMatrixRow] = []
+    seen: set[str] = set()
+    for index, raw_row in enumerate(rows_payload):
+        row_context = f"{context}.rows[{index}]"
+        row = _expect_object(raw_row, context=row_context)
+        _expect_exact_keys(
+            row,
+            context=row_context,
+            required={
+                "row_id", "label", "entry_path_or_mode", "initial_state", "event",
+                "expected_outcome", "forbidden_side_effects", "proposed_test_level",
+                "proposed_test_location", "applicability", "related_scope_item_ids",
+                "execution_owner",
+            },
+        )
+        row_id = _validate_risk_row_id(row["row_id"], context=f"{row_context}.row_id")
+        if row_id in seen:
+            raise AgentLoopError(f"{context} contains duplicate row ID `{row_id}`.")
+        seen.add(row_id)
+        row_applicability = _risk_bounded_string(row["applicability"], context=f"{row_context}.applicability", max_bytes=64)
+        if row_applicability not in {"applicable", "required", "not-applicable"}:
+            raise AgentLoopError(f"{row_context}.applicability is invalid.")
+        rows.append(
+            RiskTestMatrixRow(
+                row_id=row_id,
+                label=_risk_bounded_string(row["label"], context=f"{row_context}.label"),
+                entry_path_or_mode=_risk_bounded_string(row["entry_path_or_mode"], context=f"{row_context}.entry_path_or_mode"),
+                initial_state=_risk_bounded_string(row["initial_state"], context=f"{row_context}.initial_state"),
+                event=_risk_bounded_string(row["event"], context=f"{row_context}.event"),
+                expected_outcome=_risk_bounded_string(row["expected_outcome"], context=f"{row_context}.expected_outcome"),
+                forbidden_side_effects=_risk_bounded_string_list(row["forbidden_side_effects"], context=f"{row_context}.forbidden_side_effects"),
+                proposed_test_level=_risk_bounded_string(row["proposed_test_level"], context=f"{row_context}.proposed_test_level"),
+                proposed_test_location=_risk_bounded_string(row["proposed_test_location"], context=f"{row_context}.proposed_test_location"),
+                applicability=row_applicability,
+                related_scope_item_ids=_risk_bounded_string_list(row["related_scope_item_ids"], context=f"{row_context}.related_scope_item_ids"),
+                execution_owner=_validate_risk_owner(row["execution_owner"], context=f"{row_context}.execution_owner"),
+            )
+        )
+    exclusions = _risk_bounded_string_list(
+        payload["important_exclusions"], context=f"{context}.important_exclusions", max_items=RISK_MATRIX_MAX_EXCLUSIONS
+    )
+    rationale_value = payload.get("not_applicable_rationale")
+    rationale = None if rationale_value is None else _risk_bounded_string(
+        rationale_value, context=f"{context}.not_applicable_rationale", max_bytes=2_048
+    )
+    if applicability == "not-applicable":
+        if rows:
+            raise AgentLoopError(f"{context} not-applicable matrices must contain no rows.")
+        if not rationale:
+            raise AgentLoopError(f"{context} not-applicable matrices require a non-empty rationale.")
+    elif not rows:
+        raise AgentLoopError(f"{context} applicable matrices require at least one row.")
+    return RiskTestMatrix(
+        applicability=applicability,
+        rows=tuple(rows),
+        important_exclusions=exclusions,
+        not_applicable_rationale=rationale,
+    )
+
+
+def parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix") -> RiskTestMatrix:
+    """Validate the bounded generation-1 matrix payload."""
+    if isinstance(value, RiskTestMatrix):
+        matrix = value
+        encoded = json.dumps(matrix.to_payload(), separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")
+        if len(encoded) > RISK_MATRIX_MAX_PAYLOAD_BYTES:
+            raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_PAYLOAD_BYTES}-byte payload bound.")
+        return matrix
+    matrix = _parse_risk_test_matrix(value, context=context)
+    encoded = json.dumps(matrix.to_payload(), separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")
+    if len(encoded) > RISK_MATRIX_MAX_PAYLOAD_BYTES:
+        raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_PAYLOAD_BYTES}-byte payload bound.")
+    return matrix
+
+
+def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_matrix_changes") -> tuple[RiskTestMatrixChange, ...]:
+    if isinstance(value, dict):
+        _expect_exact_keys(value, context=context, required={"changes"})
+        value = value["changes"]
+    if isinstance(value, tuple):
+        value = list(value)
+    if not isinstance(value, list):
+        raise AgentLoopError(f"{context} must be a JSON array or an object containing `changes`.")
+    if len(value) > RISK_MATRIX_MAX_CHANGES:
+        raise AgentLoopError(f"{context} exceeds the {RISK_MATRIX_MAX_CHANGES}-change bound.")
+    changes: list[RiskTestMatrixChange] = []
+    for index, raw_change in enumerate(value):
+        change_context = f"{context}[{index}]"
+        change = _expect_object(raw_change, context=change_context)
+        _expect_exact_keys(change, context=change_context, required={"operation", "row_ids", "rationale"})
+        operation = _risk_bounded_string(change["operation"], context=f"{change_context}.operation", max_bytes=32)
+        if operation not in RISK_MATRIX_CHANGE_OPERATIONS:
+            raise AgentLoopError(f"{change_context}.operation is invalid.")
+        row_ids = tuple(_validate_risk_row_id(item, context=f"{change_context}.row_ids[{i}]") for i, item in enumerate(
+            _risk_bounded_string_list(change["row_ids"], context=f"{change_context}.row_ids")
+        ))
+        if not row_ids:
+            raise AgentLoopError(f"{change_context}.row_ids must not be empty.")
+        changes.append(RiskTestMatrixChange(operation=operation, row_ids=row_ids, rationale=_risk_bounded_string(change["rationale"], context=f"{change_context}.rationale", max_bytes=2_048)))
+    return tuple(changes)
+
+
+def parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_matrix_changes") -> tuple[RiskTestMatrixChange, ...]:
+    return _parse_risk_test_matrix_changes(value, context=context)
+
+
+def risk_test_matrix_identity(
+    matrix: RiskTestMatrix | Mapping[str, object],
+    changes: Sequence[RiskTestMatrixChange | Mapping[str, object]] = (),
+    *,
+    contract_version: int = RISK_TEST_MATRIX_CONTRACT_VERSION,
+) -> str:
+    parsed_matrix = matrix if isinstance(matrix, RiskTestMatrix) else parse_risk_test_matrix(matrix)
+    parsed_changes = tuple(
+        item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]
+        for item in changes
+    )
+    payload = {
+        "contract_version": contract_version,
+        "matrix": parsed_matrix.to_payload(),
+        "changes": [item.to_payload() for item in parsed_changes],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def sanitize_risk_test_matrix(value: RiskTestMatrix | Mapping[str, object] | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    parsed = value if isinstance(value, RiskTestMatrix) else parse_risk_test_matrix(value)
+    return parsed.to_payload()
+
+
+def validate_risk_test_matrix_revision(
+    previous: RiskTestMatrix | Mapping[str, object],
+    current: RiskTestMatrix | Mapping[str, object],
+    changes: Sequence[RiskTestMatrixChange | Mapping[str, object]],
+    *,
+    approved: bool = False,
+) -> tuple[RiskTestMatrixChange, ...]:
+    """Require an explicit audit operation for every semantic draft change."""
+    old = previous if isinstance(previous, RiskTestMatrix) else parse_risk_test_matrix(previous, context="previous risk_test_matrix")
+    new = current if isinstance(current, RiskTestMatrix) else parse_risk_test_matrix(current, context="current risk_test_matrix")
+    parsed_changes = tuple(
+        item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]
+        for item in changes
+    )
+    if approved and old.to_payload() != new.to_payload() and not parsed_changes:
+        raise AgentLoopError("Approved risk test matrix is immutable; substantive changes require explicit replanning.")
+    covered = {row_id for change in parsed_changes for row_id in change.row_ids}
+    old_by_id = {row.row_id: row for row in old.rows}
+    new_by_id = {row.row_id: row for row in new.rows}
+    changed_ids = {
+        row_id for row_id in set(old_by_id) | set(new_by_id)
+        if old_by_id.get(row_id) != new_by_id.get(row_id)
+    }
+    missing = sorted(changed_ids - covered)
+    if missing:
+        raise AgentLoopError("Risk matrix changes omit audit operations for: " + ", ".join(missing))
+    if approved and changed_ids:
+        raise AgentLoopError("Approved risk matrix rows cannot be removed, reassigned, or weakened without a newly reviewed baseline.")
+    return parsed_changes
+
+
+@dataclass(frozen=True)
+class RiskTestMatrixEvidenceRow:
+    row_id: str
+    status: str
+    test_identifiers: tuple[str, ...]
+    test_locations: tuple[str, ...]
+    workflow_path_claim: str
+    outcome_assertions: tuple[str, ...]
+    forbidden_effect_assertions: tuple[str, ...]
+    evidence_citations: tuple[TestObservationCitation, ...]
+    caveats: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RiskTestMatrixEvidence:
+    matrix_identity: str
+    rows: tuple[RiskTestMatrixEvidenceRow, ...]
+
+
+def _parse_risk_evidence_citations(value: object, *, context: str) -> tuple[TestObservationCitation, ...]:
+    return _expect_test_observations(value, context=context)
+
+
+def parse_risk_test_matrix_evidence(
+    value: object,
+    *,
+    matrix: RiskTestMatrix | Mapping[str, object] | None = None,
+    expected_identity: str | None = None,
+    context: str = "risk_test_matrix_evidence",
+) -> RiskTestMatrixEvidence:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(payload, context=context, required={"matrix_identity", "rows"})
+    identity = _risk_bounded_string(payload["matrix_identity"], context=f"{context}.matrix_identity", max_bytes=128)
+    if not re.fullmatch(r"[0-9a-f]{64}", identity):
+        raise AgentLoopError(f"{context}.matrix_identity must be a SHA-256 digest.")
+    if expected_identity is not None and identity != expected_identity:
+        raise AgentLoopError(f"{context}.matrix_identity does not match the delivered approved matrix.")
+    if matrix is not None and expected_identity is None and identity != risk_test_matrix_identity(matrix):
+        raise AgentLoopError(f"{context}.matrix_identity does not match the delivered matrix payload.")
+    raw_rows = payload["rows"]
+    if not isinstance(raw_rows, list):
+        raise AgentLoopError(f"{context}.rows must be a JSON array.")
+    if len(raw_rows) > RISK_MATRIX_MAX_ROWS:
+        raise AgentLoopError(f"{context}.rows exceeds the {RISK_MATRIX_MAX_ROWS}-row bound.")
+    parsed_matrix = parse_risk_test_matrix(matrix) if matrix is not None else None
+    expected_ids = {row.row_id for row in parsed_matrix.rows} if parsed_matrix is not None and parsed_matrix.is_applicable else None
+    result: list[RiskTestMatrixEvidenceRow] = []
+    seen: set[str] = set()
+    for index, raw_row in enumerate(raw_rows):
+        row_context = f"{context}.rows[{index}]"
+        row = _expect_object(raw_row, context=row_context)
+        _expect_exact_keys(
+            row,
+            context=row_context,
+            required={
+                "row_id", "status", "test_identifiers", "test_locations", "workflow_path_claim",
+                "outcome_assertions", "forbidden_effect_assertions", "evidence_citations",
+            },
+            optional={"caveats"},
+        )
+        row_id = _validate_risk_row_id(row["row_id"], context=f"{row_context}.row_id")
+        if row_id in seen:
+            raise AgentLoopError(f"{context} maps row `{row_id}` more than once.")
+        seen.add(row_id)
+        status = _risk_bounded_string(row["status"], context=f"{row_context}.status", max_bytes=64)
+        if status not in RISK_MATRIX_EVIDENCE_STATUSES:
+            raise AgentLoopError(f"{row_context}.status is invalid.")
+        result.append(
+            RiskTestMatrixEvidenceRow(
+                row_id=row_id,
+                status=status,
+                test_identifiers=_risk_bounded_string_list(row["test_identifiers"], context=f"{row_context}.test_identifiers"),
+                test_locations=_risk_bounded_string_list(row["test_locations"], context=f"{row_context}.test_locations"),
+                workflow_path_claim=_risk_bounded_string(row["workflow_path_claim"], context=f"{row_context}.workflow_path_claim"),
+                outcome_assertions=_risk_bounded_string_list(row["outcome_assertions"], context=f"{row_context}.outcome_assertions"),
+                forbidden_effect_assertions=_risk_bounded_string_list(row["forbidden_effect_assertions"], context=f"{row_context}.forbidden_effect_assertions"),
+                evidence_citations=_parse_risk_evidence_citations(row["evidence_citations"], context=f"{row_context}.evidence_citations"),
+                caveats=_risk_bounded_string_list(row.get("caveats", []), context=f"{row_context}.caveats"),
+            )
+        )
+        if status == "verified" and (
+            not result[-1].test_identifiers
+            or not result[-1].test_locations
+            or not result[-1].outcome_assertions
+            or not result[-1].forbidden_effect_assertions
+            or not result[-1].evidence_citations
+        ):
+            raise AgentLoopError(
+                f"{row_context} with status `verified` must include test identifiers, locations, "
+                "outcome and forbidden-effect assertions, and evidence citations."
+            )
+    if expected_ids is not None and {row.row_id for row in result} != expected_ids:
+        missing = sorted(expected_ids - {row.row_id for row in result})
+        extra = sorted({row.row_id for row in result} - expected_ids)
+        raise AgentLoopError(f"{context} must map every delivered row exactly once (missing={missing}, extra={extra}).")
+    return RiskTestMatrixEvidence(matrix_identity=identity, rows=tuple(result))
+
+
+def _parse_risk_test_matrix_contract_fields(
+    payload: dict[str, object], *, context: str, required: bool = False
+) -> tuple[int | None, RiskTestMatrix | None, tuple[RiskTestMatrixChange, ...]]:
+    present = {
+        name: name in payload
+        for name in ("risk_test_matrix_contract_version", "risk_test_matrix", "risk_test_matrix_changes")
+    }
+    if any(present.values()) and not all(present.values()):
+        raise AgentLoopError(
+            f"{context} risk matrix fields must include risk_test_matrix_contract_version, "
+            "risk_test_matrix, and risk_test_matrix_changes together."
+        )
+    if not any(present.values()):
+        if required:
+            raise AgentLoopError(
+                f"Fresh {context} responses require risk_test_matrix_contract_version: 1 "
+                "and a complete risk_test_matrix contract."
+            )
+        return None, None, ()
+    version = _expect_int(
+        payload["risk_test_matrix_contract_version"],
+        context=f"{context}.risk_test_matrix_contract_version",
+    )
+    if version != RISK_TEST_MATRIX_CONTRACT_VERSION:
+        raise AgentLoopError(f"Unsupported {context} risk_test_matrix_contract_version: {version}.")
+    matrix = parse_risk_test_matrix(payload["risk_test_matrix"], context=f"{context}.risk_test_matrix")
+    changes = parse_risk_test_matrix_changes(
+        payload["risk_test_matrix_changes"], context=f"{context}.risk_test_matrix_changes"
+    )
+    return version, matrix, changes
 
 @dataclass(frozen=True)
 class StructuredDiscussReview:
@@ -2739,7 +3184,10 @@ def parse_structured_plan_review(text: str, *, reviewer: str) -> ParsedPlanRevie
 
 
 def validate_structured_coder_followup(
-    text: str, *, required_architecture_impact_contract: int = 0
+    text: str, *, required_architecture_impact_contract: int = 0,
+    delivered_risk_test_matrix: RiskTestMatrix | Mapping[str, object] | None = None,
+    delivered_risk_test_matrix_identity: str | None = None,
+    required_risk_test_matrix_contract: int = 0,
 ) -> StructuredCoderFollowup | None:
     payload = _extract_structured_coder_followup_payload(text)
     if payload is None:
@@ -2766,6 +3214,7 @@ def validate_structured_coder_followup(
             "remaining_item_notes",
             "tests_run",
             "test_observations",
+            "risk_test_matrix_evidence",
             "disputed_items",
             "dispute_evidence",
             "architecture_impact",
@@ -2798,6 +3247,16 @@ def validate_structured_coder_followup(
         payload.get("test_observations", []),
         context="coder_followup.test_observations",
     )
+    risk_evidence = None
+    if "risk_test_matrix_evidence" in payload:
+        risk_evidence = parse_risk_test_matrix_evidence(
+            payload["risk_test_matrix_evidence"],
+            matrix=delivered_risk_test_matrix,
+            expected_identity=delivered_risk_test_matrix_identity,
+            context="coder_followup.risk_test_matrix_evidence",
+        )
+    elif required_risk_test_matrix_contract and delivered_risk_test_matrix is not None and parse_risk_test_matrix(delivered_risk_test_matrix).is_applicable:
+        raise AgentLoopError("coder_followup must include risk_test_matrix_evidence for the delivered matrix.")
     architecture_impact = (
         _parse_architecture_impact(payload["architecture_impact"], context="coder_followup.architecture_impact")
         if "architecture_impact" in payload else None
@@ -2881,6 +3340,7 @@ def validate_structured_coder_followup(
         dispute_evidence=dispute_evidence,
         test_observations=test_observations,
         architecture_impact=architecture_impact,
+        risk_test_matrix_evidence=risk_evidence,
     )
 
 
@@ -2888,6 +3348,9 @@ def validate_structured_issue_implementation(
     text: str,
     *,
     required_architecture_impact_contract: int = 0,
+    delivered_risk_test_matrix: RiskTestMatrix | Mapping[str, object] | None = None,
+    delivered_risk_test_matrix_identity: str | None = None,
+    required_risk_test_matrix_contract: int = 0,
 ) -> StructuredIssueImplementation | None:
     """Parse and validate the strict issue-implementation result envelope.
 
@@ -2915,7 +3378,7 @@ def validate_structured_issue_implementation(
             "human_requirements",
             "human_requirement_dispositions",
         },
-        optional={"tests_run", "test_observations", "architecture_impact"},
+        optional={"tests_run", "test_observations", "architecture_impact", "risk_test_matrix_evidence"},
     )
     state = _expect_non_empty_string(payload["state"], context="issue_implementation.state")
     if state != "blocking":
@@ -2958,6 +3421,16 @@ def validate_structured_issue_implementation(
         payload.get("test_observations", []),
         context="issue_implementation.test_observations",
     )
+    risk_evidence = None
+    if "risk_test_matrix_evidence" in payload:
+        risk_evidence = parse_risk_test_matrix_evidence(
+            payload["risk_test_matrix_evidence"],
+            matrix=delivered_risk_test_matrix,
+            expected_identity=delivered_risk_test_matrix_identity,
+            context="issue_implementation.risk_test_matrix_evidence",
+        )
+    elif required_risk_test_matrix_contract and delivered_risk_test_matrix is not None and parse_risk_test_matrix(delivered_risk_test_matrix).is_applicable:
+        raise AgentLoopError("issue_implementation must include risk_test_matrix_evidence for the delivered matrix.")
     architecture_impact = (
         _parse_architecture_impact(
             payload["architecture_impact"], context="issue_implementation.architecture_impact"
@@ -2989,6 +3462,7 @@ def validate_structured_issue_implementation(
         tests_run=tests_run,
         test_observations=test_observations,
         architecture_impact=architecture_impact,
+        risk_test_matrix_evidence=risk_evidence,
     )
     # Keep this semantic contradiction visible to callers as a dedicated error
     # with the typed payload attached.  The orchestration adapter first
@@ -3064,6 +3538,7 @@ def validate_structured_plan_revision(
     *,
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
+    require_risk_test_matrix_contract: int = 0,
 ) -> StructuredPlanRevision | None:
     payload = _extract_structured_plan_revision_payload(text)
     if payload is None:
@@ -3094,12 +3569,20 @@ def validate_structured_plan_revision(
             "architecture_impact",
             "execution_strategy_contract_version",
             "execution_recommendation",
+            "risk_test_matrix_contract_version",
+            "risk_test_matrix",
+            "risk_test_matrix_changes",
         },
     )
     execution_version, execution_recommendation = _parse_execution_contract_fields(
         payload,
         context="plan_revision",
         required=require_execution_strategy_contract == 1,
+    )
+    risk_version, risk_matrix, risk_changes = _parse_risk_test_matrix_contract_fields(
+        payload,
+        context="plan_revision",
+        required=require_risk_test_matrix_contract == 1,
     )
     state = _expect_non_empty_string(payload["state"], context="plan_revision.state")
     if state != "blocking":
@@ -3150,6 +3633,9 @@ def validate_structured_plan_revision(
         architecture_impact=architecture_impact,
         execution_strategy_contract_version=execution_version,
         execution_recommendation=execution_recommendation,
+        risk_test_matrix_contract_version=risk_version,
+        risk_test_matrix=risk_matrix,
+        risk_test_matrix_changes=risk_changes,
     )
 
 
@@ -3158,6 +3644,7 @@ def validate_structured_plan_state(
     *,
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
+    require_risk_test_matrix_contract: int = 0,
 ) -> StructuredPlanState | None:
     payload = _extract_structured_plan_state_payload(text)
     if payload is None:
@@ -3181,12 +3668,20 @@ def validate_structured_plan_state(
             "architecture_impact",
             "execution_strategy_contract_version",
             "execution_recommendation",
+            "risk_test_matrix_contract_version",
+            "risk_test_matrix",
+            "risk_test_matrix_changes",
         },
     )
     execution_version, execution_recommendation = _parse_execution_contract_fields(
         payload,
         context="plan_state",
         required=require_execution_strategy_contract == 1,
+    )
+    risk_version, risk_matrix, risk_changes = _parse_risk_test_matrix_contract_fields(
+        payload,
+        context="plan_state",
+        required=require_risk_test_matrix_contract == 1,
     )
     state = _expect_state(payload["state"], context="plan_state.state")
     if state != "blocking":
@@ -3224,6 +3719,9 @@ def validate_structured_plan_state(
         architecture_impact=architecture_impact,
         execution_strategy_contract_version=execution_version,
         execution_recommendation=execution_recommendation,
+        risk_test_matrix_contract_version=risk_version,
+        risk_test_matrix=risk_matrix,
+        risk_test_matrix_changes=risk_changes,
     )
 
 

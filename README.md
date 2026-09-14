@@ -43,6 +43,25 @@ can inspect and revert the results.
 The default workflow is deliberately conservative: Claude is the coder, Codex
 is the reviewer, the review limit is 10 rounds, and automatic merge is off.
 
+### Risk-based mode and transition matrices
+
+Fresh stateful or multi-mode plans may carry a bounded generation-1 risk matrix.
+Each applicable row has a matrix-local ID, entry path or mode, initial state,
+event, expected outcome, forbidden side effects, proposed test location, and one
+execution owner. Simple local work can instead use a non-empty, proportionate
+not-applicable rationale; important exclusions remain explicit. Rows are
+planning proposals until implementation evidence maps them to actual tests.
+
+The structured matrix payload is the authority, not a copied markdown table.
+Round metadata and the existing bounded sidecar persist its canonical identity,
+so a renderer change does not invalidate an otherwise authentic plan. A corrupt
+or unfittable matrix closes only the matrix channel and reports a diagnostic;
+it does not withdraw a separately valid plan hash and subject. Historical plans
+without a matrix remain resumable without invented rows. The same contract is
+available to skill helpers: use `helpers.validate_response` or
+`helpers.render_response` with `--require-risk-test-matrix-contract` when a fresh
+generation-1 matrix is required.
+
 ## Requirements
 
 - Python 3.11 or newer.

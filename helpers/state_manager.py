@@ -79,6 +79,7 @@ from coding_review_agent_loop.protocol import (
     sanitize_architecture_impact,
     validate_structured_plan_state,
     validate_structured_plan_revision,
+    risk_test_matrix_identity,
 )
 from coding_review_agent_loop.local_test_evidence import canonicalize_bounded_evidence
 
@@ -369,6 +370,10 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         args, "execution_strategy_contract_version", None
     )
     execution_strategy_identity: dict | None = None
+    risk_test_matrix_contract_version: int | None = None
+    risk_test_matrix_payload: dict | None = None
+    risk_test_matrix_changes_payload: tuple[dict, ...] = ()
+    risk_test_matrix_identity_value: str | None = None
     parsed_strategy = None
     identity_source = raw_structured_coder_response or body
     fresh_source = False
@@ -410,6 +415,16 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
                     "fresh planning metadata requires a complete execution recommendation"
                 )
             execution_strategy_identity = parsed_strategy.execution_recommendation.identity()
+            risk_test_matrix_contract_version = parsed_strategy.risk_test_matrix_contract_version
+            if parsed_strategy.risk_test_matrix is not None:
+                risk_test_matrix_payload = parsed_strategy.risk_test_matrix.to_payload()
+                risk_test_matrix_changes_payload = tuple(
+                    change.to_payload() for change in parsed_strategy.risk_test_matrix_changes
+                )
+                risk_test_matrix_identity_value = risk_test_matrix_identity(
+                    parsed_strategy.risk_test_matrix,
+                    parsed_strategy.risk_test_matrix_changes,
+                )
             if raw_structured_coder_response is None:
                 raw_structured_coder_response = identity_source
         except (AgentLoopError, AttributeError, json.JSONDecodeError, TypeError) as exc:
@@ -561,6 +576,11 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         ),
         execution_strategy_contract_version=execution_strategy_contract_version,
         execution_strategy_identity=execution_strategy_identity,
+        risk_test_matrix_contract_version=risk_test_matrix_contract_version,
+        risk_test_matrix_payload=risk_test_matrix_payload,
+        risk_test_matrix_changes_payload=risk_test_matrix_changes_payload,
+        risk_test_matrix_identity=risk_test_matrix_identity_value,
+        risk_test_matrix_boundary_digest=risk_test_matrix_identity_value,
     )
     augmented = _attach_round_metadata(body, metadata)
 

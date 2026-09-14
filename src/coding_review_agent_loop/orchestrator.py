@@ -270,7 +270,9 @@ from .protocol import (
     validate_structured_issue_implementation,
     validate_structured_plan_state,
     validate_structured_plan_revision,
+    validate_risk_test_matrix_revision,
     validate_structured_task_result,
+    risk_test_matrix_identity,
     validate_structured_discuss_agenda,
     parse_structured_discuss_final_synthesis,
     validate_structured_discuss_final_synthesis,
@@ -342,6 +344,7 @@ from .ci_health import (
 from .comment_rendering import (
     DEFERRED_STAGES_MARKER_RE,
     EXECUTION_RECOMMENDATION_MARKER_RE,
+    RISK_TEST_MATRIX_MARKER_RE,
     ITEM_SUMMARY_LIMIT,
     _append_before_trailing_metadata,
     _format_unresolved_item_label,
@@ -356,6 +359,7 @@ from .comment_rendering import (
     _review_freeform_summary_text,
     decode_deferred_stages_marker,
     decode_execution_recommendation_marker,
+    decode_risk_test_matrix_marker,
     normalize_freeform_signature,
     render_discuss_round_summary_comment,
     render_public_agent_comment,
@@ -3781,13 +3785,20 @@ def _validate_issue_implementation_response(
     *,
     human_requirements,
     require_architecture_impact: bool = False,
+    delivered_risk_test_matrix: object = None,
+    delivered_risk_test_matrix_identity: str | None = None,
+    require_risk_test_matrix_contract: bool = False,
 ) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
         return _TerminalNoPrImplementation("clarification")
     try:
         parsed = validate_structured_issue_implementation(
-            text, required_architecture_impact_contract=(1 if require_architecture_impact else 0)
+            text,
+            required_architecture_impact_contract=(1 if require_architecture_impact else 0),
+            delivered_risk_test_matrix=delivered_risk_test_matrix,
+            delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
+            required_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
         )
     except IssueImplementationConflictError as exc:
         parsed = exc.payload
@@ -5978,6 +5989,19 @@ def _implement_approved_issue(
             text,
             human_requirements=implementation_requirements,
             require_architecture_impact=True,
+            delivered_risk_test_matrix=(
+                approved_plan_context.risk_test_matrix_payload
+                if approved_plan_context is not None and approved_plan_context.matrix_available
+                else None
+            ),
+            delivered_risk_test_matrix_identity=(
+                approved_plan_context.risk_test_matrix_identity
+                if approved_plan_context is not None and approved_plan_context.matrix_available
+                else None
+            ),
+            require_risk_test_matrix_contract=(
+                approved_plan_context is not None and approved_plan_context.matrix_available
+            ),
         ),
         usage_context=usage_context,
         role="coder",
@@ -6581,6 +6605,35 @@ def _run_plan_first_loop(
                         structured_plan.execution_recommendation.identity()
                         if structured_plan is not None
                         and structured_plan.execution_recommendation is not None
+                        else None
+                    ),
+                    risk_test_matrix_contract_version=(
+                        structured_plan.risk_test_matrix_contract_version
+                        if structured_plan is not None else None
+                    ),
+                    risk_test_matrix_payload=(
+                        structured_plan.risk_test_matrix.to_payload()
+                        if structured_plan is not None and structured_plan.risk_test_matrix is not None
+                        else None
+                    ),
+                    risk_test_matrix_changes_payload=(
+                        tuple(change.to_payload() for change in structured_plan.risk_test_matrix_changes)
+                        if structured_plan is not None else ()
+                    ),
+                    risk_test_matrix_identity=(
+                        risk_test_matrix_identity(
+                            structured_plan.risk_test_matrix,
+                            structured_plan.risk_test_matrix_changes,
+                        )
+                        if structured_plan is not None and structured_plan.risk_test_matrix is not None
+                        else None
+                    ),
+                    risk_test_matrix_boundary_digest=(
+                        risk_test_matrix_identity(
+                            structured_plan.risk_test_matrix,
+                            structured_plan.risk_test_matrix_changes,
+                        )
+                        if structured_plan is not None and structured_plan.risk_test_matrix is not None
                         else None
                     ),
                 ),
@@ -7838,6 +7891,21 @@ def _run_plan_first_loop(
         raw_structured_coder_response: str | None = None
         if isinstance(plan_response.marker_value, StructuredPlanRevision):
             raw_structured_coder_response = plan_response.text
+            previous_matrix_match = RISK_TEST_MATRIX_MARKER_RE.search(current_plan)
+            if previous_matrix_match is not None and plan_response.marker_value.risk_test_matrix is None:
+                raise AgentLoopError(
+                    "Plan revision omitted the approved draft risk matrix; preserve its rows or "
+                    "record an explicit matrix revision instead of silently removing it."
+                )
+            if previous_matrix_match is not None and plan_response.marker_value.risk_test_matrix is not None:
+                previous_matrix_payload = decode_risk_test_matrix_marker(
+                    previous_matrix_match.group("payload")
+                )
+                validate_risk_test_matrix_revision(
+                    previous_matrix_payload["matrix"],
+                    plan_response.marker_value.risk_test_matrix,
+                    plan_response.marker_value.risk_test_matrix_changes,
+                )
             canonical_plan = render_canonical_plan_revision(
                 plan_response.marker_value, must_fix_items, config
             )
@@ -7891,6 +7959,35 @@ def _run_plan_first_loop(
                         if isinstance(plan_response.marker_value, StructuredPlanRevision)
                         and plan_response.marker_value.execution_recommendation is not None
                         else None
+                    ),
+                    risk_test_matrix_contract_version=(
+                        plan_response.marker_value.risk_test_matrix_contract_version
+                        if isinstance(plan_response.marker_value, StructuredPlanRevision) else None
+                    ),
+                    risk_test_matrix_payload=(
+                        plan_response.marker_value.risk_test_matrix.to_payload()
+                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                        and plan_response.marker_value.risk_test_matrix is not None else None
+                    ),
+                    risk_test_matrix_changes_payload=(
+                        tuple(change.to_payload() for change in plan_response.marker_value.risk_test_matrix_changes)
+                        if isinstance(plan_response.marker_value, StructuredPlanRevision) else ()
+                    ),
+                    risk_test_matrix_identity=(
+                        risk_test_matrix_identity(
+                            plan_response.marker_value.risk_test_matrix,
+                            plan_response.marker_value.risk_test_matrix_changes,
+                        )
+                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                        and plan_response.marker_value.risk_test_matrix is not None else None
+                    ),
+                    risk_test_matrix_boundary_digest=(
+                        risk_test_matrix_identity(
+                            plan_response.marker_value.risk_test_matrix,
+                            plan_response.marker_value.risk_test_matrix_changes,
+                        )
+                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                        and plan_response.marker_value.risk_test_matrix is not None else None
                     ),
                     **_architecture_metadata_fields(
                         config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
