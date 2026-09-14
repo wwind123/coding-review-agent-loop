@@ -248,12 +248,14 @@ def test_authoritative_caveats_have_headroom_across_multiple_receipts() -> None:
 def test_matrix_level_draft_changes_cannot_hide_behind_one_row_operation() -> None:
     previous = {**_matrix(), "rows": [_row("row-one"), _row("row-two")]}
     current = {**previous, "important_exclusions": ["A newly explicit exclusion."]}
-    with pytest.raises(AgentLoopError, match="complete matrix scope"):
+    with pytest.raises(AgentLoopError, match="complete matrix scope") as exc_info:
         validate_risk_test_matrix_revision(
             previous,
             current,
             [{"operation": "change", "row_ids": ["row-one"], "rationale": "Clarified one row."}],
         )
+    assert "Changed matrix fields: important_exclusions" in str(exc_info.value)
+    assert "Required row_ids: [row-one, row-two]" in str(exc_info.value)
     validate_risk_test_matrix_revision(
         previous,
         current,
