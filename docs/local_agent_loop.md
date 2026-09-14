@@ -1795,7 +1795,10 @@ open draft, trusted author, reserved branch, managed label, `main` base, exact
 head, current workflow revision, and exactly one fresh generation-scoped
 handoff record in one of the paired dispatch-requested, attached, or completed
 states. Prepared-only, duplicate, ambiguous, stale, foreign, and drifted
-records are rejected.
+records are rejected. The base runner checks `created_at` against its current
+epoch time: the record may be at most 15 minutes old and at most 5 minutes in
+the future for clock skew. A completed no-status retry is accepted only when
+it names the immediately preceding terminal attempt of the same Actions run.
 
 Validation alone exposes the expected SHA. The exact-head job checks out that
 SHA, verifies `git rev-parse HEAD`, installs `.[dev]` on Python 3.12, and runs

@@ -116,9 +116,11 @@ jobs:
         run: |
           python - <<'PY'
           import json
+          import math
           import os
           import re
           import sys
+          import time
           from urllib.error import HTTPError, URLError
           from urllib.parse import urljoin
           from urllib.request import Request, urlopen
@@ -337,10 +339,16 @@ jobs:
           # Source repository: wwind123/coding-review-agent-loop
           # Source path: .github/workflows/ci.yml
           # Extraction boundary: validate_dispatch() through its return value.
+          # A dispatch intent must be no more than 15 minutes old and may be at most 5
+          # minutes ahead of the runner clock. The producer creates the record
+          # immediately before dispatch; bounding both directions prevents replay while
+          # tolerating normal clock skew.
+          MAX_INTENT_AGE_SECONDS = 15 * 60
+          MAX_INTENT_FUTURE_SKEW_SECONDS = 5 * 60
           def validate_dispatch(
               *, protocol, pr_number_text, expected_head, nonce, repo, ref,
               configured_actor, initiating_actor, rerun_actor, current_run_id,
-              current_run_attempt, api_json, api_pages, validate,
+              current_run_attempt, current_time, api_json, api_pages, validate,
           ):
               if not (
                   protocol == '2'
@@ -355,6 +363,12 @@ jobs:
                   raise ValueError('managed dispatch run ID is invalid')
               if not re.fullmatch(r'[1-9][0-9]*', current_run_attempt or ''):
                   raise ValueError('managed dispatch run attempt is invalid')
+              if (
+                  type(current_time) not in {int, float}
+                  or not math.isfinite(current_time)
+                  or current_time <= 0
+              ):
+                  raise ValueError('managed dispatch current time is invalid')
               executing_run = (int(current_run_id), int(current_run_attempt))
               trusted_actor = (configured_actor or '').strip()
               if not re.fullmatch(r'[A-Za-z0-9-]+', trusted_actor):
@@ -388,12 +402,33 @@ jobs:
                   pr, pages, repo, pr_number_text, expected_head, nonce,
                   live_login, revision, live_id,
               )
+              intent_age = current_time - record['created_at']
+              if intent_age > MAX_INTENT_AGE_SECONDS:
+                  raise ValueError('managed intent record is stale')
+              if intent_age < -MAX_INTENT_FUTURE_SKEW_SECONDS:
+                  raise ValueError('managed intent record is too far in the future')
               record_run = (record.get('run_id'), record.get('run_attempt'))
-              if record['state'] in {'attached', 'completed'} and record_run != executing_run:
-                  raise ValueError('managed intent run pair does not match executing Actions run')
               if record['state'] == 'completed' and record.get('terminal_outcome') == 'no-status':
-                  if (record.get('terminal_run_id'), record.get('terminal_run_attempt')) != executing_run:
-                      raise ValueError('completed no-status record is not bound to executing Actions run')
+                  terminal_key = (record.get('terminal_run_id'), record.get('terminal_run_attempt'))
+                  history = record.get('terminal_attempts')
+                  same_run_attempts = [
+                      item['run_attempt'] for item in history
+                      if item['run_id'] == record_run[0]
+                  ]
+                  # The driver records a no-status terminal attempt before a human or
+                  # operator reruns this same Actions run. Accept only the next attempt
+                  # of that same run; this rejects foreign, repeated, skipped, and
+                  # incoherent transitions.
+                  if (
+                      terminal_key != record_run
+                      or record_run[0] != executing_run[0]
+                      or not same_run_attempts
+                      or max(same_run_attempts) != record_run[1]
+                      or executing_run[1] != record_run[1] + 1
+                  ):
+                      raise ValueError('completed no-status retry run pair is incoherent')
+              elif record['state'] in {'attached', 'completed'} and record_run != executing_run:
+                  raise ValueError('managed intent run pair does not match executing Actions run')
               return {
                   'target_sha': expected_head,
                   'pr_number': pr_number_text,
@@ -414,6 +449,7 @@ jobs:
               rerun_actor=os.environ.get('GH_TRIGGERING_ACTOR'),
               current_run_id=os.environ.get('GH_RUN_ID'),
               current_run_attempt=os.environ.get('GH_RUN_ATTEMPT'),
+              current_time=int(time.time()),
               api_json=api_json,
               api_pages=api_pages,
               validate=validate,
@@ -485,7 +521,7 @@ jobs:
           # BEGIN MANAGED_CI_V2_PUBLISHER
           # Source repository: wwind123/coding-review-agent-loop
           # Source path: .github/workflows/ci.yml
-          # Extraction boundary: build_status_payload() through its return value.
+          # Extraction boundary: build_status_request() through its return value.
           def build_status_payload(
               *, target_sha, validation_result, test_result, nonce, run_id,
               run_attempt, server_url, repository,
@@ -518,28 +554,53 @@ jobs:
                                     '/actions/runs/' + run_id,
                   },
               }
+
+          def build_status_request(
+              *, target_sha, validation_result, test_result, nonce, run_id,
+              run_attempt, server_url, api_url, repository,
+          ):
+              payload_object = build_status_payload(
+                  target_sha=target_sha,
+                  validation_result=validation_result,
+                  test_result=test_result,
+                  nonce=nonce,
+                  run_id=run_id,
+                  run_attempt=run_attempt,
+                  server_url=server_url,
+                  repository=repository,
+              )
+              if (
+                  payload_object is None
+                  or not isinstance(api_url, str)
+                  or not api_url
+              ):
+                  return None
+              validated_target = payload_object['target_sha']
+              return {
+                  'target_sha': validated_target,
+                  'url': api_url.rstrip('/') + '/repos/' + repository +
+                         '/statuses/' + validated_target,
+                  'payload': payload_object['payload'],
+              }
           # END MANAGED_CI_V2_PUBLISHER
 
-          target = os.environ.get('TARGET_SHA', '')
-          payload_object = build_status_payload(
-              target_sha=target,
+          request_plan = build_status_request(
+              target_sha=os.environ.get('TARGET_SHA', ''),
               validation_result=os.environ.get('VALIDATION_RESULT', ''),
               test_result=os.environ.get('TEST_RESULT', ''),
               nonce=os.environ.get('NONCE', ''),
               run_id=os.environ.get('RUN_ID', ''),
               run_attempt=os.environ.get('RUN_ATTEMPT', ''),
               server_url=os.environ.get('SERVER_URL', ''),
+              api_url=os.environ.get('GH_API_URL', ''),
               repository=os.environ.get('GH_REPOSITORY', ''),
           )
-          if payload_object is None:
+          if request_plan is None:
               print('Authorization failed before an exact target was established; no status written.')
               raise SystemExit(0)
-          target = payload_object['target_sha']
-          payload = json.dumps(payload_object['payload']).encode('utf-8')
-          run_id = os.environ['RUN_ID']
+          payload = json.dumps(request_plan['payload']).encode('utf-8')
           request = Request(
-              os.environ['GH_API_URL'].rstrip('/') + '/repos/' +
-              os.environ['GH_REPOSITORY'] + '/statuses/' + target,
+              request_plan['url'],
               data=payload,
               method='POST',
               headers={

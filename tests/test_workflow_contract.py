@@ -290,6 +290,7 @@ def _dispatch_validate(*, record=None, **overrides):
         "rerun_actor": "agent-loop",
         "current_run_id": "200",
         "current_run_attempt": "1",
+        "current_time": 100,
     }
     values.update(overrides)
     calls = []
@@ -340,15 +341,77 @@ def test_dispatch_validator_accepts_initial_and_current_run_bound_retry_records(
         record=_record(
             "completed",
             run_id=200,
-            run_attempt=2,
+            run_attempt=1,
             terminal_run_id=200,
-            terminal_run_attempt=2,
-            terminal_attempts=[{"run_id": 200, "run_attempt": 2}],
+            terminal_run_attempt=1,
+            terminal_attempts=[{"run_id": 200, "run_attempt": 1}],
             terminal_outcome="no-status",
         ),
         current_run_attempt="2",
     )
     assert completed["record"]["terminal_outcome"] == "no-status"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "record": _record(
+                "completed",
+                run_id=200,
+                run_attempt=1,
+                terminal_run_id=200,
+                terminal_run_attempt=1,
+                terminal_attempts=[{"run_id": 200, "run_attempt": 1}],
+                terminal_outcome="no-status",
+            ),
+            "current_run_attempt": "1",
+        },
+        {
+            "record": _record(
+                "completed",
+                run_id=200,
+                run_attempt=1,
+                terminal_run_id=200,
+                terminal_run_attempt=1,
+                terminal_attempts=[{"run_id": 200, "run_attempt": 1}],
+                terminal_outcome="no-status",
+            ),
+            "current_run_attempt": "3",
+        },
+        {
+            "record": _record(
+                "completed",
+                run_id=200,
+                run_attempt=1,
+                terminal_run_id=200,
+                terminal_run_attempt=1,
+                terminal_attempts=[{"run_id": 200, "run_attempt": 1}],
+                terminal_outcome="no-status",
+            ),
+            "current_run_id": "201",
+            "current_run_attempt": "2",
+        },
+        {
+            "record": _record(
+                "completed",
+                run_id=200,
+                run_attempt=1,
+                terminal_run_id=200,
+                terminal_run_attempt=1,
+                terminal_attempts=[
+                    {"run_id": 200, "run_attempt": 1},
+                    {"run_id": 200, "run_attempt": 3},
+                ],
+                terminal_outcome="no-status",
+            ),
+            "current_run_attempt": "2",
+        },
+    ],
+)
+def test_dispatch_validator_rejects_incoherent_completed_retry_transitions(overrides):
+    with pytest.raises(ValueError, match="retry run pair|executing Actions run"):
+        _dispatch_validate(**overrides)
 
 
 @pytest.mark.parametrize(
@@ -387,6 +450,23 @@ def test_dispatch_validator_requires_current_run_identity(overrides):
         _dispatch_validate(**overrides)
 
 
+def test_dispatch_validator_enforces_bounded_intent_freshness_and_clock_skew():
+    window = dispatch_validator.MAX_INTENT_AGE_SECONDS
+    skew = dispatch_validator.MAX_INTENT_FUTURE_SKEW_SECONDS
+
+    assert _dispatch_validate(
+        record=_record(created_at=100), current_time=100 + window
+    )[0]["target_sha"] == "b" * 40
+    with pytest.raises(ValueError, match="stale"):
+        _dispatch_validate(record=_record(created_at=100), current_time=100 + window + 1)
+
+    assert _dispatch_validate(
+        record=_record(created_at=100 + skew), current_time=100
+    )[0]["target_sha"] == "b" * 40
+    with pytest.raises(ValueError, match="future"):
+        _dispatch_validate(record=_record(created_at=100 + skew + 1), current_time=100)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -418,6 +498,7 @@ def test_dispatch_validator_propagates_api_failure_without_authorizing_target():
         "rerun_actor": "agent-loop",
         "current_run_id": "200",
         "current_run_attempt": "1",
+        "current_time": 100,
     }
 
     def failing_api(_path):
@@ -456,6 +537,7 @@ def _publisher_payload(**overrides):
         "run_id": "200",
         "run_attempt": "1",
         "server_url": "https://github.com",
+        "api_url": "https://api.github.com",
         "repository": "OWNER/REPO",
     }
     values.update(overrides)
@@ -463,9 +545,10 @@ def _publisher_payload(**overrides):
 
 
 def test_terminal_publisher_decision_is_production_derived_and_safely_correlated():
-    success = publisher.build_status_payload(**_publisher_payload())
+    success = publisher.build_status_request(**_publisher_payload())
     assert success == {
         "target_sha": "b" * 40,
+        "url": "https://api.github.com/repos/OWNER/REPO/statuses/" + "b" * 40,
         "payload": {
             "state": "success",
             "context": "final-ci/exact-head",
@@ -474,7 +557,7 @@ def test_terminal_publisher_decision_is_production_derived_and_safely_correlated
         },
     }
 
-    failure = publisher.build_status_payload(
+    failure = publisher.build_status_request(
         **_publisher_payload(test_result="failure", run_attempt="2")
     )
     assert failure["target_sha"] == "b" * 40
@@ -482,10 +565,10 @@ def test_terminal_publisher_decision_is_production_derived_and_safely_correlated
     assert "attempt=2" in failure["payload"]["description"]
     assert failure["payload"]["target_url"].endswith("/actions/runs/200")
 
-    assert publisher.build_status_payload(
+    assert publisher.build_status_request(
         **_publisher_payload(validation_result="failure")
     ) is None
-    assert publisher.build_status_payload(**_publisher_payload(target_sha="")) is None
+    assert publisher.build_status_request(**_publisher_payload(target_sha="")) is None
 
 
 @pytest.mark.parametrize(
@@ -498,6 +581,15 @@ def test_terminal_publisher_decision_is_production_derived_and_safely_correlated
     ],
 )
 def test_terminal_publisher_does_not_write_for_unbound_correlation(field, value):
-    assert publisher.build_status_payload(
+    assert publisher.build_status_request(
         **_publisher_payload(**{field: value})
+    ) is None
+
+
+def test_terminal_publisher_request_uses_only_the_validated_target():
+    request = publisher.build_status_request(**_publisher_payload())
+    assert request["url"].endswith("/statuses/" + request["target_sha"])
+    assert request["target_sha"] == "b" * 40
+    assert publisher.build_status_request(
+        **_publisher_payload(api_url="")
     ) is None

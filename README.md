@@ -93,7 +93,11 @@ After the workflow change is merged, the sole-maintainer rollout is ordered:
 
 For an approved head, the base-branch workflow validates the live actor,
 repository, PR tuple, workflow revision, and one fresh generation-scoped
-handoff record before exposing `expected_head_sha`. A separate job checks out
+handoff record before exposing `expected_head_sha`. Freshness is measured on
+the base runner: `created_at` must be at most 15 minutes old and no more than
+5 minutes ahead of the runner clock. A no-status retry may advance only from
+the recorded terminal attempt to the immediate next attempt of that same run.
+A separate job checks out
 that exact SHA, installs the editable development dependencies, and runs the
 full `python -m pytest` suite once. The always-evaluated publisher writes
 `final-ci/exact-head` only for that validated target, with the nonce, run ID,

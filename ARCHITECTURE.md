@@ -206,7 +206,10 @@ Managed dispatch is authorized in base-workflow code. It resolves the
 configured `AGENT_LOOP_MANAGED_ACTOR` to the live identity, requires both the
 initiating and re-run actors to match, validates the live PR and current base
 workflow revision, and accepts exactly one fresh generation-scoped handoff
-record. Only after validation does the exact-head job receive the target SHA;
+record. Freshness is bounded to 15 minutes of age with a 5-minute future-skew
+allowance, and a no-status retry must be the immediate next attempt of the same
+run after its recorded terminal attempt. Only after validation does the
+exact-head job receive the target SHA;
 it verifies checkout, installs editable development dependencies, and runs the
 complete pytest suite once. An always-evaluated publisher writes the
 `final-ci/exact-head` status only for that validated SHA, correlating nonce,

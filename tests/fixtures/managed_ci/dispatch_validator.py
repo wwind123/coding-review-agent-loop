@@ -8,6 +8,7 @@ The contract tests invoke this copy with offline API callbacks and compare its
 source block to the workflow so identity and input checks remain production-linked.
 """
 
+import math
 import re
 
 
@@ -15,10 +16,16 @@ import re
 # Source repository: wwind123/coding-review-agent-loop
 # Source path: .github/workflows/ci.yml
 # Extraction boundary: validate_dispatch() through its return value.
+# A dispatch intent must be no more than 15 minutes old and may be at most 5
+# minutes ahead of the runner clock. The producer creates the record
+# immediately before dispatch; bounding both directions prevents replay while
+# tolerating normal clock skew.
+MAX_INTENT_AGE_SECONDS = 15 * 60
+MAX_INTENT_FUTURE_SKEW_SECONDS = 5 * 60
 def validate_dispatch(
     *, protocol, pr_number_text, expected_head, nonce, repo, ref,
     configured_actor, initiating_actor, rerun_actor, current_run_id,
-    current_run_attempt, api_json, api_pages, validate,
+    current_run_attempt, current_time, api_json, api_pages, validate,
 ):
     if not (
         protocol == '2'
@@ -33,6 +40,12 @@ def validate_dispatch(
         raise ValueError('managed dispatch run ID is invalid')
     if not re.fullmatch(r'[1-9][0-9]*', current_run_attempt or ''):
         raise ValueError('managed dispatch run attempt is invalid')
+    if (
+        type(current_time) not in {int, float}
+        or not math.isfinite(current_time)
+        or current_time <= 0
+    ):
+        raise ValueError('managed dispatch current time is invalid')
     executing_run = (int(current_run_id), int(current_run_attempt))
     trusted_actor = (configured_actor or '').strip()
     if not re.fullmatch(r'[A-Za-z0-9-]+', trusted_actor):
@@ -66,12 +79,33 @@ def validate_dispatch(
         pr, pages, repo, pr_number_text, expected_head, nonce,
         live_login, revision, live_id,
     )
+    intent_age = current_time - record['created_at']
+    if intent_age > MAX_INTENT_AGE_SECONDS:
+        raise ValueError('managed intent record is stale')
+    if intent_age < -MAX_INTENT_FUTURE_SKEW_SECONDS:
+        raise ValueError('managed intent record is too far in the future')
     record_run = (record.get('run_id'), record.get('run_attempt'))
-    if record['state'] in {'attached', 'completed'} and record_run != executing_run:
-        raise ValueError('managed intent run pair does not match executing Actions run')
     if record['state'] == 'completed' and record.get('terminal_outcome') == 'no-status':
-        if (record.get('terminal_run_id'), record.get('terminal_run_attempt')) != executing_run:
-            raise ValueError('completed no-status record is not bound to executing Actions run')
+        terminal_key = (record.get('terminal_run_id'), record.get('terminal_run_attempt'))
+        history = record.get('terminal_attempts')
+        same_run_attempts = [
+            item['run_attempt'] for item in history
+            if item['run_id'] == record_run[0]
+        ]
+        # The driver records a no-status terminal attempt before a human or
+        # operator reruns this same Actions run. Accept only the next attempt
+        # of that same run; this rejects foreign, repeated, skipped, and
+        # incoherent transitions.
+        if (
+            terminal_key != record_run
+            or record_run[0] != executing_run[0]
+            or not same_run_attempts
+            or max(same_run_attempts) != record_run[1]
+            or executing_run[1] != record_run[1] + 1
+        ):
+            raise ValueError('completed no-status retry run pair is incoherent')
+    elif record['state'] in {'attached', 'completed'} and record_run != executing_run:
+        raise ValueError('managed intent run pair does not match executing Actions run')
     return {
         'target_sha': expected_head,
         'pr_number': pr_number_text,
