@@ -31,9 +31,9 @@ on:
         default: ''
 
 # Dispatch runs are deliberately correlated by nonce in the Actions UI and by
-# PR/head in the concurrency key.  Ordinary PR and push runs retain GitHub's
-# normal naming fallback when inputs are unavailable.
-run-name: managed-ci-v2 nonce=${{ inputs.managed_nonce }}
+# PR/head in the concurrency key.  Ordinary PR and push runs use the workflow
+# name, so they are never mislabeled as managed dispatches.
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_nonce != '' && format('managed-ci-v2 nonce={0}', inputs.managed_nonce) || github.workflow }}
 
 jobs:
   test:
@@ -106,6 +106,7 @@ jobs:
           GH_REF: ${{ github.ref }}
           GH_ACTOR: ${{ github.actor }}
           GH_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          CONFIGURED_ACTOR: ${{ vars.AGENT_LOOP_MANAGED_ACTOR }}
           INPUT_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
           INPUT_EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
@@ -308,49 +309,84 @@ jobs:
                   url = next_match.group(1) if next_match else None
               return pages
 
-          protocol = os.environ['INPUT_PROTOCOL_VERSION']
-          pr_number_text = os.environ['INPUT_PR_NUMBER']
-          expected_head = os.environ['INPUT_EXPECTED_HEAD_SHA']
-          nonce = os.environ['INPUT_MANAGED_NONCE']
-          if not (protocol == '2' and re.fullmatch(r'[1-9][0-9]*', pr_number_text or '')
+          # BEGIN MANAGED_CI_V2_DISPATCH_VALIDATOR
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/ci.yml
+          # Extraction boundary: validate_dispatch() through its return value.
+          def validate_dispatch(
+              *, protocol, pr_number_text, expected_head, nonce, repo, ref,
+              configured_actor, initiating_actor, rerun_actor, api_json, api_pages,
+              validate,
+          ):
+              if not (
+                  protocol == '2'
+                  and re.fullmatch(r'[1-9][0-9]*', pr_number_text or '')
                   and re.fullmatch(r'[0-9a-f]{40}', expected_head or '')
-                  and re.fullmatch(r'[A-Za-z0-9_-]{32}', nonce or '')):
-              raise SystemExit('managed dispatch inputs must be complete protocol-v2 values')
-
-          repo = os.environ['GH_REPOSITORY']
-          if os.environ.get('GH_REF') != 'refs/heads/main':
-              raise SystemExit('managed dispatch must execute the base workflow from main')
-          configured = api_json('repos/' + repo + '/actions/variables/AGENT_LOOP_MANAGED_ACTOR')
-          trusted_actor = configured.get('value') if isinstance(configured, dict) else None
-          live_user = api_json('user')
-          live_login = live_user.get('login') if isinstance(live_user, dict) else None
-          live_id = live_user.get('id') if isinstance(live_user, dict) else None
-          initiating_actor = os.environ['GH_ACTOR']
-          rerun_actor = os.environ['GH_TRIGGERING_ACTOR']
-          if (not isinstance(trusted_actor, str) or not trusted_actor.strip()
-                  or not isinstance(live_login, str) or type(live_id) is not int
+                  and re.fullmatch(r'[A-Za-z0-9_-]{32}', nonce or '')
+              ):
+                  raise ValueError('managed dispatch inputs must be complete protocol-v2 values')
+              if ref != 'refs/heads/main':
+                  raise ValueError('managed dispatch must execute the base workflow from main')
+              trusted_actor = (configured_actor or '').strip()
+              if not re.fullmatch(r'[A-Za-z0-9-]+', trusted_actor):
+                  raise ValueError('managed dispatch trusted actor configuration is invalid')
+              live_user = api_json('users/' + trusted_actor)
+              live_login = live_user.get('login') if isinstance(live_user, dict) else None
+              live_id = live_user.get('id') if isinstance(live_user, dict) else None
+              if (
+                  not isinstance(live_login, str)
+                  or type(live_id) is not int
+                  or not isinstance(initiating_actor, str)
+                  or not isinstance(rerun_actor, str)
                   or trusted_actor.casefold() != live_login.casefold()
                   or initiating_actor.casefold() != live_login.casefold()
-                  or rerun_actor.casefold() != live_login.casefold()):
-              raise SystemExit('managed dispatch actors do not match the configured live identity')
+                  or rerun_actor.casefold() != live_login.casefold()
+              ):
+                  raise ValueError('managed dispatch actors do not match the configured live identity')
+              live_repo = api_json('repos/' + repo)
+              if (
+                  not isinstance(live_repo, dict)
+                  or live_repo.get('full_name', '').casefold() != repo.casefold()
+              ):
+                  raise ValueError('managed dispatch repository identity could not be validated')
+              pr = api_json('repos/' + repo + '/pulls/' + pr_number_text)
+              base_commit = api_json('repos/' + repo + '/commits/main')
+              revision = base_commit.get('sha') if isinstance(base_commit, dict) else None
+              if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision):
+                  raise ValueError('managed dispatch base workflow revision is unavailable')
+              pages = api_pages('repos/' + repo + '/issues/' + pr_number_text + '/comments?per_page=100')
+              record = validate(
+                  pr, pages, repo, pr_number_text, expected_head, nonce,
+                  live_login, revision, live_id,
+              )
+              return {
+                  'target_sha': expected_head,
+                  'pr_number': pr_number_text,
+                  'managed_nonce': nonce,
+                  'record': record,
+              }
+          # END MANAGED_CI_V2_DISPATCH_VALIDATOR
 
-          live_repo = api_json('repos/' + repo)
-          if (not isinstance(live_repo, dict)
-                  or live_repo.get('full_name', '').casefold() != repo.casefold()):
-              raise SystemExit('managed dispatch repository identity could not be validated')
-          pr = api_json('repos/' + repo + '/pulls/' + pr_number_text)
-          base_commit = api_json('repos/' + repo + '/commits/main')
-          revision = base_commit.get('sha') if isinstance(base_commit, dict) else None
-          if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision):
-              raise SystemExit('managed dispatch base workflow revision is unavailable')
-          pages = api_pages('repos/' + repo + '/issues/' + pr_number_text + '/comments?per_page=100')
-          validate(pr, pages, repo, pr_number_text, expected_head, nonce, live_login, revision, live_id)
+          validated = validate_dispatch(
+              protocol=os.environ['INPUT_PROTOCOL_VERSION'],
+              pr_number_text=os.environ['INPUT_PR_NUMBER'],
+              expected_head=os.environ['INPUT_EXPECTED_HEAD_SHA'],
+              nonce=os.environ['INPUT_MANAGED_NONCE'],
+              repo=os.environ['GH_REPOSITORY'],
+              ref=os.environ.get('GH_REF'),
+              configured_actor=os.environ.get('CONFIGURED_ACTOR'),
+              initiating_actor=os.environ.get('GH_ACTOR'),
+              rerun_actor=os.environ.get('GH_TRIGGERING_ACTOR'),
+              api_json=api_json,
+              api_pages=api_pages,
+              validate=validate,
+          )
 
           output_path = os.environ['GITHUB_OUTPUT']
           with open(output_path, 'a', encoding='utf-8') as output:
-              output.write('target_sha=' + expected_head + '\n')
-              output.write('pr_number=' + pr_number_text + '\n')
-              output.write('managed_nonce=' + nonce + '\n')
+              output.write('target_sha=' + validated['target_sha'] + '\n')
+              output.write('pr_number=' + validated['pr_number'] + '\n')
+              output.write('managed_nonce=' + validated['managed_nonce'] + '\n')
           print('Managed dispatch validated for the exact live PR head.')
           PY
 

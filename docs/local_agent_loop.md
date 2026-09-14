@@ -1786,9 +1786,9 @@ No label-addition, readiness, draft-conversion, or arbitrary existing-PR
 adoption event is part of this installed route.
 
 The manual dispatch inputs are `protocol_version`, `pr_number`,
-`expected_head_sha`, and `managed_nonce`, with the exact run name
-`managed-ci-v2 nonce=${{ inputs.managed_nonce }}`. All four empty inputs mean
-ordinary manual CI; partial inputs are rejected. The base workflow resolves
+`expected_head_sha`, and `managed_nonce`. A managed dispatch is named
+`managed-ci-v2 nonce=<managed_nonce>`; ordinary runs use the workflow name.
+All four empty inputs mean ordinary manual CI; partial inputs are rejected. The base workflow resolves
 `AGENT_LOOP_MANAGED_ACTOR` to the live authenticated identity and requires the
 initiating and re-run actors to agree. It then validates the live repository,
 open draft, trusted author, reserved branch, managed label, `main` base, exact
@@ -1815,6 +1815,14 @@ never implicit, does not weaken other repositories' defaults, does not enable
 existing-PR adoption, and does not replace a head-guarded merge. Keep the
 serial queue on ordinary CI until live qualification proves suppression,
 exact-head status publication, ordinary recovery, and post-merge `main` CI.
+
+For a plan-first issue implementation, the complete invocation is:
+
+```bash
+agent-loop issue <issue-number> --repo wwind123/coding-review-agent-loop \
+  --plan-first --implement-after-approval --auto-merge --managed-ci \
+  --managed-ci-trusted-actor wwind123 --allow-unprotected-managed-ci
+```
 
 #### Read-only readiness preflight and unprotected override
 

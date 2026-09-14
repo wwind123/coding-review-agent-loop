@@ -9,24 +9,40 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.managed_ci import current_router
+from fixtures.managed_ci import dispatch_validator, local_router
 
 
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
-CURRENT_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "current_router.py"
+LOCAL_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "local_router.py"
+DISPATCH_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "dispatch_validator.py"
 
 
 def _workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
 
 
-def _validator_block(text: str) -> str:
-    marker = text.index("# BEGIN MANAGED_CI_V2_VALIDATOR")
+def _extraction_block(text: str, marker_name: str) -> str:
+    marker = text.index(f"# BEGIN {marker_name}")
     start = text.rfind("\n", 0, marker) + 1
-    end = text.index("# END MANAGED_CI_V2_VALIDATOR", start)
+    end = text.index(f"# END {marker_name}", start)
     end = text.index("\n", end) + 1
     return textwrap.dedent(text[start:end])
+
+
+def _validator_block(text: str) -> str:
+    return _extraction_block(text, "MANAGED_CI_V2_VALIDATOR")
+
+
+def _dispatch_block(text: str) -> str:
+    return _extraction_block(text, "MANAGED_CI_V2_DISPATCH_VALIDATOR")
+
+
+def _job_if_expression(text: str) -> str:
+    marker = "    if: >-\n"
+    start = text.index(marker) + len(marker)
+    end = text.index("    name: Python 3.12 full suite", start)
+    return textwrap.dedent(text[start:end]).strip()
 
 
 def _pr(**overrides):
@@ -85,7 +101,7 @@ def _pages(*records, actor="agent-loop", actor_id=7):
 
 
 def _validate(record, *, pr=None, pages=None, actor="agent-loop", actor_id=7):
-    return current_router.validate(
+    return local_router.validate(
         pr or _pr(),
         pages if pages is not None else _pages(record),
         "OWNER/REPO",
@@ -110,7 +126,7 @@ def test_workflow_advertises_exact_activation_contract():
         "expected_head_sha",
         "managed_nonce",
         "final-ci/exact-head",
-        "run-name: managed-ci-v2 nonce=${{ inputs.managed_nonce }}",
+        "run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_nonce != '' && format('managed-ci-v2 nonce={0}', inputs.managed_nonce) || github.workflow }}",
     ):
         assert required in workflow
 
@@ -126,7 +142,13 @@ def test_workflow_advertises_exact_activation_contract():
 
 def test_validator_fixture_is_an_extraction_of_production_workflow():
     assert _validator_block(_workflow_text()) == _validator_block(
-        CURRENT_FIXTURE.read_text(encoding="utf-8")
+        LOCAL_FIXTURE.read_text(encoding="utf-8")
+    )
+
+
+def test_dispatch_validator_fixture_is_an_extraction_of_production_workflow():
+    assert _dispatch_block(_workflow_text()) == _dispatch_block(
+        DISPATCH_FIXTURE.read_text(encoding="utf-8")
     )
 
 
@@ -218,6 +240,22 @@ def _ordinary_route(action, pr, trusted_actor):
 
 
 def test_routing_matrix_is_label_race_safe_and_fail_open():
+    assert _job_if_expression(_workflow_text()) == """github.event_name == 'push' ||
+(github.event_name == 'workflow_dispatch' &&
+ inputs.protocol_version == '' && inputs.pr_number == '' &&
+ inputs.expected_head_sha == '' && inputs.managed_nonce == '') ||
+(github.event_name == 'pull_request' &&
+ (github.event.action == 'unlabeled' ||
+  !(github.event.pull_request.base.ref == 'main' &&
+    github.event.pull_request.base.repo.full_name == github.repository &&
+    github.event.pull_request.head.repo.full_name == github.repository &&
+    startsWith(github.event.pull_request.head.ref, 'agent-loop/managed-') &&
+    github.event.pull_request.draft == true &&
+    vars.AGENT_LOOP_MANAGED_ACTOR != '' &&
+    github.event.pull_request.user.login == vars.AGENT_LOOP_MANAGED_ACTOR &&
+    (github.event.action == 'opened' ||
+     ((github.event.action == 'synchronize' || github.event.action == 'reopened') &&
+      contains(github.event.pull_request.labels.*.name, 'agent-loop-managed'))))))""".strip()
     opening = _pr(labels=[])
     labeled = _pr()
     assert _ordinary_route("opened", opening, "agent-loop") is False
@@ -226,6 +264,97 @@ def test_routing_matrix_is_label_race_safe_and_fail_open():
     assert _ordinary_route("synchronize", labeled, "wrong-actor") is True
     assert _ordinary_route("unlabeled", labeled, "agent-loop") is True
     assert _ordinary_route("synchronize", _pr(head={"sha": "b" * 40, "ref": "feature", "repo": {"full_name": "fork/REPO"}}), "agent-loop") is True
+
+
+def _dispatch_validate(**overrides):
+    values = {
+        "protocol": "2",
+        "pr_number_text": "7",
+        "expected_head": "b" * 40,
+        "nonce": "n" * 32,
+        "repo": "OWNER/REPO",
+        "ref": "refs/heads/main",
+        "configured_actor": "agent-loop",
+        "initiating_actor": "agent-loop",
+        "rerun_actor": "agent-loop",
+    }
+    values.update(overrides)
+    calls = []
+    revision = "a" * 40
+    records = {
+        "users/agent-loop": {"login": "agent-loop", "id": 7},
+        "repos/OWNER/REPO": {"full_name": "OWNER/REPO"},
+        "repos/OWNER/REPO/pulls/7": _pr(),
+        "repos/OWNER/REPO/commits/main": {"sha": revision},
+    }
+
+    def api_json(path):
+        calls.append(path)
+        return records[path]
+
+    def api_pages(path):
+        calls.append(path)
+        return _pages(_record())
+
+    result = dispatch_validator.validate_dispatch(
+        **values,
+        api_json=api_json,
+        api_pages=api_pages,
+        validate=local_router.validate,
+    )
+    return result, calls
+
+
+def test_dispatch_validator_resolves_named_actor_and_returns_exact_target():
+    result, calls = _dispatch_validate()
+    assert result["target_sha"] == "b" * 40
+    assert result["record"]["state"] == "dispatch-requested"
+    assert calls[:2] == ["users/agent-loop", "repos/OWNER/REPO"]
+    assert "user" not in calls
+    assert not any("actions/variables" in path for path in calls)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"protocol": ""},
+        {"pr_number_text": ""},
+        {"expected_head": ""},
+        {"nonce": ""},
+        {"ref": "refs/heads/feature"},
+        {"configured_actor": ""},
+        {"initiating_actor": "other"},
+        {"rerun_actor": "other"},
+    ],
+)
+def test_dispatch_validator_rejects_partial_trust_and_actor_inputs(overrides):
+    with pytest.raises(ValueError):
+        _dispatch_validate(**overrides)
+
+
+def test_dispatch_validator_propagates_api_failure_without_authorizing_target():
+    values = {
+        "protocol": "2",
+        "pr_number_text": "7",
+        "expected_head": "b" * 40,
+        "nonce": "n" * 32,
+        "repo": "OWNER/REPO",
+        "ref": "refs/heads/main",
+        "configured_actor": "agent-loop",
+        "initiating_actor": "agent-loop",
+        "rerun_actor": "agent-loop",
+    }
+
+    def failing_api(_path):
+        raise ValueError("GitHub API read failed")
+
+    with pytest.raises(ValueError, match="GitHub API read failed"):
+        dispatch_validator.validate_dispatch(
+            **values,
+            api_json=failing_api,
+            api_pages=failing_api,
+            validate=local_router.validate,
+        )
 
 
 def test_workflow_keeps_exact_checkout_suite_and_safe_terminal_publisher():

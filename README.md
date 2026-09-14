@@ -83,6 +83,13 @@ After the workflow change is merged, the sole-maintainer rollout is ordered:
    every applicable issue-created invocation. The waiver is explicit per run;
    it does not change defaults for other repositories, enable arbitrary
    existing-PR adoption, or replace a head-guarded merge.
+   For example:
+
+   ```bash
+   agent-loop issue <issue-number> --repo wwind123/coding-review-agent-loop \
+     --plan-first --implement-after-approval --auto-merge --managed-ci \
+     --managed-ci-trusted-actor wwind123 --allow-unprotected-managed-ci
+   ```
 
 For an approved head, the base-branch workflow validates the live actor,
 repository, PR tuple, workflow revision, and one fresh generation-scoped
