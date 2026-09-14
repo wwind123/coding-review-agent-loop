@@ -7476,22 +7476,8 @@ def _run_plan_first_loop(
                     issue_number=first_agent_phase.issue_number,
                 )
                 phase_parent_context = first_agent_phase.phase.parent_context or current_plan
-                implementation_result = _implement_approved_issue(
-                    runner,
-                    issue_number=first_agent_phase.issue_number,
-                    approved_plan=phase_parent_context,
-                    config=config,
-                    memory=memory,
-                    issue_context=child_issue_context,
-                    approved_plan_context=make_approved_plan_context(
-                        current_plan,
-                        source_locator=f"issue #{issue_number} topology checkpoint phase 1",
-                    ),
-                    parent_issue_context=parent_issue_context,
-                    coder_session_id=coder_session_id,
-                    usage_context=usage_context,
-                    execution_recommendation=recommendation,
-                )
+                # Persist the parent-owned assignment before child execution so
+                # PR validation and crash recovery see the same phase identity.
                 post_phase_implementation_handoff_comment(
                     runner,
                     config=config,
@@ -7517,7 +7503,22 @@ def _run_plan_first_loop(
                     ),
                     plan_subject=plan_subject,
                 )
-                return implementation_result
+                return _implement_approved_issue(
+                    runner,
+                    issue_number=first_agent_phase.issue_number,
+                    approved_plan=phase_parent_context,
+                    config=config,
+                    memory=memory,
+                    issue_context=child_issue_context,
+                    approved_plan_context=make_approved_plan_context(
+                        current_plan,
+                        source_locator=f"issue #{issue_number} topology checkpoint phase 1",
+                    ),
+                    parent_issue_context=parent_issue_context,
+                    coder_session_id=coder_session_id,
+                    usage_context=usage_context,
+                    execution_recommendation=recommendation,
+                )
 
             if mode == "implement-one-shot":
                 plan_hash = approved_plan_hash(current_plan)
