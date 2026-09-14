@@ -1,5 +1,6 @@
 import sys
 import json
+import re
 from datetime import datetime as datetime_type, timezone
 
 import pytest
@@ -15,7 +16,9 @@ from coding_review_agent_loop.prompts import (
     build_issue_implementation_prompt,
     build_issue_prompt,
     build_issue_plan_prompt,
+    build_merge_conflict_prompt,
     build_plan_revision_prompt,
+    build_same_pr_followup_prompt,
     build_task_clarification_prompt,
     format_pr_checks,
 )
@@ -1884,11 +1887,12 @@ def test_coder_followup_prompts_require_human_requirements_acknowledgement_only_
     )
     without_requirements = builder(77, 2, "Fix the bug.", config)
 
-    assert "mandatory next-revision requirements" in with_requirements
-    assert HUMAN_REQUIREMENTS_ADDRESSED_MARKER in with_requirements
-    assert "### Human requirements" in with_requirements
+    assert "authoritative for next-revision requirements" in with_requirements
+    assert "human_requirement_dispositions" in with_requirements
+    assert re.search(r"(?m)^<!-- HUMAN_REQUIREMENTS_ADDRESSED -->$", with_requirements) is None
+    assert re.search(r"(?m)^### Human requirements$", with_requirements) is None
     assert f"`{requirement.requirement_id}`" in with_requirements
-    assert "mandatory next-revision requirements" not in without_requirements
+    assert "No signed human requirements were surfaced" in without_requirements
     assert f"`{requirement.requirement_id}`" not in without_requirements
 
 @pytest.mark.parametrize("builder", [build_followup_prompt, build_same_pr_followup_prompt])
@@ -1915,8 +1919,42 @@ def test_coder_followup_prompts_accept_precomputed_human_requirements_context(tm
     )
 
     assert context.block in prompt
-    assert HUMAN_REQUIREMENTS_ADDRESSED_MARKER in prompt
+    assert re.search(r"(?m)^<!-- HUMAN_REQUIREMENTS_ADDRESSED -->$", prompt) is None
+    assert "Do not place Markdown prose or any other content between the JSON object and the `AGENT_STATE` footer." in prompt
     assert f"`{requirements[0].requirement_id}`" in prompt
+
+
+def test_all_pr_followup_prompt_paths_use_json_only_human_requirement_acknowledgement(tmp_path):
+    config = make_config(tmp_path)
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="reviewer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Please use the absolute URL.",
+    )
+    prompts = (
+        build_followup_prompt(77, 2, "Fix the bug.", config, human_requirements=(requirement,)),
+        build_same_pr_followup_prompt(77, 2, "Fix the bug.", config, human_requirements=(requirement,)),
+        build_merge_conflict_prompt(
+            77,
+            2,
+            "Resolve the conflict.",
+            config,
+            human_requirements=(requirement,),
+            base_branch="main",
+            head_sha="deadbeef",
+            merge_state_detail="mergeable=CONFLICTING",
+        ),
+    )
+
+    for prompt in prompts:
+        assert '"kind": "coder_followup"' in prompt
+        assert "human_requirement_dispositions" in prompt
+        assert "Do not place Markdown prose or any other content between the JSON object and the `AGENT_STATE` footer." in prompt
+        assert re.search(r"(?m)^<!-- HUMAN_REQUIREMENTS_ADDRESSED -->$", prompt) is None
+        assert re.search(r"(?m)^### Human requirements$", prompt) is None
+        assert f"`{requirement.requirement_id}`" in prompt
 
 @pytest.mark.parametrize("builder", [build_followup_prompt, build_same_pr_followup_prompt])
 def test_coder_followup_prompts_require_structured_json(tmp_path, builder):

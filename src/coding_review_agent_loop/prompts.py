@@ -891,6 +891,7 @@ def render_coder_human_requirements_prompt_context(
 def _coder_human_requirements_guidance(
     context: CoderHumanRequirementsPromptContext,
     *,
+    response_kind: str = "plan_state",
     requirement_label: str = "next-revision requirements",
     include_disposition_json: bool = False,
     surfaced_requirement_instruction: str = (
@@ -900,6 +901,28 @@ def _coder_human_requirements_guidance(
     lines = [
         f"The signed human requirements section above is authoritative for {requirement_label}.",
     ]
+    if response_kind == "coder_followup":
+        lines.extend([
+            "This is a structured `coder_followup` response. Acknowledge signed human requirements only through the dedicated JSON fields `human_requirement_dispositions` and `human_requirements`.",
+            "Do not emit `<!-- HUMAN_REQUIREMENTS_ADDRESSED -->` or a `### Human requirements` section. Do not place Markdown prose or any other content between the JSON object and the `AGENT_STATE` footer.",
+        ])
+        if not context.surfaced_requirement_ids and not context.requires_direct_discussion_ack:
+            lines.extend([
+                "No signed human requirements were surfaced. Treat ordinary issue acceptance criteria, issue prose, reviewer items, and comments as non-signed context, not protocol IDs.",
+                "Set `human_requirement_dispositions` to [] and `human_requirements.addressed_ids` to [] with `checked_discussion_directly` false.",
+            ])
+        elif context.surfaced_requirement_ids:
+            surfaced = ", ".join(f"`{item}`" for item in context.surfaced_requirement_ids)
+            lines.extend([
+                "The structured JSON must include exactly one disposition with non-empty evidence for each surfaced signed requirement ID: "
+                + surfaced
+                + ". Put only labels with an `addressed` disposition in `human_requirements.addressed_ids`; blocked and not-applicable labels do not belong there.",
+            ])
+        else:
+            lines.extend([
+                "The detailed requirement entries were omitted to stay within prompt bounds. Set both JSON ledgers empty and set `checked_discussion_directly` true only after checking the GitHub discussion directly.",
+            ])
+        return "\n".join(lines) + "\n"
     if not context.surfaced_requirement_ids and not context.requires_direct_discussion_ack:
         lines.extend([
             "No signed human requirements were surfaced. Treat ordinary issue acceptance criteria, issue prose, reviewer items, and comments as non-signed context, not protocol IDs.",
@@ -2099,6 +2122,7 @@ prose between the JSON object and footer.
 {_scratch_file_guidance()}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
+    response_kind="plan_state",
     requirement_label="planning requirements",
     include_disposition_json=True,
     surfaced_requirement_instruction=(
@@ -2460,6 +2484,7 @@ branch, commit, push, or open a pull request during this planning stage.
 {_scratch_file_guidance()}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
+    response_kind="plan_revision",
     requirement_label="planning requirements",
     include_disposition_json=True,
     surfaced_requirement_instruction=(
@@ -2584,6 +2609,7 @@ def _build_compact_plan_revision_prompt(
         human_requirements_block=human_requirements_context.block,
         human_requirements_guidance=_coder_human_requirements_guidance(
             human_requirements_context,
+            response_kind="plan_revision",
             requirement_label="planning requirements",
             include_disposition_json=True,
             surfaced_requirement_instruction=(
@@ -3613,7 +3639,7 @@ Do not create a new PR.
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
-{human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
+{human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup")}
 {_architecture_impact_guidance(required=True)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
@@ -3672,7 +3698,7 @@ remains blocked pending another review round after this cleanup.
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
-{human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
+{human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup")}
 {_architecture_impact_guidance(required=True)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
@@ -3736,7 +3762,7 @@ against the new head after your push.
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
-{human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context)}
+{human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup")}
 {_architecture_impact_guidance(required=True)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}

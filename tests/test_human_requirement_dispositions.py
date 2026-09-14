@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from agent_loop_helpers import structured_coder_followup
 import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import HumanReviewRequirement
@@ -104,3 +105,26 @@ def test_current_plan_gate_rejects_missing_coder_dispositions():
         _plan([]),
         surfaced_requirement_ids=("Requirement 1",),
     )
+
+
+def test_ack_gate_requires_dedicated_coder_disposition_evidence():
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="reviewer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Please use the absolute URL.",
+    )
+    output = structured_coder_followup(
+        addressed_items=[],
+        human_requirement_ids=[],
+        human_requirement_dispositions=[],
+    )
+
+    with pytest.raises(AgentLoopError, match="missing"):
+        validate_human_requirement_dispositions(
+            [],
+            surfaced_requirement_ids=(requirement.requirement_id,),
+            context="coder_followup.human_requirement_dispositions",
+        )
+    assert '"human_requirement_dispositions": []' in output

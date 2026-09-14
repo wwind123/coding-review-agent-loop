@@ -1,8 +1,11 @@
 """Orchestrator-level tests for GitHub merge-conflict detection and routing (#606)."""
+import re
 from unittest.mock import patch
 
 import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import run_pr_loop
+from coding_review_agent_loop.github import HumanReviewRequirement
+from coding_review_agent_loop.prompts import build_merge_conflict_prompt
 
 from agent_loop_helpers import FakeRunner, command_index, make_config
 
@@ -25,6 +28,31 @@ def _check_runs_commands(runner):
 
 def _merge_commands(runner):
     return [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "merge"]]
+
+
+def test_conflict_followup_keeps_human_ack_out_of_reviewer_item_fields(tmp_path):
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="reviewer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Please use the absolute URL.",
+    )
+    prompt = build_merge_conflict_prompt(
+        77,
+        2,
+        "Human-requirements acknowledgement is still pending.",
+        make_config(tmp_path),
+        human_requirements=(requirement,),
+        base_branch="main",
+        head_sha="deadbeef",
+        merge_state_detail="mergeable=CONFLICTING",
+    )
+
+    assert "merge conflict" in prompt.lower()
+    assert "human_requirement_dispositions" in prompt
+    assert re.search(r"(?m)^<!-- HUMAN_REQUIREMENTS_ADDRESSED -->$", prompt) is None
+    assert re.search(r"(?m)^### Human requirements$", prompt) is None
 
 
 def test_conflict_at_round_start_skips_reviewers_and_routes_to_coder(tmp_path):

@@ -2313,7 +2313,7 @@ def test_pr_loop_rejects_malformed_structured_coder_followup_before_re_review(tm
     ):
         run_pr_loop(runner, pr_number=77, config=config)
 
-def test_reconcile_human_requirements_ack_item_surfaces_markdown_ack_blocker():
+def test_reconcile_human_requirements_ack_item_does_not_mint_blocker_for_generic_output():
     human_requirements = (
         HumanReviewRequirement(
             source_type="PR comment",
@@ -2331,8 +2331,59 @@ def test_reconcile_human_requirements_ack_item_surfaces_markdown_ack_blocker():
         source_round=2,
     )
 
+    assert reconciled == []
+
+
+def test_reconcile_human_requirements_ack_item_retains_dedicated_failure():
+    human_requirements = (
+        HumanReviewRequirement(
+            source_type="PR comment",
+            author="reviewer",
+            created_at="2026-05-18T10:00:00Z",
+            url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+            body="Please use the absolute URL.",
+        ),
+    )
+    invalid_structured = structured_coder_followup(
+        addressed_items=[],
+        human_requirement_ids=[],
+        human_requirement_dispositions=[],
+    )
+
+    reconciled = _reconcile_human_requirements_ack_item(
+        (),
+        coder_output=invalid_structured,
+        human_requirements=human_requirements,
+        source_round=2,
+    )
+
     assert [item.item_id for item in reconciled] == [HUMAN_REQUIREMENTS_ACK_ITEM_ID]
-    assert "missing required signed human requirements marker" in reconciled[0].text
+    assert "missing" in reconciled[0].text.lower()
+
+
+def test_rejected_structured_response_content_cannot_trigger_provider_advice():
+    malformed = structured_coder_followup(
+        summary="Authentication, credit, billing, and dirty-tree vocabulary are only content.",
+    )
+
+    assert (
+        orchestrator._failure_category(
+            malformed,
+            public_response=True,
+            repair_expected_kind="coder_followup",
+        )
+        == "deterministic"
+    )
+    error = orchestrator._format_invalid_agent_response_error(
+        agent_name="Anthropic Claude",
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        reason="schema validation failed; repair invocation failure: timeout",
+        result=None,
+        log_paths=(),
+        category="deterministic",
+        classification_text="structured coder_followup response failed trusted validation",
+    )
+    assert "credentials or billing" not in error
 
 def test_reconcile_human_requirements_ack_item_clears_markdown_ack_blocker():
     human_requirements = (
@@ -4360,7 +4411,7 @@ def test_watch_publishes_approved_followups_only_after_terminal_success(
             structured_coder_followup(
                 state="blocking",
                 summary="Fixed CI.",
-                addressed_items=["item-2"],
+                addressed_items=["item-1", "item-2"],
             )
         ],
     )
@@ -6167,6 +6218,85 @@ def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rerevie
     assert "Keep the change narrowly scoped to the listed items" in followup_prompt
     assert "Do not take on\nlarger redesigns or unrelated future work" in followup_prompt
     assert "Add broader integration coverage later." in runner.comments[-1]
+
+
+def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_items(tmp_path):
+    """Same-PR dispatch must give repair the same item namespace as its prompt."""
+    malformed_coder_response = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "coder_followup",
+            "state": "approved",
+            "summary": "The visible follow-up is complete.",
+            "addressed_items": ["item-2"],
+            "remaining_items": [],
+            "human_requirements": {
+                "addressed_ids": [],
+                "checked_discussion_directly": False,
+            },
+            "human_requirement_dispositions": [],
+        }
+    )
+    repaired_coder_response = structured_coder_followup(
+        state="approved",
+        summary="The visible follow-up is complete.",
+        addressed_items=["item-2"],
+        remaining_items=[],
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                future_followups=["Document the broader behavior in a later PR."],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="The current-PR behavior is fixed.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "future"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+        ],
+        gemini_outputs=[
+            structured_pr_review(
+                state="blocking",
+                same_pr_followups=["Fix the current-PR behavior."],
+                reviewer="Google Gemini",
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="The current-PR behavior is fixed.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "future"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+                reviewer="Google Gemini",
+            ),
+        ],
+        claude_outputs=[
+            malformed_coder_response,
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        approved_followups="fix-and-summarize",
+        agent_max_retries=0,
+        reviewer=("codex", "gemini"),
+    )
+    repair_calls = []
+
+    def fake_attempt_repair(raw, gemini_cmd, *, expected_kind=None, **kwargs):
+        repair_calls.append((expected_kind, kwargs.get("unresolved_item_ids")))
+        return repaired_coder_response
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert repair_calls == [("coder_followup", ("item-2",))]
+    followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "Fix the current-PR behavior." in followup_prompt
+    assert "Document the broader behavior in a later PR." not in followup_prompt
 
 
 def test_blocking_same_pr_followup_reaches_coder_even_when_approved_followups_ignored(tmp_path):
