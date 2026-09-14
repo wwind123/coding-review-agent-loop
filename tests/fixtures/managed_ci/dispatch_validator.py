@@ -1,7 +1,7 @@
 """Extraction-bounded copy of the workflow's v2 dispatch validator.
 
 Source repository: wwind123/coding-review-agent-loop
-Source commit: 544b7659cda865d3f436e5b884b6d77d54a05e67
+Source commit: 1dde616f1f1b8274994548306f4ca255a9c98786
 Source path: .github/workflows/ci.yml
 Extraction boundary: ``validate_dispatch`` through its return value.
 The contract tests invoke this copy with offline API callbacks and compare its

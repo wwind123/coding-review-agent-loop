@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -41,6 +42,20 @@ def _dispatch_block(text: str) -> str:
 
 def _publisher_block(text: str) -> str:
     return _extraction_block(text, "MANAGED_CI_V2_PUBLISHER")
+
+
+def _fixture_source_commit(text: str) -> str:
+    match = re.search(r"^Source commit: ([0-9a-f]{40})$", text, re.MULTILINE)
+    assert match is not None
+    return match.group(1)
+
+
+def _workflow_at_commit(commit: str) -> str:
+    return subprocess.check_output(
+        ["git", "show", f"{commit}:.github/workflows/ci.yml"],
+        cwd=ROOT,
+        text=True,
+    )
 
 
 def _job_if_expression(text: str) -> str:
@@ -160,6 +175,21 @@ def test_dispatch_validator_fixture_is_an_extraction_of_production_workflow():
 def test_publisher_fixture_is_an_extraction_of_production_workflow():
     assert _publisher_block(_workflow_text()) == _publisher_block(
         PUBLISHER_FIXTURE.read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.parametrize(
+    ("fixture", "marker"),
+    [
+        (DISPATCH_FIXTURE, "MANAGED_CI_V2_DISPATCH_VALIDATOR"),
+        (PUBLISHER_FIXTURE, "MANAGED_CI_V2_PUBLISHER"),
+    ],
+)
+def test_fixture_provenance_commit_contains_the_extracted_workflow_block(fixture, marker):
+    fixture_text = fixture.read_text(encoding="utf-8")
+    source_commit = _fixture_source_commit(fixture_text)
+    assert _extraction_block(_workflow_at_commit(source_commit), marker) == _extraction_block(
+        fixture_text, marker
     )
 
 

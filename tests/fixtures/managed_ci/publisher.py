@@ -1,7 +1,7 @@
 """Extraction-bounded copy of the workflow's terminal publisher decision.
 
 Source repository: wwind123/coding-review-agent-loop
-Source commit: 278699233efee2aebe5346e89e7daebaa0bb8cd6
+Source commit: 1dde616f1f1b8274994548306f4ca255a9c98786
 Source path: .github/workflows/ci.yml
 Extraction boundary: ``build_status_request`` through its return value.
 The contract tests compare this fixture to the production workflow and invoke
