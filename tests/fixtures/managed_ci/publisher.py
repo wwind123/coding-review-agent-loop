@@ -2,6 +2,7 @@
 
 Source repository: wwind123/coding-review-agent-loop
 Source commit: 1dde616f1f1b8274994548306f4ca255a9c98786
+Source block SHA-256: 818c8419655f01e205095d2046a28cd28050868148eed0bcbeb41b7a5af41c4b
 Source path: .github/workflows/ci.yml
 Extraction boundary: ``build_status_request`` through its return value.
 The contract tests compare this fixture to the production workflow and invoke

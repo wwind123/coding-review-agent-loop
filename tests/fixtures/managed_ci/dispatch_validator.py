@@ -2,6 +2,7 @@
 
 Source repository: wwind123/coding-review-agent-loop
 Source commit: 1dde616f1f1b8274994548306f4ca255a9c98786
+Source block SHA-256: 4ec4a65cdd9026144a7e05972cb450d14258542ed14e9fec8ec5221ee92deaf8
 Source path: .github/workflows/ci.yml
 Extraction boundary: ``validate_dispatch`` through its return value.
 The contract tests invoke this copy with offline API callbacks and compare its

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-import subprocess
 import textwrap
 from pathlib import Path
 
@@ -44,18 +44,10 @@ def _publisher_block(text: str) -> str:
     return _extraction_block(text, "MANAGED_CI_V2_PUBLISHER")
 
 
-def _fixture_source_commit(text: str) -> str:
-    match = re.search(r"^Source commit: ([0-9a-f]{40})$", text, re.MULTILINE)
+def _fixture_source_digest(text: str) -> str:
+    match = re.search(r"^Source block SHA-256: ([0-9a-f]{64})$", text, re.MULTILINE)
     assert match is not None
     return match.group(1)
-
-
-def _workflow_at_commit(commit: str) -> str:
-    return subprocess.check_output(
-        ["git", "show", f"{commit}:.github/workflows/ci.yml"],
-        cwd=ROOT,
-        text=True,
-    )
 
 
 def _job_if_expression(text: str) -> str:
@@ -185,12 +177,13 @@ def test_publisher_fixture_is_an_extraction_of_production_workflow():
         (PUBLISHER_FIXTURE, "MANAGED_CI_V2_PUBLISHER"),
     ],
 )
-def test_fixture_provenance_commit_contains_the_extracted_workflow_block(fixture, marker):
+def test_fixture_provenance_digest_contains_the_extracted_workflow_block(fixture, marker):
     fixture_text = fixture.read_text(encoding="utf-8")
-    source_commit = _fixture_source_commit(fixture_text)
-    assert _extraction_block(_workflow_at_commit(source_commit), marker) == _extraction_block(
-        fixture_text, marker
-    )
+    source_digest = _fixture_source_digest(fixture_text)
+    fixture_block = _extraction_block(fixture_text, marker)
+    workflow_block = _extraction_block(_workflow_text(), marker)
+    assert hashlib.sha256(fixture_block.encode("utf-8")).hexdigest() == source_digest
+    assert hashlib.sha256(workflow_block.encode("utf-8")).hexdigest() == source_digest
 
 
 @pytest.mark.parametrize("state", ["dispatch-requested", "attached", "completed"])
