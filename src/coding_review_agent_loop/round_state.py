@@ -800,6 +800,25 @@ def _decode_matrix_json(value: object, *, context: str) -> object | None:
     return json.loads(value)
 
 
+def _risk_test_matrix_metadata_present(metadata: PostedRoundMetadata) -> bool:
+    """Return whether metadata carries a matrix record rather than defaults.
+
+    ``risk_test_matrix_changes_payload`` defaults to an empty tuple for
+    backwards-compatible in-memory construction.  That default is not a
+    durable matrix discriminator and must not make a legacy record appear
+    matrix-bearing during recovery.
+    """
+    return any(
+        value is not None
+        for value in (
+            metadata.risk_test_matrix_contract_version,
+            metadata.risk_test_matrix_payload,
+            metadata.risk_test_matrix_identity,
+            metadata.risk_test_matrix_boundary_digest,
+        )
+    ) or bool(metadata.risk_test_matrix_changes_payload)
+
+
 def _matrix_metadata_fields(
     payload: Mapping[str, object], *, canonical_text: str | None = None
 ) -> dict[str, object]:
@@ -942,15 +961,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
     }
     if any(value not in (None, (), []) for value in scheduler_values.values()):
         payload.update(scheduler_values)
-    matrix_present = any(
-        value is not None
-        for value in (
-            metadata.risk_test_matrix_contract_version,
-            metadata.risk_test_matrix_payload,
-            metadata.risk_test_matrix_identity,
-            metadata.risk_test_matrix_boundary_digest,
-        )
-    )
+    matrix_present = _risk_test_matrix_metadata_present(metadata)
     matrix_values = {
         "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,
         "risk_test_matrix_payload": _matrix_json(metadata.risk_test_matrix_payload),
@@ -2039,16 +2050,7 @@ def recover_approved_plan_context(
     matching_indices = {index for index, _raw in candidates}
     matching_records = [record for record in records if record.index in matching_indices]
     matrix_presence = [
-        any(
-            value is not None
-            for value in (
-                record.metadata.risk_test_matrix_contract_version,
-                record.metadata.risk_test_matrix_payload,
-                record.metadata.risk_test_matrix_changes_payload,
-                record.metadata.risk_test_matrix_identity,
-                record.metadata.risk_test_matrix_boundary_digest,
-            )
-        )
+        _risk_test_matrix_metadata_present(record.metadata)
         for record in matching_records
     ]
     matching_matrix_identities = {

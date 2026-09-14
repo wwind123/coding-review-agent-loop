@@ -456,6 +456,34 @@ def test_m780_06_metadata_round_trip_authenticates_payload_not_rendered_words() 
     assert closed.risk_test_matrix_diagnostic
 
 
+def test_legacy_plan_recovery_ignores_empty_default_matrix_audit() -> None:
+    canonical = "Legacy approved plan\n\n### Scope\n- Preserve the API."
+    comment = SimpleNamespace(
+        body=_attach_round_metadata(
+            canonical,
+            PostedRoundMetadata(
+                flow="plan",
+                role="coder",
+                agent="Codex",
+                round_number=1,
+                subject="legacy",
+                canonical_plan=canonical,
+            ),
+        )
+    )
+
+    expected = make_approved_plan_context(canonical)
+    recovered = recover_approved_plan_context(
+        (comment,),
+        expected_hash=expected.plan_hash,
+        expected_subject=expected.plan_subject,
+    )
+
+    assert recovered.is_available
+    assert recovered.risk_test_matrix_availability == "not-planned"
+    assert recovered.risk_test_matrix_diagnostic is None
+
+
 def test_m780_11_payload_bound_boundary_mismatch_closes_only_matrix_channel() -> None:
     matrix = parse_risk_test_matrix(_matrix())
     identity = risk_test_matrix_identity(matrix)
