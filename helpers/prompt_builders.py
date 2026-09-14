@@ -35,6 +35,7 @@ from coding_review_agent_loop.prompts import (
     build_plan_decomposition_prompt,
     build_plan_review_prompt,
     build_plan_revision_prompt,
+    build_plan_shortening_prompt,
     build_review_prompt,
     build_same_pr_followup_prompt,
     render_coder_human_requirements_prompt_context,
@@ -522,6 +523,39 @@ def build_plan_revision_prompt_for_skill(
         unresolved_items=unresolved,
         architecture_context=architecture_context,
         require_risk_test_matrix_contract=risk_test_matrix_contract_required,
+    ), config)
+
+
+def build_plan_shortening_prompt_for_skill(
+    original_response: str,
+    *,
+    response_kind: str,
+    target_chars: int,
+    repo: str,
+    coder: AgentName,
+    reviewers: Sequence[AgentName] = (),
+    workdir: str,
+    prior_items_raw: Sequence[dict] = (),
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    architecture_options: dict | None = None,
+) -> str:
+    """Build the fresh, one-pass lossless shortening prompt for skill mode."""
+    config = make_minimal_config(
+        repo, coder, tuple(reviewers), reviewer=coder, workdir=workdir,
+        architecture_context=architecture_context,
+        **(architecture_options or {}),
+    )
+    architecture_context = architecture_context or _acquire_skill_architecture(
+        config, workdir=workdir,
+    )
+    unresolved = [_deserialize_unresolved_item(item) for item in prior_items_raw]
+    return _with_containment_guidance(build_plan_shortening_prompt(
+        original_response,
+        response_kind=response_kind,  # type: ignore[arg-type]
+        target_chars=target_chars,
+        config=config,
+        prior_items=unresolved,
+        architecture_context=architecture_context,
     ), config)
 
 

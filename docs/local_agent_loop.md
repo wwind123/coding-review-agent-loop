@@ -64,6 +64,33 @@ without invalidating an otherwise verified plan hash and subject. Legacy records
 without a matrix remain resumable without fabrication. Both CLI and skill-mode
 helpers accept `--require-risk-test-matrix-contract` for fresh contract checks.
 
+### Planning publication transport and bounded shortening
+
+Planning prompts include a conservative Unicode-character response ceiling. It
+accounts for measured canonical-render expansion, visible sections, metadata,
+references, and a reserve; it is guidance for model-controlled JSON/prose, not
+a GitHub postability guarantee. Publication uses a typed preflight of the
+actual rendered, projected, metadata-attached carrier and does not advance
+round state before that carrier fits the hard 60,000-character limit.
+
+Transport projects large execution recommendations and risk matrices before
+asking a model to shorten prose. The visible anchor keeps a bounded summary and
+authenticated reference while digest-checked sidecars carry the exact canonical
+payload and matrix audit. Consumers hydrate and verify those payloads before
+strict validation, resume, hashing, review, or decomposition. If prose remains
+oversized, a fresh configured coder receives one separately accounted
+`shortener` turn; structured fields remain exact and summary/step clauses must
+survive deterministic ordered literal matching. A lossy, invalid, second-attempt,
+or still-oversized result is rejected without review or approval effects.
+
+The original valid candidate is retained in bounded recovery state with its
+digest, canonical identity, target, failure, sidecar completeness, and consumed
+attempt flag. Partial sidecars or anchors fail closed. In host-as-coder mode,
+`run-plan-round` persists an `attempt-required` handoff and accepts one
+digest-bound `--shortened-plan-file` re-entry; restart cannot reset the attempt
+or invoke a competing planner. Historical unversioned rounds remain
+legacy-undecided rather than being upgraded by inference.
+
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
 ### Machine obligations and resumable qualification

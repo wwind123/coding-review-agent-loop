@@ -24,11 +24,84 @@ from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
     UNKNOWN_MACHINE_AUTHORITY,
+    parse_risk_test_matrix,
+    risk_test_matrix_identity,
     validate_structured_plan_state,
 )
+from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
 from coding_review_agent_loop.review_scheduling import ReviewSchedulingContract
 from coding_review_agent_loop.unresolved_items import _apply_unresolved_item_dispositions
 from coding_review_agent_loop.protocol_markers import TrustedBody
+
+
+def _large_matrix_payload() -> dict[str, object]:
+    rows = []
+    for index in range(10):
+        # Distinct text prevents compression from hiding the sidecar boundary.
+        blob = hashlib.sha256(f"matrix-row-{index}".encode()).hexdigest() * 10
+        rows.append({
+            "row_id": f"row-{index}",
+            "label": f"Exercise {blob}",
+            "entry_path_or_mode": f"CLI mode {blob}",
+            "initial_state": f"Validated state {blob}",
+            "event": f"Transport event {blob}",
+            "expected_outcome": f"Exact hydration {blob}",
+            "forbidden_side_effects": [f"No loss {blob}"],
+            "proposed_test_level": "boundary unit tests",
+            "proposed_test_location": "tests/test_round_transport.py",
+            "applicability": "required",
+            "related_scope_item_ids": ["scope-projection"],
+            "execution_owner": "one-shot",
+        })
+    return {
+        "applicability": "applicable",
+        "rows": rows,
+        "important_exclusions": ["No truncation or identity drift."],
+    }
+
+
+def test_planning_policy_uses_unicode_guidance_separate_from_actual_fit() -> None:
+    policy = transport.PlanningPublicationPolicy(
+        hard_limit_chars=100,
+        measured_renderer_expansion_chars=10,
+        required_visible_section_chars=5,
+        attached_metadata_chars=7,
+        reference_chars=3,
+        safety_reserve_chars=2,
+    )
+    assert policy.response_ceiling_chars == 73
+    assert transport.planning_response_ceiling(
+        hard_limit_chars=100,
+        measured_renderer_expansion_chars=10,
+        required_visible_section_chars=5,
+        attached_metadata_chars=7,
+        reference_chars=3,
+        safety_reserve_chars=2,
+    ) == 73
+    fits = transport.preflight_planning_publication("✓" * 100)
+    oversized = transport.preflight_planning_publication("✓" * 60_001)
+    assert fits.status == "fits"
+    assert oversized.status == "shortening-required"
+    assert oversized.original_response_chars == 60_001
+
+
+def test_oversized_matrix_is_projected_losslessly_before_shortening() -> None:
+    matrix = parse_risk_test_matrix(_large_matrix_payload())
+    identity = risk_test_matrix_identity(matrix)
+    section = render_risk_test_matrix_section(matrix)
+    body = _random_text(30_000) + "\n\n" + section
+
+    prepared = transport.prepare_round_comment(body)
+    assert len(prepared) > 1
+    assert all(len(str(part)) <= transport.MAX_GITHUB_BODY_CHARS for part in prepared)
+    anchor = str(prepared[-1])
+    marker = list(comment_rendering.RISK_TEST_MATRIX_MARKER_RE.finditer(anchor))[-1]
+    hydrated = comment_rendering.decode_risk_test_matrix_marker(
+        marker.group("payload"), bodies=tuple(map(str, prepared))
+    )
+    assert hydrated["identity"] == identity
+    assert hydrated["matrix"] == matrix.to_payload()
+    assert transport.preflight_planning_publication(body).status == "fits"
 
 
 def _random_text(size: int) -> str:

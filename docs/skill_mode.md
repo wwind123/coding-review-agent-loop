@@ -62,6 +62,32 @@ plans without a matrix remain compatible. Use
 `--require-risk-test-matrix-contract` when explicitly checking a fresh matrix
 contract.
 
+### Planning publication transport and host handoff
+
+All initial and revision prompt builders give the coder a conservative
+Unicode-character ceiling for model-controlled JSON/prose. The ceiling budgets
+renderer expansion, visible sections, metadata, references, and a reserve; it
+is guidance, while only preflight of the actual rendered, projected,
+metadata-attached carrier authorizes publication under the hard 60,000-character
+limit.
+
+Execution recommendations and risk matrices are projected before shortening.
+Their bounded anchors retain readable summaries and authenticated references;
+exact canonical payloads and matrix audits stay in digest-checked sidecars and
+are hydrated before strict consumers run. One residual oversized candidate gets
+one fresh `shortener` invocation with separate usage accounting. Exact
+structured fields and deterministic ordered summary/step clauses are checked
+before re-rendering and posting. Invalid, lossy, second-attempt, or still-
+oversized output fails closed without reviewer or approval state changes.
+
+The host-as-coder path persists the original response, digest, response kind,
+target, failure, sidecar completeness, and `attempt-required` state. Re-enter
+once with `--shortened-plan-file PATH`; the file must match the recorded kind
+and lineage, and the attempt is consumed before validation. Restart resumes the
+handoff or recovery artifact rather than treating the original as a new round
+or invoking a competing planner. Historical unversioned rounds remain
+legacy-undecided.
+
 ### Containment and test gates
 
 External skill agents and the skill-mode test gate use the same shared

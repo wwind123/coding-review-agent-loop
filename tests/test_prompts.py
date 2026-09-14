@@ -18,6 +18,7 @@ from coding_review_agent_loop.prompts import (
     build_issue_plan_prompt,
     build_merge_conflict_prompt,
     build_plan_revision_prompt,
+    build_plan_shortening_prompt,
     build_same_pr_followup_prompt,
     build_task_clarification_prompt,
     format_pr_checks,
@@ -91,6 +92,23 @@ def test_fresh_plan_prompts_show_the_exact_one_shot_contract_shape(tmp_path):
         assert '"final_integration_work": {"status": "none"' in prompt
         assert "Do not include non-empty top-level legacy" in prompt
     assert "omit child stages" not in initial.lower()
+
+
+def test_all_plan_entry_prompts_explain_response_guidance_and_shortening_contract(tmp_path):
+    config = make_config(tmp_path)
+    initial = build_issue_plan_prompt(814, config)
+    full_revision = build_plan_revision_prompt(814, 2, "Previous plan", "Blocking review", config)
+    compact_revision = build_plan_revision_prompt(
+        814, 2, "Previous plan", "Blocking review", config, compact_context=True
+    )
+    shortening = build_plan_shortening_prompt(
+        '{"kind":"plan_state"}', response_kind="plan_state", target_chars=42, config=config
+    )
+    for prompt in (initial, full_revision, compact_revision, shortening):
+        assert "Unicode characters" in prompt
+        assert "not a GitHub postability limit" in prompt
+    assert "dedicated one-pass transport recovery turn" in shortening
+    assert "Do not paraphrase" in shortening
 
 
 def test_legacy_plan_revision_prompt_does_not_invent_matrix_generation(tmp_path):

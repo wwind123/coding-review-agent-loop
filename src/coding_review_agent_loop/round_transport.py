@@ -8,6 +8,8 @@ import json
 import re
 import zlib
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Literal
 
 from .errors import AgentLoopError
 from .protocol_markers import TrustedBody, scan_reserved_markers
@@ -29,6 +31,16 @@ _EXECUTION_RECOMMENDATION_SECTION_BOUNDARY_RE = re.compile(
     r"(?P<digest>[0-9a-f]{64})\s*-->\r?$",
     re.I,
 )
+_RISK_TEST_MATRIX_MARKER_RE = re.compile(
+    r"<!--\s*AGENT_RISK_TEST_MATRIX:\s*"
+    r"(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.I,
+)
+_RISK_TEST_MATRIX_SECTION_BOUNDARY_RE = re.compile(
+    r"(?m)^<!--\s*risk-test-matrix-section:\s*"
+    r"(?P<identity>[0-9a-f]{64})\s*-->\r?$",
+    re.I,
+)
 # Spill reviewer checkpoints first: they are often the largest metadata field
 # and are required to safely resume a provisional parallel-review round.
 _SPILL_FIELDS = (
@@ -48,6 +60,153 @@ _SPILL_FIELDS = (
 _MAX_COMPRESSED = 8_000_000
 _MAX_DECOMPRESSED = 16_000_000
 _PART_CHARS = 40_000
+
+# Planning responses are model-controlled text.  This guidance is deliberately
+# lower than the GitHub limit because canonical rendering, protocol metadata,
+# sidecar references, and a small reserve are not controlled by the model.
+DEFAULT_RENDERER_EXPANSION_CHARS = 4_000
+DEFAULT_VISIBLE_SECTION_CHARS = 2_000
+DEFAULT_ATTACHED_METADATA_CHARS = 5_000
+DEFAULT_REFERENCE_CHARS = 1_000
+DEFAULT_SAFETY_RESERVE_CHARS = 2_000
+
+
+@dataclass(frozen=True)
+class PlanningPublicationPolicy:
+    """The planning response guidance and actual carrier hard limit.
+
+    All public quantities in this policy are Unicode characters.  The hard
+    limit is intentionally separate from the model response ceiling: only the
+    prepared carrier decides whether publication is authorized.
+    """
+
+    hard_limit_chars: int = MAX_GITHUB_BODY_CHARS
+    measured_renderer_expansion_chars: int = DEFAULT_RENDERER_EXPANSION_CHARS
+    required_visible_section_chars: int = DEFAULT_VISIBLE_SECTION_CHARS
+    attached_metadata_chars: int = DEFAULT_ATTACHED_METADATA_CHARS
+    reference_chars: int = DEFAULT_REFERENCE_CHARS
+    safety_reserve_chars: int = DEFAULT_SAFETY_RESERVE_CHARS
+
+    def __post_init__(self) -> None:
+        values = (
+            self.hard_limit_chars,
+            self.measured_renderer_expansion_chars,
+            self.required_visible_section_chars,
+            self.attached_metadata_chars,
+            self.reference_chars,
+            self.safety_reserve_chars,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise ValueError("Planning publication costs must be integer character quantities.")
+        if self.hard_limit_chars <= 0 or any(value < 0 for value in values[1:]):
+            raise ValueError("Planning publication costs must be non-negative and bounded.")
+
+    @property
+    def model_response_ceiling_chars(self) -> int:
+        return max(
+            1,
+            self.hard_limit_chars
+            - self.measured_renderer_expansion_chars
+            - self.required_visible_section_chars
+            - self.attached_metadata_chars
+            - self.reference_chars
+            - self.safety_reserve_chars,
+        )
+
+    @property
+    def response_ceiling_chars(self) -> int:
+        """Alias used by prompt builders and callers outside transport."""
+        return self.model_response_ceiling_chars
+
+
+DEFAULT_PLANNING_PUBLICATION_POLICY = PlanningPublicationPolicy()
+
+
+@dataclass(frozen=True)
+class PlanningPreflightOutcome:
+    """Typed result of preparing the actual planning carrier."""
+
+    status: Literal["fits", "shortening-required", "unrecoverable"]
+    response_ceiling_chars: int
+    original_response_chars: int
+    prepared: tuple[TrustedBody, ...] = ()
+    diagnostic: str | None = None
+
+    @property
+    def postable(self) -> bool:
+        return self.status == "fits" and bool(self.prepared)
+
+
+def planning_response_ceiling(
+    *,
+    hard_limit_chars: int = MAX_GITHUB_BODY_CHARS,
+    measured_renderer_expansion_chars: int = DEFAULT_RENDERER_EXPANSION_CHARS,
+    required_visible_section_chars: int = DEFAULT_VISIBLE_SECTION_CHARS,
+    attached_metadata_chars: int = DEFAULT_ATTACHED_METADATA_CHARS,
+    reference_chars: int = DEFAULT_REFERENCE_CHARS,
+    safety_reserve_chars: int = DEFAULT_SAFETY_RESERVE_CHARS,
+) -> int:
+    """Compute conservative Unicode-character guidance for a plan response."""
+    return PlanningPublicationPolicy(
+        hard_limit_chars=hard_limit_chars,
+        measured_renderer_expansion_chars=measured_renderer_expansion_chars,
+        required_visible_section_chars=required_visible_section_chars,
+        attached_metadata_chars=attached_metadata_chars,
+        reference_chars=reference_chars,
+        safety_reserve_chars=safety_reserve_chars,
+    ).response_ceiling_chars
+
+
+def planning_response_guidance(
+    policy: PlanningPublicationPolicy = DEFAULT_PLANNING_PUBLICATION_POLICY,
+) -> str:
+    """Render the model-facing budget without conflating it with postability."""
+    return (
+        "Planning response size guidance (Unicode characters): keep the model-"
+        f"controlled structured JSON/prose at or below {policy.response_ceiling_chars:,} "
+        "characters. This is conservative guidance, not a GitHub postability "
+        "limit; canonical rendering, lossless transport projections, metadata, "
+        "and references are measured again on the actual prepared carrier before "
+        f"publication (hard carrier ceiling {policy.hard_limit_chars:,} characters)."
+    )
+
+
+def preflight_planning_publication(
+    body: str | TrustedBody,
+    *,
+    policy: PlanningPublicationPolicy = DEFAULT_PLANNING_PUBLICATION_POLICY,
+) -> PlanningPreflightOutcome:
+    """Prepare a plan carrier without advancing state or posting a comment."""
+    original_chars = len(str(body))
+    try:
+        prepared = prepare_round_comment(body)
+    except AgentLoopError as exc:
+        diagnostic = str(exc)
+        status: Literal["shortening-required", "unrecoverable"] = (
+            "shortening-required"
+            if "shorten" in diagnostic.lower() or "oversized" in diagnostic.lower()
+            else "unrecoverable"
+        )
+        return PlanningPreflightOutcome(
+            status=status,
+            response_ceiling_chars=policy.response_ceiling_chars,
+            original_response_chars=original_chars,
+            diagnostic=diagnostic,
+        )
+    if any(len(part) > policy.hard_limit_chars for part in prepared):
+        return PlanningPreflightOutcome(
+            status="unrecoverable",
+            response_ceiling_chars=policy.response_ceiling_chars,
+            original_response_chars=original_chars,
+            prepared=prepared,
+            diagnostic="Prepared planning carrier exceeds the hard character ceiling.",
+        )
+    return PlanningPreflightOutcome(
+        status="fits",
+        response_ceiling_chars=policy.response_ceiling_chars,
+        original_response_chars=original_chars,
+        prepared=prepared,
+    )
 
 
 def execution_recommendation_section_boundary(encoded: str) -> str:
@@ -270,6 +429,128 @@ def _prepare_execution_recommendation_transport(
     )
 
 
+def _prepare_risk_test_matrix_transport(
+    body_text: str,
+) -> tuple[str, list[TrustedBody], tuple[int, int, str] | None]:
+    """Project a large validated matrix into an authenticated compact anchor.
+
+    The caller has already rendered the validated structured response.  The
+    matrix marker and identity boundary are therefore authenticated inputs; the
+    exact canonical matrix-plus-change payload is copied losslessly into the
+    ordinary bounded sidecar channel before the visible section is replaced.
+    """
+    if len(body_text) <= MAX_GITHUB_BODY_CHARS:
+        return body_text, [], None
+    from .comment_rendering import decode_risk_test_matrix_marker
+
+    markers = list(_RISK_TEST_MATRIX_MARKER_RE.finditer(body_text))
+    boundaries = list(_RISK_TEST_MATRIX_SECTION_BOUNDARY_RE.finditer(body_text))
+    if len(markers) != 1 or len(boundaries) != 1:
+        return body_text, [], None
+    marker = markers[0]
+    boundary = boundaries[0]
+    if marker.start() < boundary.end():
+        return body_text, [], None
+    try:
+        parsed = decode_risk_test_matrix_marker(marker.group("payload"))
+    except (AgentLoopError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise AgentLoopError(
+            "Risk test matrix marker is not a recoverable canonical payload."
+        ) from None
+    if parsed.get("identity") != boundary.group("identity"):
+        raise AgentLoopError("Risk test matrix section boundary does not match its payload.")
+    if "$round_transport_risk_test_matrix" in parsed:
+        # A second preparation pass is already projected.  Do not mint a new
+        # sidecar lineage or alter the authenticated reference.
+        return body_text, [], None
+
+    canonical_raw = json.dumps(
+        {
+            "contract_version": parsed["contract_version"],
+            "matrix": parsed["matrix"],
+            "changes": parsed["changes"],
+            "identity": parsed["identity"],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    packed = zlib.compress(canonical_raw, 9)
+    if len(packed) > _MAX_COMPRESSED:
+        raise AgentLoopError("Risk test matrix is too large to transport safely.")
+    encoded_packed = _b64(packed)
+    anchor_id = hashlib.sha256(body_text.encode("utf-8")).hexdigest()[:24]
+    spill_digest = hashlib.sha256(packed).hexdigest()
+    raw_digest = hashlib.sha256(canonical_raw).hexdigest()
+    chunks = [
+        encoded_packed[index : index + _PART_CHARS]
+        for index in range(0, len(encoded_packed), _PART_CHARS)
+    ]
+    reference = {
+        "$round_transport_risk_test_matrix": anchor_id,
+        "field": "risk_test_matrix_payload",
+        "parts": len(chunks),
+        "sha256": raw_digest,
+        "spill": spill_digest,
+        "identity": parsed["identity"],
+        "contract_version": parsed["contract_version"],
+    }
+    replacement = _b64(
+        json.dumps(reference, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    transformed = (
+        body_text[: marker.start("payload")]
+        + replacement
+        + body_text[marker.end("payload") :]
+    )
+    sidecars = [
+        _sidecar(
+            {
+                "v": 1,
+                "anchor": anchor_id,
+                "spill": spill_digest,
+                "field": "risk_test_matrix_payload",
+                "index": index,
+                "count": len(chunks),
+                "sha256": raw_digest,
+                "data": chunk,
+            }
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+
+    matrix = parsed.get("matrix")
+    rows = matrix.get("rows", []) if isinstance(matrix, dict) else []
+    applicability = matrix.get("applicability") if isinstance(matrix, dict) else None
+    compact_lines = [
+        risk_test_matrix_section_boundary(str(parsed["identity"])),
+        "### Risk-based mode and transition test matrix",
+        f"- **Applicability:** {applicability or 'applicable'}",
+        f"- **Rows:** {len(rows) if isinstance(rows, list) else 0} validated transition rows",
+        "The complete validated matrix and change audit are retained in bounded "
+        "transport sidecars and hydrated before strict state, review, resume, "
+        "hash, or decomposition consumers run.",
+    ]
+    if isinstance(matrix, dict) and matrix.get("important_exclusions"):
+        compact_lines.append(
+            "- **Important exclusions:** "
+            + "; ".join(str(item) for item in matrix["important_exclusions"][:3])
+        )
+    transported_marker = _RISK_TEST_MATRIX_MARKER_RE.search(transformed)
+    if transported_marker is None:
+        raise AgentLoopError("Risk test matrix transport lost its protocol marker.")
+    # Use the transformed marker text, preserving the exact authorized marker
+    # token in the replacement TrustedBody.
+    compact_lines.append(transported_marker.group(0))
+    compact_section = "\n".join(compact_lines)
+    compacted = (
+        body_text[: boundary.start()]
+        + compact_section
+        + transformed[transported_marker.end() :]
+    )
+    return compacted, sidecars, (boundary.start(), marker.end(), compact_section)
+
+
 def _replace_authorized_range(
     carrier: TrustedBody,
     *,
@@ -305,7 +586,10 @@ def _replace_authorized_range(
                     start <= segment_start
                     and segment_end <= end
                     and (
-                        segment.token == "AGENT_EXECUTION_RECOMMENDATION"
+                        segment.token in {
+                            "AGENT_EXECUTION_RECOMMENDATION",
+                            "AGENT_RISK_TEST_MATRIX",
+                        }
                         or (segment.token, segment.text) in replacement_markers
                     )
                 ):
@@ -374,10 +658,31 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             )
         )
     body_text = str(carrier)
-    body_text, sidecars, execution_rewrite = _prepare_execution_recommendation_transport(
+    # Project the largest authenticated sections before spilling round
+    # metadata.  Both transforms are lossless and report their offsets against
+    # the exact text received by the following transform.
+    body_text, sidecars, matrix_rewrite = _prepare_risk_test_matrix_transport(body_text)
+    trusted_anchor = carrier
+    if matrix_rewrite is not None:
+        start, end, compact_section = matrix_rewrite
+        trusted_compact_section = TrustedBody.canonical(
+            compact_section,
+            expected_tokens=tuple(
+                occurrence.definition.token
+                for occurrence in scan_reserved_markers(compact_section)
+            ),
+        )
+        trusted_anchor = _replace_authorized_range(
+            trusted_anchor,
+            start=start,
+            end=end,
+            replacement=trusted_compact_section,
+        )
+
+    body_text, execution_sidecars, execution_rewrite = _prepare_execution_recommendation_transport(
         body_text
     )
-    trusted_anchor = carrier
+    sidecars.extend(execution_sidecars)
     if execution_rewrite is not None:
         start, end, compact_section = execution_rewrite
         trusted_compact_section = TrustedBody.canonical(
@@ -528,6 +833,8 @@ def hydrate_mapping(
         reference_key = (
             "$round_transport_execution_recommendation"
             if "$round_transport_execution_recommendation" in ref
+            else "$round_transport_risk_test_matrix"
+            if "$round_transport_risk_test_matrix" in ref
             else "$round_transport_spill"
         )
         if reference_key not in ref:

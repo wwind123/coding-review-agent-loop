@@ -36,7 +36,14 @@ from .issue_pr_provenance import (
     compare_issue_pr_provenance,
     parse_issue_pr_provenance_messages,
 )
-from .round_transport import MAX_GITHUB_BODY_CHARS, prepare_round_comment
+from .round_transport import (
+    DEFAULT_PLANNING_PUBLICATION_POLICY,
+    MAX_GITHUB_BODY_CHARS,
+    PlanningPreflightOutcome,
+    PlanningPublicationPolicy,
+    preflight_planning_publication,
+    prepare_round_comment,
+)
 from .protocol import parse_signed_human_requirement_body
 from .protocol_markers import (
     ISSUE_BODY_SURFACE,
@@ -1733,6 +1740,33 @@ def post_issue_comment(
     for prepared in bodies:
         prepared.validate_for_surface(ISSUE_COMMENT_SURFACE)
         _post_comment_body(runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared)
+
+
+def post_planning_issue_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    body: str | TrustedBody,
+    policy: PlanningPublicationPolicy = DEFAULT_PLANNING_PUBLICATION_POLICY,
+) -> PlanningPreflightOutcome:
+    """Post only a carrier that passed the final planning preflight.
+
+    The preflight is deliberately non-mutating.  Callers must handle a
+    shortening-required or unrecoverable result before invoking this seam.
+    """
+    outcome = preflight_planning_publication(body, policy=policy)
+    if not outcome.postable:
+        raise AgentLoopError(outcome.diagnostic or "Planning publication preflight failed.")
+    for prepared in outcome.prepared:
+        prepared.validate_for_surface(ISSUE_COMMENT_SURFACE)
+        _post_comment_body(
+            runner,
+            config=config,
+            command=["issue", "comment", str(issue_number)],
+            body=prepared,
+        )
+    return outcome
 
 
 def reject_forged_protocol_markers(body: str) -> None:

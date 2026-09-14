@@ -198,6 +198,10 @@ from coding_review_agent_loop.repair import (
     require_recoverable_fresh_risk_test_matrix_contract,
     strip_unknown_prior_item_dispositions,
 )
+from coding_review_agent_loop.repair_preservation import validate_shortened_plan_response
+from coding_review_agent_loop.round_transport import (
+    preflight_planning_publication,
+)
 from helpers.validate_response import _deserialize_human_requirements, validate_response_text
 
 # ---------------------------------------------------------------------------
@@ -2835,6 +2839,8 @@ def _complete_coder_turn(
     prior_risk_test_matrix_changes: Sequence[object] = (),
     architecture_identity: dict | None = None,
     architecture_contract_version: int | None = None,
+    shortening_attempted: bool = False,
+    external_args: Sequence[str] = (),
 ) -> dict:
     """Validate, render, canonicalize, attach (role coder), and post a coder plan.
 
@@ -3085,6 +3091,100 @@ def _complete_coder_turn(
         *reject_risk_test_matrix_contract_args,
     )
 
+    planning_preflight = preflight_planning_publication(
+        tagged.read_text(encoding="utf-8")
+    )
+    if planning_preflight.status != "fits":
+        if shortening_attempted:
+            raise _ValidationError(
+                "skill_runner: the single plan-shortening attempt did not produce a "
+                f"postable carrier: {planning_preflight.diagnostic or planning_preflight.status}"
+            )
+        if planning_preflight.status == "unrecoverable":
+            raise _ValidationError(
+                "skill_runner: valid plan retained in the coder repair artifact, but "
+                f"its prepared carrier is unrecoverable: {planning_preflight.diagnostic}"
+            )
+
+        from coding_review_agent_loop.repair_preservation import validate_shortened_plan_response
+        # This invocation is intentionally fresh and separately recorded. The
+        # producer response is retained in the repair directory and is the
+        # preservation source for the one allowed shortening turn.
+        prior_items = tuple(_deserialize_unresolved_item(item) for item in next_prior_items_raw)
+        from helpers.prompt_builders import build_plan_shortening_prompt_for_skill
+        shortening_prompt = build_plan_shortening_prompt_for_skill(
+            raw_text,
+            repo=repo,
+            coder=coder,  # type: ignore[arg-type]
+            reviewers=(),
+            workdir=str(work_dir),
+            response_kind=kind,  # type: ignore[arg-type]
+            target_chars=planning_preflight.response_ceiling_chars,
+            prior_items_raw=next_prior_items_raw,
+        )
+        shortening_prompt_file = work_dir / "plan-shortening-prompt.md"
+        shortening_output_file = work_dir / "plan-shortening-raw.md"
+        shortening_usage_file = work_dir / "plan-shortening-usage.json"
+        shortening_evidence_file = work_dir / "plan-shortening-response-evidence.json"
+        _write_text(shortening_prompt_file, shortening_prompt)
+        _run_helper(
+            "helpers.run_external",
+            "--agent", coder,
+            "--role", "shortener",
+            "--prompt-file", str(shortening_prompt_file),
+            "--output", str(shortening_output_file),
+            "--workdir", str(work_dir),
+            "--repo", repo,
+            "--flow", "plan",
+            "--usage-output", str(shortening_usage_file),
+            "--response-evidence-output", str(shortening_evidence_file),
+            *( ["--cmd", gemini_cmd] if coder == "gemini" else [] ),
+            *external_args,
+        )
+        shortened_text = shortening_output_file.read_text(encoding="utf-8")
+        try:
+            validate_shortened_plan_response(
+                raw_text,
+                shortened_text,
+                prior_items=prior_items,
+                require_architecture_impact_contract=bool(required_architecture_impact_contract),
+                require_execution_strategy_contract=bool(require_execution_strategy_contract),
+                require_risk_test_matrix_contract=bool(require_risk_test_matrix_contract),
+            )
+        except AgentLoopError as exc:
+            raise _ValidationError(f"skill_runner: shortened plan rejected: {exc}") from exc
+        raw_output.write_text(shortened_text, encoding="utf-8")
+        producer_usage = None
+        if usage_file.exists():
+            try:
+                producer_usage = json.loads(usage_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                producer_usage = None
+        result = _complete_coder_turn(
+            coder=coder, coder_cap=coder_cap, issue=issue, repo=repo,
+            new_round_number=new_round_number, next_prior_items_raw=next_prior_items_raw,
+            kind=kind, dry_run=dry_run, raw_output=raw_output, work_dir=work_dir,
+            usage_file=shortening_usage_file, auto_recover=False,
+            response_evidence=None, gemini_cmd=gemini_cmd,
+            surfaced_requirement_ids=surfaced_requirement_ids,
+            requires_direct_discussion_ack=requires_direct_discussion_ack,
+            required_architecture_impact_contract=required_architecture_impact_contract,
+            require_execution_strategy_contract=require_execution_strategy_contract,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+            reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
+            prior_canonical_plan=prior_canonical_plan,
+            prior_risk_test_matrix=prior_risk_test_matrix,
+            prior_risk_test_matrix_changes=prior_risk_test_matrix_changes,
+            architecture_identity=architecture_identity,
+            architecture_contract_version=architecture_contract_version,
+            shortening_attempted=True,
+            external_args=external_args,
+        )
+        result["producer_usage"] = producer_usage
+        result["shortening_usage"] = result.get("usage")
+        result["usage"] = producer_usage
+        return result
+
     if not dry_run:
         _run_helper(
             "helpers.state_manager", "write-pending-comment",
@@ -3101,7 +3201,12 @@ def _complete_coder_turn(
     else:
         print(f"[dry-run] would post {coder_cap} plan for {repo}#{issue} (round {new_round_number})")
 
-    return {"plan_text": canonical_text, "subject": subject, "usage": coder_usage}
+    return {
+        "plan_text": canonical_text,
+        "subject": subject,
+        "usage": coder_usage,
+        "shortening_usage": None,
+    }
 
 
 def _run_external_coder_phase(
@@ -3148,6 +3253,7 @@ def _run_external_coder_phase(
             "is_new_round": False,
             "local_completed": {str(n) for n in resume.get("completed_reviewer_names", [])},
             "coder_usage": None,
+            "coder_shortening_usage": None,
         }
 
     # coder-round-1 or coder-round-next: run the external coder turn.
@@ -3336,6 +3442,7 @@ def _run_external_coder_phase(
                     if hasattr(coder_architecture, "identity") else None
                 ),
                 architecture_contract_version=1,
+                external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
             )
         except FreshContractIntegrityError as exc:
             print(
@@ -3372,6 +3479,7 @@ def _run_external_coder_phase(
         "is_new_round": True,
         "local_completed": set(),
         "coder_usage": completed.get("usage"),
+        "coder_shortening_usage": completed.get("shortening_usage"),
     }
 
 
@@ -3707,6 +3815,65 @@ def _run_host_coder_phase(
     issue: int = args.issue
     repo: str = args.repo
 
+    # A host shortening handoff is digest-bound and at-most-once.  Re-entry is
+    # explicit so the original plan file cannot silently become a competing
+    # planner round after a restart.
+    planning_handoff = resume.get("planning_shortening")
+    handoff_candidate_file: Path | None = None
+    if isinstance(planning_handoff, dict):
+        if planning_handoff.get("attempt_state") != "attempt-required":
+            print(
+                "skill_runner: the recorded plan-shortening attempt is already consumed; "
+                "resume the persisted recovery artifact instead of submitting another file.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        candidate_arg = getattr(args, "shortened_plan_file", None)
+        if not candidate_arg:
+            print(
+                "skill_runner: oversized plan requires one host shortening handoff. "
+                "Rewrite the recorded plan without changing its contract, then re-enter "
+                "with --shortened-plan-file PATH.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        handoff_candidate_file = Path(candidate_arg)
+        try:
+            candidate_text = handoff_candidate_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"skill_runner: cannot read shortened-plan file: {exc}", file=sys.stderr)
+            sys.exit(1)
+        original_text = planning_handoff.get("original_response")
+        original_digest = planning_handoff.get("original_digest")
+        if not isinstance(original_text, str) or not isinstance(original_digest, str):
+            print("skill_runner: shortening handoff is incomplete or corrupt.", file=sys.stderr)
+            sys.exit(1)
+        if hashlib.sha256(original_text.encode("utf-8")).hexdigest() != original_digest:
+            print("skill_runner: shortening handoff original digest is invalid.", file=sys.stderr)
+            sys.exit(1)
+        # Consume before validation so a malformed host submission cannot reset
+        # the one-at-most-once allowance on restart.
+        planning_handoff = {**planning_handoff, "attempt_state": "attempted"}
+        resume["planning_shortening"] = planning_handoff
+        if not dry_run:
+            _run_helper(
+                "helpers.state_manager", "write-session",
+                "--issue", str(issue), "--repo", repo,
+                "--fields", json.dumps({"planning_shortening": planning_handoff}),
+            )
+        try:
+            validate_shortened_plan_response(
+                original_text,
+                candidate_text,
+                require_architecture_impact_contract=True,
+                require_execution_strategy_contract=True,
+                require_risk_test_matrix_contract=True,
+            )
+        except AgentLoopError as exc:
+            print(f"skill_runner: shortened plan rejected: {exc}", file=sys.stderr)
+            sys.exit(1)
+        plan_file = handoff_candidate_file
+
     # New-round vs resume detection must use the same canonical plan text that
     # attach-metadata persists. Host plan files are structured JSON, while the
     # round record stores the deterministic markdown rendering; hashing the
@@ -3730,7 +3897,9 @@ def _run_host_coder_phase(
         canonical_plan_text = raw_plan_text
     plan_subject = _plan_subject(canonical_plan_text)
     current_plan_subject = resume.get("current_plan_subject")
-    is_new_round = current_plan_subject != plan_subject
+    # A shortening handoff has not been published yet even when its canonical
+    # subject happens to equal the most recent durable round.
+    is_new_round = handoff_candidate_file is not None or current_plan_subject != plan_subject
 
     if is_new_round:
         completed_round_number = int(resume.get("completed_round_number", 0))
@@ -3783,6 +3952,48 @@ def _run_host_coder_phase(
                     "--execution-strategy-contract-version", "1",
                     "--risk-test-matrix-contract-version", "1",
                 )
+                tagged_text = tagged_plan.read_text(encoding="utf-8")
+                planning_preflight = preflight_planning_publication(tagged_text)
+                if planning_preflight.status != "fits":
+                    handoff = {
+                        "attempt_state": (
+                            "attempt-required"
+                            if planning_preflight.status == "shortening-required"
+                            else "unrecoverable"
+                        ),
+                        "response_kind": "plan_state",
+                        "expected_kind": "plan_state",
+                        "original_response": raw_plan_text,
+                        "original_digest": hashlib.sha256(
+                            raw_plan_text.encode("utf-8")
+                        ).hexdigest(),
+                        "canonical_plan": canonical_plan_text,
+                        "response_ceiling_chars": planning_preflight.response_ceiling_chars,
+                        "failure": planning_preflight.diagnostic
+                        or planning_preflight.status,
+                        "sidecar_completeness": "prepared-but-not-posted",
+                    }
+                    _run_helper(
+                        "helpers.state_manager", "write-session",
+                        "--issue", str(issue), "--repo", repo,
+                        "--fields", json.dumps({"planning_shortening": handoff}),
+                    )
+                    if planning_preflight.status == "shortening-required":
+                        print(
+                            "skill_runner: plan is valid but oversized after lossless "
+                            "transport projection. Shorten it once while preserving every "
+                            "structured entry and obligation, save the result, then re-enter "
+                            "with --shortened-plan-file PATH.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "skill_runner: valid plan cannot fit the bounded carrier; "
+                            "the original candidate and recovery state were retained. "
+                            f"{handoff['failure']}",
+                            file=sys.stderr,
+                        )
+                    sys.exit(2)
                 _run_helper(
                     "helpers.state_manager", "write-pending-comment",
                     "--issue", str(issue), "--repo", repo,
@@ -3796,6 +4007,12 @@ def _run_host_coder_phase(
                     "helpers.state_manager", "clear-pending-comment",
                     "--issue", str(issue), "--repo", repo,
                 )
+                if isinstance(planning_handoff, dict):
+                    _run_helper(
+                        "helpers.state_manager", "write-session",
+                        "--issue", str(issue), "--repo", repo,
+                        "--fields", json.dumps({"planning_shortening": None}),
+                    )
         else:
             print(f"[dry-run] would post plan for {repo}#{issue} (round {new_round_number})")
 
@@ -3860,6 +4077,7 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
     is_new_round: bool = phase["is_new_round"]
     local_completed: set[str] = phase["local_completed"]
     coder_usage: dict | None = phase["coder_usage"]
+    coder_shortening_usage: dict | None = phase.get("coder_shortening_usage")
 
     # Step 5 — reconstruct round state from already-completed reviewers (RESUME path only).
     # In a new round, completed_reviewer_data belongs to the previous round and must not
@@ -4036,6 +4254,8 @@ def cmd_run_plan_round(args: argparse.Namespace) -> None:
     usage_records = list(round_reviewer_records)
     if coder_usage is not None:
         usage_records.append({"usage": coder_usage})
+    if coder_shortening_usage is not None:
+        usage_records.append({"usage": coder_shortening_usage})
     usage = _aggregate_reviewer_usage(usage_records)
     if usage is not None:
         result_json["usage"] = usage
@@ -6570,6 +6790,10 @@ def main() -> None:
     p_plan.add_argument(
         "--plan-file", default=None,
         help="Plan markdown file. Required for --coder claude; ignored for an external coder.",
+    )
+    p_plan.add_argument(
+        "--shortened-plan-file", default=None,
+        help="One digest-bound host shortening re-entry file after an oversized plan handoff.",
     )
     p_plan.add_argument("--reviewers", type=normalize_agent_name, nargs="+", required=True)
     p_plan.add_argument("--workdir-codex", default=None)
