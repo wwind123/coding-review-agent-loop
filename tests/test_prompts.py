@@ -128,10 +128,11 @@ def test_legacy_plan_revision_prompt_does_not_invent_matrix_generation(tmp_path)
 
     fresh = build_plan_revision_prompt(783, 2, "Previous plan", "Blocking review", config)
     assert "For work involving multiple execution modes" in fresh
-    assert "additional matrix-level audit entry" in fresh
+    assert "exactly one\nmatrix-level audit entry" in fresh
     assert "complete union of row IDs" in fresh
     assert "prior and revised matrices" in fresh
     assert 'use `["matrix"]` when both matrices have no rows' in fresh
+    assert "do not duplicate it" in fresh
 
 
 def test_plan_review_prompts_expose_complete_one_shot_and_staged_recommendations(tmp_path):
