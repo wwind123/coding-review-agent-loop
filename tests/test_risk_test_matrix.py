@@ -103,6 +103,92 @@ def test_m780_03_draft_changes_are_explicit_and_approved_rows_are_immutable() ->
         validate_risk_test_matrix_revision(_matrix(), changed, [])
 
 
+@pytest.mark.parametrize(
+    ("operation", "current", "message"),
+    [
+        (
+            "add",
+            {**_matrix(), "rows": [{**_row(), "expected_outcome": "A different outcome"}]},
+            "newly introduced",
+        ),
+        (
+            "change",
+            {**_matrix(), "rows": [{**_row("row-new")}]},
+            "retained",
+        ),
+        (
+            "retire",
+            {**_matrix(), "rows": [{**_row(), "expected_outcome": "A different outcome"}]},
+            "removed",
+        ),
+    ],
+)
+def test_m780_03_audit_operation_must_match_actual_row_transition(
+    operation: str, current: dict[str, object], message: str
+) -> None:
+    with pytest.raises(AgentLoopError, match=message):
+        validate_risk_test_matrix_revision(
+            _matrix(),
+            current,
+            [{"operation": operation, "row_ids": ["row-ordinary"], "rationale": "Mislabelled change."}],
+        )
+
+
+def test_m780_03_split_and_merge_require_removed_added_cardinality() -> None:
+    split_current = {
+        **_matrix(),
+        "rows": [{**_row("row-new-one")}, {**_row("row-new-two")}],
+    }
+    with pytest.raises(AgentLoopError, match="exactly one prior row and at least two"):
+        validate_risk_test_matrix_revision(
+            _matrix(),
+            split_current,
+            [{
+                "operation": "split",
+                "row_ids": ["row-ordinary", "row-new-one"],
+                "rationale": "Invalid split cardinality.",
+            }],
+        )
+
+    merge_current = {
+        **_matrix(),
+        "rows": [{**_row("row-merged")}, {**_row("row-other-new")}],
+    }
+    previous = {**_matrix(), "rows": [_row("row-old-one"), _row("row-old-two")]}
+    with pytest.raises(AgentLoopError, match="at least two prior rows and exactly one"):
+        validate_risk_test_matrix_revision(
+            previous,
+            merge_current,
+            [{
+                "operation": "merge",
+                "row_ids": ["row-old-one", "row-old-two", "row-merged", "row-other-new"],
+                "rationale": "Invalid merge membership.",
+            }],
+        )
+
+
+def test_m780_03_overlapping_row_audits_are_rejected() -> None:
+    previous = {**_matrix(), "rows": [_row("row-old"), _row("row-other")]}
+    current = {**_matrix(), "rows": [{**_row("row-new-one")}, {**_row("row-new-two")}]}
+    with pytest.raises(AgentLoopError, match="overlap"):
+        validate_risk_test_matrix_revision(
+            previous,
+            current,
+            [
+                {
+                    "operation": "split",
+                    "row_ids": ["row-old", "row-new-one", "row-new-two"],
+                    "rationale": "Split the old scenario.",
+                },
+                {
+                    "operation": "retire",
+                    "row_ids": ["row-old"],
+                    "rationale": "Overlapping audit subject.",
+                },
+            ],
+        )
+
+
 def test_approved_matrix_accepts_the_final_revision_change_audit() -> None:
     changes = [{
         "operation": "change",

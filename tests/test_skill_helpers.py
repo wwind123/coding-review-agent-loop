@@ -3861,6 +3861,38 @@ class TestRetryValidateCoder:
             assert result.returncode != 0
             assert "risk matrix audit failed" in result.stderr
 
+    def test_retry_validate_coder_revision_rejects_mislabeled_matrix_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            prior = _fresh_applicable_plan_state_matrix()
+            changed = {
+                **prior,
+                "rows": [{
+                    **prior["rows"][0],
+                    "expected_outcome": "A changed outcome",
+                }],
+            }
+            repair_dir = self._make_coder_revision_repair_dir(
+                tmppath,
+                matrix=changed,
+                changes=[{
+                    "operation": "add",
+                    "row_ids": ["row-skill-resume"],
+                    "rationale": "Mislabelled retained-row edit.",
+                }],
+            )
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run", env=env, check=False,
+            )
+
+            assert result.returncode != 0
+            assert "invalid transition" in result.stderr
+
     def test_retry_validate_coder_revision_accepts_historical_audit_replay(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)

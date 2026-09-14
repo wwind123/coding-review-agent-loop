@@ -1095,46 +1095,125 @@ def validate_risk_test_matrix_revision(
         )
     old_by_id = {row.row_id: row for row in old.rows}
     new_by_id = {row.row_id: row for row in new.rows}
+    old_ids = set(old_by_id)
+    new_ids = set(new_by_id)
     changed_ids = {
-        row_id for row_id in set(old_by_id) | set(new_by_id)
+        row_id for row_id in old_ids | new_ids
         if old_by_id.get(row_id) != new_by_id.get(row_id)
+    }
+    added_ids = new_ids - old_ids
+    retired_ids = old_ids - new_ids
+    retained_changed_ids = {
+        row_id for row_id in old_ids & new_ids
+        if old_by_id[row_id] != new_by_id[row_id]
     }
     changed_matrix_fields = {
         field
         for field in ("applicability", "important_exclusions", "not_applicable_rationale")
         if getattr(old, field) != getattr(new, field)
     }
-    covered = {row_id for change in current_changes for row_id in change.row_ids}
+    # A matrix-level operation is a separate audit subject from row
+    # transitions. Keep the complete-scope representation for compatibility
+    # with existing rendered audits, but do not let it discharge a row add,
+    # change, retire, split, or merge on its own.
+    matrix_scope = (old_ids | new_ids) or {"matrix"}
+    for change in current_changes:
+        if len(set(change.row_ids)) != len(change.row_ids):
+            raise AgentLoopError(
+                f"Risk matrix audit operation `{change.operation}` repeats a row ID; "
+                "each row may be audited only once."
+            )
+    matrix_change_indexes: set[int] = set()
     if changed_matrix_fields:
-        # Matrix-level semantics need a matrix-level audit operation. A row
-        # operation that happens to mention one changed row cannot authorize a
-        # rewrite of exclusions, applicability, or the not-applicable reason.
-        # For a zero-row not-applicable matrix, ``matrix`` is the explicit
-        # matrix-level audit subject (and is not a row ID).
-        matrix_scope = set(old_by_id) | set(new_by_id) or {"matrix"}
-        if not any(
-            change.operation in {"change", "split", "merge"}
-            and set(change.row_ids) == matrix_scope
-            for change in current_changes
-        ):
+        matrix_change_indexes = {
+            index for index, change in enumerate(current_changes)
+            if change.operation == "change" and set(change.row_ids) == matrix_scope
+        }
+        if len(matrix_change_indexes) != 1:
             raise AgentLoopError(
                 "Risk matrix-level changes require one review-visible audit operation "
-                "covering the complete matrix scope."
+                "with operation `change` covering the complete matrix scope."
             )
+
+    # Validate each operation against the actual old/new transition. Merely
+    # covering the changed IDs is insufficient: an ``add`` must contain only
+    # new IDs, ``retire`` only removed IDs, and ``change`` only retained rows
+    # whose row payload changed. Split/merge groups use old-side/new-side
+    # membership cardinality so the audit records the direction of the
+    # transition rather than accepting an arbitrary relabeling of the same ID
+    # set. A retained ID is valid for a split/merge only when its row payload
+    # actually changed.
+    covered: set[str] = set()
+    seen_subjects: set[str] = set()
+    for index, change in enumerate(current_changes):
+        if index in matrix_change_indexes:
+            continue
+        subject = set(change.row_ids)
+        overlap = sorted(subject & seen_subjects)
+        if overlap:
+            raise AgentLoopError(
+                "Risk matrix audit operations overlap on row IDs: " + ", ".join(overlap)
+            )
+        unknown = sorted(subject - (old_ids | new_ids))
+        if unknown:
+            raise AgentLoopError(
+                "Risk matrix audit operation names unknown row IDs: " + ", ".join(unknown)
+            )
+
+        removed = subject & retired_ids
+        added = subject & added_ids
+        retained = subject & (old_ids & new_ids)
+        changed_retained = retained & retained_changed_ids
+        unchanged_retained = retained - retained_changed_ids
+        operation = change.operation
+        valid = False
+        expected = ""
+        if operation == "add":
+            valid = bool(subject) and subject == added
+            expected = "only newly introduced row IDs"
+        elif operation == "retire":
+            valid = bool(subject) and subject == removed
+            expected = "only removed row IDs"
+        elif operation == "change":
+            valid = bool(subject) and subject == changed_retained
+            expected = "only retained row IDs whose row payload changed"
+        elif operation == "split":
+            old_members = subject & old_ids
+            new_members = subject & new_ids
+            valid = (
+                len(old_members) == 1
+                and len(new_members) >= 2
+                and retained == changed_retained
+            )
+            expected = "exactly one prior row and at least two current rows"
+        elif operation == "merge":
+            old_members = subject & old_ids
+            new_members = subject & new_ids
+            valid = (
+                len(old_members) >= 2
+                and len(new_members) == 1
+                and retained == changed_retained
+            )
+            expected = "at least two prior rows and exactly one current row"
+        if not valid:
+            details = []
+            if unchanged_retained:
+                details.append("unchanged retained=" + ",".join(sorted(unchanged_retained)))
+            if added and operation not in {"add", "split", "merge"}:
+                details.append("new=" + ",".join(sorted(added)))
+            if removed and operation not in {"retire", "split", "merge"}:
+                details.append("removed=" + ",".join(sorted(removed)))
+            detail = f" ({'; '.join(details)})" if details else ""
+            raise AgentLoopError(
+                f"Risk matrix audit operation `{operation}` has an invalid transition{detail}; "
+                f"it must name {expected}."
+            )
+        seen_subjects.update(subject)
+        covered.update(subject)
+
     missing = sorted(changed_ids - covered)
     if missing:
         raise AgentLoopError("Risk matrix changes omit audit operations for: " + ", ".join(missing))
-    matrix_audit_scope = (
-        (set(old_by_id) | set(new_by_id)) or {"matrix"}
-        if changed_matrix_fields
-        else set()
-    )
-    extra = sorted(covered - changed_ids - matrix_audit_scope)
-    if extra:
-        raise AgentLoopError(
-            "Risk matrix changes contain audit subjects with no corresponding semantic change: "
-            + ", ".join(extra)
-        )
     if approved and changed_ids:
         raise AgentLoopError("Approved risk matrix rows cannot be removed, reassigned, or weakened without a newly reviewed baseline.")
     return parsed_changes
