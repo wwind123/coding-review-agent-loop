@@ -1113,9 +1113,10 @@ def validate_risk_test_matrix_revision(
         if getattr(old, field) != getattr(new, field)
     }
     # A matrix-level operation is a separate audit subject from row
-    # transitions. Keep the complete-scope representation for compatibility
-    # with existing rendered audits, but do not let it discharge a row add,
-    # change, retire, split, or merge on its own.
+    # transitions. Keep the complete-scope representation and its established
+    # change/split/merge operation allowance for compatibility with existing
+    # rendered audits, but do not let it discharge a row add, change, retire,
+    # split, or merge on its own.
     matrix_scope = (old_ids | new_ids) or {"matrix"}
     for change in current_changes:
         if len(set(change.row_ids)) != len(change.row_ids):
@@ -1127,12 +1128,13 @@ def validate_risk_test_matrix_revision(
     if changed_matrix_fields:
         matrix_change_indexes = {
             index for index, change in enumerate(current_changes)
-            if change.operation == "change" and set(change.row_ids) == matrix_scope
+            if change.operation in {"change", "split", "merge"}
+            and set(change.row_ids) == matrix_scope
         }
         if len(matrix_change_indexes) != 1:
             raise AgentLoopError(
                 "Risk matrix-level changes require one review-visible audit operation "
-                "with operation `change` covering the complete matrix scope."
+                "with operation `change`, `split`, or `merge` covering the complete matrix scope."
             )
 
     # Validate each operation against the actual old/new transition. Merely
