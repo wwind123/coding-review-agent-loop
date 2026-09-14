@@ -870,3 +870,47 @@ def test_m780_12_staged_context_keeps_pending_rows_read_only() -> None:
     )
     assert scoped.risk_test_matrix_expected_row_ids == ("row-owned",)
     assert scoped.risk_test_matrix_pending_row_ids == ("row-later",)
+
+
+def test_scope_not_applicable_matrix_skips_stage_owner_validation() -> None:
+    matrix = parse_risk_test_matrix(_not_applicable())
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        render_risk_test_matrix_section(matrix),
+        expected_hash=None,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+
+    scoped = scope_approved_plan_matrix(
+        context,
+        execution_owner="stage-not-in-plan",
+        valid_stage_ids=("stage-first",),
+    )
+
+    assert scoped is context
+    assert scoped.risk_test_matrix_expected_row_ids == ()
+
+
+def test_scope_applicable_matrix_rejects_unknown_stage_owner() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        render_risk_test_matrix_section(matrix),
+        expected_hash=None,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+
+    with pytest.raises(AgentLoopError, match="not an approved stage ID"):
+        scope_approved_plan_matrix(
+            context,
+            execution_owner="stage-not-in-plan",
+            valid_stage_ids=("stage-first",),
+        )

@@ -371,6 +371,7 @@ def test_build_resume_preserves_architecture_identity_for_resume_filter(
             "compact_prior_summaries": (),
             "completed_reviews": (type("Record", (), {"metadata": metadata})(),),
             "local_test_evidence": None,
+            "coder_metadata": None,
         },
     )()
     monkeypatch.setattr(state_manager, "_fetch_issue_comments", lambda *args, **kwargs: [])
