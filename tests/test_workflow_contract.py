@@ -9,13 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.managed_ci import dispatch_validator, local_router
+from fixtures.managed_ci import dispatch_validator, local_router, publisher
 
 
 ROOT = Path(__file__).parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 LOCAL_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "local_router.py"
 DISPATCH_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "dispatch_validator.py"
+PUBLISHER_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "publisher.py"
 
 
 def _workflow_text() -> str:
@@ -36,6 +37,10 @@ def _validator_block(text: str) -> str:
 
 def _dispatch_block(text: str) -> str:
     return _extraction_block(text, "MANAGED_CI_V2_DISPATCH_VALIDATOR")
+
+
+def _publisher_block(text: str) -> str:
+    return _extraction_block(text, "MANAGED_CI_V2_PUBLISHER")
 
 
 def _job_if_expression(text: str) -> str:
@@ -149,6 +154,12 @@ def test_validator_fixture_is_an_extraction_of_production_workflow():
 def test_dispatch_validator_fixture_is_an_extraction_of_production_workflow():
     assert _dispatch_block(_workflow_text()) == _dispatch_block(
         DISPATCH_FIXTURE.read_text(encoding="utf-8")
+    )
+
+
+def test_publisher_fixture_is_an_extraction_of_production_workflow():
+    assert _publisher_block(_workflow_text()) == _publisher_block(
+        PUBLISHER_FIXTURE.read_text(encoding="utf-8")
     )
 
 
@@ -266,7 +277,7 @@ def test_routing_matrix_is_label_race_safe_and_fail_open():
     assert _ordinary_route("synchronize", _pr(head={"sha": "b" * 40, "ref": "feature", "repo": {"full_name": "fork/REPO"}}), "agent-loop") is True
 
 
-def _dispatch_validate(**overrides):
+def _dispatch_validate(*, record=None, **overrides):
     values = {
         "protocol": "2",
         "pr_number_text": "7",
@@ -277,6 +288,8 @@ def _dispatch_validate(**overrides):
         "configured_actor": "agent-loop",
         "initiating_actor": "agent-loop",
         "rerun_actor": "agent-loop",
+        "current_run_id": "200",
+        "current_run_attempt": "1",
     }
     values.update(overrides)
     calls = []
@@ -294,7 +307,7 @@ def _dispatch_validate(**overrides):
 
     def api_pages(path):
         calls.append(path)
-        return _pages(_record())
+        return _pages(record or _record())
 
     result = dispatch_validator.validate_dispatch(
         **values,
@@ -312,6 +325,66 @@ def test_dispatch_validator_resolves_named_actor_and_returns_exact_target():
     assert calls[:2] == ["users/agent-loop", "repos/OWNER/REPO"]
     assert "user" not in calls
     assert not any("actions/variables" in path for path in calls)
+
+
+def test_dispatch_validator_accepts_initial_and_current_run_bound_retry_records():
+    initial, _ = _dispatch_validate()
+    assert initial["record"]["state"] == "dispatch-requested"
+
+    attached, _ = _dispatch_validate(
+        record=_record("attached", run_id=200, run_attempt=1),
+    )
+    assert attached["record"]["run_id"] == 200
+
+    completed, _ = _dispatch_validate(
+        record=_record(
+            "completed",
+            run_id=200,
+            run_attempt=2,
+            terminal_run_id=200,
+            terminal_run_attempt=2,
+            terminal_attempts=[{"run_id": 200, "run_attempt": 2}],
+            terminal_outcome="no-status",
+        ),
+        current_run_attempt="2",
+    )
+    assert completed["record"]["terminal_outcome"] == "no-status"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"record": _record("attached", run_id=201, run_attempt=1)},
+        {"record": _record("attached", run_id=200, run_attempt=2)},
+        {
+            "record": _record(
+                "completed",
+                run_id=200,
+                run_attempt=1,
+                terminal_run_id=201,
+                terminal_run_attempt=1,
+                terminal_attempts=[{"run_id": 201, "run_attempt": 1}],
+                terminal_outcome="no-status",
+            ),
+        },
+    ],
+)
+def test_dispatch_validator_rejects_foreign_or_inconsistent_run_pairs(overrides):
+    with pytest.raises(ValueError, match="run pair|executing Actions run|terminal run"):
+        _dispatch_validate(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"current_run_id": ""},
+        {"current_run_attempt": "0"},
+        {"current_run_id": "not-a-run"},
+    ],
+)
+def test_dispatch_validator_requires_current_run_identity(overrides):
+    with pytest.raises(ValueError, match="run ID|run attempt"):
+        _dispatch_validate(**overrides)
 
 
 @pytest.mark.parametrize(
@@ -343,6 +416,8 @@ def test_dispatch_validator_propagates_api_failure_without_authorizing_target():
         "configured_actor": "agent-loop",
         "initiating_actor": "agent-loop",
         "rerun_actor": "agent-loop",
+        "current_run_id": "200",
+        "current_run_attempt": "1",
     }
 
     def failing_api(_path):
@@ -366,7 +441,63 @@ def test_workflow_keeps_exact_checkout_suite_and_safe_terminal_publisher():
     assert "Authorization failed before an exact target was established; no status written." in workflow
     assert "context': 'final-ci/exact-head'" in workflow
     assert "target_url'" in workflow
-    assert "nonce=' + os.environ['NONCE'] + ';run_id='" in workflow
+    assert "'nonce=' + nonce + ';run_id='" in workflow
     assert "cancel-in-progress: false" in workflow
     assert "GH_REF: ${{ github.ref }}" in workflow
     assert "managed dispatch must execute the base workflow from main" in workflow
+
+
+def _publisher_payload(**overrides):
+    values = {
+        "target_sha": "b" * 40,
+        "validation_result": "success",
+        "test_result": "success",
+        "nonce": "n" * 32,
+        "run_id": "200",
+        "run_attempt": "1",
+        "server_url": "https://github.com",
+        "repository": "OWNER/REPO",
+    }
+    values.update(overrides)
+    return values
+
+
+def test_terminal_publisher_decision_is_production_derived_and_safely_correlated():
+    success = publisher.build_status_payload(**_publisher_payload())
+    assert success == {
+        "target_sha": "b" * 40,
+        "payload": {
+            "state": "success",
+            "context": "final-ci/exact-head",
+            "description": "nonce=" + "n" * 32 + ";run_id=200;attempt=1;result=success",
+            "target_url": "https://github.com/OWNER/REPO/actions/runs/200",
+        },
+    }
+
+    failure = publisher.build_status_payload(
+        **_publisher_payload(test_result="failure", run_attempt="2")
+    )
+    assert failure["target_sha"] == "b" * 40
+    assert failure["payload"]["state"] == "failure"
+    assert "attempt=2" in failure["payload"]["description"]
+    assert failure["payload"]["target_url"].endswith("/actions/runs/200")
+
+    assert publisher.build_status_payload(
+        **_publisher_payload(validation_result="failure")
+    ) is None
+    assert publisher.build_status_payload(**_publisher_payload(target_sha="")) is None
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("nonce", "short"),
+        ("run_id", "0"),
+        ("run_attempt", ""),
+        ("server_url", ""),
+    ],
+)
+def test_terminal_publisher_does_not_write_for_unbound_correlation(field, value):
+    assert publisher.build_status_payload(
+        **_publisher_payload(**{field: value})
+    ) is None

@@ -106,6 +106,8 @@ jobs:
           GH_REF: ${{ github.ref }}
           GH_ACTOR: ${{ github.actor }}
           GH_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
           CONFIGURED_ACTOR: ${{ vars.AGENT_LOOP_MANAGED_ACTOR }}
           INPUT_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
@@ -125,7 +127,7 @@ jobs:
           # Source repository: wwind123/coding-review-agent-loop
           # Source path: .github/workflows/ci.yml
           # Extraction boundary: validate() through its closing assertion.
-          # This block is copied verbatim into tests/fixtures/managed_ci/current_router.py.
+          # This block is copied verbatim into tests/fixtures/managed_ci/local_router.py.
           def validate(
               pr, pages, repo, num, sha, nonce, actor, revision, actor_id=None
           ):
@@ -234,7 +236,7 @@ jobs:
                           fail('invalid terminal run ID')
                       if terminal_id is None and terminal_attempt is not None:
                           fail('terminal attempt has no terminal run ID')
-                      if terminal_attempt is not None and (type(terminal_attempt) is not int or terminal_attempt <= 0):
+                      if terminal_id is not None and (type(terminal_attempt) is not int or terminal_attempt <= 0):
                           fail('invalid terminal run attempt')
                       if record.get('terminal_outcome') not in {None, 'no-status'}:
                           fail('invalid terminal outcome')
@@ -248,12 +250,34 @@ jobs:
                           item_id, item_attempt = item['run_id'], item['run_attempt']
                           if type(item_id) is not int or item_id <= 0:
                               fail('invalid terminal history run ID')
-                          if item_attempt is not None and (type(item_attempt) is not int or item_attempt <= 0):
+                          if type(item_attempt) is not int or item_attempt <= 0:
                               fail('invalid terminal history run attempt')
                           key = (item_id, item_attempt)
                           if key in seen_attempts:
                               fail('duplicate terminal attempt history')
                           seen_attempts.add(key)
+                      terminal_key = (terminal_id, terminal_attempt)
+                      if terminal_id is not None and terminal_key not in seen_attempts:
+                          fail('terminal run is absent from terminal attempt history')
+                      outcome = record.get('terminal_outcome')
+                      if record['state'] == 'prepared' and (
+                          terminal_id is not None
+                          or terminal_attempt is not None
+                          or outcome is not None
+                          or attempts
+                      ):
+                          fail('prepared intent has terminal lifecycle fields')
+                      if record['state'] == 'dispatch-requested':
+                          if terminal_id is not None and outcome != 'no-status':
+                              fail('dispatch-requested retry lacks no-status outcome')
+                      if record['state'] == 'attached' and outcome is not None:
+                          fail('attached intent has terminal outcome')
+                      if record['state'] == 'completed' and outcome == 'no-status':
+                          if (run_id, run_attempt) != terminal_key:
+                              fail('completed no-status record is not bound to its terminal run')
+                      if record['state'] in {'attached', 'completed'} and outcome is None:
+                          if (run_id, run_attempt) in seen_attempts:
+                              fail('active run is already terminal history')
                       expected = {
                           'repository': repo,
                           'pr': int(num),
@@ -315,8 +339,8 @@ jobs:
           # Extraction boundary: validate_dispatch() through its return value.
           def validate_dispatch(
               *, protocol, pr_number_text, expected_head, nonce, repo, ref,
-              configured_actor, initiating_actor, rerun_actor, api_json, api_pages,
-              validate,
+              configured_actor, initiating_actor, rerun_actor, current_run_id,
+              current_run_attempt, api_json, api_pages, validate,
           ):
               if not (
                   protocol == '2'
@@ -327,6 +351,11 @@ jobs:
                   raise ValueError('managed dispatch inputs must be complete protocol-v2 values')
               if ref != 'refs/heads/main':
                   raise ValueError('managed dispatch must execute the base workflow from main')
+              if not re.fullmatch(r'[1-9][0-9]*', current_run_id or ''):
+                  raise ValueError('managed dispatch run ID is invalid')
+              if not re.fullmatch(r'[1-9][0-9]*', current_run_attempt or ''):
+                  raise ValueError('managed dispatch run attempt is invalid')
+              executing_run = (int(current_run_id), int(current_run_attempt))
               trusted_actor = (configured_actor or '').strip()
               if not re.fullmatch(r'[A-Za-z0-9-]+', trusted_actor):
                   raise ValueError('managed dispatch trusted actor configuration is invalid')
@@ -359,6 +388,12 @@ jobs:
                   pr, pages, repo, pr_number_text, expected_head, nonce,
                   live_login, revision, live_id,
               )
+              record_run = (record.get('run_id'), record.get('run_attempt'))
+              if record['state'] in {'attached', 'completed'} and record_run != executing_run:
+                  raise ValueError('managed intent run pair does not match executing Actions run')
+              if record['state'] == 'completed' and record.get('terminal_outcome') == 'no-status':
+                  if (record.get('terminal_run_id'), record.get('terminal_run_attempt')) != executing_run:
+                      raise ValueError('completed no-status record is not bound to executing Actions run')
               return {
                   'target_sha': expected_head,
                   'pr_number': pr_number_text,
@@ -377,6 +412,8 @@ jobs:
               configured_actor=os.environ.get('CONFIGURED_ACTOR'),
               initiating_actor=os.environ.get('GH_ACTOR'),
               rerun_actor=os.environ.get('GH_TRIGGERING_ACTOR'),
+              current_run_id=os.environ.get('GH_RUN_ID'),
+              current_run_attempt=os.environ.get('GH_RUN_ATTEMPT'),
               api_json=api_json,
               api_pages=api_pages,
               validate=validate,
@@ -442,30 +479,64 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import re
           from urllib.request import Request, urlopen
 
+          # BEGIN MANAGED_CI_V2_PUBLISHER
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/ci.yml
+          # Extraction boundary: build_status_payload() through its return value.
+          def build_status_payload(
+              *, target_sha, validation_result, test_result, nonce, run_id,
+              run_attempt, server_url, repository,
+          ):
+              if (
+                  validation_result != 'success'
+                  or not isinstance(target_sha, str)
+                  or not re.fullmatch(r'[0-9a-f]{40}', target_sha)
+                  or not re.fullmatch(r'[A-Za-z0-9_-]{32}', nonce or '')
+                  or not re.fullmatch(r'[1-9][0-9]*', run_id or '')
+                  or not re.fullmatch(r'[1-9][0-9]*', run_attempt or '')
+                  or not isinstance(server_url, str)
+                  or not server_url
+                  or not isinstance(repository, str)
+                  or not repository
+              ):
+                  return None
+              state = 'success' if test_result == 'success' else 'failure'
+              description = (
+                  'nonce=' + nonce + ';run_id=' + run_id +
+                  ';attempt=' + run_attempt + ';result=' + state
+              )
+              return {
+                  'target_sha': target_sha,
+                  'payload': {
+                      'state': state,
+                      'context': 'final-ci/exact-head',
+                      'description': description,
+                      'target_url': server_url.rstrip('/') + '/' + repository +
+                                    '/actions/runs/' + run_id,
+                  },
+              }
+          # END MANAGED_CI_V2_PUBLISHER
+
           target = os.environ.get('TARGET_SHA', '')
-          if not target:
+          payload_object = build_status_payload(
+              target_sha=target,
+              validation_result=os.environ.get('VALIDATION_RESULT', ''),
+              test_result=os.environ.get('TEST_RESULT', ''),
+              nonce=os.environ.get('NONCE', ''),
+              run_id=os.environ.get('RUN_ID', ''),
+              run_attempt=os.environ.get('RUN_ATTEMPT', ''),
+              server_url=os.environ.get('SERVER_URL', ''),
+              repository=os.environ.get('GH_REPOSITORY', ''),
+          )
+          if payload_object is None:
               print('Authorization failed before an exact target was established; no status written.')
               raise SystemExit(0)
-          success = (
-              os.environ.get('VALIDATION_RESULT') == 'success'
-              and os.environ.get('TEST_RESULT') == 'success'
-          )
-          state = 'success' if success else 'failure'
+          target = payload_object['target_sha']
+          payload = json.dumps(payload_object['payload']).encode('utf-8')
           run_id = os.environ['RUN_ID']
-          attempt = os.environ['RUN_ATTEMPT']
-          description = (
-              'nonce=' + os.environ['NONCE'] + ';run_id=' + run_id +
-              ';attempt=' + attempt + ';result=' + state
-          )
-          payload = json.dumps({
-              'state': state,
-              'context': 'final-ci/exact-head',
-              'description': description,
-              'target_url': os.environ['SERVER_URL'] + '/' + os.environ['GH_REPOSITORY'] +
-                            '/actions/runs/' + run_id,
-          }).encode('utf-8')
           request = Request(
               os.environ['GH_API_URL'].rstrip('/') + '/repos/' +
               os.environ['GH_REPOSITORY'] + '/statuses/' + target,

@@ -17,7 +17,7 @@ import re
 # Source repository: wwind123/coding-review-agent-loop
 # Source path: .github/workflows/ci.yml
 # Extraction boundary: validate() through its closing assertion.
-# This block is copied verbatim into tests/fixtures/managed_ci/current_router.py.
+# This block is copied verbatim into tests/fixtures/managed_ci/local_router.py.
 def validate(
     pr, pages, repo, num, sha, nonce, actor, revision, actor_id=None
 ):
@@ -126,7 +126,7 @@ def validate(
                 fail('invalid terminal run ID')
             if terminal_id is None and terminal_attempt is not None:
                 fail('terminal attempt has no terminal run ID')
-            if terminal_attempt is not None and (type(terminal_attempt) is not int or terminal_attempt <= 0):
+            if terminal_id is not None and (type(terminal_attempt) is not int or terminal_attempt <= 0):
                 fail('invalid terminal run attempt')
             if record.get('terminal_outcome') not in {None, 'no-status'}:
                 fail('invalid terminal outcome')
@@ -140,12 +140,34 @@ def validate(
                 item_id, item_attempt = item['run_id'], item['run_attempt']
                 if type(item_id) is not int or item_id <= 0:
                     fail('invalid terminal history run ID')
-                if item_attempt is not None and (type(item_attempt) is not int or item_attempt <= 0):
+                if type(item_attempt) is not int or item_attempt <= 0:
                     fail('invalid terminal history run attempt')
                 key = (item_id, item_attempt)
                 if key in seen_attempts:
                     fail('duplicate terminal attempt history')
                 seen_attempts.add(key)
+            terminal_key = (terminal_id, terminal_attempt)
+            if terminal_id is not None and terminal_key not in seen_attempts:
+                fail('terminal run is absent from terminal attempt history')
+            outcome = record.get('terminal_outcome')
+            if record['state'] == 'prepared' and (
+                terminal_id is not None
+                or terminal_attempt is not None
+                or outcome is not None
+                or attempts
+            ):
+                fail('prepared intent has terminal lifecycle fields')
+            if record['state'] == 'dispatch-requested':
+                if terminal_id is not None and outcome != 'no-status':
+                    fail('dispatch-requested retry lacks no-status outcome')
+            if record['state'] == 'attached' and outcome is not None:
+                fail('attached intent has terminal outcome')
+            if record['state'] == 'completed' and outcome == 'no-status':
+                if (run_id, run_attempt) != terminal_key:
+                    fail('completed no-status record is not bound to its terminal run')
+            if record['state'] in {'attached', 'completed'} and outcome is None:
+                if (run_id, run_attempt) in seen_attempts:
+                    fail('active run is already terminal history')
             expected = {
                 'repository': repo,
                 'pr': int(num),

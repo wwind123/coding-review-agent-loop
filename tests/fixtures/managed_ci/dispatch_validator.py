@@ -17,8 +17,8 @@ import re
 # Extraction boundary: validate_dispatch() through its return value.
 def validate_dispatch(
     *, protocol, pr_number_text, expected_head, nonce, repo, ref,
-    configured_actor, initiating_actor, rerun_actor, api_json, api_pages,
-    validate,
+    configured_actor, initiating_actor, rerun_actor, current_run_id,
+    current_run_attempt, api_json, api_pages, validate,
 ):
     if not (
         protocol == '2'
@@ -29,6 +29,11 @@ def validate_dispatch(
         raise ValueError('managed dispatch inputs must be complete protocol-v2 values')
     if ref != 'refs/heads/main':
         raise ValueError('managed dispatch must execute the base workflow from main')
+    if not re.fullmatch(r'[1-9][0-9]*', current_run_id or ''):
+        raise ValueError('managed dispatch run ID is invalid')
+    if not re.fullmatch(r'[1-9][0-9]*', current_run_attempt or ''):
+        raise ValueError('managed dispatch run attempt is invalid')
+    executing_run = (int(current_run_id), int(current_run_attempt))
     trusted_actor = (configured_actor or '').strip()
     if not re.fullmatch(r'[A-Za-z0-9-]+', trusted_actor):
         raise ValueError('managed dispatch trusted actor configuration is invalid')
@@ -61,6 +66,12 @@ def validate_dispatch(
         pr, pages, repo, pr_number_text, expected_head, nonce,
         live_login, revision, live_id,
     )
+    record_run = (record.get('run_id'), record.get('run_attempt'))
+    if record['state'] in {'attached', 'completed'} and record_run != executing_run:
+        raise ValueError('managed intent run pair does not match executing Actions run')
+    if record['state'] == 'completed' and record.get('terminal_outcome') == 'no-status':
+        if (record.get('terminal_run_id'), record.get('terminal_run_attempt')) != executing_run:
+            raise ValueError('completed no-status record is not bound to executing Actions run')
     return {
         'target_sha': expected_head,
         'pr_number': pr_number_text,
