@@ -954,6 +954,11 @@ def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix")
             raise AgentLoopError(f"{context} not-applicable matrices require a non-empty rationale.")
     elif not rows:
         raise AgentLoopError(f"{context} applicable matrices require at least one row.")
+    elif not any(row.applicability in {"applicable", "required"} for row in rows):
+        raise AgentLoopError(
+            f"{context} applicable matrices require at least one applicable or required row; "
+            "use a not-applicable matrix with a proportionate rationale when no scenario is enforceable."
+        )
     return RiskTestMatrix(
         applicability=applicability,
         rows=tuple(rows),
@@ -1053,6 +1058,14 @@ def validate_risk_test_matrix_revision(
     semantic_changed = old.to_payload() != new.to_payload()
     if approved and semantic_changed:
         raise AgentLoopError("Approved risk matrix is immutable; substantive changes require explicit replanning.")
+    # The approval boundary receives the accepted draft plus the audit carried
+    # by that draft, rather than a prior approved baseline.  The audit is a
+    # historical record of how the draft got here, so its subjects are not
+    # required to be a diff against the identical accepted payload.  Draft
+    # revisions (the non-approved path) still run the complete coverage and
+    # no-extra-subject checks below.
+    if approved and not semantic_changed:
+        return parsed_changes
     if semantic_changed and not parsed_changes:
         raise AgentLoopError(
             "Risk matrix changes omit audit operations; semantic changes require explicit "
@@ -1186,63 +1199,90 @@ def parse_risk_test_matrix_evidence(
         status = _risk_bounded_string(row["status"], context=f"{row_context}.status", max_bytes=64)
         if status not in RISK_MATRIX_EVIDENCE_STATUSES:
             raise AgentLoopError(f"{row_context}.status is invalid.")
-        result.append(
-            RiskTestMatrixEvidenceRow(
-                row_id=row_id,
-                status=status,
-                test_identifiers=_risk_bounded_string_list(row["test_identifiers"], context=f"{row_context}.test_identifiers"),
-                test_locations=_risk_bounded_string_list(row["test_locations"], context=f"{row_context}.test_locations"),
-                workflow_path_claim=_risk_bounded_string(row["workflow_path_claim"], context=f"{row_context}.workflow_path_claim"),
-                outcome_assertions=_risk_bounded_string_list(row["outcome_assertions"], context=f"{row_context}.outcome_assertions"),
-                forbidden_effect_assertions=_risk_bounded_string_list(row["forbidden_effect_assertions"], context=f"{row_context}.forbidden_effect_assertions"),
-                evidence_citations=_parse_risk_evidence_citations(row["evidence_citations"], context=f"{row_context}.evidence_citations"),
-                caveats=_risk_bounded_string_list(row.get("caveats", []), context=f"{row_context}.caveats"),
-            )
+        parsed_row = RiskTestMatrixEvidenceRow(
+            row_id=row_id,
+            status=status,
+            test_identifiers=_risk_bounded_string_list(row["test_identifiers"], context=f"{row_context}.test_identifiers"),
+            test_locations=_risk_bounded_string_list(row["test_locations"], context=f"{row_context}.test_locations"),
+            workflow_path_claim=_risk_bounded_string(row["workflow_path_claim"], context=f"{row_context}.workflow_path_claim"),
+            outcome_assertions=_risk_bounded_string_list(row["outcome_assertions"], context=f"{row_context}.outcome_assertions"),
+            forbidden_effect_assertions=_risk_bounded_string_list(row["forbidden_effect_assertions"], context=f"{row_context}.forbidden_effect_assertions"),
+            evidence_citations=_parse_risk_evidence_citations(row["evidence_citations"], context=f"{row_context}.evidence_citations"),
+            caveats=_risk_bounded_string_list(row.get("caveats", []), context=f"{row_context}.caveats"),
         )
         if status == "verified" and (
-            not result[-1].test_identifiers
-            or not result[-1].test_locations
-            or not result[-1].outcome_assertions
-            or not result[-1].forbidden_effect_assertions
-            or not result[-1].evidence_citations
+            not parsed_row.test_identifiers
+            or not parsed_row.test_locations
+            or not parsed_row.outcome_assertions
+            or not parsed_row.forbidden_effect_assertions
+            or not parsed_row.evidence_citations
         ):
             raise AgentLoopError(
                 f"{row_context} with status `verified` must include test identifiers, locations, "
                 "outcome and forbidden-effect assertions, and evidence citations."
             )
         if authoritative_test_observations is not None:
-            invalid = []
-            for citation in result[-1].evidence_citations:
-                matches = [
+            invalid: list[str] = []
+            matched_observations: list[object] = []
+            expected_statuses: set[str] = set()
+            for citation in parsed_row.evidence_citations:
+                citation_matches = [
                     observation
                     for observation in authoritative_test_observations
                     if _citation_matches_observation(citation, observation)
                 ]
-                if not matches or (
+                matched_observations.extend(citation_matches)
+                if not citation_matches or (
                     status == "verified"
                     and not any(
                         _authoritative_receipt_passes(observation, claim=citation.claim)
-                        for observation in matches
+                        for observation in citation_matches
                     )
                 ):
                     invalid.append(citation.receipt_id)
+                expected_statuses.update(
+                    expected
+                    for observation in citation_matches
+                    if (expected := _receipt_expected_status(observation, claim=citation.claim)) is not None
+                )
             if invalid:
                 raise AgentLoopError(
                     f"{row_context} contains citations without matching authoritative "
                     + ("passing " if status == "verified" else "")
                     + "test receipts: " + ", ".join(invalid)
                 )
-            if matches:
-                expected_statuses = {
-                    expected
-                    for observation in matches
-                    if (expected := _receipt_expected_status(observation, claim=citation.claim)) is not None
-                }
-                if expected_statuses and status not in expected_statuses:
-                    raise AgentLoopError(
-                        f"{row_context} status `{status}` contradicts the authoritative receipt "
-                        f"outcome; expected one of {sorted(expected_statuses)}."
-                    )
+            if expected_statuses and (
+                (len(expected_statuses) == 1 and status not in expected_statuses)
+                or (len(expected_statuses) > 1 and status != "incomplete")
+            ):
+                raise AgentLoopError(
+                    f"{row_context} status `{status}` contradicts the authoritative receipt "
+                    f"outcome; expected {sorted(expected_statuses)} or `incomplete` for mixed receipts."
+                )
+            if matched_observations:
+                # Receipt and attribution caveats are authoritative evidence,
+                # not optional coder prose. Carry every one into the row so a
+                # repair or renderer cannot turn a caveated result into a
+                # clean-looking verification. The bounded validator rejects
+                # overflow rather than silently truncating caveats.
+                all_caveats = list(parsed_row.caveats)
+                for observation in matched_observations:
+                    semantics, _rich = _observation_semantics(observation)
+                    for caveat in (*semantics["attribution_caveats"], *semantics["caveats"]):
+                        rendered_caveat = _risk_bounded_string(
+                            caveat,
+                            context=f"{row_context}.authoritative_caveat",
+                        )
+                        if rendered_caveat not in all_caveats:
+                            all_caveats.append(rendered_caveat)
+                parsed_row = dataclasses.replace(
+                    parsed_row,
+                    caveats=_risk_bounded_string_list(
+                        all_caveats,
+                        context=f"{row_context}.caveats",
+                    ),
+                )
+        result.append(parsed_row)
     if expected_ids is not None and {row.row_id for row in result} != expected_ids:
         missing = sorted(expected_ids - {row.row_id for row in result})
         extra = sorted({row.row_id for row in result} - expected_ids)
@@ -1327,6 +1367,8 @@ def _observation_semantics(observation: object) -> tuple[dict[str, object], bool
     attribution = value("attribution")
     if attribution is None and projected_value is not None:
         attribution = projected_value.get("tree")
+    if attribution is None:
+        attribution = value("tree")
     if isinstance(attribution, Mapping):
         attribution_values = dict(attribution)
     else:
@@ -1371,13 +1413,17 @@ def _authoritative_receipt_passes(
     expected_attribution = "base-reproduction" if claim == "base-reproduction" else "current-head"
     if semantics["attribution_state"] != expected_attribution:
         return False
-    if semantics["attribution_stable"] is False or semantics["untracked_input"]:
+    if semantics["attribution_stable"] is not True or semantics["untracked_input"]:
         return False
     if semantics["environment"] not in {None, "equivalent", "not-compared"}:
         return False
     if semantics["superseded_by"]:
         return False
-    if semantics["wrapper_bootstrap"] == "failed" or semantics["inner_exec"] == "failed":
+    if (
+        semantics["wrapper_bootstrap"] != "verified"
+        or semantics["inner_exec"] != "started"
+        or semantics["suite_start"] != "verified"
+    ):
         return False
     caveats = " ".join(
         str(item).casefold()

@@ -89,6 +89,8 @@ def test_m780_02_trivial_work_accepts_only_a_non_empty_not_applicable_rationale(
     assert not matrix.is_applicable
     with pytest.raises(AgentLoopError, match="not_applicable_rationale|not-applicable matrices require"):
         parse_risk_test_matrix({**_not_applicable(), "not_applicable_rationale": "   "})
+    with pytest.raises(AgentLoopError, match="at least one applicable or required row"):
+        parse_risk_test_matrix({**_matrix(), "rows": [{**_row(), "applicability": "not-applicable"}]})
 
 
 def test_m780_03_draft_changes_are_explicit_and_approved_rows_are_immutable() -> None:
@@ -99,6 +101,16 @@ def test_m780_03_draft_changes_are_explicit_and_approved_rows_are_immutable() ->
         validate_risk_test_matrix_revision(_matrix(), changed, changes, approved=True)
     with pytest.raises(AgentLoopError, match="omit audit operations"):
         validate_risk_test_matrix_revision(_matrix(), changed, [])
+
+
+def test_approved_matrix_accepts_the_final_revision_change_audit() -> None:
+    changes = [{
+        "operation": "change",
+        "row_ids": ["row-ordinary"],
+        "rationale": "Clarified the post-review recovery transition.",
+    }]
+    parsed = validate_risk_test_matrix_revision(_matrix(), _matrix(), changes, approved=True)
+    assert parsed[0].rationale == changes[0]["rationale"]
 
 
 def test_matrix_level_draft_changes_cannot_hide_behind_one_row_operation() -> None:
@@ -361,25 +373,38 @@ def test_m780_05_verified_evidence_requires_a_passing_authoritative_receipt() ->
         )
 
 
-def _rich_receipt(*, outcome: str = "passed", attribution_state: str = "current-head") -> SimpleNamespace:
+def _rich_receipt(
+    *,
+    outcome: str = "passed",
+    attribution_state: str = "current-head",
+    receipt_id: str = "receipt-rich",
+    stable: bool | None = True,
+    attribution_caveats: tuple[str, ...] = (),
+    caveats: tuple[str, ...] = (),
+    wrapper_bootstrap: str = "verified",
+    inner_exec: str = "started",
+    suite_start: str = "verified",
+    environment_state: str = "not-compared",
+    superseded_by: str | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
-        receipt_id="receipt-rich",
+        receipt_id=receipt_id,
         claim=None,
         normalized_command="python3 -m pytest tests/test_orchestrator_pr.py -q",
         outcome=outcome,
         provenance="parent-observed",
         attribution=SimpleNamespace(
             state=attribution_state,
-            stable=True,
+            stable=stable,
             untracked_input=False,
-            caveats=(),
+            caveats=attribution_caveats,
         ),
-        environment_state="not-compared",
-        superseded_by=None,
-        caveats=(),
-        wrapper_bootstrap="verified",
-        inner_exec="started",
-        suite_start="verified",
+        environment_state=environment_state,
+        superseded_by=superseded_by,
+        caveats=caveats,
+        wrapper_bootstrap=wrapper_bootstrap,
+        inner_exec=inner_exec,
+        suite_start=suite_start,
         public_projection=lambda: {
             "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
         },
@@ -427,6 +452,59 @@ def test_receipt_semantics_reject_stale_verified_and_relabelled_failure() -> Non
     assert parsed.rows[0].status == "failed"
 
 
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("wrapper_bootstrap", "unknown"),
+        ("inner_exec", "not-attempted"),
+        ("suite_start", "not-started"),
+    ],
+)
+def test_verified_receipts_require_affirmative_launch_and_suite_boundaries(field: str, value: str) -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    receipt = _rich_receipt(**{field: value})
+    with pytest.raises(AgentLoopError, match="passing.*receipts"):
+        parse_risk_test_matrix_evidence(
+            _evidence_for_status(identity, "verified"),
+            matrix=matrix,
+            authoritative_test_observations=[receipt],
+        )
+
+
+def test_receipt_caveats_and_mixed_outcomes_are_retained_as_incomplete() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "incomplete")
+    evidence["rows"][0]["evidence_citations"] = [
+        {
+            "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
+            "receipt_id": "receipt-rich",
+            "claim": "current-result",
+        },
+        {
+            "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
+            "receipt_id": "receipt-failed",
+            "claim": "current-result",
+        },
+    ]
+    parsed = parse_risk_test_matrix_evidence(
+        evidence,
+        matrix=matrix,
+        authoritative_test_observations=[
+            _rich_receipt(
+                receipt_id="receipt-rich",
+                attribution_caveats=("head comparison caveat",),
+                caveats=("wrapper caveat",),
+            ),
+            _rich_receipt(receipt_id="receipt-failed", outcome="failed"),
+        ],
+    )
+    assert parsed.rows[0].status == "incomplete"
+    assert "head comparison caveat" in parsed.rows[0].caveats
+    assert "wrapper caveat" in parsed.rows[0].caveats
+
+
 def test_m780_05_row_not_applicable_is_not_an_evidence_obligation() -> None:
     payload = _matrix()
     payload["rows"] = [
@@ -470,7 +548,7 @@ def test_m780_08c_oversized_matrix_is_omitted_atomically_from_prompt_context() -
     assert "Row row-ordinary" not in rendered
 
 
-def test_m780_08b_fitting_identity_only_context_keeps_matrix_enforceable() -> None:
+def test_complete_fitting_matrix_context_keeps_matrix_enforceable() -> None:
     matrix = parse_risk_test_matrix(_matrix())
     identity = risk_test_matrix_identity(matrix)
     context = make_approved_plan_context(
@@ -488,6 +566,28 @@ def test_m780_08b_fitting_identity_only_context_keeps_matrix_enforceable() -> No
     rendered = format_approved_plan_context(context, max_chars=5_000)
     assert "Row row-ordinary" in rendered
     assert "matrix: unavailable" not in rendered
+
+
+def test_m780_08b_fitting_identity_only_context_is_diagnostic_only() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        None,
+        expected_hash="a" * 16,
+        expected_subject="b" * 64,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=None,
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    from coding_review_agent_loop.prompts import format_approved_plan_context
+
+    rendered = format_approved_plan_context(context, max_chars=5_000)
+    assert not context.matrix_available
+    assert context.risk_test_matrix_diagnostic
+    assert "matrix: unavailable" in rendered
+    assert "Row row-ordinary" not in rendered
 
 
 def test_matrix_priority_omits_large_canonical_prose_before_small_matrix() -> None:

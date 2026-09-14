@@ -114,6 +114,34 @@ def _canonicalize_plan_subject_source(
     return text
 
 
+def _resume_matrix_fields(metadata: PostedRoundMetadata | None) -> dict[str, object]:
+    """Expose the authenticated matrix carrier in a skill resume descriptor.
+
+    The skill runner separately rehydrates an approved PR plan from its
+    provenance-bound issue comments, but plan-round resumes use this descriptor
+    as their only structured transport. Keep the complete bounded payload and
+    its identities available so a skill restart does not fall back to rendered
+    table prose.
+    """
+    if metadata is None:
+        return {
+            "risk_test_matrix_contract_version": None,
+            "risk_test_matrix_payload": None,
+            "risk_test_matrix_changes_payload": [],
+            "risk_test_matrix_identity": None,
+            "risk_test_matrix_boundary_digest": None,
+            "risk_test_matrix_diagnostic": None,
+        }
+    return {
+        "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,
+        "risk_test_matrix_payload": metadata.risk_test_matrix_payload,
+        "risk_test_matrix_changes_payload": list(metadata.risk_test_matrix_changes_payload),
+        "risk_test_matrix_identity": metadata.risk_test_matrix_identity,
+        "risk_test_matrix_boundary_digest": metadata.risk_test_matrix_boundary_digest,
+        "risk_test_matrix_diagnostic": metadata.risk_test_matrix_diagnostic,
+    }
+
+
 def _session_path(repo: str, issue: int) -> Path:
     slug = repo.replace("/", "-").replace(":", "-")
     state_home = Path(
@@ -213,6 +241,7 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
         "current_plan_subject": None,
         "local_test_evidence": None,
         "pending_comment_body": session.get("pending_comment_body"),
+        **_resume_matrix_fields(None),
     }
 
     try:
@@ -230,6 +259,7 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                 descriptor["current_plan"] = plan_text
                 descriptor["current_plan_subject"] = _plan_subject(plan_text)
                 descriptor["local_test_evidence"] = resumed.local_test_evidence
+                descriptor.update(_resume_matrix_fields(resumed.coder_metadata))
                 descriptor["completed_reviewer_data"] = [
                     {
                         "reviewer_name": record.metadata.agent,
@@ -279,6 +309,7 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                 descriptor["completed_reviewer_names"] = completed_names
                 descriptor["current_plan_subject"] = head_sha
                 descriptor["local_test_evidence"] = result.local_test_evidence
+                descriptor.update(_resume_matrix_fields(result.coder_metadata))
                 descriptor["completed_reviewer_data"] = [
                     {
                         "reviewer_name": record.metadata.agent,
