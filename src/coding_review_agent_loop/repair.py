@@ -33,6 +33,8 @@ from .protocol import (
     STATE_RE,
     parse_human_requirements_acknowledgement,
     parse_execution_recommendation_payload,
+    parse_risk_test_matrix,
+    parse_risk_test_matrix_changes,
 )
 from .errors import FreshContractIntegrityError
 
@@ -1328,7 +1330,6 @@ def _build_repair_prompt(
         ("{planning_human_requirements_instruction}", planning_human_requirements_instruction),
         ("{reviewer_human_requirements_instruction}", reviewer_human_requirements_instr),
         ("{prior_item_dispositions_instruction}", prior_item_dispositions_instruction),
-        ("{fresh_contract_instruction}", fresh_contract_instruction),
         ("{raw_response}", raw),
     )
     for placeholder, value in replacements:
@@ -1395,6 +1396,44 @@ def require_recoverable_fresh_execution_contract(raw: str, *, expected_kind: str
         raise FreshContractIntegrityError(
             "Fresh planning response is not mechanically recoverable: its execution "
             "recommendation is incomplete or inconsistent; start a new planner turn."
+        ) from exc
+
+
+def require_recoverable_fresh_risk_test_matrix_contract(
+    raw: str, *, expected_kind: str
+) -> None:
+    """Reject model repair when a fresh matrix cannot be recovered losslessly."""
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
+    except json.JSONDecodeError as exc:
+        raise FreshContractIntegrityError(
+            "Fresh planning response is not mechanically recoverable: its JSON source "
+            "cannot be parsed; start a new planner turn."
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("kind") != expected_kind:
+        raise FreshContractIntegrityError(
+            "Fresh planning response is not mechanically recoverable: expected the "
+            f"`{expected_kind}` source envelope; start a new planner turn."
+        )
+    required = (
+        "risk_test_matrix_contract_version",
+        "risk_test_matrix",
+        "risk_test_matrix_changes",
+    )
+    if any(name not in payload for name in required) or payload.get(
+        "risk_test_matrix_contract_version"
+    ) != 1:
+        raise FreshContractIntegrityError(
+            "Fresh planning response is not mechanically recoverable: the complete "
+            "generation-1 risk test matrix is absent; start a new planner turn."
+        )
+    try:
+        parse_risk_test_matrix(payload["risk_test_matrix"])
+        parse_risk_test_matrix_changes(payload["risk_test_matrix_changes"])
+    except Exception as exc:
+        raise FreshContractIntegrityError(
+            "Fresh planning response is not mechanically recoverable: its risk test "
+            "matrix is incomplete or inconsistent; start a new planner turn."
         ) from exc
 
 

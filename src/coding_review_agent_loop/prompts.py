@@ -1442,16 +1442,27 @@ def format_approved_plan_context(
     if plan_context.diagnostic:
         lines.extend(["", f"Plan recovery diagnostic: {plan_context.diagnostic}"])
     if max_chars is not None and plan_context.matrix_available:
+        matrix_prefix = "\n".join(lines)
+        canonical_omission = (
+            "Canonical approved plan text: omitted; the authenticated structured matrix above remains "
+            "the only enforceable plan channel."
+        )
         if plan_context.canonical_text:
             matrix_candidate = (
-                "\n".join(lines)
+                matrix_prefix
                 + "\n\nCanonical approved plan text:\n"
                 + plan_context.canonical_text
                 + "\n"
             )
+            # The structured matrix is the approval-critical channel. If the
+            # full prose would exceed the provider budget, omit prose first;
+            # only a matrix that cannot fit on its own is degraded.
+            matrix_only_candidate = matrix_prefix + "\n\n" + canonical_omission + "\n"
+            if len(matrix_candidate) > max_chars and len(matrix_only_candidate) <= max_chars:
+                return matrix_only_candidate
         else:
             matrix_candidate = (
-                "\n".join(lines)
+                matrix_prefix
                 + "\n\nCanonical approved plan text: omitted; the authenticated structured matrix above remains the only enforceable plan channel.\n"
             )
         if len(matrix_candidate) > max_chars:

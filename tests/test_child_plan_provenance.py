@@ -14,11 +14,14 @@ from coding_review_agent_loop.decomposition import (
     PHASE_IMPLEMENTATION_MARKER_RE,
     normalize_execution_recommendation,
     format_topology_checkpoint, phase_identity,
+    risk_matrix_row_ids_for_owner, validate_separately_planned_child_matrix,
+    _decode_phase_implementation_handoff_metadata,
 )
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment, IssueContext
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+from coding_review_agent_loop.protocol import parse_risk_test_matrix
 
 
 def plan_record(plan):
@@ -136,12 +139,53 @@ def fresh_staged_plan():
     )
 
 
+def fresh_staged_matrix_plan():
+    """Fresh staged parent fixture with explicit owned transition rows."""
+    plan = fresh_staged_plan()
+    payload, end = json.JSONDecoder().raw_decode(plan)
+    rows = []
+    for row_id, owner in (("row-stage-one", "stage-one"), ("row-stage-two", "stage-two")):
+        rows.append({
+            "row_id": row_id,
+            "label": f"{owner} transition",
+            "entry_path_or_mode": "review-only recovery",
+            "initial_state": "review complete",
+            "event": "repaired head passes",
+            "expected_outcome": "The owned transition completes.",
+            "forbidden_side_effects": ["No stale merge."],
+            "proposed_test_level": "orchestrator",
+            "proposed_test_location": "tests/test_child_plan_provenance.py",
+            "applicability": "applicable",
+            "related_scope_item_ids": ["scope-1" if owner == "stage-one" else "scope-2"],
+            "execution_owner": owner,
+        })
+    payload["risk_test_matrix"] = {
+        "applicability": "applicable",
+        "rows": rows,
+        "important_exclusions": ["Unrelated flag combinations are not required."],
+    }
+    payload["risk_test_matrix_changes"] = []
+    json_plan = json.dumps(payload) + plan[end:]
+    from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
+    matrix = payload["risk_test_matrix"]
+    footer = "\n<!-- AGENT_PLAN_STATE:"
+    return json_plan.replace(
+        footer,
+        "\n\n" + render_risk_test_matrix_section(
+            parse_risk_test_matrix(matrix),
+            (),
+        ) + footer,
+        1,
+    )
+
+
 def fresh_child_contexts(
     plan,
     *,
     stable_stage_id="stage-one",
     summary_mode="implement-by-phase",
     handoff_mode="implement-by-phase",
+    inherited_matrix_row_ids=(),
 ):
     raw_payload, _ = json.JSONDecoder().raw_decode(plan)
     from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
@@ -171,6 +215,7 @@ def fresh_child_contexts(
         phase_plan_hash=parent_hash, strategy="staged",
         recommendation_digest=normalized.recommendation_digest,
         execution_strategy_contract_version=1,
+        inherited_matrix_row_ids=inherited_matrix_row_ids,
     )
     if stable_stage_id != phase.stage_id:
         marker = orchestrator.PHASE_IDENTITY_MARKER_RE.search(child_body)
@@ -207,6 +252,7 @@ def fresh_child_contexts(
         strategy="staged", execution_strategy_contract_version=1,
         recommendation_digest=normalized.recommendation_digest,
         plan_subject=orchestrator._plan_subject(plan),
+        inherited_matrix_row_ids=inherited_matrix_row_ids,
     )
     handoff = format_phase_implementation_handoff_comment(
         parent_issue=55, mode=handoff_mode, plan_hash=parent_hash,
@@ -214,6 +260,7 @@ def fresh_child_contexts(
         topology_source="approved-plan-v1", execution_strategy_contract_version=1,
         recommendation_digest=normalized.recommendation_digest,
         plan_subject=orchestrator._plan_subject(plan),
+        inherited_matrix_row_ids=inherited_matrix_row_ids,
     )
     parent = IssueContext(
         number=55, repo="OWNER/REPO", title="Parent", body="Parent scope.",
@@ -432,3 +479,158 @@ def test_cli_run_pr_loop_requires_child_plan_without_parent_phase_handoff(
     with pytest.raises(AgentLoopError, match="approved child plan"):
         orchestrator.run_pr_loop(runner, pr_number=77, config=config)
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+def _matrix_row(row_id, owner, *, expected="The transition completes."):
+    return {
+        "row_id": row_id,
+        "label": row_id,
+        "entry_path_or_mode": "review-only recovery",
+        "initial_state": "review complete",
+        "event": "repaired head passes",
+        "expected_outcome": expected,
+        "forbidden_side_effects": ["No stale merge."],
+        "proposed_test_level": "orchestrator",
+        "proposed_test_location": "tests/test_child_plan_provenance.py",
+        "applicability": "applicable",
+        "related_scope_item_ids": ["scope-1"],
+        "execution_owner": owner,
+    }
+
+
+def test_m780_12_generated_handoff_records_owned_rows_and_separate_child_must_link_them():
+    parent_matrix = {
+        "applicability": "applicable",
+        "rows": [
+            _matrix_row("row-owned", "api"),
+            _matrix_row("row-later", "later"),
+        ],
+        "important_exclusions": [],
+    }
+    assert risk_matrix_row_ids_for_owner(parent_matrix, "api") == ("row-owned",)
+    child_matrix = {
+        **parent_matrix,
+        "rows": [
+            {**_matrix_row("row-owned", "api")},
+            _matrix_row("child-local", "api"),
+        ],
+    }
+    assert validate_separately_planned_child_matrix(
+        parent_matrix, child_matrix, execution_owner="api"
+    ) == ("row-owned",)
+    with pytest.raises(AgentLoopError, match="missing inherited"):
+        validate_separately_planned_child_matrix(
+            parent_matrix,
+            {**child_matrix, "rows": [_matrix_row("child-local", "api")]},
+            execution_owner="api",
+        )
+
+    phase = PlanPhase(
+        title="API", scope="API.", non_goals="None.", dependency_notes="None.",
+        rollout_risk="low", validation="Run the workflow test.", parent_context="Parent.",
+        automation="agent-pr", depends_on=(), stage_id="api", position=1,
+        deliverables=("API.",), acceptance_criteria=("Done.",),
+    )
+    body = format_phase_issue_body(
+        repo="OWNER/REPO", parent_issue=55, approved_plan="Parent.", phase=phase,
+        created_so_far=(), phase_identity_value="identity", topology_source="approved-plan-v1",
+        phase_index=1, phase_plan_hash="a" * 16, strategy="staged",
+        recommendation_digest="b" * 64, execution_strategy_contract_version=1,
+        inherited_matrix_row_ids=("row-owned",),
+    )
+    assert "Inherited parent risk-matrix obligations" in body
+    handoff = format_phase_implementation_handoff_comment(
+        parent_issue=55, mode="implement-by-phase", plan_hash="a" * 16,
+        phase_index=1,
+        created=CreatedPhaseIssue(phase=phase, issue_url="https://github.com/OWNER/REPO/issues/56", issue_number=56),
+        strategy="staged", topology_source="approved-plan-v1",
+        execution_strategy_contract_version=1, recommendation_digest="b" * 64,
+        plan_subject="c" * 64, inherited_matrix_row_ids=("row-owned",),
+    )
+    decoded = _decode_phase_implementation_handoff_metadata(
+        PHASE_IMPLEMENTATION_MARKER_RE.search(handoff).group("payload")
+    )
+    assert decoded.inherited_matrix_row_ids == ("row-owned",)
+
+
+def test_m780_12_generated_child_dispatch_enforces_owned_rows_and_keeps_later_rows_pending(
+    tmp_path, monkeypatch
+):
+    plan = fresh_staged_matrix_plan()
+    child, parent = fresh_child_contexts(
+        plan, inherited_matrix_row_ids=("row-stage-one",)
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77, "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "Row row-stage-one" in prompt
+    assert "Row row-stage-two" in prompt
+    assert "[enforceable]" in prompt
+    assert "[read-only pending obligation]" in prompt
+
+
+def test_m780_12_separately_planned_child_requires_parent_row_and_uses_child_provenance(
+    tmp_path, monkeypatch
+):
+    parent_plan = fresh_staged_matrix_plan()
+    child, parent = fresh_child_contexts(
+        parent_plan,
+        summary_mode="decompose-only",
+        handoff_mode="implement-by-phase",
+        inherited_matrix_row_ids=("row-stage-one",),
+    )
+    child_matrix = {
+        "applicability": "applicable",
+        # Separately planned children may add local rows, but the inherited
+        # row must retain every approved semantic field.  Copy it from the
+        # parent fixture so this test exercises provenance rather than an
+        # accidental text difference in the child plan.
+        "rows": [
+            next(
+                row for row in json.JSONDecoder().raw_decode(parent_plan)[0]["risk_test_matrix"]["rows"]
+                if row["row_id"] == "row-stage-one"
+            )
+        ],
+        "important_exclusions": ["Unrelated flag combinations are not required."],
+    }
+    child_plan = "Approved child plan.\n\n" + __import__(
+        "coding_review_agent_loop.comment_rendering", fromlist=["render_risk_test_matrix_section"]
+    ).render_risk_test_matrix_section(parse_risk_test_matrix(child_matrix))
+    child_hash = approved_plan_hash(child_plan)
+    child_handoff = format_issue_pr_handoff_comment(
+        issue_number=56, pr_number=77,
+        pr_url="https://github.com/OWNER/REPO/pull/77", pr_head_sha="abc123",
+        flow="approved-plan-implementation", plan_hash=child_hash,
+    )
+    child = dataclasses.replace(
+        child,
+        comments=(comment(plan_record(child_plan)), comment(child_handoff)),
+    )
+    parent = dataclasses.replace(parent, comments=parent.comments[:-1])
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77, "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+    prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
+    assert "Row row-stage-one" in prompt
+    assert "[enforceable]" in prompt

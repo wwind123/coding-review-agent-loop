@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -20,11 +21,14 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
     validate_risk_test_matrix_revision,
 )
+from coding_review_agent_loop.decomposition import validate_risk_matrix_ownership
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
     _decode_round_metadata,
     _encode_round_metadata,
+    _attach_round_metadata,
     make_approved_plan_context,
+    recover_approved_plan_context,
     scope_approved_plan_matrix,
 )
 from coding_review_agent_loop.round_transport import (
@@ -95,6 +99,59 @@ def test_m780_03_draft_changes_are_explicit_and_approved_rows_are_immutable() ->
         validate_risk_test_matrix_revision(_matrix(), changed, changes, approved=True)
     with pytest.raises(AgentLoopError, match="omit audit operations"):
         validate_risk_test_matrix_revision(_matrix(), changed, [])
+
+
+def test_matrix_level_draft_changes_cannot_hide_behind_one_row_operation() -> None:
+    previous = {**_matrix(), "rows": [_row("row-one"), _row("row-two")]}
+    current = {**previous, "important_exclusions": ["A newly explicit exclusion."]}
+    with pytest.raises(AgentLoopError, match="complete matrix scope"):
+        validate_risk_test_matrix_revision(
+            previous,
+            current,
+            [{"operation": "change", "row_ids": ["row-one"], "rationale": "Clarified one row."}],
+        )
+    validate_risk_test_matrix_revision(
+        previous,
+        current,
+        [{
+            "operation": "change",
+            "row_ids": ["row-one", "row-two"],
+            "rationale": "Clarified the matrix exclusions.",
+        }],
+    )
+
+
+def test_non_prefixed_stage_id_is_a_valid_parser_owner_but_topology_membership_is_checked() -> None:
+    matrix = parse_risk_test_matrix({**_matrix(), "rows": [{**_row(), "execution_owner": "api"}]})
+    recommendation = {
+        "strategy": "staged",
+        "rationale": "Split by lifecycle boundary.",
+        "staging_feasibility": "safe",
+        "scope_items": [{
+            "scope_item_id": "scope-1", "requirement": "Do it.", "acceptance_criteria": ["Done."],
+        }, {
+            "scope_item_id": "scope-2", "requirement": "Integrate it.", "acceptance_criteria": ["Integrated."],
+        }],
+        "coupling_constraints": [],
+        "child_stages": [{
+            "stage_id": "api", "position": 1, "title": "API", "summary": "API.",
+            "deliverables": ["API."], "non_goals": [], "acceptance_criteria": ["Done."],
+            "depends_on_stage_ids": [], "dependency_notes": "None.", "automation": "agent-pr",
+            "rollout_risk": "low", "compatibility_constraints": [], "covered_scope_item_ids": ["scope-1"],
+        }, {
+            "stage_id": "later", "position": 2, "title": "Integration", "summary": "Integration.",
+            "deliverables": ["Integration."], "non_goals": [], "acceptance_criteria": ["Integrated."],
+            "depends_on_stage_ids": ["api"], "dependency_notes": "After API.", "automation": "agent-pr",
+            "rollout_risk": "low", "compatibility_constraints": [], "covered_scope_item_ids": ["scope-2"],
+        }],
+        "retained_parent_work": {"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []},
+        "final_integration_work": {"status": "none", "deliverables": [], "acceptance_criteria": [], "covered_scope_item_ids": []},
+        "caveats": [],
+    }
+    from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
+
+    parsed_recommendation = parse_execution_recommendation_payload(recommendation)
+    validate_risk_matrix_ownership(matrix, parsed_recommendation)
 
 
 def test_m780_04_not_applicable_and_matrix_less_plan_payloads_remain_compatible() -> None:
@@ -304,6 +361,72 @@ def test_m780_05_verified_evidence_requires_a_passing_authoritative_receipt() ->
         )
 
 
+def _rich_receipt(*, outcome: str = "passed", attribution_state: str = "current-head") -> SimpleNamespace:
+    return SimpleNamespace(
+        receipt_id="receipt-rich",
+        claim=None,
+        normalized_command="python3 -m pytest tests/test_orchestrator_pr.py -q",
+        outcome=outcome,
+        provenance="parent-observed",
+        attribution=SimpleNamespace(
+            state=attribution_state,
+            stable=True,
+            untracked_input=False,
+            caveats=(),
+        ),
+        environment_state="not-compared",
+        superseded_by=None,
+        caveats=(),
+        wrapper_bootstrap="verified",
+        inner_exec="started",
+        suite_start="verified",
+        public_projection=lambda: {
+            "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
+        },
+    )
+
+
+def _evidence_for_status(identity: str, status: str) -> dict[str, object]:
+    return {
+        "matrix_identity": identity,
+        "rows": [{
+            "row_id": "row-ordinary", "status": status,
+            "test_identifiers": ["test_review_only_recovery"],
+            "test_locations": ["tests/test_orchestrator_pr.py:1"],
+            "workflow_path_claim": "The recovery branch was exercised.",
+            "outcome_assertions": ["The observed outcome is retained."],
+            "forbidden_effect_assertions": ["No forbidden side effect occurred."],
+            "evidence_citations": [{
+                "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
+                "receipt_id": "receipt-rich", "claim": "current-result",
+            }],
+        }],
+    }
+
+
+def test_receipt_semantics_reject_stale_verified_and_relabelled_failure() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    with pytest.raises(AgentLoopError, match="passing.*receipts"):
+        parse_risk_test_matrix_evidence(
+            _evidence_for_status(identity, "verified"),
+            matrix=matrix,
+            authoritative_test_observations=[_rich_receipt(attribution_state="stale")],
+        )
+    with pytest.raises(AgentLoopError, match="passing.*receipts"):
+        parse_risk_test_matrix_evidence(
+            _evidence_for_status(identity, "verified"),
+            matrix=matrix,
+            authoritative_test_observations=[_rich_receipt(outcome="failed")],
+        )
+    parsed = parse_risk_test_matrix_evidence(
+        _evidence_for_status(identity, "failed"),
+        matrix=matrix,
+        authoritative_test_observations=[_rich_receipt(outcome="failed")],
+    )
+    assert parsed.rows[0].status == "failed"
+
+
 def test_m780_05_row_not_applicable_is_not_an_evidence_obligation() -> None:
     payload = _matrix()
     payload["rows"] = [
@@ -345,6 +468,74 @@ def test_m780_08c_oversized_matrix_is_omitted_atomically_from_prompt_context() -
     assert "matrix: unavailable" in rendered
     assert "zero matrix rows are enforceable" in rendered
     assert "Row row-ordinary" not in rendered
+
+
+def test_m780_08b_fitting_identity_only_context_keeps_matrix_enforceable() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        None,
+        expected_hash="a" * 16,
+        expected_subject="b" * 64,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    from coding_review_agent_loop.prompts import format_approved_plan_context
+
+    rendered = format_approved_plan_context(context, max_chars=5_000)
+    assert "Row row-ordinary" in rendered
+    assert "matrix: unavailable" not in rendered
+
+
+def test_matrix_priority_omits_large_canonical_prose_before_small_matrix() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        "large approved body\n" + "x" * 70_000 + "\n" + render_risk_test_matrix_section(matrix),
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    from coding_review_agent_loop.prompts import format_approved_plan_context
+
+    rendered = format_approved_plan_context(context, max_chars=5_000)
+    assert "Row row-ordinary" in rendered
+    assert "Canonical approved plan text: omitted" in rendered
+    assert "matrix: unavailable" not in rendered
+
+
+def test_matching_plan_records_with_divergent_matrix_metadata_close_only_matrix_channel() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    other_matrix = parse_risk_test_matrix({**_matrix(), "rows": [{**_row(), "expected_outcome": "Different."}]})
+    other_identity = risk_test_matrix_identity(other_matrix)
+    canonical = "Approved plan\n\n" + render_risk_test_matrix_section(matrix)
+    comments = [
+        SimpleNamespace(body=_attach_round_metadata(canonical, PostedRoundMetadata(
+            flow="plan", role="coder", agent="Codex", round_number=1,
+            subject="subject", canonical_plan=canonical,
+            risk_test_matrix_contract_version=1, risk_test_matrix_payload=matrix.to_payload(),
+            risk_test_matrix_identity=identity, risk_test_matrix_boundary_digest=identity,
+        ))),
+        SimpleNamespace(body=_attach_round_metadata(canonical, PostedRoundMetadata(
+            flow="plan", role="coder", agent="Codex", round_number=2,
+            subject="subject", canonical_plan=canonical,
+            risk_test_matrix_contract_version=1, risk_test_matrix_payload=other_matrix.to_payload(),
+            risk_test_matrix_identity=other_identity, risk_test_matrix_boundary_digest=other_identity,
+        ))),
+    ]
+    recovered = recover_approved_plan_context(
+        comments,
+        expected_hash=hashlib.sha256(canonical.strip().encode()).hexdigest()[:16],
+    )
+    assert recovered.availability == "available"
+    assert not recovered.matrix_available
+    assert recovered.risk_test_matrix_diagnostic
 
 
 def test_m780_12_staged_context_keeps_pending_rows_read_only() -> None:

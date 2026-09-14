@@ -2024,22 +2024,34 @@ def recover_approved_plan_context(
             ),
         )
     matching_indices = {index for index, _raw in candidates}
+    matching_records = [record for record in records if record.index in matching_indices]
+    matrix_presence = [
+        any(
+            value is not None
+            for value in (
+                record.metadata.risk_test_matrix_contract_version,
+                record.metadata.risk_test_matrix_payload,
+                record.metadata.risk_test_matrix_changes_payload,
+                record.metadata.risk_test_matrix_identity,
+                record.metadata.risk_test_matrix_boundary_digest,
+            )
+        )
+        for record in matching_records
+    ]
     matching_matrix_identities = {
         record.metadata.risk_test_matrix_identity
-        for record in records
-        if record.index in matching_indices
-        and record.metadata.risk_test_matrix_identity is not None
+        for record, present in zip(matching_records, matrix_presence)
+        if present
     }
-    if len(matching_matrix_identities) > 1:
-        return ApprovedPlanContext(
-            plan_hash=expected_hash,
-            plan_subject=expected_subject,
-            availability="mismatched",
-            has_matching_candidate=True,
-            diagnostic=(
-                f"Multiple divergent risk matrix identities match approved plan {expected_hash}."
-            ),
-        )
+    matching_matrix_identity_missing = any(
+        present and record.metadata.risk_test_matrix_identity is None
+        for record, present in zip(matching_records, matrix_presence)
+    )
+    matrix_conflict = bool(matching_matrix_identities) and (
+        len(matching_matrix_identities) > 1
+        or not all(matrix_presence)
+        or matching_matrix_identity_missing
+    )
     index, raw = candidates[-1]
     matching_record = next((record for record in reversed(records) if record.index == index), None)
     matrix_fields: dict[str, object] = {}
@@ -2053,6 +2065,21 @@ def recover_approved_plan_context(
             "risk_test_matrix_source_locator": f"issue comment index {index}",
             "risk_test_matrix_diagnostic": matching_record.metadata.risk_test_matrix_diagnostic,
         }
+        if matrix_conflict:
+            # Canonical plan identity is still unambiguous. Close only the
+            # semantic matrix channel when matching records disagree; do not
+            # turn a matrix-only conflict into a whole-plan mismatch.
+            matrix_fields.update(
+                {
+                    "risk_test_matrix_diagnostic": (
+                        f"Multiple divergent risk matrix records match approved plan {expected_hash}."
+                    ),
+                    "risk_test_matrix_payload": None,
+                    "risk_test_matrix_changes_payload": (),
+                    "risk_test_matrix_identity": None,
+                    "risk_test_matrix_boundary_digest": None,
+                }
+            )
         if expected_matrix_identity is not None and matching_record.metadata.risk_test_matrix_identity != expected_matrix_identity:
             matrix_fields["risk_test_matrix_diagnostic"] = (
                 f"Recovered matrix identity does not match handoff identity {expected_matrix_identity}."

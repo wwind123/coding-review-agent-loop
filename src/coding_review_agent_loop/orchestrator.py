@@ -52,6 +52,8 @@ from .decomposition import (
     adapt_typed_child_stages,
     normalize_execution_recommendation,
     validate_risk_matrix_ownership,
+    validate_separately_planned_child_matrix,
+    risk_matrix_row_ids_for_owner,
     recover_execution_recommendation,
     ExecutionDecision,
     EXECUTION_TOPOLOGY_SOURCE,
@@ -296,6 +298,7 @@ from .repair import (
     execute_repair,
     strip_unknown_prior_item_dispositions,
     require_recoverable_fresh_execution_contract,
+    require_recoverable_fresh_risk_test_matrix_contract,
 )
 from .runner import Runner
 from .salvage import (
@@ -2248,6 +2251,27 @@ def _run_structured_repair(
                     RepairAttemptResult(
                         backend="none",
                         model="fresh-contract-integrity",
+                        prompt="",
+                        output=raw,
+                        returncode=None,
+                        outcome="fresh_contract_integrity",
+                        diagnostic=str(exc),
+                        log_path=None,
+                        fallback_planned=False,
+                    )
+                ]
+    if repair_kwargs.get("require_risk_test_matrix_contract"):
+        expected_kind = repair_kwargs.get("expected_kind")
+        if isinstance(expected_kind, str):
+            try:
+                require_recoverable_fresh_risk_test_matrix_contract(
+                    raw, expected_kind=expected_kind
+                )
+            except FreshContractIntegrityError as exc:
+                return None, None, [
+                    RepairAttemptResult(
+                        backend="none",
+                        model="fresh-matrix-contract-integrity",
                         prompt="",
                         output=raw,
                         returncode=None,
@@ -4938,6 +4962,12 @@ def _preflight_fresh_staged_topology(
     decomposition, retained_parent_scope = normalized_topology
     plan_hash = approved_plan_hash(approved_plan)
     plan_subject = _plan_subject(approved_plan)
+    matrix_context = make_approved_plan_context(
+        approved_plan,
+        source_locator=f"issue #{issue_number} approved-plan topology",
+        expected_hash=plan_hash,
+        expected_subject=plan_subject,
+    )
     # Reconcile any already-published approval-bound decision before the
     # summary/child/handoff inventory below.  The finder also scans decisions
     # for older plan hashes, preventing a changed approved plan from creating a
@@ -5064,6 +5094,10 @@ def _preflight_fresh_staged_topology(
         recommendation_digest=decomposition.recommendation_digest,
         plan_subject=plan_subject,
         preflight_only=True,
+        risk_test_matrix=(
+            matrix_context.risk_test_matrix_payload
+            if matrix_context.matrix_available else None
+        ),
     )
     if isinstance(preflight_children, NeedsHumanDecision):
         return preflight_children
@@ -6302,10 +6336,15 @@ def _decompose_approved_plan(
             expected_subject=plan_subject,
         )
         if parent_matrix_context.matrix_available:
+            risk_matrix_payload = parent_matrix_context.risk_test_matrix_payload
             validate_risk_matrix_ownership(
                 parent_matrix_context.risk_test_matrix_payload,
                 execution_recommendation,
             )
+        else:
+            risk_matrix_payload = None
+    else:
+        risk_matrix_payload = None
     if normalized_topology is not None:
         decomposition, retained_parent_scope = normalized_topology
         reject_legacy_topology_collision(
@@ -6412,6 +6451,15 @@ def _decompose_approved_plan(
             operation_description="plan decomposition",
         )
         decomposition = decomposition_response.marker_value
+    if topology_source == EXECUTION_TOPOLOGY_SOURCE and risk_matrix_payload is None:
+        recovered_matrix_context = make_approved_plan_context(
+            approved_plan,
+            source_locator=f"issue #{issue_number} approved-plan topology",
+            expected_hash=plan_hash,
+            expected_subject=plan_subject,
+        )
+        if recovered_matrix_context.matrix_available:
+            risk_matrix_payload = recovered_matrix_context.risk_test_matrix_payload
     created = create_decomposition_child_issues(
         runner,
         config=config,
@@ -6426,6 +6474,7 @@ def _decompose_approved_plan(
         execution_strategy_contract_version=execution_contract_version,
         recommendation_digest=recommendation_digest,
         plan_subject=plan_subject,
+        risk_test_matrix=risk_matrix_payload,
     )
     if isinstance(created, NeedsHumanDecision):
         return created
@@ -6705,6 +6754,16 @@ def _run_plan_first_loop(
         next_unresolved_item_number = resumed_round.next_unresolved_item_number
         start_round_number = resumed_round.round_number
         log(config, f"Planning issue #{issue_number}: resuming round {start_round_number}")
+        # A resumed round carries its planning-generation discriminator in
+        # durable coder metadata. Historical rounds intentionally have no
+        # discriminator and must remain legacy-undecided; applying the fresh
+        # gate here would force an old plan to fabricate a matrix on its next
+        # revision.
+        require_fresh_matrix_contract = bool(
+            require_fresh_matrix_contract
+            and resumed_round.coder_metadata is not None
+            and resumed_round.coder_metadata.risk_test_matrix_contract_version == 1
+        )
 
     for round_number in range(start_round_number, config.max_rounds + 1):
         current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
@@ -7372,6 +7431,18 @@ def _run_plan_first_loop(
                 expected_hash=plan_hash,
                 expected_subject=plan_subject,
             )
+            if approved_plan_context.matrix_available:
+                # Cross the approval boundary through the same immutable
+                # validator used by recovery. There is no prior approved
+                # baseline to diff on a first approval, so comparing the
+                # accepted payload with itself specifically asserts that the
+                # boundary cannot mutate it while it is being bound.
+                validate_risk_test_matrix_revision(
+                    approved_plan_context.risk_test_matrix_payload or {},
+                    approved_plan_context.risk_test_matrix_payload or {},
+                    approved_plan_context.risk_test_matrix_changes_payload,
+                    approved=True,
+                )
             recommendation = _current_execution_recommendation(
                 current_plan, issue_context.comments
             )
@@ -7584,6 +7655,15 @@ def _run_plan_first_loop(
                     issue_number=first_agent_phase.issue_number,
                 )
                 phase_parent_context = first_agent_phase.phase.parent_context or current_plan
+                first_stage_id = (
+                    getattr(first_agent_phase.phase, "stage_id", None)
+                    or str(getattr(first_agent_phase.phase, "position", 1))
+                )
+                inherited_matrix_row_ids = risk_matrix_row_ids_for_owner(
+                    approved_plan_context.risk_test_matrix_payload
+                    if approved_plan_context.matrix_available else None,
+                    first_stage_id,
+                )
                 # Persist the parent-owned assignment before child execution so
                 # PR validation and crash recovery see the same phase identity.
                 post_phase_implementation_handoff_comment(
@@ -7610,16 +7690,13 @@ def _run_plan_first_loop(
                         if recommendation is not None else None
                     ),
                     plan_subject=plan_subject,
+                    inherited_matrix_row_ids=inherited_matrix_row_ids,
                 )
                 child_plan_context = make_approved_plan_context(
                     current_plan,
                     source_locator=f"issue #{issue_number} topology checkpoint phase 1",
                     expected_hash=plan_hash,
                     expected_subject=plan_subject,
-                )
-                first_stage_id = (
-                    getattr(first_agent_phase.phase, "stage_id", None)
-                    or str(getattr(first_agent_phase.phase, "position", 1))
                 )
                 child_plan_context = scope_approved_plan_matrix(
                     child_plan_context,
@@ -10610,6 +10687,21 @@ def run_pr_loop(
                                     raise AgentLoopError(
                                         "Fresh decomposition child phase stable ID disagrees with its ordinal."
                                     )
+                                parent_matrix_row_ids = risk_matrix_row_ids_for_owner(
+                                    parent_plan_context.risk_test_matrix_payload
+                                    if parent_plan_context.matrix_available else None,
+                                    stable_stage_id,
+                                )
+                                marker_row_ids = phase_payload.get(
+                                    "inherited_matrix_row_ids", []
+                                )
+                                if not isinstance(marker_row_ids, list) or any(
+                                    not isinstance(item, str) for item in marker_row_ids
+                                ) or tuple(marker_row_ids) != parent_matrix_row_ids:
+                                    raise AgentLoopError(
+                                        "Fresh decomposition child phase inherited matrix rows "
+                                        "do not match the approved parent owner allocation."
+                                    )
                                 expected_identity = phase_identity(
                                     parent_issue=parent_issue_context.number,
                                     plan_hash=phase_plan_hash,
@@ -10674,6 +10766,13 @@ def run_pr_loop(
                                         "implementation handoffs for the same phase."
                                     )
                                 phase_handoff = phase_handoffs[0] if phase_handoffs else None
+                                if phase_handoff is not None and tuple(
+                                    phase_handoff.inherited_matrix_row_ids
+                                ) != parent_matrix_row_ids:
+                                    raise AgentLoopError(
+                                        "Fresh decomposition child implementation handoff has an "
+                                        "unbound or incomplete parent matrix assignment."
+                                    )
                                 if phase_handoff is not None and (
                                     phase_handoff.plan_hash != phase_plan_hash
                                     or phase_handoff.mode != "implement-by-phase"
@@ -10719,12 +10818,28 @@ def run_pr_loop(
                                     )
                                     if (
                                         not child_plan_context.is_available
-                                        or not child_plan_context.canonical_text
+                                        or not (
+                                            child_plan_context.canonical_text
+                                            or child_plan_context.matrix_available
+                                        )
                                     ):
                                         raise AgentLoopError(
                                             "Fresh decomposition child phase has no parent "
                                             "implementation handoff and no recoverable approved "
                                             "child plan; repair the child issue-to-PR provenance."
+                                        )
+                                    inherited_ids = validate_separately_planned_child_matrix(
+                                        parent_plan_context.risk_test_matrix_payload
+                                        if parent_plan_context.matrix_available else None,
+                                        child_plan_context.risk_test_matrix_payload
+                                        if child_plan_context.matrix_available else None,
+                                        execution_owner=stable_stage_id,
+                                    )
+                                    if inherited_ids:
+                                        child_plan_context = scope_approved_plan_matrix(
+                                            child_plan_context,
+                                            execution_owner=stable_stage_id,
+                                            valid_stage_ids=(stable_stage_id,),
                                         )
                                     approved_plan_context = child_plan_context
                             else:

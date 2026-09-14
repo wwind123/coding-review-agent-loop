@@ -776,7 +776,11 @@ RISK_MATRIX_EVIDENCE_STATUSES = frozenset(
     }
 )
 _RISK_ROW_ID_RE = re.compile(r"^(?!.*(?:^|[-_.])(item|finding|review|blocker)[-_.]?\d)(?!hr-)[A-Za-z0-9][A-Za-z0-9._-]*$")
-_RISK_OWNER_STAGE_RE = re.compile(r"^(?:stage|child)[-_.][A-Za-z0-9][A-Za-z0-9._-]*$")
+# Stage IDs are approved-plan identifiers, not a second, narrower namespace.
+# Topology validation checks membership in the approved recommendation; this
+# parser must accept valid IDs such as ``api`` and ``s1`` as well as the older
+# ``stage-*``/``child-*`` spellings.
+_RISK_OWNER_STAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _risk_bounded_string(value: object, *, context: str, max_bytes: int = RISK_MATRIX_MAX_FIELD_BYTES) -> str:
@@ -1054,16 +1058,48 @@ def validate_risk_test_matrix_revision(
             "Risk matrix changes omit audit operations; semantic changes require explicit "
             "review-visible audit operations."
         )
-    covered = {row_id for change in parsed_changes for row_id in change.row_ids}
     old_by_id = {row.row_id: row for row in old.rows}
     new_by_id = {row.row_id: row for row in new.rows}
     changed_ids = {
         row_id for row_id in set(old_by_id) | set(new_by_id)
         if old_by_id.get(row_id) != new_by_id.get(row_id)
     }
+    changed_matrix_fields = {
+        field
+        for field in ("applicability", "important_exclusions", "not_applicable_rationale")
+        if getattr(old, field) != getattr(new, field)
+    }
+    covered = {row_id for change in parsed_changes for row_id in change.row_ids}
+    if changed_matrix_fields:
+        # Matrix-level semantics need a matrix-level audit operation. A row
+        # operation that happens to mention one changed row cannot authorize a
+        # rewrite of exclusions, applicability, or the not-applicable reason.
+        # For a zero-row not-applicable matrix, ``matrix`` is the explicit
+        # matrix-level audit subject (and is not a row ID).
+        matrix_scope = set(old_by_id) | set(new_by_id) or {"matrix"}
+        if not any(
+            change.operation in {"change", "split", "merge"}
+            and set(change.row_ids) == matrix_scope
+            for change in parsed_changes
+        ):
+            raise AgentLoopError(
+                "Risk matrix-level changes require one review-visible audit operation "
+                "covering the complete matrix scope."
+            )
     missing = sorted(changed_ids - covered)
     if missing:
         raise AgentLoopError("Risk matrix changes omit audit operations for: " + ", ".join(missing))
+    matrix_audit_scope = (
+        (set(old_by_id) | set(new_by_id)) or {"matrix"}
+        if changed_matrix_fields
+        else set()
+    )
+    extra = sorted(covered - changed_ids - matrix_audit_scope)
+    if extra:
+        raise AgentLoopError(
+            "Risk matrix changes contain audit subjects with no corresponding semantic change: "
+            + ", ".join(extra)
+        )
     if approved and changed_ids:
         raise AgentLoopError("Approved risk matrix rows cannot be removed, reassigned, or weakened without a newly reviewed baseline.")
     return parsed_changes
@@ -1185,8 +1221,7 @@ def parse_risk_test_matrix_evidence(
                 if not matches or (
                     status == "verified"
                     and not any(
-                        getattr(observation, "outcome", None) == "passed"
-                        and getattr(observation, "provenance", None) == "parent-observed"
+                        _authoritative_receipt_passes(observation, claim=citation.claim)
                         for observation in matches
                     )
                 ):
@@ -1197,6 +1232,17 @@ def parse_risk_test_matrix_evidence(
                     + ("passing " if status == "verified" else "")
                     + "test receipts: " + ", ".join(invalid)
                 )
+            if matches:
+                expected_statuses = {
+                    expected
+                    for observation in matches
+                    if (expected := _receipt_expected_status(observation, claim=citation.claim)) is not None
+                }
+                if expected_statuses and status not in expected_statuses:
+                    raise AgentLoopError(
+                        f"{row_context} status `{status}` contradicts the authoritative receipt "
+                        f"outcome; expected one of {sorted(expected_statuses)}."
+                    )
     if expected_ids is not None and {row.row_id for row in result} != expected_ids:
         missing = sorted(expected_ids - {row.row_id for row in result})
         extra = sorted({row.row_id for row in result} - expected_ids)
@@ -1209,9 +1255,29 @@ def _citation_matches_observation(
     observation: object,
 ) -> bool:
     """Match a coder citation to a live broker observation, not just its shape."""
-    observed_claim = getattr(observation, "claim", None)
+    projected_value: Mapping[str, object] | None = None
+    projected = getattr(observation, "public_projection", None)
+    if callable(projected):
+        try:
+            value = projected()
+        except Exception:  # pragma: no cover - defensive provider boundary
+            value = None
+        if isinstance(value, Mapping):
+            projected_value = value
+    elif isinstance(observation, Mapping):
+        projected_value = observation
+
+    def observed(name: str, default: object = None) -> object:
+        value = getattr(observation, name, default)
+        if value is not default:
+            return value
+        if projected_value is not None:
+            return projected_value.get(name, default)
+        return default
+
+    observed_claim = observed("claim")
     if (
-        getattr(observation, "receipt_id", None) != citation.receipt_id
+        observed("receipt_id") != citation.receipt_id
         or (
             observed_claim is not None
             and observed_claim != citation.claim
@@ -1220,21 +1286,127 @@ def _citation_matches_observation(
     ):
         return False
     commands: set[str] = set()
+    if projected_value is not None and isinstance(projected_value.get("command"), str):
+        commands.add(projected_value["command"])
+    normalized = observed("normalized_command")
+    if isinstance(normalized, str):
+        commands.add(normalized)
+    command = observed("command")
+    if isinstance(command, (tuple, list)) and all(isinstance(item, str) for item in command):
+        commands.add(shlex.join(command))
+    return citation.command in commands
+
+
+def _observation_semantics(observation: object) -> tuple[dict[str, object], bool]:
+    """Return receipt semantics and whether this is a rich broker receipt.
+
+    Older tests and historical records may expose only outcome/provenance and
+    a command projection. They remain matchable, while current broker
+    observations are required to pass the complete attribution and caveat
+    checks before a row can claim ``verified``.
+    """
+    projected_value: Mapping[str, object] | None = None
     projected = getattr(observation, "public_projection", None)
     if callable(projected):
         try:
             value = projected()
         except Exception:  # pragma: no cover - defensive provider boundary
             value = None
-        if isinstance(value, Mapping) and isinstance(value.get("command"), str):
-            commands.add(value["command"])
-    normalized = getattr(observation, "normalized_command", None)
-    if isinstance(normalized, str):
-        commands.add(normalized)
-    command = getattr(observation, "command", None)
-    if isinstance(command, (tuple, list)) and all(isinstance(item, str) for item in command):
-        commands.add(shlex.join(command))
-    return citation.command in commands
+        if isinstance(value, Mapping):
+            projected_value = value
+    elif isinstance(observation, Mapping):
+        projected_value = observation
+
+    def value(name: str, default: object = None) -> object:
+        marker = object()
+        actual = getattr(observation, name, marker)
+        if actual is not marker:
+            return actual
+        return projected_value.get(name, default) if projected_value is not None else default
+
+    attribution = value("attribution")
+    if attribution is None and projected_value is not None:
+        attribution = projected_value.get("tree")
+    if isinstance(attribution, Mapping):
+        attribution_values = dict(attribution)
+    else:
+        attribution_values = {
+            name: getattr(attribution, name, None)
+            for name in ("state", "stable", "untracked_input", "caveats")
+        } if attribution is not None else {}
+    environment = value("environment_state")
+    if environment is None and projected_value is not None:
+        environment = projected_value.get("environment")
+    semantics = {
+        "outcome": value("outcome"),
+        "provenance": value("provenance"),
+        "attribution_state": attribution_values.get("state"),
+        "attribution_stable": attribution_values.get("stable"),
+        "untracked_input": attribution_values.get("untracked_input", False),
+        "attribution_caveats": tuple(attribution_values.get("caveats") or ()),
+        "environment": environment,
+        "superseded_by": value("superseded_by"),
+        "caveats": tuple(value("caveats", ()) or ()),
+        "wrapper_bootstrap": value("wrapper_bootstrap"),
+        "inner_exec": value("inner_exec"),
+        "suite_start": value("suite_start"),
+    }
+    rich = isinstance(attribution, (Mapping,)) or attribution is not None or any(
+        name in (projected_value or {})
+        for name in ("environment", "superseded_by", "caveats", "wrapper_bootstrap", "inner_exec", "suite_start")
+    )
+    return semantics, rich
+
+
+def _authoritative_receipt_passes(
+    observation: object,
+    *,
+    claim: str,
+) -> bool:
+    semantics, rich = _observation_semantics(observation)
+    if semantics["outcome"] != "passed" or semantics["provenance"] != "parent-observed":
+        return False
+    if not rich:
+        return True
+    expected_attribution = "base-reproduction" if claim == "base-reproduction" else "current-head"
+    if semantics["attribution_state"] != expected_attribution:
+        return False
+    if semantics["attribution_stable"] is False or semantics["untracked_input"]:
+        return False
+    if semantics["environment"] not in {None, "equivalent", "not-compared"}:
+        return False
+    if semantics["superseded_by"]:
+        return False
+    if semantics["wrapper_bootstrap"] == "failed" or semantics["inner_exec"] == "failed":
+        return False
+    caveats = " ".join(
+        str(item).casefold()
+        for item in (*semantics["attribution_caveats"], *semantics["caveats"])
+    )
+    return not any(
+        token in caveats
+        for token in (
+            "stale", "untracked", "environment", "changed", "mismatch", "supersed",
+            "timeout", "timed out", "incomplete", "unknown", "disagreement",
+        )
+    )
+
+
+def _receipt_expected_status(observation: object, *, claim: str) -> str | None:
+    semantics, rich = _observation_semantics(observation)
+    if not rich:
+        return None
+    outcome = semantics["outcome"]
+    if outcome == "passed":
+        return "verified" if _authoritative_receipt_passes(observation, claim=claim) else "stale/unverified"
+    return {
+        "failed": "failed",
+        "timed_out": "timed-out",
+        "interrupted": "blocked",
+        "launch-failed": "blocked",
+        "overlap-rejected": "blocked",
+        "incomplete": "incomplete",
+    }.get(str(outcome))
 
 
 def _parse_risk_test_matrix_contract_fields(

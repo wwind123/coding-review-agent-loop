@@ -195,6 +195,7 @@ from coding_review_agent_loop.repair import (
     attempt_envelope_normalization,
     attempt_repair,
     require_recoverable_fresh_execution_contract,
+    require_recoverable_fresh_risk_test_matrix_contract,
     strip_unknown_prior_item_dispositions,
 )
 from helpers.validate_response import _deserialize_human_requirements, validate_response_text
@@ -483,6 +484,7 @@ def _recover_structured_response(
     gemini_cmd: str = "gemini",
     reviewer_normalization: bool = False,
     require_execution_strategy_contract: bool = False,
+    require_risk_test_matrix_contract: bool = False,
 ) -> tuple[str, object]:
     """Run deterministic-to-Gemini recovery without mutating the saved raw artifact."""
     candidate = original_text
@@ -493,15 +495,23 @@ def _recover_structured_response(
     # planning provenance. This permits a complete reviewed object in a JSON
     # fence while still refusing absent or partial recommendations before any
     # model-backed repair can invent topology.
-    if require_execution_strategy_contract and expected_kind in {"plan_state", "plan_revision"}:
+    if (
+        (require_execution_strategy_contract or require_risk_test_matrix_contract)
+        and expected_kind in {"plan_state", "plan_revision"}
+    ):
         normalized_source = attempt_envelope_normalization(
             candidate, expected_kind=expected_kind
         )
         if normalized_source is not None:
             candidate = normalized_source
-        require_recoverable_fresh_execution_contract(
-            candidate, expected_kind=expected_kind
-        )
+        if require_execution_strategy_contract:
+            require_recoverable_fresh_execution_contract(
+                candidate, expected_kind=expected_kind
+            )
+        if require_risk_test_matrix_contract:
+            require_recoverable_fresh_risk_test_matrix_contract(
+                candidate, expected_kind=expected_kind
+            )
 
     try:
         return candidate, validate(candidate)
@@ -2858,6 +2868,9 @@ def _complete_coder_turn(
                 gemini_cmd=gemini_cmd,
                 require_execution_strategy_contract=bool(
                     require_execution_strategy_contract
+                ),
+                require_risk_test_matrix_contract=bool(
+                    require_risk_test_matrix_contract
                 ),
             )
             validated_result = validate(raw_text)
@@ -5426,6 +5439,10 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
                 requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
                 response_evidence=response_evidence,
                 gemini_cmd=gemini_cmd,
+                require_risk_test_matrix_contract=bool(
+                    approved_plan_context is not None
+                    and approved_plan_context.matrix_available
+                ),
             )
             raw_output.write_text(coder_output, encoding="utf-8")
             if isinstance(parsed, StructuredCoderFollowup):
