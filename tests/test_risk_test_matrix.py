@@ -493,6 +493,27 @@ def test_m780_07_approved_context_has_matrix_channel_even_if_renderer_wording_ch
     assert context.risk_test_matrix_payload == matrix.to_payload()
 
 
+def test_marker_only_approved_context_preserves_non_empty_change_audit() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    changes = (
+        RiskTestMatrixChange(
+            "change",
+            ("row-ordinary",),
+            "Clarified the post-review recovery outcome.",
+        ),
+    )
+    canonical = "Approved plan\n\n" + render_risk_test_matrix_section(matrix, changes)
+
+    context = make_approved_plan_context(canonical)
+
+    assert context.availability == "available"
+    assert context.matrix_available
+    assert context.risk_test_matrix_expected_row_ids == ("row-ordinary",)
+    assert context.risk_test_matrix_changes_payload == tuple(
+        change.to_payload() for change in changes
+    )
+
+
 def test_m780_08a_matrix_semantics_remain_available_without_canonical_prose() -> None:
     matrix = parse_risk_test_matrix(_matrix())
     identity = risk_test_matrix_identity(matrix)

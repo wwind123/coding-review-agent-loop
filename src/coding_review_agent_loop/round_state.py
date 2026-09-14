@@ -1808,12 +1808,15 @@ def make_approved_plan_context(
         if marker is not None:
             try:
                 marker_payload = decode_risk_test_matrix_marker(marker.group("payload"))
-                matrix = parse_risk_test_matrix(marker_payload["matrix"])
-                changes = parse_risk_test_matrix_changes(marker_payload["changes"])
                 matrix_fields = _approved_matrix_channel(
                     contract_version=int(marker_payload["contract_version"]),
-                    payload=matrix,
-                    changes_payload=changes,
+                    # Keep the marker's validated JSON-compatible payloads
+                    # intact.  The channel parser accepts raw mappings; a
+                    # parsed RiskTestMatrixChange is intentionally not a
+                    # mapping and would make marker-only recovery fail for
+                    # the normal non-empty draft audit case.
+                    payload=marker_payload["matrix"],
+                    changes_payload=marker_payload["changes"],
                     identity=str(marker_payload["identity"]),
                     source_locator=risk_test_matrix_source_locator or source_locator,
                     boundary_digest=str(marker_payload["identity"]),
