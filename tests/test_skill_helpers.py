@@ -246,7 +246,12 @@ def _write_tmp(content: str, suffix: str = ".md") -> str:
 
 def _fresh_applicable_plan_state() -> str:
     payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
-    payload["risk_test_matrix"] = {
+    payload["risk_test_matrix"] = _fresh_applicable_plan_state_matrix()
+    return json.dumps(payload) + _VALID_PLAN_STATE[end:]
+
+
+def _fresh_applicable_plan_state_matrix() -> dict:
+    return {
         "applicability": "applicable",
         "rows": [{
             "row_id": "row-skill-resume",
@@ -264,7 +269,6 @@ def _fresh_applicable_plan_state() -> str:
         }],
         "important_exclusions": ["Unrelated review modes."],
     }
-    return json.dumps(payload) + _VALID_PLAN_STATE[end:]
 
 
 class TestValidateResponse:
@@ -3685,6 +3689,50 @@ class TestRetryValidateCoder:
         (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return repair_dir
 
+    def _make_coder_revision_repair_dir(
+        self,
+        tmpdir: Path,
+        *,
+        matrix: dict,
+        changes: list[dict],
+        prior_changes: list[dict] | None = None,
+    ) -> Path:
+        repair_dir = tmpdir / "9997-r2-codex-coder"
+        repair_dir.mkdir(parents=True, exist_ok=True)
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["kind"] = "plan_revision"
+        payload["prior_plan_item_dispositions"] = []
+        payload["risk_test_matrix"] = matrix
+        payload["risk_test_matrix_changes"] = changes
+        (repair_dir / "raw.md").write_text(
+            json.dumps(payload) + _VALID_PLAN_STATE[end:], encoding="utf-8"
+        )
+        (repair_dir / "prior_items.json").write_text("[]", encoding="utf-8")
+        (repair_dir / "prior-canonical-plan.md").write_text(
+            "The prior canonical plan.", encoding="utf-8"
+        )
+        manifest = {
+            "role": "coder",
+            "agent": "codex",
+            "agent_cap": "Codex",
+            "flow": "plan",
+            "issue": 9997,
+            "repo": "OWNER/REPO",
+            "new_round_number": 2,
+            "kind": "plan_revision",
+            "dry_run": True,
+            "architecture_contract_version": 1,
+            "execution_strategy_contract_required": True,
+            "risk_test_matrix_contract_required": True,
+            "prior_canonical_plan_file": "prior-canonical-plan.md",
+            "prior_risk_test_matrix": _fresh_applicable_plan_state_matrix(),
+            "prior_risk_test_matrix_changes": prior_changes or [],
+        }
+        (repair_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+        return repair_dir
+
     def test_retry_validate_coder_plan_state_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
@@ -3786,6 +3834,58 @@ class TestRetryValidateCoder:
                 check=False,
             )
             assert result.returncode != 0
+
+    def test_retry_validate_coder_revision_rejects_unaudited_matrix_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            prior = _fresh_applicable_plan_state_matrix()
+            changed = {
+                **prior,
+                "rows": [{
+                    **prior["rows"][0],
+                    "expected_outcome": "A weakened outcome",
+                }],
+            }
+            repair_dir = self._make_coder_revision_repair_dir(
+                tmppath, matrix=changed, changes=[],
+            )
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run", env=env, check=False,
+            )
+
+            assert result.returncode != 0
+            assert "risk matrix audit failed" in result.stderr
+
+    def test_retry_validate_coder_revision_accepts_historical_audit_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            historical = {
+                "operation": "change",
+                "row_ids": ["row-skill-resume"],
+                "rationale": "Clarified the resume transition.",
+            }
+            repair_dir = self._make_coder_revision_repair_dir(
+                tmppath,
+                matrix=_fresh_applicable_plan_state_matrix(),
+                changes=[historical],
+                prior_changes=[historical],
+            )
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run", env=env, check=False,
+            )
+
+            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+            assert (repair_dir / "coder-tagged.md").exists()
 
 
 # ---------------------------------------------------------------------------

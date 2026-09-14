@@ -101,7 +101,7 @@ import subprocess
 import sys
 import tempfile
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -2759,6 +2759,9 @@ def _save_coder_raw_to_repair_dir(
     execution_strategy_contract_version: int | None = None,
     execution_strategy_contract_required: bool = False,
     risk_test_matrix_contract_required: bool = False,
+    prior_canonical_plan: str | None = None,
+    prior_risk_test_matrix: Mapping[str, object] | None = None,
+    prior_risk_test_matrix_changes: Sequence[object] = (),
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy the coder's raw response + context to a stable repair dir.
@@ -2791,6 +2794,13 @@ def _save_coder_raw_to_repair_dir(
         manifest["execution_strategy_contract_required"] = True
     if risk_test_matrix_contract_required:
         manifest["risk_test_matrix_contract_required"] = True
+    if prior_canonical_plan is not None:
+        prior_plan_file = repair_dir / "prior-canonical-plan.md"
+        _write_text(prior_plan_file, prior_canonical_plan)
+        manifest["prior_canonical_plan_file"] = prior_plan_file.name
+    if prior_risk_test_matrix is not None:
+        manifest["prior_risk_test_matrix"] = dict(prior_risk_test_matrix)
+        manifest["prior_risk_test_matrix_changes"] = list(prior_risk_test_matrix_changes)
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -2816,6 +2826,9 @@ def _complete_coder_turn(
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
     require_risk_test_matrix_contract: int = 0,
+    prior_canonical_plan: str | None = None,
+    prior_risk_test_matrix: Mapping[str, object] | None = None,
+    prior_risk_test_matrix_changes: Sequence[object] = (),
     architecture_identity: dict | None = None,
     architecture_contract_version: int | None = None,
 ) -> dict:
@@ -2930,7 +2943,10 @@ def _complete_coder_turn(
             raw_structured_args = ["--raw-structured-coder-response-file", str(raw_structured_file)]
     else:
         from coding_review_agent_loop.comment_rendering import render_canonical_plan_revision
-        from coding_review_agent_loop.protocol import validate_structured_plan_revision
+        from coding_review_agent_loop.protocol import (
+            validate_risk_test_matrix_revision,
+            validate_structured_plan_revision,
+        )
 
         parsed = validate_structured_plan_revision(
             raw_text,
@@ -2942,6 +2958,25 @@ def _complete_coder_turn(
                 f"skill_runner: {coder_cap} plan_revision did not parse\n"
                 f"skill_runner: raw response at: {raw_output}"
             )
+        if prior_risk_test_matrix is not None:
+            if parsed.risk_test_matrix is None:
+                raise _ValidationError(
+                    "skill_runner: plan_revision omitted the prior risk test matrix; "
+                    "preserve it or record an explicit matrix revision."
+                )
+            try:
+                validate_risk_test_matrix_revision(
+                    prior_risk_test_matrix,
+                    parsed.risk_test_matrix,
+                    parsed.risk_test_matrix_changes,
+                    historical_changes=prior_risk_test_matrix_changes,
+                )
+            except (AgentLoopError, ValueError, TypeError) as exc:
+                prior_label = " prior canonical plan" if prior_canonical_plan is not None else ""
+                raise _ValidationError(
+                    f"skill_runner: plan_revision risk matrix audit failed against the"
+                    f"{prior_label}: {exc}"
+                ) from exc
         prior_items = [_deserialize_unresolved_item(i) for i in next_prior_items_raw]
         # The coder's actual model is in run_external's usage sidecar (#332); stamp it
         # so a skill-mode plan revision is signed e.g. "-- Google Antigravity: Gemini
@@ -3135,6 +3170,9 @@ def _run_external_coder_phase(
 
     if phase == "coder-round-1":
         next_prior_items_raw: list[dict] = []
+        prior_canonical_plan = None
+        prior_risk_test_matrix = None
+        prior_risk_test_matrix_changes: tuple[object, ...] = ()
         prompt_text = build_plan_prompt_for_skill(
             issue_dict, repo=repo, coder=coder,  # type: ignore[arg-type]
             reviewers=reviewers, workdir=workdir, memory=memory,  # type: ignore[arg-type]
@@ -3145,6 +3183,23 @@ def _run_external_coder_phase(
         kind = "plan_state"
     else:  # coder-round-next
         next_prior_items_raw = list(phase_info["next_prior_items_raw"])
+        prior_canonical_plan = (
+            str(resume["current_plan"])
+            if isinstance(resume.get("current_plan"), str)
+            else None
+        )
+        prior_matrix_value = resume.get("risk_test_matrix_payload")
+        prior_risk_test_matrix = (
+            prior_matrix_value
+            if isinstance(prior_matrix_value, Mapping)
+            else None
+        )
+        prior_changes_value = resume.get("risk_test_matrix_changes_payload")
+        prior_risk_test_matrix_changes = (
+            tuple(prior_changes_value)
+            if isinstance(prior_changes_value, (list, tuple))
+            else ()
+        )
         prompt_text = build_plan_revision_prompt_for_skill(
             issue_dict, repo=repo, coder=coder,  # type: ignore[arg-type]
             reviewers=reviewers, workdir=workdir,  # type: ignore[arg-type]
@@ -3212,6 +3267,9 @@ def _run_external_coder_phase(
             architecture_contract_version=1,
             execution_strategy_contract_required=True,
             risk_test_matrix_contract_required=True,
+            prior_canonical_plan=prior_canonical_plan,
+            prior_risk_test_matrix=prior_risk_test_matrix,
+            prior_risk_test_matrix_changes=prior_risk_test_matrix_changes,
             gemini_cmd=gemini_cmd,
         )
 
@@ -3235,6 +3293,9 @@ def _run_external_coder_phase(
                 required_architecture_impact_contract=1,
                 require_execution_strategy_contract=1,
                 require_risk_test_matrix_contract=1,
+                prior_canonical_plan=prior_canonical_plan,
+                prior_risk_test_matrix=prior_risk_test_matrix,
+                prior_risk_test_matrix_changes=prior_risk_test_matrix_changes,
                 architecture_identity=(
                     coder_architecture.identity()
                     if hasattr(coder_architecture, "identity") else None
@@ -4322,6 +4383,29 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
         next_prior_items_raw = json.loads(
             (repair_dir / "prior_items.json").read_text(encoding="utf-8")
         )
+        prior_canonical_plan = None
+        prior_plan_name = manifest.get("prior_canonical_plan_file")
+        if isinstance(prior_plan_name, str):
+            try:
+                prior_canonical_plan = (repair_dir / prior_plan_name).read_text(encoding="utf-8")
+            except OSError as exc:
+                print(
+                    f"skill_runner: cannot read prior canonical plan for retry: {exc}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        prior_matrix_value = manifest.get("prior_risk_test_matrix")
+        prior_risk_test_matrix = (
+            prior_matrix_value
+            if isinstance(prior_matrix_value, Mapping)
+            else None
+        )
+        prior_changes_value = manifest.get("prior_risk_test_matrix_changes")
+        prior_risk_test_matrix_changes = (
+            tuple(prior_changes_value)
+            if isinstance(prior_changes_value, list)
+            else ()
+        )
         try:
             result = _complete_coder_turn(
                 coder=coder, coder_cap=coder_cap, issue=issue, repo=repo,
@@ -4353,6 +4437,9 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                     or manifest.get("risk_test_matrix_contract_version") == 1
                     else 0
                 ),
+                prior_canonical_plan=prior_canonical_plan,
+                prior_risk_test_matrix=prior_risk_test_matrix,
+                prior_risk_test_matrix_changes=prior_risk_test_matrix_changes,
             )
         except FreshContractIntegrityError as exc:
             print(
