@@ -1199,7 +1199,7 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
         "Prior unresolved review items from earlier rounds",
         "",
         "Explicitly evaluate every item below before approving. Use the item IDs exactly as written.",
-        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge. Machine obligations must still be dispositioned, but reviewer approval is advisory evidence only and never CI success.",
+        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge. Machine obligations must still be dispositioned, but reviewer approval is advisory evidence only and never CI success. For a managed exact-head CI obligation with lifecycle `awaiting_current_head_review`, the orchestrator can dispatch qualification only after every required reviewer approves the candidate head. If the failed-head defect is fixed and no code-level blocker remains, approve the review and mark the carried predicate `resolved`; do not block waiting for the post-approval dispatch. The machine obligation remains active until authoritative qualification clears it.",
         "Every `blocking` or `same-pr` prior-item disposition requires an actionable `note`: explain what remains wrong on this head, cite relevant code or test evidence, and say what change or test would resolve it. A bare status or summary alone is insufficient. A different defect needs a new item, not a repurposed ID. Resolved dispositions may omit the note.",
         "",
     ]
@@ -3251,6 +3251,15 @@ or acknowledgement state. Do not treat reviewer approval, skipped checks,
 missing checks, intermediate-filtered checks, stale results, or an unrelated
 run as authoritative success; the named machine authority must validate the
 required current repair head.
+
+Managed exact-head CI with lifecycle `awaiting_current_head_review` is
+approval-gated: the orchestrator dispatches authoritative qualification only
+after every required reviewer approves the candidate head. When the old
+failed-head defect is fixed and no code-level blocker remains, return an
+approved review and disposition that carried predicate as `"resolved"`. Do not
+block merely because the post-approval managed dispatch has not run. Reviewer
+approval does not clear the machine obligation; it advances the orchestrator
+to qualification, which remains responsible for clearing it.
 
 The displayed Original claim is this stable item ID's predicate. Narrower evidence
 for that same defect may remain on the old ID. If you accept the original predicate
