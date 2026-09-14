@@ -454,6 +454,53 @@ class TestValidateResponse:
         assert "risk matrix section does not match" in result.stderr
         assert not output_path.exists()
 
+    def test_attach_metadata_rejects_extra_matrix_prose_after_valid_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """A valid payload cannot authorize additional visible matrix prose."""
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        raw_plan = _fresh_applicable_plan_state()
+        parsed = validate_structured_plan_state(
+            raw_plan,
+            require_execution_strategy_contract=1,
+            require_risk_test_matrix_contract=1,
+        )
+        canonical = render_canonical_plan_state(parsed)
+        marker = "-->"
+        marker_end = canonical.index(marker, canonical.index("AGENT_RISK_TEST_MATRIX")) + len(marker)
+        tampered_body = canonical[:marker_end] + "\n\n| `injected-row` | Visible extra row |\n" + canonical[marker_end:]
+        assert "injected-row" in tampered_body
+
+        raw_path = tmp_path / "plan.json"
+        raw_path.write_text(raw_plan, encoding="utf-8")
+        body_path = tmp_path / "tampered.md"
+        body_path.write_text(tampered_body, encoding="utf-8")
+        canonical_path = tmp_path / "canonical.md"
+        canonical_path.write_text(canonical, encoding="utf-8")
+        output_path = tmp_path / "attached.md"
+
+        result = _run(
+            "helpers.state_manager",
+            "attach-metadata",
+            "--body-file", str(body_path),
+            "--output", str(output_path),
+            "--flow", "plan",
+            "--role", "coder",
+            "--agent", "Claude",
+            "--round-number", "1",
+            "--state", "blocking",
+            "--subject-plan-file", str(canonical_path),
+            "--canonical-plan-file", str(canonical_path),
+            "--raw-structured-coder-response-file", str(raw_path),
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "posted body risk matrix section does not match" in result.stderr
+        assert not output_path.exists()
+
     def test_missing_plan_state_marker_rejected(self) -> None:
         path = _write_tmp(_INVALID_PLAN_STATE)
         result = _run("helpers.validate_response", "--file", path, "--kind", "plan_state", check=False)
