@@ -38,6 +38,7 @@ MARKERS = (
     ("AGENT_LOOP_META", f"<!-- AGENT_LOOP_META: {_compressed({'flow': 'pr'})} -->", PR_COMMENT_SURFACE),
     ("AGENT_LOOP_SIDECAR", f"<!-- AGENT_LOOP_SIDECAR: {_b64({'v': 1})} -->", ISSUE_COMMENT_SURFACE),
     ("AGENT_TYPED_PLAN_STAGES", f"<!-- AGENT_TYPED_PLAN_STAGES: {_b64({'child_stages': []})} -->", ISSUE_COMMENT_SURFACE),
+    ("AGENT_RISK_TEST_MATRIX", f"<!-- AGENT_RISK_TEST_MATRIX: {_b64({'matrix': {}, 'changes': []})} -->", ISSUE_COMMENT_SURFACE),
     ("AGENT_DEFERRED_STAGES", f"<!-- AGENT_DEFERRED_STAGES: {_b64({'stages': []})} -->", ISSUE_COMMENT_SURFACE),
     ("AGENT_PLAN_DECOMPOSITION", f"<!-- AGENT_PLAN_DECOMPOSITION: {_b64({'phases': []})} -->", ISSUE_COMMENT_SURFACE),
     ("AGENT_PLAN_PHASE_IMPLEMENTATION", f"<!-- AGENT_PLAN_PHASE_IMPLEMENTATION: {_b64({'phase': 1})} -->", ISSUE_COMMENT_SURFACE),
@@ -138,7 +139,7 @@ def test_ordinary_issue_comment_writer_enforces_issue_comment_surface():
 
 def test_source_inventory_has_no_unregistered_protocol_literals():
     assert_source_inventory(Path(__file__).parents[1])
-    assert len(RESERVED_MARKER_REGISTRY) == 26
+    assert len(RESERVED_MARKER_REGISTRY) == 27
 
 
 def test_issue_provenance_trailer_is_not_a_reserved_marker_or_forged_body_record():

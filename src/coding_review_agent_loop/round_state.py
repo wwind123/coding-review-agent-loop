@@ -308,6 +308,16 @@ def scope_approved_plan_matrix(
     rows = context.risk_test_matrix_payload.get("rows", [])
     if not isinstance(rows, list):
         return context
+    # A not-applicable matrix carries no enforceable owner obligations.  Do
+    # not validate a downstream phase identifier in this case: legacy
+    # decomposition adapters may expose a positional placeholder even when a
+    # fresh recommendation has no matrix rows to assign.
+    if not any(
+        isinstance(row, dict)
+        and row.get("applicability") in {"applicable", "required"}
+        for row in rows
+    ):
+        return context
     if execution_owner not in {"one-shot", "retained-parent", "final-integration"} and valid_stage_ids:
         if execution_owner not in set(valid_stage_ids):
             raise AgentLoopError(

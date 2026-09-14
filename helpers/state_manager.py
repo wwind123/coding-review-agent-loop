@@ -259,7 +259,9 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                 descriptor["current_plan"] = plan_text
                 descriptor["current_plan_subject"] = _plan_subject(plan_text)
                 descriptor["local_test_evidence"] = resumed.local_test_evidence
-                descriptor.update(_resume_matrix_fields(resumed.coder_metadata))
+                descriptor.update(
+                    _resume_matrix_fields(getattr(resumed, "coder_metadata", None))
+                )
                 descriptor["completed_reviewer_data"] = [
                     {
                         "reviewer_name": record.metadata.agent,
@@ -309,7 +311,9 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                 descriptor["completed_reviewer_names"] = completed_names
                 descriptor["current_plan_subject"] = head_sha
                 descriptor["local_test_evidence"] = result.local_test_evidence
-                descriptor.update(_resume_matrix_fields(result.coder_metadata))
+                descriptor.update(
+                    _resume_matrix_fields(getattr(result, "coder_metadata", None))
+                )
                 descriptor["completed_reviewer_data"] = [
                     {
                         "reviewer_name": record.metadata.agent,
