@@ -148,6 +148,104 @@ def test_auto_legacy_plan_round_reaches_review_before_legacy_refusal(tmp_path):
     assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
 
 
+@pytest.mark.parametrize("include_matrix", [False, True])
+def test_legacy_plan_revision_gate_runs_through_issue_loop(tmp_path, monkeypatch, include_matrix):
+    """A resumed legacy round keeps execution rules but rejects matrix opt-in."""
+    legacy_plan = "Historical execution-v1 plan."
+    legacy_comment = _attach_round_metadata(
+        legacy_plan + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Anthropic Claude",
+            round_number=1,
+            subject=_plan_subject(legacy_plan),
+            canonical_plan=legacy_plan,
+            state="blocking",
+        ),
+    )
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload.update(
+        {
+            "kind": "plan_revision",
+            "summary": "Revised the historical plan with the execution contract.",
+            "prior_plan_item_dispositions": [
+                {"item_id": "item-1", "disposition": "resolved"}
+            ],
+        }
+    )
+    if not include_matrix:
+        for key in (
+            "risk_test_matrix_contract_version",
+            "risk_test_matrix",
+            "risk_test_matrix_changes",
+        ):
+            payload.pop(key, None)
+    revision = (
+        json.dumps(payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _FakeRunner(
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-09-14T00:00:00Z",
+                "body": legacy_comment,
+            }
+        ],
+        claude_outputs=[revision],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                summary="The legacy plan needs a revision.",
+                blocking_plan_issues=["Add the reviewed execution contract."],
+            ),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        execution_strategy_contract_required=True,
+        plan_execution_mode="plan-only",
+        max_rounds=3,
+    )
+    captured_gate_values = []
+    original_validator = orchestrator_module._validate_plan_revision_response
+
+    def capture_validator(*args, **kwargs):
+        captured_gate_values.append(
+            kwargs["reject_unsolicited_risk_test_matrix_contract"]
+        )
+        return original_validator(*args, **kwargs)
+
+    monkeypatch.setattr(
+        orchestrator_module, "_validate_plan_revision_response", capture_validator
+    )
+    if include_matrix:
+        with patch.object(orchestrator_module, "attempt_repair", return_value=None):
+            with pytest.raises(AgentLoopError):
+                run_issue_loop(
+                    runner,
+                    issue_number=56,
+                    config=config,
+                    plan_first=True,
+                )
+        assert captured_gate_values and all(captured_gate_values)
+    else:
+        assert run_issue_loop(
+            runner,
+            issue_number=56,
+            config=config,
+            plan_first=True,
+        ) == 0
+        assert captured_gate_values == [True]
+
+
 def _fresh_staged_plan_for_recovery() -> tuple[str, str]:
     raw = structured_v1_plan_state()
     payload, end = json.JSONDecoder().raw_decode(raw.lstrip())

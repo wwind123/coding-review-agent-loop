@@ -1826,7 +1826,7 @@ def _execution_strategy_contract_guidance(
     *, include_risk_test_matrix_contract: bool = True
 ) -> str:
     """Shared generation-1 planning contract for full and compact prompts."""
-    return """
+    execution_guidance = """
 Every newly invoked `plan_state` and `plan_revision` must include
 `execution_strategy_contract_version`: `1` and a complete
 `execution_recommendation`. Historical unversioned records are legacy-undecided
@@ -1883,6 +1883,17 @@ legacy typed categories are omitted):
 }
 ```
 
+"""
+    if not include_risk_test_matrix_contract:
+        return execution_guidance + """
+Historical matrix-less revision contract:
+This revision resumes a durable planning round that predates the risk-based
+matrix generation gate. Do not add `risk_test_matrix_contract_version`,
+`risk_test_matrix`, or `risk_test_matrix_changes`; preserve their absence.
+Only an explicitly fresh generation-1 planning lifecycle may introduce those
+fields, and the validator rejects an unsolicited matrix here.
+"""
+    return execution_guidance + """
 Risk-based mode and transition matrix contract:
 For work involving multiple execution modes, lifecycle states, persistence or
 restart, authorization boundaries, or recovery/failure paths, also include
@@ -1909,13 +1920,6 @@ matrix and use an empty list when the matrix is unchanged. Do not copy the
 prior revision's audit entries into a new unchanged revision. Exact historical
 entries that are repeated from the prior canonical matrix are tolerated for
 resume compatibility, but they do not count as coverage for a new change.
-""" if include_risk_test_matrix_contract else """
-Historical matrix-less revision contract:
-This revision resumes a durable planning round that predates the risk-based
-matrix generation gate. Do not add `risk_test_matrix_contract_version`,
-`risk_test_matrix`, or `risk_test_matrix_changes`; preserve their absence.
-Only an explicitly fresh generation-1 planning lifecycle may introduce those
-fields, and the validator rejects an unsolicited matrix here.
 """
 
 

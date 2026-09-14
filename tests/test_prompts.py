@@ -97,8 +97,25 @@ def test_legacy_plan_revision_prompt_does_not_invent_matrix_generation(tmp_path)
     )
 
     assert "Historical matrix-less revision contract" in legacy
+    assert '"execution_strategy_contract_version": 1' in legacy
+    assert '"execution_recommendation"' in legacy
+    assert "Its exact required keys are" in legacy
     assert "risk_test_matrix_contract_version`: `1`" not in legacy
     assert "risk_test_matrix`: `1`" not in legacy
+
+    compact_legacy = build_plan_revision_prompt(
+        783,
+        2,
+        "Historical execution-v1 plan.",
+        "Blocking review",
+        config,
+        compact_context=True,
+        require_risk_test_matrix_contract=False,
+    )
+    assert '"execution_strategy_contract_version": 1' in compact_legacy
+    assert '"execution_recommendation"' in compact_legacy
+    assert "Historical matrix-less revision contract" in compact_legacy
+    assert "risk_test_matrix_contract_version`: `1`" not in compact_legacy
 
     fresh = build_plan_revision_prompt(783, 2, "Previous plan", "Blocking review", config)
     assert "For work involving multiple execution modes" in fresh
