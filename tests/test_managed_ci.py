@@ -2861,7 +2861,7 @@ def test_v2_emitted_lifecycle_records_are_accepted_by_pinned_consumers(tmp_path)
                 historical_router.validate(
                     pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision
                 )
-            with pytest.raises(ValueError, match="exactly one distinct qualifying intent"):
+            with pytest.raises(ValueError, match="prepared intent"):
                 current_router.validate(
                     pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision
                 )

@@ -58,6 +58,43 @@ Each agent CLI has its own authentication, quota, terms, and model
 availability. Confirm those with the provider; this tool does not combine or
 replace provider subscriptions.
 
+### Managed CI in this repository
+
+This repository's `.github/workflows/ci.yml` installs the managed-CI v2
+contract with the literal `AGENT_LOOP_MANAGED_CI_V2` and
+`AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1` declarations. Pull requests use
+exactly four activities: `opened`, `synchronize`, `reopened`, and `unlabeled`.
+Only a trusted, same-repository draft on the reserved
+`agent-loop/managed-*` branch can suppress intermediate CI: opening is
+recognized before the label write, while later synchronization and reopening
+require `agent-loop-managed`. Unlabeled events always run the ordinary Python
+3.12 suite, and forks, malformed payloads, trust mismatches, and all ordinary
+PRs fail open to that suite. Pushes to `main` and all-empty manual dispatches
+also run the complete suite.
+
+After the workflow change is merged, the sole-maintainer rollout is ordered:
+
+1. Set the repository Actions variable to the trusted actor:
+   `gh variable set AGENT_LOOP_MANAGED_ACTOR --repo wwind123/coding-review-agent-loop --body wwind123`.
+2. Authenticate `gh` as `wwind123`, then run the read-only preflight:
+   `agent-loop managed-ci preflight --repo wwind123/coding-review-agent-loop --base main --trusted-actor wwind123`.
+3. While `main` remains unprotected, pass
+   `--managed-ci-trusted-actor wwind123 --allow-unprotected-managed-ci` on
+   every applicable issue-created invocation. The waiver is explicit per run;
+   it does not change defaults for other repositories, enable arbitrary
+   existing-PR adoption, or replace a head-guarded merge.
+
+For an approved head, the base-branch workflow validates the live actor,
+repository, PR tuple, workflow revision, and one fresh generation-scoped
+handoff record before exposing `expected_head_sha`. A separate job checks out
+that exact SHA, installs the editable development dependencies, and runs the
+full `python -m pytest` suite once. The always-evaluated publisher writes
+`final-ci/exact-head` only for that validated target, with the nonce, run ID,
+attempt, and Actions URL correlated in the status. Authorization failures
+before target validation write no status; checkout or test failures publish a
+terminal non-success result. Keep queued work on ordinary CI until this
+post-merge live qualification is complete.
+
 ### Process-tree containment
 
 Agent subprocesses and repository test gates use a shared per-user containment

@@ -1,13 +1,68 @@
 name: CI
 
+# These declarations are intentionally literal.  The local driver uses them
+# as readiness gates before it is allowed to suppress pull_request CI.
+env:
+  AGENT_LOOP_MANAGED_CI_V2: enabled
+  AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1: enabled
+
 on:
-  pull_request:
   push:
     branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, unlabeled]
+  workflow_dispatch:
+    inputs:
+      protocol_version:
+        description: Managed-CI protocol version (leave empty for ordinary manual CI)
+        required: false
+        default: ''
+      pr_number:
+        description: Pull request being qualified
+        required: false
+        default: ''
+      expected_head_sha:
+        description: Exact pull request head SHA
+        required: false
+        default: ''
+      managed_nonce:
+        description: Fresh generation nonce from the managed-CI handoff record
+        required: false
+        default: ''
+
+# Dispatch runs are deliberately correlated by nonce in the Actions UI and by
+# PR/head in the concurrency key.  Ordinary PR and push runs retain GitHub's
+# normal naming fallback when inputs are unavailable.
+run-name: managed-ci-v2 nonce=${{ inputs.managed_nonce }}
 
 jobs:
   test:
+    # The expression is fail-open.  Only a complete, trusted, same-repository
+    # managed draft may suppress a matrix.  `opened` is checked without the
+    # label because the opening event can race the separate label write;
+    # synchronize/reopened require the active label.  `unlabeled` always
+    # returns to ordinary CI so label release is recoverable.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.protocol_version == '' && inputs.pr_number == '' &&
+       inputs.expected_head_sha == '' && inputs.managed_nonce == '') ||
+      (github.event_name == 'pull_request' &&
+       (github.event.action == 'unlabeled' ||
+        !(github.event.pull_request.base.ref == 'main' &&
+          github.event.pull_request.base.repo.full_name == github.repository &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'agent-loop/managed-') &&
+          github.event.pull_request.draft == true &&
+          vars.AGENT_LOOP_MANAGED_ACTOR != '' &&
+          github.event.pull_request.user.login == vars.AGENT_LOOP_MANAGED_ACTOR &&
+          (github.event.action == 'opened' ||
+           ((github.event.action == 'synchronize' || github.event.action == 'reopened') &&
+            contains(github.event.pull_request.labels.*.name, 'agent-loop-managed'))))))
+    name: Python 3.12 full suite
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -15,3 +70,378 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -e '.[dev]'
       - run: python -m pytest
+
+  validate-managed:
+    # All-empty manual dispatch is ordinary CI.  Every partial or non-empty
+    # managed input reaches this job and is rejected unless the complete
+    # dispatch contract and the live PR/audit tuple validate.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '')
+    name: Validate managed exact-head dispatch
+    runs-on: ubuntu-latest
+    concurrency:
+      group: managed-ci-v2-pr-${{ inputs.pr_number }}-head-${{ inputs.expected_head_sha }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      target_sha: ${{ steps.validate.outputs.target_sha }}
+      pr_number: ${{ steps.validate.outputs.pr_number }}
+      managed_nonce: ${{ steps.validate.outputs.managed_nonce }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate live PR and handoff record
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          INPUT_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          INPUT_MANAGED_NONCE: ${{ inputs.managed_nonce }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urljoin
+          from urllib.request import Request, urlopen
+
+          # BEGIN MANAGED_CI_V2_VALIDATOR
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/ci.yml
+          # Extraction boundary: validate() through its closing assertion.
+          # This block is copied verbatim into tests/fixtures/managed_ci/current_router.py.
+          def validate(
+              pr, pages, repo, num, sha, nonce, actor, revision, actor_id=None
+          ):
+              def fail(reason):
+                  raise ValueError(reason)
+
+              def exact_int(value, name, positive=False):
+                  if type(value) is not int or (positive and value <= 0):
+                      fail('invalid ' + name)
+
+              def exact_string(value, name, pattern=None):
+                  if type(value) is not str or (pattern and not re.fullmatch(pattern, value)):
+                      fail('invalid ' + name)
+
+              if not isinstance(pr, dict):
+                  fail('live PR response is not an object')
+              labels = {
+                  item.get('name') for item in pr.get('labels', [])
+                  if isinstance(item, dict)
+              }
+              if pr.get('state') != 'open' or pr.get('draft') is not True:
+                  fail('live PR is not an open draft')
+              if pr.get('base', {}).get('ref') != 'main':
+                  fail('live PR base is not main')
+              if pr.get('head', {}).get('sha') != sha:
+                  fail('live PR head drifted')
+              if (pr.get('head', {}).get('repo') or {}).get('full_name') != repo:
+                  fail('live PR repository drifted')
+              pr_user = pr.get('user', {})
+              if pr_user.get('login') != actor or (actor_id is not None and type(pr_user.get('id')) is not int):
+                  fail('live PR author identity drifted')
+              if actor_id is not None and pr_user.get('id') != actor_id:
+                  fail('live PR author ID drifted')
+              if type(pr.get('number')) is not int or pr.get('number') != int(num):
+                  fail('live PR number drifted')
+              if not pr.get('head', {}).get('ref', '').startswith('agent-loop/managed-'):
+                  fail('live PR branch is not reserved')
+              if 'agent-loop-managed' not in labels:
+                  fail('live PR managed label is absent')
+              if not isinstance(pages, list):
+                  fail('comments response is not paginated JSON')
+
+              required = {
+                  'version', 'repository', 'pr', 'expected_head_sha', 'base_ref',
+                  'workflow_revision', 'generation', 'nonce', 'created_at', 'state',
+                  'run_id', 'run_attempt', 'terminal_run_id', 'terminal_run_attempt',
+                  'terminal_outcome', 'terminal_attempts',
+              }
+              allowed_states = {'prepared', 'dispatch-requested', 'attached', 'completed'}
+              envelope = re.compile(r'^<!-- AGENT_MANAGED_CI_INTENT_V2 (?P<payload>.*?) -->$')
+              sha_re = r'[0-9a-f]{40}'
+              token_re = r'[A-Za-z0-9_-]{32}'
+              validated = []
+              for page in pages:
+                  if not isinstance(page, list):
+                      fail('malformed comments page')
+                  for comment in page:
+                      if not isinstance(comment, dict):
+                          fail('malformed comment object')
+                      user = comment.get('user')
+                      if not isinstance(user, dict) or type(user.get('login')) is not str:
+                          fail('malformed comment author')
+                      if user['login'] != actor:
+                          continue
+                      if actor_id is not None and user.get('id') != actor_id:
+                          fail('trusted comment author ID drifted')
+                      body = comment.get('body')
+                      if type(body) is not str:
+                          fail('trusted comment body is not text')
+                      match = envelope.fullmatch(body.strip())
+                      if match is None:
+                          continue
+                      try:
+                          record = json.loads(match.group('payload'))
+                      except json.JSONDecodeError:
+                          fail('trusted intent envelope contains malformed JSON')
+                      if not isinstance(record, dict):
+                          fail('trusted intent payload is not an object')
+                      if record.get('version') != 2:
+                          fail('unsupported intent version')
+                      if record.get('nonce') != nonce:
+                          continue
+                      if set(record) != required:
+                          fail('trusted intent has an invalid schema')
+                      exact_string(record.get('repository'), 'repository', r'[^/\s]+/[^/\s]+')
+                      exact_int(record.get('pr'), 'pr', True)
+                      exact_string(record.get('expected_head_sha'), 'expected_head_sha', sha_re)
+                      exact_string(record.get('base_ref'), 'base_ref', r'[^\s]+')
+                      exact_string(record.get('workflow_revision'), 'workflow_revision', sha_re)
+                      if actor_id is not None or record.get('generation') is not None:
+                          exact_string(record.get('generation'), 'generation', r'[A-Za-z0-9_-]+')
+                      exact_string(record.get('nonce'), 'nonce', token_re)
+                      exact_int(record.get('created_at'), 'created_at', True)
+                      exact_string(record.get('state'), 'state', r'(?:prepared|dispatch-requested|attached|completed)')
+                      if record['state'] not in allowed_states:
+                          fail('invalid lifecycle state')
+                      run_id, run_attempt = record.get('run_id'), record.get('run_attempt')
+                      if record['state'] in {'prepared', 'dispatch-requested'}:
+                          if run_id is not None or run_attempt is not None:
+                              fail('early lifecycle state has run fields')
+                      elif type(run_id) is not int or run_id <= 0 or type(run_attempt) is not int or run_attempt <= 0:
+                          fail('attached lifecycle state lacks paired run fields')
+                      terminal_id = record.get('terminal_run_id')
+                      terminal_attempt = record.get('terminal_run_attempt')
+                      if terminal_id is not None and (type(terminal_id) is not int or terminal_id <= 0):
+                          fail('invalid terminal run ID')
+                      if terminal_id is None and terminal_attempt is not None:
+                          fail('terminal attempt has no terminal run ID')
+                      if terminal_attempt is not None and (type(terminal_attempt) is not int or terminal_attempt <= 0):
+                          fail('invalid terminal run attempt')
+                      if record.get('terminal_outcome') not in {None, 'no-status'}:
+                          fail('invalid terminal outcome')
+                      attempts = record.get('terminal_attempts')
+                      if not isinstance(attempts, list):
+                          fail('terminal attempt history is not a list')
+                      seen_attempts = set()
+                      for item in attempts:
+                          if not isinstance(item, dict) or set(item) != {'run_id', 'run_attempt'}:
+                              fail('malformed terminal attempt history')
+                          item_id, item_attempt = item['run_id'], item['run_attempt']
+                          if type(item_id) is not int or item_id <= 0:
+                              fail('invalid terminal history run ID')
+                          if item_attempt is not None and (type(item_attempt) is not int or item_attempt <= 0):
+                              fail('invalid terminal history run attempt')
+                          key = (item_id, item_attempt)
+                          if key in seen_attempts:
+                              fail('duplicate terminal attempt history')
+                          seen_attempts.add(key)
+                      expected = {
+                          'repository': repo,
+                          'pr': int(num),
+                          'expected_head_sha': sha,
+                          'base_ref': 'main',
+                          'workflow_revision': revision,
+                          'nonce': nonce,
+                      }
+                      if any(record[key] != value for key, value in expected.items()):
+                          fail('trusted intent binding drifted')
+                      validated.append(record)
+              if len(validated) != 1:
+                  fail('expected exactly one fresh intent for requested nonce')
+              if validated[0]['state'] == 'prepared':
+                  fail('prepared intent is not a dispatch authorization')
+              return validated[0]
+          # END MANAGED_CI_V2_VALIDATOR
+
+          def api_json(path):
+              request = Request(
+                  urljoin(os.environ['GH_API_URL'].rstrip('/') + '/', path.lstrip('/')),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json'},
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      payload = json.load(response)
+              except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                  raise ValueError('GitHub API read failed for ' + path) from exc
+              if not isinstance(payload, (dict, list)):
+                  raise ValueError('GitHub API returned an invalid payload for ' + path)
+              return payload
+
+          def api_pages(path):
+              url = urljoin(os.environ['GH_API_URL'].rstrip('/') + '/', path.lstrip('/'))
+              pages = []
+              while url:
+                  request = Request(
+                      url,
+                      headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                               'Accept': 'application/vnd.github+json'},
+                  )
+                  try:
+                      with urlopen(request, timeout=30) as response:
+                          page = json.load(response)
+                          link = response.headers.get('Link', '')
+                  except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                      raise ValueError('GitHub API pagination failed for ' + path) from exc
+                  if not isinstance(page, list):
+                      raise ValueError('GitHub API page is not an array for ' + path)
+                  pages.append(page)
+                  next_match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+                  url = next_match.group(1) if next_match else None
+              return pages
+
+          protocol = os.environ['INPUT_PROTOCOL_VERSION']
+          pr_number_text = os.environ['INPUT_PR_NUMBER']
+          expected_head = os.environ['INPUT_EXPECTED_HEAD_SHA']
+          nonce = os.environ['INPUT_MANAGED_NONCE']
+          if not (protocol == '2' and re.fullmatch(r'[1-9][0-9]*', pr_number_text or '')
+                  and re.fullmatch(r'[0-9a-f]{40}', expected_head or '')
+                  and re.fullmatch(r'[A-Za-z0-9_-]{32}', nonce or '')):
+              raise SystemExit('managed dispatch inputs must be complete protocol-v2 values')
+
+          repo = os.environ['GH_REPOSITORY']
+          if os.environ.get('GH_REF') != 'refs/heads/main':
+              raise SystemExit('managed dispatch must execute the base workflow from main')
+          configured = api_json('repos/' + repo + '/actions/variables/AGENT_LOOP_MANAGED_ACTOR')
+          trusted_actor = configured.get('value') if isinstance(configured, dict) else None
+          live_user = api_json('user')
+          live_login = live_user.get('login') if isinstance(live_user, dict) else None
+          live_id = live_user.get('id') if isinstance(live_user, dict) else None
+          initiating_actor = os.environ['GH_ACTOR']
+          rerun_actor = os.environ['GH_TRIGGERING_ACTOR']
+          if (not isinstance(trusted_actor, str) or not trusted_actor.strip()
+                  or not isinstance(live_login, str) or type(live_id) is not int
+                  or trusted_actor.casefold() != live_login.casefold()
+                  or initiating_actor.casefold() != live_login.casefold()
+                  or rerun_actor.casefold() != live_login.casefold()):
+              raise SystemExit('managed dispatch actors do not match the configured live identity')
+
+          live_repo = api_json('repos/' + repo)
+          if (not isinstance(live_repo, dict)
+                  or live_repo.get('full_name', '').casefold() != repo.casefold()):
+              raise SystemExit('managed dispatch repository identity could not be validated')
+          pr = api_json('repos/' + repo + '/pulls/' + pr_number_text)
+          base_commit = api_json('repos/' + repo + '/commits/main')
+          revision = base_commit.get('sha') if isinstance(base_commit, dict) else None
+          if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision):
+              raise SystemExit('managed dispatch base workflow revision is unavailable')
+          pages = api_pages('repos/' + repo + '/issues/' + pr_number_text + '/comments?per_page=100')
+          validate(pr, pages, repo, pr_number_text, expected_head, nonce, live_login, revision, live_id)
+
+          output_path = os.environ['GITHUB_OUTPUT']
+          with open(output_path, 'a', encoding='utf-8') as output:
+              output.write('target_sha=' + expected_head + '\n')
+              output.write('pr_number=' + pr_number_text + '\n')
+              output.write('managed_nonce=' + nonce + '\n')
+          print('Managed dispatch validated for the exact live PR head.')
+          PY
+
+  exact-head:
+    needs: validate-managed
+    if: needs.validate-managed.result == 'success'
+    name: Test validated exact head
+    runs-on: ubuntu-latest
+    concurrency:
+      group: managed-ci-v2-pr-${{ needs.validate-managed.outputs.pr_number }}-head-${{ needs.validate-managed.outputs.target_sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate-managed.outputs.target_sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify exact checkout
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.validate-managed.outputs.target_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest
+
+  publish-exact-head:
+    needs: [validate-managed, exact-head]
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '')
+    name: Publish final exact-head status
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Publish correlated terminal status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ needs.validate-managed.outputs.target_sha }}
+          VALIDATION_RESULT: ${{ needs.validate-managed.result }}
+          TEST_RESULT: ${{ needs.exact-head.result }}
+          NONCE: ${{ needs.validate-managed.outputs.managed_nonce }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from urllib.request import Request, urlopen
+
+          target = os.environ.get('TARGET_SHA', '')
+          if not target:
+              print('Authorization failed before an exact target was established; no status written.')
+              raise SystemExit(0)
+          success = (
+              os.environ.get('VALIDATION_RESULT') == 'success'
+              and os.environ.get('TEST_RESULT') == 'success'
+          )
+          state = 'success' if success else 'failure'
+          run_id = os.environ['RUN_ID']
+          attempt = os.environ['RUN_ATTEMPT']
+          description = (
+              'nonce=' + os.environ['NONCE'] + ';run_id=' + run_id +
+              ';attempt=' + attempt + ';result=' + state
+          )
+          payload = json.dumps({
+              'state': state,
+              'context': 'final-ci/exact-head',
+              'description': description,
+              'target_url': os.environ['SERVER_URL'] + '/' + os.environ['GH_REPOSITORY'] +
+                            '/actions/runs/' + run_id,
+          }).encode('utf-8')
+          request = Request(
+              os.environ['GH_API_URL'].rstrip('/') + '/repos/' +
+              os.environ['GH_REPOSITORY'] + '/statuses/' + target,
+              data=payload,
+              method='POST',
+              headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+              },
+          )
+          with urlopen(request, timeout=30):
+              pass
+          print('Published correlated final-ci/exact-head status for the validated SHA.')
+          PY
