@@ -113,6 +113,52 @@ def test_approved_matrix_accepts_the_final_revision_change_audit() -> None:
     assert parsed[0].rationale == changes[0]["rationale"]
 
 
+def test_draft_revision_ignores_an_exactly_replayed_historical_audit() -> None:
+    historical = [{
+        "operation": "change",
+        "row_ids": ["row-ordinary"],
+        "rationale": "Clarified the post-review recovery transition.",
+    }]
+    parsed = validate_risk_test_matrix_revision(
+        _matrix(),
+        _matrix(),
+        historical,
+        historical_changes=historical,
+    )
+    assert parsed[0].row_ids == ("row-ordinary",)
+
+
+def test_authoritative_caveats_have_headroom_across_multiple_receipts() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    evidence["rows"][0]["evidence_citations"] = [
+        {
+            "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
+            "receipt_id": f"receipt-{index}",
+            "claim": "current-result",
+        }
+        for index in range(8)
+    ]
+    observations = [
+        _rich_receipt(
+            receipt_id=f"receipt-{index}",
+            attribution_caveats=(f"authoritative head caveat {index}",),
+            caveats=(f"broker caveat {index}",),
+        )
+        for index in range(8)
+    ]
+
+    parsed = parse_risk_test_matrix_evidence(
+        evidence,
+        matrix=matrix,
+        authoritative_test_observations=observations,
+    )
+
+    assert len(parsed.rows[0].caveats) == 16
+    assert "broker caveat 7" in parsed.rows[0].caveats
+
+
 def test_matrix_level_draft_changes_cannot_hide_behind_one_row_operation() -> None:
     previous = {**_matrix(), "rows": [_row("row-one"), _row("row-two")]}
     current = {**previous, "important_exclusions": ["A newly explicit exclusion."]}

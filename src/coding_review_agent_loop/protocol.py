@@ -764,6 +764,10 @@ RISK_MATRIX_MAX_ROWS = 24
 RISK_MATRIX_MAX_EXCLUSIONS = 16
 RISK_MATRIX_MAX_CHANGES = 32
 RISK_MATRIX_MAX_LIST_ITEMS = 12
+# A row may cite several authoritative receipts. Their attribution and
+# execution caveats are merged into the row and need more room than ordinary
+# bounded agent-authored lists, without making any list unbounded.
+RISK_MATRIX_MAX_CAVEATS = 48
 RISK_MATRIX_MAX_FIELD_BYTES = 1_024
 RISK_MATRIX_MAX_PAYLOAD_BYTES = 96_000
 RISK_MATRIX_APPLICABILITY = frozenset({"applicable", "not-applicable"})
@@ -1047,14 +1051,32 @@ def validate_risk_test_matrix_revision(
     changes: Sequence[RiskTestMatrixChange | Mapping[str, object]],
     *,
     approved: bool = False,
+    historical_changes: Sequence[RiskTestMatrixChange | Mapping[str, object]] = (),
 ) -> tuple[RiskTestMatrixChange, ...]:
-    """Require an explicit audit operation for every semantic draft change."""
+    """Require an explicit audit operation for every semantic draft change.
+
+    Revisions are commonly rendered from the previous canonical plan, which
+    can cause an agent to repeat an already recorded audit entry. Exact
+    entries supplied through ``historical_changes`` are ignored for the
+    current diff, but any new semantic change still needs a fresh operation
+    and any unrelated operation is still rejected.
+    """
     old = previous if isinstance(previous, RiskTestMatrix) else parse_risk_test_matrix(previous, context="previous risk_test_matrix")
     new = current if isinstance(current, RiskTestMatrix) else parse_risk_test_matrix(current, context="current risk_test_matrix")
     parsed_changes = tuple(
         item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]
         for item in changes
     )
+    parsed_historical_changes = [
+        item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]
+        for item in historical_changes
+    ]
+    current_changes = list(parsed_changes)
+    for historical_change in parsed_historical_changes:
+        try:
+            current_changes.remove(historical_change)
+        except ValueError:
+            continue
     semantic_changed = old.to_payload() != new.to_payload()
     if approved and semantic_changed:
         raise AgentLoopError("Approved risk matrix is immutable; substantive changes require explicit replanning.")
@@ -1066,7 +1088,7 @@ def validate_risk_test_matrix_revision(
     # no-extra-subject checks below.
     if approved and not semantic_changed:
         return parsed_changes
-    if semantic_changed and not parsed_changes:
+    if semantic_changed and not current_changes:
         raise AgentLoopError(
             "Risk matrix changes omit audit operations; semantic changes require explicit "
             "review-visible audit operations."
@@ -1082,7 +1104,7 @@ def validate_risk_test_matrix_revision(
         for field in ("applicability", "important_exclusions", "not_applicable_rationale")
         if getattr(old, field) != getattr(new, field)
     }
-    covered = {row_id for change in parsed_changes for row_id in change.row_ids}
+    covered = {row_id for change in current_changes for row_id in change.row_ids}
     if changed_matrix_fields:
         # Matrix-level semantics need a matrix-level audit operation. A row
         # operation that happens to mention one changed row cannot authorize a
@@ -1093,7 +1115,7 @@ def validate_risk_test_matrix_revision(
         if not any(
             change.operation in {"change", "split", "merge"}
             and set(change.row_ids) == matrix_scope
-            for change in parsed_changes
+            for change in current_changes
         ):
             raise AgentLoopError(
                 "Risk matrix-level changes require one review-visible audit operation "
@@ -1208,7 +1230,11 @@ def parse_risk_test_matrix_evidence(
             outcome_assertions=_risk_bounded_string_list(row["outcome_assertions"], context=f"{row_context}.outcome_assertions"),
             forbidden_effect_assertions=_risk_bounded_string_list(row["forbidden_effect_assertions"], context=f"{row_context}.forbidden_effect_assertions"),
             evidence_citations=_parse_risk_evidence_citations(row["evidence_citations"], context=f"{row_context}.evidence_citations"),
-            caveats=_risk_bounded_string_list(row.get("caveats", []), context=f"{row_context}.caveats"),
+            caveats=_risk_bounded_string_list(
+                row.get("caveats", []),
+                context=f"{row_context}.caveats",
+                max_items=RISK_MATRIX_MAX_CAVEATS,
+            ),
         )
         if status == "verified" and (
             not parsed_row.test_identifiers
@@ -1264,7 +1290,9 @@ def parse_risk_test_matrix_evidence(
                 # not optional coder prose. Carry every one into the row so a
                 # repair or renderer cannot turn a caveated result into a
                 # clean-looking verification. The bounded validator rejects
-                # overflow rather than silently truncating caveats.
+                # overflow rather than silently truncating caveats; caveats
+                # have their own allowance because several receipts can each
+                # contribute authoritative attribution and broker caveats.
                 all_caveats = list(parsed_row.caveats)
                 for observation in matched_observations:
                     semantics, _rich = _observation_semantics(observation)
@@ -1280,6 +1308,7 @@ def parse_risk_test_matrix_evidence(
                     caveats=_risk_bounded_string_list(
                         all_caveats,
                         context=f"{row_context}.caveats",
+                        max_items=RISK_MATRIX_MAX_CAVEATS,
                     ),
                 )
         result.append(parsed_row)

@@ -590,17 +590,18 @@ def test_m780_12_separately_planned_child_requires_parent_row_and_uses_child_pro
         handoff_mode="implement-by-phase",
         inherited_matrix_row_ids=("row-stage-one",),
     )
+    inherited_row = next(
+        row for row in json.JSONDecoder().raw_decode(parent_plan)[0]["risk_test_matrix"]["rows"]
+        if row["row_id"] == "row-stage-one"
+    )
     child_matrix = {
         "applicability": "applicable",
-        # Separately planned children may add local rows, but the inherited
-        # row must retain every approved semantic field.  Copy it from the
-        # parent fixture so this test exercises provenance rather than an
-        # accidental text difference in the child plan.
+        # A separately planned child owns its own matrix. Its one-shot owner
+        # is valid for the child plan even though the inherited parent row was
+        # allocated to the parent topology's stage-one owner.
         "rows": [
-            next(
-                row for row in json.JSONDecoder().raw_decode(parent_plan)[0]["risk_test_matrix"]["rows"]
-                if row["row_id"] == "row-stage-one"
-            )
+            {**inherited_row, "execution_owner": "one-shot"},
+            _matrix_row("child-local", "one-shot"),
         ],
         "important_exclusions": ["Unrelated flag combinations are not required."],
     }
@@ -634,3 +635,4 @@ def test_m780_12_separately_planned_child_requires_parent_row_and_uses_child_pro
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert "Row row-stage-one" in prompt
     assert "[enforceable]" in prompt
+    assert "Row child-local" in prompt

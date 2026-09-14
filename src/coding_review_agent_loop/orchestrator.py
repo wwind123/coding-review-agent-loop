@@ -8054,6 +8054,7 @@ def _run_plan_first_loop(
                     previous_matrix_payload["matrix"],
                     plan_response.marker_value.risk_test_matrix,
                     plan_response.marker_value.risk_test_matrix_changes,
+                    historical_changes=previous_matrix_payload.get("changes", ()),
                 )
             canonical_plan = render_canonical_plan_revision(
                 plan_response.marker_value, must_fix_items, config
@@ -10828,19 +10829,24 @@ def run_pr_loop(
                                             "implementation handoff and no recoverable approved "
                                             "child plan; repair the child issue-to-PR provenance."
                                         )
-                                    inherited_ids = validate_separately_planned_child_matrix(
+                                    validate_separately_planned_child_matrix(
                                         parent_plan_context.risk_test_matrix_payload
                                         if parent_plan_context.matrix_available else None,
                                         child_plan_context.risk_test_matrix_payload
                                         if child_plan_context.matrix_available else None,
                                         execution_owner=stable_stage_id,
                                     )
-                                    if inherited_ids:
-                                        child_plan_context = scope_approved_plan_matrix(
-                                            child_plan_context,
-                                            execution_owner=stable_stage_id,
-                                            valid_stage_ids=(stable_stage_id,),
-                                        )
+                                    # The child has its own approved plan, so
+                                    # its matrix owners are authoritative for
+                                    # this PR. The parent stage ID is only the
+                                    # binding used to validate inherited row
+                                    # semantics; using it to scope the child
+                                    # payload would make a valid one-shot child
+                                    # (whose rows are owned by `one-shot`)
+                                    # unenforceable. All applicable rows in
+                                    # the separately approved child plan,
+                                    # including inherited and child-local rows,
+                                    # remain enforceable here.
                                     approved_plan_context = child_plan_context
                             else:
                                 checkpoint = None

@@ -1900,6 +1900,13 @@ corrections visible in `risk_test_matrix_changes` with add/change/retire/split/
 merge operations and rationales; after approval, substantive changes require
 the normal newly reviewed plan workflow. Narrow local changes may use the
 non-empty not-applicable rationale.
+
+On a plan revision, `risk_test_matrix_changes` is the audit for the current
+revision only: describe exactly the semantic diff from the immediately prior
+matrix and use an empty list when the matrix is unchanged. Do not copy the
+prior revision's audit entries into a new unchanged revision. Exact historical
+entries that are repeated from the prior canonical matrix are tolerated for
+resume compatibility, but they do not count as coverage for a new change.
 """
 
 
