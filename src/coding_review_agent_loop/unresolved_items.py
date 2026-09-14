@@ -727,15 +727,11 @@ def _validate_structured_coder_followup_items(
     unresolved_items: Sequence[UnresolvedReviewItem],
 ) -> None:
     allowed_ids = [item.item_id for item in select_coder_followup_items(unresolved_items)]
-    # Future follow-ups are informational carry-forwards, not actionable this round --
-    # they are not shown in the same-PR-only follow-up prompt, so the coder cannot
-    # always classify them into addressed/remaining/disputed. Allow (but do not
-    # require) referencing them when they are shown in the general prompt.
-    required_ids = [
-        item.item_id
-        for item in select_coder_followup_items(unresolved_items)
-        if item.status != "future"
-    ]
+    # The caller supplies the dispatch-specific item set that was rendered in
+    # the prompt. Every selected item is therefore required in the coder's
+    # addressed/remaining/disputed partition, including retained future work
+    # on general and merge-conflict handoffs.
+    required_ids = [item.item_id for item in select_coder_followup_items(unresolved_items)]
     listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
     duplicates = sorted({item_id for item_id in listed_ids if listed_ids.count(item_id) > 1})
     if duplicates:

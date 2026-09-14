@@ -4411,7 +4411,7 @@ def test_watch_publishes_approved_followups_only_after_terminal_success(
             structured_coder_followup(
                 state="blocking",
                 summary="Fixed CI.",
-                addressed_items=["item-2"],
+                addressed_items=["item-1", "item-2"],
             )
         ],
     )
@@ -6228,7 +6228,7 @@ def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_ite
             "kind": "coder_followup",
             "state": "approved",
             "summary": "The visible follow-up is complete.",
-            "addressed_items": ["item-1"],
+            "addressed_items": ["item-2"],
             "remaining_items": [],
             "human_requirements": {
                 "addressed_ids": [],
@@ -6240,29 +6240,49 @@ def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_ite
     repaired_coder_response = structured_coder_followup(
         state="approved",
         summary="The visible follow-up is complete.",
-        addressed_items=["item-1"],
+        addressed_items=["item-2"],
         remaining_items=[],
     )
     runner = FakeRunner(
         codex_outputs=[
             structured_pr_review(
-                state="blocking",
-                same_pr_followups=["Fix the current-PR behavior."],
+                state="approved",
                 future_followups=["Document the broader behavior in a later PR."],
             ),
             structured_pr_review(
                 state="approved",
                 summary="The current-PR behavior is fixed.",
-                future_followups=["Document the broader behavior in a later PR."],
-                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "future"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
             ),
         ],
-        claude_outputs=[malformed_coder_response],
+        gemini_outputs=[
+            structured_pr_review(
+                state="blocking",
+                same_pr_followups=["Fix the current-PR behavior."],
+                reviewer="Google Gemini",
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="The current-PR behavior is fixed.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "future"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+                reviewer="Google Gemini",
+            ),
+        ],
+        claude_outputs=[
+            malformed_coder_response,
+        ],
     )
     config = make_config(
         tmp_path,
         approved_followups="fix-and-summarize",
         agent_max_retries=0,
+        reviewer=("codex", "gemini"),
     )
     repair_calls = []
 
@@ -6273,7 +6293,7 @@ def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_ite
     with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert repair_calls == [("coder_followup", ("item-1",))]
+    assert repair_calls == [("coder_followup", ("item-2",))]
     followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
     assert "Fix the current-PR behavior." in followup_prompt
     assert "Document the broader behavior in a later PR." not in followup_prompt

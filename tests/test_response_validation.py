@@ -152,6 +152,39 @@ def test_validate_coder_followup_response_accepts_structured_item_partition():
     assert parsed.remaining_items == ("item-2",)
 
 
+def test_validate_coder_followup_response_requires_visible_future_item():
+    unresolved_items = (
+        UnresolvedReviewItem(
+            item_id="item-1",
+            reviewer="OpenAI Codex",
+            source_round=1,
+            text="Fix the current-PR behavior.",
+            status="blocking",
+        ),
+        UnresolvedReviewItem(
+            item_id="item-2",
+            reviewer="OpenAI Codex",
+            source_round=1,
+            text="Document the broader behavior in a later PR.",
+            status="future",
+        ),
+    )
+    response = structured_coder_followup(
+        addressed_items=["item-1"],
+        summary="The current-PR behavior is fixed.",
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match="did not classify all unresolved reviewer items.*item-2",
+    ):
+        _validate_coder_followup_response(
+            response,
+            unresolved_items=unresolved_items,
+            human_requirements=(),
+        )
+
+
 def test_coder_namespace_keeps_machine_items_and_separates_ack_record():
     machine_item = UnresolvedReviewItem(
         item_id="github-pr-checks",
