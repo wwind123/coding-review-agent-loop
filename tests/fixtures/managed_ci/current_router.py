@@ -1,6 +1,7 @@
 """Extraction-bounded copy of the production managed-CI v2 validator.
 
 Source repository: wwind123/coding-review-agent-loop
+Source commit: c7d319dfc557cb1d18a93197d79120705aaf71fa
 Source path: .github/workflows/ci.yml
 Extraction boundary: the ``MANAGED_CI_V2_VALIDATOR`` block.
 The contract test compares this fixture to that workflow block after YAML
