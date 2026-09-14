@@ -1767,6 +1767,13 @@ on code that already fails the configured local test command. Use
 
 Failing GitHub checks always block approval and can route back to the coder. Pending or unavailable GitHub checks are treated as an external wait state rather than actionable coder feedback: if every reviewer approves the code and only GitHub checks are pending/unavailable, the loop posts a comment and stops with a clear message instead of erroring or starting another coder/reviewer round. If those checks later pass, manual merge is fine and rerunning is optional unless you want agent-loop to re-check or automate the final step. With `--auto-merge`, the loop instead keeps watching until checks resolve before merging. With active `--managed-ci`, the informational comment is retained but the loop falls through to dispatch the final exact-head workflow; ordinary pending/unavailable checks are not qualification.
 
+Managed exact-head qualification is approval-gated. Reviewers approve a
+repaired candidate when no code-level blocker remains even though the managed
+qualification job has not run; that approval advances the orchestrator to the
+authoritative dispatch. A reviewer disposition cannot itself clear the durable
+machine obligation, and the missing post-approval dispatch is not a reason to
+withhold code approval.
+
 ### Managed exact-head CI
 
 #### Installed repository contract

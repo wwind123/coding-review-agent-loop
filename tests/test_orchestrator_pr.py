@@ -429,6 +429,110 @@ def test_machine_checkpoint_revert_returns_to_repair_required_without_value_erro
     assert checkpoint.candidate_head_sha is None
 
 
+def test_approval_gated_managed_ci_wait_cannot_block_code_approval():
+    item = UnresolvedReviewItem(
+        item_id="item-33",
+        reviewer="GitHub managed exact-head CI",
+        source_round=9,
+        text="Managed exact-head CI failed on the previous head.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="awaiting_current_head_review",
+        failed_head_sha="failed-head",
+        candidate_head_sha="repair-head",
+    )
+    parsed = parse_pr_review(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "pr_review",
+                "state": "blocking",
+                "summary": "Code is ready; managed exact-head CI has not run.",
+                "blocking_items": [],
+                "same_pr_followups": [],
+                "future_followups": [],
+                "prior_item_dispositions": [
+                    {
+                        "item_id": "item-33",
+                        "disposition": "blocking",
+                        "note": "The orchestrator must obtain exact-head qualification.",
+                    }
+                ],
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+        reviewer="OpenAI Codex",
+    )
+
+    normalized = orchestrator._normalize_approval_gated_managed_ci_review(
+        parsed,
+        prior_items=[item],
+        pr_checks=_watch_check_board("passing"),
+        current_head_sha="repair-head",
+    )
+
+    assert normalized.state == "approved"
+    assert normalized.dispositions[0].disposition == "resolved"
+
+
+@pytest.mark.parametrize(
+    ("mutate_item", "checks_state", "add_code_finding"),
+    [
+        ({"obligation_kind": "github-pr-checks"}, "passing", False),
+        ({"lifecycle": "repair_required", "candidate_head_sha": None}, "passing", False),
+        ({"candidate_head_sha": "different-head"}, "passing", False),
+        ({}, "failing", False),
+        ({}, "passing", True),
+    ],
+)
+def test_managed_ci_wait_normalization_fails_closed(
+    mutate_item, checks_state, add_code_finding
+):
+    item = UnresolvedReviewItem(
+        item_id="item-33",
+        reviewer="GitHub managed exact-head CI",
+        source_round=9,
+        text="Managed exact-head CI failed on the previous head.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="awaiting_current_head_review",
+        failed_head_sha="failed-head",
+        candidate_head_sha="repair-head",
+    )
+    item = dataclasses.replace(item, **mutate_item)
+    payload = {
+        "schema_version": 1,
+        "kind": "pr_review",
+        "state": "blocking",
+        "summary": "Managed exact-head CI has not run.",
+        "blocking_items": ([{"text": "A real code defect remains."}] if add_code_finding else []),
+        "same_pr_followups": [],
+        "future_followups": [],
+        "prior_item_dispositions": [
+            {
+                "item_id": "item-33",
+                "disposition": "blocking",
+                "note": "The orchestrator must obtain exact-head qualification.",
+            }
+        ],
+    }
+    parsed = parse_pr_review(
+        json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+        reviewer="OpenAI Codex",
+    )
+
+    normalized = orchestrator._normalize_approval_gated_managed_ci_review(
+        parsed,
+        prior_items=[item],
+        pr_checks=_watch_check_board(checks_state),
+        current_head_sha="repair-head",
+    )
+
+    assert normalized.state == "blocking"
+
+
 def _assert_pending_ci_stop_guidance(text):
     assert "This run cannot confirm the PR is merge-ready yet." in text
     assert "If checks pass, you can merge manually; no rerun is required." in text

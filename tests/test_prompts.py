@@ -49,6 +49,15 @@ missing checks, intermediate-filtered checks, stale results, or an unrelated
 run as authoritative success; the named machine authority must validate the
 required current repair head.
 
+Managed exact-head CI with lifecycle `awaiting_current_head_review` is
+approval-gated: the orchestrator dispatches authoritative qualification only
+after every required reviewer approves the candidate head. When the old
+failed-head defect is fixed and no code-level blocker remains, return an
+approved review and disposition that carried predicate as `"resolved"`. Do not
+block merely because the post-approval managed dispatch has not run. Reviewer
+approval does not clear the machine obligation; it advances the orchestrator
+to qualification, which remains responsible for clearing it.
+
 The displayed Original claim is this stable item ID's predicate. Narrower evidence
 for that same defect may remain on the old ID. If you accept the original predicate
 but discover a materially different defect, mark the old item `"resolved"` and put
@@ -684,6 +693,8 @@ def test_review_prompt_labels_machine_obligations_as_advisory(tmp_path):
     assert "Machine obligation: managed-exact-head-ci" in prompt
     assert "reviewer approval is advisory evidence only and never CI success" in prompt
     assert "the named machine authority must validate" in prompt
+    assert "the orchestrator can dispatch qualification only after every required reviewer approves" in prompt
+    assert "do not block waiting for the post-approval dispatch" in prompt
 
 
 def test_review_prompt_splits_legacy_updates_without_mutating_claim_and_preserves_notes(tmp_path):

@@ -4224,6 +4224,56 @@ def _is_pending_ci_only_review(parsed_review: ParsedReview, pr_checks: PullReque
     )
 
 
+def _normalize_approval_gated_managed_ci_review(
+    parsed_review: ParsedReview,
+    *,
+    prior_items: Sequence[UnresolvedReviewItem],
+    pr_checks: PullRequestChecks,
+    current_head_sha: str | None,
+) -> ParsedReview:
+    """Prevent a reviewer from deadlocking post-approval managed CI.
+
+    A repaired managed-CI head must first receive every required reviewer
+    approval. Only then can the orchestrator dispatch exact-head
+    qualification. Reviewers still disposition the durable machine record,
+    but a blocking disposition against that wait is not a code finding.
+    """
+    if parsed_review.state != "blocking" or pr_checks.state not in {"passing", "no_checks"}:
+        return parsed_review
+    if parsed_review.blocking_items or parsed_review.followups.same_pr:
+        return parsed_review
+
+    active_dispositions = tuple(
+        disposition
+        for disposition in parsed_review.dispositions
+        if disposition.disposition in {"blocking", "same-pr"}
+    )
+    if not active_dispositions:
+        return parsed_review
+
+    items_by_id = {item.item_id: item for item in prior_items}
+    for disposition in active_dispositions:
+        item = items_by_id.get(disposition.item_id)
+        if not (
+            item is not None
+            and item.is_machine_obligation
+            and item.obligation_kind == "managed-exact-head-ci"
+            and item.lifecycle == "awaiting_current_head_review"
+            and item.candidate_head_sha == current_head_sha
+            and item.failed_head_sha != current_head_sha
+        ):
+            return parsed_review
+
+    active_ids = {disposition.item_id for disposition in active_dispositions}
+    dispositions = tuple(
+        dataclasses_replace(disposition, disposition="resolved")
+        if disposition.item_id in active_ids
+        else disposition
+        for disposition in parsed_review.dispositions
+    )
+    return dataclasses_replace(parsed_review, state="approved", dispositions=dispositions)
+
+
 def _coder_infrastructure_stall_notice(stalls: Sequence[StalledCheck]) -> str:
     """Prepended to a coder follow-up review when checks are wholly
     infrastructure-blocked (#602), so the coder never has to discover this
@@ -11776,6 +11826,13 @@ def run_pr_loop(
                                 parsed = dataclasses_replace(parsed, state="approved", blocking_items=())
                             if parsed.state == "blocking" and _is_infrastructure_ci_only_review(parsed, shared_reviewer_pr_checks):
                                 parsed = dataclasses_replace(parsed, state="approved", blocking_items=())
+                            if parsed.state == "blocking":
+                                parsed = _normalize_approval_gated_managed_ci_review(
+                                    parsed,
+                                    prior_items=prior_unresolved_items,
+                                    pr_checks=shared_reviewer_pr_checks,
+                                    current_head_sha=current_pr_subject,
+                                )
                             if _is_incomplete_pr_review(parsed):
                                 return
                             _post_pr_reviewer_comment(
@@ -11804,6 +11861,7 @@ def run_pr_loop(
 
             for reviewer in (() if skip_reviewers_this_round else configured_reviewers):
                 reviewer_name = agent_display_name(reviewer)
+                reviewer_pr_checks = shared_reviewer_pr_checks
                 if (
                     selective_policy
                     and reviewer_name not in selected_reviewer_names
@@ -12065,6 +12123,31 @@ def run_pr_loop(
                     )
                     parsed_review = dataclasses_replace(parsed_review, state="approved", blocking_items=())
                     review_state = parsed_review.state
+
+                if review_state == "blocking":
+                    if reviewer_pr_checks is None:
+                        reviewer_pr_checks = get_pr_checks(
+                            runner, config=config, metadata=pr_metadata
+                        )
+                        if managed_ci_active(pr_metadata):
+                            reviewer_pr_checks = intermediate_managed_checks(
+                                reviewer_pr_checks
+                            )
+                    normalized_review = _normalize_approval_gated_managed_ci_review(
+                        parsed_review,
+                        prior_items=prior_unresolved_items,
+                        pr_checks=reviewer_pr_checks,
+                        current_head_sha=current_pr_subject,
+                    )
+                    if normalized_review.state == "approved":
+                        log(
+                            config,
+                            f"Round {round_number}: {reviewer_name} blocking review only restates "
+                            "an approval-gated managed exact-head wait; treating the code review "
+                            "as approved so the orchestrator can dispatch qualification",
+                        )
+                        parsed_review = normalized_review
+                        review_state = parsed_review.state
 
                 if _is_incomplete_pr_review(parsed_review):
                     if len(configured_reviewers) == 1:
