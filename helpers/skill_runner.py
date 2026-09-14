@@ -3049,6 +3049,10 @@ def _complete_coder_turn(
         ("--execution-strategy-contract-version", "1")
         if require_execution_strategy_contract == 1 else ()
     )
+    risk_test_matrix_contract_args = (
+        ("--risk-test-matrix-contract-version", "1")
+        if require_risk_test_matrix_contract == 1 else ()
+    )
     _run_helper(
         "helpers.state_manager", "attach-metadata",
         "--body-file", str(public_file),
@@ -3066,6 +3070,7 @@ def _complete_coder_turn(
         *architecture_args,
         *contract_args,
         *execution_contract_args,
+        *risk_test_matrix_contract_args,
     )
 
     if not dry_run:
@@ -3215,6 +3220,15 @@ def _run_external_coder_phase(
         )
         kind = "plan_revision"
 
+    # The matrix contract is generation-gated independently of the execution
+    # strategy contract. A new planning lifecycle must emit generation 1, but a
+    # revision of a historical execution-v1 round must not be forced to invent
+    # a matrix that was not present in its durable coder metadata.
+    risk_test_matrix_contract_required = (
+        phase == "coder-round-1"
+        or resume.get("risk_test_matrix_contract_version") == 1
+    )
+
     from coding_review_agent_loop.prompts import render_coder_human_requirements_prompt_context
     human_context = render_coder_human_requirements_prompt_context(human_requirements)
 
@@ -3266,7 +3280,7 @@ def _run_external_coder_phase(
             ),
             architecture_contract_version=1,
             execution_strategy_contract_required=True,
-            risk_test_matrix_contract_required=True,
+            risk_test_matrix_contract_required=risk_test_matrix_contract_required,
             prior_canonical_plan=prior_canonical_plan,
             prior_risk_test_matrix=prior_risk_test_matrix,
             prior_risk_test_matrix_changes=prior_risk_test_matrix_changes,
@@ -3292,7 +3306,9 @@ def _run_external_coder_phase(
                 requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
                 required_architecture_impact_contract=1,
                 require_execution_strategy_contract=1,
-                require_risk_test_matrix_contract=1,
+                require_risk_test_matrix_contract=(
+                    1 if risk_test_matrix_contract_required else 0
+                ),
                 prior_canonical_plan=prior_canonical_plan,
                 prior_risk_test_matrix=prior_risk_test_matrix,
                 prior_risk_test_matrix_changes=prior_risk_test_matrix_changes,
@@ -3746,6 +3762,7 @@ def _run_host_coder_phase(
                     "--canonical-plan-file", str(plan_file),
                     "--prior-items-file", str(prior_items_file),
                     "--execution-strategy-contract-version", "1",
+                    "--risk-test-matrix-contract-version", "1",
                 )
                 _run_helper(
                     "helpers.state_manager", "write-pending-comment",

@@ -404,6 +404,15 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
     execution_strategy_contract_version = getattr(
         args, "execution_strategy_contract_version", None
     )
+    risk_test_matrix_contract_version_arg = getattr(
+        args, "risk_test_matrix_contract_version", None
+    )
+    if risk_test_matrix_contract_version_arg is not None and risk_test_matrix_contract_version_arg != 1:
+        print(
+            "state_manager: risk test matrix contract version must be 1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     execution_strategy_identity: dict | None = None
     risk_test_matrix_contract_version: int | None = None
     risk_test_matrix_payload: dict | None = None
@@ -411,16 +420,34 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
     risk_test_matrix_identity_value: str | None = None
     parsed_strategy = None
     identity_source = raw_structured_coder_response or body
-    fresh_source = False
+    fresh_execution_source = False
+    fresh_matrix_source = False
     try:
         source_payload, _source_end = json.JSONDecoder().raw_decode(identity_source.lstrip())
-        fresh_source = isinstance(source_payload, dict) and (
-            "execution_strategy_contract_version" in source_payload
-            or "execution_recommendation" in source_payload
-        )
+        if isinstance(source_payload, dict):
+            fresh_execution_source = (
+                "execution_strategy_contract_version" in source_payload
+                or "execution_recommendation" in source_payload
+            )
+            fresh_matrix_source = any(
+                name in source_payload
+                for name in (
+                    "risk_test_matrix_contract_version",
+                    "risk_test_matrix",
+                    "risk_test_matrix_changes",
+                )
+            )
     except (AttributeError, json.JSONDecodeError):
-        fresh_source = False
-    if execution_strategy_contract_version is not None or fresh_source:
+        fresh_execution_source = False
+        fresh_matrix_source = False
+    matrix_contract_requested = (
+        risk_test_matrix_contract_version_arg == 1 or fresh_matrix_source
+    )
+    if (
+        execution_strategy_contract_version is not None
+        or fresh_execution_source
+        or matrix_contract_requested
+    ):
         if execution_strategy_contract_version != 1:
             if execution_strategy_contract_version is not None:
                 print(
@@ -437,13 +464,17 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
                 parsed_strategy = validate_structured_plan_state(
                     identity_source,
                     require_execution_strategy_contract=1,
-                    require_risk_test_matrix_contract=1,
+                    require_risk_test_matrix_contract=(
+                        1 if matrix_contract_requested else 0
+                    ),
                 )
             elif kind == "plan_revision":
                 parsed_strategy = validate_structured_plan_revision(
                     identity_source,
                     require_execution_strategy_contract=1,
-                    require_risk_test_matrix_contract=1,
+                    require_risk_test_matrix_contract=(
+                        1 if matrix_contract_requested else 0
+                    ),
                 )
             else:
                 raise AgentLoopError(
@@ -765,6 +796,10 @@ def main() -> None:
     p_meta.add_argument(
         "--execution-strategy-contract-version", type=int, default=None,
         help="Fresh execution-strategy contract generation carried by this record.",
+    )
+    p_meta.add_argument(
+        "--risk-test-matrix-contract-version", type=int, default=None,
+        help="Fresh risk-test-matrix contract generation carried by this record.",
     )
     p_meta.add_argument(
         "--execution-strategy-identity-file", default=None,

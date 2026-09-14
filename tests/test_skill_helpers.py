@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import base64
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -878,6 +879,51 @@ class TestStateManager:
             assert resumed.coder_metadata.execution_strategy_identity["recommendation_sha256"]
             assert resumed.coder_metadata.canonical_plan == _plan_text
             assert resumed.coder_metadata.subject == _plan_subject(_plan_text)
+
+    def test_attach_metadata_accepts_legacy_execution_v1_matrixless_revision(
+        self, tmp_path: Path
+    ) -> None:
+        """Historical execution-v1 revisions must not be upgraded by attachment."""
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["kind"] = "plan_revision"
+        payload["prior_plan_item_dispositions"] = []
+        for field in (
+            "risk_test_matrix_contract_version",
+            "risk_test_matrix",
+            "risk_test_matrix_changes",
+        ):
+            payload.pop(field, None)
+        legacy_revision = json.dumps(payload) + _VALID_PLAN_STATE[end:]
+
+        body_file = tmp_path / "legacy-revision.json"
+        body_file.write_text(legacy_revision, encoding="utf-8")
+        output_file = tmp_path / "tagged.md"
+
+        _run(
+            "helpers.state_manager",
+            "attach-metadata",
+            "--body-file", str(body_file),
+            "--output", str(output_file),
+            "--flow", "plan",
+            "--role", "coder",
+            "--agent", "Codex",
+            "--round-number", "2",
+            "--state", "blocking",
+            "--subject-plan-file", str(body_file),
+            "--canonical-plan-file", str(body_file),
+            "--raw-structured-coder-response-file", str(body_file),
+            "--execution-strategy-contract-version", "1",
+        )
+
+        from coding_review_agent_loop.round_state import _decode_round_metadata
+
+        tagged = output_file.read_text(encoding="utf-8")
+        marker = re.search(r"AGENT_LOOP_META:\s*([A-Za-z0-9+/=_-]+)", tagged)
+        assert marker is not None
+        metadata = _decode_round_metadata(marker.group(1))
+        assert metadata.execution_strategy_contract_version == 1
+        assert metadata.risk_test_matrix_contract_version is None
+        assert metadata.risk_test_matrix_payload is None
 
     def test_host_plan_rerun_reuses_canonical_subject(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An unchanged raw host plan must resume instead of posting a new round."""
@@ -3731,6 +3777,100 @@ class TestExternalCoderRun:
             manifest = json.loads((repair_dir / "manifest.json").read_text(encoding="utf-8"))
             assert manifest["role"] == "coder"
             assert manifest["kind"] == "plan_state"
+            assert manifest["risk_test_matrix_contract_required"] is True
+
+    def test_legacy_matrixless_revision_completes_through_skill_persistence(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A resumed pre-matrix round can advance through the real skill helpers."""
+        from helpers import prompt_builders, skill_runner
+
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["kind"] = "plan_revision"
+        payload["prior_plan_item_dispositions"] = []
+        for field in (
+            "risk_test_matrix_contract_version",
+            "risk_test_matrix",
+            "risk_test_matrix_changes",
+        ):
+            payload.pop(field, None)
+        legacy_revision = json.dumps(payload) + _VALID_PLAN_STATE[end:]
+
+        monkeypatch.setattr(skill_runner, "_REPAIR_BASE", tmp_path / "repair")
+        monkeypatch.setattr(
+            skill_runner,
+            "_fetch_issue_json",
+            lambda repo, issue: {
+                "number": issue,
+                "title": "Legacy plan",
+                "body": "A historical execution-v1 plan.",
+                "url": "https://github.com/OWNER/REPO/issues/9997",
+            },
+        )
+        monkeypatch.setattr(
+            prompt_builders,
+            "_acquire_skill_architecture",
+            lambda *args, **kwargs: None,
+        )
+
+        helper_calls: list[tuple[str, ...]] = []
+        real_run_helper = skill_runner._run_helper
+
+        def fake_run_helper(*args: str, check: bool = True):
+            helper_calls.append(args)
+            if args[:1] == ("helpers.run_external",):
+                output = Path(args[args.index("--output") + 1])
+                output.write_text(legacy_revision, encoding="utf-8")
+                usage = Path(args[args.index("--usage-output") + 1])
+                usage.write_text("{}", encoding="utf-8")
+                return subprocess.CompletedProcess(args, 0)
+            return real_run_helper(*args, check=check)
+
+        monkeypatch.setattr(skill_runner, "_run_helper", fake_run_helper)
+        resume = {
+            "current_plan_subject": "legacy-subject",
+            "current_plan": "The historical canonical plan.",
+            "completed_round_number": 1,
+            "round_number": 1,
+            "completed_reviewer_names": ["Codex"],
+            "completed_reviewer_data": [{
+                "reviewer_name": "Codex",
+                "state": "blocking",
+                "new_items": [],
+                "dispositions": [],
+            }],
+            "prior_items": [],
+            "risk_test_matrix_contract_version": None,
+        }
+        args = types.SimpleNamespace(
+            issue=9997,
+            repo="OWNER/REPO",
+            coder="codex",
+            workdir=str(tmp_path / "checkout"),
+            gemini_cmd="gemini",
+            architecture_context_enabled=False,
+        )
+
+        result = skill_runner._run_external_coder_phase(
+            args, "codex", resume, ["codex"], None, True
+        )
+
+        assert result["is_new_round"] is True
+        assert result["new_round_number"] == 2
+        assert any(
+            call[:2] == ("helpers.state_manager", "attach-metadata")
+            for call in helper_calls
+        )
+        assert not any(
+            "--require-risk-test-matrix-contract" in call
+            or "--risk-test-matrix-contract-version" in call
+            for call in helper_calls
+        )
+        manifest = json.loads(
+            (tmp_path / "repair" / "9997-r2-codex-coder" / "manifest.json")
+            .read_text(encoding="utf-8")
+        )
+        assert manifest.get("risk_test_matrix_contract_required") is not True
 
     def test_claude_coder_without_plan_file_rejected(self) -> None:
         result = _run(
