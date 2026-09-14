@@ -1149,15 +1149,24 @@ def validate_risk_test_matrix_revision(
     # set. A retained ID is valid for a split/merge only when its row payload
     # actually changed.
     covered: set[str] = set()
+    # Compute complete-scope row coverage before validating individual row
+    # operations. A matrix-level audit and a precise retained-row audit are
+    # separate subjects, so either ordering must be accepted when both are
+    # present in the same draft revision.
     matrix_transition_covered: set[str] = set()
+    for index in matrix_change_indexes:
+        change = current_changes[index]
+        if change.operation == "change" and not added_ids and not retired_ids:
+            matrix_transition_covered.update(retained_changed_ids)
     seen_subjects: set[str] = set()
     for index, change in enumerate(current_changes):
         if index in matrix_change_indexes:
-            if change.operation == "change" and not added_ids and not retired_ids:
-                matrix_transition_covered.update(retained_changed_ids)
             continue
         subject = set(change.row_ids)
-        overlap = sorted(subject & (seen_subjects | matrix_transition_covered))
+        # Complete-scope matrix coverage may intentionally overlap a
+        # row-specific audit; only two non-matrix operations are duplicate
+        # row subjects and should be rejected.
+        overlap = sorted(subject & seen_subjects)
         if overlap:
             raise AgentLoopError(
                 "Risk matrix audit operations overlap on row IDs: " + ", ".join(overlap)

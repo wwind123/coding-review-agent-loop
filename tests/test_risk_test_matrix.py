@@ -312,6 +312,35 @@ def test_matrix_level_change_audits_every_retained_row_changed_with_matrix_field
     )
 
 
+@pytest.mark.parametrize("matrix_audit_first", [True, False])
+def test_matrix_and_retained_row_audits_are_order_independent(matrix_audit_first: bool) -> None:
+    previous = {
+        **_matrix(),
+        "rows": [_row("row-one"), _row("row-two")],
+    }
+    current = {
+        **previous,
+        "rows": [
+            {**_row("row-one"), "expected_outcome": "Outcome one revised."},
+            _row("row-two"),
+        ],
+        "important_exclusions": ["The complete-scope exclusion was revised."],
+    }
+    matrix_change = {
+        "operation": "change",
+        "row_ids": ["row-one", "row-two"],
+        "rationale": "Updated the matrix exclusion boundary.",
+    }
+    row_change = {
+        "operation": "change",
+        "row_ids": ["row-one"],
+        "rationale": "Clarified the retained transition.",
+    }
+    changes = [matrix_change, row_change] if matrix_audit_first else [row_change, matrix_change]
+
+    validate_risk_test_matrix_revision(previous, current, changes)
+
+
 def test_non_prefixed_stage_id_is_a_valid_parser_owner_but_topology_membership_is_checked() -> None:
     matrix = parse_risk_test_matrix({**_matrix(), "rows": [{**_row(), "execution_owner": "api"}]})
     recommendation = {

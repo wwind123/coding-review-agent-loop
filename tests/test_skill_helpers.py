@@ -3919,6 +3919,39 @@ class TestRetryValidateCoder:
             assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
             assert (repair_dir / "coder-tagged.md").exists()
 
+    def test_retry_validate_coder_revision_accepts_complete_scope_row_and_exclusion_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            prior = _fresh_applicable_plan_state_matrix()
+            changed = {
+                **prior,
+                "rows": [{
+                    **prior["rows"][0],
+                    "expected_outcome": "The same row remains enforceable after the exclusion edit",
+                }],
+                "important_exclusions": ["Unrelated review modes remain out of scope."],
+            }
+            repair_dir = self._make_coder_revision_repair_dir(
+                tmppath,
+                matrix=changed,
+                changes=[{
+                    "operation": "change",
+                    "row_ids": ["row-skill-resume"],
+                    "rationale": "Updated the retained transition and matrix exclusion boundary.",
+                }],
+            )
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run", env=env, check=False,
+            )
+
+            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+            assert (repair_dir / "coder-tagged.md").exists()
+
 
 # ---------------------------------------------------------------------------
 # helpers/skill_runner.py — reversed roles: host-as-reviewer (#307)
