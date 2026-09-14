@@ -2313,7 +2313,7 @@ def test_pr_loop_rejects_malformed_structured_coder_followup_before_re_review(tm
     ):
         run_pr_loop(runner, pr_number=77, config=config)
 
-def test_reconcile_human_requirements_ack_item_surfaces_markdown_ack_blocker():
+def test_reconcile_human_requirements_ack_item_does_not_mint_blocker_for_generic_output():
     human_requirements = (
         HumanReviewRequirement(
             source_type="PR comment",
@@ -2331,8 +2331,59 @@ def test_reconcile_human_requirements_ack_item_surfaces_markdown_ack_blocker():
         source_round=2,
     )
 
+    assert reconciled == []
+
+
+def test_reconcile_human_requirements_ack_item_retains_dedicated_failure():
+    human_requirements = (
+        HumanReviewRequirement(
+            source_type="PR comment",
+            author="reviewer",
+            created_at="2026-05-18T10:00:00Z",
+            url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+            body="Please use the absolute URL.",
+        ),
+    )
+    invalid_structured = structured_coder_followup(
+        addressed_items=[],
+        human_requirement_ids=[],
+        human_requirement_dispositions=[],
+    )
+
+    reconciled = _reconcile_human_requirements_ack_item(
+        (),
+        coder_output=invalid_structured,
+        human_requirements=human_requirements,
+        source_round=2,
+    )
+
     assert [item.item_id for item in reconciled] == [HUMAN_REQUIREMENTS_ACK_ITEM_ID]
-    assert "missing required signed human requirements marker" in reconciled[0].text
+    assert "missing" in reconciled[0].text.lower()
+
+
+def test_rejected_structured_response_content_cannot_trigger_provider_advice():
+    malformed = structured_coder_followup(
+        summary="Authentication, credit, billing, and dirty-tree vocabulary are only content.",
+    )
+
+    assert (
+        orchestrator._failure_category(
+            malformed,
+            public_response=True,
+            repair_expected_kind="coder_followup",
+        )
+        == "deterministic"
+    )
+    error = orchestrator._format_invalid_agent_response_error(
+        agent_name="Anthropic Claude",
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        reason="schema validation failed; repair invocation failure: timeout",
+        result=None,
+        log_paths=(),
+        category="deterministic",
+        classification_text="structured coder_followup response failed trusted validation",
+    )
+    assert "credentials or billing" not in error
 
 def test_reconcile_human_requirements_ack_item_clears_markdown_ack_blocker():
     human_requirements = (

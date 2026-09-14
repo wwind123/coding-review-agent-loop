@@ -440,7 +440,7 @@ from .unresolved_items import (
     _clear_human_requirements_ack_item,
     _clear_merge_conflict_item,
     _format_same_pr_unresolved_items,
-    _format_unresolved_items_for_coder,
+    format_coder_followup_context,
     _maybe_fill_resolved_dispositions_from_prose,
     _next_unresolved_item,
     _advance_machine_obligations_for_head,
@@ -456,6 +456,7 @@ from .unresolved_items import (
     _record_prior_item_disposition,
     _reconcile_human_requirements_ack_item,
     _raise_if_maintained_disputed_items,
+    select_coder_followup_items,
     _upsert_human_requirements_ack_item,
     _validate_coder_followup_response,
     _validate_plan_review_response,
@@ -1007,6 +1008,15 @@ def _decode_public_response_json_prefix(text: str) -> object | None:
     return payload
 
 
+def _recognized_structured_public_response_kind(text: str) -> str | None:
+    """Return a trusted response kind without interpreting its free-form values."""
+    payload = _decode_public_response_json_prefix(text)
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("kind")
+    return kind if isinstance(kind, str) and kind in STRUCTURED_PUBLIC_RESPONSE_KINDS else None
+
+
 def _is_error_shaped_json_payload(payload: object) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -1158,6 +1168,11 @@ def _unsupported_model_classification_text(
 
 def _is_transient_public_response(text: str, *, repair_expected_kind: str | None = None) -> bool:
     """Classify extracted public responses without matching transient terms in content."""
+    if (
+        _recognized_structured_public_response_kind(text) is not None
+        and (repair_expected_kind is None or repair_expected_kind in STRUCTURED_PUBLIC_RESPONSE_KINDS)
+    ):
+        return False
     if NON_RETRYABLE_AGENT_OUTPUT_RE.search(text):
         return False
 
@@ -1194,6 +1209,16 @@ def _failure_category(
     """Classify a failure for logging: helps users decide whether to rerun or fix config/code."""
     if not text.strip():
         return "empty-response"
+    if (
+        public_response
+        and _recognized_structured_public_response_kind(text) is not None
+        and (repair_expected_kind is None or repair_expected_kind in STRUCTURED_PUBLIC_RESPONSE_KINDS)
+    ):
+        # Structured response values are agent-authored content, not provider
+        # diagnostics. A rejected envelope remains deterministic even if its
+        # prose happens to contain auth, billing, credit, timeout, or dirty-tree
+        # vocabulary.
+        return "deterministic"
     lowered = text.lower()
     if _looks_like_unsupported_effort_text(text):
         return "unsupported_effort"
@@ -3082,17 +3107,29 @@ def _run_validated_agent(
             except AgentLoopError as exc:
                 last_error = str(exc)
                 marker_safety_failure = "Current untrusted GitHub text contains reserved protocol marker(s):" in str(exc)
-                classification_text = _agent_failure_classification_text(result, phase="validation")
+                structured_kind = _recognized_structured_public_response_kind(result.text)
+                if structured_kind is not None:
+                    # Keep validation context authoritative. The structured
+                    # payload's prose is untrusted content and must not be
+                    # treated as evidence of provider auth, billing, credit,
+                    # timeout, or dirty-worktree failure.
+                    classification_text = (
+                        f"structured {structured_kind} response failed trusted validation"
+                    )
+                    public_text_is_transient = False
+                    last_failure_category = "deterministic"
+                else:
+                    classification_text = _agent_failure_classification_text(result, phase="validation")
+                    public_text_is_transient = _is_transient_public_response(
+                        classification_text,
+                        repair_expected_kind=repair_expected_kind,
+                    )
+                    last_failure_category = _failure_category(
+                        classification_text,
+                        public_response=True,
+                        repair_expected_kind=repair_expected_kind,
+                    )
                 last_classification_text = classification_text
-                public_text_is_transient = _is_transient_public_response(
-                    classification_text,
-                    repair_expected_kind=repair_expected_kind,
-                )
-                last_failure_category = _failure_category(
-                    classification_text,
-                    public_response=True,
-                    repair_expected_kind=repair_expected_kind,
-                )
                 if result.command_result is not None and result.command_result.capture_diagnostics:
                     last_failure_category = "transient"
                     public_text_is_transient = True
@@ -13891,7 +13928,7 @@ def run_pr_loop(
                 other_items = [
                     item for item in unresolved_items if item.item_id != MERGE_CONFLICT_ITEM_ID
                 ]
-                combined_review = summary_context + _format_unresolved_items_for_coder(other_items)
+                combined_review = summary_context + format_coder_followup_context(other_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )
@@ -13945,7 +13982,7 @@ def run_pr_loop(
                 )
                 log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
             else:
-                combined_review = stall_context + summary_context + _format_unresolved_items_for_coder(unresolved_items)
+                combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )
@@ -13963,9 +14000,7 @@ def run_pr_loop(
                 )
                 log(config, f"Round {round_number}: {coder_name} addressing reviewer feedback")
             repair_unresolved_item_ids = tuple(
-                item.item_id
-                for item in unresolved_items
-                if item.item_id not in {HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID}
+                item.item_id for item in select_coder_followup_items(unresolved_items)
             )
             # Persist the exact machine state and any consumed watcher budget
             # before invoking the coder. If the agent process is interrupted

@@ -2483,14 +2483,27 @@ revisions are rendered into canonical markdown for stored plan state, reviewer
 prompts, subject hashing, and resume; public comments render human-readable
 sections and omit raw JSON.
 
+Coder PR follow-ups use a deliberately narrower item namespace. Only the
+human-requirements acknowledgement record and the merge-conflict record have
+dedicated non-classifiable prompt paths. Ordinary reviewer findings and every
+other repair-required machine obligation — including managed exact-head CI,
+ordinary GitHub checks, migration validation, and conservative unknown
+obligations — remain visible in `addressed_items`, `remaining_items`, or
+`disputed_items`. The acknowledgement record is shown separately with its
+stored validation diagnostic, and its internal ID must never be placed in
+those reviewer-item fields. Merge conflicts retain their dedicated conflict
+resolution prompt. Coder classifications are evidence of intent only: they
+cannot clear a CI or other source-authoritative machine gate before that
+authority revalidates the repaired head.
+
 Signed human reviewer comments are requirements when the comment body ends with
 a standalone `-- Human Reviewer` signature. Issue comments become signed
 planning or implementation requirements; PR comments become signed PR-review
 requirements. They override AI reviewer preferences unless they are unsafe,
 impossible, or superseded by a later signed human instruction.
 
-When signed requirements are present, coder markdown fallback responses must
-include:
+When signed requirements are present, legacy coder markdown acknowledgement
+responses must include:
 
 ```md
 <!-- HUMAN_REQUIREMENTS_ADDRESSED -->
@@ -2499,18 +2512,21 @@ include:
 - Requirement hr-<digest>: explain how it was addressed or why it cannot be satisfied safely.
 ```
 
-Structured coder follow-ups carry the same acknowledgement in
-`human_requirements.addressed_ids` and
-`human_requirements.checked_discussion_directly`. If the prompt says detailed
-requirements were omitted to stay bounded, the coder must check the GitHub
-discussion directly and acknowledge that fact instead of listing requirement
-IDs. Stable IDs are content-derived and survive insertion or reordering; edited
-instructions receive new IDs, and legacy positional replies require a fresh
-acknowledgement instead of being mapped onto the current set. The orchestrator
-injects a synthetic
-`item-human-requirements-acknowledgement` item when coder acknowledgement is
-missing or invalid, then reconciles that item after a valid structured or
-markdown acknowledgement. Reviewers must include
+Structured coder follow-ups acknowledge requirements only in
+`human_requirement_dispositions` and
+`human_requirements.addressed_ids` / `checked_discussion_directly`; they do
+not include the legacy marker or a Markdown section, and no prose may appear
+between their JSON object and footer. If the prompt says detailed requirements
+were omitted to stay bounded, the coder must check the GitHub discussion
+directly and acknowledge that fact in those JSON fields instead of listing
+requirement IDs. Initial and revised planning responses retain their distinct
+post-JSON marker-and-section placement rule. Stable IDs are content-derived and
+survive insertion or reordering; edited instructions receive new IDs, and
+legacy positional replies require a fresh acknowledgement instead of being
+mapped onto the current set. The orchestrator creates or retains a synthetic
+`item-human-requirements-acknowledgement` obligation only for a dedicated
+acknowledgement/disposition failure, not for a generic schema, footer, or
+layout failure. Reviewers must include
 `<!-- HUMAN_REQUIREMENTS_RESOLVED -->` in an approved review before the loop
 treats signed requirements as resolved; otherwise the synthetic item is carried
 into the next round even if the visible review says approved.
@@ -2583,7 +2599,15 @@ protocol grammar are not compared by this guard. Those paths still rely on the
 lossless prompt and the ordinary schema/context validators. No repair can certify
 that an agent's underlying code or test claims are true.
 
-Known transient agent/model failures are retried before local failure. The
+Known transient agent/model failures are retried before local failure. A
+structurally recognized response rejected by schema, item-classification,
+acknowledgement, footer, or content validation is classified from that trusted
+validation context, not from vocabulary inside the response's prose. Thus a
+rejected response that happens to mention authentication, credit, billing, or a
+dirty tree remains a deterministic protocol failure without credential or
+billing advice. A repair timeout or invalid repair remains secondary to that
+originating validation category; genuine provider and command diagnostics keep
+their normal classifications. The
 default is two retries with bounded backoff; tune this with
 `--agent-max-retries` and `--agent-retry-backoff-seconds`. Retry matching is
 narrow and intended for stream/tool-call failures, empty responses, network

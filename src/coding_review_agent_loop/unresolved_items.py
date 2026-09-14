@@ -24,8 +24,10 @@ from .protocol import (
     MACHINE_AUTHORITY,
     MACHINE_OBLIGATION_KINDS,
     UNKNOWN_MACHINE_AUTHORITY,
+    HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     parse_plan_review,
     parse_pr_review,
+    parse_human_requirements_acknowledgement,
     validate_human_requirements_acknowledgement,
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
@@ -42,11 +44,30 @@ MIGRATION_OBLIGATION_KIND = "alembic-migration"
 MERGE_CONFLICT_OBLIGATION_KIND = "merge-conflict"
 HUMAN_REQUIREMENTS_OBLIGATION_KIND = "human-requirements-acknowledgement"
 UNKNOWN_OBLIGATION_KIND = "unknown"
+CODER_NON_CLASSIFIABLE_ITEM_IDS = frozenset(
+    {HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID}
+)
 ALL_RESOLVED_PROSE_RE = re.compile(
     r"^all (?:prior items|listed items|carried-forward items) are resolved\.?$"
     r"|^all prior unresolved items have been resolved\.?$",
     re.I,
 )
+
+
+def select_coder_followup_items(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> tuple[UnresolvedReviewItem, ...]:
+    """Return exactly the records that belong to coder item classification.
+
+    The acknowledgement and merge-conflict records have dedicated protocol
+    paths. Every other record, including machine-owned repair obligations,
+    remains in the coder's addressed/remaining/disputed namespace.
+    """
+    return tuple(
+        item
+        for item in unresolved_items
+        if item.item_id not in CODER_NON_CLASSIFIABLE_ITEM_IDS
+    )
 
 
 def _normalize_disposition_section_prose(text: str) -> str:
@@ -507,15 +528,26 @@ def _reconcile_human_requirements_ack_item(
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     if not prompt_context.surfaced_requirement_ids and not prompt_context.requires_direct_discussion_ack:
         return _clear_human_requirements_ack_item(unresolved_items)
+    # Parse the applicable structured response mode first.  Schema, footer,
+    # layout, and reviewer-item errors belong to the response validator; they
+    # must not be relabeled as a human-requirements obligation here.
+    structured_implementation: StructuredIssueImplementation | None = None
+    structured_followup: StructuredCoderFollowup | None = None
     try:
-        structured_followup = None
+        structured_implementation = validate_structured_issue_implementation(coder_output)
+    except IssueImplementationConflictError as exc:
+        structured_implementation = exc.payload
+    except AgentLoopError:
+        structured_implementation = None
+
+    if structured_implementation is None:
         try:
-            structured_implementation = validate_structured_issue_implementation(coder_output)
-        except IssueImplementationConflictError as exc:
-            structured_implementation = exc.payload
+            structured_followup = validate_structured_coder_followup(coder_output)
         except AgentLoopError:
-            structured_implementation = None
-        if isinstance(structured_implementation, StructuredIssueImplementation):
+            structured_followup = None
+
+    if isinstance(structured_implementation, StructuredIssueImplementation):
+        try:
             validate_human_requirement_dispositions(
                 structured_implementation.human_requirement_dispositions,
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
@@ -528,34 +560,64 @@ def _reconcile_human_requirements_ack_item(
                 surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
                 requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
             )
-        else:
-            structured_followup = validate_structured_coder_followup(coder_output)
-            if structured_followup is None:
-                validate_human_requirements_acknowledgement(
-                    coder_output,
-                    surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
-                    requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
-                )
-            else:
-                validate_human_requirement_dispositions(
-                    structured_followup.human_requirement_dispositions,
-                    surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
-                    context="coder_followup.human_requirement_dispositions",
-                )
-                validate_structured_human_requirements_acknowledgement(
-                    structured_followup.human_requirements.addressed_ids,
-                    dispositions=structured_followup.human_requirement_dispositions,
-                    checked_discussion_directly=structured_followup.human_requirements.checked_discussion_directly,
-                    surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
-                    requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
-                )
-    except AgentLoopError as exc:
-        return _upsert_human_requirements_ack_item(
-            unresolved_items,
-            source_round=source_round,
-            text=str(exc),
-        )
-    return _clear_human_requirements_ack_item(unresolved_items)
+        except AgentLoopError as exc:
+            return _upsert_human_requirements_ack_item(
+                unresolved_items,
+                source_round=source_round,
+                text=str(exc),
+            )
+        return _clear_human_requirements_ack_item(unresolved_items)
+
+    if isinstance(structured_followup, StructuredCoderFollowup):
+        try:
+            validate_human_requirement_dispositions(
+                structured_followup.human_requirement_dispositions,
+                surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
+                context="coder_followup.human_requirement_dispositions",
+            )
+            validate_structured_human_requirements_acknowledgement(
+                structured_followup.human_requirements.addressed_ids,
+                dispositions=structured_followup.human_requirement_dispositions,
+                checked_discussion_directly=structured_followup.human_requirements.checked_discussion_directly,
+                surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
+                requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+            )
+        except AgentLoopError as exc:
+            return _upsert_human_requirements_ack_item(
+                unresolved_items,
+                source_round=source_round,
+                text=str(exc),
+            )
+        return _clear_human_requirements_ack_item(unresolved_items)
+
+    # A legacy markdown acknowledgement is itself an applicable response mode
+    # only when the response attempted to provide its marker or section. A
+    # generic free-form/structured response with no parseable acknowledgement
+    # must remain a response-format failure, not mint a misleading gate.
+    parsed_legacy_ack = parse_human_requirements_acknowledgement(coder_output)
+    if (
+        parsed_legacy_ack.marker_present
+        or parsed_legacy_ack.section_present
+        or HUMAN_REQUIREMENTS_ADDRESSED_MARKER in coder_output
+    ):
+        try:
+            validate_human_requirements_acknowledgement(
+                coder_output,
+                surfaced_requirement_ids=prompt_context.surfaced_requirement_ids,
+                requires_direct_discussion_ack=prompt_context.requires_direct_discussion_ack,
+            )
+        except AgentLoopError as exc:
+            return _upsert_human_requirements_ack_item(
+                unresolved_items,
+                source_round=source_round,
+                text=str(exc),
+            )
+        return _clear_human_requirements_ack_item(unresolved_items)
+
+    # Do not clear a pre-existing acknowledgement record without valid
+    # acknowledgement evidence. The original validation failure remains the
+    # authoritative diagnostic for this turn.
+    return list(unresolved_items)
 
 
 _CONFIRMED_CONFLICT_HEAD_NOTE_PREFIX = "confirmed-head:"
@@ -664,18 +726,15 @@ def _validate_structured_coder_followup_items(
     *,
     unresolved_items: Sequence[UnresolvedReviewItem],
 ) -> None:
-    excluded_synthetic_ids = {HUMAN_REQUIREMENTS_ACK_ITEM_ID, MERGE_CONFLICT_ITEM_ID}
-    allowed_ids = [
-        item.item_id for item in unresolved_items if item.item_id not in excluded_synthetic_ids
-    ]
+    allowed_ids = [item.item_id for item in select_coder_followup_items(unresolved_items)]
     # Future follow-ups are informational carry-forwards, not actionable this round --
     # they are not shown in the same-PR-only follow-up prompt, so the coder cannot
     # always classify them into addressed/remaining/disputed. Allow (but do not
     # require) referencing them when they are shown in the general prompt.
     required_ids = [
         item.item_id
-        for item in unresolved_items
-        if item.item_id not in excluded_synthetic_ids and item.status != "future"
+        for item in select_coder_followup_items(unresolved_items)
+        if item.status != "future"
     ]
     listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
     duplicates = sorted({item_id for item_id in listed_ids if listed_ids.count(item_id) > 1})
@@ -1018,7 +1077,7 @@ def _record_prior_item_disposition(
 
 def _format_same_pr_unresolved_items(items: Sequence[UnresolvedReviewItem]) -> str:
     lines: list[str] = []
-    for item in items:
+    for item in select_coder_followup_items(items):
         lines.append(
             f"{item.reviewer} same-PR follow-up [{item.item_id}] from round {item.source_round}:"
         )
@@ -1059,7 +1118,7 @@ def apply_item_dispositions(
 
 def _format_unresolved_items_for_coder(items: Sequence[UnresolvedReviewItem]) -> str:
     lines: list[str] = []
-    for item in items:
+    for item in select_coder_followup_items(items):
         lines.append(
             f"{item.reviewer} unresolved {item.status} item [{item.item_id}] from round {item.source_round}:"
         )
@@ -1079,3 +1138,37 @@ def _format_unresolved_items_for_coder(items: Sequence[UnresolvedReviewItem]) ->
             lines.extend(f"- {note}" for note in item.notes)
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def _format_human_requirements_ack_for_coder(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> str:
+    """Render the acknowledgement obligation outside reviewer-item fields."""
+    item = next(
+        (item for item in unresolved_items if item.item_id == HUMAN_REQUIREMENTS_ACK_ITEM_ID),
+        None,
+    )
+    if item is None:
+        return ""
+    lines = [
+        "Human-requirements acknowledgement (dedicated non-classifiable record)",
+        f"Internal record ID: `{item.item_id}`. This is not a reviewer item.",
+        "Acknowledge or disposition the signed human requirements using only the "
+        "`human_requirements` and `human_requirement_dispositions` JSON fields. "
+        "Do not put this internal record ID in `addressed_items`, `remaining_items`, "
+        "or `disputed_items`.",
+        "Stored acknowledgement diagnostic:",
+        f"- {item.text}",
+    ]
+    return "\n".join(lines)
+
+
+def format_coder_followup_context(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+) -> str:
+    """Render classifiable coder work plus dedicated synthetic obligations."""
+    sections = [
+        _format_unresolved_items_for_coder(unresolved_items),
+        _format_human_requirements_ack_for_coder(unresolved_items),
+    ]
+    return "\n\n".join(section for section in sections if section)

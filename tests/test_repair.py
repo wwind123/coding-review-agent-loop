@@ -692,7 +692,19 @@ def test_attempt_repair_includes_coder_followup_required_item_ids():
         in prompt
     )
     assert "HUMAN_REQUIREMENTS_ADDRESSED" in prompt
-    assert "do not classify regular reviewer or orchestrator-injected item-N records" in prompt
+    assert "every other unresolved reviewer or machine-obligation ID remains classifiable" in prompt
+
+
+def test_coder_repair_context_keeps_ci_classifiable_and_dedicated_records_out():
+    prompt = _build_repair_prompt(
+        "malformed coder response",
+        expected_kind="coder_followup",
+        unresolved_item_ids=["github-pr-checks"],
+    )
+
+    assert "`github-pr-checks`" in prompt
+    assert "every other unresolved reviewer or machine-obligation ID remains classifiable" in prompt
+    assert "dedicated human-requirements acknowledgement and merge-conflict records" in prompt
 
 def test_attempt_repair_includes_empty_surfaced_requirement_guidance():
     repaired = structured_coder_followup(

@@ -6,10 +6,12 @@ from coding_review_agent_loop.protocol import (
 )
 from coding_review_agent_loop.unresolved_items import (
     CODER_DISPUTE_NOTE_PREFIX,
+    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
     MACHINE_AUTHORITY,
     _apply_dispute_evidence,
     _apply_unresolved_item_dispositions,
     _is_disputed_item,
+    format_coder_followup_context,
 )
 
 
@@ -148,6 +150,43 @@ def test_validate_coder_followup_response_accepts_structured_item_partition():
 
     assert parsed.addressed_items == ("item-1",)
     assert parsed.remaining_items == ("item-2",)
+
+
+def test_coder_namespace_keeps_machine_items_and_separates_ack_record():
+    machine_item = UnresolvedReviewItem(
+        item_id="github-pr-checks",
+        reviewer="GitHub PR checks",
+        source_round=2,
+        text="The required test check is failing.",
+        status="blocking",
+        authority=MACHINE_AUTHORITY,
+        obligation_kind="github-pr-checks",
+        lifecycle="repair_required",
+        failed_head_sha="old-head",
+    )
+    ack_item = UnresolvedReviewItem(
+        item_id=HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+        reviewer="Orchestrator",
+        source_round=2,
+        text="The signed requirement acknowledgement is missing.",
+        status="blocking",
+    )
+    response = structured_coder_followup(
+        addressed_items=["github-pr-checks"],
+        summary="Recorded the CI repair while the acknowledgement remains separate.",
+    )
+
+    parsed = _validate_coder_followup_response(
+        response,
+        unresolved_items=(machine_item, ack_item),
+        human_requirements=(),
+    )
+    rendered = format_coder_followup_context((machine_item, ack_item))
+
+    assert parsed.addressed_items == ("github-pr-checks",)
+    assert "[github-pr-checks]" in rendered
+    assert f"Internal record ID: `{HUMAN_REQUIREMENTS_ACK_ITEM_ID}`" in rendered
+    assert f"[{HUMAN_REQUIREMENTS_ACK_ITEM_ID}]" not in rendered
 
 
 @pytest.mark.parametrize(

@@ -609,7 +609,7 @@ The active planning human-requirements context above is authoritative. Do not us
 - In mixed cases, keep valid surfaced requirement labels and drop invalid extras.
 - Every reviewer item ID from the original must appear in EITHER addressed_items OR remaining_items, not both.
 - If a "Required coder follow-up item IDs" block is provided above, every listed ID must appear in exactly one of addressed_items or remaining_items even if the malformed markdown omitted it.
-- Legacy markdown markers like <!-- HUMAN_REQUIREMENTS_ADDRESSED --> and a ### Human requirements section are evidence for human_requirements.addressed_ids and checked_discussion_directly only; they do not classify regular reviewer or orchestrator-injected item-N records.
+- Legacy markdown markers like <!-- HUMAN_REQUIREMENTS_ADDRESSED --> and a ### Human requirements section are evidence for human_requirements.addressed_ids and checked_discussion_directly only. The dedicated human-requirements acknowledgement and merge-conflict records do not belong in reviewer-item arrays; every other unresolved reviewer or machine-obligation ID remains classifiable when it is listed in the repair context.
 - Do NOT include human requirement labels in addressed_items or remaining_items.
 
 ## STATE RULES (Format A/B):
