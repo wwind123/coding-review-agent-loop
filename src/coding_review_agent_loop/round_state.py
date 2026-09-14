@@ -17,6 +17,8 @@ from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, encode_mapp
 from .comment_rendering import (
     EXECUTION_RECOMMENDATION_MARKER_RE,
     decode_execution_recommendation_marker,
+    RISK_TEST_MATRIX_MARKER_RE,
+    decode_risk_test_matrix_marker,
 )
 from .local_test_evidence import canonicalize_bounded_evidence
 from .protocol_markers import TrustedBody, scan_reserved_markers
@@ -45,6 +47,12 @@ from .protocol import (
     parse_structured_discuss_review,
     parse_structured_discuss_answer,
     parse_legacy_structured_discuss_answer,
+    RiskTestMatrix,
+    RiskTestMatrixChange,
+    parse_risk_test_matrix,
+    parse_risk_test_matrix_changes,
+    risk_test_matrix_identity,
+    sanitize_risk_test_matrix,
 )
 from .review_scheduling import ReviewSchedulingContract
 from .unresolved_items import _apply_unresolved_item_dispositions
@@ -153,6 +161,15 @@ class PostedRoundMetadata:
     # undecided; generation 1 is required to resume a fresh recommendation.
     execution_strategy_contract_version: int | None = None
     execution_strategy_identity: dict | None = None
+    # Generation-1 risk matrix semantic carrier. These fields are intentionally
+    # independent of rendered canonical plan prose and are matrix-channel
+    # diagnostics, not reviewer findings.
+    risk_test_matrix_contract_version: int | None = None
+    risk_test_matrix_payload: dict | None = None
+    risk_test_matrix_changes_payload: tuple[dict, ...] = ()
+    risk_test_matrix_identity: str | None = None
+    risk_test_matrix_boundary_digest: str | None = None
+    risk_test_matrix_diagnostic: str | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -209,6 +226,21 @@ class ApprovedPlanContext:
     # a record with that hash is internally conflicting (or has the wrong
     # subject).  Parent fallback is safe only in the former case.
     has_matching_candidate: bool = False
+    # Optional atomic semantic matrix channel. ``canonical_text`` is allowed
+    # to be absent when this channel is complete and verified.
+    risk_test_matrix_availability: Literal["available", "unavailable", "omitted", "not-planned"] = "not-planned"
+    risk_test_matrix_diagnostic: str | None = None
+    risk_test_matrix_contract_version: int | None = None
+    risk_test_matrix_identity: str | None = None
+    risk_test_matrix_payload: dict | None = None
+    risk_test_matrix_changes_payload: tuple[dict, ...] = ()
+    risk_test_matrix_source_locator: str | None = None
+    risk_test_matrix_boundary_digest: str | None = None
+    # Staged children receive the complete authenticated semantics for audit,
+    # but only these owner-matching rows are enforceable in their turn.
+    risk_test_matrix_enforceable_row_ids: tuple[str, ...] | None = None
+    risk_test_matrix_pending_row_ids: tuple[str, ...] = ()
+    risk_test_matrix_execution_owner: str | None = None
 
     @property
     def raw_canonical_text(self) -> str | None:
@@ -236,7 +268,81 @@ class ApprovedPlanContext:
 
     @property
     def is_available(self) -> bool:
-        return self.availability == "available" and bool(self.canonical_text)
+        return self.availability == "available" and bool(self.canonical_text or self.matrix_available)
+
+    @property
+    def matrix_available(self) -> bool:
+        return self.risk_test_matrix_availability == "available"
+
+    @property
+    def risk_test_matrix(self) -> dict | None:
+        return self.risk_test_matrix_payload
+
+    @property
+    def risk_test_matrix_expected_row_ids(self) -> tuple[str, ...] | None:
+        if not self.matrix_available or self.risk_test_matrix_payload is None:
+            return None
+        if self.risk_test_matrix_enforceable_row_ids is not None:
+            return self.risk_test_matrix_enforceable_row_ids
+        return tuple(
+            str(row["row_id"])
+            for row in self.risk_test_matrix_payload.get("rows", [])
+            if isinstance(row, dict)
+            and row.get("applicability") in {"applicable", "required"}
+        )
+
+
+def scope_approved_plan_matrix(
+    context: ApprovedPlanContext,
+    *,
+    execution_owner: str,
+    valid_stage_ids: Sequence[str] = (),
+) -> ApprovedPlanContext:
+    """Bind a staged implementation to its owned matrix rows.
+
+    The full authenticated payload remains available for read-only pending
+    context. Evidence validation uses only the owner-matching applicable IDs.
+    """
+    if not context.matrix_available or context.risk_test_matrix_payload is None:
+        return context
+    rows = context.risk_test_matrix_payload.get("rows", [])
+    if not isinstance(rows, list):
+        return context
+    # A not-applicable matrix carries no enforceable owner obligations.  Do
+    # not validate a downstream phase identifier in this case: legacy
+    # decomposition adapters may expose a positional placeholder even when a
+    # fresh recommendation has no matrix rows to assign.
+    if not any(
+        isinstance(row, dict)
+        and row.get("applicability") in {"applicable", "required"}
+        for row in rows
+    ):
+        return context
+    if execution_owner not in {"one-shot", "retained-parent", "final-integration"} and valid_stage_ids:
+        if execution_owner not in set(valid_stage_ids):
+            raise AgentLoopError(
+                f"Risk matrix execution owner `{execution_owner}` is not an approved stage ID."
+            )
+    owned = tuple(
+        str(row["row_id"])
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("execution_owner") == execution_owner
+        and row.get("applicability") in {"applicable", "required"}
+    )
+    pending = tuple(
+        str(row["row_id"])
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("row_id") not in owned
+        and row.get("applicability") in {"applicable", "required"}
+    )
+    return replace(
+        context,
+        risk_test_matrix_enforceable_row_ids=owned,
+        risk_test_matrix_pending_row_ids=pending,
+        risk_test_matrix_execution_owner=execution_owner,
+    )
 
 
 @dataclass(frozen=True)
@@ -678,6 +784,110 @@ def _deserialize_disposition(payload: object) -> ReviewItemDisposition:
     )
 
 
+def _matrix_json(value: object) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+
+
+def _decode_matrix_json(value: object, *, context: str) -> object | None:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 200_000:
+        raise ValueError(f"{context} is not a bounded JSON payload")
+    return json.loads(value)
+
+
+def _risk_test_matrix_metadata_present(metadata: PostedRoundMetadata) -> bool:
+    """Return whether metadata carries a matrix record rather than defaults.
+
+    ``risk_test_matrix_changes_payload`` defaults to an empty tuple for
+    backwards-compatible in-memory construction.  That default is not a
+    durable matrix discriminator and must not make a legacy record appear
+    matrix-bearing during recovery.
+    """
+    return any(
+        value is not None
+        for value in (
+            metadata.risk_test_matrix_contract_version,
+            metadata.risk_test_matrix_payload,
+            metadata.risk_test_matrix_identity,
+            metadata.risk_test_matrix_boundary_digest,
+        )
+    ) or bool(metadata.risk_test_matrix_changes_payload)
+
+
+def _matrix_metadata_fields(
+    payload: Mapping[str, object], *, canonical_text: str | None = None
+) -> dict[str, object]:
+    """Decode and independently authenticate the structured matrix carrier.
+
+    Matrix corruption is deliberately converted into a closed matrix channel;
+    callers can still recover an otherwise hash/subject-valid approved plan.
+    """
+    raw_version = payload.get("risk_test_matrix_contract_version")
+    raw_matrix = payload.get("risk_test_matrix_payload")
+    raw_changes = payload.get("risk_test_matrix_changes_payload")
+    raw_identity = payload.get("risk_test_matrix_identity")
+    raw_boundary = payload.get("risk_test_matrix_boundary_digest")
+    if all(value is None for value in (raw_version, raw_matrix, raw_changes, raw_identity, raw_boundary)):
+        return {}
+    try:
+        version = int(raw_version)
+        if version != 1:
+            raise ValueError("unsupported matrix contract")
+        matrix_value = _decode_matrix_json(raw_matrix, context="risk_test_matrix_payload")
+        changes_value = _decode_matrix_json(raw_changes, context="risk_test_matrix_changes_payload")
+        matrix = parse_risk_test_matrix(matrix_value, context="stored risk_test_matrix_payload")
+        changes = parse_risk_test_matrix_changes(
+            changes_value if changes_value is not None else [],
+            context="stored risk_test_matrix_changes_payload",
+        )
+        identity = risk_test_matrix_identity(matrix, changes, contract_version=version)
+        if not isinstance(raw_identity, str) or raw_identity != identity:
+            raise ValueError("matrix identity mismatch")
+        if raw_boundary != identity:
+            raise ValueError("matrix payload-bound section boundary mismatch")
+        if canonical_text and not _canonical_matrix_boundary_matches(
+            canonical_text, identity
+        ):
+            raise ValueError("canonical plan risk matrix section boundary mismatch")
+        return {
+            "risk_test_matrix_contract_version": version,
+            "risk_test_matrix_payload": matrix.to_payload(),
+            "risk_test_matrix_changes_payload": tuple(change.to_payload() for change in changes),
+            "risk_test_matrix_identity": identity,
+            "risk_test_matrix_boundary_digest": raw_boundary,
+            "risk_test_matrix_diagnostic": None,
+        }
+    except (AgentLoopError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "risk_test_matrix_contract_version": 1 if raw_version == 1 else None,
+            "risk_test_matrix_payload": None,
+            "risk_test_matrix_changes_payload": (),
+            "risk_test_matrix_identity": None,
+            "risk_test_matrix_boundary_digest": None,
+            "risk_test_matrix_diagnostic": f"Matrix unavailable: {exc}",
+        }
+
+
+def _canonical_matrix_boundary_matches(text: str, identity: str) -> bool:
+    """Authenticate the stored renderer boundary without re-rendering prose."""
+    from .round_transport import risk_test_matrix_section_boundary
+
+    if risk_test_matrix_section_boundary(identity) not in text:
+        return False
+    marker = RISK_TEST_MATRIX_MARKER_RE.search(text)
+    if marker is None:
+        return False
+    try:
+        return decode_risk_test_matrix_marker(marker.group("payload"))["identity"] == identity
+    except (AgentLoopError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
     payload = {
         "flow": metadata.flow,
@@ -751,6 +961,19 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
     }
     if any(value not in (None, (), []) for value in scheduler_values.values()):
         payload.update(scheduler_values)
+    matrix_present = _risk_test_matrix_metadata_present(metadata)
+    matrix_values = {
+        "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,
+        "risk_test_matrix_payload": _matrix_json(metadata.risk_test_matrix_payload),
+        "risk_test_matrix_changes_payload": (
+            _matrix_json(list(metadata.risk_test_matrix_changes_payload))
+            if matrix_present else None
+        ),
+        "risk_test_matrix_identity": metadata.risk_test_matrix_identity,
+        "risk_test_matrix_boundary_digest": metadata.risk_test_matrix_boundary_digest,
+    }
+    if any(value not in (None, (), []) for value in matrix_values.values()):
+        payload.update(matrix_values)
     if metadata.qualification_checkpoint is not None:
         payload["qualification_checkpoint"] = (
             metadata.qualification_checkpoint.as_dict()
@@ -811,6 +1034,14 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             execution_strategy_identity=(
                 payload.get("execution_strategy_identity")
                 if isinstance(payload.get("execution_strategy_identity"), dict) else None
+            ),
+            **_matrix_metadata_fields(
+                payload,
+                canonical_text=(
+                    str(payload["canonical_plan"])
+                    if payload.get("canonical_plan") is not None
+                    else None
+                ),
             ),
             compact_prior_summaries=tuple(
                 str(summary) for summary in payload.get("compact_prior_summaries", [])
@@ -1476,12 +1707,92 @@ def _plan_declarations(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(sections["scope"]), tuple(sections["deferred"])
 
 
+def _approved_matrix_channel(
+    *,
+    contract_version: int | None,
+    payload: object,
+    changes_payload: object,
+    identity: str | None,
+    source_locator: str | None,
+    diagnostic: str | None = None,
+    boundary_digest: str | None = None,
+    canonical_text: str | None = None,
+) -> dict[str, object]:
+    if contract_version is None and payload is None and changes_payload in (None, (), []):
+        return {
+            "risk_test_matrix_availability": "not-planned",
+            "risk_test_matrix_diagnostic": None,
+            "risk_test_matrix_contract_version": None,
+            "risk_test_matrix_identity": None,
+            "risk_test_matrix_payload": None,
+            "risk_test_matrix_changes_payload": (),
+            "risk_test_matrix_source_locator": source_locator,
+            "risk_test_matrix_boundary_digest": boundary_digest,
+        }
+    if diagnostic:
+        return {
+            "risk_test_matrix_availability": "unavailable",
+            "risk_test_matrix_diagnostic": diagnostic,
+            "risk_test_matrix_contract_version": contract_version,
+            "risk_test_matrix_identity": None,
+            "risk_test_matrix_payload": None,
+            "risk_test_matrix_changes_payload": (),
+            "risk_test_matrix_source_locator": source_locator,
+            "risk_test_matrix_boundary_digest": boundary_digest,
+        }
+    try:
+        if contract_version != 1:
+            raise ValueError("unsupported risk matrix contract version")
+        matrix = parse_risk_test_matrix(payload, context="approved risk_test_matrix")
+        changes = parse_risk_test_matrix_changes(
+            changes_payload if changes_payload is not None else (),
+            context="approved risk_test_matrix_changes",
+        )
+        actual_identity = risk_test_matrix_identity(matrix, changes, contract_version=contract_version)
+        if not identity or identity != actual_identity:
+            raise ValueError("risk matrix identity mismatch")
+        if boundary_digest != actual_identity:
+            raise ValueError("risk matrix payload-bound section boundary mismatch")
+        if canonical_text and not _canonical_matrix_boundary_matches(
+            canonical_text, actual_identity
+        ):
+            raise ValueError("canonical plan risk matrix section boundary mismatch")
+        return {
+            "risk_test_matrix_availability": "available",
+            "risk_test_matrix_diagnostic": None,
+            "risk_test_matrix_contract_version": contract_version,
+            "risk_test_matrix_identity": actual_identity,
+            "risk_test_matrix_payload": matrix.to_payload(),
+            "risk_test_matrix_changes_payload": tuple(change.to_payload() for change in changes),
+            "risk_test_matrix_source_locator": source_locator,
+            "risk_test_matrix_boundary_digest": boundary_digest,
+        }
+    except (AgentLoopError, TypeError, ValueError) as exc:
+        return {
+            "risk_test_matrix_availability": "unavailable",
+            "risk_test_matrix_diagnostic": f"Matrix unavailable: {exc}",
+            "risk_test_matrix_contract_version": contract_version,
+            "risk_test_matrix_identity": None,
+            "risk_test_matrix_payload": None,
+            "risk_test_matrix_changes_payload": (),
+            "risk_test_matrix_source_locator": source_locator,
+            "risk_test_matrix_boundary_digest": boundary_digest,
+        }
+
+
 def make_approved_plan_context(
     text: str | None,
     *,
     source_locator: str | None = None,
     expected_hash: str | None = None,
     expected_subject: str | None = None,
+    risk_test_matrix_contract_version: int | None = None,
+    risk_test_matrix_payload: object = None,
+    risk_test_matrix_changes_payload: object = None,
+    risk_test_matrix_identity: str | None = None,
+    risk_test_matrix_source_locator: str | None = None,
+    risk_test_matrix_diagnostic: str | None = None,
+    risk_test_matrix_boundary_digest: str | None = None,
 ) -> ApprovedPlanContext:
     """Build and validate a plan context from raw canonical text.
 
@@ -1489,13 +1800,66 @@ def make_approved_plan_context(
     prompt truncation.  Callers can therefore safely pass the returned context
     through compact and full prompt builders.
     """
+    matrix_fields = _approved_matrix_channel(
+        contract_version=risk_test_matrix_contract_version,
+        payload=risk_test_matrix_payload,
+        changes_payload=risk_test_matrix_changes_payload,
+        identity=risk_test_matrix_identity,
+        source_locator=risk_test_matrix_source_locator or source_locator,
+        diagnostic=risk_test_matrix_diagnostic,
+        boundary_digest=risk_test_matrix_boundary_digest,
+        canonical_text=text,
+    )
+    if (
+        matrix_fields["risk_test_matrix_availability"] == "not-planned"
+        and text
+        and not risk_test_matrix_contract_version
+    ):
+        marker = RISK_TEST_MATRIX_MARKER_RE.search(text)
+        if marker is not None:
+            try:
+                marker_payload = decode_risk_test_matrix_marker(marker.group("payload"))
+                matrix_fields = _approved_matrix_channel(
+                    contract_version=int(marker_payload["contract_version"]),
+                    # Keep the marker's validated JSON-compatible payloads
+                    # intact.  The channel parser accepts raw mappings; a
+                    # parsed RiskTestMatrixChange is intentionally not a
+                    # mapping and would make marker-only recovery fail for
+                    # the normal non-empty draft audit case.
+                    payload=marker_payload["matrix"],
+                    changes_payload=marker_payload["changes"],
+                    identity=str(marker_payload["identity"]),
+                    source_locator=risk_test_matrix_source_locator or source_locator,
+                    boundary_digest=str(marker_payload["identity"]),
+                    canonical_text=text,
+                )
+            except (AgentLoopError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                matrix_fields = _approved_matrix_channel(
+                    contract_version=1,
+                    payload=None,
+                    changes_payload=None,
+                    identity=None,
+                    source_locator=risk_test_matrix_source_locator or source_locator,
+                    diagnostic=f"Matrix unavailable: {exc}",
+                )
     if not text or not text.strip():
+        if matrix_fields["risk_test_matrix_availability"] == "available":
+            return ApprovedPlanContext(
+                plan_hash=expected_hash,
+                plan_subject=expected_subject,
+                source_locator=source_locator,
+                availability="available",
+                has_matching_candidate=True,
+                diagnostic="Canonical approved plan prose omitted; authenticated structured matrix remains available.",
+                **matrix_fields,
+            )
         return ApprovedPlanContext(
             plan_hash=expected_hash,
             plan_subject=expected_subject,
             source_locator=source_locator,
             availability="unavailable",
             diagnostic="The approved plan text is unavailable; recover the canonical plan record before reviewing.",
+            **matrix_fields,
         )
     raw = text.strip()
     actual_hash = _approved_plan_hash(raw)
@@ -1511,6 +1875,7 @@ def make_approved_plan_context(
             diagnostic=(
                 f"Recovered plan hash {actual_hash} does not match handoff hash {expected_hash}."
             ),
+            **matrix_fields,
         )
     if expected_subject is not None and actual_subject != expected_subject:
         return ApprovedPlanContext(
@@ -1523,6 +1888,7 @@ def make_approved_plan_context(
             diagnostic=(
                 f"Recovered plan subject {actual_subject} does not match handoff subject {expected_subject}."
             ),
+            **matrix_fields,
         )
     scope, deferred = _plan_declarations(raw)
     return ApprovedPlanContext(
@@ -1534,6 +1900,7 @@ def make_approved_plan_context(
         deferred_work=deferred,
         availability="available",
         has_matching_candidate=True,
+        **matrix_fields,
     )
 
 
@@ -1609,6 +1976,7 @@ def recover_approved_plan_context(
     *,
     expected_hash: str,
     expected_subject: str | None = None,
+    expected_matrix_identity: str | None = None,
 ) -> ApprovedPlanContext:
     """Recover exactly the plan selected by a durable implementation handoff."""
     records = _extract_round_metadata_records(comments, flow="plan")
@@ -1679,12 +2047,67 @@ def recover_approved_plan_context(
                 f"Multiple divergent canonical plan records match handoff hash {expected_hash}."
             ),
         )
+    matching_indices = {index for index, _raw in candidates}
+    matching_records = [record for record in records if record.index in matching_indices]
+    matrix_presence = [
+        _risk_test_matrix_metadata_present(record.metadata)
+        for record in matching_records
+    ]
+    matching_matrix_identities = {
+        record.metadata.risk_test_matrix_identity
+        for record, present in zip(matching_records, matrix_presence)
+        if present
+    }
+    matching_matrix_identity_missing = any(
+        present and record.metadata.risk_test_matrix_identity is None
+        for record, present in zip(matching_records, matrix_presence)
+    )
+    matrix_conflict = bool(matching_matrix_identities) and (
+        len(matching_matrix_identities) > 1
+        or not all(matrix_presence)
+        or matching_matrix_identity_missing
+    )
     index, raw = candidates[-1]
+    matching_record = next((record for record in reversed(records) if record.index == index), None)
+    matrix_fields: dict[str, object] = {}
+    if matching_record is not None:
+        matrix_fields = {
+            "risk_test_matrix_contract_version": matching_record.metadata.risk_test_matrix_contract_version,
+            "risk_test_matrix_payload": matching_record.metadata.risk_test_matrix_payload,
+            "risk_test_matrix_changes_payload": matching_record.metadata.risk_test_matrix_changes_payload,
+            "risk_test_matrix_identity": matching_record.metadata.risk_test_matrix_identity,
+            "risk_test_matrix_boundary_digest": matching_record.metadata.risk_test_matrix_boundary_digest,
+            "risk_test_matrix_source_locator": f"issue comment index {index}",
+            "risk_test_matrix_diagnostic": matching_record.metadata.risk_test_matrix_diagnostic,
+        }
+        if matrix_conflict:
+            # Canonical plan identity is still unambiguous. Close only the
+            # semantic matrix channel when matching records disagree; do not
+            # turn a matrix-only conflict into a whole-plan mismatch.
+            matrix_fields.update(
+                {
+                    "risk_test_matrix_diagnostic": (
+                        f"Multiple divergent risk matrix records match approved plan {expected_hash}."
+                    ),
+                    "risk_test_matrix_payload": None,
+                    "risk_test_matrix_changes_payload": (),
+                    "risk_test_matrix_identity": None,
+                    "risk_test_matrix_boundary_digest": None,
+                }
+            )
+        if expected_matrix_identity is not None and matching_record.metadata.risk_test_matrix_identity != expected_matrix_identity:
+            matrix_fields["risk_test_matrix_diagnostic"] = (
+                f"Recovered matrix identity does not match handoff identity {expected_matrix_identity}."
+            )
+            matrix_fields["risk_test_matrix_payload"] = None
+            matrix_fields["risk_test_matrix_changes_payload"] = ()
+            matrix_fields["risk_test_matrix_identity"] = None
     return make_approved_plan_context(
         raw,
         source_locator=f"issue comment index {index}",
         expected_hash=expected_hash,
         expected_subject=expected_subject,
+        **matrix_fields,
     )
 
 
@@ -1807,6 +2230,7 @@ def _resume_plan_round(
     current_plan = latest_coder_record.metadata.canonical_plan or latest_coder_record.body
     coder_output = latest_coder_record.metadata.raw_structured_coder_response or current_plan
     metadata_version = latest_coder_record.metadata.execution_strategy_contract_version
+    matrix_metadata_version = latest_coder_record.metadata.risk_test_matrix_contract_version
     if metadata_version == 1:
         # A generation-1 plan is identified by its canonical rendered text.
         # Never resume a record whose subject was computed from a different
@@ -1827,6 +2251,7 @@ def _resume_plan_round(
         body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
     )
     fresh_artifact = False
+    fresh_matrix_artifact = False
     try:
         raw_payload, _ = json.JSONDecoder().raw_decode(coder_output.lstrip())
         fresh_artifact = (
@@ -1836,11 +2261,25 @@ def _resume_plan_round(
                 or "execution_recommendation" in raw_payload
             )
         ) or "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+        fresh_matrix_artifact = (
+            isinstance(raw_payload, dict)
+            and (
+                "risk_test_matrix_contract_version" in raw_payload
+                or "risk_test_matrix" in raw_payload
+            )
+        ) or RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
     except (AttributeError, json.JSONDecodeError):
         fresh_artifact = "AGENT_EXECUTION_RECOMMENDATION" in latest_coder_record.body
+        fresh_matrix_artifact = RISK_TEST_MATRIX_MARKER_RE.search(latest_coder_record.body) is not None
     if fresh_artifact and metadata_version != 1:
         raise AgentLoopError(
             "Fresh generation-1 planning data is present but its round metadata is "
+            "missing or not generation 1; restart the planning handoff instead of "
+            "downgrading it to legacy-undecided."
+        )
+    if fresh_matrix_artifact and matrix_metadata_version != 1:
+        raise AgentLoopError(
+            "Fresh generation-1 risk matrix data is present but its round metadata is "
             "missing or not generation 1; restart the planning handoff instead of "
             "downgrading it to legacy-undecided."
         )
@@ -1860,6 +2299,7 @@ def _resume_plan_round(
                 parsed_revision = validate_structured_plan_revision(
                     coder_output,
                     require_execution_strategy_contract=1,
+                    require_risk_test_matrix_contract=(1 if matrix_metadata_version == 1 else 0),
                 )
                 if parsed_revision is None:
                     raise AgentLoopError(
@@ -1870,6 +2310,7 @@ def _resume_plan_round(
                 parsed = validate_structured_plan_state(
                     coder_output,
                     require_execution_strategy_contract=1,
+                    require_risk_test_matrix_contract=(1 if matrix_metadata_version == 1 else 0),
                 )
                 if parsed is None:
                     raise AgentLoopError(
@@ -1917,6 +2358,27 @@ def _resume_plan_round(
                     "Generation-1 planning metadata has a missing or mismatched complete "
                     "strategy/topology identity across raw response, canonical sidecar, and metadata."
                 )
+            if matrix_metadata_version == 1:
+                parsed_matrix = (
+                    parsed_revision.risk_test_matrix
+                    if response_kind == "plan_revision"
+                    else parsed.risk_test_matrix
+                )
+                parsed_changes = (
+                    parsed_revision.risk_test_matrix_changes
+                    if response_kind == "plan_revision"
+                    else parsed.risk_test_matrix_changes
+                )
+                if parsed_matrix is None or not latest_coder_record.metadata.risk_test_matrix_identity:
+                    raise AgentLoopError("Generation-1 planning metadata has no complete risk matrix identity.")
+                if risk_test_matrix_identity(parsed_matrix, parsed_changes) != latest_coder_record.metadata.risk_test_matrix_identity:
+                    raise AgentLoopError("Generation-1 planning metadata has a mismatched risk matrix identity.")
+                matrix_marker_match = RISK_TEST_MATRIX_MARKER_RE.search(current_plan)
+                if matrix_marker_match is None:
+                    raise AgentLoopError("Generation-1 planning metadata has no canonical risk matrix sidecar.")
+                matrix_marker = decode_risk_test_matrix_marker(matrix_marker_match.group("payload"))
+                if matrix_marker["identity"] != latest_coder_record.metadata.risk_test_matrix_identity:
+                    raise AgentLoopError("Generation-1 canonical risk matrix sidecar does not match metadata.")
         except (AgentLoopError, AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AgentLoopError(
                 "Generation-1 planning round metadata is missing or has a malformed "

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import base64
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -103,6 +104,14 @@ _VALID_PLAN_STATE = json.dumps({
     "summary": "Plan is ready for review.",
     "plan_steps": ["Step one"],
     "execution_strategy_contract_version": 1,
+    "risk_test_matrix_contract_version": 1,
+    "risk_test_matrix": {
+        "applicability": "not-applicable",
+        "rows": [],
+        "important_exclusions": [],
+        "not_applicable_rationale": "This helper fixture models a narrow local test harness without stateful mode transitions.",
+    },
+    "risk_test_matrix_changes": [],
     "execution_recommendation": {
         "strategy": "one-shot",
         "rationale": "The dry-run work is one coherent boundary.",
@@ -236,6 +245,33 @@ def _write_tmp(content: str, suffix: str = ".md") -> str:
         return f.name
 
 
+def _fresh_applicable_plan_state() -> str:
+    payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+    payload["risk_test_matrix"] = _fresh_applicable_plan_state_matrix()
+    return json.dumps(payload) + _VALID_PLAN_STATE[end:]
+
+
+def _fresh_applicable_plan_state_matrix() -> dict:
+    return {
+        "applicability": "applicable",
+        "rows": [{
+            "row_id": "row-skill-resume",
+            "label": "Skill resume retains the planned transition",
+            "entry_path_or_mode": "skill PR review",
+            "initial_state": "approved plan persisted before resume",
+            "event": "skill reviewer resumes",
+            "expected_outcome": "The same row remains enforceable",
+            "forbidden_side_effects": ["Do not substitute a later plan"],
+            "proposed_test_level": "helper",
+            "proposed_test_location": "tests/test_skill_helpers.py::test_matrix_parity",
+            "applicability": "applicable",
+            "related_scope_item_ids": ["scope-1"],
+            "execution_owner": "one-shot",
+        }],
+        "important_exclusions": ["Unrelated review modes."],
+    }
+
+
 class TestValidateResponse:
     def test_valid_plan_state_accepted(self) -> None:
         path = _write_tmp(_VALID_PLAN_STATE)
@@ -251,6 +287,220 @@ class TestValidateResponse:
             "--require-execution-strategy-contract",
         )
         assert "validation passed: plan_state" in result.stdout
+
+    def test_m780_10_skill_cli_schema_render_persist_and_resume_keep_matrix_semantics(
+        self, tmp_path: Path
+    ) -> None:
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+        from coding_review_agent_loop.round_state import (
+            _extract_round_metadata_records,
+            make_approved_plan_context,
+            recover_approved_plan_context,
+        )
+        from helpers.prompt_builders import build_pr_fix_prompt_for_skill
+        from helpers.validate_response import validate_response_text
+
+        raw_plan = _fresh_applicable_plan_state()
+        raw_path = tmp_path / "plan.json"
+        raw_path.write_text(raw_plan, encoding="utf-8")
+        cli_result = _run(
+            "helpers.validate_response",
+            "--file", str(raw_path),
+            "--kind", "plan_state",
+            "--require-execution-strategy-contract",
+            "--require-risk-test-matrix-contract",
+        )
+        assert "validation passed: plan_state" in cli_result.stdout
+        parsed = validate_response_text(
+            raw_plan,
+            kind="plan_state",
+            require_execution_strategy_contract=1,
+            require_risk_test_matrix_contract=1,
+        )
+        assert parsed.risk_test_matrix is not None
+        canonical = render_canonical_plan_state(parsed)
+        plan_context = make_approved_plan_context(canonical)
+        rendered_path = tmp_path / "rendered.md"
+        render_result = _run(
+            "helpers.render_response",
+            "--file", str(raw_path),
+            "--kind", "plan_state",
+            "--output", str(rendered_path),
+            "--require-execution-strategy-contract",
+            "--require-risk-test-matrix-contract",
+        )
+        assert "rendered:" in render_result.stdout
+        assert "row-skill-resume" in rendered_path.read_text(encoding="utf-8")
+
+        attached_path = tmp_path / "attached.md"
+        _run(
+            "helpers.state_manager",
+            "attach-metadata",
+            "--body-file", str(raw_path),
+            "--output", str(attached_path),
+            "--flow", "plan",
+            "--role", "coder",
+            "--agent", "Claude",
+            "--round-number", "1",
+            "--state", "blocking",
+            "--subject-plan-file", str(raw_path),
+        )
+        attached = attached_path.read_text(encoding="utf-8")
+        assert "AGENT_LOOP_META" in attached
+        records = _extract_round_metadata_records(
+            [types.SimpleNamespace(body=attached)], flow="plan"
+        )
+        assert len(records) == 1
+        recovered_metadata = records[0].metadata
+        assert recovered_metadata.risk_test_matrix_payload is not None
+        assert recovered_metadata.risk_test_matrix_identity == plan_context.risk_test_matrix_identity
+        recovered = recover_approved_plan_context(
+            [types.SimpleNamespace(body=attached)],
+            expected_hash=plan_context.plan_hash or "",
+        )
+        assert recovered.matrix_available
+        assert recovered.risk_test_matrix_payload == plan_context.risk_test_matrix_payload
+
+        fake_gh_dir = tmp_path / "fake-gh"
+        fake_gh_dir.mkdir()
+        encoded_attached = base64.b64encode(attached.encode("utf-8")).decode("ascii")
+        fake_gh = fake_gh_dir / "gh"
+        fake_gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import base64, sys\n"
+            f"body = base64.b64decode({encoded_attached!r}).decode('utf-8')\n"
+            "if sys.argv[1:2] == ['api']:\n"
+            "    print(body)\n"
+            "else:\n"
+            "    print('{}')\n",
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        resume_result = _run(
+            "helpers.state_manager",
+            "build-resume",
+            "--issue", "56",
+            "--repo", "OWNER/REPO",
+            "--reviewers", "codex",
+            "--flow", "plan",
+            env=_make_fake_gh_env(fake_gh_dir),
+        )
+        resume = json.loads(resume_result.stdout)
+        assert resume["risk_test_matrix_identity"] == plan_context.risk_test_matrix_identity
+        assert resume["risk_test_matrix_payload"] == plan_context.risk_test_matrix_payload
+
+        prompt = build_pr_fix_prompt_for_skill(
+            77,
+            [{
+                "item_id": "item-1", "reviewer": "Codex", "source_round": 1,
+                "text": "Keep the transition covered.", "status": "blocking",
+                "source_status": "blocking", "notes": [],
+            }],
+            1,
+            repo="OWNER/REPO",
+            coder="codex",
+            reviewers=["codex"],
+            workdir=str(tmp_path),
+            approved_plan_context=recovered,
+            architecture_context_enabled=False,
+        )
+        assert "row-skill-resume" in prompt
+        assert "Do not substitute a later plan" in prompt
+
+    def test_attach_metadata_rejects_visible_matrix_tampering_with_valid_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """Skill persistence must validate rendered matrix prose at the write boundary."""
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        raw_plan = _fresh_applicable_plan_state()
+        parsed = validate_structured_plan_state(
+            raw_plan,
+            require_execution_strategy_contract=1,
+            require_risk_test_matrix_contract=1,
+        )
+        canonical = render_canonical_plan_state(parsed)
+        tampered = canonical.replace(
+            "The same row remains enforceable",
+            "A different row is enforceable",
+            1,
+        )
+        assert tampered != canonical
+        assert "AGENT_RISK_TEST_MATRIX" in tampered
+
+        raw_path = tmp_path / "plan.json"
+        raw_path.write_text(raw_plan, encoding="utf-8")
+        body_path = tmp_path / "tampered.md"
+        body_path.write_text(tampered, encoding="utf-8")
+        output_path = tmp_path / "attached.md"
+
+        result = _run(
+            "helpers.state_manager",
+            "attach-metadata",
+            "--body-file", str(body_path),
+            "--output", str(output_path),
+            "--flow", "plan",
+            "--role", "coder",
+            "--agent", "Claude",
+            "--round-number", "1",
+            "--state", "blocking",
+            "--subject-plan-file", str(body_path),
+            "--canonical-plan-file", str(body_path),
+            "--raw-structured-coder-response-file", str(raw_path),
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "risk matrix section does not match" in result.stderr
+        assert not output_path.exists()
+
+    def test_attach_metadata_rejects_extra_matrix_prose_after_valid_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """A valid payload cannot authorize additional visible matrix prose."""
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        raw_plan = _fresh_applicable_plan_state()
+        parsed = validate_structured_plan_state(
+            raw_plan,
+            require_execution_strategy_contract=1,
+            require_risk_test_matrix_contract=1,
+        )
+        canonical = render_canonical_plan_state(parsed)
+        marker = "-->"
+        marker_end = canonical.index(marker, canonical.index("AGENT_RISK_TEST_MATRIX")) + len(marker)
+        tampered_body = canonical[:marker_end] + "\n\n| `injected-row` | Visible extra row |\n" + canonical[marker_end:]
+        assert "injected-row" in tampered_body
+
+        raw_path = tmp_path / "plan.json"
+        raw_path.write_text(raw_plan, encoding="utf-8")
+        body_path = tmp_path / "tampered.md"
+        body_path.write_text(tampered_body, encoding="utf-8")
+        canonical_path = tmp_path / "canonical.md"
+        canonical_path.write_text(canonical, encoding="utf-8")
+        output_path = tmp_path / "attached.md"
+
+        result = _run(
+            "helpers.state_manager",
+            "attach-metadata",
+            "--body-file", str(body_path),
+            "--output", str(output_path),
+            "--flow", "plan",
+            "--role", "coder",
+            "--agent", "Claude",
+            "--round-number", "1",
+            "--state", "blocking",
+            "--subject-plan-file", str(canonical_path),
+            "--canonical-plan-file", str(canonical_path),
+            "--raw-structured-coder-response-file", str(raw_path),
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "posted body risk matrix section does not match" in result.stderr
+        assert not output_path.exists()
 
     def test_missing_plan_state_marker_rejected(self) -> None:
         path = _write_tmp(_INVALID_PLAN_STATE)
@@ -629,6 +879,51 @@ class TestStateManager:
             assert resumed.coder_metadata.execution_strategy_identity["recommendation_sha256"]
             assert resumed.coder_metadata.canonical_plan == _plan_text
             assert resumed.coder_metadata.subject == _plan_subject(_plan_text)
+
+    def test_attach_metadata_accepts_legacy_execution_v1_matrixless_revision(
+        self, tmp_path: Path
+    ) -> None:
+        """Historical execution-v1 revisions must not be upgraded by attachment."""
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["kind"] = "plan_revision"
+        payload["prior_plan_item_dispositions"] = []
+        for field in (
+            "risk_test_matrix_contract_version",
+            "risk_test_matrix",
+            "risk_test_matrix_changes",
+        ):
+            payload.pop(field, None)
+        legacy_revision = json.dumps(payload) + _VALID_PLAN_STATE[end:]
+
+        body_file = tmp_path / "legacy-revision.json"
+        body_file.write_text(legacy_revision, encoding="utf-8")
+        output_file = tmp_path / "tagged.md"
+
+        _run(
+            "helpers.state_manager",
+            "attach-metadata",
+            "--body-file", str(body_file),
+            "--output", str(output_file),
+            "--flow", "plan",
+            "--role", "coder",
+            "--agent", "Codex",
+            "--round-number", "2",
+            "--state", "blocking",
+            "--subject-plan-file", str(body_file),
+            "--canonical-plan-file", str(body_file),
+            "--raw-structured-coder-response-file", str(body_file),
+            "--execution-strategy-contract-version", "1",
+        )
+
+        from coding_review_agent_loop.round_state import _decode_round_metadata
+
+        tagged = output_file.read_text(encoding="utf-8")
+        marker = re.search(r"AGENT_LOOP_META:\s*([A-Za-z0-9+/=_-]+)", tagged)
+        assert marker is not None
+        metadata = _decode_round_metadata(marker.group(1))
+        assert metadata.execution_strategy_contract_version == 1
+        assert metadata.risk_test_matrix_contract_version is None
+        assert metadata.risk_test_matrix_payload is None
 
     def test_host_plan_rerun_reuses_canonical_subject(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An unchanged raw host plan must resume instead of posting a new round."""
@@ -3482,6 +3777,139 @@ class TestExternalCoderRun:
             manifest = json.loads((repair_dir / "manifest.json").read_text(encoding="utf-8"))
             assert manifest["role"] == "coder"
             assert manifest["kind"] == "plan_state"
+            assert manifest["risk_test_matrix_contract_required"] is True
+
+    def test_legacy_matrixless_revision_completes_through_skill_persistence(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A resumed pre-matrix round can advance through the real skill helpers."""
+        from helpers import prompt_builders, skill_runner
+
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["kind"] = "plan_revision"
+        payload["prior_plan_item_dispositions"] = []
+        for field in (
+            "risk_test_matrix_contract_version",
+            "risk_test_matrix",
+            "risk_test_matrix_changes",
+        ):
+            payload.pop(field, None)
+        legacy_revision = json.dumps(payload) + _VALID_PLAN_STATE[end:]
+
+        monkeypatch.setattr(skill_runner, "_REPAIR_BASE", tmp_path / "repair")
+        monkeypatch.setattr(
+            skill_runner,
+            "_fetch_issue_json",
+            lambda repo, issue: {
+                "number": issue,
+                "title": "Legacy plan",
+                "body": "A historical execution-v1 plan.",
+                "url": "https://github.com/OWNER/REPO/issues/9997",
+            },
+        )
+        monkeypatch.setattr(
+            prompt_builders,
+            "_acquire_skill_architecture",
+            lambda *args, **kwargs: None,
+        )
+
+        helper_calls: list[tuple[str, ...]] = []
+        captured_prompts: list[str] = []
+        real_run_helper = skill_runner._run_helper
+
+        def fake_run_helper(*args: str, check: bool = True):
+            helper_calls.append(args)
+            if args[:1] == ("helpers.run_external",):
+                captured_prompts.append(
+                    Path(args[args.index("--prompt-file") + 1]).read_text(encoding="utf-8")
+                )
+                output = Path(args[args.index("--output") + 1])
+                output.write_text(legacy_revision, encoding="utf-8")
+                usage = Path(args[args.index("--usage-output") + 1])
+                usage.write_text("{}", encoding="utf-8")
+                return subprocess.CompletedProcess(args, 0)
+            return real_run_helper(*args, check=check)
+
+        monkeypatch.setattr(skill_runner, "_run_helper", fake_run_helper)
+        resume = {
+            "current_plan_subject": "legacy-subject",
+            "current_plan": "The historical canonical plan.",
+            "completed_round_number": 1,
+            "round_number": 1,
+            "completed_reviewer_names": ["Codex"],
+            "completed_reviewer_data": [{
+                "reviewer_name": "Codex",
+                "state": "blocking",
+                "new_items": [],
+                "dispositions": [],
+            }],
+            "prior_items": [],
+            "risk_test_matrix_contract_version": None,
+        }
+        args = types.SimpleNamespace(
+            issue=9997,
+            repo="OWNER/REPO",
+            coder="codex",
+            workdir=str(tmp_path / "checkout"),
+            gemini_cmd="gemini",
+            architecture_context_enabled=False,
+        )
+
+        result = skill_runner._run_external_coder_phase(
+            args, "codex", resume, ["codex"], None, True
+        )
+
+        assert result["is_new_round"] is True
+        assert result["new_round_number"] == 2
+        assert any(
+            call[:2] == ("helpers.state_manager", "attach-metadata")
+            for call in helper_calls
+        )
+        assert not any(
+            "--require-risk-test-matrix-contract" in call
+            or "--risk-test-matrix-contract-version" in call
+            for call in helper_calls
+        )
+        assert captured_prompts
+        assert "Historical matrix-less revision contract" in captured_prompts[0]
+        assert "risk_test_matrix_contract_version`: `1`" not in captured_prompts[0]
+        manifest = json.loads(
+            (tmp_path / "repair" / "9997-r2-codex-coder" / "manifest.json")
+            .read_text(encoding="utf-8")
+        )
+        assert manifest.get("risk_test_matrix_contract_required") is not True
+
+    def test_attach_metadata_rejects_matrix_opt_in_on_legacy_revision(
+        self, tmp_path: Path
+    ) -> None:
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["kind"] = "plan_revision"
+        payload["prior_plan_item_dispositions"] = []
+        body = json.dumps(payload) + _VALID_PLAN_STATE[end:]
+        body_file = tmp_path / "legacy-matrix-bearing-revision.json"
+        body_file.write_text(body, encoding="utf-8")
+        output_file = tmp_path / "tagged.md"
+
+        result = _run(
+            "helpers.state_manager",
+            "attach-metadata",
+            "--body-file", str(body_file),
+            "--output", str(output_file),
+            "--flow", "plan",
+            "--role", "coder",
+            "--agent", "Codex",
+            "--round-number", "2",
+            "--state", "blocking",
+            "--subject-plan-file", str(body_file),
+            "--canonical-plan-file", str(body_file),
+            "--raw-structured-coder-response-file", str(body_file),
+            "--execution-strategy-contract-version", "1",
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "cannot opt into" in result.stderr
+        assert not output_file.exists()
 
     def test_claude_coder_without_plan_file_rejected(self) -> None:
         result = _run(
@@ -3533,6 +3961,50 @@ class TestRetryValidateCoder:
             "dry_run": True,
         }
         (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return repair_dir
+
+    def _make_coder_revision_repair_dir(
+        self,
+        tmpdir: Path,
+        *,
+        matrix: dict,
+        changes: list[dict],
+        prior_changes: list[dict] | None = None,
+    ) -> Path:
+        repair_dir = tmpdir / "9997-r2-codex-coder"
+        repair_dir.mkdir(parents=True, exist_ok=True)
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["kind"] = "plan_revision"
+        payload["prior_plan_item_dispositions"] = []
+        payload["risk_test_matrix"] = matrix
+        payload["risk_test_matrix_changes"] = changes
+        (repair_dir / "raw.md").write_text(
+            json.dumps(payload) + _VALID_PLAN_STATE[end:], encoding="utf-8"
+        )
+        (repair_dir / "prior_items.json").write_text("[]", encoding="utf-8")
+        (repair_dir / "prior-canonical-plan.md").write_text(
+            "The prior canonical plan.", encoding="utf-8"
+        )
+        manifest = {
+            "role": "coder",
+            "agent": "codex",
+            "agent_cap": "Codex",
+            "flow": "plan",
+            "issue": 9997,
+            "repo": "OWNER/REPO",
+            "new_round_number": 2,
+            "kind": "plan_revision",
+            "dry_run": True,
+            "architecture_contract_version": 1,
+            "execution_strategy_contract_required": True,
+            "risk_test_matrix_contract_required": True,
+            "prior_canonical_plan_file": "prior-canonical-plan.md",
+            "prior_risk_test_matrix": _fresh_applicable_plan_state_matrix(),
+            "prior_risk_test_matrix_changes": prior_changes or [],
+        }
+        (repair_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
         return repair_dir
 
     def test_retry_validate_coder_plan_state_dry_run(self) -> None:
@@ -3636,6 +4108,123 @@ class TestRetryValidateCoder:
                 check=False,
             )
             assert result.returncode != 0
+
+    def test_retry_validate_coder_revision_rejects_unaudited_matrix_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            prior = _fresh_applicable_plan_state_matrix()
+            changed = {
+                **prior,
+                "rows": [{
+                    **prior["rows"][0],
+                    "expected_outcome": "A weakened outcome",
+                }],
+            }
+            repair_dir = self._make_coder_revision_repair_dir(
+                tmppath, matrix=changed, changes=[],
+            )
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run", env=env, check=False,
+            )
+
+            assert result.returncode != 0
+            assert "risk matrix audit failed" in result.stderr
+
+    def test_retry_validate_coder_revision_rejects_mislabeled_matrix_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            prior = _fresh_applicable_plan_state_matrix()
+            changed = {
+                **prior,
+                "rows": [{
+                    **prior["rows"][0],
+                    "expected_outcome": "A changed outcome",
+                }],
+            }
+            repair_dir = self._make_coder_revision_repair_dir(
+                tmppath,
+                matrix=changed,
+                changes=[{
+                    "operation": "add",
+                    "row_ids": ["row-skill-resume"],
+                    "rationale": "Mislabelled retained-row edit.",
+                }],
+            )
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run", env=env, check=False,
+            )
+
+            assert result.returncode != 0
+            assert "invalid transition" in result.stderr
+
+    def test_retry_validate_coder_revision_accepts_historical_audit_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            historical = {
+                "operation": "change",
+                "row_ids": ["row-skill-resume"],
+                "rationale": "Clarified the resume transition.",
+            }
+            repair_dir = self._make_coder_revision_repair_dir(
+                tmppath,
+                matrix=_fresh_applicable_plan_state_matrix(),
+                changes=[historical],
+                prior_changes=[historical],
+            )
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run", env=env, check=False,
+            )
+
+            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+            assert (repair_dir / "coder-tagged.md").exists()
+
+    def test_retry_validate_coder_revision_accepts_complete_scope_row_and_exclusion_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            _write_fake_gh(tmppath)
+            env = _make_fake_gh_env(tmppath)
+            prior = _fresh_applicable_plan_state_matrix()
+            changed = {
+                **prior,
+                "rows": [{
+                    **prior["rows"][0],
+                    "expected_outcome": "The same row remains enforceable after the exclusion edit",
+                }],
+                "important_exclusions": ["Unrelated review modes remain out of scope."],
+            }
+            repair_dir = self._make_coder_revision_repair_dir(
+                tmppath,
+                matrix=changed,
+                changes=[{
+                    "operation": "change",
+                    "row_ids": ["row-skill-resume"],
+                    "rationale": "Updated the retained transition and matrix exclusion boundary.",
+                }],
+            )
+
+            result = _run(
+                "helpers.skill_runner", "retry-validate",
+                "--repair-dir", str(repair_dir),
+                "--dry-run", env=env, check=False,
+            )
+
+            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+            assert (repair_dir / "coder-tagged.md").exists()
 
 
 # ---------------------------------------------------------------------------

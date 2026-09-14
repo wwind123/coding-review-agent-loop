@@ -79,6 +79,7 @@ from coding_review_agent_loop.protocol import (
     sanitize_architecture_impact,
     validate_structured_plan_state,
     validate_structured_plan_revision,
+    risk_test_matrix_identity,
 )
 from coding_review_agent_loop.local_test_evidence import canonicalize_bounded_evidence
 
@@ -111,6 +112,34 @@ def _canonicalize_plan_subject_source(
         # helper only canonicalizes a valid v1 subject source.
         pass
     return text
+
+
+def _resume_matrix_fields(metadata: PostedRoundMetadata | None) -> dict[str, object]:
+    """Expose the authenticated matrix carrier in a skill resume descriptor.
+
+    The skill runner separately rehydrates an approved PR plan from its
+    provenance-bound issue comments, but plan-round resumes use this descriptor
+    as their only structured transport. Keep the complete bounded payload and
+    its identities available so a skill restart does not fall back to rendered
+    table prose.
+    """
+    if metadata is None:
+        return {
+            "risk_test_matrix_contract_version": None,
+            "risk_test_matrix_payload": None,
+            "risk_test_matrix_changes_payload": [],
+            "risk_test_matrix_identity": None,
+            "risk_test_matrix_boundary_digest": None,
+            "risk_test_matrix_diagnostic": None,
+        }
+    return {
+        "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,
+        "risk_test_matrix_payload": metadata.risk_test_matrix_payload,
+        "risk_test_matrix_changes_payload": list(metadata.risk_test_matrix_changes_payload),
+        "risk_test_matrix_identity": metadata.risk_test_matrix_identity,
+        "risk_test_matrix_boundary_digest": metadata.risk_test_matrix_boundary_digest,
+        "risk_test_matrix_diagnostic": metadata.risk_test_matrix_diagnostic,
+    }
 
 
 def _session_path(repo: str, issue: int) -> Path:
@@ -212,6 +241,7 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
         "current_plan_subject": None,
         "local_test_evidence": None,
         "pending_comment_body": session.get("pending_comment_body"),
+        **_resume_matrix_fields(None),
     }
 
     try:
@@ -229,6 +259,9 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                 descriptor["current_plan"] = plan_text
                 descriptor["current_plan_subject"] = _plan_subject(plan_text)
                 descriptor["local_test_evidence"] = resumed.local_test_evidence
+                descriptor.update(
+                    _resume_matrix_fields(resumed.coder_metadata)
+                )
                 descriptor["completed_reviewer_data"] = [
                     {
                         "reviewer_name": record.metadata.agent,
@@ -278,6 +311,9 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
                 descriptor["completed_reviewer_names"] = completed_names
                 descriptor["current_plan_subject"] = head_sha
                 descriptor["local_test_evidence"] = result.local_test_evidence
+                descriptor.update(
+                    _resume_matrix_fields(result.coder_metadata)
+                )
                 descriptor["completed_reviewer_data"] = [
                     {
                         "reviewer_name": record.metadata.agent,
@@ -368,19 +404,63 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
     execution_strategy_contract_version = getattr(
         args, "execution_strategy_contract_version", None
     )
+    risk_test_matrix_contract_version_arg = getattr(
+        args, "risk_test_matrix_contract_version", None
+    )
+    if risk_test_matrix_contract_version_arg is not None and risk_test_matrix_contract_version_arg != 1:
+        print(
+            "state_manager: risk test matrix contract version must be 1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     execution_strategy_identity: dict | None = None
+    risk_test_matrix_contract_version: int | None = None
+    risk_test_matrix_payload: dict | None = None
+    risk_test_matrix_changes_payload: tuple[dict, ...] = ()
+    risk_test_matrix_identity_value: str | None = None
     parsed_strategy = None
     identity_source = raw_structured_coder_response or body
-    fresh_source = False
+    fresh_execution_source = False
+    fresh_matrix_source = False
+    source_kind: str | None = None
     try:
         source_payload, _source_end = json.JSONDecoder().raw_decode(identity_source.lstrip())
-        fresh_source = isinstance(source_payload, dict) and (
-            "execution_strategy_contract_version" in source_payload
-            or "execution_recommendation" in source_payload
-        )
+        if isinstance(source_payload, dict):
+            source_kind = source_payload.get("kind")
+            fresh_execution_source = (
+                "execution_strategy_contract_version" in source_payload
+                or "execution_recommendation" in source_payload
+            )
+            fresh_matrix_source = any(
+                name in source_payload
+                for name in (
+                    "risk_test_matrix_contract_version",
+                    "risk_test_matrix",
+                    "risk_test_matrix_changes",
+                )
+            )
     except (AttributeError, json.JSONDecodeError):
-        fresh_source = False
-    if execution_strategy_contract_version is not None or fresh_source:
+        fresh_execution_source = False
+        fresh_matrix_source = False
+        source_kind = None
+    if fresh_matrix_source and source_kind == "plan_revision" and (
+        getattr(args, "reject_unsolicited_risk_test_matrix_contract", False)
+        or risk_test_matrix_contract_version_arg != 1
+    ):
+        print(
+            "state_manager: historical matrix-less plan revisions cannot opt into "
+            "the risk test matrix contract without an explicit generation-1 gate",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    matrix_contract_requested = (
+        risk_test_matrix_contract_version_arg == 1 or fresh_matrix_source
+    )
+    if (
+        execution_strategy_contract_version is not None
+        or fresh_execution_source
+        or matrix_contract_requested
+    ):
         if execution_strategy_contract_version != 1:
             if execution_strategy_contract_version is not None:
                 print(
@@ -395,11 +475,19 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             kind = payload.get("kind") if isinstance(payload, dict) else None
             if kind == "plan_state":
                 parsed_strategy = validate_structured_plan_state(
-                    identity_source, require_execution_strategy_contract=1
+                    identity_source,
+                    require_execution_strategy_contract=1,
+                    require_risk_test_matrix_contract=(
+                        1 if matrix_contract_requested else 0
+                    ),
                 )
             elif kind == "plan_revision":
                 parsed_strategy = validate_structured_plan_revision(
-                    identity_source, require_execution_strategy_contract=1
+                    identity_source,
+                    require_execution_strategy_contract=1,
+                    require_risk_test_matrix_contract=(
+                        1 if matrix_contract_requested else 0
+                    ),
                 )
             else:
                 raise AgentLoopError(
@@ -410,6 +498,16 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
                     "fresh planning metadata requires a complete execution recommendation"
                 )
             execution_strategy_identity = parsed_strategy.execution_recommendation.identity()
+            risk_test_matrix_contract_version = parsed_strategy.risk_test_matrix_contract_version
+            if parsed_strategy.risk_test_matrix is not None:
+                risk_test_matrix_payload = parsed_strategy.risk_test_matrix.to_payload()
+                risk_test_matrix_changes_payload = tuple(
+                    change.to_payload() for change in parsed_strategy.risk_test_matrix_changes
+                )
+                risk_test_matrix_identity_value = risk_test_matrix_identity(
+                    parsed_strategy.risk_test_matrix,
+                    parsed_strategy.risk_test_matrix_changes,
+                )
             if raw_structured_coder_response is None:
                 raw_structured_coder_response = identity_source
         except (AgentLoopError, AttributeError, json.JSONDecodeError, TypeError) as exc:
@@ -533,6 +631,57 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             print(f"state_manager: cannot read architecture impact: {exc}", file=sys.stderr)
             sys.exit(1)
 
+    if risk_test_matrix_identity_value is not None:
+        from coding_review_agent_loop.comment_rendering import (
+            RISK_TEST_MATRIX_MARKER_RE,
+            decode_risk_test_matrix_marker,
+            extract_risk_test_matrix_section,
+            render_risk_test_matrix_section,
+        )
+        from coding_review_agent_loop.round_transport import risk_test_matrix_section_boundary
+
+        expected_section = render_risk_test_matrix_section(
+            parsed_strategy.risk_test_matrix,
+            parsed_strategy.risk_test_matrix_changes,
+        )
+        for label, rendered_text in (
+            ("canonical plan", canonical_plan),
+            ("posted body", body),
+        ):
+            if rendered_text is None or extract_risk_test_matrix_section(rendered_text) != expected_section:
+                print(
+                    f"state_manager: {label} risk matrix section does not match the validated structured payload",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        if canonical_plan is None or risk_test_matrix_section_boundary(
+            risk_test_matrix_identity_value
+        ) not in canonical_plan:
+            print(
+                "state_manager: canonical plan is missing the authenticated risk matrix section boundary",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        marker = RISK_TEST_MATRIX_MARKER_RE.search(canonical_plan)
+        if marker is None:
+            print(
+                "state_manager: canonical plan is missing the structured risk matrix marker",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            marker_payload = decode_risk_test_matrix_marker(marker.group("payload"))
+        except (AgentLoopError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"state_manager: canonical plan risk matrix marker is invalid: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if marker_payload.get("identity") != risk_test_matrix_identity_value:
+            print(
+                "state_manager: canonical plan risk matrix marker does not match the structured payload",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     metadata = PostedRoundMetadata(
         flow=args.flow,
         role=args.role,
@@ -561,6 +710,11 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
         ),
         execution_strategy_contract_version=execution_strategy_contract_version,
         execution_strategy_identity=execution_strategy_identity,
+        risk_test_matrix_contract_version=risk_test_matrix_contract_version,
+        risk_test_matrix_payload=risk_test_matrix_payload,
+        risk_test_matrix_changes_payload=risk_test_matrix_changes_payload,
+        risk_test_matrix_identity=risk_test_matrix_identity_value,
+        risk_test_matrix_boundary_digest=risk_test_matrix_identity_value,
     )
     augmented = _attach_round_metadata(body, metadata)
 
@@ -655,6 +809,14 @@ def main() -> None:
     p_meta.add_argument(
         "--execution-strategy-contract-version", type=int, default=None,
         help="Fresh execution-strategy contract generation carried by this record.",
+    )
+    p_meta.add_argument(
+        "--risk-test-matrix-contract-version", type=int, default=None,
+        help="Fresh risk-test-matrix contract generation carried by this record.",
+    )
+    p_meta.add_argument(
+        "--reject-unsolicited-risk-test-matrix-contract", action="store_true",
+        help="Reject matrix fields on a resumed historical matrix-less revision.",
     )
     p_meta.add_argument(
         "--execution-strategy-identity-file", default=None,

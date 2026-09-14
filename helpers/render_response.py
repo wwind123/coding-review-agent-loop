@@ -65,6 +65,11 @@ def main() -> None:
         action="store_true",
         help="Require the generation-1 execution strategy contract for plan responses.",
     )
+    parser.add_argument(
+        "--require-risk-test-matrix-contract",
+        action="store_true",
+        help="Require the generation-1 risk matrix contract for fresh plan responses.",
+    )
     args = parser.parse_args()
     model_used = args.model or None
 
@@ -76,6 +81,14 @@ def main() -> None:
 
     ctx = _load_context(args.context_file)
     prior_items = [_deserialize_unresolved_item(i) for i in ctx.get("prior_items", [])]
+    authoritative_test_observations = []
+    local_test_evidence = ctx.get("local_test_evidence")
+    if isinstance(local_test_evidence, str):
+        from coding_review_agent_loop.local_test_evidence import decode_bounded_evidence
+
+        decoded = decode_bounded_evidence(local_test_evidence)
+        if decoded is not None:
+            authoritative_test_observations = decoded.observations
 
     try:
         if args.kind == "pr_review":
@@ -99,7 +112,16 @@ def main() -> None:
                 model_used=model_used,
             )
         elif args.kind == "coder_followup":
-            parsed = validate_structured_coder_followup(text)
+            parsed = validate_structured_coder_followup(
+                text,
+                delivered_risk_test_matrix=ctx.get("risk_test_matrix"),
+                delivered_risk_test_matrix_identity=ctx.get("risk_test_matrix_identity"),
+                required_risk_test_matrix_contract=(
+                    1 if args.require_risk_test_matrix_contract else 0
+                ),
+                authoritative_test_observations=authoritative_test_observations,
+                delivered_risk_test_matrix_row_ids=ctx.get("risk_test_matrix_expected_row_ids"),
+            )
             if parsed is None:
                 print("render_response: coder_followup did not parse", file=sys.stderr)
                 sys.exit(1)
@@ -131,6 +153,11 @@ def main() -> None:
             parsed_result = _validate_issue_implementation_response(
                 text,
                 human_requirements=requirements,
+                delivered_risk_test_matrix=ctx.get("risk_test_matrix"),
+                delivered_risk_test_matrix_identity=ctx.get("risk_test_matrix_identity"),
+                require_risk_test_matrix_contract=args.require_risk_test_matrix_contract,
+                authoritative_test_observations=authoritative_test_observations,
+                delivered_risk_test_matrix_row_ids=ctx.get("risk_test_matrix_expected_row_ids"),
             )
             parsed = getattr(parsed_result, "parsed", parsed_result)
             rendered = render_public_agent_comment(
@@ -144,6 +171,9 @@ def main() -> None:
                 text,
                 require_execution_strategy_contract=(
                     1 if args.require_execution_strategy_contract else 0
+                ),
+                require_risk_test_matrix_contract=(
+                    1 if args.require_risk_test_matrix_contract else 0
                 ),
             )
             if parsed is None:
@@ -162,6 +192,9 @@ def main() -> None:
                 text,
                 require_execution_strategy_contract=(
                     1 if args.require_execution_strategy_contract else 0
+                ),
+                require_risk_test_matrix_contract=(
+                    1 if args.require_risk_test_matrix_contract else 0
                 ),
             )
             if parsed is None:

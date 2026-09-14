@@ -225,6 +225,7 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
         _b64_definition("AGENT_LOOP_SIDECAR", surfaces=_COMMENT),
         _b64_definition("AGENT_TYPED_PLAN_STAGES", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_EXECUTION_RECOMMENDATION", surfaces=_ISSUE_ONLY),
+        _b64_definition("AGENT_RISK_TEST_MATRIX", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_DEFERRED_STAGES", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_PLAN_DECOMPOSITION", surfaces=_ISSUE_ONLY),
         _b64_definition("AGENT_PLAN_EXECUTION_DECISION", surfaces=_ISSUE_ONLY),

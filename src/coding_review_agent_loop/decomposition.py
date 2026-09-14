@@ -32,7 +32,9 @@ from .protocol import (
     ExecutionCouplingConstraint,
     ExecutionScopeItem,
     ExecutionStrategyRecommendation,
+    RiskTestMatrix,
     parse_architecture_impact,
+    parse_risk_test_matrix,
     parse_execution_recommendation_payload,
     sanitize_architecture_impact,
 )
@@ -190,6 +192,7 @@ class PhaseImplementationHandoffMetadata:
     recommendation_digest: str | None = None
     stage_id: str | None = None
     plan_subject: str | None = None
+    inherited_matrix_row_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -350,6 +353,118 @@ def normalize_execution_recommendation(
         caveats=recommendation.caveats,
     )
     return decomposition, retained_scope
+
+
+def validate_risk_matrix_ownership(
+    matrix: RiskTestMatrix | dict[str, object] | None,
+    recommendation: ExecutionStrategyRecommendation,
+) -> None:
+    """Ensure every matrix owner is a real owner in the approved topology."""
+    if matrix is None:
+        return
+    parsed = matrix if isinstance(matrix, RiskTestMatrix) else parse_risk_test_matrix(matrix)
+    stage_ids = {stage.stage_id for stage in recommendation.child_stages}
+    allowed = {"one-shot", "retained-parent", "final-integration", *stage_ids}
+    unknown = sorted({row.execution_owner for row in parsed.rows} - allowed)
+    if unknown:
+        raise AgentLoopError(
+            "Risk matrix rows name execution owners absent from the approved topology: "
+            + ", ".join(unknown)
+        )
+    if recommendation.strategy == "one-shot":
+        invalid = sorted(
+            {
+                row.execution_owner
+                for row in parsed.rows
+                if row.execution_owner != "one-shot"
+            }
+        )
+        if invalid:
+            raise AgentLoopError(
+                "One-shot recommendations may assign matrix rows only to `one-shot`: "
+                + ", ".join(invalid)
+            )
+    if recommendation.strategy == "staged":
+        invalid = sorted(
+            {
+                row.execution_owner
+                for row in parsed.rows
+                if row.execution_owner == "one-shot"
+            }
+        )
+        if invalid:
+            raise AgentLoopError(
+                "Staged recommendations must assign matrix rows to a reviewed stage, "
+                "retained-parent, or final-integration owner."
+            )
+    if "retained-parent" in {row.execution_owner for row in parsed.rows} and recommendation.retained_parent_work.status == "none":
+        raise AgentLoopError(
+            "Risk matrix rows cannot be owned by retained-parent when retained parent work is not approved."
+        )
+    if "final-integration" in {row.execution_owner for row in parsed.rows} and recommendation.final_integration_work.status == "none":
+        raise AgentLoopError(
+            "Risk matrix rows cannot be owned by final-integration when final integration work is not approved."
+        )
+
+
+def risk_matrix_row_ids_for_owner(
+    matrix: RiskTestMatrix | dict[str, object] | None, owner: str
+) -> tuple[str, ...]:
+    """Return applicable parent obligations assigned to one execution owner."""
+    if matrix is None:
+        return ()
+    parsed = matrix if isinstance(matrix, RiskTestMatrix) else parse_risk_test_matrix(matrix)
+    return tuple(
+        row.row_id
+        for row in parsed.rows
+        if row.execution_owner == owner and row.applicability in {"applicable", "required"}
+    )
+
+
+def validate_separately_planned_child_matrix(
+    parent_matrix: RiskTestMatrix | dict[str, object] | None,
+    child_matrix: RiskTestMatrix | dict[str, object] | None,
+    *,
+    execution_owner: str,
+) -> tuple[str, ...]:
+    """Bind a separately approved child plan to its inherited parent rows.
+
+    A child plan may add child-local rows, but it cannot omit or weaken rows
+    allocated to this stage. The returned IDs are later used as the
+    provenance-bound discharge scope for the child turn.
+    """
+    inherited = risk_matrix_row_ids_for_owner(parent_matrix, execution_owner)
+    if not inherited:
+        return ()
+    if child_matrix is None:
+        raise AgentLoopError(
+            "Separately planned child omitted the approved parent risk matrix; "
+            "repair the child plan and link inherited row IDs before implementation."
+        )
+    parent = parent_matrix if isinstance(parent_matrix, RiskTestMatrix) else parse_risk_test_matrix(parent_matrix)
+    child = child_matrix if isinstance(child_matrix, RiskTestMatrix) else parse_risk_test_matrix(child_matrix)
+    parent_by_id = {row.row_id: row for row in parent.rows}
+    child_by_id = {row.row_id: row for row in child.rows}
+    missing = sorted(set(inherited) - set(child_by_id))
+    if missing:
+        raise AgentLoopError(
+            "Separately planned child is missing inherited parent matrix row IDs: "
+            + ", ".join(missing)
+        )
+    weakened: list[str] = []
+    for row_id in inherited:
+        expected = parent_by_id[row_id].to_payload()
+        actual = child_by_id[row_id].to_payload()
+        expected.pop("execution_owner", None)
+        actual.pop("execution_owner", None)
+        if expected != actual:
+            weakened.append(row_id)
+    if weakened:
+        raise AgentLoopError(
+            "Separately planned child changed inherited parent matrix semantics for: "
+            + ", ".join(weakened)
+        )
+    return inherited
 
 
 # Descriptive alias used by callers that want to emphasize the reviewed
@@ -583,6 +698,7 @@ def _phase_identity_marker(
     strategy: str | None = None,
     recommendation_digest: str | None = None,
     execution_strategy_contract_version: int | None = None,
+    inherited_matrix_row_ids: Sequence[str] = (),
 ) -> str:
     payload: dict[str, object] = {
         "identity": identity,
@@ -604,6 +720,8 @@ def _phase_identity_marker(
                 ),
             }
         )
+        if inherited_matrix_row_ids:
+            payload["inherited_matrix_row_ids"] = list(inherited_matrix_row_ids)
     else:
         # Historical marker shape is intentionally retained for old child
         # issues and their exact legacy lookup rules.
@@ -1099,6 +1217,7 @@ def format_phase_issue_body(
     strategy: str | None = None,
     recommendation_digest: str | None = None,
     execution_strategy_contract_version: int | None = None,
+    inherited_matrix_row_ids: Sequence[str] = (),
 ) -> str:
     parent_url = f"https://github.com/{repo}/issues/{parent_issue}"
     if phase.automation == "agent-pr":
@@ -1170,6 +1289,10 @@ def format_phase_issue_body(
             ]
         )
         body += "\n" + "\n".join(reviewed_lines)
+        if inherited_matrix_row_ids:
+            body += "\n\n## Inherited parent risk-matrix obligations\n" + "\n".join(
+                f"- {sanitize_historical_text(row_id)}" for row_id in inherited_matrix_row_ids
+            )
     if phase_identity_value is not None:
         body += "\n\n" + _phase_identity_marker(
             phase_identity_value,
@@ -1181,6 +1304,7 @@ def format_phase_issue_body(
             strategy=strategy,
             recommendation_digest=recommendation_digest,
             execution_strategy_contract_version=execution_strategy_contract_version,
+            inherited_matrix_row_ids=inherited_matrix_row_ids,
         )
     return body
 
@@ -1190,6 +1314,7 @@ def _fresh_phase_content_matches(
     *,
     parent_issue: int,
     phase: PlanPhase,
+    inherited_matrix_row_ids: Sequence[str] = (),
 ) -> bool:
     """Check the reviewed content around a fresh phase identity marker."""
     if candidate.title != _phase_issue_title(parent_issue, phase.position or 0, phase):
@@ -1226,6 +1351,13 @@ def _fresh_phase_content_matches(
         ),
         "Covered scope items: " + ", ".join(phase.covered_scope_item_ids),
     ]
+    if inherited_matrix_row_ids:
+        fragments.extend(
+            [
+                "## Inherited parent risk-matrix obligations",
+                *inherited_matrix_row_ids,
+            ]
+        )
     return all(fragment in body for fragment in fragments)
 
 
@@ -1245,6 +1377,7 @@ def create_decomposition_child_issues(
     recommendation_digest: str | None = None,
     plan_subject: str | None = None,
     preflight_only: bool = False,
+    risk_test_matrix: RiskTestMatrix | dict[str, object] | None = None,
 ) -> tuple[CreatedPhaseIssue, ...] | NeedsHumanDecision:
     """Preflight, recover, and create one immutable decomposition topology."""
     plan_hash = approved_plan_hash(approved_plan)
@@ -1259,6 +1392,11 @@ def create_decomposition_child_issues(
     recommendation_digest = recommendation_digest or decomposition.recommendation_digest
     plan_subject = plan_subject or _plan_subject_from_text(approved_plan)
     fresh = topology_source == EXECUTION_TOPOLOGY_SOURCE
+    parsed_matrix = (
+        risk_test_matrix
+        if isinstance(risk_test_matrix, RiskTestMatrix) or risk_test_matrix is None
+        else parse_risk_test_matrix(risk_test_matrix)
+    )
     if fresh and (
         strategy not in {"one-shot", "staged"}
         or execution_strategy_contract_version != EXECUTION_STRATEGY_CONTRACT_VERSION
@@ -1302,6 +1440,7 @@ def create_decomposition_child_issues(
         candidate_digest: str | None = None
         candidate_strategy: str | None = None
         candidate_contract: int | None = None
+        candidate_inherited_matrix_row_ids: tuple[str, ...] = ()
         if marker:
             payload = _decode_json_payload(marker.group("payload"), marker_name="AGENT_PLAN_PHASE_IDENTITY")
             if isinstance(payload.get("identity"), str):
@@ -1322,6 +1461,11 @@ def create_decomposition_child_issues(
                 candidate_strategy = payload["strategy"]
             if isinstance(payload.get("execution_strategy_contract_version"), int):
                 candidate_contract = payload["execution_strategy_contract_version"]
+            inherited_payload = payload.get("inherited_matrix_row_ids", [])
+            if isinstance(inherited_payload, list) and all(
+                isinstance(item, str) for item in inherited_payload
+            ):
+                candidate_inherited_matrix_row_ids = tuple(inherited_payload)
         if candidate_identity is not None and candidate_parent == parent_issue:
             recognized.add(candidate_identity)
             matched_expected = False
@@ -1341,6 +1485,10 @@ def create_decomposition_child_issues(
                             and candidate_digest == recommendation_digest
                             and candidate_strategy == strategy
                             and candidate_contract == execution_strategy_contract_version
+                            and candidate_inherited_matrix_row_ids
+                            == risk_matrix_row_ids_for_owner(
+                                parsed_matrix, expected_phase.stage_id or ""
+                            )
                         )
                     if not metadata_matches:
                         raise AgentLoopError(
@@ -1350,6 +1498,9 @@ def create_decomposition_child_issues(
                         candidate,
                         parent_issue=parent_issue,
                         phase=expected_phase,
+                        inherited_matrix_row_ids=risk_matrix_row_ids_for_owner(
+                            parsed_matrix, expected_phase.stage_id or ""
+                        ),
                     ):
                         raise AgentLoopError(
                             f"Fresh decomposition recovery content does not match phase {index}."
@@ -1429,6 +1580,10 @@ def create_decomposition_child_issues(
             strategy=strategy,
             recommendation_digest=recommendation_digest,
             execution_strategy_contract_version=execution_strategy_contract_version,
+            inherited_matrix_row_ids=(
+                risk_matrix_row_ids_for_owner(parsed_matrix, phase.stage_id or "")
+                if fresh else ()
+            ),
         )
         TrustedBody.canonical(draft, expected_tokens=("AGENT_PLAN_PHASE_IDENTITY",))
 
@@ -1529,6 +1684,10 @@ def create_decomposition_child_issues(
             strategy=strategy,
             recommendation_digest=recommendation_digest,
             execution_strategy_contract_version=execution_strategy_contract_version,
+            inherited_matrix_row_ids=(
+                risk_matrix_row_ids_for_owner(parsed_matrix, phase.stage_id or "")
+                if fresh else ()
+            ),
         )
         if "__ORCHESTRATOR_ISSUE_NUMBER__" in body:
             raise AgentLoopError(
@@ -1911,6 +2070,10 @@ def _encode_phase_implementation_handoff_metadata(
                 "recommendation_digest": metadata.recommendation_digest,
                 "stage_id": metadata.stage_id,
                 "plan_subject": metadata.plan_subject,
+                **(
+                    {"inherited_matrix_row_ids": list(metadata.inherited_matrix_row_ids)}
+                    if metadata.inherited_matrix_row_ids else {}
+                ),
             }
         )
     return _encode_json_payload(payload)
@@ -1944,11 +2107,21 @@ def _decode_phase_implementation_handoff_metadata(encoded: str) -> PhaseImplemen
             ),
             stage_id=str(payload["stage_id"]) if payload.get("stage_id") is not None else None,
             plan_subject=(str(payload["plan_subject"]) if payload.get("plan_subject") is not None else None),
+            inherited_matrix_row_ids=tuple(
+                str(item) for item in payload.get("inherited_matrix_row_ids", [])
+            ),
         )
         fresh_fields = {
             "strategy", "topology_source", "execution_strategy_contract_version",
             "recommendation_digest", "stage_id", "plan_subject",
         }
+        inherited_ids = payload.get("inherited_matrix_row_ids", [])
+        if not isinstance(inherited_ids, list) or any(
+            not isinstance(item, str) or not item.strip() for item in inherited_ids
+        ) or len(set(inherited_ids)) != len(inherited_ids):
+            raise AgentLoopError("Invalid inherited risk matrix row IDs in phase handoff.")
+        if metadata.topology_source != EXECUTION_TOPOLOGY_SOURCE and inherited_ids:
+            raise AgentLoopError("Legacy phase handoffs cannot carry fresh matrix ownership metadata.")
         if metadata.topology_source == EXECUTION_TOPOLOGY_SOURCE:
             if (
                 metadata.strategy != "staged"
@@ -2145,6 +2318,7 @@ def format_decomposition_parent_summary(
     execution_strategy_contract_version: int | None = None,
     recommendation_digest: str | None = None,
     plan_subject: str | None = None,
+    inherited_matrix_row_ids: Sequence[str] = (),
 ) -> str:
     phase_identities = tuple(
         phase_identity(
@@ -2270,6 +2444,7 @@ def format_phase_implementation_handoff_comment(
     execution_strategy_contract_version: int | None = None,
     recommendation_digest: str | None = None,
     plan_subject: str | None = None,
+    inherited_matrix_row_ids: Sequence[str] = (),
 ) -> str:
     if created.issue_number is None:
         raise AgentLoopError(
@@ -2290,6 +2465,7 @@ def format_phase_implementation_handoff_comment(
         recommendation_digest=recommendation_digest,
         stage_id=getattr(created.phase, "stage_id", None),
         plan_subject=plan_subject,
+        inherited_matrix_row_ids=tuple(inherited_matrix_row_ids),
     )
     child = created.issue_url or f"#{created.issue_number}"
     lines = [
@@ -2325,6 +2501,7 @@ def post_phase_implementation_handoff_comment(
     execution_strategy_contract_version: int | None = None,
     recommendation_digest: str | None = None,
     plan_subject: str | None = None,
+    inherited_matrix_row_ids: Sequence[str] = (),
 ) -> None:
     post_issue_comment(
         runner,
@@ -2342,6 +2519,7 @@ def post_phase_implementation_handoff_comment(
                 execution_strategy_contract_version=execution_strategy_contract_version,
                 recommendation_digest=recommendation_digest,
                 plan_subject=plan_subject,
+                inherited_matrix_row_ids=inherited_matrix_row_ids,
             ),
             expected_tokens=("AGENT_PLAN_PHASE_IMPLEMENTATION",),
         ),

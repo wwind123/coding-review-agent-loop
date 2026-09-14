@@ -98,6 +98,12 @@ def validate_response_text(
     human_requirements: list[object] | tuple[object, ...] = (),
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
+    require_risk_test_matrix_contract: int = 0,
+    reject_unsolicited_risk_test_matrix_contract: bool = False,
+    delivered_risk_test_matrix: object = None,
+    delivered_risk_test_matrix_identity: str | None = None,
+    authoritative_test_observations=None,
+    delivered_risk_test_matrix_row_ids=None,
 ) -> object:
     """Validate response text with the same context used by the helper CLI.
 
@@ -144,6 +150,7 @@ def validate_response_text(
             text,
             required_architecture_impact_contract=required_architecture_impact_contract,
             require_execution_strategy_contract=require_execution_strategy_contract,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         )
         if parsed is None:
             if required_architecture_impact_contract == 1:
@@ -185,6 +192,11 @@ def validate_response_text(
             unresolved_items=deserialized_prior,
             human_requirements=deserialized_requirements or None,
             required_architecture_impact_contract=required_architecture_impact_contract,
+            delivered_risk_test_matrix=delivered_risk_test_matrix,
+            delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
+            required_risk_test_matrix_contract=require_risk_test_matrix_contract,
+            authoritative_test_observations=authoritative_test_observations,
+            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
         )
     if kind == "issue_implementation":
         from coding_review_agent_loop.orchestrator import _validate_issue_implementation_response
@@ -193,12 +205,19 @@ def validate_response_text(
             text,
             human_requirements=deserialized_requirements,
             require_architecture_impact=(required_architecture_impact_contract == 1),
+            delivered_risk_test_matrix=delivered_risk_test_matrix,
+            delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
+            require_risk_test_matrix_contract=(require_risk_test_matrix_contract == 1),
+            authoritative_test_observations=authoritative_test_observations,
+            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
         )
 
     parsed = validate_structured_plan_revision(
         text,
         required_architecture_impact_contract=required_architecture_impact_contract,
         require_execution_strategy_contract=require_execution_strategy_contract,
+        require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+        reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
     )
     if parsed is None:
         raise AgentLoopError("Response did not parse as a structured plan_revision.")
@@ -238,6 +257,16 @@ def main() -> None:
         action="store_true",
         help="Require the fresh generation-1 planning execution recommendation.",
     )
+    parser.add_argument(
+        "--require-risk-test-matrix-contract",
+        action="store_true",
+        help="Require the fresh generation-1 risk matrix planning contract.",
+    )
+    parser.add_argument(
+        "--reject-unsolicited-risk-test-matrix-contract",
+        action="store_true",
+        help="Reject a matrix on a resumed historical matrix-less plan revision.",
+    )
     args = parser.parse_args()
 
     try:
@@ -252,6 +281,18 @@ def main() -> None:
     current_round_items = _deserialize_unresolved_items(list(ctx.get("current_round_items", [])))
     raw_human_requirements = list(ctx.get("human_requirements", []))
     human_requirements = _deserialize_human_requirements(raw_human_requirements)
+    # A matrix-bearing helper validation has no verified evidence authority
+    # unless the bounded local-evidence carrier decodes successfully.  Passing
+    # an empty sequence is intentional: it prevents a claimed `verified` row
+    # from passing on citation shape alone.
+    authoritative_test_observations = []
+    local_test_evidence = ctx.get("local_test_evidence")
+    if isinstance(local_test_evidence, str):
+        from coding_review_agent_loop.local_test_evidence import decode_bounded_evidence
+
+        decoded = decode_bounded_evidence(local_test_evidence)
+        if decoded is not None:
+            authoritative_test_observations = decoded.observations
 
     kind = args.kind
     try:
@@ -265,6 +306,16 @@ def main() -> None:
             require_execution_strategy_contract=(
                 1 if args.require_execution_strategy_contract else 0
             ),
+            require_risk_test_matrix_contract=(
+                1 if args.require_risk_test_matrix_contract else 0
+            ),
+            reject_unsolicited_risk_test_matrix_contract=(
+                args.reject_unsolicited_risk_test_matrix_contract
+            ),
+            delivered_risk_test_matrix=ctx.get("risk_test_matrix"),
+            delivered_risk_test_matrix_identity=ctx.get("risk_test_matrix_identity"),
+            authoritative_test_observations=authoritative_test_observations,
+            delivered_risk_test_matrix_row_ids=ctx.get("risk_test_matrix_expected_row_ids"),
         )
     except AgentLoopError as exc:
         print(f"validation failed: {kind}: {exc}", file=sys.stderr)

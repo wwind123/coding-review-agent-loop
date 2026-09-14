@@ -1090,6 +1090,7 @@ def _structured_coder_followup_guidance(
         "Use `addressed_item_notes` to summarize how each addressed item was resolved, and use `remaining_item_notes` to give a visible reason for each intentionally deferred remaining item.",
         "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) or when the reviewer requests a change that is mutually incompatible with a verified approved-plan decision and you have counter-evidence. For a plan conflict, `dispute_evidence` must name the conflicting approved decision, concrete counter-evidence, and why the requested change is incompatible. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`; never park a verified plan conflict in `remaining_items`, whose retry semantics would silently recycle it. Ordinary implementation defects and evidence-backed correctness, security, compatibility, or test defects must be fixed and classified as addressed or genuinely remaining, never disputed merely because the implementation followed the plan. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
         "When you use the managed `agent-loop run-tests` wrapper, cite each returned opaque receipt in `test_observations` with the exact command and claim `current-result` or `base-reproduction`. A passing subset does not supersede a broader failed suite; leave both observations visible. Unknown, stale, cross-turn, or command-disagreeing receipts are rendered as unverified.",
+        "If the approved plan delivered an applicable risk matrix, include `risk_test_matrix_evidence` with one exact row mapping per delivered row. Map rows to actual test identifiers and locations, distinguish intended workflow coverage from helper/earlier-guard coverage, assert expected outcomes and forbidden effects, and preserve missing/not-run/blocked/failed/timed-out/stale or otherwise incomplete caveats.",
         _agent_unavailable_guidance(coder_signature),
     ]
     if human_requirements_context.surfaced_requirement_ids:
@@ -1186,6 +1187,7 @@ Rules:
 - A null-PR blocker unrelated to signed requirements is valid with the empty ledger required by the rules above.
 - `tests_run` is optional and may be absent, `null`, or an empty array when no tests ran. When supplied, it contains only exact command strings; report why tests could not run in `summary`.
 - `test_observations` is optional; when supplied, each entry must contain exactly `command`, `receipt_id`, and `claim`, where `claim` is `current-result` or `base-reproduction`. Cite only receipts printed by the managed wrapper and use the exact command. A legacy or direct-shell test report remains capture-limited.
+- When the approved-plan context contains an applicable risk matrix, include `risk_test_matrix_evidence` with the exact matrix identity and exactly one mapping for every delivered row. Each mapping must name actual test identifiers and locations, state whether the intended workflow path was exercised, assert the expected outcome and forbidden effects, cite existing observations/receipts, and use an explicit status (`verified`, `missing`, `not-run`, `blocked`, `failed`, `timed-out`, `stale/unverified`, or `incomplete`). Helper-only or earlier-guard tests do not prove an orchestration row. Planned rows are not evidence, and incomplete or caveated evidence must remain visible.
 - Start directly with exactly one top-level JSON object. Put the `<!-- AGENT_STATE: blocking -->` footer immediately after it and only your standalone signature after the footer.
 
 The structured result is the public implementation record. Do not add prose,
@@ -1385,9 +1387,101 @@ def format_approved_plan_context(
         lines.extend(["", "Declared deferred work / non-goals:", *[f"- {item}" for item in plan_context.deferred_work]])
     else:
         lines.extend(["", "Declared deferred work / non-goals:", "- (none separately declared)"])
+    if plan_context.risk_test_matrix_availability == "available" and plan_context.risk_test_matrix_payload:
+        matrix = plan_context.risk_test_matrix_payload
+        lines.extend([
+            "",
+            "Risk-based mode and transition test matrix (authoritative structured semantics)",
+            f"- Contract version: {plan_context.risk_test_matrix_contract_version}",
+            f"- Matrix identity: {plan_context.risk_test_matrix_identity or '(unavailable)'}",
+        ])
+        if matrix.get("applicability") == "not-applicable":
+            lines.append(f"- Applicability: not applicable — {matrix.get('not_applicable_rationale', '')}")
+        else:
+            if plan_context.risk_test_matrix_execution_owner:
+                lines.append(
+                    "- Staged ownership: only rows owned by "
+                    f"`{plan_context.risk_test_matrix_execution_owner}` are enforceable in this turn; "
+                    "other rows are read-only pending obligations."
+                )
+            pending_ids = set(plan_context.risk_test_matrix_pending_row_ids)
+            for row in matrix.get("rows", []):
+                if not isinstance(row, dict):
+                    continue
+                ownership_note = (
+                    "[read-only pending obligation] "
+                    if row.get("row_id") in pending_ids else "[enforceable] "
+                )
+                lines.append(
+                    "- {ownership}Row {id}: {label}; path/mode={path}; initial={initial}; event={event}; "
+                    "expected={expected}; forbidden={forbidden}; test={level} @ {location}; owner={owner}".format(
+                        ownership=ownership_note,
+                        id=row.get("row_id", ""), label=row.get("label", ""),
+                        path=row.get("entry_path_or_mode", ""), initial=row.get("initial_state", ""),
+                        event=row.get("event", ""), expected=row.get("expected_outcome", ""),
+                        forbidden="; ".join(row.get("forbidden_side_effects", [])) or "none",
+                        level=row.get("proposed_test_level", ""), location=row.get("proposed_test_location", ""),
+                        owner=row.get("execution_owner", ""),
+                    )
+                )
+        exclusions = matrix.get("important_exclusions", [])
+        if exclusions:
+            lines.extend(["- Important exclusions:", *[f"  - {item}" for item in exclusions]])
+        if plan_context.risk_test_matrix_changes_payload:
+            lines.extend(["- Draft change audit:", *[
+                f"  - {item.get('operation')}: {', '.join(item.get('row_ids', []))} — {item.get('rationale')}"
+                for item in plan_context.risk_test_matrix_changes_payload if isinstance(item, dict)
+            ]])
+    elif plan_context.risk_test_matrix_availability == "unavailable":
+        lines.extend([
+            "",
+            "Risk-based mode and transition test matrix: unavailable (zero matrix rows are enforceable).",
+            f"- Matrix diagnostic: {plan_context.risk_test_matrix_diagnostic or 'structured payload could not be authenticated.'}",
+            f"- Matrix source locator: {plan_context.risk_test_matrix_source_locator or plan_context.source_locator or '(unavailable)'}",
+        ])
     if plan_context.diagnostic:
         lines.extend(["", f"Plan recovery diagnostic: {plan_context.diagnostic}"])
-    if plan_context.availability == "omitted":
+    if max_chars is not None and plan_context.matrix_available:
+        matrix_prefix = "\n".join(lines)
+        canonical_omission = (
+            "Canonical approved plan text: omitted; the authenticated structured matrix above remains "
+            "the only enforceable plan channel."
+        )
+        if plan_context.canonical_text:
+            matrix_candidate = (
+                matrix_prefix
+                + "\n\nCanonical approved plan text:\n"
+                + plan_context.canonical_text
+                + "\n"
+            )
+            # The structured matrix is the approval-critical channel. If the
+            # full prose would exceed the provider budget, omit prose first;
+            # only a matrix that cannot fit on its own is degraded.
+            matrix_only_candidate = matrix_prefix + "\n\n" + canonical_omission + "\n"
+            if len(matrix_candidate) > max_chars and len(matrix_only_candidate) <= max_chars:
+                return matrix_only_candidate
+        else:
+            matrix_candidate = (
+                matrix_prefix
+                + "\n\nCanonical approved plan text: omitted; the authenticated structured matrix above remains the only enforceable plan channel.\n"
+            )
+        if len(matrix_candidate) > max_chars:
+            # Matrix semantics are atomic.  If the complete structured channel
+            # cannot fit, expose an explicit diagnostic and zero enforceable
+            # rows while retaining the independently bound plan channel.
+            unavailable = dataclass_replace(
+                plan_context,
+                risk_test_matrix_availability="unavailable",
+                risk_test_matrix_diagnostic=(
+                    "Matrix omitted because its complete semantic payload exceeds "
+                    "the provider prompt budget; zero matrix rows are enforceable."
+                ),
+                risk_test_matrix_identity=None,
+                risk_test_matrix_payload=None,
+                risk_test_matrix_changes_payload=(),
+            )
+            return format_approved_plan_context(unavailable, max_chars=max_chars)
+    if plan_context.availability == "omitted" and not plan_context.matrix_available:
         omission = (
             "[Canonical approved plan text omitted because it exceeds the final provider prompt budget. "
             "Use the source locator to fetch and verify the exact plan before proceeding.]"
@@ -1407,6 +1501,26 @@ def format_approved_plan_context(
             "",
             "The canonical plan text is unavailable or mismatched. Do not silently substitute issue prose; request plan/handoff remediation before approving.",
             "A reviewer who finds the plan defective must identify the conflict and request a scope/plan decision; do not silently replace the agreed contract.",
+        ])
+        unavailable_text = "\n".join(lines) + "\n"
+        if max_chars is not None and len(unavailable_text) > max_chars:
+            raise AgentLoopError(
+                "Approved-plan context cannot fit the required identity and matrix "
+                f"diagnostic (minimum {len(unavailable_text)} characters; configured {max_chars})."
+            )
+        return unavailable_text
+    if plan_context.matrix_available and not plan_context.canonical_text:
+        complete = "\n".join(lines) + "\n\n" + (
+            "Canonical approved plan text: omitted; the authenticated structured matrix above remains the only enforceable plan channel."
+        ) + "\n"
+        if max_chars is not None and len(complete) > max_chars:
+            raise AgentLoopError(
+                "Approved-plan context cannot fit the authenticated matrix-only plan "
+                f"channel (minimum {len(complete)} characters; configured {max_chars})."
+            )
+        lines.extend([
+            "",
+            "Canonical approved plan text: omitted; the authenticated structured matrix above remains the only enforceable plan channel.",
         ])
         return "\n".join(lines) + "\n"
     prefix = "\n".join(lines) + "\n\nCanonical approved plan text:\n"
@@ -1454,12 +1568,14 @@ def approved_plan_reconciliation_guidance(
         )
 
     text_rendered = (
-        plan_context.is_available
+        bool(plan_context.canonical_text)
         if canonical_text_rendered is None
         else canonical_text_rendered
     )
-    if plan_context.availability == "omitted" or (
-        plan_context.availability == "available" and not text_rendered
+    if (plan_context.availability == "omitted" and not plan_context.matrix_available) or (
+        plan_context.availability == "available"
+        and not text_rendered
+        and not plan_context.matrix_available
     ):
         return (
             "Approved-plan reconciliation guidance\n\n"
@@ -1471,10 +1587,20 @@ def approved_plan_reconciliation_guidance(
             "to enforce or dispute; ordinary correctness, security, compatibility, and "
             "test defects remain reviewable. Do not invent a decision.\n"
         )
-    if plan_context.is_available and text_rendered:
+    if plan_context.is_available and (text_rendered or plan_context.matrix_available):
+        matrix_review_guidance = (
+            "When the approved context contains an applicable risk matrix, verify every delivered row against the actual workflow path and expected outcome. A helper or earlier guard is not evidence for an orchestration row; check forbidden side effects with suitable assertions, instrumentation, or shared guards, without requiring brittle line checks. Outstanding or caveated row evidence remains blocking/incomplete as appropriate, and defects outside the matrix remain reviewable.\n"
+            if plan_context.matrix_available else ""
+        )
+        canonical_note = (
+            "Canonical prose is omitted, but the independently authenticated structured matrix remains enforceable; apply the row-level guidance below.\n"
+            if not text_rendered and plan_context.matrix_available
+            else ""
+        )
         return (
             "Approved-plan reconciliation guidance\n\n"
-            "For each concern against a verified canonical plan, classify it as exactly "
+            + canonical_note
+            + "For each concern against a verified canonical plan, classify it as exactly "
             "one of these three categories:\n"
             "1. Implementation noncompliance or an ordinary defect: fix it within the "
             "approved contract and report it through the normal blocking or same-PR "
@@ -1491,6 +1617,7 @@ def approved_plan_reconciliation_guidance(
             "Plan conformance never defeats category 1 or 2, signed human instructions, "
             "the original issue authority, or safety constraints. Do not add protocol "
             "fields, call another model, or silently arbitrate incompatible requirements.\n"
+            + matrix_review_guidance
         )
 
     # Keep the existing unavailable/mismatched policy in
@@ -1518,14 +1645,27 @@ def _approved_plan_review_context_block(
     receive decision-bearing instructions for a body that was omitted.
     """
     rendered = format_approved_plan_context(plan_context, max_chars=max_chars)
-    canonical_text_rendered = bool(
+    effective_context = plan_context
+    if (
         plan_context is not None
-        and plan_context.is_available
-        and plan_context.canonical_text
-        and f"Canonical approved plan text:\n{plan_context.canonical_text}\n" in rendered
+        and plan_context.matrix_available
+        and "Risk-based mode and transition test matrix: unavailable" in rendered
+    ):
+        effective_context = dataclass_replace(
+            plan_context,
+            risk_test_matrix_availability="unavailable",
+            risk_test_matrix_identity=None,
+            risk_test_matrix_payload=None,
+            risk_test_matrix_changes_payload=(),
+        )
+    canonical_text_rendered = bool(
+        effective_context is not None
+        and effective_context.is_available
+        and effective_context.canonical_text
+        and f"Canonical approved plan text:\n{effective_context.canonical_text}\n" in rendered
     )
     return rendered + approved_plan_reconciliation_guidance(
-        plan_context,
+        effective_context,
         canonical_text_rendered=canonical_text_rendered,
     )
 
@@ -1672,12 +1812,21 @@ boundaries, and meaningful test combinations. Reject missing, duplicated,
 unknown, uncovered, or split scope IDs and any mismatch between strategy and
 conditional delivery fields. This recommendation does not select the current
 execution mode or change issue count in Stage 1.
+
+For an applicable risk-based mode/transition matrix, check meaningful
+combinations, contradictory outcomes, important exclusions, owner allocation,
+and whether each proposed test can reach the intended workflow transition.
+Helper or earlier-guard coverage is insufficient when a row names an
+orchestration transition. A narrow local change may instead provide a
+proportionate non-applicable rationale; do not demand a Cartesian product.
 """
 
 
-def _execution_strategy_contract_guidance() -> str:
+def _execution_strategy_contract_guidance(
+    *, include_risk_test_matrix_contract: bool = True
+) -> str:
     """Shared generation-1 planning contract for full and compact prompts."""
-    return """
+    execution_guidance = """
 Every newly invoked `plan_state` and `plan_revision` must include
 `execution_strategy_contract_version`: `1` and a complete
 `execution_recommendation`. Historical unversioned records are legacy-undecided
@@ -1733,10 +1882,50 @@ legacy typed categories are omitted):
   }
 }
 ```
+
+"""
+    if not include_risk_test_matrix_contract:
+        return execution_guidance + """
+Historical matrix-less revision contract:
+This revision resumes a durable planning round that predates the risk-based
+matrix generation gate. Do not add `risk_test_matrix_contract_version`,
+`risk_test_matrix`, or `risk_test_matrix_changes`; preserve their absence.
+Only an explicitly fresh generation-1 planning lifecycle may introduce those
+fields, and the validator rejects an unsolicited matrix here.
+"""
+    return execution_guidance + """
+Risk-based mode and transition matrix contract:
+For work involving multiple execution modes, lifecycle states, persistence or
+restart, authorization boundaries, or recovery/failure paths, also include
+`risk_test_matrix_contract_version`: `1`, `risk_test_matrix`, and
+`risk_test_matrix_changes`. The matrix must be bounded and must be either an
+`applicable` object with meaningful rows or a `not-applicable` object with a
+non-empty proportionate rationale. Each applicable row has a stable matrix-only
+`row_id`, label, entry path/mode, initial state, event, expected outcome,
+forbidden side effects, proposed test level/location, applicability, related
+scope-item IDs, and exactly one execution owner. Row `applicability` is
+`applicable`, `required`, or `not-applicable`; row-level `not-applicable`
+scenarios are excluded from coder evidence obligations. Include important
+exclusions.
+Do not use reviewer finding IDs such as `reviewer-id` for matrix rows. Planned tests
+are proposals, not evidence that tests exist or pass. Before approval, make
+corrections visible in `risk_test_matrix_changes` with add/change/retire/split/
+merge operations and rationales; after approval, substantive changes require
+the normal newly reviewed plan workflow. Narrow local changes may use the
+non-empty not-applicable rationale.
+
+On a plan revision, `risk_test_matrix_changes` is the audit for the current
+revision only: describe exactly the semantic diff from the immediately prior
+matrix and use an empty list when the matrix is unchanged. Do not copy the
+prior revision's audit entries into a new unchanged revision. Exact historical
+entries that are repeated from the prior canonical matrix are tolerated for
+resume compatibility, but they do not count as coverage for a new change.
 """
 
 
-def _plan_revision_schema_and_rules() -> str:
+def _plan_revision_schema_and_rules(
+    *, include_risk_test_matrix_contract: bool = True
+) -> str:
     return """Plan revision response protocol
 
 Revise the plan item by item instead of replying only with free-form prose. If
@@ -1811,7 +2000,9 @@ after the JSON object and before the `AGENT_PLAN_STATE` footer. Otherwise, put
 the `AGENT_PLAN_STATE` footer immediately after the JSON. Make the footer state
 match the JSON state, and include only your standalone signature after the
 footer.
-""" + "\n" + _execution_strategy_contract_guidance()
+""" + "\n" + _execution_strategy_contract_guidance(
+    include_risk_test_matrix_contract=include_risk_test_matrix_contract
+)
 
 
 def _compact_plan_stable_prefix(
@@ -2451,6 +2642,7 @@ def build_plan_revision_prompt(
     compact_prior: CompactPriorContext | None = None,
     compact_tail: CompactPlanTailContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    require_risk_test_matrix_contract: bool = True,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2465,6 +2657,7 @@ def build_plan_revision_prompt(
             unresolved_items=unresolved_items,
             compact_prior=compact_prior,
             compact_tail=compact_tail,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2520,7 +2713,9 @@ current-round refinements.
 
 Use this mandatory structured JSON response format:
 
-{_execution_strategy_contract_guidance()}
+{_execution_strategy_contract_guidance(
+    include_risk_test_matrix_contract=require_risk_test_matrix_contract
+)}
 
 {{
   "schema_version": 1,
@@ -2590,6 +2785,7 @@ def _build_compact_plan_revision_prompt(
     unresolved_items: Sequence[UnresolvedReviewItem],
     compact_prior: CompactPriorContext | None,
     compact_tail: CompactPlanTailContext | None,
+    require_risk_test_matrix_contract: bool,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2619,7 +2815,9 @@ def _build_compact_plan_revision_prompt(
         architecture_context=_architecture_context_block(
             config, protected_context=(human_requirements_context.block, previous_plan)
         ),
-        response_protocol=_plan_revision_schema_and_rules(),
+        response_protocol=_plan_revision_schema_and_rules(
+            include_risk_test_matrix_contract=require_risk_test_matrix_contract
+        ),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
     action = (

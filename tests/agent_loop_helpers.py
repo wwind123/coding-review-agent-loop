@@ -1484,6 +1484,14 @@ def structured_v1_plan_state(
         "summary": "Fresh execution strategy plan.",
         "plan_steps": ["Implement the reviewed scope."],
         "execution_strategy_contract_version": 1,
+        "risk_test_matrix_contract_version": 1,
+        "risk_test_matrix": {
+            "applicability": "not-applicable",
+            "rows": [],
+            "important_exclusions": [],
+            "not_applicable_rationale": "The fixture has no multi-mode or state-transition surface.",
+        },
+        "risk_test_matrix_changes": [],
         "execution_recommendation": {
             "strategy": "one-shot",
             "rationale": "The reviewed scope is one coherent delivery.",

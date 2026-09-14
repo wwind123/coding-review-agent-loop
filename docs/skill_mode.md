@@ -41,6 +41,27 @@ recover a complete v1 source before applying format-only correction. The
 `auto` policy is not a supported interactive skill-mode surface for #787; the
 existing explicit skill helpers remain unchanged.
 
+Skill planning uses the same bounded risk-matrix contract as the headless CLI.
+Fresh plan-state and plan-revision validation gates require the generation-1
+matrix fields alongside the execution-strategy fields. The skill carries the
+authenticated structured payload through implementation and PR-fix turns;
+verified row evidence must cite an authoritative test receipt, while failed,
+timed-out, stale, and incomplete observations remain caveats. Row-level
+`not-applicable` scenarios are excluded from evidence obligations, and a
+matrix-wide not-applicable plan requires a non-empty rationale. Legacy
+unversioned records remain resumable without invented matrix rows.
+For stateful or multi-mode work, a fresh plan can require generation 1 with
+applicable rows or a proportionate not-applicable rationale. The structured
+payload is carried in round metadata and sidecars, while the rendered matrix is
+only a projection; renderer drift does not replace or invalidate authenticated
+matrix semantics. Coder and PR-review prompts receive the semantic rows first,
+and implementation/follow-up evidence must map each delivered row to the
+intended workflow test, preserving incomplete and receipt caveats. Historical
+plans without a matrix remain compatible. Use
+`helpers.validate_response` or `helpers.render_response` with
+`--require-risk-test-matrix-contract` when explicitly checking a fresh matrix
+contract.
+
 ### Containment and test gates
 
 External skill agents and the skill-mode test gate use the same shared

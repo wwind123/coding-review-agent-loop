@@ -15,6 +15,7 @@ from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop, run_pr_
 from coding_review_agent_loop.comment_rendering import (
     _render_public_coder_followup_comment,
     _render_public_pr_review_comment,
+    render_risk_test_matrix_section,
 )
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.followups import (
@@ -80,6 +81,8 @@ from coding_review_agent_loop.protocol import (
     parse_pr_review,
     parse_review,
     parse_unresolved_item_dispositions,
+    parse_risk_test_matrix,
+    risk_test_matrix_identity,
     validate_structured_issue_implementation,
     validate_structured_coder_followup,
 )
@@ -1745,6 +1748,90 @@ def test_direct_pr_keeps_linked_issue_context_for_coder_followup(tmp_path):
     assert "Linked issue body" in followup_prompt
 
 
+def test_m780_09_review_only_recovery_row_survives_coder_handoff_and_pr_reresume(tmp_path):
+    matrix = parse_risk_test_matrix({
+        "applicability": "applicable",
+        "rows": [{
+            "row_id": "row-post-review-recovery",
+            "label": "Post-review recovery reaches the intended orchestration branch",
+            "entry_path_or_mode": "ordinary / review-only",
+            "initial_state": "review approval recorded, repaired head pending",
+            "event": "repaired head passes",
+            "expected_outcome": "Re-enter qualification and complete without a watcher",
+            "forbidden_side_effects": ["Do not merge until the repaired head is qualified"],
+            "proposed_test_level": "orchestrator",
+            "proposed_test_location": "tests/test_orchestrator_pr.py::test_post_review_recovery",
+            "applicability": "applicable",
+            "related_scope_item_ids": ["scope-recovery"],
+            "execution_owner": "one-shot",
+        }],
+        "important_exclusions": ["Helper-only guard tests do not discharge this row."],
+    })
+    identity = risk_test_matrix_identity(matrix)
+    canonical_plan = "Approved recovery plan.\n\n" + render_risk_test_matrix_section(matrix)
+    plan_context = orchestrator.make_approved_plan_context(
+        canonical_plan,
+        source_locator="test approved recovery plan",
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    coder_output = structured_coder_followup(
+        addressed_items=["item-1"],
+        summary="The implementation was repaired; the orchestration row remains unverified.",
+    )
+    coder_payload, coder_end = json.JSONDecoder().raw_decode(coder_output.lstrip())
+    coder_payload["risk_test_matrix_evidence"] = {
+        "matrix_identity": identity,
+        "rows": [{
+            "row_id": "row-post-review-recovery",
+            "status": "missing",
+            "test_identifiers": [],
+            "test_locations": [],
+            "workflow_path_claim": "The intended post-review recovery branch was not exercised by this handoff.",
+            "outcome_assertions": [],
+            "forbidden_effect_assertions": [],
+            "evidence_citations": [],
+            "caveats": ["No orchestration receipt was available."],
+        }],
+    }
+    coder_output = json.dumps(coder_payload) + coder_output.lstrip()[coder_end:]
+    runner = FakeRunner(
+        claude_outputs=[coder_output],
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                blocking_items=["Exercise the post-review recovery orchestration path."],
+            ),
+            structured_pr_review(
+                prior_item_dispositions=[{
+                    "item_id": "item-1",
+                    "disposition": "resolved",
+                }],
+            ),
+        ],
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=config,
+        approved_plan_context=plan_context,
+    ) == 0
+
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    reviewer_prompts = [
+        cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]
+    ]
+    assert "row-post-review-recovery" in coder_prompt
+    assert len(reviewer_prompts) == 2
+    assert all("row-post-review-recovery" in prompt for prompt in reviewer_prompts)
+    assert any("No orchestration receipt was available." in comment for comment in runner.comments)
+
+
 @pytest.mark.parametrize(
     "body, issue_views",
     [
@@ -1816,8 +1903,54 @@ def test_direct_pr_ignores_unrelated_older_issue_handoff(tmp_path):
 
 
 def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_path):
-    old_plan = "Approved old plan.\n\n### Scope\n- Preserve the old API."
-    later_plan = "Unrelated later plan.\n\n### Scope\n- Replace the old API."
+    old_matrix = parse_risk_test_matrix({
+        "applicability": "applicable",
+        "rows": [{
+            "row_id": "row-review-only-recovery",
+            "label": "Review-only recovery reaches the intended branch",
+            "entry_path_or_mode": "ordinary / review-only",
+            "initial_state": "review complete, recovery pending",
+            "event": "repaired head passes",
+            "expected_outcome": "Complete without requiring a watcher",
+            "forbidden_side_effects": ["Do not merge a stale head"],
+            "proposed_test_level": "orchestrator",
+            "proposed_test_location": "tests/test_orchestrator_pr.py::test_review_only_recovery",
+            "applicability": "applicable",
+            "related_scope_item_ids": ["scope-review-recovery"],
+            "execution_owner": "one-shot",
+        }],
+        "important_exclusions": ["Unrelated managed-CI combinations."],
+    })
+    later_matrix = parse_risk_test_matrix({
+        **old_matrix.to_payload(),
+        "rows": [{
+            **old_matrix.rows[0].to_payload(),
+            "row_id": "row-unrelated-later-plan",
+            "expected_outcome": "Use a watcher before completion",
+        }],
+    })
+    old_identity = risk_test_matrix_identity(old_matrix)
+    later_identity = risk_test_matrix_identity(later_matrix)
+    old_plan = "Preserve the old API.\n\nApproved old plan.\n\n" + render_risk_test_matrix_section(old_matrix)
+    later_plan = "Replace the old API.\n\nUnrelated later plan.\n\n" + render_risk_test_matrix_section(later_matrix)
+    old_context = orchestrator.make_approved_plan_context(
+        old_plan,
+        source_locator="test old approved plan",
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=old_matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=old_identity,
+        risk_test_matrix_boundary_digest=old_identity,
+    )
+    later_context = orchestrator.make_approved_plan_context(
+        later_plan,
+        source_locator="test later plan",
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=later_matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=later_identity,
+        risk_test_matrix_boundary_digest=later_identity,
+    )
     old_plan_comment = _attach_round_metadata(
         old_plan,
         PostedRoundMetadata(
@@ -1825,9 +1958,13 @@ def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_pat
             role="coder",
             agent="Claude",
             round_number=1,
-            subject="old-plan",
+            subject=old_context.plan_subject or "old-plan",
             canonical_plan=old_plan,
             raw_structured_coder_response=old_plan,
+            risk_test_matrix_contract_version=1,
+            risk_test_matrix_payload=old_matrix.to_payload(),
+            risk_test_matrix_identity=old_identity,
+            risk_test_matrix_boundary_digest=old_identity,
         ),
     )
     later_plan_comment = _attach_round_metadata(
@@ -1837,9 +1974,13 @@ def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_pat
             role="coder",
             agent="Claude",
             round_number=2,
-            subject="later-plan",
+            subject=later_context.plan_subject or "later-plan",
             canonical_plan=later_plan,
             raw_structured_coder_response=later_plan,
+            risk_test_matrix_contract_version=1,
+            risk_test_matrix_payload=later_matrix.to_payload(),
+            risk_test_matrix_identity=later_identity,
+            risk_test_matrix_boundary_digest=later_identity,
         ),
     )
     handoff = format_issue_pr_handoff_comment(
@@ -1873,6 +2014,8 @@ def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_pat
     )[0]
     assert "Preserve the old API." in plan_block
     assert "Replace the old API." not in plan_block
+    assert "row-review-only-recovery" in plan_block
+    assert "row-unrelated-later-plan" not in plan_block
 
 
 def test_pr_loop_runs_tests_and_merge_only_after_codex_approval(tmp_path):

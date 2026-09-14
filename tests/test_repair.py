@@ -9,6 +9,7 @@ from coding_review_agent_loop.repair import (
     attempt_repair,
     execute_repair,
     require_recoverable_fresh_execution_contract,
+    require_recoverable_fresh_risk_test_matrix_contract,
 )
 from coding_review_agent_loop.errors import FreshContractIntegrityError
 from coding_review_agent_loop.protocol import (
@@ -66,6 +67,37 @@ def test_fresh_contract_guard_requires_mechanically_recoverable_source():
     with pytest.raises(FreshContractIntegrityError, match="new planner turn"):
         require_recoverable_fresh_execution_contract(
             "leading prose before the JSON", expected_kind="plan_state"
+        )
+
+
+@pytest.mark.parametrize("missing", ["risk_test_matrix_contract_version", "risk_test_matrix", "risk_test_matrix_changes"])
+def test_fresh_matrix_contract_guard_rejects_absent_or_partial_source(missing):
+    raw = structured_v1_plan_state()
+    payload, end = json.JSONDecoder().raw_decode(raw.lstrip())
+    payload.pop(missing)
+    partial = json.dumps(payload) + raw.lstrip()[end:]
+    with pytest.raises(FreshContractIntegrityError, match="new planner turn"):
+        require_recoverable_fresh_risk_test_matrix_contract(
+            partial, expected_kind="plan_state"
+        )
+
+
+def test_skill_fresh_matrix_guard_runs_before_model_repair():
+    from helpers.skill_runner import _recover_structured_response
+
+    raw = structured_v1_plan_state()
+    payload, end = json.JSONDecoder().raw_decode(raw.lstrip())
+    payload.pop("risk_test_matrix")
+    partial = json.dumps(payload) + raw.lstrip()[end:]
+    with pytest.raises(FreshContractIntegrityError, match="new planner turn"):
+        _recover_structured_response(
+            partial,
+            expected_kind="plan_state",
+            validate=lambda text: validate_structured_plan_state(
+                text, require_execution_strategy_contract=1
+            ),
+            require_execution_strategy_contract=True,
+            require_risk_test_matrix_contract=True,
         )
 
 

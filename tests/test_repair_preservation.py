@@ -173,6 +173,40 @@ def test_prompt_demands_lossless_repair_and_separate_ledgers():
     assert "Preserve a source `disputed_items` classification" in prompt
 
 
+def test_repair_preserves_matrix_evidence_status_and_caveats():
+    source = {
+        "schema_version": 1,
+        "kind": "coder_followup",
+        "state": "blocking",
+        "summary": "The owned workflow row remains incomplete.",
+        "addressed_items": [],
+        "remaining_items": ["item-1"],
+        "disputed_items": [],
+        "risk_test_matrix_evidence": {
+            "matrix_identity": "a" * 64,
+            "rows": [{
+                "row_id": "row-recovery",
+                "status": "timed-out",
+                "test_identifiers": ["test_recovery"],
+                "test_locations": ["tests/test_orchestrator_pr.py:1"],
+                "workflow_path_claim": "The post-review recovery path was not reached.",
+                "outcome_assertions": ["The gate timed out."],
+                "forbidden_effect_assertions": ["No merge occurred."],
+                "evidence_citations": [{
+                    "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
+                    "receipt_id": "receipt-timeout", "claim": "current-result",
+                }],
+                "caveats": ["managed test gate timed out before branch entry"],
+            }],
+        },
+    }
+    check(source, deepcopy(source))
+    changed = deepcopy(source)
+    changed["risk_test_matrix_evidence"]["rows"][0]["status"] = "verified"
+    with pytest.raises(AgentLoopError, match="risk_test_matrix_evidence"):
+        check(source, changed)
+
+
 def test_repair_preserves_architecture_impact_fields():
     source = {
         "kind": "task_result",

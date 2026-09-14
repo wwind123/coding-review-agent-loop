@@ -42,6 +42,28 @@ typed stages remain legacy-undecided. A bounded repair can only reformat a
 complete recoverable v1 source; missing or partial strategy data requires a new
 planner turn.
 
+### Risk-based mode and transition matrices
+
+For planning work involving multiple modes, lifecycle transitions,
+persistence/restart, authorization, or recovery/failure paths, the generation-1
+planning contract can require a bounded structured matrix. Applicable rows use
+stable matrix-local IDs and record the entry path or mode, initial state, event,
+expected outcome, forbidden side effects, proposed test level/location, related
+scope IDs, and one execution owner. The planner also records important
+exclusions. Narrow local work may provide a non-empty not-applicable rationale
+instead of rows; the matrix is not a mandatory Cartesian product.
+
+The matrix is a review aid until implementation evidence maps each delivered row
+to an actual workflow test and existing receipt. Evidence keeps missing,
+not-run, failed, timed-out, stale/unverified, and helper-only or earlier-guard
+caveats visible. The structured payload and its identity are authoritative in
+round metadata and the bounded sidecar; rendered tables are derived output.
+Recovery tolerates renderer wording changes, while payload corruption or a
+matrix-only rendering/hydration problem reports zero enforceable matrix rows
+without invalidating an otherwise verified plan hash and subject. Legacy records
+without a matrix remain resumable without fabrication. Both CLI and skill-mode
+helpers accept `--require-risk-test-matrix-contract` for fresh contract checks.
+
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
 ### Machine obligations and resumable qualification
