@@ -265,6 +265,53 @@ def test_matrix_level_draft_changes_cannot_hide_behind_one_row_operation() -> No
     )
 
 
+def test_matrix_level_change_also_audits_a_retained_row_change() -> None:
+    previous = _matrix()
+    current = {
+        **previous,
+        "rows": [{**_row(), "expected_outcome": "A revised outcome"}],
+        "important_exclusions": ["The revised exclusion boundary."],
+    }
+
+    parsed = validate_risk_test_matrix_revision(
+        previous,
+        current,
+        [{
+            "operation": "change",
+            "row_ids": ["row-ordinary"],
+            "rationale": "Clarified the retained transition and its matrix exclusion.",
+        }],
+    )
+
+    assert parsed[0].row_ids == ("row-ordinary",)
+
+
+def test_matrix_level_change_audits_every_retained_row_changed_with_matrix_fields() -> None:
+    previous = {
+        **_matrix(),
+        "rows": [_row("row-one"), _row("row-two"), _row("row-three")],
+    }
+    current = {
+        **previous,
+        "rows": [
+            {**_row("row-one"), "expected_outcome": "Outcome one revised."},
+            {**_row("row-two"), "expected_outcome": "Outcome two revised."},
+            {**_row("row-three"), "expected_outcome": "Outcome three revised."},
+        ],
+        "important_exclusions": ["The complete-scope exclusion was revised."],
+    }
+
+    validate_risk_test_matrix_revision(
+        previous,
+        current,
+        [{
+            "operation": "change",
+            "row_ids": ["row-one", "row-two", "row-three"],
+            "rationale": "Updated every retained row and the matrix exclusions together.",
+        }],
+    )
+
+
 def test_non_prefixed_stage_id_is_a_valid_parser_owner_but_topology_membership_is_checked() -> None:
     matrix = parse_risk_test_matrix({**_matrix(), "rows": [{**_row(), "execution_owner": "api"}]})
     recommendation = {

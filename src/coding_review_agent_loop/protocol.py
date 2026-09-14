@@ -1115,8 +1115,11 @@ def validate_risk_test_matrix_revision(
     # A matrix-level operation is a separate audit subject from row
     # transitions. Keep the complete-scope representation and its established
     # change/split/merge operation allowance for compatibility with existing
-    # rendered audits, but do not let it discharge a row add, change, retire,
-    # split, or merge on its own.
+    # rendered audits. A complete-scope ``change`` also describes retained-row
+    # changes when the row set itself is unchanged; otherwise a draft that
+    # edits one or more rows while changing a matrix-level field would have no
+    # expressible audit operation. Structural row transitions still require
+    # their own add/retire/split/merge operations.
     matrix_scope = (old_ids | new_ids) or {"matrix"}
     for change in current_changes:
         if len(set(change.row_ids)) != len(change.row_ids):
@@ -1146,12 +1149,15 @@ def validate_risk_test_matrix_revision(
     # set. A retained ID is valid for a split/merge only when its row payload
     # actually changed.
     covered: set[str] = set()
+    matrix_transition_covered: set[str] = set()
     seen_subjects: set[str] = set()
     for index, change in enumerate(current_changes):
         if index in matrix_change_indexes:
+            if change.operation == "change" and not added_ids and not retired_ids:
+                matrix_transition_covered.update(retained_changed_ids)
             continue
         subject = set(change.row_ids)
-        overlap = sorted(subject & seen_subjects)
+        overlap = sorted(subject & (seen_subjects | matrix_transition_covered))
         if overlap:
             raise AgentLoopError(
                 "Risk matrix audit operations overlap on row IDs: " + ", ".join(overlap)
@@ -1213,6 +1219,7 @@ def validate_risk_test_matrix_revision(
         seen_subjects.update(subject)
         covered.update(subject)
 
+    covered.update(matrix_transition_covered)
     missing = sorted(changed_ids - covered)
     if missing:
         raise AgentLoopError("Risk matrix changes omit audit operations for: " + ", ".join(missing))
