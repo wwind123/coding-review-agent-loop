@@ -4238,7 +4238,12 @@ def _normalize_approval_gated_managed_ci_review(
     qualification. Reviewers still disposition the durable machine record,
     but a blocking disposition against that wait is not a code finding.
     """
-    if parsed_review.state != "blocking" or pr_checks.state not in {"passing", "no_checks"}:
+    if parsed_review.state != "blocking" or pr_checks.state not in {
+        "passing",
+        "no_checks",
+        "pending",
+        "unavailable",
+    }:
         return parsed_review
     if parsed_review.blocking_items or parsed_review.followups.same_pr:
         return parsed_review
@@ -4259,6 +4264,7 @@ def _normalize_approval_gated_managed_ci_review(
             and item.is_machine_obligation
             and item.obligation_kind == "managed-exact-head-ci"
             and item.lifecycle == "awaiting_current_head_review"
+            and bool(item.candidate_head_sha)
             and item.candidate_head_sha == current_head_sha
             and item.failed_head_sha != current_head_sha
         ):
@@ -12124,6 +12130,10 @@ def run_pr_loop(
                     parsed_review = dataclasses_replace(parsed_review, state="approved", blocking_items=())
                     review_state = parsed_review.state
 
+                # Intentionally include resumed records: their durable blocking
+                # state can represent only the approval-gated managed-CI wait.
+                # Normalizing that state in memory lets settlement continue to
+                # qualification without re-posting a duplicate reviewer comment.
                 if review_state == "blocking":
                     if reviewer_pr_checks is None:
                         reviewer_pr_checks = get_pr_checks(
