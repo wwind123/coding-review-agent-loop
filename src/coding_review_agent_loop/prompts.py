@@ -1822,7 +1822,9 @@ proportionate non-applicable rationale; do not demand a Cartesian product.
 """
 
 
-def _execution_strategy_contract_guidance() -> str:
+def _execution_strategy_contract_guidance(
+    *, include_risk_test_matrix_contract: bool = True
+) -> str:
     """Shared generation-1 planning contract for full and compact prompts."""
     return """
 Every newly invoked `plan_state` and `plan_revision` must include
@@ -1907,10 +1909,19 @@ matrix and use an empty list when the matrix is unchanged. Do not copy the
 prior revision's audit entries into a new unchanged revision. Exact historical
 entries that are repeated from the prior canonical matrix are tolerated for
 resume compatibility, but they do not count as coverage for a new change.
+""" if include_risk_test_matrix_contract else """
+Historical matrix-less revision contract:
+This revision resumes a durable planning round that predates the risk-based
+matrix generation gate. Do not add `risk_test_matrix_contract_version`,
+`risk_test_matrix`, or `risk_test_matrix_changes`; preserve their absence.
+Only an explicitly fresh generation-1 planning lifecycle may introduce those
+fields, and the validator rejects an unsolicited matrix here.
 """
 
 
-def _plan_revision_schema_and_rules() -> str:
+def _plan_revision_schema_and_rules(
+    *, include_risk_test_matrix_contract: bool = True
+) -> str:
     return """Plan revision response protocol
 
 Revise the plan item by item instead of replying only with free-form prose. If
@@ -1985,7 +1996,9 @@ after the JSON object and before the `AGENT_PLAN_STATE` footer. Otherwise, put
 the `AGENT_PLAN_STATE` footer immediately after the JSON. Make the footer state
 match the JSON state, and include only your standalone signature after the
 footer.
-""" + "\n" + _execution_strategy_contract_guidance()
+""" + "\n" + _execution_strategy_contract_guidance(
+    include_risk_test_matrix_contract=include_risk_test_matrix_contract
+)
 
 
 def _compact_plan_stable_prefix(
@@ -2625,6 +2638,7 @@ def build_plan_revision_prompt(
     compact_prior: CompactPriorContext | None = None,
     compact_tail: CompactPlanTailContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    require_risk_test_matrix_contract: bool = True,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2639,6 +2653,7 @@ def build_plan_revision_prompt(
             unresolved_items=unresolved_items,
             compact_prior=compact_prior,
             compact_tail=compact_tail,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2694,7 +2709,9 @@ current-round refinements.
 
 Use this mandatory structured JSON response format:
 
-{_execution_strategy_contract_guidance()}
+{_execution_strategy_contract_guidance(
+    include_risk_test_matrix_contract=require_risk_test_matrix_contract
+)}
 
 {{
   "schema_version": 1,
@@ -2764,6 +2781,7 @@ def _build_compact_plan_revision_prompt(
     unresolved_items: Sequence[UnresolvedReviewItem],
     compact_prior: CompactPriorContext | None,
     compact_tail: CompactPlanTailContext | None,
+    require_risk_test_matrix_contract: bool,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2793,7 +2811,9 @@ def _build_compact_plan_revision_prompt(
         architecture_context=_architecture_context_block(
             config, protected_context=(human_requirements_context.block, previous_plan)
         ),
-        response_protocol=_plan_revision_schema_and_rules(),
+        response_protocol=_plan_revision_schema_and_rules(
+            include_risk_test_matrix_contract=require_risk_test_matrix_contract
+        ),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
     action = (

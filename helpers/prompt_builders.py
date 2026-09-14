@@ -489,6 +489,7 @@ def build_plan_revision_prompt_for_skill(
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     architecture_options: dict | None = None,
+    risk_test_matrix_contract_required: bool = True,
 ) -> str:
     """Build the round-N+1 coder (plan revision) prompt for an external coder (#307).
 
@@ -520,6 +521,7 @@ def build_plan_revision_prompt_for_skill(
         issue_context,
         unresolved_items=unresolved,
         architecture_context=architecture_context,
+        require_risk_test_matrix_contract=risk_test_matrix_contract_required,
     ), config)
 
 

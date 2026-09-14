@@ -422,9 +422,11 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
     identity_source = raw_structured_coder_response or body
     fresh_execution_source = False
     fresh_matrix_source = False
+    source_kind: str | None = None
     try:
         source_payload, _source_end = json.JSONDecoder().raw_decode(identity_source.lstrip())
         if isinstance(source_payload, dict):
+            source_kind = source_payload.get("kind")
             fresh_execution_source = (
                 "execution_strategy_contract_version" in source_payload
                 or "execution_recommendation" in source_payload
@@ -440,6 +442,17 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
     except (AttributeError, json.JSONDecodeError):
         fresh_execution_source = False
         fresh_matrix_source = False
+        source_kind = None
+    if fresh_matrix_source and source_kind == "plan_revision" and (
+        getattr(args, "reject_unsolicited_risk_test_matrix_contract", False)
+        or risk_test_matrix_contract_version_arg != 1
+    ):
+        print(
+            "state_manager: historical matrix-less plan revisions cannot opt into "
+            "the risk test matrix contract without an explicit generation-1 gate",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     matrix_contract_requested = (
         risk_test_matrix_contract_version_arg == 1 or fresh_matrix_source
     )
@@ -800,6 +813,10 @@ def main() -> None:
     p_meta.add_argument(
         "--risk-test-matrix-contract-version", type=int, default=None,
         help="Fresh risk-test-matrix contract generation carried by this record.",
+    )
+    p_meta.add_argument(
+        "--reject-unsolicited-risk-test-matrix-contract", action="store_true",
+        help="Reject matrix fields on a resumed historical matrix-less revision.",
     )
     p_meta.add_argument(
         "--execution-strategy-identity-file", default=None,

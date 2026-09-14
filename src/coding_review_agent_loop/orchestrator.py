@@ -2293,6 +2293,7 @@ def _run_structured_repair(
                     "reviewer_requirement_ids",
                     "require_execution_strategy_contract",
                     "require_risk_test_matrix_contract",
+                    "reject_unsolicited_risk_test_matrix_contract",
                 )
             ):
                 raise
@@ -2300,6 +2301,7 @@ def _run_structured_repair(
             legacy_kwargs.pop("reviewer_requirement_ids", None)
             legacy_kwargs.pop("require_execution_strategy_contract", None)
             legacy_kwargs.pop("require_risk_test_matrix_contract", None)
+            legacy_kwargs.pop("reject_unsolicited_risk_test_matrix_contract", None)
             repaired = attempt_repair(raw, config.gemini_cmd, **legacy_kwargs)
         if repaired is None:
             return None, None, []
@@ -2686,6 +2688,7 @@ def _run_validated_agent(
     repair_requires_direct_discussion_ack: bool = False,
     require_execution_strategy_contract: bool = False,
     require_risk_test_matrix_contract: bool = False,
+    reject_unsolicited_risk_test_matrix_contract: bool = False,
     repair_allowed_prior_item_ids: Sequence[str] | None = None,
     ledger_incomplete: bool = False,
     role: str | None = None,
@@ -3520,6 +3523,11 @@ def _run_validated_agent(
                             and repair_expected_kind in {"plan_state", "plan_revision"}
                         ):
                             repair_kwargs["require_risk_test_matrix_contract"] = True
+                        if (
+                            reject_unsolicited_risk_test_matrix_contract
+                            and repair_expected_kind == "plan_revision"
+                        ):
+                            repair_kwargs["reject_unsolicited_risk_test_matrix_contract"] = True
                     elif (
                         repair_expected_kind == "coder_followup"
                         and (
@@ -4161,12 +4169,14 @@ def _validate_plan_revision_response(
     require_architecture_impact: bool = False,
     require_execution_strategy_contract: bool = False,
     require_risk_test_matrix_contract: bool = False,
+    reject_unsolicited_risk_test_matrix_contract: bool = False,
 ) -> StructuredPlanRevision | str:
     parsed = validate_structured_plan_revision(
         text,
         required_architecture_impact_contract=(1 if require_architecture_impact else 0),
         require_execution_strategy_contract=(1 if require_execution_strategy_contract else 0),
         require_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
+        reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
     )
     if parsed is not None:
         allowed_ids = {item.item_id for item in unresolved_items}
@@ -8004,6 +8014,7 @@ def _run_plan_first_loop(
                     subject=current_plan_subject,
                     action="Revise the implementation plan to address the blocking plan review.",
                 ),
+                require_risk_test_matrix_contract=require_fresh_matrix_contract,
             ),
             session_id=coder_session_id,
             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
@@ -8015,6 +8026,9 @@ def _run_plan_first_loop(
                     require_architecture_impact=True,
                     require_execution_strategy_contract=require_fresh_execution_contract,
                     require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                    reject_unsolicited_risk_test_matrix_contract=(
+                        not require_fresh_matrix_contract
+                    ),
                 ),
                 human_requirements=human_requirements,
                 requirement_scope="planning requirements",
@@ -8031,6 +8045,9 @@ def _run_plan_first_loop(
             ),
             require_execution_strategy_contract=require_fresh_execution_contract,
             require_risk_test_matrix_contract=require_fresh_matrix_contract,
+            reject_unsolicited_risk_test_matrix_contract=(
+                not require_fresh_matrix_contract
+            ),
             repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
             ledger_incomplete=round_ledger_incomplete,
             operation_description="plan revision",

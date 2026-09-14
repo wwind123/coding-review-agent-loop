@@ -3814,11 +3814,15 @@ class TestExternalCoderRun:
         )
 
         helper_calls: list[tuple[str, ...]] = []
+        captured_prompts: list[str] = []
         real_run_helper = skill_runner._run_helper
 
         def fake_run_helper(*args: str, check: bool = True):
             helper_calls.append(args)
             if args[:1] == ("helpers.run_external",):
+                captured_prompts.append(
+                    Path(args[args.index("--prompt-file") + 1]).read_text(encoding="utf-8")
+                )
                 output = Path(args[args.index("--output") + 1])
                 output.write_text(legacy_revision, encoding="utf-8")
                 usage = Path(args[args.index("--usage-output") + 1])
@@ -3866,11 +3870,46 @@ class TestExternalCoderRun:
             or "--risk-test-matrix-contract-version" in call
             for call in helper_calls
         )
+        assert captured_prompts
+        assert "Historical matrix-less revision contract" in captured_prompts[0]
+        assert "risk_test_matrix_contract_version`: `1`" not in captured_prompts[0]
         manifest = json.loads(
             (tmp_path / "repair" / "9997-r2-codex-coder" / "manifest.json")
             .read_text(encoding="utf-8")
         )
         assert manifest.get("risk_test_matrix_contract_required") is not True
+
+    def test_attach_metadata_rejects_matrix_opt_in_on_legacy_revision(
+        self, tmp_path: Path
+    ) -> None:
+        payload, end = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["kind"] = "plan_revision"
+        payload["prior_plan_item_dispositions"] = []
+        body = json.dumps(payload) + _VALID_PLAN_STATE[end:]
+        body_file = tmp_path / "legacy-matrix-bearing-revision.json"
+        body_file.write_text(body, encoding="utf-8")
+        output_file = tmp_path / "tagged.md"
+
+        result = _run(
+            "helpers.state_manager",
+            "attach-metadata",
+            "--body-file", str(body_file),
+            "--output", str(output_file),
+            "--flow", "plan",
+            "--role", "coder",
+            "--agent", "Codex",
+            "--round-number", "2",
+            "--state", "blocking",
+            "--subject-plan-file", str(body_file),
+            "--canonical-plan-file", str(body_file),
+            "--raw-structured-coder-response-file", str(body_file),
+            "--execution-strategy-contract-version", "1",
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "cannot opt into" in result.stderr
+        assert not output_file.exists()
 
     def test_claude_coder_without_plan_file_rejected(self) -> None:
         result = _run(

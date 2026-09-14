@@ -2759,6 +2759,7 @@ def _save_coder_raw_to_repair_dir(
     execution_strategy_contract_version: int | None = None,
     execution_strategy_contract_required: bool = False,
     risk_test_matrix_contract_required: bool = False,
+    reject_unsolicited_risk_test_matrix_contract: bool = False,
     prior_canonical_plan: str | None = None,
     prior_risk_test_matrix: Mapping[str, object] | None = None,
     prior_risk_test_matrix_changes: Sequence[object] = (),
@@ -2794,6 +2795,8 @@ def _save_coder_raw_to_repair_dir(
         manifest["execution_strategy_contract_required"] = True
     if risk_test_matrix_contract_required:
         manifest["risk_test_matrix_contract_required"] = True
+    if reject_unsolicited_risk_test_matrix_contract:
+        manifest["reject_unsolicited_risk_test_matrix_contract"] = True
     if prior_canonical_plan is not None:
         prior_plan_file = repair_dir / "prior-canonical-plan.md"
         _write_text(prior_plan_file, prior_canonical_plan)
@@ -2826,6 +2829,7 @@ def _complete_coder_turn(
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
     require_risk_test_matrix_contract: int = 0,
+    reject_unsolicited_risk_test_matrix_contract: bool = False,
     prior_canonical_plan: str | None = None,
     prior_risk_test_matrix: Mapping[str, object] | None = None,
     prior_risk_test_matrix_changes: Sequence[object] = (),
@@ -2850,6 +2854,9 @@ def _complete_coder_turn(
             required_architecture_impact_contract=required_architecture_impact_contract,
             require_execution_strategy_contract=require_execution_strategy_contract,
             require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+            reject_unsolicited_risk_test_matrix_contract=(
+                reject_unsolicited_risk_test_matrix_contract
+            ),
         )
         if kind == "plan_revision" and (
             surfaced_requirement_ids or requires_direct_discussion_ack
@@ -3053,6 +3060,10 @@ def _complete_coder_turn(
         ("--risk-test-matrix-contract-version", "1")
         if require_risk_test_matrix_contract == 1 else ()
     )
+    reject_risk_test_matrix_contract_args = (
+        ("--reject-unsolicited-risk-test-matrix-contract",)
+        if reject_unsolicited_risk_test_matrix_contract else ()
+    )
     _run_helper(
         "helpers.state_manager", "attach-metadata",
         "--body-file", str(public_file),
@@ -3071,6 +3082,7 @@ def _complete_coder_turn(
         *contract_args,
         *execution_contract_args,
         *risk_test_matrix_contract_args,
+        *reject_risk_test_matrix_contract_args,
     )
 
     if not dry_run:
@@ -3173,6 +3185,15 @@ def _run_external_coder_phase(
         coder_architecture_config, workdir=workdir,
     )
 
+    # The matrix contract is generation-gated independently of the execution
+    # strategy contract. A new planning lifecycle must emit generation 1, but a
+    # revision of a historical execution-v1 round must not be forced to invent
+    # a matrix that was not present in its durable coder metadata.
+    risk_test_matrix_contract_required = (
+        phase == "coder-round-1"
+        or resume.get("risk_test_matrix_contract_version") == 1
+    )
+
     if phase == "coder-round-1":
         next_prior_items_raw: list[dict] = []
         prior_canonical_plan = None
@@ -3217,17 +3238,9 @@ def _run_external_coder_phase(
             coder_test_command_timeout_seconds=getattr(args, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS),
             architecture_context=coder_architecture,
             architecture_options=_architecture_options(args),
+            risk_test_matrix_contract_required=risk_test_matrix_contract_required,
         )
         kind = "plan_revision"
-
-    # The matrix contract is generation-gated independently of the execution
-    # strategy contract. A new planning lifecycle must emit generation 1, but a
-    # revision of a historical execution-v1 round must not be forced to invent
-    # a matrix that was not present in its durable coder metadata.
-    risk_test_matrix_contract_required = (
-        phase == "coder-round-1"
-        or resume.get("risk_test_matrix_contract_version") == 1
-    )
 
     from coding_review_agent_loop.prompts import render_coder_human_requirements_prompt_context
     human_context = render_coder_human_requirements_prompt_context(human_requirements)
@@ -3281,6 +3294,9 @@ def _run_external_coder_phase(
             architecture_contract_version=1,
             execution_strategy_contract_required=True,
             risk_test_matrix_contract_required=risk_test_matrix_contract_required,
+            reject_unsolicited_risk_test_matrix_contract=(
+                kind == "plan_revision" and not risk_test_matrix_contract_required
+            ),
             prior_canonical_plan=prior_canonical_plan,
             prior_risk_test_matrix=prior_risk_test_matrix,
             prior_risk_test_matrix_changes=prior_risk_test_matrix_changes,
@@ -3308,6 +3324,9 @@ def _run_external_coder_phase(
                 require_execution_strategy_contract=1,
                 require_risk_test_matrix_contract=(
                     1 if risk_test_matrix_contract_required else 0
+                ),
+                reject_unsolicited_risk_test_matrix_contract=(
+                    kind == "plan_revision" and not risk_test_matrix_contract_required
                 ),
                 prior_canonical_plan=prior_canonical_plan,
                 prior_risk_test_matrix=prior_risk_test_matrix,
@@ -4453,6 +4472,9 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                     if manifest.get("risk_test_matrix_contract_required")
                     or manifest.get("risk_test_matrix_contract_version") == 1
                     else 0
+                ),
+                reject_unsolicited_risk_test_matrix_contract=bool(
+                    manifest.get("reject_unsolicited_risk_test_matrix_contract")
                 ),
                 prior_canonical_plan=prior_canonical_plan,
                 prior_risk_test_matrix=prior_risk_test_matrix,

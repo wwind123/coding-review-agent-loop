@@ -1239,6 +1239,7 @@ def _build_repair_prompt(
     same_round_context: str | None = None,
     require_execution_strategy_contract: bool = False,
     require_risk_test_matrix_contract: bool = False,
+    reject_unsolicited_risk_test_matrix_contract: bool = False,
 ) -> str:
     if expected_kind is not None and expected_kind not in _SUPPORTED_EXPECTED_KINDS:
         raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
@@ -1299,6 +1300,13 @@ def _build_repair_prompt(
         "matrix scenarios.\n"
         if require_risk_test_matrix_contract else ""
     )
+    legacy_matrix_instruction = (
+        "This is a historical matrix-less plan revision. Preserve the absence of "
+        "risk_test_matrix_contract_version, risk_test_matrix, and "
+        "risk_test_matrix_changes; remove those unsolicited fields rather than "
+        "creating a generation-1 baseline.\n"
+        if reject_unsolicited_risk_test_matrix_contract else ""
+    )
     detected_markers = scan_reserved_markers(raw)
     detected_tokens = sorted({item.definition.token for item in detected_markers})
     safe_labels = {
@@ -1310,7 +1318,11 @@ def _build_repair_prompt(
         for token in detected_tokens
     }
     prompt = _REPAIR_PROMPT.replace("{expected_kind_instruction}", expected_kind_instruction, 1)
-    prompt = prompt.replace("{fresh_contract_instruction}", fresh_contract_instruction + matrix_contract_instruction, 1)
+    prompt = prompt.replace(
+        "{fresh_contract_instruction}",
+        fresh_contract_instruction + matrix_contract_instruction + legacy_matrix_instruction,
+        1,
+    )
     replacements = (
         ("{reserved_marker_instruction}", (
             "## Registry-detected reserved syntax in this source:\n"
@@ -1614,6 +1626,9 @@ def execute_repair(
                     unresolved_item_ids=prompt_kwargs.get("unresolved_item_ids"),
                     surfaced_requirement_ids=prompt_kwargs.get("surfaced_requirement_ids"),
                     reviewer_requirement_ids=prompt_kwargs.get("reviewer_requirement_ids"),
+                    allow_legacy_matrix_removal=bool(
+                        prompt_kwargs.get("reject_unsolicited_risk_test_matrix_contract")
+                    ),
                 )
             except Exception as exc:
                 if outcome == "succeeded":
@@ -1826,6 +1841,7 @@ def attempt_repair(
     same_round_context: str | None = None,
     require_execution_strategy_contract: bool = False,
     require_risk_test_matrix_contract: bool = False,
+    reject_unsolicited_risk_test_matrix_contract: bool = False,
 ) -> str | None:
     """Call gemini-3.1-flash-lite via the Gemini CLI to reformat a malformed review response.
 
@@ -1845,6 +1861,7 @@ def attempt_repair(
         same_round_context=same_round_context,
         require_execution_strategy_contract=require_execution_strategy_contract,
         require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+        reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
     )
     try:
         oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
@@ -1877,6 +1894,7 @@ def attempt_repair(
                 unresolved_item_ids=unresolved_item_ids,
                 surfaced_requirement_ids=surfaced_requirement_ids,
                 reviewer_requirement_ids=reviewer_requirement_ids,
+                allow_legacy_matrix_removal=reject_unsolicited_risk_test_matrix_contract,
             )
         except Exception as exc:
             _logger.debug("repair pass content preservation failed: %s", exc)

@@ -99,6 +99,7 @@ def validate_response_text(
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
     require_risk_test_matrix_contract: int = 0,
+    reject_unsolicited_risk_test_matrix_contract: bool = False,
     delivered_risk_test_matrix: object = None,
     delivered_risk_test_matrix_identity: str | None = None,
     authoritative_test_observations=None,
@@ -216,6 +217,7 @@ def validate_response_text(
         required_architecture_impact_contract=required_architecture_impact_contract,
         require_execution_strategy_contract=require_execution_strategy_contract,
         require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+        reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
     )
     if parsed is None:
         raise AgentLoopError("Response did not parse as a structured plan_revision.")
@@ -260,6 +262,11 @@ def main() -> None:
         action="store_true",
         help="Require the fresh generation-1 risk matrix planning contract.",
     )
+    parser.add_argument(
+        "--reject-unsolicited-risk-test-matrix-contract",
+        action="store_true",
+        help="Reject a matrix on a resumed historical matrix-less plan revision.",
+    )
     args = parser.parse_args()
 
     try:
@@ -301,6 +308,9 @@ def main() -> None:
             ),
             require_risk_test_matrix_contract=(
                 1 if args.require_risk_test_matrix_contract else 0
+            ),
+            reject_unsolicited_risk_test_matrix_contract=(
+                args.reject_unsolicited_risk_test_matrix_contract
             ),
             delivered_risk_test_matrix=ctx.get("risk_test_matrix"),
             delivered_risk_test_matrix_identity=ctx.get("risk_test_matrix_identity"),

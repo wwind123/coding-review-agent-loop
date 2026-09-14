@@ -84,6 +84,26 @@ def test_fresh_plan_prompts_show_the_exact_one_shot_contract_shape(tmp_path):
     assert "omit child stages" not in initial.lower()
 
 
+def test_legacy_plan_revision_prompt_does_not_invent_matrix_generation(tmp_path):
+    config = make_config(tmp_path)
+
+    legacy = build_plan_revision_prompt(
+        783,
+        2,
+        "Historical execution-v1 plan.",
+        "Blocking review",
+        config,
+        require_risk_test_matrix_contract=False,
+    )
+
+    assert "Historical matrix-less revision contract" in legacy
+    assert "risk_test_matrix_contract_version`: `1`" not in legacy
+    assert "risk_test_matrix`: `1`" not in legacy
+
+    fresh = build_plan_revision_prompt(783, 2, "Previous plan", "Blocking review", config)
+    assert "For work involving multiple execution modes" in fresh
+
+
 def test_plan_review_prompts_expose_complete_one_shot_and_staged_recommendations(tmp_path):
     config = make_config(tmp_path)
     one_shot = validate_structured_plan_state(

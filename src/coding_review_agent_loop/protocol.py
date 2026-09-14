@@ -1582,7 +1582,8 @@ def _receipt_expected_status(observation: object, *, claim: str) -> str | None:
 
 
 def _parse_risk_test_matrix_contract_fields(
-    payload: dict[str, object], *, context: str, required: bool = False
+    payload: dict[str, object], *, context: str, required: bool = False,
+    reject_unsolicited: bool = False,
 ) -> tuple[int | None, RiskTestMatrix | None, tuple[RiskTestMatrixChange, ...]]:
     present = {
         name: name in payload
@@ -1600,6 +1601,11 @@ def _parse_risk_test_matrix_contract_fields(
                 "and a complete risk_test_matrix contract."
             )
         return None, None, ()
+    if reject_unsolicited:
+        raise AgentLoopError(
+            f"historical matrix-less {context} responses must not introduce a risk test "
+            "matrix without an explicit fresh generation-1 planning gate."
+        )
     version = _expect_int(
         payload["risk_test_matrix_contract_version"],
         context=f"{context}.risk_test_matrix_contract_version",
@@ -3968,6 +3974,7 @@ def validate_structured_plan_revision(
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
     require_risk_test_matrix_contract: int = 0,
+    reject_unsolicited_risk_test_matrix_contract: bool = False,
 ) -> StructuredPlanRevision | None:
     payload = _extract_structured_plan_revision_payload(text)
     if payload is None:
@@ -4012,6 +4019,7 @@ def validate_structured_plan_revision(
         payload,
         context="plan_revision",
         required=require_risk_test_matrix_contract == 1,
+        reject_unsolicited=reject_unsolicited_risk_test_matrix_contract,
     )
     state = _expect_non_empty_string(payload["state"], context="plan_revision.state")
     if state != "blocking":

@@ -2718,6 +2718,29 @@ def test_validate_structured_plan_revision_accepts_v1_payload():
     assert parsed.plan_steps == ("Update protocol.py.", "Add regression tests.")
 
 
+def test_matrixless_plan_revision_rejects_unsolicited_generation_one_matrix():
+    payload, end = json.JSONDecoder().raw_decode(structured_plan_revision())
+    payload.update(
+        {
+            "risk_test_matrix_contract_version": 1,
+            "risk_test_matrix": {
+                "applicability": "not-applicable",
+                "rows": [],
+                "important_exclusions": [],
+                "not_applicable_rationale": "The historical plan has no stateful transition surface.",
+            },
+            "risk_test_matrix_changes": [],
+        }
+    )
+    revision = json.dumps(payload) + structured_plan_revision()[end:]
+
+    with pytest.raises(AgentLoopError, match="historical matrix-less"):
+        validate_structured_plan_revision(
+            revision,
+            reject_unsolicited_risk_test_matrix_contract=True,
+        )
+
+
 def test_validate_structured_plan_revision_accepts_deferred_stages():
     revision = structured_plan_revision(
         deferred_stages=[
