@@ -7617,12 +7617,13 @@ def _run_plan_first_loop(
                     expected_hash=plan_hash,
                     expected_subject=plan_subject,
                 )
+                first_stage_id = (
+                    getattr(first_agent_phase.phase, "stage_id", None)
+                    or str(getattr(first_agent_phase.phase, "position", 1))
+                )
                 child_plan_context = scope_approved_plan_matrix(
                     child_plan_context,
-                    execution_owner=(
-                        first_agent_phase.phase.stage_id
-                        or str(first_agent_phase.phase.position)
-                    ),
+                    execution_owner=first_stage_id,
                     valid_stage_ids=tuple(
                         phase.stage_id or str(phase.position)
                         for phase in recommendation.child_stages

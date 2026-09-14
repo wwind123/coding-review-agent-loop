@@ -1883,7 +1883,7 @@ scope-item IDs, and exactly one execution owner. Row `applicability` is
 `applicable`, `required`, or `not-applicable`; row-level `not-applicable`
 scenarios are excluded from coder evidence obligations. Include important
 exclusions.
-Do not use reviewer finding IDs such as `item-1` for matrix rows. Planned tests
+Do not use reviewer finding IDs such as `reviewer-id` for matrix rows. Planned tests
 are proposals, not evidence that tests exist or pass. Before approval, make
 corrections visible in `risk_test_matrix_changes` with add/change/retire/split/
 merge operations and rationales; after approval, substantive changes require
