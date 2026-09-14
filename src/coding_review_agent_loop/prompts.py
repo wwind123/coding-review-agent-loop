@@ -1920,6 +1920,15 @@ matrix and use an empty list when the matrix is unchanged. Do not copy the
 prior revision's audit entries into a new unchanged revision. Exact historical
 entries that are repeated from the prior canonical matrix are tolerated for
 resume compatibility, but they do not count as coverage for a new change.
+If the revision changes a matrix-level field (`applicability`,
+`important_exclusions`, or `not_applicable_rationale`), include exactly one
+matrix-level audit entry. Its operation must be `change`, `split`, or `merge`,
+and its `row_ids` must list the complete union of row IDs in the prior and revised matrices
+(use `["matrix"]` when both matrices have no rows). An
+existing precise `change`, `split`, or `merge` entry that already covers this
+complete union satisfies the matrix-level requirement; do not duplicate it.
+Add separate precise row add/change/retire/split/merge entries only for row
+transitions not already covered by that complete-scope entry.
 """
 
 

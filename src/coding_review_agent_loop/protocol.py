@@ -1135,9 +1135,19 @@ def validate_risk_test_matrix_revision(
             and set(change.row_ids) == matrix_scope
         }
         if len(matrix_change_indexes) != 1:
+            expected_scope = ", ".join(sorted(matrix_scope))
+            changed_fields = ", ".join(sorted(changed_matrix_fields))
+            if not matrix_change_indexes:
+                match_detail = "found none"
+            else:
+                match_detail = (
+                    f"found {len(matrix_change_indexes)}; remove duplicate complete-scope entries"
+                )
             raise AgentLoopError(
                 "Risk matrix-level changes require one review-visible audit operation "
-                "with operation `change`, `split`, or `merge` covering the complete matrix scope."
+                "with operation `change`, `split`, or `merge` covering the complete matrix scope. "
+                f"{match_detail}. Changed matrix fields: {changed_fields}. "
+                f"Required row_ids: [{expected_scope}]."
             )
 
     # Validate each operation against the actual old/new transition. Merely

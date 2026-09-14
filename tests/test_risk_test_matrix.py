@@ -248,12 +248,14 @@ def test_authoritative_caveats_have_headroom_across_multiple_receipts() -> None:
 def test_matrix_level_draft_changes_cannot_hide_behind_one_row_operation() -> None:
     previous = {**_matrix(), "rows": [_row("row-one"), _row("row-two")]}
     current = {**previous, "important_exclusions": ["A newly explicit exclusion."]}
-    with pytest.raises(AgentLoopError, match="complete matrix scope"):
+    with pytest.raises(AgentLoopError, match="complete matrix scope") as exc_info:
         validate_risk_test_matrix_revision(
             previous,
             current,
             [{"operation": "change", "row_ids": ["row-one"], "rationale": "Clarified one row."}],
         )
+    assert "Changed matrix fields: important_exclusions" in str(exc_info.value)
+    assert "Required row_ids: [row-one, row-two]" in str(exc_info.value)
     validate_risk_test_matrix_revision(
         previous,
         current,
@@ -263,6 +265,60 @@ def test_matrix_level_draft_changes_cannot_hide_behind_one_row_operation() -> No
             "rationale": "Clarified the matrix exclusions.",
         }],
     )
+
+
+def test_one_row_matrix_level_and_row_change_share_one_complete_scope_audit() -> None:
+    previous = _matrix()
+    current = {
+        **previous,
+        "rows": [{**_row(), "expected_outcome": "A revised outcome"}],
+        "important_exclusions": ["The revised exclusion boundary."],
+    }
+
+    parsed = validate_risk_test_matrix_revision(
+        previous,
+        current,
+        [{
+            "operation": "change",
+            "row_ids": ["row-ordinary"],
+            "rationale": "Updated the only row and the matrix exclusion boundary.",
+        }],
+    )
+
+    assert parsed[0].row_ids == ("row-ordinary",)
+
+
+def test_matrix_level_error_distinguishes_duplicate_complete_scope_audits() -> None:
+    previous = _matrix()
+    current = {**previous, "important_exclusions": ["A newly explicit exclusion."]}
+    change = {
+        "operation": "change",
+        "row_ids": ["row-ordinary"],
+        "rationale": "Repeated complete-scope audit.",
+    }
+
+    with pytest.raises(AgentLoopError, match="found 2; remove duplicate complete-scope entries"):
+        validate_risk_test_matrix_revision(previous, current, [change, change])
+
+
+def test_rowless_not_applicable_matrix_uses_matrix_sentinel_for_rationale_change() -> None:
+    previous = _not_applicable()
+    current = {
+        **previous,
+        "not_applicable_rationale": "The revised scope remains formatting-only.",
+    }
+
+    parsed = validate_risk_test_matrix_revision(
+        previous,
+        current,
+        [{
+            "operation": "change",
+            "row_ids": ["matrix"],
+            "rationale": "Refined why the matrix remains not applicable.",
+        }],
+    )
+
+    assert parsed[0].row_ids == ("matrix",)
 
 
 def test_matrix_level_change_also_audits_a_retained_row_change() -> None:
