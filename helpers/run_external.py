@@ -71,6 +71,14 @@ _CANNED_PLAN_STATE = json.dumps(
         "summary": "Dry-run stub: plan is ready.",
         "plan_steps": ["Implement the requested changes."],
         "execution_strategy_contract_version": 1,
+        "risk_test_matrix_contract_version": 1,
+        "risk_test_matrix": {
+            "applicability": "not-applicable",
+            "rows": [],
+            "important_exclusions": [],
+            "not_applicable_rationale": "Dry-run stub has no stateful mode or transition surface.",
+        },
+        "risk_test_matrix_changes": [],
         "execution_recommendation": {
             "strategy": "one-shot",
             "rationale": "The dry-run contains one coherent implementation boundary.",

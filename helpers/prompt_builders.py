@@ -535,6 +535,7 @@ def build_implementation_prompt_for_skill(
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     architecture_options: dict | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
 ) -> str:
     """Build the external-coder implementation prompt (reversed roles, #316).
 
@@ -555,6 +556,7 @@ def build_implementation_prompt_for_skill(
     )
     return _with_containment_guidance(build_issue_implementation_prompt(
         issue_context.number, approved_plan, config, memory, issue_context=issue_context,
+        approved_plan_context=approved_plan_context,
         architecture_context=architecture_context,
     ), config)
 

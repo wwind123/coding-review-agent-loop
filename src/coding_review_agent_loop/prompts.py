@@ -1398,12 +1398,24 @@ def format_approved_plan_context(
         if matrix.get("applicability") == "not-applicable":
             lines.append(f"- Applicability: not applicable — {matrix.get('not_applicable_rationale', '')}")
         else:
+            if plan_context.risk_test_matrix_execution_owner:
+                lines.append(
+                    "- Staged ownership: only rows owned by "
+                    f"`{plan_context.risk_test_matrix_execution_owner}` are enforceable in this turn; "
+                    "other rows are read-only pending obligations."
+                )
+            pending_ids = set(plan_context.risk_test_matrix_pending_row_ids)
             for row in matrix.get("rows", []):
                 if not isinstance(row, dict):
                     continue
+                ownership_note = (
+                    "[read-only pending obligation] "
+                    if row.get("row_id") in pending_ids else "[enforceable] "
+                )
                 lines.append(
-                    "- Row {id}: {label}; path/mode={path}; initial={initial}; event={event}; "
+                    "- {ownership}Row {id}: {label}; path/mode={path}; initial={initial}; event={event}; "
                     "expected={expected}; forbidden={forbidden}; test={level} @ {location}; owner={owner}".format(
+                        ownership=ownership_note,
                         id=row.get("row_id", ""), label=row.get("label", ""),
                         path=row.get("entry_path_or_mode", ""), initial=row.get("initial_state", ""),
                         event=row.get("event", ""), expected=row.get("expected_outcome", ""),
@@ -1429,6 +1441,35 @@ def format_approved_plan_context(
         ])
     if plan_context.diagnostic:
         lines.extend(["", f"Plan recovery diagnostic: {plan_context.diagnostic}"])
+    if max_chars is not None and plan_context.matrix_available:
+        if plan_context.canonical_text:
+            matrix_candidate = (
+                "\n".join(lines)
+                + "\n\nCanonical approved plan text:\n"
+                + plan_context.canonical_text
+                + "\n"
+            )
+        else:
+            matrix_candidate = (
+                "\n".join(lines)
+                + "\n\nCanonical approved plan text: omitted; the authenticated structured matrix above remains the only enforceable plan channel.\n"
+            )
+        if len(matrix_candidate) > max_chars:
+            # Matrix semantics are atomic.  If the complete structured channel
+            # cannot fit, expose an explicit diagnostic and zero enforceable
+            # rows while retaining the independently bound plan channel.
+            unavailable = dataclass_replace(
+                plan_context,
+                risk_test_matrix_availability="unavailable",
+                risk_test_matrix_diagnostic=(
+                    "Matrix omitted because its complete semantic payload exceeds "
+                    "the provider prompt budget; zero matrix rows are enforceable."
+                ),
+                risk_test_matrix_identity=None,
+                risk_test_matrix_payload=None,
+                risk_test_matrix_changes_payload=(),
+            )
+            return format_approved_plan_context(unavailable, max_chars=max_chars)
     if plan_context.availability == "omitted" and not plan_context.matrix_available:
         omission = (
             "[Canonical approved plan text omitted because it exceeds the final provider prompt budget. "
@@ -1450,8 +1491,22 @@ def format_approved_plan_context(
             "The canonical plan text is unavailable or mismatched. Do not silently substitute issue prose; request plan/handoff remediation before approving.",
             "A reviewer who finds the plan defective must identify the conflict and request a scope/plan decision; do not silently replace the agreed contract.",
         ])
-        return "\n".join(lines) + "\n"
+        unavailable_text = "\n".join(lines) + "\n"
+        if max_chars is not None and len(unavailable_text) > max_chars:
+            raise AgentLoopError(
+                "Approved-plan context cannot fit the required identity and matrix "
+                f"diagnostic (minimum {len(unavailable_text)} characters; configured {max_chars})."
+            )
+        return unavailable_text
     if plan_context.matrix_available and not plan_context.canonical_text:
+        complete = "\n".join(lines) + "\n\n" + (
+            "Canonical approved plan text: omitted; the authenticated structured matrix above remains the only enforceable plan channel."
+        ) + "\n"
+        if max_chars is not None and len(complete) > max_chars:
+            raise AgentLoopError(
+                "Approved-plan context cannot fit the authenticated matrix-only plan "
+                f"channel (minimum {len(complete)} characters; configured {max_chars})."
+            )
         lines.extend([
             "",
             "Canonical approved plan text: omitted; the authenticated structured matrix above remains the only enforceable plan channel.",
@@ -1579,14 +1634,27 @@ def _approved_plan_review_context_block(
     receive decision-bearing instructions for a body that was omitted.
     """
     rendered = format_approved_plan_context(plan_context, max_chars=max_chars)
-    canonical_text_rendered = bool(
+    effective_context = plan_context
+    if (
         plan_context is not None
-        and plan_context.is_available
-        and plan_context.canonical_text
-        and f"Canonical approved plan text:\n{plan_context.canonical_text}\n" in rendered
+        and plan_context.matrix_available
+        and "Risk-based mode and transition test matrix: unavailable" in rendered
+    ):
+        effective_context = dataclass_replace(
+            plan_context,
+            risk_test_matrix_availability="unavailable",
+            risk_test_matrix_identity=None,
+            risk_test_matrix_payload=None,
+            risk_test_matrix_changes_payload=(),
+        )
+    canonical_text_rendered = bool(
+        effective_context is not None
+        and effective_context.is_available
+        and effective_context.canonical_text
+        and f"Canonical approved plan text:\n{effective_context.canonical_text}\n" in rendered
     )
     return rendered + approved_plan_reconciliation_guidance(
-        plan_context,
+        effective_context,
         canonical_text_rendered=canonical_text_rendered,
     )
 
@@ -1811,7 +1879,10 @@ restart, authorization boundaries, or recovery/failure paths, also include
 non-empty proportionate rationale. Each applicable row has a stable matrix-only
 `row_id`, label, entry path/mode, initial state, event, expected outcome,
 forbidden side effects, proposed test level/location, applicability, related
-scope-item IDs, and exactly one execution owner. Include important exclusions.
+scope-item IDs, and exactly one execution owner. Row `applicability` is
+`applicable`, `required`, or `not-applicable`; row-level `not-applicable`
+scenarios are excluded from coder evidence obligations. Include important
+exclusions.
 Do not use reviewer finding IDs such as `item-1` for matrix rows. Planned tests
 are proposals, not evidence that tests exist or pass. Before approval, make
 corrections visible in `risk_test_matrix_changes` with add/change/retire/split/

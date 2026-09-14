@@ -1236,6 +1236,7 @@ def _build_repair_prompt(
     unknown_prior_item_ids: Sequence[str] | None = None,
     same_round_context: str | None = None,
     require_execution_strategy_contract: bool = False,
+    require_risk_test_matrix_contract: bool = False,
 ) -> str:
     if expected_kind is not None and expected_kind not in _SUPPORTED_EXPECTED_KINDS:
         raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
@@ -1289,6 +1290,13 @@ def _build_repair_prompt(
         "topology data.\n"
         if require_execution_strategy_contract else ""
     )
+    matrix_contract_instruction = (
+        "This is a fresh generation-1 planning response. Preserve the complete "
+        "risk_test_matrix_contract_version, risk_test_matrix, and "
+        "risk_test_matrix_changes fields exactly; do not invent, omit, or weaken "
+        "matrix scenarios.\n"
+        if require_risk_test_matrix_contract else ""
+    )
     detected_markers = scan_reserved_markers(raw)
     detected_tokens = sorted({item.definition.token for item in detected_markers})
     safe_labels = {
@@ -1300,6 +1308,7 @@ def _build_repair_prompt(
         for token in detected_tokens
     }
     prompt = _REPAIR_PROMPT.replace("{expected_kind_instruction}", expected_kind_instruction, 1)
+    prompt = prompt.replace("{fresh_contract_instruction}", fresh_contract_instruction + matrix_contract_instruction, 1)
     replacements = (
         ("{reserved_marker_instruction}", (
             "## Registry-detected reserved syntax in this source:\n"
@@ -1777,6 +1786,7 @@ def attempt_repair(
     unknown_prior_item_ids: Sequence[str] | None = None,
     same_round_context: str | None = None,
     require_execution_strategy_contract: bool = False,
+    require_risk_test_matrix_contract: bool = False,
 ) -> str | None:
     """Call gemini-3.1-flash-lite via the Gemini CLI to reformat a malformed review response.
 
@@ -1795,6 +1805,7 @@ def attempt_repair(
         unknown_prior_item_ids=unknown_prior_item_ids,
         same_round_context=same_round_context,
         require_execution_strategy_contract=require_execution_strategy_contract,
+        require_risk_test_matrix_contract=require_risk_test_matrix_contract,
     )
     try:
         oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES

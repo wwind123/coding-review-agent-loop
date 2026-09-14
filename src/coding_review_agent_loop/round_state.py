@@ -236,6 +236,11 @@ class ApprovedPlanContext:
     risk_test_matrix_changes_payload: tuple[dict, ...] = ()
     risk_test_matrix_source_locator: str | None = None
     risk_test_matrix_boundary_digest: str | None = None
+    # Staged children receive the complete authenticated semantics for audit,
+    # but only these owner-matching rows are enforceable in their turn.
+    risk_test_matrix_enforceable_row_ids: tuple[str, ...] | None = None
+    risk_test_matrix_pending_row_ids: tuple[str, ...] = ()
+    risk_test_matrix_execution_owner: str | None = None
 
     @property
     def raw_canonical_text(self) -> str | None:
@@ -272,6 +277,62 @@ class ApprovedPlanContext:
     @property
     def risk_test_matrix(self) -> dict | None:
         return self.risk_test_matrix_payload
+
+    @property
+    def risk_test_matrix_expected_row_ids(self) -> tuple[str, ...] | None:
+        if not self.matrix_available or self.risk_test_matrix_payload is None:
+            return None
+        if self.risk_test_matrix_enforceable_row_ids is not None:
+            return self.risk_test_matrix_enforceable_row_ids
+        return tuple(
+            str(row["row_id"])
+            for row in self.risk_test_matrix_payload.get("rows", [])
+            if isinstance(row, dict)
+            and row.get("applicability") in {"applicable", "required"}
+        )
+
+
+def scope_approved_plan_matrix(
+    context: ApprovedPlanContext,
+    *,
+    execution_owner: str,
+    valid_stage_ids: Sequence[str] = (),
+) -> ApprovedPlanContext:
+    """Bind a staged implementation to its owned matrix rows.
+
+    The full authenticated payload remains available for read-only pending
+    context. Evidence validation uses only the owner-matching applicable IDs.
+    """
+    if not context.matrix_available or context.risk_test_matrix_payload is None:
+        return context
+    rows = context.risk_test_matrix_payload.get("rows", [])
+    if not isinstance(rows, list):
+        return context
+    if execution_owner not in {"one-shot", "retained-parent", "final-integration"} and valid_stage_ids:
+        if execution_owner not in set(valid_stage_ids):
+            raise AgentLoopError(
+                f"Risk matrix execution owner `{execution_owner}` is not an approved stage ID."
+            )
+    owned = tuple(
+        str(row["row_id"])
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("execution_owner") == execution_owner
+        and row.get("applicability") in {"applicable", "required"}
+    )
+    pending = tuple(
+        str(row["row_id"])
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("row_id") not in owned
+        and row.get("applicability") in {"applicable", "required"}
+    )
+    return replace(
+        context,
+        risk_test_matrix_enforceable_row_ids=owned,
+        risk_test_matrix_pending_row_ids=pending,
+        risk_test_matrix_execution_owner=execution_owner,
+    )
 
 
 @dataclass(frozen=True)
@@ -729,7 +790,9 @@ def _decode_matrix_json(value: object, *, context: str) -> object | None:
     return json.loads(value)
 
 
-def _matrix_metadata_fields(payload: Mapping[str, object]) -> dict[str, object]:
+def _matrix_metadata_fields(
+    payload: Mapping[str, object], *, canonical_text: str | None = None
+) -> dict[str, object]:
     """Decode and independently authenticate the structured matrix carrier.
 
     Matrix corruption is deliberately converted into a closed matrix channel;
@@ -758,6 +821,10 @@ def _matrix_metadata_fields(payload: Mapping[str, object]) -> dict[str, object]:
             raise ValueError("matrix identity mismatch")
         if raw_boundary != identity:
             raise ValueError("matrix payload-bound section boundary mismatch")
+        if canonical_text and not _canonical_matrix_boundary_matches(
+            canonical_text, identity
+        ):
+            raise ValueError("canonical plan risk matrix section boundary mismatch")
         return {
             "risk_test_matrix_contract_version": version,
             "risk_test_matrix_payload": matrix.to_payload(),
@@ -775,6 +842,21 @@ def _matrix_metadata_fields(payload: Mapping[str, object]) -> dict[str, object]:
             "risk_test_matrix_boundary_digest": None,
             "risk_test_matrix_diagnostic": f"Matrix unavailable: {exc}",
         }
+
+
+def _canonical_matrix_boundary_matches(text: str, identity: str) -> bool:
+    """Authenticate the stored renderer boundary without re-rendering prose."""
+    from .round_transport import risk_test_matrix_section_boundary
+
+    if risk_test_matrix_section_boundary(identity) not in text:
+        return False
+    marker = RISK_TEST_MATRIX_MARKER_RE.search(text)
+    if marker is None:
+        return False
+    try:
+        return decode_risk_test_matrix_marker(marker.group("payload"))["identity"] == identity
+    except (AgentLoopError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
@@ -932,7 +1014,14 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 payload.get("execution_strategy_identity")
                 if isinstance(payload.get("execution_strategy_identity"), dict) else None
             ),
-            **_matrix_metadata_fields(payload),
+            **_matrix_metadata_fields(
+                payload,
+                canonical_text=(
+                    str(payload["canonical_plan"])
+                    if payload.get("canonical_plan") is not None
+                    else None
+                ),
+            ),
             compact_prior_summaries=tuple(
                 str(summary) for summary in payload.get("compact_prior_summaries", [])
             ),
@@ -1606,6 +1695,7 @@ def _approved_matrix_channel(
     source_locator: str | None,
     diagnostic: str | None = None,
     boundary_digest: str | None = None,
+    canonical_text: str | None = None,
 ) -> dict[str, object]:
     if contract_version is None and payload is None and changes_payload in (None, (), []):
         return {
@@ -1642,6 +1732,10 @@ def _approved_matrix_channel(
             raise ValueError("risk matrix identity mismatch")
         if boundary_digest != actual_identity:
             raise ValueError("risk matrix payload-bound section boundary mismatch")
+        if canonical_text and not _canonical_matrix_boundary_matches(
+            canonical_text, actual_identity
+        ):
+            raise ValueError("canonical plan risk matrix section boundary mismatch")
         return {
             "risk_test_matrix_availability": "available",
             "risk_test_matrix_diagnostic": None,
@@ -1693,6 +1787,7 @@ def make_approved_plan_context(
         source_locator=risk_test_matrix_source_locator or source_locator,
         diagnostic=risk_test_matrix_diagnostic,
         boundary_digest=risk_test_matrix_boundary_digest,
+        canonical_text=text,
     )
     if (
         matrix_fields["risk_test_matrix_availability"] == "not-planned"
@@ -1712,6 +1807,7 @@ def make_approved_plan_context(
                     identity=str(marker_payload["identity"]),
                     source_locator=risk_test_matrix_source_locator or source_locator,
                     boundary_digest=str(marker_payload["identity"]),
+                    canonical_text=text,
                 )
             except (AgentLoopError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
                 matrix_fields = _approved_matrix_channel(
@@ -1925,6 +2021,23 @@ def recover_approved_plan_context(
             has_matching_candidate=True,
             diagnostic=(
                 f"Multiple divergent canonical plan records match handoff hash {expected_hash}."
+            ),
+        )
+    matching_indices = {index for index, _raw in candidates}
+    matching_matrix_identities = {
+        record.metadata.risk_test_matrix_identity
+        for record in records
+        if record.index in matching_indices
+        and record.metadata.risk_test_matrix_identity is not None
+    }
+    if len(matching_matrix_identities) > 1:
+        return ApprovedPlanContext(
+            plan_hash=expected_hash,
+            plan_subject=expected_subject,
+            availability="mismatched",
+            has_matching_candidate=True,
+            diagnostic=(
+                f"Multiple divergent risk matrix identities match approved plan {expected_hash}."
             ),
         )
     index, raw = candidates[-1]

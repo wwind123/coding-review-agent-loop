@@ -103,6 +103,14 @@ _VALID_PLAN_STATE = json.dumps({
     "summary": "Plan is ready for review.",
     "plan_steps": ["Step one"],
     "execution_strategy_contract_version": 1,
+    "risk_test_matrix_contract_version": 1,
+    "risk_test_matrix": {
+        "applicability": "not-applicable",
+        "rows": [],
+        "important_exclusions": [],
+        "not_applicable_rationale": "This helper fixture models a narrow local test harness without stateful mode transitions.",
+    },
+    "risk_test_matrix_changes": [],
     "execution_recommendation": {
         "strategy": "one-shot",
         "rationale": "The dry-run work is one coherent boundary.",

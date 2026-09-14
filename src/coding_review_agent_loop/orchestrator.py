@@ -51,6 +51,7 @@ from .decomposition import (
     post_phase_implementation_handoff_comment,
     adapt_typed_child_stages,
     normalize_execution_recommendation,
+    validate_risk_matrix_ownership,
     recover_execution_recommendation,
     ExecutionDecision,
     EXECUTION_TOPOLOGY_SOURCE,
@@ -413,6 +414,7 @@ from .round_state import (
     _resume_discuss_round,
     _resume_plan_round,
     make_approved_plan_context,
+    scope_approved_plan_matrix,
     recover_approved_plan_context,
     RequirementsContext,
     _resume_pr_round,
@@ -2263,12 +2265,17 @@ def _run_structured_repair(
             # context is rolled out. The real repair API accepts this keyword.
             if not any(
                 name in str(exc)
-                for name in ("reviewer_requirement_ids", "require_execution_strategy_contract")
+                for name in (
+                    "reviewer_requirement_ids",
+                    "require_execution_strategy_contract",
+                    "require_risk_test_matrix_contract",
+                )
             ):
                 raise
             legacy_kwargs = dict(repair_kwargs)
             legacy_kwargs.pop("reviewer_requirement_ids", None)
             legacy_kwargs.pop("require_execution_strategy_contract", None)
+            legacy_kwargs.pop("require_risk_test_matrix_contract", None)
             repaired = attempt_repair(raw, config.gemini_cmd, **legacy_kwargs)
         if repaired is None:
             return None, None, []
@@ -2654,6 +2661,7 @@ def _run_validated_agent(
     repair_reviewer_requirement_ids: Sequence[str] | None = None,
     repair_requires_direct_discussion_ack: bool = False,
     require_execution_strategy_contract: bool = False,
+    require_risk_test_matrix_contract: bool = False,
     repair_allowed_prior_item_ids: Sequence[str] | None = None,
     ledger_incomplete: bool = False,
     role: str | None = None,
@@ -3483,6 +3491,11 @@ def _run_validated_agent(
                             and repair_expected_kind in {"plan_state", "plan_revision"}
                         ):
                             repair_kwargs["require_execution_strategy_contract"] = True
+                        if (
+                            require_risk_test_matrix_contract
+                            and repair_expected_kind in {"plan_state", "plan_revision"}
+                        ):
+                            repair_kwargs["require_risk_test_matrix_contract"] = True
                     elif (
                         repair_expected_kind == "coder_followup"
                         and (
@@ -3788,6 +3801,8 @@ def _validate_issue_implementation_response(
     delivered_risk_test_matrix: object = None,
     delivered_risk_test_matrix_identity: str | None = None,
     require_risk_test_matrix_contract: bool = False,
+    authoritative_test_observations=None,
+    delivered_risk_test_matrix_row_ids=None,
 ) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
@@ -3799,6 +3814,8 @@ def _validate_issue_implementation_response(
             delivered_risk_test_matrix=delivered_risk_test_matrix,
             delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
             required_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
+            authoritative_test_observations=authoritative_test_observations,
+            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
         )
     except IssueImplementationConflictError as exc:
         parsed = exc.payload
@@ -3924,6 +3941,7 @@ def _require_task_implementation_result(
 def _require_plan_state_or_clarification(
     text: str, *, required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
+    require_risk_test_matrix_contract: int = 0,
 ) -> StructuredPlanState | str:
     if is_clarification_request(text):
         return "clarification"
@@ -3931,6 +3949,7 @@ def _require_plan_state_or_clarification(
         text,
         required_architecture_impact_contract=required_architecture_impact_contract,
         require_execution_strategy_contract=require_execution_strategy_contract,
+        require_risk_test_matrix_contract=require_risk_test_matrix_contract,
     )
     if structured_plan is None:
         raise AgentLoopError(
@@ -4117,11 +4136,13 @@ def _validate_plan_revision_response(
     unresolved_items: Sequence[UnresolvedReviewItem] = (),
     require_architecture_impact: bool = False,
     require_execution_strategy_contract: bool = False,
+    require_risk_test_matrix_contract: bool = False,
 ) -> StructuredPlanRevision | str:
     parsed = validate_structured_plan_revision(
         text,
         required_architecture_impact_contract=(1 if require_architecture_impact else 0),
         require_execution_strategy_contract=(1 if require_execution_strategy_contract else 0),
+        require_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
     )
     if parsed is not None:
         allowed_ids = {item.item_id for item in unresolved_items}
@@ -5795,6 +5816,11 @@ def _implement_approved_issue(
             expected_hash=plan_hash,
             expected_subject=plan_subject,
         )
+    if execution_recommendation is not None and approved_plan_context.matrix_available:
+        validate_risk_matrix_ownership(
+            approved_plan_context.risk_test_matrix_payload,
+            execution_recommendation,
+        )
     plan_additions = _extract_current_expected_closing_issue_ids(approved_plan)
     implementation_requirements = deduplicate_human_requirements(
         [
@@ -6001,6 +6027,12 @@ def _implement_approved_issue(
             ),
             require_risk_test_matrix_contract=(
                 approved_plan_context is not None and approved_plan_context.matrix_available
+            ),
+            authoritative_test_observations=runner.local_test_observations(),
+            delivered_risk_test_matrix_row_ids=(
+                approved_plan_context.risk_test_matrix_expected_row_ids
+                if approved_plan_context is not None and approved_plan_context.matrix_available
+                else None
             ),
         ),
         usage_context=usage_context,
@@ -6262,6 +6294,18 @@ def _decompose_approved_plan(
             approved_plan=approved_plan,
             plan_subject=plan_subject,
         )
+    if execution_recommendation is not None:
+        parent_matrix_context = make_approved_plan_context(
+            approved_plan,
+            source_locator=f"issue #{issue_number} approved-plan topology",
+            expected_hash=plan_hash,
+            expected_subject=plan_subject,
+        )
+        if parent_matrix_context.matrix_available:
+            validate_risk_matrix_ownership(
+                parent_matrix_context.risk_test_matrix_payload,
+                execution_recommendation,
+            )
     if normalized_topology is not None:
         decomposition, retained_parent_scope = normalized_topology
         reject_legacy_topology_collision(
@@ -6490,6 +6534,10 @@ def _run_plan_first_loop(
     require_fresh_execution_contract = bool(
         getattr(config, "execution_strategy_contract_required", False)
     )
+    # Generation-1 plans use the same fresh-contract gate as the execution
+    # recommendation.  The default config enables both; test/legacy callers
+    # that explicitly disable fresh planning contracts remain compatible.
+    require_fresh_matrix_contract = require_fresh_execution_contract
     coder_session_id: str | None = None
     reviewer_session_ids: dict[AgentName, str | None] = {}
     unresolved_items: list[UnresolvedReviewItem] = []
@@ -6520,6 +6568,9 @@ def _run_plan_first_loop(
                     require_execution_strategy_contract=(
                         1 if require_fresh_execution_contract else 0
                     ),
+                    require_risk_test_matrix_contract=(
+                        1 if require_fresh_matrix_contract else 0
+                    ),
                 ),
                 human_requirements=human_requirements,
                 requirement_scope="planning requirements",
@@ -6531,6 +6582,7 @@ def _run_plan_first_loop(
             repair_surfaced_requirement_ids=plan_human_requirements_context.surfaced_requirement_ids,
             repair_requires_direct_discussion_ack=plan_human_requirements_context.requires_direct_discussion_ack,
             require_execution_strategy_contract=require_fresh_execution_contract,
+            require_risk_test_matrix_contract=require_fresh_matrix_contract,
             operation_description="planning",
         )
         plan_output = plan_response.text
@@ -6548,6 +6600,9 @@ def _run_plan_first_loop(
             plan_output,
             require_execution_strategy_contract=(
                 1 if require_fresh_execution_contract else 0
+            ),
+            require_risk_test_matrix_contract=(
+                1 if require_fresh_matrix_contract else 0
             ),
         )
         if isinstance(structured_plan, StructuredPlanState):
@@ -7556,6 +7611,23 @@ def _run_plan_first_loop(
                     ),
                     plan_subject=plan_subject,
                 )
+                child_plan_context = make_approved_plan_context(
+                    current_plan,
+                    source_locator=f"issue #{issue_number} topology checkpoint phase 1",
+                    expected_hash=plan_hash,
+                    expected_subject=plan_subject,
+                )
+                child_plan_context = scope_approved_plan_matrix(
+                    child_plan_context,
+                    execution_owner=(
+                        first_agent_phase.phase.stage_id
+                        or str(first_agent_phase.phase.position)
+                    ),
+                    valid_stage_ids=tuple(
+                        phase.stage_id or str(phase.position)
+                        for phase in recommendation.child_stages
+                    ) if recommendation is not None else (),
+                )
                 return _implement_approved_issue(
                     runner,
                     issue_number=first_agent_phase.issue_number,
@@ -7563,10 +7635,7 @@ def _run_plan_first_loop(
                     config=config,
                     memory=memory,
                     issue_context=child_issue_context,
-                    approved_plan_context=make_approved_plan_context(
-                        current_plan,
-                        source_locator=f"issue #{issue_number} topology checkpoint phase 1",
-                    ),
+                    approved_plan_context=child_plan_context,
                     parent_issue_context=parent_issue_context,
                     coder_session_id=coder_session_id,
                     usage_context=usage_context,
@@ -7867,6 +7936,7 @@ def _run_plan_first_loop(
                     unresolved_items=items,
                     require_architecture_impact=True,
                     require_execution_strategy_contract=require_fresh_execution_contract,
+                    require_risk_test_matrix_contract=require_fresh_matrix_contract,
                 ),
                 human_requirements=human_requirements,
                 requirement_scope="planning requirements",
@@ -7882,6 +7952,7 @@ def _run_plan_first_loop(
                 plan_revision_human_requirements_context.requires_direct_discussion_ack
             ),
             require_execution_strategy_contract=require_fresh_execution_contract,
+            require_risk_test_matrix_contract=require_fresh_matrix_contract,
             repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
             ledger_incomplete=round_ledger_incomplete,
             operation_description="plan revision",
@@ -9900,6 +9971,11 @@ def _fresh_pr_qualification_snapshot(
     allow_plan_handoff_change: bool = False,
 ) -> tuple[PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None, AgentLoopConfig]:
     """Refetch the PR-side qualification inputs immediately before a gate."""
+    staged_owner = (
+        approved_plan_context.risk_test_matrix_execution_owner
+        if approved_plan_context is not None
+        else None
+    )
     context = get_pr_review_context(runner, config=config, pr_number=pr_number)
     approved_identity = _latest_pr_approval_architecture_identity(
         context.comments, head_sha=context.metadata.head_sha
@@ -10068,6 +10144,15 @@ def _fresh_pr_qualification_snapshot(
                 "Approved plan identity changed or disappeared during PR qualification; "
                 "stale approvals cannot be used for this head."
             )
+    if (
+        staged_owner
+        and fresh_approved_plan_context is not None
+        and fresh_approved_plan_context.matrix_available
+    ):
+        fresh_approved_plan_context = scope_approved_plan_matrix(
+            fresh_approved_plan_context,
+            execution_owner=staged_owner,
+        )
     requirements = _build_requirements_context(
         target_issue_context=fresh_issue,
         pr_context=context,
@@ -10377,6 +10462,13 @@ def run_pr_loop(
                 issue_number=issue_context.number,
                 repo=config.repo,
             )
+            # These values are populated only for a validated decomposition
+            # phase marker.  Keep ordinary approved-plan resumes on the normal
+            # full-matrix path without relying on branch-local state.
+            fresh_phase = False
+            phase_handoff = None
+            stable_stage_id = None
+            normalized = None
             if issue_handoff is not None and issue_handoff.pr_number != pr_number:
                 plan_bound_handoff = (
                     issue_handoff.flow == "approved-plan-implementation"
@@ -10691,6 +10783,16 @@ def run_pr_loop(
                                 )
                                 if parent_candidate.is_available:
                                     approved_plan_context = parent_candidate
+                    if (
+                        fresh_phase
+                        and phase_handoff is not None
+                        and approved_plan_context.matrix_available
+                    ):
+                        approved_plan_context = scope_approved_plan_matrix(
+                            approved_plan_context,
+                            execution_owner=stable_stage_id,
+                            valid_stage_ids=tuple(stage.stage_id for stage in normalized.phases),
+                        )
                     if not approved_plan_context.is_available:
                         raise AgentLoopError(
                             f"PR #{pr_number} is bound to approved plan {issue_handoff.plan_hash}, "
@@ -14162,6 +14264,26 @@ def run_pr_loop(
                     # Every new coder-followup response is v1. A missing
                     # document must not silently downgrade the protocol.
                     required_architecture_impact_contract=1,
+                    delivered_risk_test_matrix=(
+                        approved_plan_context.risk_test_matrix_payload
+                        if approved_plan_context is not None and approved_plan_context.matrix_available
+                        else None
+                    ),
+                    delivered_risk_test_matrix_identity=(
+                        approved_plan_context.risk_test_matrix_identity
+                        if approved_plan_context is not None and approved_plan_context.matrix_available
+                        else None
+                    ),
+                    required_risk_test_matrix_contract=(
+                        1 if approved_plan_context is not None and approved_plan_context.matrix_available
+                        else 0
+                    ),
+                    authoritative_test_observations=runner.local_test_observations(),
+                    delivered_risk_test_matrix_row_ids=(
+                        approved_plan_context.risk_test_matrix_expected_row_ids
+                        if approved_plan_context is not None and approved_plan_context.matrix_available
+                        else None
+                    ),
                 ),
                 usage_context=usage_context,
                 role="coder",

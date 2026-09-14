@@ -101,6 +101,8 @@ def validate_response_text(
     require_risk_test_matrix_contract: int = 0,
     delivered_risk_test_matrix: object = None,
     delivered_risk_test_matrix_identity: str | None = None,
+    authoritative_test_observations=None,
+    delivered_risk_test_matrix_row_ids=None,
 ) -> object:
     """Validate response text with the same context used by the helper CLI.
 
@@ -192,6 +194,8 @@ def validate_response_text(
             delivered_risk_test_matrix=delivered_risk_test_matrix,
             delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
             required_risk_test_matrix_contract=require_risk_test_matrix_contract,
+            authoritative_test_observations=authoritative_test_observations,
+            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
         )
     if kind == "issue_implementation":
         from coding_review_agent_loop.orchestrator import _validate_issue_implementation_response
@@ -203,6 +207,8 @@ def validate_response_text(
             delivered_risk_test_matrix=delivered_risk_test_matrix,
             delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,
             require_risk_test_matrix_contract=(require_risk_test_matrix_contract == 1),
+            authoritative_test_observations=authoritative_test_observations,
+            delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
         )
 
     parsed = validate_structured_plan_revision(
@@ -268,6 +274,18 @@ def main() -> None:
     current_round_items = _deserialize_unresolved_items(list(ctx.get("current_round_items", [])))
     raw_human_requirements = list(ctx.get("human_requirements", []))
     human_requirements = _deserialize_human_requirements(raw_human_requirements)
+    # A matrix-bearing helper validation has no verified evidence authority
+    # unless the bounded local-evidence carrier decodes successfully.  Passing
+    # an empty sequence is intentional: it prevents a claimed `verified` row
+    # from passing on citation shape alone.
+    authoritative_test_observations = []
+    local_test_evidence = ctx.get("local_test_evidence")
+    if isinstance(local_test_evidence, str):
+        from coding_review_agent_loop.local_test_evidence import decode_bounded_evidence
+
+        decoded = decode_bounded_evidence(local_test_evidence)
+        if decoded is not None:
+            authoritative_test_observations = decoded.observations
 
     kind = args.kind
     try:
@@ -286,6 +304,8 @@ def main() -> None:
             ),
             delivered_risk_test_matrix=ctx.get("risk_test_matrix"),
             delivered_risk_test_matrix_identity=ctx.get("risk_test_matrix_identity"),
+            authoritative_test_observations=authoritative_test_observations,
+            delivered_risk_test_matrix_row_ids=ctx.get("risk_test_matrix_expected_row_ids"),
         )
     except AgentLoopError as exc:
         print(f"validation failed: {kind}: {exc}", file=sys.stderr)

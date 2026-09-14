@@ -400,11 +400,15 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             kind = payload.get("kind") if isinstance(payload, dict) else None
             if kind == "plan_state":
                 parsed_strategy = validate_structured_plan_state(
-                    identity_source, require_execution_strategy_contract=1
+                    identity_source,
+                    require_execution_strategy_contract=1,
+                    require_risk_test_matrix_contract=1,
                 )
             elif kind == "plan_revision":
                 parsed_strategy = validate_structured_plan_revision(
-                    identity_source, require_execution_strategy_contract=1
+                    identity_source,
+                    require_execution_strategy_contract=1,
+                    require_risk_test_matrix_contract=1,
                 )
             else:
                 raise AgentLoopError(
@@ -546,6 +550,40 @@ def cmd_attach_metadata(args: argparse.Namespace) -> None:
             architecture_impact = sanitize_architecture_impact(raw_impact)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             print(f"state_manager: cannot read architecture impact: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    if risk_test_matrix_identity_value is not None:
+        from coding_review_agent_loop.comment_rendering import (
+            RISK_TEST_MATRIX_MARKER_RE,
+            decode_risk_test_matrix_marker,
+        )
+        from coding_review_agent_loop.round_transport import risk_test_matrix_section_boundary
+
+        if canonical_plan is None or risk_test_matrix_section_boundary(
+            risk_test_matrix_identity_value
+        ) not in canonical_plan:
+            print(
+                "state_manager: canonical plan is missing the authenticated risk matrix section boundary",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        marker = RISK_TEST_MATRIX_MARKER_RE.search(canonical_plan)
+        if marker is None:
+            print(
+                "state_manager: canonical plan is missing the structured risk matrix marker",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            marker_payload = decode_risk_test_matrix_marker(marker.group("payload"))
+        except (AgentLoopError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"state_manager: canonical plan risk matrix marker is invalid: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if marker_payload.get("identity") != risk_test_matrix_identity_value:
+            print(
+                "state_manager: canonical plan risk matrix marker does not match the structured payload",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
     metadata = PostedRoundMetadata(

@@ -74,6 +74,15 @@ for the mechanical containment boundary.
 Skill-mode test gates select this policy with
 `AGENT_LOOP_CONTAINMENT_MODE=auto|required|off`; the default is `auto`.
 
+Fresh generation-1 plan turns use the execution and risk-matrix contract gates
+together. A matrix is either a bounded set of meaningful mode/transition rows
+or a non-empty proportionate not-applicable rationale; row-level
+`not-applicable` entries do not create coder evidence obligations. The skill
+persists the structured payload and its audit separately from rendered prose,
+and skill implementation/follow-up turns must map applicable rows to
+authoritative test receipts. Historical unversioned plans remain resumable
+without fabricated rows.
+
 ## How to invoke this skill
 
 Open a Claude Code session **in the `coding-review-agent-loop` repo root** (or

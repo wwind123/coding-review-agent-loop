@@ -42,6 +42,14 @@ recover a complete v1 source before applying format-only correction. The
 existing explicit skill helpers remain unchanged.
 
 Skill planning uses the same bounded risk-matrix contract as the headless CLI.
+Fresh plan-state and plan-revision validation gates require the generation-1
+matrix fields alongside the execution-strategy fields. The skill carries the
+authenticated structured payload through implementation and PR-fix turns;
+verified row evidence must cite an authoritative test receipt, while failed,
+timed-out, stale, and incomplete observations remain caveats. Row-level
+`not-applicable` scenarios are excluded from evidence obligations, and a
+matrix-wide not-applicable plan requires a non-empty rationale. Legacy
+unversioned records remain resumable without invented matrix rows.
 For stateful or multi-mode work, a fresh plan can require generation 1 with
 applicable rows or a proportionate not-applicable rationale. The structured
 payload is carried in round metadata and sidecars, while the rendered matrix is

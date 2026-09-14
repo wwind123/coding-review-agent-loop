@@ -128,7 +128,11 @@ drift therefore does not invalidate authentic history; malformed, oversized, or
 matrix-only hydration/rendering data closes only the matrix channel and leaves
 an independently valid plan hash/subject available. Legacy records remain
 resumable without fabricated obligations, and implementation evidence preserves
-row-level incomplete and test-receipt caveats.
+row-level incomplete and test-receipt caveats. During staged execution, the
+approved topology assigns each applicable row to one owner: a generated child
+enforces only its owned rows while retaining sibling, later, and final rows as
+read-only pending obligations, and a separately planned child must link its
+rows to inherited parent obligations or surface a provenance conflict.
 
 Decomposition into child phases and materialization of split proposals are
 distinct workflows, with typed topology and durable checkpoints. They are not

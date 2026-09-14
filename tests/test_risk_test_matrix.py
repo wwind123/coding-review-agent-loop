@@ -25,6 +25,7 @@ from coding_review_agent_loop.round_state import (
     _decode_round_metadata,
     _encode_round_metadata,
     make_approved_plan_context,
+    scope_approved_plan_matrix,
 )
 from coding_review_agent_loop.round_transport import (
     prepare_round_comment,
@@ -156,7 +157,7 @@ def test_m780_06_metadata_round_trip_authenticates_payload_not_rendered_words() 
         agent="Codex",
         round_number=1,
         subject="subject",
-        canonical_plan="A canonical plan",
+        canonical_plan="A canonical plan\n\n" + render_risk_test_matrix_section(matrix),
         risk_test_matrix_contract_version=1,
         risk_test_matrix_payload=matrix.to_payload(),
         risk_test_matrix_identity=identity,
@@ -199,7 +200,10 @@ def test_m780_07_approved_context_has_matrix_channel_even_if_renderer_wording_ch
     matrix = parse_risk_test_matrix(_matrix())
     identity = risk_test_matrix_identity(matrix)
     context = make_approved_plan_context(
-        "Summary\n\n### Risk-based mode and transition test matrix\nA renderer changed this table.",
+        "Summary\n\n" + render_risk_test_matrix_section(matrix).replace(
+            "### Risk-based mode and transition test matrix",
+            "### Risk-based mode and transition test matrix (renderer v2)",
+        ),
         expected_hash=None,
         risk_test_matrix_contract_version=1,
         risk_test_matrix_payload=matrix.to_payload(),
@@ -257,3 +261,113 @@ def test_m780_09_public_evidence_renders_outstanding_rows_first() -> None:
         agent="Codex",
     )
     assert text.index("row-ordinary") < text.index("AGENT_STATE")
+
+
+def test_m780_05_verified_evidence_requires_a_passing_authoritative_receipt() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = {
+        "matrix_identity": identity,
+        "rows": [{
+            "row_id": "row-ordinary", "status": "verified",
+            "test_identifiers": ["test_review_only_recovery"],
+            "test_locations": ["tests/test_orchestrator_pr.py:1"],
+            "workflow_path_claim": "The orchestrator recovery path was exercised.",
+            "outcome_assertions": ["The workflow completes."],
+            "forbidden_effect_assertions": ["No stale head was merged."],
+            "evidence_citations": [{
+                "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
+                "receipt_id": "receipt-1",
+                "claim": "current-result",
+            }],
+        }],
+    }
+    authoritative = SimpleNamespace(
+        receipt_id="receipt-1",
+        claim=None,
+        normalized_command="python3 -m pytest tests/test_orchestrator_pr.py -q",
+        outcome="passed",
+        provenance="parent-observed",
+        public_projection=lambda: {"command": "python3 -m pytest tests/test_orchestrator_pr.py -q"},
+    )
+    parsed = parse_risk_test_matrix_evidence(
+        evidence,
+        matrix=matrix,
+        authoritative_test_observations=[authoritative],
+    )
+    assert parsed.rows[0].status == "verified"
+    with pytest.raises(AgentLoopError, match="authoritative.*receipts"):
+        parse_risk_test_matrix_evidence(
+            evidence,
+            matrix=matrix,
+            authoritative_test_observations=[],
+        )
+
+
+def test_m780_05_row_not_applicable_is_not_an_evidence_obligation() -> None:
+    payload = _matrix()
+    payload["rows"] = [
+        _row("row-required"),
+        {**_row("row-excluded"), "applicability": "not-applicable"},
+    ]
+    matrix = parse_risk_test_matrix(payload)
+    identity = risk_test_matrix_identity(matrix)
+    evidence = parse_risk_test_matrix_evidence(
+        {
+            "matrix_identity": identity,
+            "rows": [{
+                "row_id": "row-required", "status": "missing",
+                "test_identifiers": [], "test_locations": [],
+                "workflow_path_claim": "Not run.", "outcome_assertions": [],
+                "forbidden_effect_assertions": [], "evidence_citations": [],
+            }],
+        },
+        matrix=matrix,
+    )
+    assert [row.row_id for row in evidence.rows] == ["row-required"]
+
+
+def test_m780_08c_oversized_matrix_is_omitted_atomically_from_prompt_context() -> None:
+    large = {**_row(), "label": "x" * 900, "expected_outcome": "y" * 900}
+    matrix = parse_risk_test_matrix({**_matrix(), "rows": [large]})
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        "Approved plan prose\n\n" + render_risk_test_matrix_section(matrix),
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    from coding_review_agent_loop.prompts import format_approved_plan_context
+
+    rendered = format_approved_plan_context(context, max_chars=2_000)
+    assert "matrix: unavailable" in rendered
+    assert "zero matrix rows are enforceable" in rendered
+    assert "Row row-ordinary" not in rendered
+
+
+def test_m780_12_staged_context_keeps_pending_rows_read_only() -> None:
+    payload = _matrix()
+    payload["rows"] = [
+        {**_row("row-owned"), "execution_owner": "stage-first"},
+        {**_row("row-later"), "execution_owner": "stage-later"},
+    ]
+    matrix = parse_risk_test_matrix(payload)
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        render_risk_test_matrix_section(matrix),
+        expected_hash=None,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    scoped = scope_approved_plan_matrix(
+        context,
+        execution_owner="stage-first",
+        valid_stage_ids=("stage-first", "stage-later"),
+    )
+    assert scoped.risk_test_matrix_expected_row_ids == ("row-owned",)
+    assert scoped.risk_test_matrix_pending_row_ids == ("row-later",)

@@ -2748,6 +2748,7 @@ def _save_coder_raw_to_repair_dir(
     architecture_contract_version: int | None = None,
     execution_strategy_contract_version: int | None = None,
     execution_strategy_contract_required: bool = False,
+    risk_test_matrix_contract_required: bool = False,
     gemini_cmd: str = "gemini",
 ) -> Path:
     """Copy the coder's raw response + context to a stable repair dir.
@@ -2778,6 +2779,8 @@ def _save_coder_raw_to_repair_dir(
         manifest["execution_strategy_contract_version"] = execution_strategy_contract_version
     if execution_strategy_contract_required:
         manifest["execution_strategy_contract_required"] = True
+    if risk_test_matrix_contract_required:
+        manifest["risk_test_matrix_contract_required"] = True
     (repair_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return repair_dir
 
@@ -2802,6 +2805,7 @@ def _complete_coder_turn(
     requires_direct_discussion_ack: bool = False,
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
+    require_risk_test_matrix_contract: int = 0,
     architecture_identity: dict | None = None,
     architecture_contract_version: int | None = None,
 ) -> dict:
@@ -2822,6 +2826,7 @@ def _complete_coder_turn(
             prior_items=next_prior_items_raw,
             required_architecture_impact_contract=required_architecture_impact_contract,
             require_execution_strategy_contract=require_execution_strategy_contract,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         )
         if kind == "plan_revision" and (
             surfaced_requirement_ids or requires_direct_discussion_ack
@@ -2880,6 +2885,7 @@ def _complete_coder_turn(
         parsed_plan = validate_structured_plan_state(
             raw_text,
             require_execution_strategy_contract=require_execution_strategy_contract,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         )
         if parsed_plan is not None and parsed_plan.execution_recommendation is not None:
             canonical_text = render_canonical_plan_state(parsed_plan)
@@ -2899,6 +2905,11 @@ def _complete_coder_turn(
                     if require_execution_strategy_contract
                     else []
                 ),
+                *(
+                    ["--require-risk-test-matrix-contract"]
+                    if require_risk_test_matrix_contract
+                    else []
+                ),
                 *(["--model", coder_model] if coder_model else []),
             )
             raw_structured_file = work_dir / "coder-raw-structured.json"
@@ -2911,6 +2922,7 @@ def _complete_coder_turn(
         parsed = validate_structured_plan_revision(
             raw_text,
             require_execution_strategy_contract=require_execution_strategy_contract,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         )
         if parsed is None:
             raise _ValidationError(
@@ -2936,6 +2948,11 @@ def _complete_coder_turn(
             *(
                 ["--require-execution-strategy-contract"]
                 if require_execution_strategy_contract
+                else []
+            ),
+            *(
+                ["--require-risk-test-matrix-contract"]
+                if require_risk_test_matrix_contract
                 else []
             ),
             *(["--model", coder_model] if coder_model else []),
@@ -3181,6 +3198,7 @@ def _run_external_coder_phase(
             ),
             architecture_contract_version=1,
             execution_strategy_contract_required=True,
+            risk_test_matrix_contract_required=True,
             gemini_cmd=gemini_cmd,
         )
 
@@ -3203,6 +3221,7 @@ def _run_external_coder_phase(
                 requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
                 required_architecture_impact_contract=1,
                 require_execution_strategy_contract=1,
+                require_risk_test_matrix_contract=1,
                 architecture_identity=(
                     coder_architecture.identity()
                     if hasattr(coder_architecture, "identity") else None
@@ -3627,6 +3646,7 @@ def _run_host_coder_phase(
             "--file", str(plan_file),
             "--kind", "plan_state",
             "--require-execution-strategy-contract",
+            "--require-risk-test-matrix-contract",
         )
         if result.returncode != 0:
             print(f"skill_runner: plan validation failed: {result.stderr.strip()}", file=sys.stderr)
@@ -4314,6 +4334,12 @@ def cmd_retry_validate(args: argparse.Namespace) -> None:
                     or manifest.get("execution_strategy_contract_version") == 1
                     else 0
                 ),
+                require_risk_test_matrix_contract=(
+                    1
+                    if manifest.get("risk_test_matrix_contract_required")
+                    or manifest.get("risk_test_matrix_contract_version") == 1
+                    else 0
+                ),
             )
         except FreshContractIntegrityError as exc:
             print(
@@ -4504,6 +4530,8 @@ def _validate_coder_implementation_response(
     *,
     workdir: str,
     human_requirements,
+    approved_plan_context=None,
+    authoritative_test_observations=None,
 ) -> object:
     """Validate an external coder's typed implementation response.
 
@@ -4526,6 +4554,25 @@ def _validate_coder_implementation_response(
     result = _validate_issue_implementation_response(
         coder_output,
         human_requirements=human_requirements,
+        delivered_risk_test_matrix=(
+            approved_plan_context.risk_test_matrix_payload
+            if approved_plan_context is not None and approved_plan_context.matrix_available
+            else None
+        ),
+        delivered_risk_test_matrix_identity=(
+            approved_plan_context.risk_test_matrix_identity
+            if approved_plan_context is not None and approved_plan_context.matrix_available
+            else None
+        ),
+        require_risk_test_matrix_contract=(
+            approved_plan_context is not None and approved_plan_context.matrix_available
+        ),
+        authoritative_test_observations=authoritative_test_observations,
+        delivered_risk_test_matrix_row_ids=(
+            approved_plan_context.risk_test_matrix_expected_row_ids
+            if approved_plan_context is not None and approved_plan_context.matrix_available
+            else None
+        ),
     )
     if isinstance(result, (StructuredIssueImplementation, _TerminalIssueImplementationConflict)):
         parsed = result if isinstance(result, StructuredIssueImplementation) else result.parsed
@@ -4695,6 +4742,7 @@ def _run_child_or_one_shot_implementation(
         approved_plan_hash,
         format_one_shot_impl_handoff_comment,
     )
+    from coding_review_agent_loop.round_state import make_approved_plan_context
     execution_identity = (
         execution_recommendation.identity()
         if execution_recommendation is not None else None
@@ -4723,6 +4771,7 @@ def _run_child_or_one_shot_implementation(
         base=base,
         coder_test_command_timeout_seconds=coder_test_command_timeout_seconds,
         architecture_options=architecture_options,
+        approved_plan_context=make_approved_plan_context(approved_plan),
     )
 
     if dry_run:
@@ -4764,11 +4813,29 @@ def _run_child_or_one_shot_implementation(
             except (OSError, json.JSONDecodeError):
                 coder_usage = None
 
+        response_evidence = None
+        if evidence_file.exists():
+            try:
+                response_evidence = json.loads(evidence_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                response_evidence = None
+        authoritative_test_observations = []
+        if isinstance(response_evidence, dict):
+            from coding_review_agent_loop.local_test_evidence import decode_bounded_evidence
+
+            decoded_evidence = decode_bounded_evidence(
+                response_evidence.get("local_test_evidence")
+            )
+            if decoded_evidence is not None:
+                authoritative_test_observations.extend(decoded_evidence.observations)
+
         try:
             implementation_result = _validate_coder_implementation_response(
                 coder_output,
                 workdir=str(workdir),
                 human_requirements=issue_context.human_requirements,
+                approved_plan_context=make_approved_plan_context(approved_plan),
+                authoritative_test_observations=authoritative_test_observations,
             )
         except AgentLoopError as exc:
             debug_dir = _REPAIR_BASE / f"{issue}-implement-debug"
@@ -5307,6 +5374,15 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
         unresolved_items = tuple(
             _deserialize_unresolved_item(item) for item in active_items_raw
         )
+        authoritative_test_observations = list(runner.local_test_observations())
+        if isinstance(response_evidence, dict):
+            from coding_review_agent_loop.local_test_evidence import decode_bounded_evidence
+
+            decoded_evidence = decode_bounded_evidence(
+                response_evidence.get("local_test_evidence")
+            )
+            if decoded_evidence is not None:
+                authoritative_test_observations.extend(decoded_evidence.observations)
         validate_followup = lambda text: _validate_coder_followup_response(
             text,
             unresolved_items=unresolved_items,
@@ -5315,6 +5391,26 @@ def cmd_run_pr_fix(args: argparse.Namespace) -> None:
             # prompt material only and must not downgrade the response
             # contract.
             required_architecture_impact_contract=1,
+            delivered_risk_test_matrix=(
+                approved_plan_context.risk_test_matrix_payload
+                if approved_plan_context is not None and approved_plan_context.matrix_available
+                else None
+            ),
+            delivered_risk_test_matrix_identity=(
+                approved_plan_context.risk_test_matrix_identity
+                if approved_plan_context is not None and approved_plan_context.matrix_available
+                else None
+            ),
+            required_risk_test_matrix_contract=(
+                1 if approved_plan_context is not None and approved_plan_context.matrix_available
+                else 0
+            ),
+            authoritative_test_observations=authoritative_test_observations,
+            delivered_risk_test_matrix_row_ids=(
+                approved_plan_context.risk_test_matrix_expected_row_ids
+                if approved_plan_context is not None and approved_plan_context.matrix_available
+                else None
+            ),
         )
         try:
             coder_output, parsed = _recover_structured_response(

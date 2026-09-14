@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import shlex
 from collections.abc import Mapping, Sequence
 import dataclasses
 from dataclasses import dataclass, field
@@ -1045,8 +1046,14 @@ def validate_risk_test_matrix_revision(
         item if isinstance(item, RiskTestMatrixChange) else _parse_risk_test_matrix_changes([item])[0]
         for item in changes
     )
-    if approved and old.to_payload() != new.to_payload() and not parsed_changes:
-        raise AgentLoopError("Approved risk test matrix is immutable; substantive changes require explicit replanning.")
+    semantic_changed = old.to_payload() != new.to_payload()
+    if approved and semantic_changed:
+        raise AgentLoopError("Approved risk matrix is immutable; substantive changes require explicit replanning.")
+    if semantic_changed and not parsed_changes:
+        raise AgentLoopError(
+            "Risk matrix changes omit audit operations; semantic changes require explicit "
+            "review-visible audit operations."
+        )
     covered = {row_id for change in parsed_changes for row_id in change.row_ids}
     old_by_id = {row.row_id: row for row in old.rows}
     new_by_id = {row.row_id: row for row in new.rows}
@@ -1090,6 +1097,8 @@ def parse_risk_test_matrix_evidence(
     *,
     matrix: RiskTestMatrix | Mapping[str, object] | None = None,
     expected_identity: str | None = None,
+    authoritative_test_observations: Sequence[object] | None = None,
+    expected_row_ids: Sequence[str] | None = None,
     context: str = "risk_test_matrix_evidence",
 ) -> RiskTestMatrixEvidence:
     payload = _expect_object(value, context=context)
@@ -1107,7 +1116,19 @@ def parse_risk_test_matrix_evidence(
     if len(raw_rows) > RISK_MATRIX_MAX_ROWS:
         raise AgentLoopError(f"{context}.rows exceeds the {RISK_MATRIX_MAX_ROWS}-row bound.")
     parsed_matrix = parse_risk_test_matrix(matrix) if matrix is not None else None
-    expected_ids = {row.row_id for row in parsed_matrix.rows} if parsed_matrix is not None and parsed_matrix.is_applicable else None
+    expected_ids = (
+        set(expected_row_ids)
+        if expected_row_ids is not None
+        else (
+            {
+                row.row_id
+                for row in parsed_matrix.rows
+                if row.applicability in {"applicable", "required"}
+            }
+            if parsed_matrix is not None and parsed_matrix.is_applicable
+            else None
+        )
+    )
     result: list[RiskTestMatrixEvidenceRow] = []
     seen: set[str] = set()
     for index, raw_row in enumerate(raw_rows):
@@ -1153,11 +1174,67 @@ def parse_risk_test_matrix_evidence(
                 f"{row_context} with status `verified` must include test identifiers, locations, "
                 "outcome and forbidden-effect assertions, and evidence citations."
             )
+        if authoritative_test_observations is not None:
+            invalid = []
+            for citation in result[-1].evidence_citations:
+                matches = [
+                    observation
+                    for observation in authoritative_test_observations
+                    if _citation_matches_observation(citation, observation)
+                ]
+                if not matches or (
+                    status == "verified"
+                    and not any(
+                        getattr(observation, "outcome", None) == "passed"
+                        and getattr(observation, "provenance", None) == "parent-observed"
+                        for observation in matches
+                    )
+                ):
+                    invalid.append(citation.receipt_id)
+            if invalid:
+                raise AgentLoopError(
+                    f"{row_context} contains citations without matching authoritative "
+                    + ("passing " if status == "verified" else "")
+                    + "test receipts: " + ", ".join(invalid)
+                )
     if expected_ids is not None and {row.row_id for row in result} != expected_ids:
         missing = sorted(expected_ids - {row.row_id for row in result})
         extra = sorted({row.row_id for row in result} - expected_ids)
         raise AgentLoopError(f"{context} must map every delivered row exactly once (missing={missing}, extra={extra}).")
     return RiskTestMatrixEvidence(matrix_identity=identity, rows=tuple(result))
+
+
+def _citation_matches_observation(
+    citation: TestObservationCitation,
+    observation: object,
+) -> bool:
+    """Match a coder citation to a live broker observation, not just its shape."""
+    observed_claim = getattr(observation, "claim", None)
+    if (
+        getattr(observation, "receipt_id", None) != citation.receipt_id
+        or (
+            observed_claim is not None
+            and observed_claim != citation.claim
+        )
+        or (observed_claim is None and citation.claim != "current-result")
+    ):
+        return False
+    commands: set[str] = set()
+    projected = getattr(observation, "public_projection", None)
+    if callable(projected):
+        try:
+            value = projected()
+        except Exception:  # pragma: no cover - defensive provider boundary
+            value = None
+        if isinstance(value, Mapping) and isinstance(value.get("command"), str):
+            commands.add(value["command"])
+    normalized = getattr(observation, "normalized_command", None)
+    if isinstance(normalized, str):
+        commands.add(normalized)
+    command = getattr(observation, "command", None)
+    if isinstance(command, (tuple, list)) and all(isinstance(item, str) for item in command):
+        commands.add(shlex.join(command))
+    return citation.command in commands
 
 
 def _parse_risk_test_matrix_contract_fields(
@@ -3188,6 +3265,8 @@ def validate_structured_coder_followup(
     delivered_risk_test_matrix: RiskTestMatrix | Mapping[str, object] | None = None,
     delivered_risk_test_matrix_identity: str | None = None,
     required_risk_test_matrix_contract: int = 0,
+    authoritative_test_observations: Sequence[object] | None = None,
+    delivered_risk_test_matrix_row_ids: Sequence[str] | None = None,
 ) -> StructuredCoderFollowup | None:
     payload = _extract_structured_coder_followup_payload(text)
     if payload is None:
@@ -3253,6 +3332,8 @@ def validate_structured_coder_followup(
             payload["risk_test_matrix_evidence"],
             matrix=delivered_risk_test_matrix,
             expected_identity=delivered_risk_test_matrix_identity,
+            authoritative_test_observations=authoritative_test_observations,
+            expected_row_ids=delivered_risk_test_matrix_row_ids,
             context="coder_followup.risk_test_matrix_evidence",
         )
     elif required_risk_test_matrix_contract and delivered_risk_test_matrix is not None and parse_risk_test_matrix(delivered_risk_test_matrix).is_applicable:
@@ -3351,6 +3432,8 @@ def validate_structured_issue_implementation(
     delivered_risk_test_matrix: RiskTestMatrix | Mapping[str, object] | None = None,
     delivered_risk_test_matrix_identity: str | None = None,
     required_risk_test_matrix_contract: int = 0,
+    authoritative_test_observations: Sequence[object] | None = None,
+    delivered_risk_test_matrix_row_ids: Sequence[str] | None = None,
 ) -> StructuredIssueImplementation | None:
     """Parse and validate the strict issue-implementation result envelope.
 
@@ -3427,6 +3510,8 @@ def validate_structured_issue_implementation(
             payload["risk_test_matrix_evidence"],
             matrix=delivered_risk_test_matrix,
             expected_identity=delivered_risk_test_matrix_identity,
+            authoritative_test_observations=authoritative_test_observations,
+            expected_row_ids=delivered_risk_test_matrix_row_ids,
             context="issue_implementation.risk_test_matrix_evidence",
         )
     elif required_risk_test_matrix_contract and delivered_risk_test_matrix is not None and parse_risk_test_matrix(delivered_risk_test_matrix).is_applicable:

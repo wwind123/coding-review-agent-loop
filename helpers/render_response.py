@@ -81,6 +81,14 @@ def main() -> None:
 
     ctx = _load_context(args.context_file)
     prior_items = [_deserialize_unresolved_item(i) for i in ctx.get("prior_items", [])]
+    authoritative_test_observations = []
+    local_test_evidence = ctx.get("local_test_evidence")
+    if isinstance(local_test_evidence, str):
+        from coding_review_agent_loop.local_test_evidence import decode_bounded_evidence
+
+        decoded = decode_bounded_evidence(local_test_evidence)
+        if decoded is not None:
+            authoritative_test_observations = decoded.observations
 
     try:
         if args.kind == "pr_review":
@@ -111,6 +119,8 @@ def main() -> None:
                 required_risk_test_matrix_contract=(
                     1 if args.require_risk_test_matrix_contract else 0
                 ),
+                authoritative_test_observations=authoritative_test_observations,
+                delivered_risk_test_matrix_row_ids=ctx.get("risk_test_matrix_expected_row_ids"),
             )
             if parsed is None:
                 print("render_response: coder_followup did not parse", file=sys.stderr)
@@ -146,6 +156,8 @@ def main() -> None:
                 delivered_risk_test_matrix=ctx.get("risk_test_matrix"),
                 delivered_risk_test_matrix_identity=ctx.get("risk_test_matrix_identity"),
                 require_risk_test_matrix_contract=args.require_risk_test_matrix_contract,
+                authoritative_test_observations=authoritative_test_observations,
+                delivered_risk_test_matrix_row_ids=ctx.get("risk_test_matrix_expected_row_ids"),
             )
             parsed = getattr(parsed_result, "parsed", parsed_result)
             rendered = render_public_agent_comment(

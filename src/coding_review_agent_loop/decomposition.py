@@ -32,7 +32,9 @@ from .protocol import (
     ExecutionCouplingConstraint,
     ExecutionScopeItem,
     ExecutionStrategyRecommendation,
+    RiskTestMatrix,
     parse_architecture_impact,
+    parse_risk_test_matrix,
     parse_execution_recommendation_payload,
     sanitize_architecture_impact,
 )
@@ -350,6 +352,37 @@ def normalize_execution_recommendation(
         caveats=recommendation.caveats,
     )
     return decomposition, retained_scope
+
+
+def validate_risk_matrix_ownership(
+    matrix: RiskTestMatrix | dict[str, object] | None,
+    recommendation: ExecutionStrategyRecommendation,
+) -> None:
+    """Ensure every matrix owner is a real owner in the approved topology."""
+    if matrix is None:
+        return
+    parsed = matrix if isinstance(matrix, RiskTestMatrix) else parse_risk_test_matrix(matrix)
+    stage_ids = {stage.stage_id for stage in recommendation.child_stages}
+    allowed = {"one-shot", "retained-parent", "final-integration", *stage_ids}
+    unknown = sorted({row.execution_owner for row in parsed.rows} - allowed)
+    if unknown:
+        raise AgentLoopError(
+            "Risk matrix rows name execution owners absent from the approved topology: "
+            + ", ".join(unknown)
+        )
+    if recommendation.strategy == "one-shot":
+        invalid = sorted(
+            {
+                row.execution_owner
+                for row in parsed.rows
+                if row.execution_owner != "one-shot"
+            }
+        )
+        if invalid:
+            raise AgentLoopError(
+                "One-shot recommendations may assign matrix rows only to `one-shot`: "
+                + ", ".join(invalid)
+            )
 
 
 # Descriptive alias used by callers that want to emphasize the reviewed
