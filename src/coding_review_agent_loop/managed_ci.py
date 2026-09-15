@@ -2783,6 +2783,7 @@ def _find_resume_audit(
             or (
                 expected_handoff is not None
                 and expected_handoff.active_label_event_id is not None
+                and authorization.head_sha == expected_handoff.head_sha
                 and authorization.label_event_id != expected_handoff.active_label_event_id
             )
         ):

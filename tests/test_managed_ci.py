@@ -1103,6 +1103,10 @@ def test_fresh_authorization_supersedes_prior_grant_for_verified_descendant(tmp_
         approved_plan_hash="a" * 64,
     )
     runner.rest_pr["head"]["sha"] = "descendant"
+    # A recovery may relabel the PR before authorizing the descendant head.
+    # Historical grants remain bound to their own actor-owned label events;
+    # only the terminal grant must match the current handoff event.
+    runner.issue_events.append(label_event(202))
     runner.compare_payload = {
         "status": "ahead",
         "base_commit": {"sha": "abc123"},
@@ -1123,6 +1127,7 @@ def test_fresh_authorization_supersedes_prior_grant_for_verified_descendant(tmp_
     assert parsed is not None
     assert parsed.predecessor_head == "abc123"
     assert parsed.predecessor_comment_id == first.authorization_comment_id
+    assert parsed.label_event_id == 202
 
     resume = _find_resume_audit(
         runner,
