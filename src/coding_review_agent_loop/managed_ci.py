@@ -12,7 +12,7 @@ from datetime import datetime
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from .ci_health import (
     CiInfrastructureStall,
@@ -1244,6 +1244,37 @@ def _authorization_comment_records(
     return records
 
 
+def _github_proves_descendant(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    predecessor_head: str,
+    live_head: str,
+) -> bool:
+    """Return whether GitHub proves that live_head descends from predecessor_head."""
+    comparison = _api_json(
+        runner,
+        config,
+        (
+            f"repos/{config.repo}/compare/"
+            f"{quote(predecessor_head, safe='')}...{quote(live_head, safe='')}"
+        ),
+    )
+    base_commit = (
+        comparison.get("base_commit")
+        if isinstance(comparison.get("base_commit"), dict) else {}
+    )
+    merge_base = (
+        comparison.get("merge_base_commit")
+        if isinstance(comparison.get("merge_base_commit"), dict) else {}
+    )
+    return (
+        comparison.get("status") == "ahead"
+        and base_commit.get("sha") == predecessor_head
+        and merge_base.get("sha") == predecessor_head
+    )
+
+
 def find_actor_round_metadata_comment_ids(
     runner: Runner,
     *,
@@ -1794,15 +1825,41 @@ def authorize_fresh_issue_created_resume(
             "Managed-CI fresh authorization requires a server-observed issue-to-PR "
             "association for the explicit issue scope."
         )
-    for _comment_id, record in records:
-        if (
-            record.repository.casefold() == config.repo.casefold()
-            and record.issue_number == issue_number
-            and record.pr_number == pr_number
+    scoped_records = [
+        (comment_id, record)
+        for comment_id, record in records
+        if record.repository.casefold() == config.repo.casefold()
+        and record.issue_number == issue_number
+        and record.pr_number == pr_number
+    ]
+    incompatible_records = [
+        record
+        for _comment_id, record in scoped_records
+        if record.base_ref != config.base
+        or record.actor_login.casefold() != actor_login.casefold()
+        or record.actor_id != actor_id
+        or record.waiver != "allow-unprotected-managed-ci"
+        or (record.approved_plan_hash or None) != (approved_plan_hash or None)
+    ]
+    if incompatible_records:
+        raise AgentLoopError(
+            "Managed-CI fresh authorization found a conflicting actor-owned record; refusing to proceed."
+        )
+    predecessor: tuple[int, ManagedCiIssueAuthorization] | None = None
+    for candidate in sorted(scoped_records, key=lambda item: item[0], reverse=True):
+        if _github_proves_descendant(
+            runner,
+            config=config,
+            predecessor_head=candidate[1].head_sha,
+            live_head=metadata.head_sha,
         ):
-            raise AgentLoopError(
-                "Managed-CI fresh authorization found a conflicting actor-owned record; refusing to proceed."
-            )
+            predecessor = candidate
+            break
+    if scoped_records and predecessor is None:
+        raise AgentLoopError(
+            "Managed-CI fresh authorization found prior actor-owned authorization, but GitHub "
+            "did not prove that the live head is its descendant; refusing to proceed."
+        )
     authorization = ManagedCiIssueAuthorization(
         kind="fresh",
         repository=config.repo,
@@ -1816,6 +1873,8 @@ def authorize_fresh_issue_created_resume(
         waiver="allow-unprotected-managed-ci",
         nonce=secrets.token_urlsafe(24),
         label_event_id=label_event[0],
+        predecessor_head=(predecessor[1].head_sha if predecessor is not None else None),
+        predecessor_comment_id=(predecessor[0] if predecessor is not None else None),
         approved_plan_hash=approved_plan_hash,
     )
     comment_id = post_verified_trusted_pr_protocol_comment(

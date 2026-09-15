@@ -195,6 +195,7 @@ class V2ManagedRunner(ManagedRunner):
         issue_events=None,
         unreadable_issue_events_after_label=False,
         issue_timeline=None,
+        compare_payload=None,
         **kwargs,
     ):
         workflow = kwargs.pop("workflow", V2_WORKFLOW)
@@ -227,6 +228,7 @@ class V2ManagedRunner(ManagedRunner):
             "event": "cross-referenced",
             "source": {"issue": {"number": 7, "pull_request": {"url": "https://api.github.test/pulls/7"}}},
         }])
+        self.compare_payload = compare_payload
         self.labels_posted = False
         self.intent_snapshots = []
         self.dispatch_count = 0
@@ -293,6 +295,15 @@ class V2ManagedRunner(ManagedRunner):
         if endpoint.startswith("repos/OWNER/REPO/issues/643/timeline?"):
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, json.dumps(self.issue_timeline), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/compare/"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                cmd,
+                cwd_path,
+                json.dumps(self.compare_payload or {}),
+                "",
+                0,
+            )
         if endpoint == "repos/OWNER/REPO/issues/7/labels" and "POST" in cmd:
             cmd, cwd_path = self._record_command(args, cwd)
             self.labels_posted = True
@@ -704,6 +715,66 @@ def test_fresh_authorization_reuses_existing_creation_for_same_scope(tmp_path):
         "POST" in command and "issues/7/comments" in " ".join(command)
         for command, _cwd in runner.commands
     ) == 1
+
+
+def test_fresh_authorization_supersedes_prior_grant_for_verified_descendant(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    first = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+        approved_plan_hash="a" * 64,
+    )
+    runner.rest_pr["head"]["sha"] = "descendant"
+    runner.compare_payload = {
+        "status": "ahead",
+        "base_commit": {"sha": "abc123"},
+        "merge_base_commit": {"sha": "abc123"},
+    }
+    advanced = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(
+            metadata(), head_branch="agent-loop/managed-643", head_sha="descendant"
+        ),
+        approved_plan_hash="a" * 64,
+    )
+
+    assert advanced.authorization_kind == "fresh"
+    assert advanced.head_sha == "descendant"
+    assert advanced.authorization_comment_id != first.authorization_comment_id
+    parsed = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert parsed is not None
+    assert parsed.predecessor_head == "abc123"
+    assert parsed.predecessor_comment_id == first.authorization_comment_id
+
+
+def test_fresh_authorization_rejects_unrelated_replacement_head(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+    )
+    runner.rest_pr["head"]["sha"] = "replacement"
+    runner.compare_payload = {
+        "status": "diverged",
+        "base_commit": {"sha": "abc123"},
+        "merge_base_commit": {"sha": "other"},
+    }
+
+    with pytest.raises(AgentLoopError, match="did not prove.*descendant"):
+        authorize_fresh_issue_created_resume(
+            runner, config=config, pr_number=7, issue_number=643,
+            metadata=replace(
+                metadata(), head_branch="agent-loop/managed-643", head_sha="replacement"
+            ),
+        )
 
 
 def test_fresh_authorization_rejects_missing_server_issue_association(tmp_path):
