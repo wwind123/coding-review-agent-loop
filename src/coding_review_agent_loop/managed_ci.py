@@ -2659,7 +2659,13 @@ def _find_resume_audit(
             expected_handoff.authorization_kind == "fresh"
             and authorization.kind == "fresh"
         ):
-            return authorization.nonce == expected_handoff.override_nonce
+            # A descendant fresh grant has its own nonce and names the prior
+            # grant as its predecessor. Only the grant for the live handoff
+            # must match the freshly authenticated nonce; rejecting historical
+            # fresh grants makes every second recovery chain self-invalidating.
+            if authorization.head_sha == expected_handoff.head_sha:
+                return authorization.nonce == expected_handoff.override_nonce
+            return True
         return True
     candidates: list[tuple[int, dict[str, str]]] = []
     authorization_candidates: list[tuple[int, ManagedCiIssueAuthorization]] = []

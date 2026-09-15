@@ -882,6 +882,23 @@ def test_fresh_authorization_supersedes_prior_grant_for_verified_descendant(tmp_
     assert parsed.predecessor_head == "abc123"
     assert parsed.predecessor_comment_id == first.authorization_comment_id
 
+    resume = _find_resume_audit(
+        runner,
+        config=config,
+        pr_number=7,
+        actor_login="agent-loop",
+        actor_id=1,
+        base_ref="main",
+        issue_number=643,
+        live_head="descendant",
+        expected_handoff=advanced,
+        expected_protection="voluntary",
+    )
+
+    assert resume is not None
+    assert resume[0] == advanced.authorization_comment_id
+    assert resume[1]["nonce"] == advanced.override_nonce
+
 
 def test_fresh_authorization_rejects_unrelated_replacement_head(tmp_path):
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
