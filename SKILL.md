@@ -83,6 +83,26 @@ and skill implementation/follow-up turns must map applicable rows to
 authoritative test receipts. Historical unversioned plans remain resumable
 without fabricated rows.
 
+Planning publication is transport-first. Initial and revision prompts receive a
+conservative Unicode-character ceiling for model-controlled JSON/prose derived
+from renderer, visible-section, metadata/reference, and reserve costs. The
+ceiling is guidance, not a postability decision: only preflight of the actual
+rendered, projected, metadata-attached carrier may publish under the hard
+60,000-character limit.
+
+Execution recommendations and risk matrices are projected into bounded anchors
+with exact digest-checked sidecars before any prose shortening. Hydrate those
+sidecars before strict validation, resume, review, hashing, or decomposition.
+One residual oversized candidate receives at most one fresh `shortener` turn,
+separately accounted from format repair. Structured fields remain exact, and
+summary/plan-step clauses must survive deterministic ordered literal matching.
+Lossy, invalid, second-attempt, or still-oversized output is rejected without
+downstream state advance. The host-as-coder path persists the original digest,
+kind, target, failure, sidecar completeness, and `attempt-required` state, then
+accepts one digest-bound `--shortened-plan-file PATH` re-entry. Restart cannot
+reset that attempt or invoke a competing planner; historical unversioned rounds
+remain legacy-undecided.
+
 ## How to invoke this skill
 
 Open a Claude Code session **in the `coding-review-agent-loop` repo root** (or
@@ -170,6 +190,10 @@ These are the building blocks; the modes sequence them.
      --reviewers codex gemini \
      [--workdir-codex /path/to/checkout] [--workdir-gemini /path/to/checkout] [--workdir-antigravity /path/to/checkout]
    ```
+   If the runner reports an oversized host-authored plan handoff, keep the
+   recorded original and re-enter exactly once with
+   `--shortened-plan-file /path/to/shortened-plan.json`; the file must preserve
+   the recorded response kind and digest-bound contract.
    It prints a JSON result:
    ```json
    { "state": "approved" | "blocking", "round_number": N,

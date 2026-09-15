@@ -4,6 +4,7 @@ Run an external agent (Codex or Gemini) for one reviewer or coder turn.
 In --dry-run mode, writes a canned approved stub to --output and exits 0:
   --role reviewer → plan_review stub
   --role coder    → plan_state stub, or issue_implementation for --flow pr
+  --role shortener → one-pass plan shortening turn
 In live mode, invokes the agent CLI and writes the response to --output.
 
 Usage:
@@ -12,7 +13,7 @@ Usage:
     --prompt-file PATH \\
     --output PATH \\
     --workdir PATH \\
-    [--role {reviewer,coder}] \\
+    [--role {reviewer,coder,shortener}] \\
     [--cmd PATH] \\
     [--dry-run]
 """
@@ -179,7 +180,7 @@ _CANNED_PLAN_DECOMPOSITION = json.dumps(
 
 
 def _build_dry_run_response(role: str, flow: str = "plan") -> str:
-    if role == "coder":
+    if role in {"coder", "shortener"}:
         if flow == "decompose":
             return _CANNED_PLAN_DECOMPOSITION
         return _CANNED_IMPLEMENTATION if flow == "pr" else _CANNED_PLAN_STATE
@@ -230,8 +231,8 @@ def main() -> None:
     parser.add_argument(
         "--role",
         default="reviewer",
-        choices=["reviewer", "coder"],
-        help="Turn role: 'reviewer' (default) or 'coder' (Codex writes the plan).",
+        choices=["reviewer", "coder", "shortener"],
+        help="Turn role: reviewer, coder, or the one-pass planning shortener.",
     )
     parser.add_argument("--cmd", default=None, help="Agent CLI command (overrides default).")
     parser.add_argument("--diff-file", default=None, help="Path to a pre-fetched PR diff to embed in the prompt.")
@@ -459,7 +460,7 @@ def main() -> None:
 
     runner = Runner(dry_run=False)
     runner.configure_from_config(config)
-    runner.set_containment_role("coder" if args.role == "coder" else "reviewer")
+    runner.set_containment_role("coder" if args.role in {"coder", "shortener"} else "reviewer")
     # Re-clone (if requested) happens once, outside the retry loop: it raises
     # deterministically and re-cloning per attempt would be wasteful.
     if args.repo:
@@ -686,6 +687,7 @@ def main() -> None:
                     "usage": usage.to_dict(),
                     # Model that actually ran, for the dynamic signature (#332).
                     "model_used": result.model_used,
+                    "turn_role": args.role,
                 }, indent=2),
                 encoding="utf-8",
             )

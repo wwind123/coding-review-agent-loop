@@ -49,6 +49,7 @@ from coding_review_agent_loop.orchestrator import (
     _plan_subject,
     _strip_round_metadata,
 )
+from coding_review_agent_loop.round_transport import PlanningPublicationPolicy
 from coding_review_agent_loop.prompts import (
     build_completion_recovery_prompt,
     build_issue_prompt,
@@ -101,6 +102,152 @@ def test_auto_execution_resolves_one_shot_after_approval(tmp_path):
     assert resolved.requested_policy == "auto"
     assert resolved.action == "implement-one-shot"
     assert resolved.strategy == "one-shot"
+
+
+def test_plan_candidate_uses_response_guidance_and_records_shortener_recovery(
+    tmp_path, monkeypatch
+):
+    source = json.loads(
+        structured_plan_state(
+            summary=("Please simply just briefly " * 100)
+            + "preserve the requested plan obligation.",
+            plan_steps=["Please preserve the requested plan obligation."],
+        ).split("\n", 1)[0]
+    )
+    source_text = json.dumps(source) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    candidate = dict(source)
+    candidate["summary"] = "preserve the requested plan obligation."
+    candidate_text = json.dumps(candidate) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    parsed_source = validate_structured_plan_state(source_text)
+    parsed_candidate = validate_structured_plan_state(candidate_text)
+    response = orchestrator_module.ValidatedAgentResponse(
+        text=source_text, session_id="producer", marker_value=parsed_source
+    )
+    shortened = orchestrator_module.ValidatedAgentResponse(
+        text=candidate_text, session_id=None, marker_value=parsed_candidate
+    )
+    calls = []
+
+    def fake_shortener(*args, **kwargs):
+        calls.append(kwargs)
+        return shortened
+
+    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", fake_shortener)
+    config = make_config(tmp_path)
+    metadata_factory = lambda candidate_response, candidate_plan, canonical, public: PostedRoundMetadata(
+        flow="plan", role="coder", agent="Anthropic Claude", round_number=1,
+        subject=_plan_subject(canonical), canonical_plan=canonical,
+        raw_structured_coder_response=candidate_response.text,
+    )
+    prepared = orchestrator_module._prepare_plan_candidate_for_publication(
+        _FakeRunner(), config=config, response=response, parsed=parsed_source,
+        prior_items=(), metadata_factory=metadata_factory,
+        usage_context=orchestrator_module._new_usage_context(config),
+        issue_number=56,
+        policy=PlanningPublicationPolicy(
+            hard_limit_chars=5_000,
+            measured_renderer_expansion_chars=1_000,
+            required_visible_section_chars=1_000,
+            attached_metadata_chars=1_000,
+            reference_chars=500,
+            safety_reserve_chars=500,
+        ),
+    )
+    assert calls and calls[0]["role"] == "shortener"
+    assert calls[0]["session_id"] is None
+    assert calls[0]["use_repair"] is False
+    assert calls[0]["max_invocations"] == 1
+    assert prepared.response.text == candidate_text
+    assert prepared.preflight.status == "fits"
+    assert prepared.recovery_path is not None
+    assert prepared.recovery_path.exists()
+
+
+def test_plan_candidate_rejects_lossy_shortener_and_retains_recovery(
+    tmp_path, monkeypatch
+):
+    source_payload = json.loads(
+        structured_plan_state(
+            summary=("Please " * 8_000)
+            + "Preserve the first obligation and preserve the second obligation.",
+            plan_steps=["Preserve the first obligation."],
+        ).split("\n", 1)[0]
+    )
+    candidate_payload = dict(source_payload)
+    candidate_payload["summary"] = "Preserve the first obligation."
+    footer = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    source_text = json.dumps(source_payload) + footer
+    candidate_text = json.dumps(candidate_payload) + footer
+    parsed_source = validate_structured_plan_state(source_text)
+    assert parsed_source is not None
+    response = orchestrator_module.ValidatedAgentResponse(
+        text=source_text, session_id="producer", marker_value=parsed_source
+    )
+
+    def fake_shortener(*_args, **kwargs):
+        kwargs["validate"](candidate_text)
+        raise AssertionError("lossy candidate unexpectedly passed preservation")
+
+    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", fake_shortener)
+    config = make_config(tmp_path)
+    metadata_factory = lambda candidate_response, candidate_plan, canonical, public: PostedRoundMetadata(
+        flow="plan", role="coder", agent="Anthropic Claude", round_number=1,
+        subject=_plan_subject(canonical), canonical_plan=canonical,
+        raw_structured_coder_response=candidate_response.text,
+    )
+
+    with pytest.raises(AgentLoopError, match="Shortening content preservation failed"):
+        orchestrator_module._prepare_plan_candidate_for_publication(
+            _FakeRunner(), config=config, response=response, parsed=parsed_source,
+            prior_items=(), metadata_factory=metadata_factory,
+            usage_context=orchestrator_module._new_usage_context(config),
+            issue_number=57,
+        )
+
+    recovery_path = orchestrator_module._planning_recovery_path(config, 57)
+    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+    assert recovery["attempt_state"] == "attempted"
+    assert recovery["attempt_consumed"] is True
+    assert recovery["original_response"] == source_text
+    assert recovery["original_digest"] == __import__("hashlib").sha256(
+        source_text.encode("utf-8")
+    ).hexdigest()
+
+
+def test_cli_planning_recovery_rejects_mutated_prepared_carrier(tmp_path):
+    config = make_config(tmp_path)
+    candidate = "candidate response"
+    path = orchestrator_module._write_planning_recovery(
+        config,
+        58,
+        response_kind="plan_state",
+        original_response="original response",
+        canonical_plan="canonical plan",
+        response_ceiling_chars=100,
+        attempt_state="candidate-ready",
+        failure="publication pending",
+        candidate_response=candidate,
+        prepared=["carrier"],
+    )
+    assert path is not None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["prepared_carriers"] = ["tampered carrier"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(AgentLoopError, match="incomplete or corrupt"):
+        orchestrator_module._reconcile_cli_planning_recovery(
+            _FakeRunner(),
+            config=config,
+            issue_number=58,
+            issue_context=IssueContext(
+                number=58,
+                repo="OWNER/REPO",
+                title="Issue",
+                body="Body",
+                url=None,
+                comments=(),
+            ),
+        )
 
 
 def test_auto_execution_resolves_staged_after_approval(tmp_path):

@@ -33,6 +33,9 @@ from coding_review_agent_loop.round_state import (
     recover_approved_plan_context,
     _latest_pr_approved_reviews_for_head,
 )
+from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+from coding_review_agent_loop.protocol import risk_test_matrix_identity, validate_structured_plan_state
+from agent_loop_helpers import structured_v1_plan_state
 
 
 def _requirement(*, body: str, created_at: str, url: str) -> HumanReviewRequirement:
@@ -72,6 +75,20 @@ def test_signed_requirement_ids_survive_insertion_and_body_edits():
     assert first.requirement_id != edited.requirement_id
     assert f"Requirement {first.requirement_id}:" in format_human_requirements((first, inserted))
     assert f"Requirement {first.requirement_id}:" in format_human_requirements((inserted, first))
+
+
+def test_approved_plan_context_hydrates_projected_matrix_identity_for_consumers():
+    parsed = validate_structured_plan_state(
+        structured_v1_plan_state(), require_execution_strategy_contract=1,
+        require_risk_test_matrix_contract=1,
+    )
+    canonical = render_canonical_plan_state(parsed)
+    context = make_approved_plan_context(canonical)
+    assert context.matrix_available
+    assert context.risk_test_matrix_identity == risk_test_matrix_identity(
+        parsed.risk_test_matrix, parsed.risk_test_matrix_changes
+    )
+    assert context.risk_test_matrix == parsed.risk_test_matrix.to_payload()
 
 
 def test_reviewer_coverage_uses_digest_identity_and_rejects_legacy_labels():

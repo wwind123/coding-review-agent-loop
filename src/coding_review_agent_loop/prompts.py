@@ -7,7 +7,7 @@ import re
 import shlex
 from dataclasses import dataclass, replace as dataclass_replace
 from textwrap import indent
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
@@ -27,7 +27,7 @@ from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provena
 from .memory import AgentMemoryContext, format_agent_memory_context
 from .managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
 from .salvage import AGENT_SALVAGE_MARKER_RE
-from .round_transport import is_round_transport_sidecar
+from .round_transport import is_round_transport_sidecar, planning_response_guidance
 from .protocol import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
@@ -2034,6 +2034,7 @@ def _compact_plan_stable_prefix(
             f"Repository: {config.repo}",
             workdir_guidance,
             _scratch_file_guidance(),
+            planning_response_guidance(),
             architecture_context,
             response_protocol,
             _memory_block(memory, config),
@@ -2265,6 +2266,7 @@ def build_issue_plan_prompt(
 
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this planning stage.
+{planning_response_guidance()}
 {_architecture_impact_guidance(required=True)}
 For a plan (rather than a clarification), respond with exactly one structured JSON
 `plan_state` object. It must have this complete contract:
@@ -2681,6 +2683,7 @@ def build_plan_revision_prompt(
 
 Revise the plan in this local checkout without editing code. Do not create a
 branch, commit, push, or open a pull request during this planning stage.
+{planning_response_guidance()}
 {_coder_workdir_guidance(config, implementation=False)}
 {_architecture_impact_guidance(required=True)}
 {_scratch_file_guidance()}
@@ -2859,6 +2862,47 @@ in this exact order:
 
 <!-- AGENT_PLAN_STATE: blocking -->
 -- {coder_signature}
+"""
+
+
+def build_plan_shortening_prompt(
+    original_response: str,
+    *,
+    response_kind: Literal["plan_state", "plan_revision"],
+    target_chars: int,
+    config: AgentLoopConfig,
+    prior_items: Sequence[UnresolvedReviewItem] = (),
+    architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+) -> str:
+    """Ask a fresh coder session for one deterministic lossless shortening pass."""
+    config = _with_architecture_context(config, architecture_context)
+    signature = agent_signature(config.coder, config, role="shortener")
+    return f"""Shorten this already-valid {response_kind} planning response for publication.
+
+This is a dedicated one-pass transport recovery turn, not a review, format repair,
+new plan, or decision change. Return exactly the same structured contract and
+footer kind. The model-controlled response target is at most {target_chars:,}
+Unicode characters; actual rendered transport is checked separately.
+
+Preserve every structured field exactly, including dispositions, issue and
+requirement IDs, architecture impact, execution recommendation, risk matrix and
+audit, typed/deferred categories, and all response markers. In `summary` and
+each corresponding `plan_steps` entry, remove only connective/filler wording
+when every ordered obligation clause, literal, path, number, modal, negation,
+edge condition, and test command remains as an exact normalized substring.
+Do not paraphrase, merge entries, reorder clauses, infer omissions, or change
+any plan decision. If a clause cannot be shortened, retain it verbatim.
+
+{planning_response_guidance()}
+Original valid response:
+
+{original_response}
+
+End with the exact {response_kind} footer and standalone signature for this
+shortening turn:
+
+<!-- AGENT_PLAN_STATE: blocking -->
+-- {signature}
 """
 
 

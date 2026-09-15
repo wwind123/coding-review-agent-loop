@@ -102,6 +102,7 @@ from .github import (
     get_pr_state,
     merge_pr,
     post_issue_comment,
+    post_planning_issue_comment,
     post_pr_comment,
     post_trusted_pr_contract_record,
     post_trusted_pr_comment,
@@ -204,6 +205,7 @@ from .prompts import (
     build_plan_decomposition_prompt,
     build_plan_review_prompt,
     build_plan_revision_prompt,
+    build_plan_shortening_prompt,
     build_merge_conflict_prompt,
     build_review_prompt,
     build_same_pr_followup_prompt,
@@ -300,6 +302,7 @@ from .repair import (
     require_recoverable_fresh_execution_contract,
     require_recoverable_fresh_risk_test_matrix_contract,
 )
+from .repair_preservation import validate_shortened_plan_response
 from .runner import Runner
 from .salvage import (
     SalvageArtifacts,
@@ -426,7 +429,13 @@ from .round_state import (
     _serialize_unresolved_item,
     _strip_round_metadata,
 )
-from .round_transport import is_round_transport_sidecar
+from .round_transport import (
+    MAX_GITHUB_BODY_CHARS,
+    PlanningPreflightOutcome,
+    PlanningPublicationPolicy,
+    is_round_transport_sidecar,
+    preflight_planning_publication,
+)
 from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
 from .review_scheduling import (
     GitChange,
@@ -2697,6 +2706,7 @@ def _run_validated_agent(
     salvage_context: SalvageContext | None = None,
     operation_description: str | None = None,
     completion_recovery: CompletionRecoveryPolicy | None = None,
+    max_invocations: int | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -2728,6 +2738,10 @@ def _run_validated_agent(
         if antigravity_attempts is not None
         else config.agent_max_retries + 2
     )
+    if max_invocations is not None:
+        if max_invocations < 1:
+            raise ValueError("max_invocations must be positive")
+        max_attempts = min(max_attempts, max_invocations)
     last_error = f"{agent_name} produced no output."
     last_result: AgentResult | None = None
     last_classification_text = ""
@@ -3767,6 +3781,356 @@ def _run_validated_agent(
         failure_category=last_failure_category,
         terminal_public_response=terminal_public_response,
         containment=last_result.containment if last_result is not None else None,
+    )
+
+
+@dataclass(frozen=True)
+class _PreparedPlanCandidate:
+    response: ValidatedAgentResponse
+    parsed: StructuredPlanState | StructuredPlanRevision
+    canonical_plan: str
+    public_comment: str
+    metadata: PostedRoundMetadata
+    preflight: PlanningPreflightOutcome
+    recovery_path: Path | None = None
+
+
+def _planning_recovery_path(config: AgentLoopConfig, issue_number: int) -> Path:
+    repo_key = hashlib.sha256(config.repo.encode("utf-8")).hexdigest()[:16]
+    return config.log_dir / "planning-recovery" / f"{repo_key}-{issue_number}.json"
+
+
+def _write_planning_recovery(
+    config: AgentLoopConfig,
+    issue_number: int | None,
+    *,
+    response_kind: str,
+    original_response: str,
+    canonical_plan: str,
+    response_ceiling_chars: int,
+    attempt_state: str,
+    failure: str,
+    candidate_response: str | None = None,
+    prepared: Sequence[TrustedBody] = (),
+) -> Path | None:
+    """Persist the one planning candidate before any shortening/publication work."""
+    if issue_number is None:
+        return None
+    path = _planning_recovery_path(config, issue_number)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "response_kind": response_kind,
+        "original_response": original_response,
+        "original_digest": hashlib.sha256(original_response.encode("utf-8")).hexdigest(),
+        "canonical_plan": canonical_plan,
+        "response_ceiling_chars": response_ceiling_chars,
+        "attempt_state": attempt_state,
+        "attempt_consumed": attempt_state in {"attempted", "candidate-ready"},
+        "failure": failure,
+        "candidate_response": candidate_response,
+        "candidate_digest": (
+            hashlib.sha256(candidate_response.encode("utf-8")).hexdigest()
+            if candidate_response is not None else None
+        ),
+        "prepared_carriers": [str(body) for body in prepared],
+        "prepared_carrier_digests": [
+            hashlib.sha256(str(body).encode("utf-8")).hexdigest()
+            for body in prepared
+        ],
+    }
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def _clear_planning_recovery(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _reconcile_cli_planning_recovery(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    issue_context: IssueContext,
+) -> bool:
+    """Reconcile a prepared CLI candidate before a new planner can run."""
+    path = _planning_recovery_path(config, issue_number)
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("recovery object required")
+        original = payload["original_response"]
+        original_digest = payload["original_digest"]
+        if (
+            not isinstance(original, str)
+            or not isinstance(original_digest, str)
+            or hashlib.sha256(original.encode("utf-8")).hexdigest() != original_digest
+        ):
+            raise ValueError("original candidate digest mismatch")
+        state = payload.get("attempt_state")
+        carriers = payload.get("prepared_carriers")
+        if state == "candidate-ready":
+            if not isinstance(carriers, list) or not carriers or any(
+                not isinstance(carrier, str) for carrier in carriers
+            ):
+                raise ValueError("prepared carrier set is incomplete")
+            carrier_digests = payload.get("prepared_carrier_digests")
+            if (
+                not isinstance(carrier_digests, list)
+                or len(carrier_digests) != len(carriers)
+                or any(
+                    not isinstance(digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    for digest in carrier_digests
+                )
+            ):
+                raise ValueError("prepared carrier digest set is incomplete")
+            if any(
+                len(carrier) > MAX_GITHUB_BODY_CHARS
+                or hashlib.sha256(carrier.encode("utf-8")).hexdigest() != digest
+                for carrier, digest in zip(carriers, carrier_digests, strict=True)
+            ):
+                raise ValueError("prepared carrier digest or size mismatch")
+            candidate_response = payload.get("candidate_response")
+            candidate_digest = payload.get("candidate_digest")
+            if (
+                not isinstance(candidate_response, str)
+                or not isinstance(candidate_digest, str)
+                or hashlib.sha256(candidate_response.encode("utf-8")).hexdigest()
+                != candidate_digest
+            ):
+                raise ValueError("shortened candidate digest mismatch")
+            existing = {
+                str(getattr(comment, "body", "")).strip()
+                for comment in issue_context.comments
+            }
+            for carrier in carriers:
+                if carrier.strip() in existing:
+                    continue
+                trusted = TrustedBody.canonical(
+                    carrier,
+                    expected_tokens=tuple(
+                        occurrence.definition.token
+                        for occurrence in scan_reserved_markers(carrier)
+                    ),
+                )
+                post_issue_comment(
+                    runner,
+                    config=config,
+                    issue_number=issue_number,
+                    body=trusted,
+                )
+                existing.add(carrier.strip())
+            _clear_planning_recovery(path)
+            return True
+        if state in {"attempted", "unrecoverable"}:
+            raise AgentLoopError(
+                "A plan-shortening attempt is already consumed and remains in the "
+                f"recoverable artifact {path}; no competing planner invocation is allowed."
+            )
+        raise ValueError("unknown planning recovery state")
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AgentLoopError(
+            f"Planning recovery artifact {path} is incomplete or corrupt; repair it "
+            "before starting a new planning round."
+        ) from exc
+
+
+def _prepare_plan_candidate_for_publication(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    response: ValidatedAgentResponse,
+    parsed: StructuredPlanState | StructuredPlanRevision,
+    prior_items: Sequence[UnresolvedReviewItem],
+    metadata_factory: Callable[
+        [ValidatedAgentResponse, StructuredPlanState | StructuredPlanRevision, str, str],
+        PostedRoundMetadata,
+    ],
+    usage_context: RunUsageContext,
+    issue_number: int | None = None,
+    architecture_context: object | None = None,
+    policy: PlanningPublicationPolicy | None = None,
+) -> _PreparedPlanCandidate:
+    """Run transport preflight and, once, a fresh lossless shortening turn."""
+    policy = policy or PlanningPublicationPolicy()
+
+    def build_body(
+        candidate_response: ValidatedAgentResponse,
+        candidate: StructuredPlanState | StructuredPlanRevision,
+    ) -> tuple[str, str, PostedRoundMetadata, PlanningPreflightOutcome]:
+        if isinstance(candidate, StructuredPlanState):
+            # Preserve the raw identity for the historical matrix-less initial
+            # structured form; generation-1 recommendations use the canonical
+            # renderer. Revisions always render canonically so carried typed
+            # sections remain consumable by legacy-compatible downstream paths.
+            candidate_canonical = (
+                candidate_response.text
+                if candidate.execution_recommendation is None
+                and candidate.risk_test_matrix is None
+                else render_canonical_plan_state(candidate, config)
+            )
+            candidate_public = render_public_agent_comment(
+                kind="plan_state",
+                parsed=candidate,
+                agent=config.coder,
+                config=config,
+                model_used=candidate_response.model_used,
+            )
+        else:
+            candidate_canonical = render_canonical_plan_revision(candidate, prior_items, config)
+            candidate_public = render_public_agent_comment(
+                kind="plan_revision",
+                parsed=candidate,
+                agent=config.coder,
+                prior_items=prior_items,
+                raw_text=candidate_response.text,
+                config=config,
+                model_used=candidate_response.model_used,
+            )
+        metadata = metadata_factory(
+            candidate_response, candidate, candidate_canonical, candidate_public
+        )
+        attached = _attach_round_metadata(candidate_public, metadata)
+        return (
+            candidate_canonical,
+            candidate_public,
+            metadata,
+            preflight_planning_publication(
+                attached,
+                policy=policy,
+                response_chars=len(candidate_response.text),
+            ),
+        )
+
+    candidate_canonical, candidate_public, metadata, preflight = build_body(response, parsed)
+    response_kind = "plan_state" if isinstance(parsed, StructuredPlanState) else "plan_revision"
+    if preflight.status == "fits":
+        return _PreparedPlanCandidate(
+            response=response,
+            parsed=parsed,
+            canonical_plan=candidate_canonical,
+            public_comment=candidate_public,
+            metadata=metadata,
+            preflight=preflight,
+        )
+    recovery_path = _write_planning_recovery(
+        config,
+        issue_number,
+        response_kind=response_kind,
+        original_response=response.text,
+        canonical_plan=candidate_canonical,
+        response_ceiling_chars=preflight.response_ceiling_chars,
+        attempt_state="unrecoverable" if preflight.status == "unrecoverable" else "attempted",
+        failure=preflight.diagnostic or preflight.status,
+        prepared=preflight.prepared,
+    )
+    if preflight.status == "unrecoverable":
+        raise AgentLoopError(
+            "Planning publication could not prepare a bounded carrier; the valid "
+            f"candidate was retained locally. {preflight.diagnostic or ''}".strip()
+        )
+
+    # This invocation is deliberately independent of the producing session and
+    # has exactly one provider call.  No format-repair path is enabled here.
+    kind: Literal["plan_state", "plan_revision"] = (
+        "plan_state" if isinstance(parsed, StructuredPlanState) else "plan_revision"
+    )
+    try:
+        shortened_response = _run_validated_agent(
+            runner,
+            agent=config.coder,
+            config=config,
+            prompt=build_plan_shortening_prompt(
+                response.text,
+                response_kind=kind,
+                target_chars=preflight.response_ceiling_chars,
+                config=config,
+                prior_items=prior_items,
+                architecture_context=architecture_context,
+            ),
+            marker_description="<!-- AGENT_PLAN_STATE: blocking -->",
+            validate=lambda text: validate_shortened_plan_response(
+                response.text,
+                text,
+                prior_items=prior_items,
+                require_architecture_impact_contract=True,
+                require_execution_strategy_contract=(
+                    parsed.execution_recommendation is not None
+                ),
+                require_risk_test_matrix_contract=(parsed.risk_test_matrix is not None),
+            ),
+            session_id=None,
+            usage_context=usage_context,
+            use_repair=False,
+            role="shortener",
+            label="plan-shortening",
+            operation_description="plan shortening",
+            max_invocations=1,
+        )
+    except AgentLoopError as exc:
+        _write_planning_recovery(
+            config,
+            issue_number,
+            response_kind=response_kind,
+            original_response=response.text,
+            canonical_plan=candidate_canonical,
+            response_ceiling_chars=preflight.response_ceiling_chars,
+            attempt_state="attempted",
+            failure=str(exc),
+        )
+        raise
+    shortened_parsed = shortened_response.marker_value
+    if not isinstance(shortened_parsed, (StructuredPlanState, StructuredPlanRevision)):
+        raise AgentLoopError("Plan shortening returned an unexpected structured response kind.")
+    shortened_canonical, shortened_public, shortened_metadata, shortened_preflight = build_body(
+        shortened_response, shortened_parsed
+    )
+    if shortened_preflight.status != "fits":
+        _write_planning_recovery(
+            config,
+            issue_number,
+            response_kind=response_kind,
+            original_response=response.text,
+            canonical_plan=candidate_canonical,
+            response_ceiling_chars=preflight.response_ceiling_chars,
+            attempt_state="attempted",
+            failure=shortened_preflight.diagnostic or shortened_preflight.status,
+            candidate_response=shortened_response.text,
+        )
+        raise AgentLoopError(
+            "The single lossless plan-shortening attempt did not produce a postable "
+            f"carrier: {shortened_preflight.diagnostic or shortened_preflight.status}."
+        )
+    return _PreparedPlanCandidate(
+        response=shortened_response,
+        parsed=shortened_parsed,
+        canonical_plan=shortened_canonical,
+        public_comment=shortened_public,
+        metadata=shortened_metadata,
+        preflight=shortened_preflight,
+        recovery_path=_write_planning_recovery(
+            config,
+            issue_number,
+            response_kind=response_kind,
+            original_response=response.text,
+            canonical_plan=shortened_canonical,
+            response_ceiling_chars=preflight.response_ceiling_chars,
+            attempt_state="candidate-ready",
+            failure="shortened candidate prepared; publication pending",
+            candidate_response=shortened_response.text,
+            prepared=shortened_preflight.prepared,
+        ),
     )
 
 
@@ -6646,6 +7010,17 @@ def _run_plan_first_loop(
     )
     coder_name = agent_display_name(config.coder)
     configured_reviewers = reviewers(config)
+    if _reconcile_cli_planning_recovery(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        issue_context=issue_context,
+    ):
+        # The just-reconciled anchor may now be the current plan. Re-read the
+        # issue before selecting reviewer records or dispatching a planner.
+        issue_context = get_issue_context(
+            runner, config=config, issue_number=issue_number
+        )
     require_fresh_execution_contract = bool(
         getattr(config, "execution_strategy_contract_required", False)
     )
@@ -6742,76 +7117,145 @@ def _run_plan_first_loop(
             public_plan_output = normalize_freeform_signature(
                 plan_output, agent=config.coder, config=config, model_used=plan_response.model_used
             )
-        post_issue_comment(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            body=_attach_round_metadata(
-                public_plan_output,
-                PostedRoundMetadata(
-                    flow="plan",
-                    role="coder",
-                    agent=coder_name,
-                    round_number=1,
-                    subject=_plan_subject(current_plan),
-                    prior_items=(),
-                    canonical_plan=canonical_plan,
-                    raw_structured_coder_response=raw_structured_coder_response,
-                    compact_prior_summaries=tuple(compact_prior_summaries),
-                    model_used=plan_response.model_used,
-                    **_metadata_identity_fields(plan_response),
-                    acquisition_outcome=plan_response.acquisition_outcome,
-                    acquisition_returncode=plan_response.acquisition_returncode,
-                    **_architecture_metadata_fields(
-                        config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
-                    ),
-                    execution_strategy_contract_version=(
-                        1
-                        if structured_plan is not None
-                        and structured_plan.execution_recommendation is not None
-                        else None
-                    ),
-                    execution_strategy_identity=(
-                        structured_plan.execution_recommendation.identity()
-                        if structured_plan is not None
-                        and structured_plan.execution_recommendation is not None
-                        else None
-                    ),
-                    risk_test_matrix_contract_version=(
-                        structured_plan.risk_test_matrix_contract_version
-                        if structured_plan is not None else None
-                    ),
-                    risk_test_matrix_payload=(
-                        structured_plan.risk_test_matrix.to_payload()
-                        if structured_plan is not None and structured_plan.risk_test_matrix is not None
-                        else None
-                    ),
-                    risk_test_matrix_changes_payload=(
-                        tuple(change.to_payload() for change in structured_plan.risk_test_matrix_changes)
-                        if structured_plan is not None else ()
-                    ),
-                    risk_test_matrix_identity=(
-                        risk_test_matrix_identity(
-                            structured_plan.risk_test_matrix,
-                            structured_plan.risk_test_matrix_changes,
-                        )
-                        if structured_plan is not None and structured_plan.risk_test_matrix is not None
-                        else None
-                    ),
-                    risk_test_matrix_boundary_digest=(
-                        risk_test_matrix_identity(
-                            structured_plan.risk_test_matrix,
-                            structured_plan.risk_test_matrix_changes,
-                        )
-                        if structured_plan is not None and structured_plan.risk_test_matrix is not None
-                        else None
-                    ),
-                ),
+        initial_metadata = PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent=coder_name,
+            round_number=1,
+            subject=_plan_subject(current_plan),
+            prior_items=(),
+            canonical_plan=canonical_plan,
+            raw_structured_coder_response=raw_structured_coder_response,
+            compact_prior_summaries=tuple(compact_prior_summaries),
+            model_used=plan_response.model_used,
+            **_metadata_identity_fields(plan_response),
+            acquisition_outcome=plan_response.acquisition_outcome,
+            acquisition_returncode=plan_response.acquisition_returncode,
+            **_architecture_metadata_fields(
+                config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
+            ),
+            execution_strategy_contract_version=(
+                1 if structured_plan is not None and structured_plan.execution_recommendation is not None else None
+            ),
+            execution_strategy_identity=(
+                structured_plan.execution_recommendation.identity()
+                if structured_plan is not None and structured_plan.execution_recommendation is not None else None
+            ),
+            risk_test_matrix_contract_version=(
+                structured_plan.risk_test_matrix_contract_version if structured_plan is not None else None
+            ),
+            risk_test_matrix_payload=(
+                structured_plan.risk_test_matrix.to_payload()
+                if structured_plan is not None and structured_plan.risk_test_matrix is not None else None
+            ),
+            risk_test_matrix_changes_payload=(
+                tuple(change.to_payload() for change in structured_plan.risk_test_matrix_changes)
+                if structured_plan is not None else ()
+            ),
+            risk_test_matrix_identity=(
+                risk_test_matrix_identity(structured_plan.risk_test_matrix, structured_plan.risk_test_matrix_changes)
+                if structured_plan is not None and structured_plan.risk_test_matrix is not None else None
+            ),
+            risk_test_matrix_boundary_digest=(
+                risk_test_matrix_identity(structured_plan.risk_test_matrix, structured_plan.risk_test_matrix_changes)
+                if structured_plan is not None and structured_plan.risk_test_matrix is not None else None
             ),
         )
+        if isinstance(structured_plan, StructuredPlanState):
+            prepared_candidate = _prepare_plan_candidate_for_publication(
+                runner,
+                config=config,
+                response=plan_response,
+                parsed=structured_plan,
+                prior_items=(),
+                metadata_factory=lambda candidate_response, candidate, candidate_canonical, _candidate_public: dataclasses_replace(
+                    initial_metadata,
+                    subject=_plan_subject(candidate_canonical),
+                    canonical_plan=candidate_canonical,
+                    raw_structured_coder_response=candidate_response.text,
+                    model_used=candidate_response.model_used,
+                    **_metadata_identity_fields(candidate_response),
+                    acquisition_outcome=candidate_response.acquisition_outcome,
+                    acquisition_returncode=candidate_response.acquisition_returncode,
+                    architecture_impact=sanitize_architecture_impact(
+                        getattr(candidate_response.marker_value, "architecture_impact", None)
+                    ),
+                    execution_strategy_identity=(
+                        candidate.execution_recommendation.identity()
+                        if candidate.execution_recommendation is not None else None
+                    ),
+                    execution_strategy_contract_version=(
+                        1 if candidate.execution_recommendation is not None else None
+                    ),
+                    risk_test_matrix_contract_version=candidate.risk_test_matrix_contract_version,
+                    risk_test_matrix_payload=(
+                        candidate.risk_test_matrix.to_payload()
+                        if candidate.risk_test_matrix is not None else None
+                    ),
+                    risk_test_matrix_changes_payload=tuple(
+                        change.to_payload() for change in candidate.risk_test_matrix_changes
+                    ),
+                    risk_test_matrix_identity=(
+                        risk_test_matrix_identity(candidate.risk_test_matrix, candidate.risk_test_matrix_changes)
+                        if candidate.risk_test_matrix is not None else None
+                    ),
+                    risk_test_matrix_boundary_digest=(
+                        risk_test_matrix_identity(candidate.risk_test_matrix, candidate.risk_test_matrix_changes)
+                        if candidate.risk_test_matrix is not None else None
+                    ),
+                ),
+                usage_context=usage_context,
+                issue_number=issue_number,
+                architecture_context=config.architecture_context,
+            )
+            plan_response = prepared_candidate.response
+            structured_plan = prepared_candidate.parsed
+            canonical_plan = prepared_candidate.canonical_plan
+            current_plan = canonical_plan
+            public_plan_output = prepared_candidate.public_comment
+            raw_structured_coder_response = plan_response.text
+            initial_metadata = prepared_candidate.metadata
+            coder_session_id = plan_response.session_id
+            post_planning_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=_attach_round_metadata(public_plan_output, initial_metadata),
+            )
+            _clear_planning_recovery(prepared_candidate.recovery_path)
+        else:
+            initial_preflight = preflight_planning_publication(
+                _attach_round_metadata(public_plan_output, initial_metadata),
+                response_chars=len(plan_response.text),
+            )
+            if initial_preflight.status != "fits":
+                _write_planning_recovery(
+                    config,
+                    issue_number,
+                    response_kind="freeform",
+                    original_response=plan_response.text,
+                    canonical_plan=canonical_plan or plan_response.text,
+                    response_ceiling_chars=initial_preflight.response_ceiling_chars,
+                    attempt_state="unrecoverable",
+                    failure=(
+                        "Free-form planning responses cannot use the structured "
+                        "lossless shortening contract; "
+                        f"{initial_preflight.diagnostic or initial_preflight.status}"
+                    ),
+                )
+                raise AgentLoopError(
+                    "Planning publication preflight failed for the valid plan: "
+                    f"{initial_preflight.diagnostic or initial_preflight.status}"
+                )
+            post_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=_attach_round_metadata(public_plan_output, initial_metadata),
+            )
         start_round_number = 1
         resumed_round: ResumedReviewRound | None = None
-        current_coder_output = plan_output
+        current_coder_output = plan_response.text
     else:
         current_plan, resumed_round = resume_state
         current_coder_output = resumed_round.coder_output
@@ -8152,74 +8596,150 @@ def _run_plan_first_loop(
             public_comment = normalize_freeform_signature(
                 plan_response.text, agent=config.coder, config=config, model_used=plan_response.model_used
             )
-        coder_session_id = plan_response.session_id
-        post_issue_comment(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            body=_attach_round_metadata(
-                public_comment,
-                PostedRoundMetadata(
-                    flow="plan",
-                    role="coder",
-                    agent=coder_name,
-                    round_number=round_number + 1,
-                    subject=_plan_subject(current_plan),
-                    prior_items=tuple(unresolved_items),
-                    canonical_plan=canonical_plan,
-                    raw_structured_coder_response=raw_structured_coder_response,
-                    compact_prior_summaries=tuple(compact_prior_summaries),
-                    model_used=plan_response.model_used,
-                    **_metadata_identity_fields(plan_response),
+        revision_metadata = PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent=coder_name,
+            round_number=round_number + 1,
+            subject=_plan_subject(current_plan),
+            prior_items=tuple(unresolved_items),
+            canonical_plan=canonical_plan,
+            raw_structured_coder_response=raw_structured_coder_response,
+            compact_prior_summaries=tuple(compact_prior_summaries),
+            model_used=plan_response.model_used,
+            **_metadata_identity_fields(plan_response),
+            execution_strategy_contract_version=(
+                1 if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                and plan_response.marker_value.execution_recommendation is not None else None
+            ),
+            execution_strategy_identity=(
+                plan_response.marker_value.execution_recommendation.identity()
+                if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                and plan_response.marker_value.execution_recommendation is not None else None
+            ),
+            risk_test_matrix_contract_version=(
+                plan_response.marker_value.risk_test_matrix_contract_version
+                if isinstance(plan_response.marker_value, StructuredPlanRevision) else None
+            ),
+            risk_test_matrix_payload=(
+                plan_response.marker_value.risk_test_matrix.to_payload()
+                if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                and plan_response.marker_value.risk_test_matrix is not None else None
+            ),
+            risk_test_matrix_changes_payload=(
+                tuple(change.to_payload() for change in plan_response.marker_value.risk_test_matrix_changes)
+                if isinstance(plan_response.marker_value, StructuredPlanRevision) else ()
+            ),
+            risk_test_matrix_identity=(
+                risk_test_matrix_identity(plan_response.marker_value.risk_test_matrix, plan_response.marker_value.risk_test_matrix_changes)
+                if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                and plan_response.marker_value.risk_test_matrix is not None else None
+            ),
+            risk_test_matrix_boundary_digest=(
+                risk_test_matrix_identity(plan_response.marker_value.risk_test_matrix, plan_response.marker_value.risk_test_matrix_changes)
+                if isinstance(plan_response.marker_value, StructuredPlanRevision)
+                and plan_response.marker_value.risk_test_matrix is not None else None
+            ),
+            **_architecture_metadata_fields(
+                config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
+            ),
+            acquisition_outcome=plan_response.acquisition_outcome,
+            acquisition_returncode=plan_response.acquisition_returncode,
+        )
+        if isinstance(plan_response.marker_value, StructuredPlanRevision):
+            prepared_candidate = _prepare_plan_candidate_for_publication(
+                runner,
+                config=config,
+                response=plan_response,
+                parsed=plan_response.marker_value,
+                prior_items=must_fix_items,
+                metadata_factory=lambda candidate_response, candidate, candidate_canonical, _candidate_public: dataclasses_replace(
+                    revision_metadata,
+                    subject=_plan_subject(candidate_canonical),
+                    canonical_plan=candidate_canonical,
+                    raw_structured_coder_response=candidate_response.text,
+                    model_used=candidate_response.model_used,
+                    **_metadata_identity_fields(candidate_response),
+                    acquisition_outcome=candidate_response.acquisition_outcome,
+                    acquisition_returncode=candidate_response.acquisition_returncode,
+                    architecture_impact=sanitize_architecture_impact(
+                        getattr(candidate_response.marker_value, "architecture_impact", None)
+                    ),
                     execution_strategy_contract_version=(
-                        1
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.execution_recommendation is not None
-                        else None
+                        1 if candidate.execution_recommendation is not None else None
                     ),
                     execution_strategy_identity=(
-                        plan_response.marker_value.execution_recommendation.identity()
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.execution_recommendation is not None
-                        else None
+                        candidate.execution_recommendation.identity()
+                        if candidate.execution_recommendation is not None else None
                     ),
-                    risk_test_matrix_contract_version=(
-                        plan_response.marker_value.risk_test_matrix_contract_version
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision) else None
-                    ),
+                    risk_test_matrix_contract_version=candidate.risk_test_matrix_contract_version,
                     risk_test_matrix_payload=(
-                        plan_response.marker_value.risk_test_matrix.to_payload()
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.risk_test_matrix is not None else None
+                        candidate.risk_test_matrix.to_payload()
+                        if candidate.risk_test_matrix is not None else None
                     ),
-                    risk_test_matrix_changes_payload=(
-                        tuple(change.to_payload() for change in plan_response.marker_value.risk_test_matrix_changes)
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision) else ()
+                    risk_test_matrix_changes_payload=tuple(
+                        change.to_payload() for change in candidate.risk_test_matrix_changes
                     ),
                     risk_test_matrix_identity=(
-                        risk_test_matrix_identity(
-                            plan_response.marker_value.risk_test_matrix,
-                            plan_response.marker_value.risk_test_matrix_changes,
-                        )
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.risk_test_matrix is not None else None
+                        risk_test_matrix_identity(candidate.risk_test_matrix, candidate.risk_test_matrix_changes)
+                        if candidate.risk_test_matrix is not None else None
                     ),
                     risk_test_matrix_boundary_digest=(
-                        risk_test_matrix_identity(
-                            plan_response.marker_value.risk_test_matrix,
-                            plan_response.marker_value.risk_test_matrix_changes,
-                        )
-                        if isinstance(plan_response.marker_value, StructuredPlanRevision)
-                        and plan_response.marker_value.risk_test_matrix is not None else None
+                        risk_test_matrix_identity(candidate.risk_test_matrix, candidate.risk_test_matrix_changes)
+                        if candidate.risk_test_matrix is not None else None
                     ),
-                    **_architecture_metadata_fields(
-                        config, impact=getattr(plan_response.marker_value, "architecture_impact", None)
-                    ),
-                    acquisition_outcome=plan_response.acquisition_outcome,
-                    acquisition_returncode=plan_response.acquisition_returncode,
                 ),
-            ),
-        )
+                usage_context=usage_context,
+                issue_number=issue_number,
+                architecture_context=config.architecture_context,
+            )
+            plan_response = prepared_candidate.response
+            parsed_revision = prepared_candidate.parsed
+            assert isinstance(parsed_revision, StructuredPlanRevision)
+            canonical_plan = prepared_candidate.canonical_plan
+            current_plan = canonical_plan
+            current_coder_output = plan_response.text
+            public_comment = prepared_candidate.public_comment
+            raw_structured_coder_response = plan_response.text
+            revision_metadata = prepared_candidate.metadata
+            post_planning_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=_attach_round_metadata(public_comment, revision_metadata),
+            )
+            _clear_planning_recovery(prepared_candidate.recovery_path)
+        else:
+            revision_preflight = preflight_planning_publication(
+                _attach_round_metadata(public_comment, revision_metadata),
+                response_chars=len(plan_response.text),
+            )
+            if revision_preflight.status != "fits":
+                _write_planning_recovery(
+                    config,
+                    issue_number,
+                    response_kind="freeform",
+                    original_response=plan_response.text,
+                    canonical_plan=canonical_plan or plan_response.text,
+                    response_ceiling_chars=revision_preflight.response_ceiling_chars,
+                    attempt_state="unrecoverable",
+                    failure=(
+                        "Free-form planning responses cannot use the structured "
+                        "lossless shortening contract; "
+                        f"{revision_preflight.diagnostic or revision_preflight.status}"
+                    ),
+                )
+                raise AgentLoopError(
+                    "Planning publication preflight failed for the valid revision: "
+                    f"{revision_preflight.diagnostic or revision_preflight.status}"
+                )
+            post_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=_attach_round_metadata(public_comment, revision_metadata),
+            )
+        coder_session_id = plan_response.session_id
         resumed_round = None
 
     raise AgentLoopError(

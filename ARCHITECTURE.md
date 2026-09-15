@@ -139,6 +139,36 @@ distinct workflows, with typed topology and durable checkpoints. They are not
 inferred by creating an issue for every sentence mentioning deferred work.
 See [decomposition boundaries](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization).
 
+#### Planning publication transport and recovery
+
+Planning publication is transport-first. Prompt builders communicate a
+conservative Unicode-character ceiling for the model-controlled JSON/prose;
+that guidance is derived from measured renderer expansion, visible sections,
+metadata/references, and a fixed reserve, and is not itself a postability
+decision. The only authority to post is a typed preflight of the actual
+rendered, projected, metadata-attached carrier against the hard 60,000-character
+limit.
+
+Before prose shortening, validated execution recommendations and risk matrices
+are projected into bounded readable anchors. Their exact canonical payloads,
+identities, and change audits are compressed into digest-checked sidecars;
+hydration happens before strict state, resume, review, hashing, or decomposition
+consumers. A remaining oversized plan gets at most one fresh configured-coder
+shortening turn, with a distinct `shortener` usage label and no format-repair
+budget. Exact structured-field equality and ordered literal clause preservation
+reject semantic loss before the carrier is re-rendered and preflighted again.
+
+If the candidate cannot be published, bounded recovery state retains its original
+response, canonical identity, target, failure, digest, sidecar completeness, and
+attempt state. Partial publication fails closed and reconciliation is idempotent;
+review, decomposition, implementation, and approval do not advance from a
+diagnostic. Skill host-as-coder mode persists an `attempt-required` handoff and
+accepts one digest-bound shortened file on re-entry. The original and shortened
+artifacts, plus any prepared carrier set, live under stable repair paths; a ready
+carrier set is reconciled before phase selection so a crash cannot wedge a consumed
+handoff or publish only an anchor. Historical unversioned rounds remain
+legacy-undecided and are never upgraded by inference.
+
 #### Generation-1 reviewed execution strategy
 
 Fresh planning and revision turns carry `execution_strategy_contract_version: 1`
@@ -264,6 +294,7 @@ between GitHub and local artifacts:
 | --- | --- |
 | Source and candidate identity | Git commits/branches and live GitHub PR metadata. |
 | Cross-invocation workflow history | GitHub comments with round metadata, canonical issue/PR handoffs, plan identities, and managed-CI intents; oversized payloads use sidecar comments. |
+| Pending oversized planning candidate | Bounded local handoff/recovery state plus complete canonical sidecars; stores the original digest, expected response kind, target, failure, sidecar completeness, and one-at-most-once shortening state before any publication or reviewer action. |
 | Invocation results | Unique response files and external subprocess logs; validate the current attempt before accepting an artifact. |
 | Work in progress | Tool-owned or explicitly supplied checkouts; tracked diffs can be preserved as salvage on supported failure paths. |
 | Local evidence | Test observations/receipts, runtime recommendations, usage summaries, and containment evidence. |

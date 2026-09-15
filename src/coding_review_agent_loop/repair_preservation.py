@@ -566,3 +566,157 @@ def validate_repair_preservation(
             )
             require(match is not None, field)
             available.pop(match)
+
+
+# Shortening has a stricter contract than ordinary format repair.  A repair may
+# normalize a malformed envelope; a shortening candidate must already be a
+# valid plan and may only remove deterministic connective prose.
+_SHORTENING_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:\r?\n+|[.!?]+\s+|;\s+|\s+(?:and|or|but|while|unless|then)\s+)",
+    re.IGNORECASE,
+)
+_SHORTENING_LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
+_SHORTENING_FILLER_RE = re.compile(
+    r"\b(?:please|simply|just|briefly|as\s+needed|in\s+order\s+to)\b",
+    re.IGNORECASE,
+)
+
+
+def _shortening_clauses(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        return ()
+    clauses: list[str] = []
+    for raw in _SHORTENING_CLAUSE_SPLIT_RE.split(value):
+        clause = _SHORTENING_LIST_PREFIX_RE.sub("", raw)
+        clause = _SHORTENING_FILLER_RE.sub("", clause)
+        clause = _normalized(clause).strip(" ,:")
+        if not clause:
+            continue
+        # Boilerplate connective-only fragments carry no obligation.  Content
+        # words, literals, paths, quantities, modals, and polarity remain.
+        if not _SHORTENING_FILLER_RE.sub("", clause).strip(" ,:"):
+            continue
+        clauses.append(clause)
+    return tuple(clauses)
+
+
+def _shortening_match_text(value: object) -> str:
+    """Normalize a prose field using the same removable fillers on both sides."""
+    if not isinstance(value, str):
+        return ""
+    return _normalized(_SHORTENING_FILLER_RE.sub("", value))
+
+
+def _require_ordered_clauses(
+    source: object,
+    candidate: object,
+    *,
+    field: str,
+) -> None:
+    if not isinstance(source, str) or not isinstance(candidate, str):
+        raise AgentLoopError(
+            f"Shortening content preservation failed for {field}: expected string fields."
+        )
+    # Fillers are removed symmetrically.  This permits either a shortened
+    # clause or the verbatim clause requested by the prompt (for example,
+    # ``in order to`` in the middle of a clause) without weakening ordered
+    # literal matching.
+    candidate_normalized = _shortening_match_text(candidate)
+    cursor = 0
+    seen: set[str] = set()
+    for clause in _shortening_clauses(source):
+        if clause in seen:
+            continue
+        seen.add(clause)
+        position = candidate_normalized.find(_shortening_match_text(clause), cursor)
+        if position < 0:
+            raise AgentLoopError(
+                f"Shortening content preservation failed for {field}: preserve the "
+                f"ordered obligation clause `{clause}`."
+            )
+        cursor = position + len(_shortening_match_text(clause))
+
+
+def validate_shortened_plan_response(
+    raw: str,
+    shortened: str,
+    *,
+    prior_items: Sequence[object] = (),
+    require_architecture_impact_contract: bool = True,
+    require_execution_strategy_contract: bool = True,
+    require_risk_test_matrix_contract: bool = True,
+) -> object:
+    """Validate one lossless, schema-valid plan-shortening candidate.
+
+    The return value is the validated structured plan object.  Every structured
+    field except ``summary`` and ``plan_steps`` must be exactly equal in the
+    parsed JSON payload.  Those two prose fields retain each ordered
+    obligation clause as a normalized literal substring, which deliberately
+    rejects semantic paraphrases, polarity changes, dropped paths, quantities,
+    tests, and edge conditions.
+    """
+    source = _payload(raw)
+    target = _payload(shortened)
+    if not source or not target:
+        raise AgentLoopError("Shortening response must contain one structured JSON object.")
+    kind = source.get("kind")
+    if kind not in {"plan_state", "plan_revision"} or target.get("kind") != kind:
+        raise AgentLoopError("Shortening response kind must match the original plan kind.")
+    if source.get("schema_version") != target.get("schema_version") or source.get("state") != target.get("state"):
+        raise AgentLoopError("Shortening may not change the plan schema version or state.")
+    if not isinstance(source.get("summary"), str) or not isinstance(target.get("summary"), str):
+        raise AgentLoopError("Shortening requires string summaries.")
+    source_steps = source.get("plan_steps")
+    target_steps = target.get("plan_steps")
+    if (
+        not isinstance(source_steps, list)
+        or not isinstance(target_steps, list)
+        or len(source_steps) != len(target_steps)
+        or any(not isinstance(item, str) for item in source_steps + target_steps)
+    ):
+        raise AgentLoopError(
+            "Shortening must preserve the exact plan-step entry cardinality and types."
+        )
+    if len(shortened) >= len(raw):
+        raise AgentLoopError("Shortening candidate is not shorter than the original response.")
+
+    source_without_prose = dict(source)
+    target_without_prose = dict(target)
+    source_without_prose.pop("summary", None)
+    source_without_prose.pop("plan_steps", None)
+    target_without_prose.pop("summary", None)
+    target_without_prose.pop("plan_steps", None)
+    if source_without_prose != target_without_prose:
+        raise AgentLoopError(
+            "Shortening may not change structured entries, dispositions, matrix, "
+            "recommendation, architecture impact, or closing declarations."
+        )
+
+    # Run the ordinary strict schema/footer checks after the exact-field gate.
+    from .protocol import validate_structured_plan_revision, validate_structured_plan_state
+
+    if kind == "plan_state":
+        parsed = validate_structured_plan_state(
+            shortened,
+            required_architecture_impact_contract=(1 if require_architecture_impact_contract else 0),
+            require_execution_strategy_contract=(1 if require_execution_strategy_contract else 0),
+            require_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
+        )
+    else:
+        parsed = validate_structured_plan_revision(
+            shortened,
+            required_architecture_impact_contract=(1 if require_architecture_impact_contract else 0),
+            require_execution_strategy_contract=(1 if require_execution_strategy_contract else 0),
+            require_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
+        )
+    if parsed is None:
+        raise AgentLoopError("Shortening response did not pass the structured plan validator.")
+
+    _require_ordered_clauses(source["summary"], target["summary"], field="summary")
+    for index, (source_step, target_step) in enumerate(zip(source_steps, target_steps)):
+        _require_ordered_clauses(
+            source_step,
+            target_step,
+            field=f"plan_steps[{index}]",
+        )
+    return parsed

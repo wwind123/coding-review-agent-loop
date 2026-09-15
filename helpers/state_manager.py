@@ -40,7 +40,10 @@ Subcommands:
   write-pending-comment
     --issue N --repo REPO --body PATH
 
-    Writes a pending comment body path to session state.
+  write-pending-comments
+    --issue N --repo REPO --bodies '["PATH", "PATH"]'
+
+    Writes one or more pending comment body paths to session state.
 
   clear-pending-comment
     --issue N --repo REPO
@@ -55,6 +58,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -161,7 +165,19 @@ def _load_session(path: Path) -> dict[str, object]:
 
 def _save_session(path: Path, data: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, indent=2, sort_keys=True))
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 @dataclass
@@ -241,6 +257,8 @@ def cmd_build_resume(args: argparse.Namespace) -> None:
         "current_plan_subject": None,
         "local_test_evidence": None,
         "pending_comment_body": session.get("pending_comment_body"),
+        "pending_comment_bodies": session.get("pending_comment_bodies"),
+        "planning_shortening": session.get("planning_shortening"),
         **_resume_matrix_fields(None),
     }
 
@@ -747,14 +765,39 @@ def cmd_write_pending_comment(args: argparse.Namespace) -> None:
     path = _session_path(args.repo, args.issue)
     existing = _load_session(path)
     existing["pending_comment_body"] = str(args.body)
+    existing.pop("pending_comment_bodies", None)
     _save_session(path, existing)
     print(f"pending comment path written: {path}")
+
+
+def cmd_write_pending_comments(args: argparse.Namespace) -> None:
+    path = _session_path(args.repo, args.issue)
+    existing = _load_session(path)
+    try:
+        bodies = json.loads(args.bodies)
+    except json.JSONDecodeError as exc:
+        print(f"state_manager: invalid --bodies JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if (
+        not isinstance(bodies, list)
+        or not bodies
+        or any(not isinstance(body, str) or not body for body in bodies)
+    ):
+        print("state_manager: --bodies must be a non-empty JSON array of paths", file=sys.stderr)
+        sys.exit(1)
+    existing["pending_comment_bodies"] = bodies
+    # Keep the singular field absent so older readers cannot accidentally post
+    # only the anchor and omit transport sidecars.
+    existing.pop("pending_comment_body", None)
+    _save_session(path, existing)
+    print(f"pending comment paths written: {path}")
 
 
 def cmd_clear_pending_comment(args: argparse.Namespace) -> None:
     path = _session_path(args.repo, args.issue)
     existing = _load_session(path)
     existing.pop("pending_comment_body", None)
+    existing.pop("pending_comment_bodies", None)
     _save_session(path, existing)
     print(f"pending comment cleared: {path}")
 
@@ -851,6 +894,15 @@ def main() -> None:
     p_pending.add_argument("--repo", required=True)
     p_pending.add_argument("--body", required=True)
 
+    # write-pending-comments
+    p_pending_many = subparsers.add_parser(
+        "write-pending-comments",
+        help="Record all prepared transport comment body paths as one pending publication.",
+    )
+    p_pending_many.add_argument("--issue", type=int, required=True)
+    p_pending_many.add_argument("--repo", required=True)
+    p_pending_many.add_argument("--bodies", required=True, help="JSON array of body paths.")
+
     # clear-pending-comment
     p_clear = subparsers.add_parser("clear-pending-comment", help="Clear the pending comment body path.")
     p_clear.add_argument("--issue", type=int, required=True)
@@ -863,6 +915,7 @@ def main() -> None:
         "write-session": cmd_write_session,
         "read-session": cmd_read_session,
         "write-pending-comment": cmd_write_pending_comment,
+        "write-pending-comments": cmd_write_pending_comments,
         "clear-pending-comment": cmd_clear_pending_comment,
     }
     dispatch[args.subcommand](args)

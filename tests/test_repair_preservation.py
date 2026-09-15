@@ -6,7 +6,10 @@ import pytest
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.protocol import validate_structured_task_result
 from coding_review_agent_loop.repair import _build_repair_prompt
-from coding_review_agent_loop.repair_preservation import validate_repair_preservation
+from coding_review_agent_loop.repair_preservation import (
+    validate_repair_preservation,
+    validate_shortened_plan_response,
+)
 from agent_loop_helpers import structured_v1_plan_state
 
 
@@ -171,6 +174,79 @@ def test_prompt_demands_lossless_repair_and_separate_ledgers():
     assert "Retain failure, timeout, skipped-test" in prompt
     assert "`addressed_items`, `remaining_items`, or `disputed_items`" in prompt
     assert "Preserve a source `disputed_items` classification" in prompt
+
+
+def _shortening_fixture() -> tuple[str, str]:
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["summary"] = (
+        "Please implement file action /src/example.py and run "
+        "python3 -m pytest tests/test_example.py -q; do not change quantity 3."
+    )
+    payload["plan_steps"] = [
+        "Please update /src/example.py and preserve the error branch, then run the focused test.",
+        "Do not reorder step 2 and keep the caveat exactly.",
+    ]
+    raw = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder"
+    shortened_payload = deepcopy(payload)
+    shortened_payload["summary"] = (
+        "implement file action /src/example.py run "
+        "python3 -m pytest tests/test_example.py -q; do not change quantity 3."
+    )
+    shortened_payload["plan_steps"] = [
+        "update /src/example.py preserve the error branch, run the focused test.",
+        "Do not reorder step 2 keep the caveat exactly.",
+    ]
+    shortened = (
+        json.dumps(shortened_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder"
+    )
+    return raw, shortened
+
+
+def test_shortening_preserves_ordered_obligation_clauses_and_all_structured_fields():
+    raw, shortened = _shortening_fixture()
+    parsed = validate_shortened_plan_response(raw, shortened)
+    assert parsed.summary.startswith("implement file action /src/example.py")
+    assert len(shortened) < len(raw)
+
+
+def test_shortening_accepts_verbatim_clause_with_mid_clause_filler() -> None:
+    source_payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    source_payload["summary"] = (
+        "Please implement file action /src/example.py and run the focused test."
+    )
+    source_payload["plan_steps"] = [
+        "Please use a bounded loop in order to avoid overflow, then run the focused test.",
+        "Please keep the caveat exactly.",
+    ]
+    candidate_payload = deepcopy(source_payload)
+    candidate_payload["summary"] = "implement file action /src/example.py and run the focused test."
+    candidate_payload["plan_steps"] = [
+        "use a bounded loop in order to avoid overflow, run the focused test.",
+        "keep the caveat exactly.",
+    ]
+    source = json.dumps(source_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder"
+    verbatim = json.dumps(candidate_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder"
+    # The candidate keeps the otherwise removable filler verbatim. Matching
+    # must normalize both source and candidate, not require a broken literal.
+    validate_shortened_plan_response(source, verbatim)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("summary", "Implement file action /src/other.py run python3 -m pytest tests/test_example.py -q; do not change quantity 3."),
+        ("summary", "Implement file action /src/example.py run python3 -m pytest tests/test_example.py -q; change quantity 3."),
+        ("plan_steps", ["Update /src/example.py preserve the error branch, run another test.", "Do not reorder step 2 keep the caveat exactly."]),
+    ],
+)
+def test_shortening_rejects_loss_of_file_test_quantity_or_polarity(field, replacement):
+    raw, shortened = _shortening_fixture()
+    payload = json.loads(shortened.split("\n", 1)[0])
+    payload[field] = replacement
+    candidate = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder"
+    with pytest.raises(AgentLoopError, match="Shortening content preservation failed"):
+        validate_shortened_plan_response(raw, candidate)
 
 
 def test_repair_preserves_matrix_evidence_status_and_caveats():

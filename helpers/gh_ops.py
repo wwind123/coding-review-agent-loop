@@ -60,8 +60,8 @@ def cmd_post_issue_comment(args: argparse.Namespace) -> None:
         str(args.issue),
         "--repo",
         args.repo,
-        "--body",
-        body,
+        "--body-file",
+        args.file,
         gh_cmd=args.gh_cmd,
     )
     print(f"comment posted to {args.repo}#{args.issue}")
@@ -97,8 +97,8 @@ def cmd_post_pr_comment(args: argparse.Namespace) -> None:
         str(args.pr),
         "--repo",
         args.repo,
-        "--body",
-        body,
+        "--body-file",
+        args.file,
         gh_cmd=args.gh_cmd,
     )
     print(f"comment posted to {args.repo}#PR{args.pr}")

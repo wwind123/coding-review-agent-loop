@@ -827,6 +827,86 @@ class TestStateManager:
         data = json.loads(result.stdout)
         assert "pending_comment_body" not in data
 
+    def test_write_and_clear_prepared_pending_comment_set(self, tmp_path: Path) -> None:
+        repo = "test/skill-repo"
+        issue = 9998
+        body_paths = [str(tmp_path / "sidecar.md"), str(tmp_path / "anchor.md")]
+        _run(
+            "helpers.state_manager",
+            "write-pending-comments",
+            "--issue", str(issue), "--repo", repo,
+            "--bodies", json.dumps(body_paths),
+        )
+        result = _run(
+            "helpers.state_manager", "read-session",
+            "--issue", str(issue), "--repo", repo,
+        )
+        assert json.loads(result.stdout)["pending_comment_bodies"] == body_paths
+        _run(
+            "helpers.state_manager", "clear-pending-comment",
+            "--issue", str(issue), "--repo", repo,
+        )
+        result = _run(
+            "helpers.state_manager", "read-session",
+            "--issue", str(issue), "--repo", repo,
+        )
+        assert "pending_comment_bodies" not in json.loads(result.stdout)
+
+    def test_host_publication_posts_the_prepared_transport_carriers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A projected carrier, not the pre-projection anchor, is published."""
+        from helpers import skill_runner
+        from coding_review_agent_loop.round_transport import (
+            PlanningPreflightOutcome,
+        )
+        from coding_review_agent_loop.protocol_markers import TrustedBody
+
+        plan_file = tmp_path / "plan.json"
+        plan_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        prepared = (
+            TrustedBody.current_untrusted_visible("exact sidecar"),
+            TrustedBody.current_untrusted_visible("exact anchor"),
+        )
+        posted: list[str] = []
+
+        def fake_run_helper(*args, **_kwargs):
+            if args[:2] == ("helpers.state_manager", "attach-metadata"):
+                output_file = Path(args[args.index("--output") + 1])
+                output_file.write_text("unprepared anchor", encoding="utf-8")
+            elif args[:2] == ("helpers.gh_ops", "post-issue-comment"):
+                path = Path(args[args.index("--file") + 1])
+                posted.append(path.read_text(encoding="utf-8"))
+
+        monkeypatch.setattr(skill_runner, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(
+            skill_runner,
+            "_run_helper_capture",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        )
+        monkeypatch.setattr(
+            skill_runner,
+            "preflight_planning_publication",
+            lambda *_args, **_kwargs: PlanningPreflightOutcome(
+                status="fits",
+                response_ceiling_chars=46_000,
+                original_response_chars=10,
+                prepared=prepared,
+            ),
+        )
+
+        result = skill_runner._run_host_coder_phase(
+            types.SimpleNamespace(issue=9993, repo="OWNER/REPO"),
+            plan_file,
+            {},
+            False,
+        )
+
+        assert result["is_new_round"] is True
+        assert posted == [str(body) for body in prepared]
+
     def test_attach_metadata_produces_valid_agent_loop_meta(self) -> None:
         """attach-metadata must embed AGENT_LOOP_META that _resume_plan_round recognizes."""
         plan_body = _VALID_PLAN_STATE
@@ -963,6 +1043,436 @@ class TestStateManager:
             assert second["is_new_round"] is False
             assert second["new_round_number"] == first["new_round_number"]
             assert second["plan_subject"] == first["plan_subject"]
+
+    def test_host_shortening_attempted_state_rejects_second_submission(self, tmp_path: Path) -> None:
+        from helpers import skill_runner
+
+        plan_file = tmp_path / "plan.json"
+        plan_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        args = types.SimpleNamespace(
+            issue=9997,
+            repo="OWNER/REPO",
+            shortened_plan_file=None,
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            skill_runner._run_host_coder_phase(
+                args,
+                plan_file,
+                {"planning_shortening": {
+                    "attempt_state": "attempted",
+                    "original_response": _VALID_PLAN_STATE,
+                    "original_digest": __import__("hashlib").sha256(
+                        _VALID_PLAN_STATE.encode("utf-8")
+                    ).hexdigest(),
+                }},
+                True,
+            )
+        assert excinfo.value.code == 1
+
+    def test_host_initial_oversize_persists_original_before_handoff(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+        from coding_review_agent_loop.round_transport import PlanningPreflightOutcome
+
+        raw_payload, footer_start = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        raw_payload["summary"] = "Please " * 12_000
+        original_text = json.dumps(raw_payload) + _VALID_PLAN_STATE[footer_start:]
+        plan_file = tmp_path / "plan.json"
+        plan_file.write_text(original_text, encoding="utf-8")
+        repair_base = tmp_path / "repair"
+        monkeypatch.setattr(skill_runner, "_REPAIR_BASE", repair_base)
+        state_writes: list[dict] = []
+
+        def fake_run_helper(*args, **_kwargs):
+            if args[:2] == ("helpers.state_manager", "write-session"):
+                fields_index = args.index("--fields")
+                state_writes.append(json.loads(args[fields_index + 1]))
+            elif args[:2] == ("helpers.state_manager", "attach-metadata"):
+                body_file = Path(args[args.index("--body-file") + 1])
+                output_file = Path(args[args.index("--output") + 1])
+                output_file.write_text(body_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+        monkeypatch.setattr(skill_runner, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(
+            skill_runner,
+            "_run_helper_capture",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        )
+        monkeypatch.setattr(
+            skill_runner,
+            "preflight_planning_publication",
+            lambda *_args, **_kwargs: PlanningPreflightOutcome(
+                status="shortening-required",
+                response_ceiling_chars=46_000,
+                original_response_chars=len(original_text),
+                diagnostic="response guidance exceeded",
+            ),
+        )
+
+        args = types.SimpleNamespace(
+            issue=9993,
+            repo="OWNER/REPO",
+            shortened_plan_file=None,
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            skill_runner._run_host_coder_phase(args, plan_file, {"completed_round_number": 0}, False)
+
+        assert excinfo.value.code == 2
+        original_artifact = (
+            repair_base / "9993-r1-claude-coder" / "plan-shortening-original.md"
+        )
+        assert original_artifact.read_text(encoding="utf-8") == original_text
+        handoff = state_writes[-1]["planning_shortening"]
+        assert handoff["attempt_state"] == "attempt-required"
+        assert handoff["attempt_consumed"] is False
+        assert handoff["original_response"] == original_text
+
+    def test_host_reentry_rejects_a_conflicting_candidate_already_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+
+        original_text = _VALID_PLAN_STATE
+        persisted_candidate = tmp_path / "persisted-shortened.json"
+        persisted_candidate.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        supplied_candidate = tmp_path / "different-shortened.json"
+        payload, footer_start = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["summary"] = "A different candidate."
+        supplied_candidate.write_text(
+            json.dumps(payload) + _VALID_PLAN_STATE[footer_start:], encoding="utf-8"
+        )
+        args = types.SimpleNamespace(
+            issue=9992,
+            repo="OWNER/REPO",
+            shortened_plan_file=str(supplied_candidate),
+        )
+        handoff = {
+            "attempt_state": "attempt-required",
+            "response_kind": "plan_state",
+            "expected_kind": "plan_state",
+            "original_response": original_text,
+            "original_digest": __import__("hashlib").sha256(
+                original_text.encode("utf-8")
+            ).hexdigest(),
+            "shortening_output_file": str(persisted_candidate),
+            "candidate_digest": __import__("hashlib").sha256(
+                persisted_candidate.read_bytes()
+            ).hexdigest(),
+        }
+        with pytest.raises(SystemExit) as excinfo:
+            skill_runner._run_host_coder_phase(
+                args,
+                tmp_path / "original-plan.json",
+                {"completed_round_number": 0, "planning_shortening": handoff},
+                True,
+            )
+        assert excinfo.value.code == 1
+
+    def test_host_shortening_restart_reuses_consumed_candidate_artifact(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+        from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+        raw_payload, footer_start = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        raw_payload["summary"] = "Please Plan is ready for review."
+        original_text = json.dumps(raw_payload) + _VALID_PLAN_STATE[footer_start:]
+        candidate_file = tmp_path / "shortened-plan.md"
+        candidate_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        candidate_digest = __import__("hashlib").sha256(
+            _VALID_PLAN_STATE.encode("utf-8")
+        ).hexdigest()
+        original_digest = __import__("hashlib").sha256(
+            original_text.encode("utf-8")
+        ).hexdigest()
+        parsed = validate_structured_plan_state(
+            _VALID_PLAN_STATE,
+            require_execution_strategy_contract=1,
+            require_risk_test_matrix_contract=1,
+        )
+        assert parsed is not None
+        monkeypatch.setattr(
+            skill_runner,
+            "_run_helper_capture",
+            lambda *_args: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        )
+        args = types.SimpleNamespace(issue=9996, repo="OWNER/REPO")
+        phase = skill_runner._run_host_coder_phase(
+            args,
+            tmp_path / "original-plan.md",
+            {
+                "completed_round_number": 0,
+                "planning_shortening": {
+                    "attempt_state": "attempted",
+                    "response_kind": "plan_state",
+                    "expected_kind": "plan_state",
+                    "original_response": original_text,
+                    "original_digest": original_digest,
+                    "shortening_output_file": str(candidate_file),
+                    "candidate_digest": candidate_digest,
+                },
+            },
+            True,
+        )
+        assert phase["is_new_round"] is True
+        assert phase["plan_text"] == render_canonical_plan_state(parsed)
+
+    def test_host_shortening_rejects_lossy_consumed_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+
+        original_payload, footer_start = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        original_payload["summary"] = (
+            "Plan is ready for review and preserve all details."
+        )
+        footer = _VALID_PLAN_STATE[footer_start:]
+        original_text = json.dumps(original_payload) + footer
+        candidate_payload = dict(original_payload)
+        candidate_payload["summary"] = "Plan is ready for review."
+        candidate_text = json.dumps(candidate_payload) + footer
+        original_file = tmp_path / "original-plan.json"
+        candidate_file = tmp_path / "shortened-plan.json"
+        original_file.write_text(original_text, encoding="utf-8")
+        candidate_file.write_text(candidate_text, encoding="utf-8")
+        args = types.SimpleNamespace(issue=9995, repo="OWNER/REPO")
+
+        with pytest.raises(SystemExit) as excinfo:
+            skill_runner._run_host_coder_phase(
+                args,
+                original_file,
+                {
+                    "completed_round_number": 0,
+                    "prior_items": [],
+                    "planning_shortening": {
+                        "attempt_state": "attempted",
+                        "response_kind": "plan_state",
+                        "expected_kind": "plan_state",
+                        "original_response": original_text,
+                        "original_digest": __import__("hashlib").sha256(
+                            original_text.encode("utf-8")
+                        ).hexdigest(),
+                        "shortening_output_file": str(candidate_file),
+                        "candidate_digest": __import__("hashlib").sha256(
+                            candidate_text.encode("utf-8")
+                        ).hexdigest(),
+                    },
+                },
+                True,
+            )
+        assert excinfo.value.code == 1
+
+    def test_host_shortening_reentry_keeps_original_when_candidate_still_over_budget(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+        from coding_review_agent_loop.round_transport import PlanningPreflightOutcome
+
+        original_payload, footer_start = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        original_payload["summary"] = (
+            "Please " * 8_000 + "Plan is ready for review."
+        )
+        original_text = json.dumps(original_payload) + _VALID_PLAN_STATE[footer_start:]
+        candidate_text = _VALID_PLAN_STATE
+        shortened_file = tmp_path / "shortened-plan.json"
+        shortened_file.write_text(candidate_text, encoding="utf-8")
+        original_digest = __import__("hashlib").sha256(
+            original_text.encode("utf-8")
+        ).hexdigest()
+        candidate_digest = __import__("hashlib").sha256(
+            candidate_text.encode("utf-8")
+        ).hexdigest()
+        state_writes: list[dict] = []
+
+        def fake_run_helper(*args, **_kwargs):
+            if args[:2] == ("helpers.state_manager", "write-session"):
+                fields_index = args.index("--fields")
+                state_writes.append(json.loads(args[fields_index + 1]))
+            elif args[:2] == ("helpers.state_manager", "attach-metadata"):
+                body_file = Path(args[args.index("--body-file") + 1])
+                output_file = Path(args[args.index("--output") + 1])
+                output_file.write_text(body_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+        monkeypatch.setattr(skill_runner, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(
+            skill_runner,
+            "_run_helper_capture",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        )
+        monkeypatch.setattr(
+            skill_runner,
+            "preflight_planning_publication",
+            lambda *_args, **_kwargs: PlanningPreflightOutcome(
+                status="shortening-required",
+                response_ceiling_chars=100,
+                original_response_chars=101,
+                diagnostic="still over guidance",
+            ),
+        )
+        args = types.SimpleNamespace(
+            issue=9994,
+            repo="OWNER/REPO",
+            shortened_plan_file=str(shortened_file),
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            skill_runner._run_host_coder_phase(
+                args,
+                tmp_path / "original-plan.json",
+                {
+                    "completed_round_number": 0,
+                    "prior_items": [],
+                    "planning_shortening": {
+                        "attempt_state": "attempt-required",
+                        "response_kind": "plan_state",
+                        "expected_kind": "plan_state",
+                        "original_response": original_text,
+                        "original_digest": original_digest,
+                        "shortening_output_file": str(tmp_path / "persisted.json"),
+                    },
+                },
+                False,
+            )
+        assert excinfo.value.code == 2
+        handoff = state_writes[-1]["planning_shortening"]
+        assert handoff["attempt_state"] == "attempted"
+        assert handoff["original_response"] == original_text
+        assert handoff["original_digest"] == original_digest
+        assert handoff["candidate_digest"] == candidate_digest
+
+    def test_recovered_external_shortening_candidate_rechecks_lossless_contract(
+        self, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+        from coding_review_agent_loop.errors import AgentLoopError
+
+        original_payload, footer_start = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        original_payload["summary"] = (
+            "Please preserve the first obligation and preserve the second obligation."
+        )
+        candidate_payload = dict(original_payload)
+        candidate_payload["summary"] = "Preserve the first obligation."
+        footer = _VALID_PLAN_STATE[footer_start:]
+        original_text = json.dumps(original_payload) + footer
+        candidate_text = json.dumps(candidate_payload) + footer
+        handoff = {
+            "original_response": original_text,
+            "original_digest": __import__("hashlib").sha256(
+                original_text.encode("utf-8")
+            ).hexdigest(),
+            "candidate_digest": __import__("hashlib").sha256(
+                candidate_text.encode("utf-8")
+            ).hexdigest(),
+        }
+
+        with pytest.raises(AgentLoopError, match="lossless validation"):
+            skill_runner._validate_persisted_shortening_candidate(
+                handoff=handoff,
+                candidate_text=candidate_text,
+                next_prior_items_raw=[],
+                require_architecture_impact_contract=True,
+                require_execution_strategy_contract=True,
+                require_risk_test_matrix_contract=True,
+            )
+
+    def test_prepared_host_handoff_reconciles_each_carrier_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+        from coding_review_agent_loop.round_transport import _sidecar
+
+        sidecar = tmp_path / "sidecar.md"
+        anchor = tmp_path / "anchor.md"
+        sidecar.write_text(
+            _sidecar({"v": 1, "field": "test", "data": "a"}),
+            encoding="utf-8",
+        )
+        anchor.write_text("Visible anchor", encoding="utf-8")
+        monkeypatch.setattr(
+            skill_runner,
+            "_fetch_issue_comments_raw",
+            lambda *_args, **_kwargs: [sidecar.read_text(encoding="utf-8")],
+        )
+        calls: list[tuple[str, ...]] = []
+        monkeypatch.setattr(
+            skill_runner,
+            "_run_helper",
+            lambda *args, **_kwargs: calls.append(tuple(args)),
+        )
+
+        assert skill_runner._reconcile_prepared_planning_handoff(
+            {
+                "planning_shortening": {
+                    "attempt_state": "attempted",
+                    "publication_state": "ready",
+                    "prepared_carrier_files": [str(sidecar), str(anchor)],
+                    "prepared_carrier_digests": [
+                        __import__("hashlib").sha256(
+                            sidecar.read_text(encoding="utf-8").encode("utf-8")
+                        ).hexdigest(),
+                        __import__("hashlib").sha256(
+                            anchor.read_text(encoding="utf-8").encode("utf-8")
+                        ).hexdigest(),
+                    ],
+                }
+            },
+            9996,
+            "OWNER/REPO",
+            False,
+        ) is True
+        posted = [
+            call for call in calls
+            if call[:2] == ("helpers.gh_ops", "post-issue-comment")
+        ]
+        assert len(posted) == 1
+        assert str(anchor) in posted[0]
+        assert any(call[:2] == ("helpers.state_manager", "write-session") for call in calls)
+
+    def test_pending_transport_reconciles_sidecars_idempotently(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+        from coding_review_agent_loop.round_transport import _sidecar
+
+        sidecar = tmp_path / "sidecar.md"
+        anchor = tmp_path / "anchor.md"
+        sidecar.write_text(
+            _sidecar({"v": 1, "field": "test", "data": "a"}),
+            encoding="utf-8",
+        )
+        anchor.write_text("Visible anchor", encoding="utf-8")
+        monkeypatch.setattr(
+            skill_runner,
+            "_fetch_issue_comments_raw",
+            lambda *_args, **_kwargs: [sidecar.read_text(encoding="utf-8")],
+        )
+        calls: list[tuple[str, ...]] = []
+        monkeypatch.setattr(
+            skill_runner,
+            "_run_helper",
+            lambda *args, **_kwargs: calls.append(tuple(args)),
+        )
+        skill_runner._reconcile_pending_comment(
+            {
+                "pending_comment_bodies": [str(sidecar), str(anchor)],
+                "planning_shortening": {"attempt_state": "attempted"},
+            },
+            9997,
+            "OWNER/REPO",
+            False,
+        )
+        posted = [call for call in calls if call[:2] == ("helpers.gh_ops", "post-issue-comment")]
+        assert len(posted) == 1
+        assert str(anchor) in posted[0]
+        assert any(call[:2] == ("helpers.state_manager", "write-session") for call in calls)
 
     def test_attach_metadata_persists_surfaced_reviewer_requirement_ids(self) -> None:
         requirement_id = "hr-" + "a" * 64

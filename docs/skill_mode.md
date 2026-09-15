@@ -62,6 +62,34 @@ plans without a matrix remain compatible. Use
 `--require-risk-test-matrix-contract` when explicitly checking a fresh matrix
 contract.
 
+### Planning publication transport and host handoff
+
+All initial and revision prompt builders give the coder a conservative
+Unicode-character ceiling for model-controlled JSON/prose. The ceiling budgets
+renderer expansion, visible sections, metadata, references, and a reserve; it
+is guidance, while only preflight of the actual rendered, projected,
+metadata-attached carrier authorizes publication under the hard 60,000-character
+limit.
+
+Execution recommendations and risk matrices are projected before shortening.
+Their bounded anchors retain readable summaries and authenticated references;
+exact canonical payloads and matrix audits stay in digest-checked sidecars and
+are hydrated before strict consumers run. One residual oversized candidate gets
+one fresh `shortener` invocation with separate usage accounting. Exact
+structured fields and deterministic ordered summary/step clauses are checked
+before re-rendering and posting. Invalid, lossy, second-attempt, or still-
+oversized output fails closed without reviewer or approval state changes.
+
+The host-as-coder path persists the original response, digest, response kind,
+target, failure, sidecar completeness, and `attempt-required` state. Re-enter
+once with `--shortened-plan-file PATH`; the file is copied to a stable repair
+artifact, must match the recorded kind and lineage, and the attempt is consumed
+before validation. Prepared sidecars and the anchor are recorded before remote
+writes; restart reconciles that exact carrier set idempotently, including a crash
+after a partial post, before selecting a planner or reviewer. A consumed handoff
+without a complete candidate remains fail-closed and cannot be re-armed. Historical
+unversioned rounds remain legacy-undecided.
+
 ### Containment and test gates
 
 External skill agents and the skill-mode test gate use the same shared
@@ -417,10 +445,23 @@ Fields written by `state_manager write-session`:
 | `session_id` | Current skill session UUID prefix |
 | `round_number` | Current plan/PR round number |
 | `pending_comment_body` | Path to a comment body not yet posted |
+| `pending_comment_bodies` | Complete ordered set of prepared sidecar/anchor carriers not yet reconciled |
+| `planning_shortening` | Digest-bound planning candidate and at-most-once shortening/handoff state |
 
-The `pending_comment_body` field provides crash recovery: if the session ends
-after writing the comment file but before posting it, the next `build-resume`
-call includes the path so Claude can re-post it.
+The pending comment fields provide crash recovery: if the session ends after
+writing one or more prepared carrier files but before all are posted, the next
+`build-resume` call includes the complete ordered set so the skill can compare
+each carrier with existing comments and post only missing units. Missing files,
+conflicting digests, or partial transport state fail closed; reconciliation is
+idempotent. The singular `pending_comment_body` remains a compatibility read
+path for older sessions.
+
+When a planning candidate needs shortening, `planning_shortening` is written
+before the fresh external turn or host handoff. It retains the original
+response and digest, expected response kind, target, failure, and sidecar
+completeness. A consumed attempt blocks competing planner/shortener turns;
+successful reconciliation clears the record only after the complete prepared
+carrier set is posted.
 
 ## Resume from existing round
 

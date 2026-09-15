@@ -24,12 +24,15 @@ from coding_review_agent_loop.comment_rendering import (
     _render_test_command_for_comment,
     decode_deferred_stages_marker,
     decode_execution_recommendation_marker,
+    decode_risk_test_matrix_marker,
     normalize_freeform_signature,
     render_agent_unavailable_comment,
     render_deferred_stages_section,
     render_discuss_round_summary_comment,
     render_typed_plan_stages_section,
     render_execution_recommendation_section,
+    render_risk_test_matrix_section,
+    RISK_TEST_MATRIX_MARKER_RE,
 )
 from coding_review_agent_loop.protocol import (
     DiscussSynthesisConsensus,
@@ -42,6 +45,7 @@ from coding_review_agent_loop.protocol import (
     ParsedFailedDiscussResponse,
     ParsedDiscussReview,
     ParsedDiscussRoundSynthesis,
+    risk_test_matrix_identity,
 )
 from coding_review_agent_loop.orchestrator import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
@@ -72,6 +76,7 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
 )
 from coding_review_agent_loop.protocol import TypedPlanStages
+from coding_review_agent_loop.round_transport import prepare_round_comment
 
 from agent_loop_helpers import (
     blocking_issues,
@@ -106,6 +111,51 @@ def test_execution_recommendation_rendering_round_trips_with_all_review_fields_v
     assert "`caveats`" in section
     assert decode_execution_recommendation_marker(marker.group("payload")) == (
         parsed.execution_recommendation.to_payload()
+    )
+
+
+def test_projected_matrix_anchor_hydrates_exact_matrix_marker():
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["risk_test_matrix"] = {
+        "applicability": "applicable",
+        "rows": [
+            {
+                "row_id": f"row-{index}",
+                "label": "A validated matrix transition row with bounded evidence. " + "x" * 450,
+                "entry_path_or_mode": "planning transport boundary",
+                "initial_state": "a valid plan is prepared " + "x" * 450,
+                "event": "the matrix section is projected " + "x" * 450,
+                "expected_outcome": "the exact matrix remains recoverable " + "x" * 450,
+                "forbidden_side_effects": ["No matrix truncation. " + "x" * 450],
+                "proposed_test_level": "boundary",
+                "proposed_test_location": "tests/test_comment_rendering.py",
+                "applicability": "applicable",
+                "related_scope_item_ids": ["scope-transport", "scope-" + "x" * 450],
+                "execution_owner": "one-shot",
+            }
+            for index in range(24)
+        ],
+        "important_exclusions": ["No inferred or truncated rows."],
+    }
+    parsed = validate_structured_plan_state(
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder",
+        require_execution_strategy_contract=1,
+        require_risk_test_matrix_contract=1,
+    )
+    section = render_risk_test_matrix_section(
+        parsed.risk_test_matrix, parsed.risk_test_matrix_changes
+    )
+    assert len(section) > 60_000
+    prepared = prepare_round_comment(section)
+    assert len(prepared) > 1
+    anchor = str(prepared[-1])
+    marker = RISK_TEST_MATRIX_MARKER_RE.search(anchor)
+    assert marker is not None
+    hydrated = decode_risk_test_matrix_marker(
+        marker.group("payload"), bodies=tuple(map(str, prepared))
+    )
+    assert hydrated["identity"] == risk_test_matrix_identity(
+        parsed.risk_test_matrix, parsed.risk_test_matrix_changes
     )
 
 

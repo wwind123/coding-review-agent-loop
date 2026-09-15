@@ -2376,7 +2376,9 @@ def _resume_plan_round(
                 matrix_marker_match = RISK_TEST_MATRIX_MARKER_RE.search(current_plan)
                 if matrix_marker_match is None:
                     raise AgentLoopError("Generation-1 planning metadata has no canonical risk matrix sidecar.")
-                matrix_marker = decode_risk_test_matrix_marker(matrix_marker_match.group("payload"))
+                matrix_marker = decode_risk_test_matrix_marker(
+                    matrix_marker_match.group("payload"), bodies=all_bodies
+                )
                 if matrix_marker["identity"] != latest_coder_record.metadata.risk_test_matrix_identity:
                     raise AgentLoopError("Generation-1 canonical risk matrix sidecar does not match metadata.")
         except (AgentLoopError, AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:

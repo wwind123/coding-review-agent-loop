@@ -28,6 +28,27 @@ def test_skill_planning_recovery_refuses_to_invent_fresh_contract():
         )
 
 
+def test_external_skill_resume_does_not_start_competing_planner_after_shortening():
+    from helpers import skill_runner
+
+    args = type(
+        "Args", (), {
+            "issue": 814,
+            "repo": "OWNER/REPO",
+            "gemini_cmd": "gemini",
+        }
+    )()
+    resume = {
+        "completed_round_number": 0,
+        "planning_shortening": {"attempt_state": "attempted"},
+    }
+    with pytest.raises(SystemExit) as excinfo:
+        skill_runner._run_external_coder_phase(
+            args, "codex", resume, [], None, True
+        )
+    assert excinfo.value.code == 1
+
+
 def test_demo_loop_dry_run() -> None:
     """
     Run helpers/demo_loop.py and verify it:
