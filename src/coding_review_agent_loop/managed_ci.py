@@ -479,6 +479,25 @@ def parse_managed_ci_override_record(
     return ManagedCiOverrideRecord(nonce=nonce, fields=tuple(fields))
 
 
+def _opening_override_nonce(body: str | None) -> str | None:
+    """Return the nonce authenticated by the PR-opening body, if present.
+
+    A fresh or continuity authorization has its own nonce.  Revalidation must
+    never pass that terminal nonce to the PR-body parser; the body, when it
+    carries an override, is bound only to the original opening nonce.
+    """
+    body = body or ""
+    if UNPROTECTED_OVERRIDE_TRAILER not in body:
+        return None
+    record = parse_managed_ci_override_record(
+        body,
+        surface=PR_BODY_SURFACE,
+        schema="body",
+        required=True,
+    )
+    return record.nonce if record is not None else None
+
+
 @dataclass(frozen=True)
 class OrdinaryRecoveryCapability:
     """Invocation-owned proof that this run deliberately released managed CI."""
@@ -1939,16 +1958,7 @@ def authorize_fresh_issue_created_resume(
             trusted_actor_id=actor_id,
             protection_mode=record.protection,
             override_nonce=record.nonce,
-            opening_override_nonce=(
-                parse_managed_ci_override_record(
-                    metadata.body or "",
-                    surface=PR_BODY_SURFACE,
-                    schema="body",
-                    required=False,
-                ).nonce
-                if UNPROTECTED_OVERRIDE_TRAILER in (metadata.body or "")
-                else None
-            ),
+            opening_override_nonce=_opening_override_nonce(metadata.body),
             active_label_event_id=record.label_event_id,
             lifecycle=(
                 "draft-labeled" if MANAGED_LABEL in labels
@@ -2070,16 +2080,7 @@ def authorize_fresh_issue_created_resume(
         trusted_actor_id=actor_id,
         protection_mode=protection.state,
         override_nonce=authorization.nonce,
-        opening_override_nonce=(
-            parse_managed_ci_override_record(
-                metadata.body or "",
-                surface=PR_BODY_SURFACE,
-                schema="body",
-                required=False,
-            ).nonce
-            if UNPROTECTED_OVERRIDE_TRAILER in (metadata.body or "")
-            else None
-        ),
+        opening_override_nonce=_opening_override_nonce(metadata.body),
         active_label_event_id=label_event[0],
         lifecycle=(
             "draft-labeled" if MANAGED_LABEL in labels
@@ -2127,7 +2128,12 @@ def revalidate_issue_created_handoff(
     # Creation and fresh grants can advance to a continuity terminal, but the
     # PR body remains bound to the opening authorization nonce.  Revalidate
     # that immutable opening tuple rather than treating the continuity record's
-    # nonce as if it had been written into the PR body.
+    # nonce as if it had been written into the PR body.  Recover the opening
+    # nonce from the body as a defensive fallback for handoffs assembled from
+    # a terminal record without the copied field.
+    opening_override_nonce = handoff.opening_override_nonce
+    if opening_override_nonce is None:
+        opening_override_nonce = _opening_override_nonce(metadata.body)
     validated = _issue_created_tuple(
         runner,
         config=config,
@@ -2135,7 +2141,7 @@ def revalidate_issue_created_handoff(
         issue_number=handoff.issue_number,
         metadata=metadata,
         expected_branch=handoff.branch,
-        expected_nonce=handoff.opening_override_nonce,
+        expected_nonce=opening_override_nonce,
         protection_mode=handoff.protection_mode,
         lifecycle=(
             "ready-unlabeled"
@@ -2159,6 +2165,7 @@ def revalidate_issue_created_handoff(
         validated,
         authorization_kind=handoff.authorization_kind,
         authorization_comment_id=handoff.authorization_comment_id,
+        opening_override_nonce=opening_override_nonce,
         approved_plan_hash=handoff.approved_plan_hash,
     )
 

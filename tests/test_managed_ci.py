@@ -1317,6 +1317,38 @@ def test_recovery_accepts_continuity_terminal_for_opening_body_head(tmp_path):
     assert audit[1]["kind"] == "continuity"
 
 
+def test_continuity_revalidation_never_uses_terminal_nonce_for_opening_body(
+    tmp_path,
+):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = replace(
+        _authorization_handoff(),
+        lifecycle="draft-labeled",
+        authorization_kind="continuity",
+        override_nonce="continuity-nonce",
+        opening_override_nonce=None,
+        active_label_event_id=101,
+        authorization_comment_id=42,
+    )
+
+    validated = revalidate_issue_created_handoff(
+        runner,
+        config=config,
+        handoff=handoff,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+    )
+
+    assert validated.override_nonce == "continuity-nonce"
+    assert validated.opening_override_nonce == "nonce-643"
+
+
 def test_public_pr_missing_authorization_reaches_parser_valid_fresh_remedy(tmp_path):
     recovered_metadata = replace(
         metadata(),
