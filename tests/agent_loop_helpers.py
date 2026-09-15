@@ -778,6 +778,7 @@ class FakeRunner(Runner):
 
         if cmd[:2] == ["codex", "exec"]:
             output = self._next_agent_output(self.codex_outputs)
+            explicit_stdout = isinstance(output, dict) and "stdout" in output
             if isinstance(output, dict):
                 public_response = output.get("public_response", "")
                 stdout = output.get("stdout", "")
@@ -789,7 +790,8 @@ class FakeRunner(Runner):
                 normalized = self._normalize_legacy_agent_output(public_response, "\n".join(cmd))
                 if normalized != public_response:
                     public_response = normalized
-                    stdout = normalized
+                    if not explicit_stdout:
+                        stdout = normalized
             self._maybe_write_public_response_file(cmd, prompt=input_text)
             if "--output-last-message" in cmd:
                 out_path = Path(cmd[cmd.index("--output-last-message") + 1])

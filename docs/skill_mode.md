@@ -82,11 +82,13 @@ oversized output fails closed without reviewer or approval state changes.
 
 The host-as-coder path persists the original response, digest, response kind,
 target, failure, sidecar completeness, and `attempt-required` state. Re-enter
-once with `--shortened-plan-file PATH`; the file must match the recorded kind
-and lineage, and the attempt is consumed before validation. Restart resumes the
-handoff or recovery artifact rather than treating the original as a new round
-or invoking a competing planner. Historical unversioned rounds remain
-legacy-undecided.
+once with `--shortened-plan-file PATH`; the file is copied to a stable repair
+artifact, must match the recorded kind and lineage, and the attempt is consumed
+before validation. Prepared sidecars and the anchor are recorded before remote
+writes; restart reconciles that exact carrier set idempotently, including a crash
+after a partial post, before selecting a planner or reviewer. A consumed handoff
+without a complete candidate remains fail-closed and cannot be re-armed. Historical
+unversioned rounds remain legacy-undecided.
 
 ### Containment and test gates
 

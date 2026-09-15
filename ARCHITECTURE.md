@@ -163,8 +163,11 @@ response, canonical identity, target, failure, digest, sidecar completeness, and
 attempt state. Partial publication fails closed and reconciliation is idempotent;
 review, decomposition, implementation, and approval do not advance from a
 diagnostic. Skill host-as-coder mode persists an `attempt-required` handoff and
-accepts one digest-bound shortened file on re-entry. Historical unversioned
-rounds remain legacy-undecided and are never upgraded by inference.
+accepts one digest-bound shortened file on re-entry. The original and shortened
+artifacts, plus any prepared carrier set, live under stable repair paths; a ready
+carrier set is reconciled before phase selection so a crash cannot wedge a consumed
+handoff or publish only an anchor. Historical unversioned rounds remain
+legacy-undecided and are never upgraded by inference.
 
 #### Generation-1 reviewed execution strategy
 
