@@ -4493,12 +4493,16 @@ def _stop_issue_resume_after_real_activation(monkeypatch):
         "_freeze_prompt_architecture",
         lambda _runner, config, **_kwargs: config,
     )
+    real_activate_managed_ci = orchestrator_module.activate_managed_ci
+
+    def activate_then_stop(*args, **kwargs):
+        result = real_activate_managed_ci(*args, **kwargs)
+        raise _RealManagedActivationReached(result)
+
     monkeypatch.setattr(
         orchestrator_module,
-        "validate_open_pr",
-        lambda *_args, **_kwargs: (
-            _ for _ in ()
-        ).throw(_RealManagedActivationReached()),
+        "activate_managed_ci",
+        activate_then_stop,
     )
 
 
@@ -4728,27 +4732,36 @@ def test_managed_issue_publication_malformed_response_stops_before_handoff_or_re
 def test_issue_fresh_recovery_discovers_pre_handoff_pr_without_reimplementing(
     tmp_path, monkeypatch,
 ):
-    runner = FakeRunner(
+    runner = _IssueRecoveryWorkflowRunner(
+        labeled=False,
         open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
         pr_commit_pages=_provenance_pages(
             "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct"
         ),
     )
-    resumed = []
-    monkeypatch.setattr(
-        orchestrator_module, "run_pr_loop",
-        lambda *_a, **kwargs: resumed.append(kwargs) or 0,
-    )
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_fresh_authorization=True,
         managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "issue", "56", "--managed-ci", "--managed-ci-fresh",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
     )
+    _stop_issue_resume_after_real_activation(monkeypatch)
 
-    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+    with pytest.raises(_RealManagedActivationReached):
+        run_issue_loop(runner, issue_number=56, config=config)
 
-    assert len(resumed) == 1
-    assert resumed[0]["managed_ci_issue_number"] == 56
-    assert resumed[0]["issue_context"].number == 56
+    records = [
+        parsed
+        for comment in runner.authorization_comments
+        if (parsed := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    assert len(records) == 1 and records[0].kind == "fresh"
+    assert runner.labels_posted is True
+    assert runner.dispatch_count == 0
     assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
 
 def test_issue_loop_outside_workdir_after_reported_pr_hedges_unconfirmed_pr(tmp_path):

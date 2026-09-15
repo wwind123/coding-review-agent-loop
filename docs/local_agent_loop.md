@@ -1901,6 +1901,14 @@ checkpoint cannot be written, agent-loop removes `agent-loop-managed` and
 waits for the workflow's `unlabeled` recovery CI instead of treating a
 `no_checks` board as mergeable.
 
+The explicit fresh issue-created command is printed only for an authenticated
+issue-created missing or stale authorization whose issue scope is known and
+whose invocation includes the unprotected waiver. It is not a remedy for an
+unreadable or foreign label event, a missing waiver/protection prerequisite, a
+tuple or publication race, an intent-ledger failure, or an adopted/source-managed
+PR; those states report the failed prerequisite and require that state to be
+restored.
+
 Issue-created unprotected authorization is persisted independently of coder
 test evidence. After the live PR number and opening tuple are authenticated,
 agent-loop writes one versioned authorization record as an actor-authored PR

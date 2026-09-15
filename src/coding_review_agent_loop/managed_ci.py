@@ -2677,6 +2677,7 @@ def _release_for_ordinary_recovery(
             fresh_authorization_allowed
             and config.allow_unprotected_managed_ci
             and fresh_issue_number is not None
+            and _reason_allows_fresh_issue_created_authorization(reason)
         ):
             fresh = render_managed_ci_resume_command(
                 config,
@@ -2707,6 +2708,22 @@ def _release_for_ordinary_recovery(
         released_at=int(time.time()),
         prior_run_ids=frozenset(prior_run_ids),
     )
+
+
+def _reason_allows_fresh_issue_created_authorization(reason: str) -> bool:
+    """Return whether an explicit issue-created grant can repair ``reason``.
+
+    Ordinary release is also used by adoption and source-managed paths.  A
+    generic ``managed_ci`` flag is therefore not enough to advertise the
+    exceptional issue-created grant: ownership, waiver, tuple, and publication
+    failures have different remedies and several cannot be repaired by a new
+    grant at all.
+    """
+    return reason in {
+        "no fully bound actor-owned issue-created authorization reaches the live head",
+        "the durable issue-created authorization is bound to an older head; "
+        "no trusted continuity record authorizes the live head",
+    }
 
 
 def refresh_ordinary_recovery_capability(
@@ -2811,20 +2828,42 @@ def _find_resume_audit(
                 valid_label_event_ids is not None
                 and authorization.label_event_id not in valid_label_event_ids
             )
-            or (
-                expected_handoff is not None
-                and expected_handoff.active_label_event_id is not None
-                and authorization.head_sha == expected_handoff.head_sha
-                and authorization.label_event_id != expected_handoff.active_label_event_id
-            )
         ):
             return False
         if expected_handoff is None:
             return True
         if (
-            authorization.issue_number != expected_handoff.issue_number
+            authorization.repository.casefold() != expected_handoff.repository.casefold()
+            or authorization.pr_number != expected_handoff.pr_number
+            or authorization.issue_number != expected_handoff.issue_number
+            or authorization.base_ref != expected_handoff.base_ref
+            or authorization.actor_login.casefold()
+            != expected_handoff.trusted_actor_login.casefold()
+            or authorization.actor_id != expected_handoff.trusted_actor_id
+            or authorization.protection != expected_handoff.protection_mode
             or (authorization.approved_plan_hash or None)
             != (expected_handoff.approved_plan_hash or None)
+        ):
+            return False
+        # The opening nonce belongs to the authenticated PR body.  Validate it
+        # on the creation root even when a later fresh/continuity record is the
+        # selected terminal, so a trusted comment cannot launder a mismatched
+        # historical root into resume authority.
+        if authorization.kind == "creation":
+            expected_nonce = expected_handoff.opening_override_nonce
+            if (
+                expected_nonce is None
+                and expected_handoff.authorization_kind == "creation"
+                and authorization.head_sha == expected_handoff.head_sha
+            ):
+                expected_nonce = expected_handoff.override_nonce
+            if expected_nonce is not None and authorization.nonce != expected_nonce:
+                return False
+        if (
+            authorization.kind == "fresh"
+            and expected_handoff.authorization_kind == "fresh"
+            and authorization.head_sha == expected_handoff.head_sha
+            and authorization.nonce != expected_handoff.override_nonce
         ):
             return False
         # The handoff's comment identity is the authenticated terminal record.
@@ -2987,6 +3026,15 @@ def _find_resume_audit(
             else:
                 if current.kind in {"creation", "fresh"}:
                     valid_terminals.append((terminal_comment_id, terminal_record))
+        if expected_handoff is not None and expected_handoff.active_label_event_id is not None:
+            # Only the terminal record must point at the active event.  Older
+            # roots and continuity ancestors may legitimately reference prior
+            # actor-owned label applications in the same chain.
+            valid_terminals = [
+                item
+                for item in valid_terminals
+                if item[1].label_event_id == expected_handoff.active_label_event_id
+            ]
         if expected_handoff is not None and expected_handoff.authorization_comment_id is not None:
             valid_terminals = [
                 item

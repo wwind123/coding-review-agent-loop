@@ -569,10 +569,16 @@ def _stop_after_real_activation(monkeypatch):
         "_freeze_prompt_architecture",
         lambda _runner, config, **_kwargs: config,
     )
+    real_activate_managed_ci = orchestrator.activate_managed_ci
+
+    def activate_then_stop(*args, **kwargs):
+        result = real_activate_managed_ci(*args, **kwargs)
+        raise _ActivationReached(result)
+
     monkeypatch.setattr(
         orchestrator,
-        "validate_open_pr",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(_ActivationReached()),
+        "activate_managed_ci",
+        activate_then_stop,
     )
 
 
@@ -1469,6 +1475,74 @@ def test_resume_rejects_every_mismatched_authorization_binding(tmp_path, mutatio
     ) is None
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["actor-payload", "actor-id-payload", "nonce", "waiver", "protection", "label-event", "plan"],
+)
+def test_activation_rejects_mismatched_authorization_without_label_or_dispatch(tmp_path, mutation):
+    handoff = replace(
+        _authorization_handoff(), approved_plan_hash="plan-hash",
+        authorization_comment_id=41,
+    )
+    record = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="nonce-643",
+        label_event_id=101, approved_plan_hash="plan-hash",
+    )
+    changes = {
+        "actor-payload": {"actor_login": "attacker"},
+        "actor-id-payload": {"actor_id": 2},
+        "nonce": {"nonce": "wrong"},
+        "waiver": {"waiver": "different-waiver"},
+        "protection": {"protection": "plan_limited"},
+        "label-event": {"label_event_id": 999},
+        "plan": {"approved_plan_hash": "other-plan"},
+    }
+    record = replace(record, **changes[mutation])
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"state": "open", "draft": True, "labels": []},
+        issue_events=[label_event()],
+        intent_comments=[{
+            "id": 41,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": str(format_issue_created_authorization_comment(record)),
+        }],
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+
+    with pytest.raises(AgentLoopError, match="--managed-ci-fresh"):
+        activate_managed_ci(
+            runner,
+            config=config,
+            pr_number=7,
+            metadata=metadata(),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created",
+                lifecycle="draft-unlabeled-reentry",
+                issue_created_handoff=handoff,
+            ),
+        )
+
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert not any(
+        command[:5] == [
+            "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
+        ]
+        for command, _cwd in runner.commands
+    )
+
+
 def test_resume_rejects_unsolicited_live_head(tmp_path):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
@@ -1641,6 +1715,44 @@ def test_fresh_remedy_is_not_advertised_without_the_explicit_waiver(tmp_path):
     message = str(exc_info.value)
     assert "--managed-ci-fresh" not in message
     assert "no issue-created authorization grant was inferred" in message
+
+
+def test_ordinary_release_renders_recovered_issue_scope_as_parser_valid_fresh_command(tmp_path):
+    runner = V2ManagedRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+
+    with pytest.raises(AgentLoopError) as exc_info:
+        _release_for_ordinary_recovery(
+            runner,
+            config=config,
+            pr_number=7,
+            base_ref="main",
+            expected_head_sha="abc123",
+            active_event=(101, "agent-loop", 1),
+            reason="no fully bound actor-owned issue-created authorization reaches the live head",
+            recovery_capable=True,
+            fresh_issue_number=643,
+            fresh_authorization_allowed=True,
+        )
+
+    command = str(exc_info.value).split("`", 2)[1]
+    parsed = build_parser().parse_args(shlex.split(command)[1:])
+    assert parsed.command == "pr"
+    assert parsed.pr_number == 7
+    assert parsed.managed_ci_fresh_authorization is True
+    assert parsed.managed_ci_issue == 643
+    assert parsed.allow_unprotected_managed_ci is True
 
 
 def test_draft_unlabeled_missing_authorization_does_not_apply_label_and_prints_valid_fresh_command(

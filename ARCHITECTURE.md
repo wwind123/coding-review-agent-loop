@@ -274,6 +274,11 @@ label event, and authorization-comment state immediately before writing, and
 fresh grants bind the observed voluntary or plan-limited protection state.
 Legacy PR discovery during explicit managed issue recovery does not synthesize
 a canonical handoff from an implementation response that failed validation.
+Fresh-authorization guidance is emitted only for an authenticated
+issue-created missing/stale authorization with a known issue scope and explicit
+unprotected waiver. Label-event, protection, tuple/publication, intent-ledger,
+adoption, and source-managed failures retain their own prerequisite-specific
+diagnostics rather than advertising an inapplicable grant.
 
 Automatic authority across a coder repair head is a narrow execution/data-flow
 transition: the orchestrator must have persisted the blocking round, invoked
