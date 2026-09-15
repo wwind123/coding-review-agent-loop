@@ -265,13 +265,20 @@ rejected and cannot produce handoff, approval, readiness, dispatch, or
 qualification state. A response rejected before the PR number is accepted is
 never parsed for authority; recovery requires the explicit fresh operator
 grant in issue or PR mode, with PR mode naming the issue scope.
+PR-mode recovery fetches that issue from GitHub, resolves any canonical
+approved-plan identity from its durable comments, and requires a server-side
+issue timeline association to the exact PR; candidate-authored closing text is
+not the source of authorization.
 
 Automatic authority across a coder repair head is a narrow execution/data-flow
 transition: the orchestrator must have persisted the blocking round, invoked
 the coder for that round, validated the response and assigned-checkout head
 advance, re-read the exact live PR tuple, and persist one continuity comment
 binding predecessor head, new head, predecessor authorization, and round
-metadata identities. Resume accepts only one unique gap-free chain. Missing,
+metadata identities. Those referenced comments are parsed again on resume and
+must be the blocking reviewer record for the predecessor head and the coder
+record for the immediately following round and new head. Resume accepts only
+one unique gap-free chain. Missing,
 forked, stale, unsolicited, or raced links fail closed and direct an eligible
 operator to fresh authorization. PR bodies, branches, labels, draft state,
 commits, and coder-authored comments remain corroboration only; they are not

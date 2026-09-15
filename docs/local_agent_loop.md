@@ -1932,7 +1932,11 @@ This is a new operator authorization, not recovered creation provenance. It
 requires the authenticated actor, same-repository open PR, reserved issue
 branch, selected base, live exact head, expected issue association, an
 actor-owned managed-label history, and the canonical approved-plan scope when
-one applies. Identical retries reuse the same comment; conflicting records,
+one applies. PR mode fetches the issue and its canonical plan comments from
+GitHub and requires a server-observed issue timeline association to the PR;
+PR-body closing text is corroboration, not authority. Identical retries reuse
+an existing valid creation, fresh, or continuity authorization at that exact
+head instead of publishing a competing grant; conflicting records,
 ambiguous provenance, or changed live state fail closed before labels,
 readiness, review dispatch, qualification, or merge writes.
 
@@ -2070,8 +2074,11 @@ When an orchestrator-dispatched coder repair advances the PR, automatic
 authority movement is allowed only through one unique, gap-free chain of
 actor-authored continuity comments. Each continuity record binds the
 predecessor authorization comment, predecessor head, new exact head, and the
-durable review/coder round metadata identities. A push, branch name, PR body,
-author, label, draft state, missing link, fork, or race cannot extend
+durable review/coder round metadata identities. The referenced records are
+re-parsed as the blocking review for the predecessor
+head and the immediately following coder record for the new head; unrelated or
+malformed metadata and authorization-comment fallbacks are rejected. A push,
+branch name, PR body, author, label, draft state, missing link, fork, or race cannot extend
 authority; recovery prints the explicit fresh-authorization command instead.
 
 #### Creating a managed PR from an existing branch

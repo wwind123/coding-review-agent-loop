@@ -5764,7 +5764,8 @@ def _validate_tests_with_post_pr_context(
         raise AgentLoopError(
             f"{exc}\n\n"
             f"PR #{pr_number} was confirmed open, but the handoff/reviewer comments were not posted because "
-            f"the {report_description} was invalid. Correct the PR/comment if needed, then continue safely with "
+            f"the {report_description} was invalid. The managed-CI authorization checkpoint, when required, "
+            "was persisted before this report was rejected. Correct the PR/comment if needed, then continue safely with "
             f"`agent-loop pr {pr_number}` instead of rerunning implementation and creating a duplicate PR."
         ) from exc
 
@@ -5805,6 +5806,40 @@ def _validate_structured_response_tests_with_post_pr_context(
         pr_number=pr_number,
         report_description="structured test report",
     )
+
+
+def _publish_issue_authorization_with_recovery(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    metadata: PullRequestMetadata,
+    issue_number: int,
+    approved_plan_hash_value: str | None = None,
+) -> AuthenticatedIssueCreatedHandoff:
+    """Publish the durable checkpoint or give an authority-changing remedy."""
+    try:
+        return publish_issue_created_authorization(
+            runner,
+            config=config,
+            handoff=handoff,
+            metadata=metadata,
+            approved_plan_hash=approved_plan_hash_value,
+        )
+    except AgentLoopError as exc:
+        command = render_managed_ci_resume_command(
+            config,
+            pr_number=handoff.pr_number,
+            issue_number=issue_number,
+            managed_ci=True,
+            fresh_authorization=True,
+            fresh_issue_number=issue_number,
+        )
+        raise AgentLoopError(
+            f"{exc}\n\nManaged-CI authorization publication was interrupted and no "
+            "handoff or qualification was claimed. After verifying the PR, create an "
+            f"explicit new operator authorization with `{command}`."
+        ) from exc
 
 
 def _round_ledger_may_be_incomplete(
@@ -6241,16 +6276,17 @@ def _implement_approved_issue(
                 implementation_config,
                 managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
             )
-        else:
-            reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
         if managed_ci_handoff is not None:
-            managed_ci_handoff = publish_issue_created_authorization(
+            managed_ci_handoff = _publish_issue_authorization_with_recovery(
                 runner,
                 config=implementation_config,
                 handoff=managed_ci_handoff,
                 metadata=initial_pr_context.metadata,
-                approved_plan_hash=plan_hash,
+                issue_number=issue_number,
+                approved_plan_hash_value=plan_hash,
             )
+    else:
+        reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
     if isinstance(implementation_result, StructuredIssueImplementation):
         _validate_structured_response_tests_with_post_pr_context(
             implementation_result.tests_run,
@@ -8762,11 +8798,12 @@ def run_issue_loop(
                     config,
                     managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
                 )
-            managed_ci_handoff = publish_issue_created_authorization(
+            managed_ci_handoff = _publish_issue_authorization_with_recovery(
                 runner,
                 config=config,
                 handoff=managed_ci_handoff,
                 metadata=initial_pr_context.metadata,
+                issue_number=issue_number,
             )
         else:
             reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
@@ -10401,6 +10438,80 @@ def run_pr_loop(
                 config,
                 managed_ci_issue_number=fresh_issue_number,
             )
+            if issue_context is None:
+                validate_open_issue(
+                    runner, config=config, issue_number=fresh_issue_number
+                )
+                issue_context = get_issue_context(
+                    runner, config=config, issue_number=fresh_issue_number
+                )
+            elif issue_context.number != fresh_issue_number:
+                raise AgentLoopError(
+                    "Managed-CI fresh authorization issue scope does not match the "
+                    "authenticated issue context."
+                )
+            canonical_handoff = find_latest_issue_pr_handoff(
+                issue_context.comments,
+                issue_number=fresh_issue_number,
+                repo=config.repo,
+            )
+            if canonical_handoff is not None:
+                if canonical_handoff.pr_number != pr_number:
+                    raise AgentLoopError(
+                        "Managed-CI fresh authorization issue scope is already bound to "
+                        "a different canonical PR."
+                    )
+                if canonical_handoff.flow == "approved-plan-implementation":
+                    if not canonical_handoff.plan_hash:
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization found an approved-plan handoff "
+                            "without a canonical plan identity."
+                        )
+                    recovered = recover_approved_plan_context(
+                        issue_context.comments,
+                        expected_hash=canonical_handoff.plan_hash,
+                    )
+                    if not recovered.is_available:
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization could not recover the canonical "
+                            "approved plan for the explicit issue scope."
+                        )
+                    if (
+                        approved_plan_context is not None
+                        and approved_plan_context.plan_hash != recovered.plan_hash
+                    ):
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization approved-plan scope does not "
+                            "match the canonical issue plan."
+                        )
+                    approved_plan_context = recovered
+            elif approved_plan_context is None:
+                resumed_plan = _resume_plan_round(
+                    issue_context.comments,
+                    configured_reviewers=reviewers(config),
+                )
+                if resumed_plan is not None:
+                    plan_text, resumed_plan_round = resumed_plan
+                    configured_names = {
+                        agent_display_name(reviewer) for reviewer in reviewers(config)
+                    }
+                    approved_names = {
+                        record.metadata.agent
+                        for record in resumed_plan_round.completed_reviews
+                        if record.metadata.state == "approved"
+                    }
+                    if approved_names != configured_names:
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization found planning state without "
+                            "a complete canonical reviewer approval."
+                        )
+                    approved_plan_context = make_approved_plan_context(
+                        plan_text,
+                        source_locator=(
+                            f"issue #{fresh_issue_number} canonical approved plan"
+                        ),
+                        expected_hash=approved_plan_hash(plan_text),
+                    )
             managed_ci_handoff = authorize_fresh_issue_created_resume(
                 runner,
                 config=config,
@@ -14767,9 +14878,10 @@ def run_pr_loop(
                         pr_number=pr_number,
                         actor_login=managed_ci_handoff.trusted_actor_login,
                         actor_id=managed_ci_handoff.trusted_actor_id,
+                        predecessor_head=predecessor_head,
+                        new_head=new_head,
+                        round_number=round_number,
                     )
-                    if not round_comment_ids and managed_ci_handoff.authorization_comment_id:
-                        round_comment_ids = (managed_ci_handoff.authorization_comment_id,)
                     managed_ci_handoff = publish_issue_created_continuity_authorization(
                         runner,
                         config=config,

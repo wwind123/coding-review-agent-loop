@@ -41,6 +41,7 @@ from .protocol_markers import (
     TrustedBody,
     scan_reserved_markers,
 )
+from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, hydrate_mapping
 
 
 MANAGED_LABEL = "agent-loop-managed"
@@ -1250,26 +1251,130 @@ def find_actor_round_metadata_comment_ids(
     pr_number: int,
     actor_login: str,
     actor_id: int,
+    predecessor_head: str,
+    new_head: str,
+    round_number: int,
 ) -> tuple[int, ...]:
-    """Return authenticated PR-comment IDs carrying durable PR round metadata."""
+    """Return the exact blocking-review and coder records for one head transition."""
     comments = _api_list(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
         raise AgentLoopError("Managed-CI continuity could not inspect PR round metadata comments.")
-    result: list[int] = []
-    for comment in comments:
-        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+    by_index = _continuity_round_records(comments)
+    reviewers: list[int] = []
+    coders: list[int] = []
+    for index, comment in enumerate(comments):
+        metadata = by_index.get(index)
         user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
         comment_id = comment.get("id")
         if (
-            "AGENT_LOOP_META:" in body
-            and user.get("login") == actor_login
-            and user.get("id") == actor_id
-            and isinstance(comment_id, int)
+            metadata is None
+            or user.get("login") != actor_login
+            or user.get("id") != actor_id
+            or not isinstance(comment_id, int)
         ):
-            result.append(comment_id)
-    return tuple(sorted(set(result)))
+            continue
+        if (
+            metadata["role"] == "reviewer"
+            and metadata["state"] == "blocking"
+            and metadata["subject"] == predecessor_head
+            and metadata["round_number"] == round_number
+        ):
+            reviewers.append(comment_id)
+        elif (
+            metadata["role"] == "coder"
+            and metadata["subject"] == new_head
+            and metadata["round_number"] == round_number + 1
+        ):
+            coders.append(comment_id)
+    if not reviewers or len(coders) != 1:
+        raise AgentLoopError(
+            "Managed-CI head continuity requires correlated blocking-review and coder round metadata."
+        )
+    return tuple(sorted(set((*reviewers, coders[0]))))
+
+
+def _continuity_round_records(
+    comments: list[dict[str, object]],
+) -> dict[int, dict[str, object]]:
+    """Decode only the immutable fields needed by continuity validation."""
+    bodies = tuple(
+        comment.get("body") if isinstance(comment.get("body"), str) else ""
+        for comment in comments
+    )
+    result: dict[int, dict[str, object]] = {}
+    for index, body in enumerate(bodies):
+        matches = tuple(ROUND_RESUME_MARKER_RE.finditer(body))
+        if not matches:
+            continue
+        payload, missing = hydrate_mapping(
+            decode_mapping(matches[-1].group("payload")), bodies
+        )
+        if missing:
+            raise AgentLoopError("Managed-CI continuity round metadata is incomplete.")
+        required = {
+            "flow": str,
+            "role": str,
+            "subject": str,
+            "round_number": int,
+        }
+        if any(not isinstance(payload.get(key), kind) for key, kind in required.items()):
+            raise AgentLoopError("Managed-CI continuity round metadata is malformed.")
+        if payload["flow"] != "pr":
+            continue
+        result[index] = {
+            "role": payload["role"],
+            "state": payload.get("state"),
+            "subject": payload["subject"],
+            "round_number": payload["round_number"],
+        }
+    return result
+
+
+def _continuity_round_metadata_is_valid(
+    comments: list[dict[str, object]],
+    *,
+    authorization: ManagedCiIssueAuthorization,
+) -> bool:
+    """Reauthenticate the exact round records referenced by a continuity grant."""
+    if authorization.kind != "continuity" or not authorization.round_comment_ids:
+        return False
+    try:
+        by_index = _continuity_round_records(comments)
+    except AgentLoopError:
+        return False
+    selected = []
+    wanted = set(authorization.round_comment_ids)
+    for index, comment in enumerate(comments):
+        if comment.get("id") not in wanted:
+            continue
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        metadata = by_index.get(index)
+        if (
+            metadata is None
+            or user.get("login") != authorization.actor_login
+            or user.get("id") != authorization.actor_id
+        ):
+            return False
+        selected.append(metadata)
+    if len(selected) != len(wanted):
+        return False
+    coders = [
+        item for item in selected
+        if item["role"] == "coder" and item["subject"] == authorization.head_sha
+    ]
+    if len(coders) != 1:
+        return False
+    coder_round = coders[0]["round_number"]
+    reviewers = [
+        item for item in selected
+        if item["role"] == "reviewer"
+        and item["state"] == "blocking"
+        and item["subject"] == authorization.predecessor_head
+        and item["round_number"] == coder_round - 1
+    ]
+    return bool(reviewers) and len(reviewers) + 1 == len(selected)
 
 
 def publish_issue_created_authorization(
@@ -1429,7 +1534,16 @@ def publish_issue_created_continuity_authorization(
         and (record.approved_plan_hash or None) == (handoff.approved_plan_hash or None)
     ]
     if same_transition:
-        comment_id, _record = sorted(same_transition, key=lambda item: item[0])[-1]
+        comment_id, existing_record = sorted(same_transition, key=lambda item: item[0])[-1]
+        round_comments = _api_list(
+            runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
+        )
+        if round_comments is None or not _continuity_round_metadata_is_valid(
+            round_comments, authorization=existing_record
+        ):
+            raise AgentLoopError(
+                "Managed-CI head continuity record does not reference correlated round metadata."
+            )
         return replace(
             handoff,
             head_sha=new_head,
@@ -1455,6 +1569,15 @@ def publish_issue_created_continuity_authorization(
         round_comment_ids=normalized_round_comment_ids,
         approved_plan_hash=handoff.approved_plan_hash,
     )
+    round_comments = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
+    )
+    if round_comments is None or not _continuity_round_metadata_is_valid(
+        round_comments, authorization=authorization
+    ):
+        raise AgentLoopError(
+            "Managed-CI head continuity requires authenticated, correlated round metadata."
+        )
     for comment_id, record in records:
         if record == authorization:
             return replace(
@@ -1550,14 +1673,6 @@ def authorize_fresh_issue_created_resume(
         raise AgentLoopError("Managed-CI fresh authorization does not match the selected base branch.")
     if metadata.head_sha is None or metadata.repo.casefold() != config.repo.casefold():
         raise AgentLoopError("Managed-CI fresh authorization requires a same-repository exact live head.")
-    linked = parse_strong_issue_reference_evidence(
-        metadata.body or "", repo=config.repo, issue_number=issue_number
-    )
-    if len(linked) != 1:
-        raise AgentLoopError(
-            "Managed-CI fresh authorization requires one server-observed closing reference "
-            "to the explicit issue scope."
-        )
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
@@ -1601,7 +1716,7 @@ def authorize_fresh_issue_created_resume(
     existing = [
         (comment_id, record)
         for comment_id, record in records
-        if record.kind == "fresh"
+        if record.kind in {"creation", "fresh", "continuity"}
         and record.repository.casefold() == config.repo.casefold()
         and record.issue_number == issue_number
         and record.pr_number == pr_number
@@ -1609,9 +1724,29 @@ def authorize_fresh_issue_created_resume(
         and record.head_sha == metadata.head_sha
         and record.actor_login.casefold() == actor_login.casefold()
         and record.actor_id == actor_id
+        and record.waiver == "allow-unprotected-managed-ci"
         and (record.approved_plan_hash or None) == (approved_plan_hash or None)
     ]
     if existing:
+        distinct_existing = {record for _comment_id, record in existing}
+        if len(distinct_existing) > 1:
+            creation_records = {
+                record for record in distinct_existing if record.kind == "creation"
+            }
+            fresh_records = {
+                record for record in distinct_existing if record.kind == "fresh"
+            }
+            if (
+                len(creation_records) == 1
+                and len(fresh_records) == 1
+                and len(distinct_existing) == 2
+            ):
+                existing = [item for item in existing if item[1].kind == "fresh"]
+            else:
+                raise AgentLoopError(
+                    "Managed-CI fresh authorization found conflicting exact-head "
+                    "authorization records; refusing to proceed."
+                )
         comment_id, record = sorted(existing, key=lambda item: item[0])[-1]
         return AuthenticatedIssueCreatedHandoff(
             pr_number=pr_number,
@@ -1630,14 +1765,38 @@ def authorize_fresh_issue_created_resume(
                 else "draft-unlabeled-reentry" if pr.get("draft") is True
                 else "ready-unlabeled-reentry"
             ),
-            authorization_kind="fresh",
+            authorization_kind=record.kind,
             authorization_comment_id=comment_id,
             approved_plan_hash=record.approved_plan_hash,
         )
+    issue_timeline = _api_list(
+        runner,
+        config,
+        f"repos/{config.repo}/issues/{issue_number}/timeline?per_page=100",
+    )
+    associated = False
+    if issue_timeline is not None:
+        for timeline_event in issue_timeline:
+            source = (
+                timeline_event.get("source")
+                if isinstance(timeline_event.get("source"), dict) else {}
+            )
+            source_issue = source.get("issue") if isinstance(source.get("issue"), dict) else {}
+            if (
+                timeline_event.get("event") == "cross-referenced"
+                and source_issue.get("number") == pr_number
+                and isinstance(source_issue.get("pull_request"), dict)
+            ):
+                associated = True
+                break
+    if not associated:
+        raise AgentLoopError(
+            "Managed-CI fresh authorization requires a server-observed issue-to-PR "
+            "association for the explicit issue scope."
+        )
     for _comment_id, record in records:
         if (
-            record.kind == "fresh"
-            and record.repository.casefold() == config.repo.casefold()
+            record.repository.casefold() == config.repo.casefold()
             and record.issue_number == issue_number
             and record.pr_number == pr_number
         ):
@@ -2431,8 +2590,9 @@ def _find_resume_audit(
         for comment_id, authorization in authorization_candidates:
             unique.setdefault(authorization, []).append(comment_id)
         records = [
-            (max(comment_ids), authorization)
+            (comment_id, authorization)
             for authorization, comment_ids in unique.items()
+            for comment_id in comment_ids
         ]
         if live_head is None:
             selected = sorted(records, key=lambda item: item[0])[-1]
@@ -2462,6 +2622,10 @@ def _find_resume_audit(
             while current.kind == "continuity":
                 if current in seen or current.predecessor_comment_id is None or current.predecessor_head is None:
                     break
+                if not _continuity_round_metadata_is_valid(
+                    comments, authorization=current
+                ):
+                    break
                 seen.add(current)
                 predecessor = by_comment_id.get(current.predecessor_comment_id)
                 if predecessor is None or predecessor.head_sha != current.predecessor_head:
@@ -2470,8 +2634,25 @@ def _find_resume_audit(
             else:
                 if current.kind in {"creation", "fresh"}:
                     valid_terminals.append((terminal_comment_id, terminal_record))
-        if len({record for _comment_id, record in valid_terminals}) != 1:
-            return None
+        distinct_terminals = {record for _comment_id, record in valid_terminals}
+        if len(distinct_terminals) != 1:
+            # A fresh operator grant at the exact creation head supersedes the
+            # creation checkpoint.  This compatibility case repairs records
+            # produced by older clients which published both; multiple grants
+            # or any competing continuity terminal remain ambiguous.
+            root_kinds = {record.kind for record in distinct_terminals}
+            fresh_roots = [
+                item for item in valid_terminals if item[1].kind == "fresh"
+            ]
+            creation_roots = [
+                item for item in valid_terminals if item[1].kind == "creation"
+            ]
+            if root_kinds <= {"creation", "fresh"} and len(
+                {record for _cid, record in fresh_roots}
+            ) == 1 and creation_roots:
+                valid_terminals = fresh_roots
+            else:
+                return None
         if valid_terminals:
             selected = max(valid_terminals, key=lambda item: item[0])
             return (

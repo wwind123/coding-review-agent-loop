@@ -272,7 +272,9 @@ missing or whose implementation response was rejected before a PR number was
 accepted, recovery is deliberately explicit. Use `--managed-ci-fresh` with
 `--managed-ci` and the unprotected waiver; PR mode must also provide
 `--managed-ci-issue <issue-number>`. This creates a new operator grant after
-validating the live PR tuple and does not adopt arbitrary existing PRs.
+validating the live PR tuple, fetching the issue and canonical plan scope, and
+confirming a server-observed issue-to-PR association. It reuses any valid
+exact-head authorization and does not adopt arbitrary existing PRs.
 
 ## How the Review Loop Behaves
 

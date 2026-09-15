@@ -4208,11 +4208,94 @@ def test_issue_loop_outside_workdir_after_reported_pr_mentions_confirmed_resume(
         run_issue_loop(runner, issue_number=56, config=config)
 
     message = str(exc_info.value)
+    assert "outside the assigned checkout" in message
     assert "PR #77 was confirmed open" in message
     assert "handoff/reviewer comments were not posted" in message
     assert "agent-loop pr 77" in message
     assert runner.comments == []
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+def test_managed_issue_invalid_post_pr_report_persists_authorization_before_rejection(
+    tmp_path, monkeypatch,
+):
+    nonce = "durable-before-report-rejection"
+    runner = FakeRunner(
+        codex_outputs=[
+            "Fixed issue.\nTests: cd /outside && python -m pytest\n"
+            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+        ],
+        pr_payload={
+            "body": f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}",
+            "headRefName": "agent-loop/managed-56",
+            "headRefOid": "abc123",
+        },
+    )
+    config = make_config(
+        tmp_path, coder="codex", reviewer="claude", managed_ci=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+    )
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56", trusted_actor="agent-loop",
+        protection_mode="voluntary", audit_nonce=nonce,
+    )
+    handoff = _managed_issue_handoff(nonce=nonce)
+    events = []
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "publish_issue_created_authorization",
+        lambda *_a, **_k: events.append("authorization") or replace(
+            handoff, authorization_comment_id=123
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "run_pr_loop",
+        lambda *_a, **_k: events.append("review") or 0,
+    )
+
+    with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert events == ["authorization"]
+    assert runner.comments == []
+
+
+def test_managed_issue_authorization_publication_failure_prints_fresh_recovery(
+    tmp_path, monkeypatch,
+):
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "issue", "56", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "publish_issue_created_authorization",
+        lambda *_a, **_k: (_ for _ in ()).throw(AgentLoopError("comment returned no ID")),
+    )
+    with pytest.raises(AgentLoopError) as exc_info:
+        orchestrator_module._publish_issue_authorization_with_recovery(
+            FakeRunner(), config=config,
+            handoff=_managed_issue_handoff(nonce="nonce"),
+            metadata=orchestrator_module.PullRequestMetadata(
+                number=77, repo="OWNER/REPO", title="PR",
+                head_branch="agent-loop/managed-56", base_branch="main",
+                head_sha="abc123", url="https://github.test/pull/77",
+            ),
+            issue_number=56,
+        )
+    message = str(exc_info.value)
+    assert "publication was interrupted" in message
+    assert "--managed-ci-fresh" in message
+    assert "agent-loop issue 56" in message
 
 def test_issue_loop_outside_workdir_after_reported_pr_hedges_unconfirmed_pr(tmp_path):
     runner = FakeRunner(
@@ -4235,6 +4318,7 @@ def test_issue_loop_outside_workdir_after_reported_pr_hedges_unconfirmed_pr(tmp_
 
     message = str(exc_info.value)
     assert "PR #77 is CLOSED" in message
+    assert "agent-loop pr 77" not in message
     assert runner.comments == []
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
