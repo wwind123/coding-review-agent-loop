@@ -831,6 +831,17 @@ def build_parser() -> argparse.ArgumentParser:
             "never applies to arbitrary PR adoption."
         ),
     )
+    issue.add_argument(
+        "--managed-ci-fresh",
+        "--managed-ci-fresh-authorization",
+        dest="managed_ci_fresh_authorization",
+        action="store_true",
+        help=(
+            "Explicitly create a new issue-created managed-CI authorization when the "
+            "original PR-comment checkpoint is missing or unusable. Requires the "
+            "unprotected waiver and validates the live PR tuple before writing."
+        ),
+    )
     add_review_parallel(issue)
 
     pr = subparsers.add_parser("pr", help="Run the reviewer/coder loop on an existing PR.")
@@ -865,6 +876,25 @@ def build_parser() -> argparse.ArgumentParser:
             "request and "
             "--managed-ci-trusted-actor; never authorizes arbitrary PR adoption."
         ),
+    )
+    pr.add_argument(
+        "--managed-ci-fresh",
+        "--managed-ci-fresh-authorization",
+        dest="managed_ci_fresh_authorization",
+        action="store_true",
+        help=(
+            "Explicitly create a new issue-created managed-CI authorization for this "
+            "PR. Requires --managed-ci-issue, the unprotected waiver, and the live "
+            "reserved issue branch/tuple."
+        ),
+    )
+    pr.add_argument(
+        "--managed-ci-issue",
+        "--managed-ci-issue-number",
+        dest="managed_ci_issue",
+        type=int,
+        metavar="ISSUE",
+        help="Issue scope required by --managed-ci-fresh in PR mode.",
     )
     pr.add_argument(
         "--managed-ci-adopt-existing-pr",
@@ -1389,6 +1419,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError("--allow-unprotected-managed-ci requires --managed-ci-trusted-actor.")
             if getattr(args, "managed_ci_adopt_existing_pr", False):
                 raise AgentLoopError("--allow-unprotected-managed-ci cannot be used with --managed-ci-adopt-existing-pr.")
+        if getattr(args, "managed_ci_fresh_authorization", False):
+            if args.command not in {"issue", "pr"}:
+                raise AgentLoopError(
+                    "--managed-ci-fresh is only supported with `agent-loop issue` or `agent-loop pr`."
+                )
+            if not getattr(args, "managed_ci", False):
+                raise AgentLoopError("--managed-ci-fresh requires --managed-ci.")
+            if not getattr(args, "allow_unprotected_managed_ci", False):
+                raise AgentLoopError(
+                    "--managed-ci-fresh requires --allow-unprotected-managed-ci."
+                )
+            if not (args.managed_ci_trusted_actor or "").strip():
+                raise AgentLoopError("--managed-ci-fresh requires --managed-ci-trusted-actor.")
+            if args.command == "pr" and not getattr(args, "managed_ci_issue", None):
+                raise AgentLoopError(
+                    "--managed-ci-fresh in PR mode requires --managed-ci-issue <issue-number>."
+                )
+        elif getattr(args, "managed_ci_issue", None) is not None:
+            raise AgentLoopError("--managed-ci-issue requires --managed-ci-fresh in PR mode.")
         if args.command == "issue":
             if args.implement_after_approval and not args.plan_first:
                 raise AgentLoopError("--implement-after-approval requires --plan-first.")

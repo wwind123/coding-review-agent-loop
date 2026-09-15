@@ -51,6 +51,11 @@ MARKERS = (
     ("AGENT_MANAGED_CI_INTENT_V2", "<!-- AGENT_MANAGED_CI_INTENT_V2 {\"pr\":1,\"repository\":\"OWNER/REPO\"} -->", PR_COMMENT_SURFACE),
     ("AGENT_LOOP_MANAGED_CI_QUALIFIED_V2", "<!-- AGENT_LOOP_MANAGED_CI_QUALIFIED_V2 repo=OWNER/REPO pr=1 base=main protocol=2 qualified_head=abc reviewers=Codex protection=strict nonce=n run_id=1 attempt=1 generation=g -->", PR_COMMENT_SURFACE),
     ("AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1", "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1 nonce=n", PR_COMMENT_SURFACE),
+    (
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1",
+        f"<!-- AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1: {_b64({'actor': 'agent-loop', 'actor_id': 1, 'base': 'main', 'head': 'abc', 'issue': 1, 'kind': 'creation', 'label_event_id': 1, 'nonce': 'n', 'pr': 1, 'protection': 'voluntary', 'repository': 'OWNER/REPO', 'version': 1, 'waiver': 'allow-unprotected-managed-ci'})} -->",
+        PR_COMMENT_SURFACE,
+    ),
     ("AGENT_MANAGED_PR_SOURCE_V1", f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {_b64({'source_branch': 'fix', 'source_sha': 'a'})} -->", PR_BODY_SURFACE),
     ("AGENT_SPLIT_CHILD", "<!-- AGENT_SPLIT_CHILD: parent=1 key=" + "a" * 64 + " -->", ISSUE_BODY_SURFACE),
     ("AGENT_SPLIT_STAGE_HANDOFF", f"<!-- AGENT_SPLIT_STAGE_HANDOFF: {_b64({'parent_issue': 1})} -->", ISSUE_COMMENT_SURFACE),
@@ -75,6 +80,17 @@ def test_strict_bare_records_are_rejected_even_without_complete_grammar():
     for token in ("AGENT_MANAGED_PR_SOURCE_V1", "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"):
         with pytest.raises(AgentLoopError):
             TrustedBody.current_untrusted_visible(f"ordinary prose mentions {token}")
+
+
+def test_issue_created_authorization_record_is_pr_comment_only():
+    marker = next(
+        marker for token, marker, _surface in MARKERS
+        if token == "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1"
+    )
+    with pytest.raises(AgentLoopError, match="not allowed on the pr_body surface"):
+        TrustedBody.canonical(marker, surface=PR_BODY_SURFACE, expected_tokens=(
+            "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1",
+        ))
 
 
 def test_historical_sanitization_is_stable_and_cannot_create_adjacent_marker():
@@ -139,7 +155,7 @@ def test_ordinary_issue_comment_writer_enforces_issue_comment_surface():
 
 def test_source_inventory_has_no_unregistered_protocol_literals():
     assert_source_inventory(Path(__file__).parents[1])
-    assert len(RESERVED_MARKER_REGISTRY) == 27
+    assert len(RESERVED_MARKER_REGISTRY) == 28
 
 
 def test_issue_provenance_trailer_is_not_a_reserved_marker_or_forged_body_record():

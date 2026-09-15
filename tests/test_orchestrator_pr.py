@@ -179,6 +179,257 @@ def _carried_ci_obligations() -> tuple[UnresolvedReviewItem, ...]:
     )
 
 
+def _approved_issue_plan_comments(plan: str) -> list[dict[str, object]]:
+    subject = orchestrator._plan_subject(plan)
+    return [
+        {
+            "author": {"login": "coding-review-agent-loop"},
+            "createdAt": "2026-05-01T00:00:00Z",
+            "body": _attach_round_metadata(
+                plan,
+                PostedRoundMetadata(
+                    flow="plan", role="coder", agent="Claude", round_number=1,
+                    subject=subject, canonical_plan=plan,
+                    raw_structured_coder_response=plan,
+                ),
+            ),
+        },
+        {
+            "author": {"login": "coding-review-agent-loop"},
+            "createdAt": "2026-05-01T00:01:00Z",
+            "body": _attach_round_metadata(
+                "Approved.",
+                PostedRoundMetadata(
+                    flow="plan", role="reviewer", agent="Codex",
+                    round_number=1, subject=subject, state="approved",
+                ),
+            ),
+        },
+    ]
+
+
+class _FreshScopeCaptured(Exception):
+    pass
+
+
+def test_pr_fresh_authorization_binds_server_recovered_approved_plan(tmp_path, monkeypatch):
+    plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
+    runner = FakeRunner(
+        issue_comments=_approved_issue_plan_comments(plan),
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    captured = {}
+
+    def authorize(*args, **kwargs):
+        captured.update(kwargs)
+        raise _FreshScopeCaptured
+
+    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        reviewer=("codex",),
+    )
+
+    with pytest.raises(_FreshScopeCaptured):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert captured["issue_number"] == 56
+    assert captured["approved_plan_hash"] == orchestrator.approved_plan_hash(plan)
+    assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
+
+
+def test_pr_ordinary_resume_binds_server_recovered_approved_plan_before_activation(
+    tmp_path, monkeypatch,
+):
+    plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
+    runner = FakeRunner(
+        issue_comments=_approved_issue_plan_comments(plan),
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="voluntary", override_nonce="opening-nonce",
+    )
+    captured = {}
+    monkeypatch.setattr(
+        orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff
+    )
+
+    def revalidate(*_args, **kwargs):
+        captured.update(kwargs)
+        raise _FreshScopeCaptured
+
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", revalidate)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        reviewer=("codex",),
+    )
+
+    with pytest.raises(_FreshScopeCaptured):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert captured["handoff"].approved_plan_hash == orchestrator.approved_plan_hash(plan)
+    assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
+
+
+def test_pr_fresh_authorization_rejects_mismatched_supplied_plan_scope(tmp_path, monkeypatch):
+    canonical = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
+    supplied = orchestrator.make_approved_plan_context(
+        "Different plan.\n\n### Plan steps\n1. Change the boundary.", source_locator="test"
+    )
+    runner = FakeRunner(
+        issue_comments=_approved_issue_plan_comments(canonical),
+        pr_payload={"headRefName": "agent-loop/managed-56", "body": "Fixes #56"},
+    )
+    monkeypatch.setattr(
+        orchestrator, "authorize_fresh_issue_created_resume",
+        lambda *args, **kwargs: (_ for _ in ()).throw(_FreshScopeCaptured()),
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        reviewer=("codex",),
+    )
+
+    with pytest.raises(AgentLoopError, match="does not match the canonical issue plan"):
+        run_pr_loop(
+            runner, pr_number=77, config=config, approved_plan_context=supplied
+        )
+
+
+def test_pr_fresh_authorization_rejects_incomplete_plan_scope(tmp_path, monkeypatch):
+    plan = "Unapproved plan."
+    subject = orchestrator._plan_subject(plan)
+    runner = FakeRunner(
+        issue_comments=[{
+            "author": {"login": "coding-review-agent-loop"},
+            "createdAt": "2026-05-01T00:00:00Z",
+            "body": _attach_round_metadata(
+                plan,
+                PostedRoundMetadata(
+                    flow="plan", role="reviewer", agent="OpenAI Codex",
+                    round_number=1, subject=subject, state="blocking",
+                ),
+            ),
+        }],
+        pr_payload={"headRefName": "agent-loop/managed-56", "body": "Fixes #56"},
+    )
+    monkeypatch.setattr(
+        orchestrator, "authorize_fresh_issue_created_resume",
+        lambda *args, **kwargs: (_ for _ in ()).throw(_FreshScopeCaptured()),
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        reviewer=("codex",),
+    )
+
+    with pytest.raises(AgentLoopError, match="complete canonical approved plan"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+
+def test_pr_fresh_authorization_allows_authenticated_planless_issue_scope(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        pr_payload={"headRefName": "agent-loop/managed-56", "body": "Fixes #56"},
+    )
+    captured = {}
+
+    def authorize(*args, **kwargs):
+        captured.update(kwargs)
+        raise _FreshScopeCaptured
+
+    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        reviewer=("codex",),
+    )
+
+    with pytest.raises(_FreshScopeCaptured):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert captured["approved_plan_hash"] is None
+
+
+def test_managed_issue_fix_round_publishes_correlated_head_continuity(
+    tmp_path, monkeypatch,
+):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="A repair is required.",
+                blocking_items=["Fix the managed recovery edge case."],
+            ),
+            structured_pr_review(
+                state="approved", summary="The repair is complete.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="voluntary", override_nonce="root",
+        authorization_kind="creation", authorization_comment_id=17,
+    )
+    selected = []
+    published = []
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
+    )
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        orchestrator, "find_actor_round_metadata_comment_ids",
+        lambda *_a, **kwargs: selected.append(kwargs) or (88, 89),
+    )
+    def publish(*_args, **kwargs):
+        published.append(kwargs)
+        raise _FreshScopeCaptured
+
+    monkeypatch.setattr(
+        orchestrator, "publish_issue_created_continuity_authorization", publish
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=("codex",), max_rounds=2,
+    )
+
+    with pytest.raises(_FreshScopeCaptured):
+        run_pr_loop(
+            runner, pr_number=77, config=config, managed_ci_handoff=handoff,
+            managed_ci_issue_number=56,
+        )
+
+    assert len(selected) == len(published) == 1
+    assert selected[0]["predecessor_head"] == "abc123"
+    assert selected[0]["new_head"] == "abc123-coder-1"
+    assert selected[0]["after_comment_id"] == 17
+    assert published[0]["round_comment_ids"] == (88, 89)
+
+
 def test_pr_resume_prompt_uses_current_wrapper_health_without_dropping_command(
     tmp_path, monkeypatch
 ):

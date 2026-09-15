@@ -1896,10 +1896,62 @@ This intentionally tightens the issue-created v2 path for workflows that can
 suppress `pull_request` CI. A repository that previously ran that v2 flow
 without non-bypassable GitHub protection now uses ordinary CI unless the
 operator supplies the explicit waiver for that invocation. If activation later
-cannot prove readiness, a later waiver is omitted, or the override audit
-comment cannot be written, agent-loop removes `agent-loop-managed` and waits
-for the workflow's `unlabeled` recovery CI instead of treating a `no_checks`
-board as mergeable.
+cannot prove readiness, a later waiver is omitted, or the authorization
+checkpoint cannot be written, agent-loop removes `agent-loop-managed` and
+waits for the workflow's `unlabeled` recovery CI instead of treating a
+`no_checks` board as mergeable.
+
+The explicit fresh issue-created command is printed only for an authenticated
+issue-created missing or stale authorization whose issue scope is known and
+whose invocation includes the unprotected waiver. It is not a remedy for an
+unreadable or foreign label event, a missing waiver/protection prerequisite, a
+tuple or publication race, an intent-ledger failure, or an adopted/source-managed
+PR; those states report the failed prerequisite and require that state to be
+restored.
+
+Issue-created unprotected authorization is persisted independently of coder
+test evidence. After the live PR number and opening tuple are authenticated,
+agent-loop writes one versioned authorization record as an actor-authored PR
+comment before validating `tests_run` or test-observation locations. The PR
+body nonce remains only an opening-handshake input; PR-body copies, issue
+comments, malformed records, coder-authored comments, and mismatched actor,
+repository, issue, base, label event, or exact-head fields never authorize
+managed CI. A rejected post-PR test report therefore stays rejected without a
+handoff or approval, while the same authorized head remains resumable.
+
+If structured response validation fails before a PR number is accepted, no
+creation authorization is synthesized from the rejected response. On a later
+issue-mode recovery, use the explicit fresh grant:
+
+```bash
+agent-loop issue <issue-number> --managed-ci --managed-ci-fresh \
+  --managed-ci-trusted-actor <login> --allow-unprotected-managed-ci
+```
+
+When entering from PR mode, the issue scope must be explicit:
+
+```bash
+agent-loop pr <number> --managed-ci --managed-ci-fresh \
+  --managed-ci-issue <issue-number> \
+  --managed-ci-trusted-actor <login> --allow-unprotected-managed-ci
+```
+
+This is a new operator authorization, not recovered creation provenance. It
+requires the authenticated actor, same-repository open PR, reserved issue
+branch, selected base, live exact head, expected issue association, an
+actor-owned managed-label history, and the canonical approved-plan scope when
+one applies. PR mode fetches the issue and its canonical plan comments from
+GitHub and requires a server-observed issue timeline association to the PR;
+PR-body closing text is corroboration, not authority. Identical retries reuse
+an existing valid creation, fresh, or continuity authorization at that exact
+head instead of publishing a competing grant; conflicting records,
+ambiguous provenance, or changed live state fail closed before labels,
+readiness, review dispatch, qualification, or merge writes.
+The grant records the live voluntary or plan-limited protection assessment,
+and the PR tuple, managed-label event, and authorization-comment set are read
+again immediately before publication. Managed issue recovery from a legacy
+association does not backfill a canonical handoff for a response whose report
+was rejected; authorization and coder evidence remain separate checkpoints.
 
 To retry an interrupted issue-created managed draft on an unprotected
 repository and preserve automatic merging, use the explicit per-invocation
@@ -2025,13 +2077,23 @@ For an unprotected override, the coder carries the preflight-minted nonce in
 one canonical body record containing only that nonce; it must not add another
 reserved body record. During the same issue-created handoff, agent-loop checks
 the draft's repository/base/head/branch/label/author tuple and one issue
-closing reference, re-reads it to catch races, then compares the body record
-to its in-memory nonce before any handoff publication. The richer actor-owned
-audit comment has separate provenance fields and its own schema. A forged,
-stale, duplicate, malformed, unrelated, or mismatched record fails before any
-handoff write. A direct PR resume treats historical records as provenance only
-and mints fresh authorization; it never accepts an old nonce for dispatch,
-readiness, or merge authority.
+closing reference, re-reads it to catch races, then publishes the richer
+actor-authored PR-comment authorization record before post-PR report checks.
+That record has its own versioned schema and binds the repository, issue, PR,
+actor login and immutable ID, base, exact head, waiver, nonce, and managed-label
+event. It is the only durable source for unprotected issue-created resume.
+
+When an orchestrator-dispatched coder repair advances the PR, automatic
+authority movement is allowed only through one unique, gap-free chain of
+actor-authored continuity comments. Each continuity record binds the
+predecessor authorization comment, predecessor head, new exact head, and the
+durable review/coder round metadata identities. The referenced records are
+re-parsed, must postdate the predecessor authorization, and must order the
+blocking review for the predecessor head before the immediately following
+coder record for the new head; unrelated or
+malformed metadata and authorization-comment fallbacks are rejected. A push,
+branch name, PR body, author, label, draft state, missing link, fork, or race cannot extend
+authority; recovery prints the explicit fresh-authorization command instead.
 
 #### Creating a managed PR from an existing branch
 

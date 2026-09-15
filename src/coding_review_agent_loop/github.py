@@ -761,6 +761,23 @@ def missing_expected_closing_issue_ids(
     return tuple(sorted(set(expected_issue_ids) - observed))
 
 
+def unexpected_closing_issue_ids(
+    body: str | None,
+    *,
+    repo: str,
+    expected_issue_ids: Sequence[int],
+) -> tuple[int, ...]:
+    """Return same-repository closing IDs outside the durable contract."""
+    observed = {
+        evidence.issue_number
+        for evidence in parse_issue_reference_evidence(
+            body, repo=repo, include_non_closing=False, affirmative=True
+        )
+        if evidence.closing and evidence.target_repo.casefold() == repo.casefold()
+    }
+    return tuple(sorted(observed - set(expected_issue_ids)))
+
+
 def validate_pr_expected_closing_issues(
     runner: Runner,
     *,
@@ -768,8 +785,14 @@ def validate_pr_expected_closing_issues(
     pr_number: int,
     expected_issue_ids: Sequence[int],
     body: str | None = None,
+    reject_unexpected: bool = False,
 ) -> tuple[int, ...]:
-    """Validate a known contract against one freshly fetched PR body."""
+    """Validate a known contract against one freshly fetched PR body.
+
+    Direct PR mode retains its historical subset-then-supersede behavior. The
+    managed issue recovery seam can opt into exact validation so an existing
+    PR cannot use an unapproved closing reference as recovery provenance.
+    """
     if config.dry_run:
         return ()
     current_body = _get_pr_body(runner, config=config, pr_number=pr_number) if body is None else body
@@ -785,6 +808,19 @@ def validate_pr_expected_closing_issues(
             "listed issue has its own `Closes`, `Fixes`, or `Resolves` keyword/reference pair, then "
             f"resume with `agent-loop pr {pr_number}`; do not create another PR."
         )
+    if reject_unexpected:
+        unexpected = unexpected_closing_issue_ids(
+            current_body, repo=config.repo, expected_issue_ids=expected_issue_ids
+        )
+        if unexpected:
+            rendered = ", ".join(f"#{issue}" for issue in unexpected)
+            expected = ", ".join(f"#{issue}" for issue in sorted(set(expected_issue_ids))) or "(none)"
+            raise AgentLoopError(
+                f"PR #{pr_number} has affirmative closing references outside the expected contract: "
+                f"{rendered}. The immutable expected set is {{{expected}}}. Remove each unapproved "
+                "`Closes`, `Fixes`, or `Resolves` reference from the existing PR description, then "
+                f"resume with `agent-loop pr {pr_number}`; do not create another PR."
+            )
     return missing
 
 
@@ -1792,6 +1828,79 @@ def post_trusted_pr_comment(
         _post_trusted_protocol_comment(
             runner, config=config, command=["pr", "comment", str(pr_number)], body=prepared
         )
+
+
+def post_verified_trusted_pr_protocol_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    body: TrustedBody,
+    expected_author_login: str | None = None,
+    expected_author_id: int | None = None,
+) -> int:
+    """Persist one trusted PR protocol record and return its server ID.
+
+    Durable authorization records use the REST issue-comment endpoint so the
+    returned comment identity is available to the caller.  The body is
+    validated again at this seam; if GitHub includes author/body fields in its
+    response, they must agree with the authenticated producer and exact
+    carrier.  A numeric comment ID is mandatory even for providers that return
+    a reduced response payload.
+    """
+    if not isinstance(body, TrustedBody):
+        raise AgentLoopError("Verified trusted PR protocol posting requires a TrustedBody.")
+    body.validate_for_surface(PR_COMMENT_SURFACE)
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "api",
+            "--method",
+            "POST",
+            f"repos/{config.repo}/issues/{pr_number}/comments",
+            "-f",
+            f"body={body}",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise AgentLoopError(
+            f"Unable to persist the trusted PR protocol record for PR #{pr_number}."
+            + (f" {detail}" if detail else "")
+        )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(
+            f"Trusted PR protocol record for PR #{pr_number} returned invalid JSON."
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("id"), int):
+        raise AgentLoopError(
+            f"Trusted PR protocol record for PR #{pr_number} returned no comment ID."
+        )
+    returned_body = payload.get("body")
+    if returned_body != str(body):
+        raise AgentLoopError(
+            f"Trusted PR protocol record for PR #{pr_number} returned a different body."
+        )
+    returned_user = payload.get("user") or payload.get("author")
+    if not isinstance(returned_user, dict):
+        raise AgentLoopError(
+            f"Trusted PR protocol record for PR #{pr_number} returned no author identity."
+        )
+    login = returned_user.get("login") or returned_user.get("slug")
+    user_id = returned_user.get("id")
+    if expected_author_login is not None and login != expected_author_login:
+        raise AgentLoopError(
+            f"Trusted PR protocol record for PR #{pr_number} was authored by an unexpected actor."
+        )
+    if expected_author_id is not None and user_id != expected_author_id:
+        raise AgentLoopError(
+            f"Trusted PR protocol record for PR #{pr_number} has an unexpected actor identity."
+        )
+    return payload["id"]
 
 
 def post_trusted_pr_contract_record(

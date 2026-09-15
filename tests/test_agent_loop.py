@@ -1512,6 +1512,26 @@ def test_explicit_managed_ci_requires_trusted_actor_before_agent_preflight(capsy
     assert "--managed-ci requires --managed-ci-trusted-actor" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["pr", "77", "--repo", "OWNER/REPO", "--managed-ci-fresh"],
+         "--managed-ci-fresh requires --managed-ci"),
+        (["pr", "77", "--repo", "OWNER/REPO", "--managed-ci", "--managed-ci-fresh",
+          "--managed-ci-trusted-actor", "agent-loop"],
+         "--managed-ci-fresh requires --allow-unprotected-managed-ci"),
+        (["pr", "77", "--repo", "OWNER/REPO", "--managed-ci", "--managed-ci-fresh",
+          "--allow-unprotected-managed-ci", "--managed-ci-trusted-actor", "agent-loop"],
+         "--managed-ci-fresh in PR mode requires --managed-ci-issue"),
+        (["pr", "77", "--repo", "OWNER/REPO", "--managed-ci-issue", "56"],
+         "--managed-ci-issue requires --managed-ci-fresh"),
+    ],
+)
+def test_managed_ci_fresh_cli_rejects_incomplete_authorization(argv, message, capsys):
+    assert main(argv) == 1
+    assert message in capsys.readouterr().err
+
+
 def test_config_records_explicit_existing_pr_managed_ci_adoption(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
@@ -1638,6 +1658,57 @@ def test_unprotected_managed_ci_override_rejects_existing_pr_adoption(capsys):
         "--allow-unprotected-managed-ci",
     ]) == 1
     assert "cannot be used with --managed-ci-adopt-existing-pr" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            ["pr", "77", "--managed-ci-fresh"],
+            "--managed-ci-fresh requires --managed-ci",
+        ),
+        (
+            [
+                "pr", "77", "--managed-ci", "--managed-ci-fresh",
+                "--managed-ci-trusted-actor", "agent-loop",
+            ],
+            "--managed-ci-fresh requires --allow-unprotected-managed-ci",
+        ),
+        (
+            [
+                "pr", "77", "--managed-ci", "--managed-ci-fresh",
+                "--allow-unprotected-managed-ci",
+            ],
+            "--managed-ci requires --managed-ci-trusted-actor",
+        ),
+        (
+            [
+                "pr", "77", "--managed-ci", "--managed-ci-fresh",
+                "--managed-ci-trusted-actor", "agent-loop",
+                "--allow-unprotected-managed-ci",
+            ],
+            "--managed-ci-fresh in PR mode requires --managed-ci-issue",
+        ),
+        (
+            [
+                "pr", "77", "--managed-ci", "--managed-ci-issue", "56",
+                "--managed-ci-trusted-actor", "agent-loop",
+            ],
+            "--managed-ci-issue requires --managed-ci-fresh",
+        ),
+    ],
+)
+def test_managed_ci_fresh_recovery_cli_validation_errors_are_explicit(
+    tmp_path, monkeypatch, capsys, arguments, message,
+):
+    monkeypatch.setattr(
+        cli_module,
+        "config_from_args",
+        lambda *_args, **_kwargs: make_config(tmp_path),
+    )
+
+    assert main(arguments) == 1
+    assert message in capsys.readouterr().err
 
 
 def test_managed_ci_preflight_reports_the_resolved_base(monkeypatch, capsys):
