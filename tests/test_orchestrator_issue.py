@@ -214,6 +214,42 @@ def test_plan_candidate_rejects_lossy_shortener_and_retains_recovery(
     ).hexdigest()
 
 
+def test_cli_planning_recovery_rejects_mutated_prepared_carrier(tmp_path):
+    config = make_config(tmp_path)
+    candidate = "candidate response"
+    path = orchestrator_module._write_planning_recovery(
+        config,
+        58,
+        response_kind="plan_state",
+        original_response="original response",
+        canonical_plan="canonical plan",
+        response_ceiling_chars=100,
+        attempt_state="candidate-ready",
+        failure="publication pending",
+        candidate_response=candidate,
+        prepared=["carrier"],
+    )
+    assert path is not None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["prepared_carriers"] = ["tampered carrier"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(AgentLoopError, match="incomplete or corrupt"):
+        orchestrator_module._reconcile_cli_planning_recovery(
+            _FakeRunner(),
+            config=config,
+            issue_number=58,
+            issue_context=IssueContext(
+                number=58,
+                repo="OWNER/REPO",
+                title="Issue",
+                body="Body",
+                url=None,
+                comments=(),
+            ),
+        )
+
+
 def test_auto_execution_resolves_staged_after_approval(tmp_path):
     config = make_config(tmp_path, plan_execution_mode="auto")
     recommendation = validate_structured_plan_state(

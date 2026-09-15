@@ -430,6 +430,7 @@ from .round_state import (
     _strip_round_metadata,
 )
 from .round_transport import (
+    MAX_GITHUB_BODY_CHARS,
     PlanningPreflightOutcome,
     PlanningPublicationPolicy,
     is_round_transport_sidecar,
@@ -3833,6 +3834,10 @@ def _write_planning_recovery(
             if candidate_response is not None else None
         ),
         "prepared_carriers": [str(body) for body in prepared],
+        "prepared_carrier_digests": [
+            hashlib.sha256(str(body).encode("utf-8")).hexdigest()
+            for body in prepared
+        ],
     }
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -3879,6 +3884,23 @@ def _reconcile_cli_planning_recovery(
                 not isinstance(carrier, str) for carrier in carriers
             ):
                 raise ValueError("prepared carrier set is incomplete")
+            carrier_digests = payload.get("prepared_carrier_digests")
+            if (
+                not isinstance(carrier_digests, list)
+                or len(carrier_digests) != len(carriers)
+                or any(
+                    not isinstance(digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    for digest in carrier_digests
+                )
+            ):
+                raise ValueError("prepared carrier digest set is incomplete")
+            if any(
+                len(carrier) > MAX_GITHUB_BODY_CHARS
+                or hashlib.sha256(carrier.encode("utf-8")).hexdigest() != digest
+                for carrier, digest in zip(carriers, carrier_digests, strict=True)
+            ):
+                raise ValueError("prepared carrier digest or size mismatch")
             candidate_response = payload.get("candidate_response")
             candidate_digest = payload.get("candidate_digest")
             if (

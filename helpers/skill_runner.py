@@ -227,6 +227,57 @@ def _shortening_artifact_paths(*, coder: str, issue: int, round_number: int) -> 
     }
 
 
+def _validate_persisted_shortening_candidate(
+    *,
+    handoff: Mapping[str, object],
+    candidate_text: str,
+    next_prior_items_raw: Sequence[dict],
+    require_architecture_impact_contract: bool,
+    require_execution_strategy_contract: bool,
+    require_risk_test_matrix_contract: bool,
+) -> str:
+    """Validate a recovered one-shot candidate before ordinary plan handling.
+
+    A persisted shortening artifact is not a fresh planner response.  Recovery
+    must reapply the source-digest and lossless-preservation boundary before
+    rendering, attaching metadata, or publishing it.  Returning the digest
+    lets callers backfill the digest in artifacts written by older revisions
+    without changing the candidate or consuming another provider turn.
+    """
+    original_text = handoff.get("original_response")
+    original_digest = handoff.get("original_digest")
+    if (
+        not isinstance(original_text, str)
+        or not isinstance(original_digest, str)
+        or hashlib.sha256(original_text.encode("utf-8")).hexdigest() != original_digest
+    ):
+        raise AgentLoopError(
+            "persisted shortening handoff has an invalid original candidate digest"
+        )
+    candidate_digest = hashlib.sha256(candidate_text.encode("utf-8")).hexdigest()
+    recorded_digest = handoff.get("candidate_digest")
+    if recorded_digest is not None and recorded_digest != candidate_digest:
+        raise AgentLoopError(
+            "persisted shortening candidate digest does not match its artifact"
+        )
+    try:
+        validate_shortened_plan_response(
+            original_text,
+            candidate_text,
+            prior_items=tuple(
+                _deserialize_unresolved_item(item) for item in next_prior_items_raw
+            ),
+            require_architecture_impact_contract=require_architecture_impact_contract,
+            require_execution_strategy_contract=require_execution_strategy_contract,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+        )
+    except (AgentLoopError, ValueError, TypeError) as exc:
+        raise AgentLoopError(
+            f"persisted shortening candidate failed lossless validation: {exc}"
+        ) from exc
+    return candidate_digest
+
+
 class _ValidationError(Exception):
     """Raised by _complete_reviewer_turn when the reviewer response fails validation."""
 
@@ -3386,6 +3437,21 @@ def _complete_coder_turn(
             *( ["--dry-run"] if dry_run else [] ),
         )
         shortened_text = shortening_output_file.read_text(encoding="utf-8")
+        candidate_digest = hashlib.sha256(shortened_text.encode("utf-8")).hexdigest()
+        handoff = {
+            **handoff,
+            "shortening_output_file": str(shortening_output_file),
+            "candidate_digest": candidate_digest,
+        }
+        if not dry_run:
+            # The provider artifact is durable before validation/publication.
+            # A crash after this write can therefore resume the same candidate,
+            # while the original response and consumed attempt remain bound.
+            _run_helper(
+                "helpers.state_manager", "write-session",
+                "--issue", str(issue), "--repo", repo,
+                "--fields", json.dumps({"planning_shortening": handoff}),
+            )
         try:
             validate_shortened_plan_response(
                 raw_text,
@@ -3395,7 +3461,7 @@ def _complete_coder_turn(
                 require_execution_strategy_contract=bool(require_execution_strategy_contract),
                 require_risk_test_matrix_contract=bool(require_risk_test_matrix_contract),
             )
-        except AgentLoopError as exc:
+        except (AgentLoopError, ValueError, TypeError) as exc:
             raise _ValidationError(f"skill_runner: shortened plan rejected: {exc}") from exc
         # Keep the producer response in repair_dir/raw.md. The shortening
         # candidate is a separate durable artifact so restart can complete
@@ -3634,6 +3700,36 @@ def _run_external_coder_phase(
                         file=sys.stderr,
                     )
                     sys.exit(1)
+                candidate_text = output_path.read_text(encoding="utf-8")
+                try:
+                    candidate_digest = _validate_persisted_shortening_candidate(
+                        handoff=planning_handoff,
+                        candidate_text=candidate_text,
+                        next_prior_items_raw=next_prior_items_raw,
+                        require_architecture_impact_contract=True,
+                        require_execution_strategy_contract=True,
+                        require_risk_test_matrix_contract=(
+                            risk_test_matrix_contract_required
+                        ),
+                    )
+                except (OSError, AgentLoopError) as exc:
+                    print(
+                        f"skill_runner: persisted shortened plan rejected: {exc}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                if planning_handoff.get("candidate_digest") is None and not dry_run:
+                    planning_handoff = {
+                        **planning_handoff,
+                        "candidate_digest": candidate_digest,
+                    }
+                    _run_helper(
+                        "helpers.state_manager", "write-session",
+                        "--issue", str(issue), "--repo", repo,
+                        "--fields", json.dumps(
+                            {"planning_shortening": planning_handoff}
+                        ),
+                    )
                 try:
                     recovery_evidence = (
                         json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -4443,7 +4539,27 @@ def _run_host_coder_phase(
                 if planning_preflight.status != "fits":
                     if isinstance(planning_handoff, dict):
                         # Re-entry already consumed the allowance. Preserve the
-                        # first candidate and attempt state instead of rearming.
+                        # first candidate and attempt state instead of rearming,
+                        # and never replace the original source with the
+                        # shortened file that was just re-entered.
+                        original_response = planning_handoff.get("original_response")
+                        original_digest = planning_handoff.get("original_digest")
+                        if (
+                            not isinstance(original_response, str)
+                            or not isinstance(original_digest, str)
+                            or hashlib.sha256(
+                                original_response.encode("utf-8")
+                            ).hexdigest() != original_digest
+                        ):
+                            raise AgentLoopError(
+                                "host shortening handoff has an invalid original candidate"
+                            )
+                        if planning_handoff.get("attempt_state") not in {
+                            "attempted", "unrecoverable"
+                        }:
+                            raise AgentLoopError(
+                                "host shortening handoff cannot be re-armed after re-entry"
+                            )
                         handoff = {
                             **planning_handoff,
                             "failure": planning_preflight.diagnostic
