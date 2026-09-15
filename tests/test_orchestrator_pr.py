@@ -243,6 +243,46 @@ def test_pr_fresh_authorization_binds_server_recovered_approved_plan(tmp_path, m
     assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
 
 
+def test_pr_ordinary_resume_binds_server_recovered_approved_plan_before_activation(
+    tmp_path, monkeypatch,
+):
+    plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
+    runner = FakeRunner(
+        issue_comments=_approved_issue_plan_comments(plan),
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="voluntary", override_nonce="opening-nonce",
+    )
+    captured = {}
+    monkeypatch.setattr(
+        orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff
+    )
+
+    def revalidate(*_args, **kwargs):
+        captured.update(kwargs)
+        raise _FreshScopeCaptured
+
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", revalidate)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        reviewer=("codex",),
+    )
+
+    with pytest.raises(_FreshScopeCaptured):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert captured["handoff"].approved_plan_hash == orchestrator.approved_plan_hash(plan)
+    assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
+
+
 def test_pr_fresh_authorization_rejects_mismatched_supplied_plan_scope(tmp_path, monkeypatch):
     canonical = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
     supplied = orchestrator.make_approved_plan_context(

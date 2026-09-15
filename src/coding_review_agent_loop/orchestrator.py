@@ -10578,6 +10578,81 @@ def run_pr_loop(
                 if managed_ci_handoff is None:
                     reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
                 else:
+                    # Ordinary PR recovery must bind authorization records to
+                    # the canonical server-side issue/plan scope just as the
+                    # explicit fresh path does.  The record's own plan field
+                    # is never allowed to define that scope.
+                    if issue_context is None:
+                        validate_open_issue(
+                            runner,
+                            config=config,
+                            issue_number=managed_ci_handoff.issue_number,
+                        )
+                        issue_context = get_issue_context(
+                            runner,
+                            config=config,
+                            issue_number=managed_ci_handoff.issue_number,
+                        )
+                    canonical_handoff = find_latest_issue_pr_handoff(
+                        issue_context.comments,
+                        issue_number=managed_ci_handoff.issue_number,
+                        repo=config.repo,
+                    )
+                    recovered_scope: ApprovedPlanContext | None = None
+                    if (
+                        canonical_handoff is not None
+                        and canonical_handoff.flow == "approved-plan-implementation"
+                        and canonical_handoff.plan_hash
+                    ):
+                        candidate_scope = recover_approved_plan_context(
+                            issue_context.comments,
+                            expected_hash=canonical_handoff.plan_hash,
+                        )
+                        if not candidate_scope.is_available:
+                            raise AgentLoopError(
+                                "Managed-CI ordinary resume could not recover the canonical approved plan."
+                            )
+                        recovered_scope = candidate_scope
+                    elif canonical_handoff is None:
+                        resumed_plan = _resume_plan_round(
+                            issue_context.comments,
+                            configured_reviewers=reviewers(config),
+                        )
+                        if resumed_plan is not None:
+                            plan_text, resumed_plan_round = resumed_plan
+                            configured_names = {
+                                agent_display_name(reviewer) for reviewer in reviewers(config)
+                            }
+                            approved_names = {
+                                record.metadata.agent
+                                for record in resumed_plan_round.completed_reviews
+                                if record.metadata.state == "approved"
+                            }
+                            if approved_names != configured_names:
+                                raise AgentLoopError(
+                                    "Managed-CI ordinary resume found incomplete canonical plan approval."
+                                )
+                            recovered_scope = make_approved_plan_context(
+                                plan_text,
+                                source_locator=(
+                                    f"issue #{managed_ci_handoff.issue_number} canonical approved plan"
+                                ),
+                                expected_hash=approved_plan_hash(plan_text),
+                            )
+                    if recovered_scope is not None:
+                        if (
+                            approved_plan_context is not None
+                            and approved_plan_context.plan_hash != recovered_scope.plan_hash
+                        ):
+                            raise AgentLoopError(
+                                "Managed-CI ordinary resume approved-plan scope does not match "
+                                "the canonical issue plan."
+                            )
+                        approved_plan_context = recovered_scope
+                        managed_ci_handoff = dataclasses_replace(
+                            managed_ci_handoff,
+                            approved_plan_hash=recovered_scope.plan_hash,
+                        )
                     managed_ci_handoff = revalidate_issue_created_handoff(
                         runner,
                         config=config,
