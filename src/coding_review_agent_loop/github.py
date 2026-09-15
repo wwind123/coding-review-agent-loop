@@ -761,6 +761,23 @@ def missing_expected_closing_issue_ids(
     return tuple(sorted(set(expected_issue_ids) - observed))
 
 
+def unexpected_closing_issue_ids(
+    body: str | None,
+    *,
+    repo: str,
+    expected_issue_ids: Sequence[int],
+) -> tuple[int, ...]:
+    """Return same-repository closing IDs outside the durable contract."""
+    observed = {
+        evidence.issue_number
+        for evidence in parse_issue_reference_evidence(
+            body, repo=repo, include_non_closing=False, affirmative=True
+        )
+        if evidence.closing and evidence.target_repo.casefold() == repo.casefold()
+    }
+    return tuple(sorted(observed - set(expected_issue_ids)))
+
+
 def validate_pr_expected_closing_issues(
     runner: Runner,
     *,
@@ -768,8 +785,14 @@ def validate_pr_expected_closing_issues(
     pr_number: int,
     expected_issue_ids: Sequence[int],
     body: str | None = None,
+    reject_unexpected: bool = False,
 ) -> tuple[int, ...]:
-    """Validate a known contract against one freshly fetched PR body."""
+    """Validate a known contract against one freshly fetched PR body.
+
+    Direct PR mode retains its historical subset-then-supersede behavior. The
+    managed issue recovery seam can opt into exact validation so an existing
+    PR cannot use an unapproved closing reference as recovery provenance.
+    """
     if config.dry_run:
         return ()
     current_body = _get_pr_body(runner, config=config, pr_number=pr_number) if body is None else body
@@ -785,6 +808,19 @@ def validate_pr_expected_closing_issues(
             "listed issue has its own `Closes`, `Fixes`, or `Resolves` keyword/reference pair, then "
             f"resume with `agent-loop pr {pr_number}`; do not create another PR."
         )
+    if reject_unexpected:
+        unexpected = unexpected_closing_issue_ids(
+            current_body, repo=config.repo, expected_issue_ids=expected_issue_ids
+        )
+        if unexpected:
+            rendered = ", ".join(f"#{issue}" for issue in unexpected)
+            expected = ", ".join(f"#{issue}" for issue in sorted(set(expected_issue_ids))) or "(none)"
+            raise AgentLoopError(
+                f"PR #{pr_number} has affirmative closing references outside the expected contract: "
+                f"{rendered}. The immutable expected set is {{{expected}}}. Remove each unapproved "
+                "`Closes`, `Fixes`, or `Resolves` reference from the existing PR description, then "
+                f"resume with `agent-loop pr {pr_number}`; do not create another PR."
+            )
     return missing
 
 

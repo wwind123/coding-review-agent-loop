@@ -2111,6 +2111,10 @@ def revalidate_issue_created_handoff(
             metadata=metadata,
             approved_plan_hash=handoff.approved_plan_hash,
         )
+    # Creation and fresh grants can advance to a continuity terminal, but the
+    # PR body remains bound to the opening authorization nonce.  Revalidate
+    # that immutable opening tuple rather than treating the continuity record's
+    # nonce as if it had been written into the PR body.
     validated = _issue_created_tuple(
         runner,
         config=config,
@@ -2118,7 +2122,7 @@ def revalidate_issue_created_handoff(
         issue_number=handoff.issue_number,
         metadata=metadata,
         expected_branch=handoff.branch,
-        expected_nonce=handoff.override_nonce,
+        expected_nonce=handoff.opening_override_nonce,
         protection_mode=handoff.protection_mode,
         lifecycle=(
             "ready-unlabeled"

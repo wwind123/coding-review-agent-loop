@@ -4436,6 +4436,11 @@ class _IssueRecoveryWorkflowRunner(FakeRunner):
                 "user": {"login": "agent-loop", "id": 1},
             }
             self.authorization_comments.append(comment)
+            self.pr_payload.setdefault("comments", []).append({
+                "author": {"login": "agent-loop"},
+                "createdAt": f"2026-05-23T00:00:{comment_id:02d}Z",
+                "body": body,
+            })
             return CommandResult(recorded, cwd_path, json.dumps(comment), "", 0)
         if endpoint.startswith("repos/OWNER/REPO/issues/56/timeline?"):
             recorded, cwd_path = self._record_command(args, cwd)
@@ -4503,6 +4508,88 @@ def _stop_issue_resume_after_real_activation(monkeypatch):
         orchestrator_module,
         "activate_managed_ci",
         activate_then_stop,
+    )
+
+
+class _RealManagedReviewReached(Exception):
+    pass
+
+
+def _stop_issue_resume_after_reviewer(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_freeze_prompt_architecture",
+        lambda _runner, config, **_kwargs: config,
+    )
+    real_post_pr_comment = orchestrator_module.post_pr_comment
+
+    def post_and_stop(*args, **kwargs):
+        result = real_post_pr_comment(*args, **kwargs)
+        if str(kwargs.get("body") or "").startswith("**Review verdict:**"):
+            raise _RealManagedReviewReached
+        return result
+
+    monkeypatch.setattr(orchestrator_module, "post_pr_comment", post_and_stop)
+
+
+def test_managed_issue_resume_reviews_same_head_after_post_pr_report_rejection(
+    tmp_path, monkeypatch,
+):
+    runner = _IssueRecoveryWorkflowRunner(
+        labeled=True,
+        codex_outputs=[
+            "Fixed issue.\nTests: cd /outside && python -m pytest\n"
+            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n"
+            "-- OpenAI Codex"
+        ],
+        claude_outputs=[
+            structured_pr_review(state="approved", summary="Reviewed the resumed exact head.")
+        ],
+    )
+    config = make_config(
+        tmp_path, coder="codex", reviewer="claude", managed_ci=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        pre_review_tests=False,
+    )
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56", trusted_actor="agent-loop",
+        protection_mode="voluntary", audit_nonce="opening-nonce",
+    )
+    handoff = _managed_issue_handoff(nonce="opening-nonce")
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
+    )
+
+    with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    runner.pr_commit_pages = _provenance_pages(
+        "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct"
+    )
+    coder_calls = sum(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    _stop_issue_resume_after_reviewer(monkeypatch)
+
+    with pytest.raises(_RealManagedReviewReached):
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert sum(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands) == coder_calls
+    assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == 1
+    reviewer_command = next(command for command, _cwd in runner.commands if command[:1] == ["claude"])
+    assert "abc123" in " ".join(reviewer_command)
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert any("Reviewed the resumed exact head." in comment for comment in runner.comments)
+    assert not any(
+        marker in comment
+        for comment in runner.comments
+        for marker in (
+            "AGENT_ISSUE_PR_HANDOFF", "AGENT_TEST_OBSERVATION",
+            "AGENT_MANAGED_CI_READINESS",
+        )
     )
 
 
@@ -4592,6 +4679,9 @@ def test_pre_pr_number_response_rejection_then_fresh_issue_recovery_uses_real_ac
     runner = _IssueRecoveryWorkflowRunner(
         labeled=False,
         codex_outputs=[rejected, rejected],
+        claude_outputs=[
+            structured_pr_review(state="approved", summary="Reviewed after explicit recovery.")
+        ],
     )
     ordinary_config = make_config(
         tmp_path, coder="codex", reviewer="claude", managed_ci=True,
@@ -4634,9 +4724,9 @@ def test_pre_pr_number_response_rejection_then_fresh_issue_recovery_uses_real_ac
             "--allow-unprotected-managed-ci",
         ),
     )
-    _stop_issue_resume_after_real_activation(monkeypatch)
+    _stop_issue_resume_after_reviewer(monkeypatch)
     recovery_start = len(runner.commands)
-    with pytest.raises(_RealManagedActivationReached):
+    with pytest.raises(_RealManagedReviewReached):
         run_issue_loop(runner, issue_number=56, config=fresh_config)
 
     recovery_commands = runner.commands[recovery_start:]
@@ -4657,7 +4747,43 @@ def test_pre_pr_number_response_rejection_then_fresh_issue_recovery_uses_real_ac
     ) == coder_calls
     assert runner.labels_posted is True
     assert runner.dispatch_count == 0
+    reviewer_command = next(command for command, _cwd in runner.commands if command[:1] == ["claude"])
+    assert "abc123" in " ".join(reviewer_command)
+    assert any("Reviewed after explicit recovery." in comment for comment in runner.comments)
+    assert not any(
+        marker in comment
+        for comment in runner.comments
+        for marker in (
+            "AGENT_ISSUE_PR_HANDOFF", "AGENT_TEST_OBSERVATION",
+            "AGENT_MANAGED_CI_READINESS",
+        )
+    )
+
+
+def test_managed_issue_legacy_recovery_rejects_unexpected_closing_reference(
+    tmp_path,
+):
+    body = "Fixes #56\nCloses #999"
+    runner = _IssueRecoveryWorkflowRunner(
+        labeled=False,
+        open_prs_payload=[{"number": 77, "body": body}],
+        pr_payload={"body": body},
+    )
+    config = make_config(
+        tmp_path, coder="codex", reviewer="claude", managed_ci=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+    )
+
+    with pytest.raises(AgentLoopError, match="outside the expected contract"):
+        run_issue_loop(runner, issue_number=56, config=config)
+
     assert runner.comments == []
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert not any(
+        command[:1] in (["claude"], ["codex"])
+        for command, _cwd in runner.commands
+    )
 
 
 def test_managed_issue_authorization_publication_failure_prints_fresh_recovery(

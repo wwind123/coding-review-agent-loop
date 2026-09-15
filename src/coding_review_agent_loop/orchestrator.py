@@ -6050,10 +6050,7 @@ def _implement_approved_issue(
         # report was rejected before the canonical handoff checkpoint. Its
         # durable authorization is sufficient to enter the PR loop, but must
         # not launder that rejected report into a canonical handoff.
-        if (
-            resolved_pr.source == "legacy-closing-reference"
-            and not implementation_config.managed_ci
-        ):
+        if resolved_pr.source == "legacy-closing-reference":
             pr_url, pr_head_sha = require_pr_metadata_for_handoff(resumed_pr_context.metadata)
             validate_pr_expected_closing_issues(
                 runner,
@@ -6061,6 +6058,7 @@ def _implement_approved_issue(
                 pr_number=existing_pr_number,
                 expected_issue_ids=closing_contract.issue_ids,
                 body=resumed_pr_context.metadata.body,
+                reject_unexpected=implementation_config.managed_ci,
             )
             pr_contract = make_pr_contract(
                 repository=implementation_config.repo,
@@ -6079,18 +6077,19 @@ def _implement_approved_issue(
                     expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
                 ),
             )
-            post_issue_pr_handoff_comment(
-                runner,
-                config=implementation_config,
-                issue_number=issue_number,
-                pr_number=existing_pr_number,
-                pr_url=pr_url,
-                pr_head_sha=pr_head_sha,
-                flow="approved-plan-implementation",
-                plan_hash=plan_hash,
-                expected_closing_issue_ids=closing_contract.issue_ids,
-                supersedes_hash=closing_contract.supersedes_hash,
-            )
+            if not implementation_config.managed_ci:
+                post_issue_pr_handoff_comment(
+                    runner,
+                    config=implementation_config,
+                    issue_number=issue_number,
+                    pr_number=existing_pr_number,
+                    pr_url=pr_url,
+                    pr_head_sha=pr_head_sha,
+                    flow="approved-plan-implementation",
+                    plan_hash=plan_hash,
+                    expected_closing_issue_ids=closing_contract.issue_ids,
+                    supersedes_hash=closing_contract.supersedes_hash,
+                )
         if one_shot_parent_issue is not None:
             post_one_shot_impl_handoff_comment(
                 runner,
@@ -8560,10 +8559,7 @@ def run_issue_loop(
             # Keep rejected issue-implementation evidence rejected during an
             # explicit managed recovery. The PR loop authenticates the
             # authorization record independently of this legacy association.
-            if (
-                resolved_pr.source == "legacy-closing-reference"
-                and not config.managed_ci
-            ):
+            if resolved_pr.source == "legacy-closing-reference":
                 pr_context = get_pr_review_context(runner, config=config, pr_number=resolved_pr.pr_number)
                 validate_pr_expected_closing_issues(
                     runner,
@@ -8571,6 +8567,7 @@ def run_issue_loop(
                     pr_number=resolved_pr.pr_number,
                     expected_issue_ids=closing_contract.issue_ids,
                     body=pr_context.metadata.body,
+                    reject_unexpected=config.managed_ci,
                 )
                 pr_url, pr_head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
                 pr_contract = make_pr_contract(
@@ -8594,22 +8591,23 @@ def run_issue_loop(
                         expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
                     ),
                 )
-                post_issue_pr_handoff_comment(
-                    runner,
-                    config=config,
-                    issue_number=issue_number,
-                    pr_number=resolved_pr.pr_number,
-                    pr_url=pr_url,
-                    pr_head_sha=pr_head_sha,
-                    flow=(
-                        "approved-plan-implementation"
-                        if plan_first and recovered_plan_hash is not None
-                        else "issue-implementation"
-                    ),
-                    plan_hash=recovered_plan_hash if plan_first else None,
-                    expected_closing_issue_ids=closing_contract.issue_ids,
-                    supersedes_hash=closing_contract.supersedes_hash,
-                )
+                if not config.managed_ci:
+                    post_issue_pr_handoff_comment(
+                        runner,
+                        config=config,
+                        issue_number=issue_number,
+                        pr_number=resolved_pr.pr_number,
+                        pr_url=pr_url,
+                        pr_head_sha=pr_head_sha,
+                        flow=(
+                            "approved-plan-implementation"
+                            if plan_first and recovered_plan_hash is not None
+                            else "issue-implementation"
+                        ),
+                        plan_hash=recovered_plan_hash if plan_first else None,
+                        expected_closing_issue_ids=closing_contract.issue_ids,
+                        supersedes_hash=closing_contract.supersedes_hash,
+                    )
             return run_pr_loop(
                 runner,
                 pr_number=resolved_pr.pr_number,
@@ -11372,6 +11370,7 @@ def run_pr_loop(
                 pr_number=pr_number,
                 expected_issue_ids=closing_contract.expected_closing_issue_ids,
                 body=initial_pr_context.metadata.body,
+                reject_unexpected=config.managed_ci and issue_context is not None,
             )
             if contract_needs_persisting:
                 post_trusted_pr_comment(
@@ -11685,6 +11684,7 @@ def run_pr_loop(
                     pr_number=pr_number,
                     expected_issue_ids=closing_contract.expected_closing_issue_ids,
                     body=pr_metadata.body,
+                    reject_unexpected=config.managed_ci and issue_context is not None,
                 )
             if managed_ci_active(pr_metadata) and pre_review_tests_passed and pr_metadata.head_sha:
                 publish_round_readiness(

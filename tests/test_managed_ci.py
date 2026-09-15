@@ -695,6 +695,72 @@ def test_run_pr_loop_fresh_recovery_uses_real_authorization_and_activation(
     assert runner.comments == []
 
 
+def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_grant(
+    tmp_path, monkeypatch,
+):
+    runner = _workflow_runner_for_issue_authorization(None, labeled=True)
+    root = publish_issue_created_authorization(
+        runner, config=make_config(
+            tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+            managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        ),
+        handoff=replace(
+            _authorization_handoff(),
+            override_nonce="opening-nonce",
+            opening_override_nonce="opening-nonce",
+        ),
+        metadata=replace(metadata(), body=runner.rest_pr["body"]),
+    )
+    runner.intent_comments.extend([
+        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="next-head", round_number=2),
+    ])
+    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.pr_payload["headRefOid"] = "next-head"
+    continuity = publish_issue_created_continuity_authorization(
+        runner,
+        config=make_config(
+            tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+            managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        ),
+        handoff=root,
+        predecessor_head="abc123",
+        new_head="next-head",
+        round_comment_ids=(88, 89),
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=643,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-fresh",
+            "--managed-ci-issue", "643", "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    _stop_after_real_activation(monkeypatch)
+
+    with pytest.raises(_ActivationReached) as exc_info:
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    records = [
+        (comment["id"], record)
+        for comment in runner.intent_comments
+        if (record := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    assert [record.kind for _comment_id, record in records] == ["creation", "continuity"]
+    assert root.authorization_comment_id == records[0][0]
+    assert continuity.authorization_comment_id == records[1][0]
+    assert sum(
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in " ".join(command)
+        and "POST" in command
+        for command, _cwd in runner.commands
+    ) == 2
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+
+
 def _authorization_handoff(*, head="abc123"):
     return managed_ci.AuthenticatedIssueCreatedHandoff(
         pr_number=7,
