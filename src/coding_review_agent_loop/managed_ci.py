@@ -201,6 +201,11 @@ class AuthenticatedIssueCreatedHandoff:
     trusted_actor_id: int
     protection_mode: str
     override_nonce: str | None
+    # The nonce carried by the authenticated PR-opening body, when present.
+    # Fresh operator grants have their own nonce and retain this separately so
+    # resume validation can distinguish historical opening provenance from the
+    # grant that is being activated.
+    opening_override_nonce: str | None = None
     active_label_event_id: int | None = None
     lifecycle: Literal[
         "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
@@ -1168,6 +1173,7 @@ def _issue_created_tuple(
         trusted_actor_id=actor_id,
         protection_mode=protection_mode,
         override_nonce=record.nonce if record is not None else None,
+        opening_override_nonce=record.nonce if record is not None else None,
         lifecycle={
             "draft-labeled": "draft-labeled",
             "draft-unlabeled": "draft-unlabeled-reentry",
@@ -1719,6 +1725,25 @@ def _historical_managed_label_event(
     actor_login: str,
     actor_id: int,
 ) -> tuple[int, str, int] | None:
+    events = _managed_label_event_history(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        actor_login=actor_login,
+        actor_id=actor_id,
+    )
+    return events[-1] if events else None
+
+
+def _managed_label_event_history(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    actor_login: str,
+    actor_id: int,
+) -> list[tuple[int, str, int]] | None:
+    """Return every actor-owned managed-label application in timeline order."""
     events = _api_list(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
     )
@@ -1741,7 +1766,7 @@ def _historical_managed_label_event(
             and identity == actor_id
         ):
             candidates.append((event_id, login, identity))
-    return sorted(candidates, key=lambda item: item[0])[-1] if candidates else None
+    return sorted(candidates, key=lambda item: item[0])
 
 
 def authorize_fresh_issue_created_resume(
@@ -1805,17 +1830,19 @@ def authorize_fresh_issue_created_resume(
             "Managed-CI fresh authorization could not authenticate the live PR tuple; "
             "the PR was left unchanged."
         )
-    label_event = _historical_managed_label_event(
+    label_events = _managed_label_event_history(
         runner,
         config=config,
         pr_number=pr_number,
         actor_login=actor_login,
         actor_id=actor_id,
     )
-    if label_event is None:
+    if not label_events:
         raise AgentLoopError(
             "Managed-CI fresh authorization requires an actor-owned managed-label event."
         )
+    label_event = label_events[-1]
+    valid_label_event_ids = {event_id for event_id, _login, _actor_id in label_events}
 
     def revalidate_live_authorization_tuple() -> None:
         live_pr = _api_json(
@@ -1876,6 +1903,7 @@ def authorize_fresh_issue_created_resume(
         and record.actor_id == actor_id
         and record.protection == protection.state
         and record.waiver == "allow-unprotected-managed-ci"
+        and record.label_event_id in valid_label_event_ids
         and (record.approved_plan_hash or None) == (approved_plan_hash or None)
     ]
     if existing:
@@ -1911,6 +1939,16 @@ def authorize_fresh_issue_created_resume(
             trusted_actor_id=actor_id,
             protection_mode=record.protection,
             override_nonce=record.nonce,
+            opening_override_nonce=(
+                parse_managed_ci_override_record(
+                    metadata.body or "",
+                    surface=PR_BODY_SURFACE,
+                    schema="body",
+                    required=False,
+                ).nonce
+                if UNPROTECTED_OVERRIDE_TRAILER in (metadata.body or "")
+                else None
+            ),
             active_label_event_id=record.label_event_id,
             lifecycle=(
                 "draft-labeled" if MANAGED_LABEL in labels
@@ -1961,6 +1999,7 @@ def authorize_fresh_issue_created_resume(
         or record.actor_id != actor_id
         or record.protection != protection.state
         or record.waiver != "allow-unprotected-managed-ci"
+        or record.label_event_id not in valid_label_event_ids
         or (record.approved_plan_hash or None) != (approved_plan_hash or None)
     ]
     if incompatible_records:
@@ -2031,6 +2070,16 @@ def authorize_fresh_issue_created_resume(
         trusted_actor_id=actor_id,
         protection_mode=protection.state,
         override_nonce=authorization.nonce,
+        opening_override_nonce=(
+            parse_managed_ci_override_record(
+                metadata.body or "",
+                surface=PR_BODY_SURFACE,
+                schema="body",
+                required=False,
+            ).nonce
+            if UNPROTECTED_OVERRIDE_TRAILER in (metadata.body or "")
+            else None
+        ),
         active_label_event_id=label_event[0],
         lifecycle=(
             "draft-labeled" if MANAGED_LABEL in labels
@@ -2194,32 +2243,6 @@ def recover_issue_created_handoff(
                 "Managed-CI issue-created resume requires an actor-owned active managed-label event."
             )
         handoff = replace(handoff, active_label_event_id=event[0])
-    if record is not None:
-        comments = _api_list(
-            runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
-        )
-        if comments is None:
-            raise AgentLoopError("Managed-CI issue-created resume could not inspect override audit provenance.")
-        if any(
-            UNPROTECTED_OVERRIDE_TRAILER in (
-                comment.get("body") if isinstance(comment.get("body"), str) else ""
-            )
-            for comment in comments
-        ) and _find_resume_audit(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            actor_login=handoff.trusted_actor_login,
-            actor_id=handoff.trusted_actor_id,
-            base_ref=handoff.base_ref,
-            issue_number=handoff.issue_number,
-            live_head=handoff.head_sha,
-            expected_handoff=handoff,
-            expected_protection=(handoff.protection_mode if record is not None else None),
-        ) is None:
-            raise AgentLoopError(
-                "Managed-CI issue-created resume found malformed or uncorrelated override audit provenance."
-            )
     return handoff
 
 
@@ -2810,18 +2833,37 @@ def _find_resume_audit(
         # actor-authored record with the same public tuple.
         if expected_handoff.authorization_comment_id is not None:
             if comment_id == expected_handoff.authorization_comment_id:
-                return authorization.kind == expected_handoff.authorization_kind
+                if authorization.kind != expected_handoff.authorization_kind:
+                    return False
+                if authorization.kind == "creation":
+                    expected_nonce = expected_handoff.opening_override_nonce
+                    if expected_nonce is None:
+                        expected_nonce = expected_handoff.override_nonce
+                    return expected_nonce is None or authorization.nonce == expected_nonce
+                if authorization.kind == "fresh":
+                    return authorization.nonce == expected_handoff.override_nonce
+                # Continuity nonces are minted for the new exact head. The
+                # trusted comment identity and validated predecessor chain,
+                # rather than the opening-body nonce, bind that terminal.
+                return True
             return True
         if authorization.head_sha != expected_handoff.head_sha:
             return True
-        if authorization.kind != expected_handoff.authorization_kind:
-            return False
-        # Creation and fresh records are bound to the nonce authenticated from
-        # the PR opening or fresh-authorization checkpoint. Continuity records
-        # use their own nonce and are instead identified by their durable
-        # comment ID and correlated predecessor/round metadata.
-        if authorization.kind in {"creation", "fresh"}:
-            return authorization.nonce == expected_handoff.override_nonce
+        # A recovered handoff initially describes the PR-opening body, so its
+        # default kind is ``creation`` even when a later continuity record is
+        # the terminal authority for the live head. Creation and fresh records
+        # must match the nonce for the checkpoint that authenticated them;
+        # continuity records carry a new nonce and are validated by their
+        # predecessor/round chain instead.
+        if authorization.kind == "creation":
+            expected_nonce = expected_handoff.opening_override_nonce
+            if expected_nonce is None and expected_handoff.authorization_kind == "creation":
+                expected_nonce = expected_handoff.override_nonce
+            return expected_nonce is None or authorization.nonce == expected_nonce
+        if authorization.kind == "fresh":
+            if expected_handoff.authorization_kind == "fresh":
+                return authorization.nonce == expected_handoff.override_nonce
+            return True
         return True
     candidates: list[tuple[int, dict[str, str]]] = []
     authorization_candidates: list[tuple[int, ManagedCiIssueAuthorization]] = []
