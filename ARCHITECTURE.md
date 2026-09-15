@@ -276,8 +276,9 @@ the coder for that round, validated the response and assigned-checkout head
 advance, re-read the exact live PR tuple, and persist one continuity comment
 binding predecessor head, new head, predecessor authorization, and round
 metadata identities. Those referenced comments are parsed again on resume and
-must be the blocking reviewer record for the predecessor head and the coder
-record for the immediately following round and new head. Resume accepts only
+must be newer than the predecessor authorization, with the blocking reviewer
+record for the predecessor head ordered before the coder record for the
+immediately following round and new head. Resume accepts only
 one unique gap-free chain. Missing,
 forked, stale, unsolicited, or raced links fail closed and direct an eligible
 operator to fresh authorization. PR bodies, branches, labels, draft state,

@@ -10485,7 +10485,7 @@ def run_pr_loop(
                             "match the canonical issue plan."
                         )
                     approved_plan_context = recovered
-            elif approved_plan_context is None:
+            else:
                 resumed_plan = _resume_plan_round(
                     issue_context.comments,
                     configured_reviewers=reviewers(config),
@@ -10505,12 +10505,29 @@ def run_pr_loop(
                             "Managed-CI fresh authorization found planning state without "
                             "a complete canonical reviewer approval."
                         )
-                    approved_plan_context = make_approved_plan_context(
+                    recovered_plan_context = make_approved_plan_context(
                         plan_text,
                         source_locator=(
                             f"issue #{fresh_issue_number} canonical approved plan"
                         ),
                         expected_hash=approved_plan_hash(plan_text),
+                    )
+                    if (
+                        approved_plan_context is not None
+                        and approved_plan_context.plan_hash
+                        != recovered_plan_context.plan_hash
+                    ):
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization approved-plan scope does not "
+                            "match the canonical issue plan."
+                        )
+                    approved_plan_context = recovered_plan_context
+                elif approved_plan_context is not None or _extract_round_metadata_records(
+                    issue_context.comments, flow="plan"
+                ):
+                    raise AgentLoopError(
+                        "Managed-CI fresh authorization could not prove a complete canonical "
+                        "approved plan for the explicit issue scope."
                     )
             managed_ci_handoff = authorize_fresh_issue_created_resume(
                 runner,
@@ -14881,6 +14898,9 @@ def run_pr_loop(
                         predecessor_head=predecessor_head,
                         new_head=new_head,
                         round_number=round_number,
+                        after_comment_id=(
+                            managed_ci_handoff.authorization_comment_id or 0
+                        ),
                     )
                     managed_ci_handoff = publish_issue_created_continuity_authorization(
                         runner,

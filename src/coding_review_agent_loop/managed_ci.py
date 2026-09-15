@@ -1285,6 +1285,7 @@ def find_actor_round_metadata_comment_ids(
     predecessor_head: str,
     new_head: str,
     round_number: int,
+    after_comment_id: int,
 ) -> tuple[int, ...]:
     """Return the exact blocking-review and coder records for one head transition."""
     comments = _api_list(
@@ -1304,6 +1305,7 @@ def find_actor_round_metadata_comment_ids(
             or user.get("login") != actor_login
             or user.get("id") != actor_id
             or not isinstance(comment_id, int)
+            or comment_id <= after_comment_id
         ):
             continue
         if (
@@ -1319,7 +1321,11 @@ def find_actor_round_metadata_comment_ids(
             and metadata["round_number"] == round_number + 1
         ):
             coders.append(comment_id)
-    if not reviewers or len(coders) != 1:
+    if (
+        not reviewers
+        or len(coders) != 1
+        or any(comment_id >= coders[0] for comment_id in reviewers)
+    ):
         raise AgentLoopError(
             "Managed-CI head continuity requires correlated blocking-review and coder round metadata."
         )
@@ -1375,7 +1381,7 @@ def _continuity_round_metadata_is_valid(
         by_index = _continuity_round_records(comments)
     except AgentLoopError:
         return False
-    selected = []
+    selected: list[tuple[int, dict[str, object]]] = []
     wanted = set(authorization.round_comment_ids)
     for index, comment in enumerate(comments):
         if comment.get("id") not in wanted:
@@ -1388,22 +1394,31 @@ def _continuity_round_metadata_is_valid(
             or user.get("id") != authorization.actor_id
         ):
             return False
-        selected.append(metadata)
+        comment_id = comment.get("id")
+        if (
+            not isinstance(comment_id, int)
+            or authorization.predecessor_comment_id is None
+            or comment_id <= authorization.predecessor_comment_id
+        ):
+            return False
+        selected.append((comment_id, metadata))
     if len(selected) != len(wanted):
         return False
     coders = [
         item for item in selected
-        if item["role"] == "coder" and item["subject"] == authorization.head_sha
+        if item[1]["role"] == "coder" and item[1]["subject"] == authorization.head_sha
     ]
     if len(coders) != 1:
         return False
-    coder_round = coders[0]["round_number"]
+    coder_id, coder_metadata = coders[0]
+    coder_round = coder_metadata["round_number"]
     reviewers = [
         item for item in selected
-        if item["role"] == "reviewer"
-        and item["state"] == "blocking"
-        and item["subject"] == authorization.predecessor_head
-        and item["round_number"] == coder_round - 1
+        if item[1]["role"] == "reviewer"
+        and item[1]["state"] == "blocking"
+        and item[1]["subject"] == authorization.predecessor_head
+        and item[1]["round_number"] == coder_round - 1
+        and item[0] < coder_id
     ]
     return bool(reviewers) and len(reviewers) + 1 == len(selected)
 

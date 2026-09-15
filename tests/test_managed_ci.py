@@ -660,6 +660,138 @@ def test_continuity_publication_rejects_missing_correlated_round_metadata(tmp_pa
         )
 
 
+def test_round_metadata_selection_requires_current_ordered_transition(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.extend([
+        _round_comment(18, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(19, role="coder", subject="next-head", round_number=2),
+        _round_comment(51, role="coder", subject="next-head", round_number=2),
+        _round_comment(52, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+    ])
+    config = make_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+            predecessor_head="abc123", new_head="next-head", round_number=1,
+            after_comment_id=50,
+        )
+
+
+def test_continuity_resume_rejects_round_metadata_older_than_predecessor(tmp_path):
+    root = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
+        label_event_id=101,
+    )
+    continuity = ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="next-head", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
+        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=50,
+        round_comment_ids=(48, 49),
+    )
+    comments = [
+        _round_comment(48, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(49, role="coder", subject="next-head", round_number=2),
+        {"id": 50, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(root))},
+        {"id": 51, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(continuity))},
+    ]
+    runner = V2ManagedRunner(intent_comments=comments)
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    assert _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="next-head",
+    ) is None
+
+
+@pytest.mark.parametrize("mutation", ["unrelated", "malformed", "gapped"])
+def test_continuity_resume_rejects_uncorrelated_round_metadata(tmp_path, mutation):
+    root = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
+        label_event_id=101,
+    )
+    continuation = ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="next-head", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
+        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        round_comment_ids=(42, 43),
+    )
+    reviewer = _round_comment(
+        42, role="reviewer", subject="abc123", round_number=1, state="blocking"
+    )
+    coder = _round_comment(43, role="coder", subject="next-head", round_number=2)
+    if mutation == "unrelated":
+        reviewer = _round_comment(
+            42, role="reviewer", subject="different-head", round_number=1,
+            state="blocking",
+        )
+    elif mutation == "malformed":
+        reviewer["body"] = "<!-- AGENT_ROUND_RESUME: !!! -->"
+    else:
+        reviewer = _round_comment(
+            42, role="reviewer", subject="abc123", round_number=7, state="blocking"
+        )
+    comments = [
+        {"id": 41, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(root))},
+        reviewer,
+        coder,
+        {"id": 44, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(continuation))},
+    ]
+    runner = V2ManagedRunner(intent_comments=comments)
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    assert _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="next-head",
+    ) is None
+
+
+def test_continuity_resume_rejects_two_valid_metadata_forks(tmp_path):
+    root = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
+        label_event_id=101,
+    )
+    first = ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="next-head", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="first",
+        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        round_comment_ids=(42, 43),
+    )
+    second = replace(first, nonce="second", round_comment_ids=(44, 45))
+    comments = [
+        {"id": 41, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(root))},
+        _round_comment(42, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(43, role="coder", subject="next-head", round_number=2),
+        _round_comment(44, role="reviewer", subject="abc123", round_number=3, state="blocking"),
+        _round_comment(45, role="coder", subject="next-head", round_number=4),
+        {"id": 46, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(first))},
+        {"id": 47, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(second))},
+    ]
+    runner = V2ManagedRunner(intent_comments=comments)
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    assert _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="next-head",
+    ) is None
+
+
 def test_fresh_issue_authorization_requires_explicit_scope_and_is_idempotent(tmp_path):
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     config = make_config(
@@ -891,6 +1023,61 @@ def test_resume_rejects_unsolicited_live_head(tmp_path):
     assert _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
         base_ref="main", issue_number=643, live_head="unsolicited",
+    ) is None
+
+
+def test_activation_rejects_stale_authorization_before_dispatch(tmp_path, monkeypatch):
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"state": "open", "draft": True, "labels": [{"name": MANAGED_LABEL}]},
+        issue_events=[label_event()],
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        managed_ci_issue_number=643,
+    )
+    handoff = _authorization_handoff()
+    monkeypatch.setattr(
+        managed_ci, "_find_resume_audit",
+        lambda *args, **kwargs: (41, {
+            "nonce": "old", "repo": "OWNER/REPO", "base": "main",
+            "head": "older-head", "protection": "voluntary",
+            "active_label_event_id": "101", "kind": "creation",
+            "issue": "643", "pr": "7",
+        }),
+    )
+
+    with pytest.raises(AgentLoopError, match="bound to an older head"):
+        activate_managed_ci(
+            runner, config=config, pr_number=7, metadata=metadata(),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created", lifecycle="draft-labeled",
+                issue_created_handoff=handoff,
+            ),
+        )
+
+    commands = [command for command, _cwd in runner.commands]
+    assert any("DELETE" in command for command in commands)
+    assert not any("dispatches" in " ".join(command) for command in commands)
+
+
+def test_pr_body_authorization_copy_cannot_supply_resume_provenance(tmp_path):
+    record = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
+        label_event_id=101,
+    )
+    runner = V2ManagedRunner(
+        intent_comments=[],
+        rest_pr={"body": str(format_issue_created_authorization_comment(record))},
+    )
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    assert _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="abc123",
     ) is None
 
 

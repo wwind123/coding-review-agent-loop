@@ -2075,8 +2075,9 @@ authority movement is allowed only through one unique, gap-free chain of
 actor-authored continuity comments. Each continuity record binds the
 predecessor authorization comment, predecessor head, new exact head, and the
 durable review/coder round metadata identities. The referenced records are
-re-parsed as the blocking review for the predecessor
-head and the immediately following coder record for the new head; unrelated or
+re-parsed, must postdate the predecessor authorization, and must order the
+blocking review for the predecessor head before the immediately following
+coder record for the new head; unrelated or
 malformed metadata and authorization-comment fallbacks are rejected. A push,
 branch name, PR body, author, label, draft state, missing link, fork, or race cannot extend
 authority; recovery prints the explicit fresh-authorization command instead.
