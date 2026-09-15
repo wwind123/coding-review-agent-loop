@@ -494,9 +494,30 @@ def render_risk_test_matrix_section(
     return "\n".join(lines)
 
 
-def decode_risk_test_matrix_marker(encoded: str) -> dict[str, object]:
+def decode_risk_test_matrix_marker(
+    encoded: str, *, bodies: Sequence[str] = ()
+) -> dict[str, object]:
     payload = _decode_json_payload(encoded, marker_name=RISK_TEST_MATRIX_MARKER)
-    if _encode_json_payload(payload) != encoded or set(payload) != {"contract_version", "matrix", "changes", "identity"}:
+    if _encode_json_payload(payload) != encoded:
+        raise AgentLoopError(f"Invalid {RISK_TEST_MATRIX_MARKER} payload.")
+    if "$round_transport_risk_test_matrix" in payload:
+        from .round_transport import hydrate_mapping
+
+        hydrated, missing = hydrate_mapping(
+            {"risk_test_matrix_marker": payload}, bodies
+        )
+        recovered = hydrated.get("risk_test_matrix_marker")
+        if missing or not isinstance(recovered, str):
+            raise AgentLoopError(
+                f"Invalid {RISK_TEST_MATRIX_MARKER} payload: sidecar unavailable."
+            )
+        try:
+            payload = json.loads(recovered)
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError(
+                f"Invalid {RISK_TEST_MATRIX_MARKER} payload: sidecar is not JSON."
+            ) from exc
+    if not isinstance(payload, dict) or set(payload) != {"contract_version", "matrix", "changes", "identity"}:
         raise AgentLoopError(f"Invalid {RISK_TEST_MATRIX_MARKER} payload.")
     if payload["contract_version"] != 1:
         raise AgentLoopError(f"Unsupported {RISK_TEST_MATRIX_MARKER} contract version.")

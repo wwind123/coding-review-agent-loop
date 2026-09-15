@@ -10,7 +10,7 @@ import zlib
 from collections.abc import Mapping, Sequence
 
 from .errors import AgentLoopError
-from .protocol_markers import TrustedBody, scan_reserved_markers
+from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
 
 MAX_GITHUB_BODY_CHARS = 60_000
 ROUND_RESUME_MARKER_RE = re.compile(
@@ -29,6 +29,14 @@ _EXECUTION_RECOMMENDATION_SECTION_BOUNDARY_RE = re.compile(
     r"(?P<digest>[0-9a-f]{64})\s*-->\r?$",
     re.I,
 )
+_RISK_TEST_MATRIX_RE = re.compile(
+    r"<!--\s*AGENT_RISK_TEST_MATRIX:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.I,
+)
+_RISK_TEST_MATRIX_SECTION_BOUNDARY_RE = re.compile(
+    r"(?m)^<!--\s*risk-test-matrix-section:\s*(?P<identity>[0-9a-f]{64})\s*-->\r?$",
+    re.I,
+)
 # Spill reviewer checkpoints first: they are often the largest metadata field
 # and are required to safely resume a provisional parallel-review round.
 _SPILL_FIELDS = (
@@ -44,10 +52,13 @@ _SPILL_FIELDS = (
     "execution_recommendation",
     "risk_test_matrix_payload",
     "risk_test_matrix_changes_payload",
+    "risk_test_matrix_marker",
 )
 _MAX_COMPRESSED = 8_000_000
 _MAX_DECOMPRESSED = 16_000_000
 _PART_CHARS = 40_000
+_RISK_MATRIX_COMPACT_AT_CHARS = 50_000
+_RISK_MATRIX_MARKER_COMPACT_AT_CHARS = 4_000
 
 
 def execution_recommendation_section_boundary(encoded: str) -> str:
@@ -270,12 +281,161 @@ def _prepare_execution_recommendation_transport(
     )
 
 
+def _prepare_risk_test_matrix_transport(
+    body_text: str,
+) -> tuple[str, list[TrustedBody], tuple[int, int, str] | None]:
+    """Move a large matrix marker to sidecars and retain a compact public index."""
+    matches = list(_RISK_TEST_MATRIX_RE.finditer(body_text))
+    if (
+        not matches
+        or len(body_text) <= _RISK_MATRIX_COMPACT_AT_CHARS
+        or len(matches[-1].group("payload")) <= _RISK_MATRIX_MARKER_COMPACT_AT_CHARS
+    ):
+        return body_text, [], None
+    match = matches[-1]
+    try:
+        raw_payload = base64.urlsafe_b64decode(match.group("payload").encode("ascii"))
+        parsed = json.loads(raw_payload.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("matrix object required")
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentLoopError("Risk matrix marker is not a recoverable JSON object.") from exc
+    if "$round_transport_risk_test_matrix" in parsed:
+        return body_text, [], None
+
+    identity = parsed.get("identity")
+    matrix = parsed.get("matrix")
+    if not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity):
+        raise AgentLoopError("Risk matrix marker has no valid identity.")
+    if not isinstance(matrix, dict):
+        raise AgentLoopError("Risk matrix marker has no matrix object.")
+
+    canonical_raw = json.dumps(
+        parsed, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+    ).encode("utf-8")
+    packed = zlib.compress(canonical_raw, 9)
+    if len(packed) > _MAX_COMPRESSED:
+        raise AgentLoopError("Risk matrix is too large to transport safely.")
+    encoded_packed = _b64(packed)
+    anchor_id = hashlib.sha256(body_text.encode("utf-8")).hexdigest()[:24]
+    spill_digest = hashlib.sha256(packed).hexdigest()
+    raw_digest = hashlib.sha256(canonical_raw).hexdigest()
+    chunks = [
+        encoded_packed[index : index + _PART_CHARS]
+        for index in range(0, len(encoded_packed), _PART_CHARS)
+    ]
+    reference = {
+        "$round_transport_risk_test_matrix": anchor_id,
+        "field": "risk_test_matrix_marker",
+        "parts": len(chunks),
+        "sha256": raw_digest,
+        "spill": spill_digest,
+    }
+    replacement = _b64(
+        json.dumps(reference, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    transformed = (
+        body_text[: match.start("payload")]
+        + replacement
+        + body_text[match.end("payload") :]
+    )
+    sidecars = [
+        _sidecar(
+            {
+                "v": 1,
+                "anchor": anchor_id,
+                "spill": spill_digest,
+                "field": "risk_test_matrix_marker",
+                "index": index,
+                "count": len(chunks),
+                "sha256": raw_digest,
+                "data": chunk,
+            }
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+
+    boundaries = [
+        boundary
+        for boundary in _RISK_TEST_MATRIX_SECTION_BOUNDARY_RE.finditer(body_text)
+        if boundary.end() <= match.start() and boundary.group("identity") == identity
+    ]
+    if not boundaries:
+        return transformed, sidecars, None
+    section_boundary = boundaries[-1]
+    transported_matches = list(_RISK_TEST_MATRIX_RE.finditer(transformed))
+    if not transported_matches:
+        raise AgentLoopError(
+            "Risk test matrix transport rewrite lost its protocol marker."
+        )
+    transported_match = transported_matches[-1]
+    rows = matrix.get("rows")
+    row_index: list[tuple[str, str, str]] = []
+    if isinstance(rows, list):
+        for row in rows:
+            row_id = row.get("row_id") if isinstance(row, dict) else None
+            if isinstance(row_id, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", row_id):
+                label = sanitize_historical_text(str(row.get("label", "")))
+                owner = sanitize_historical_text(str(row.get("execution_owner", "")))
+                label = " ".join(label.split()).replace("|", "\\|")
+                if len(label) > 160:
+                    label = label[:157].rstrip() + "..."
+                row_index.append((row_id, label, owner))
+    applicability = matrix.get("applicability")
+    preserved_markers = [
+        occurrence.text
+        for occurrence in scan_reserved_markers(body_text)
+        if (
+            section_boundary.start() <= occurrence.start < match.end()
+            and occurrence.definition.token != "AGENT_RISK_TEST_MATRIX"
+        )
+    ]
+    compact_lines = [
+        risk_test_matrix_section_boundary(identity),
+        "### Risk-based mode and transition test matrix",
+        f"- **Applicability:** {applicability if applicability in {'applicable', 'not-applicable'} else 'unknown'}",
+        f"- **Rows:** {len(rows) if isinstance(rows, list) else 0}",
+    ]
+    if row_index:
+        compact_lines.extend(
+            [
+                "",
+                "| ID | Scenario | Owner |",
+                "| --- | --- | --- |",
+                *[
+                    f"| `{row_id}` | {label} | `{owner}` |"
+                    for row_id, label, owner in row_index
+                ],
+            ]
+        )
+    compact_lines.extend(
+        [
+            "The complete validated matrix is retained in authenticated transport "
+            "sidecars and is hydrated losslessly for reviewer and coder prompts.",
+            *preserved_markers,
+            transported_match.group(0),
+        ]
+    )
+    compact_section = "\n".join(compact_lines)
+    compacted = (
+        transformed[: section_boundary.start()]
+        + compact_section
+        + transformed[transported_match.end() :]
+    )
+    return compacted, sidecars, (
+        section_boundary.start(),
+        match.end(),
+        compact_section,
+    )
+
+
 def _replace_authorized_range(
     carrier: TrustedBody,
     *,
     start: int,
     end: int,
     replacement: TrustedBody,
+    replaceable_token: str,
 ) -> TrustedBody:
     """Replace visible text while retaining marker provenance around it."""
     original = str(carrier)
@@ -305,7 +465,7 @@ def _replace_authorized_range(
                     start <= segment_start
                     and segment_end <= end
                     and (
-                        segment.token == "AGENT_EXECUTION_RECOMMENDATION"
+                        segment.token == replaceable_token
                         or (segment.token, segment.text) in replacement_markers
                     )
                 ):
@@ -392,6 +552,7 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             start=start,
             end=end,
             replacement=trusted_compact_section,
+            replaceable_token="AGENT_EXECUTION_RECOMMENDATION",
         )
     elif sidecars:
         original_execution = _EXECUTION_RECOMMENDATION_RE.search(str(carrier))
@@ -402,6 +563,36 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
                 token="AGENT_EXECUTION_RECOMMENDATION",
                 old_text=original_execution.group(0),
                 new_text=transported_execution.group(0),
+            )
+    body_text, matrix_sidecars, matrix_rewrite = _prepare_risk_test_matrix_transport(
+        body_text
+    )
+    sidecars.extend(matrix_sidecars)
+    if matrix_rewrite is not None:
+        start, end, compact_section = matrix_rewrite
+        trusted_compact_section = TrustedBody.canonical(
+            compact_section,
+            expected_tokens=tuple(
+                occurrence.definition.token
+                for occurrence in scan_reserved_markers(compact_section)
+            ),
+        )
+        trusted_anchor = _replace_authorized_range(
+            trusted_anchor,
+            start=start,
+            end=end,
+            replacement=trusted_compact_section,
+            replaceable_token="AGENT_RISK_TEST_MATRIX",
+        )
+    elif matrix_sidecars:
+        original_matrices = list(_RISK_TEST_MATRIX_RE.finditer(str(trusted_anchor)))
+        transported_matrices = list(_RISK_TEST_MATRIX_RE.finditer(body_text))
+        if original_matrices and transported_matrices:
+            trusted_anchor = _replace_authorized_marker(
+                trusted_anchor,
+                token="AGENT_RISK_TEST_MATRIX",
+                old_text=original_matrices[-1].group(0),
+                new_text=transported_matrices[-1].group(0),
             )
     matches = list(ROUND_RESUME_MARKER_RE.finditer(body_text))
     if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches and not sidecars:
@@ -528,7 +719,11 @@ def hydrate_mapping(
         reference_key = (
             "$round_transport_execution_recommendation"
             if "$round_transport_execution_recommendation" in ref
-            else "$round_transport_spill"
+            else (
+                "$round_transport_risk_test_matrix"
+                if "$round_transport_risk_test_matrix" in ref
+                else "$round_transport_spill"
+            )
         )
         if reference_key not in ref:
             continue

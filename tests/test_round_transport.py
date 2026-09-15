@@ -24,6 +24,7 @@ from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
     UNKNOWN_MACHINE_AUTHORITY,
+    parse_risk_test_matrix,
     validate_structured_plan_state,
 )
 from coding_review_agent_loop.review_scheduling import ReviewSchedulingContract
@@ -42,6 +43,45 @@ def _comment(payload: dict[str, object], body: str = "Visible response") -> str:
 def _anchor_payload(anchor: str) -> dict[str, object]:
     match = list(transport.ROUND_RESUME_MARKER_RE.finditer(anchor))[-1]
     return transport.decode_mapping(match.group("payload"))
+
+
+def _risk_test_matrix_marker_payload(
+    *, row_count: int = 11, repetition: int = 40
+) -> tuple[dict[str, object], str]:
+    rows = []
+    for index in range(row_count):
+        rows.append(
+            {
+                "row_id": f"row-{index}",
+                "label": f"Transition {index} " + "label " * repetition,
+                "entry_path_or_mode": "auto / staged " + "entry " * repetition,
+                "initial_state": "approved primary " + "state " * repetition,
+                "event": "panel review completes " + "event " * repetition,
+                "expected_outcome": "advance exactly once " + "outcome " * repetition,
+                "forbidden_side_effects": [
+                    "do not duplicate work " + "effect " * repetition
+                ],
+                "proposed_test_level": "orchestrator",
+                "proposed_test_location": f"tests/test_orchestrator_pr.py::test_transition_{index}",
+                "applicability": "applicable",
+                "related_scope_item_ids": ["scope-review-policy"],
+                "execution_owner": "one-shot",
+            }
+        )
+    matrix = parse_risk_test_matrix(
+        {
+            "applicability": "applicable",
+            "rows": rows,
+            "important_exclusions": ["No unrelated review modes."],
+        }
+    )
+    payload = {
+        "contract_version": 1,
+        "matrix": matrix.to_payload(),
+        "changes": [],
+        "identity": comment_rendering.risk_test_matrix_identity(matrix),
+    }
+    return payload, comment_rendering._encode_json_payload(payload)
 
 
 def test_encode_decode_mapping_round_trip_and_legacy_base64() -> None:
@@ -225,6 +265,173 @@ def test_rendered_oversized_execution_recommendation_keeps_anchor_bounded_and_re
         for item in prepared
     )
     anchor_body.validate_for_surface("issue_comment")
+
+
+def test_large_risk_matrix_uses_compact_anchor_and_lossless_sidecar() -> None:
+    rows = []
+    for index in range(11):
+        rows.append(
+            {
+                "row_id": f"row-{index}",
+                "label": f"Transition {index} " + "label " * 40,
+                "entry_path_or_mode": "auto / staged " + "entry " * 40,
+                "initial_state": "approved primary " + "state " * 40,
+                "event": "panel review completes " + "event " * 40,
+                "expected_outcome": "advance exactly once " + "outcome " * 40,
+                "forbidden_side_effects": ["do not duplicate work " + "effect " * 40],
+                "proposed_test_level": "orchestrator",
+                "proposed_test_location": f"tests/test_orchestrator_pr.py::test_transition_{index}",
+                "applicability": "applicable",
+                "related_scope_item_ids": ["scope-review-policy"],
+                "execution_owner": "one-shot",
+            }
+        )
+    matrix = parse_risk_test_matrix(
+        {
+            "applicability": "applicable",
+            "rows": rows,
+            "important_exclusions": ["No unrelated review modes."],
+        }
+    )
+    section = comment_rendering.render_risk_test_matrix_section(matrix)
+    canonical_plan = _random_text(30_000) + "\n" + section
+    body = _attach_round_metadata(
+        canonical_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="codex",
+            round_number=1,
+            subject="large-matrix-plan",
+            canonical_plan=canonical_plan,
+            risk_test_matrix_contract_version=1,
+            risk_test_matrix_payload=matrix.to_payload(),
+            risk_test_matrix_identity=comment_rendering.risk_test_matrix_identity(matrix),
+            risk_test_matrix_boundary_digest=comment_rendering.risk_test_matrix_identity(matrix),
+        ),
+    )
+    assert len(body) > transport._RISK_MATRIX_COMPACT_AT_CHARS
+
+    prepared = transport.prepare_round_comment(body)
+    anchor = str(prepared[-1])
+
+    assert len(anchor) <= transport.MAX_GITHUB_BODY_CHARS
+    assert "- **Rows:** 11" in anchor
+    assert "`row-0`" in anchor and "`row-10`" in anchor
+    assert "Transition 0" in anchor
+    assert "advance exactly once" not in anchor
+    assert "hydrated losslessly" in anchor
+    marker = list(comment_rendering.RISK_TEST_MATRIX_MARKER_RE.finditer(anchor))[-1]
+    decoded = comment_rendering.decode_risk_test_matrix_marker(
+        marker.group("payload"), bodies=tuple(map(str, prepared))
+    )
+    assert decoded["matrix"] == matrix.to_payload()
+    round_payload = _anchor_payload(anchor)
+    hydrated_round, missing = transport.hydrate_mapping(
+        round_payload, tuple(map(str, prepared))
+    )
+    assert missing == set()
+    assert hydrated_round["canonical_plan"] == canonical_plan
+    with pytest.raises(AgentLoopError, match="sidecar unavailable"):
+        comment_rendering.decode_risk_test_matrix_marker(marker.group("payload"))
+    assert any(
+        '"field":"risk_test_matrix_marker"' in base64.urlsafe_b64decode(
+            transport.ROUND_TRANSPORT_SIDECAR_RE.search(str(item)).group("payload")
+        ).decode()
+        for item in prepared[:-1]
+    )
+    prepared[-1].validate_for_surface("issue_comment")
+
+
+def test_oversized_risk_matrix_without_section_boundary_uses_bounded_lossless_sidecar() -> None:
+    payload, encoded = _risk_test_matrix_marker_payload()
+    marker_text = f"<!-- AGENT_RISK_TEST_MATRIX: {encoded} -->"
+    prefix_length = max(
+        1, transport._RISK_MATRIX_COMPACT_AT_CHARS + 1 - len(marker_text)
+    )
+    body = _random_text(prefix_length) + "\n" + marker_text
+
+    assert len(body) > transport._RISK_MATRIX_COMPACT_AT_CHARS
+    assert transport.risk_test_matrix_section_boundary(payload["identity"]) not in body
+
+    prepared = transport.prepare_round_comment(body)
+    anchor_body = prepared[-1]
+    anchor = str(anchor_body)
+
+    assert len(anchor) <= transport.MAX_GITHUB_BODY_CHARS
+    marker = list(comment_rendering.RISK_TEST_MATRIX_MARKER_RE.finditer(anchor))[-1]
+    assert (marker.group(0), "AGENT_RISK_TEST_MATRIX") in anchor_body.segments
+    assert comment_rendering.decode_risk_test_matrix_marker(
+        marker.group("payload"), bodies=tuple(map(str, prepared))
+    ) == payload
+
+
+def test_oversized_risk_matrix_fallback_replaces_last_authorized_marker() -> None:
+    first_payload, first_encoded = _risk_test_matrix_marker_payload(
+        row_count=1, repetition=2
+    )
+    last_payload, last_encoded = _risk_test_matrix_marker_payload()
+    first_marker = f"<!-- AGENT_RISK_TEST_MATRIX: {first_encoded} -->"
+    last_marker = f"<!-- AGENT_RISK_TEST_MATRIX: {last_encoded} -->"
+    prefix_length = max(
+        1, transport._RISK_MATRIX_COMPACT_AT_CHARS + 1 - len(last_marker) - len(first_marker) - 1
+    )
+    carrier = TrustedBody.join(
+        TrustedBody.current_untrusted_visible(_random_text(prefix_length)),
+        TrustedBody.marker("AGENT_RISK_TEST_MATRIX", first_marker),
+        TrustedBody.current_untrusted_visible("\n"),
+        TrustedBody.marker("AGENT_RISK_TEST_MATRIX", last_marker),
+    )
+
+    prepared = transport.prepare_round_comment(carrier)
+    anchor_body = prepared[-1]
+    markers = list(comment_rendering.RISK_TEST_MATRIX_MARKER_RE.finditer(str(anchor_body)))
+
+    assert len(markers) == 2
+    assert markers[0].group("payload") == first_encoded
+    assert markers[-1].group("payload") != last_encoded
+    assert (markers[-1].group(0), "AGENT_RISK_TEST_MATRIX") in anchor_body.segments
+    assert comment_rendering.decode_risk_test_matrix_marker(
+        markers[-1].group("payload"), bodies=tuple(map(str, prepared))
+    ) == last_payload
+    assert comment_rendering.decode_risk_test_matrix_marker(
+        markers[0].group("payload")
+    ) == first_payload
+
+
+def test_risk_matrix_rewrite_loss_raises_typed_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload, encoded = _risk_test_matrix_marker_payload()
+    marker_text = f"<!-- AGENT_RISK_TEST_MATRIX: {encoded} -->"
+    body = "\n".join(
+        [
+            transport.risk_test_matrix_section_boundary(payload["identity"]),
+            "### Risk-based mode and transition test matrix",
+            marker_text,
+        ]
+    )
+    body = _random_text(
+        max(1, transport._RISK_MATRIX_COMPACT_AT_CHARS + 1 - len(body) - 1)
+    ) + "\n" + body
+    original_pattern = transport._RISK_TEST_MATRIX_RE
+
+    class MarkerPattern:
+        calls = 0
+
+        def finditer(self, text: str):
+            self.calls += 1
+            if self.calls == 1:
+                return original_pattern.finditer(text)
+            return iter(())
+
+    pattern = MarkerPattern()
+    monkeypatch.setattr(transport, "_RISK_TEST_MATRIX_RE", pattern)
+
+    with pytest.raises(
+        AgentLoopError, match="transport rewrite lost its protocol marker"
+    ):
+        transport._prepare_risk_test_matrix_transport(body)
 
 
 def test_prepare_round_comment_spills_multiple_fields_in_fixed_order() -> None:
