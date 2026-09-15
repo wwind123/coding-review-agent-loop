@@ -154,10 +154,64 @@ def test_plan_candidate_uses_response_guidance_and_records_shortener_recovery(
         ),
     )
     assert calls and calls[0]["role"] == "shortener"
+    assert calls[0]["session_id"] is None
+    assert calls[0]["use_repair"] is False
+    assert calls[0]["max_invocations"] == 1
     assert prepared.response.text == candidate_text
     assert prepared.preflight.status == "fits"
     assert prepared.recovery_path is not None
     assert prepared.recovery_path.exists()
+
+
+def test_plan_candidate_rejects_lossy_shortener_and_retains_recovery(
+    tmp_path, monkeypatch
+):
+    source_payload = json.loads(
+        structured_plan_state(
+            summary=("Please " * 8_000)
+            + "Preserve the first obligation and preserve the second obligation.",
+            plan_steps=["Preserve the first obligation."],
+        ).split("\n", 1)[0]
+    )
+    candidate_payload = dict(source_payload)
+    candidate_payload["summary"] = "Preserve the first obligation."
+    footer = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    source_text = json.dumps(source_payload) + footer
+    candidate_text = json.dumps(candidate_payload) + footer
+    parsed_source = validate_structured_plan_state(source_text)
+    assert parsed_source is not None
+    response = orchestrator_module.ValidatedAgentResponse(
+        text=source_text, session_id="producer", marker_value=parsed_source
+    )
+
+    def fake_shortener(*_args, **kwargs):
+        kwargs["validate"](candidate_text)
+        raise AssertionError("lossy candidate unexpectedly passed preservation")
+
+    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", fake_shortener)
+    config = make_config(tmp_path)
+    metadata_factory = lambda candidate_response, candidate_plan, canonical, public: PostedRoundMetadata(
+        flow="plan", role="coder", agent="Anthropic Claude", round_number=1,
+        subject=_plan_subject(canonical), canonical_plan=canonical,
+        raw_structured_coder_response=candidate_response.text,
+    )
+
+    with pytest.raises(AgentLoopError, match="Shortening content preservation failed"):
+        orchestrator_module._prepare_plan_candidate_for_publication(
+            _FakeRunner(), config=config, response=response, parsed=parsed_source,
+            prior_items=(), metadata_factory=metadata_factory,
+            usage_context=orchestrator_module._new_usage_context(config),
+            issue_number=57,
+        )
+
+    recovery_path = orchestrator_module._planning_recovery_path(config, 57)
+    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+    assert recovery["attempt_state"] == "attempted"
+    assert recovery["attempt_consumed"] is True
+    assert recovery["original_response"] == source_text
+    assert recovery["original_digest"] == __import__("hashlib").sha256(
+        source_text.encode("utf-8")
+    ).hexdigest()
 
 
 def test_auto_execution_resolves_staged_after_approval(tmp_path):
