@@ -1393,6 +1393,98 @@ def test_activation_rejects_stale_authorization_before_dispatch(tmp_path, monkey
     assert not any("dispatches" in " ".join(command) for command in commands)
 
 
+def test_unlabeled_activation_rejects_wrong_terminal_comment_without_label_or_dispatch(
+    tmp_path, monkeypatch
+):
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"state": "open", "draft": True, "labels": []},
+        issue_events=[label_event()],
+        intent_comments=[{
+            "id": 42,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": str(format_issue_created_authorization_comment(
+                ManagedCiIssueAuthorization(
+                    kind="creation", repository="OWNER/REPO", issue_number=643,
+                    pr_number=7, base_ref="main", head_sha="abc123",
+                    actor_login="agent-loop", actor_id=1,
+                    protection="voluntary", waiver="allow-unprotected-managed-ci",
+                    nonce="nonce-643", label_event_id=101,
+                )
+            )),
+        }],
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    handoff = replace(_authorization_handoff(), authorization_comment_id=41)
+
+    with pytest.raises(AgentLoopError, match="--managed-ci-fresh") as exc_info:
+        activate_managed_ci(
+            runner,
+            config=config,
+            pr_number=7,
+            metadata=metadata(),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created",
+                lifecycle="draft-unlabeled-reentry",
+                issue_created_handoff=handoff,
+            ),
+        )
+
+    command = str(exc_info.value).split("`", 2)[1]
+    parsed = build_parser().parse_args(shlex.split(command)[1:])
+    assert parsed.command == "pr"
+    assert parsed.managed_ci_fresh_authorization is True
+    assert parsed.managed_ci_issue == 643
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert not any(
+        command[:5] == [
+            "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
+        ]
+        for command, _cwd in runner.commands
+    )
+
+
+def test_fresh_remedy_is_not_advertised_without_the_explicit_waiver(tmp_path):
+    runner = V2ManagedRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=False,
+    )
+
+    with pytest.raises(AgentLoopError) as exc_info:
+        _release_for_ordinary_recovery(
+            runner,
+            config=config,
+            pr_number=7,
+            base_ref="main",
+            expected_head_sha="abc123",
+            active_event=(101, "agent-loop", 1),
+            reason="authorization provenance is unavailable",
+            recovery_capable=True,
+            fresh_issue_number=643,
+            fresh_authorization_allowed=True,
+        )
+
+    message = str(exc_info.value)
+    assert "--managed-ci-fresh" not in message
+    assert "no issue-created authorization grant was inferred" in message
+
+
 def test_draft_unlabeled_missing_authorization_does_not_apply_label_and_prints_valid_fresh_command(
     tmp_path,
 ):
@@ -1426,6 +1518,62 @@ def test_draft_unlabeled_missing_authorization_does_not_apply_label_and_prints_v
     command = message.split("`", 2)[1]
     parsed = build_parser().parse_args(shlex.split(command)[1:])
     assert parsed.command == "pr"
+    assert parsed.managed_ci_issue == 643
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+
+
+def test_draft_unlabeled_stale_activation_prints_fresh_recovery_without_labeling(
+    tmp_path, monkeypatch
+):
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"state": "open", "draft": True, "labels": []},
+        issue_events=[label_event()],
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    monkeypatch.setattr(
+        managed_ci,
+        "_find_resume_audit",
+        lambda *args, **kwargs: (41, {
+            "nonce": "old",
+            "repo": "OWNER/REPO",
+            "base": "main",
+            "head": "older-head",
+            "protection": "voluntary",
+            "active_label_event_id": "101",
+            "kind": "creation",
+            "issue": "643",
+            "pr": "7",
+        }),
+    )
+
+    with pytest.raises(AgentLoopError, match="--managed-ci-fresh") as exc_info:
+        activate_managed_ci(
+            runner,
+            config=config,
+            pr_number=7,
+            metadata=metadata(),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created",
+                lifecycle="draft-unlabeled-reentry",
+                issue_created_handoff=_authorization_handoff(),
+            ),
+        )
+
+    command = str(exc_info.value).split("`", 2)[1]
+    parsed = build_parser().parse_args(shlex.split(command)[1:])
     assert parsed.managed_ci_issue == 643
     assert runner.labels_posted is False
     assert runner.dispatch_count == 0
@@ -2430,22 +2578,50 @@ def _resume_audit(*, head="old-head", repo="OWNER/REPO", base="main"):
     }
 
 
-def test_pr_mode_resumes_only_from_immutable_issue_draft_facts_and_mints_fresh_audit(tmp_path):
+def test_pr_mode_resumes_only_from_durable_issue_authorization_and_mints_fresh_audit(tmp_path):
     config = make_config(
         tmp_path,
         auto_merge=True,
+        managed_ci=True,
         managed_ci_pr_mode=True,
         managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
     )
+    resume_metadata = replace(metadata(), head_branch="agent-loop/managed-643")
     runner = V2ManagedRunner(
         workflow=SUPPRESSING_V2_WORKFLOW,
-        rest_pr={"draft": True},
+        rest_pr={"state": "open", "draft": True, "body": resume_metadata.body},
         issue_events=[label_event()],
-        intent_comments=[_resume_audit()],
+        intent_comments=[{
+            "id": 41,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": str(format_issue_created_authorization_comment(
+                ManagedCiIssueAuthorization(
+                    kind="creation", repository="OWNER/REPO", issue_number=643,
+                    pr_number=7, base_ref="main", head_sha="abc123",
+                    actor_login="agent-loop", actor_id=1, protection="voluntary",
+                    waiver="allow-unprotected-managed-ci", nonce="nonce-643",
+                    label_event_id=101,
+                )
+            )),
+        }],
     )
 
-    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+    handoff = recover_issue_created_handoff(
+        runner, config=config, pr_number=7, metadata=resume_metadata, issue_number=643
+    )
+    assert handoff is not None
+    contract = activate_managed_ci(
+        runner,
+        config=config,
+        pr_number=7,
+        metadata=resume_metadata,
+        managed_resume=AuthenticatedManagedResume(
+            origin="issue-created",
+            lifecycle=handoff.lifecycle,
+            issue_created_handoff=handoff,
+        ),
+    )
 
     assert contract is not None
     assert contract.activation_path == "managed"

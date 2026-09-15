@@ -4252,17 +4252,12 @@ def test_issue_loop_outside_workdir_after_reported_pr_mentions_confirmed_resume(
 def test_managed_issue_invalid_post_pr_report_persists_authorization_before_rejection(
     tmp_path, monkeypatch,
 ):
-    nonce = "durable-before-report-rejection"
-    runner = FakeRunner(
+    runner = _IssueRecoveryWorkflowRunner(
+        labeled=True,
         codex_outputs=[
             "Fixed issue.\nTests: cd /outside && python -m pytest\n"
             "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
         ],
-        pr_payload={
-            "body": f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}",
-            "headRefName": "agent-loop/managed-56",
-            "headRefOid": "abc123",
-        },
     )
     config = make_config(
         tmp_path, coder="codex", reviewer="claude", managed_ci=True,
@@ -4270,35 +4265,31 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
     )
     intent = ManagedCiCreationIntent(
         branch="agent-loop/managed-56", trusted_actor="agent-loop",
-        protection_mode="voluntary", audit_nonce=nonce,
+        protection_mode="voluntary", audit_nonce="opening-nonce",
     )
-    handoff = _managed_issue_handoff(nonce=nonce)
-    events = []
+    handoff = _managed_issue_handoff(nonce="opening-nonce")
     monkeypatch.setattr(
         orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
     monkeypatch.setattr(
         orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
     )
-    monkeypatch.setattr(
-        orchestrator_module, "publish_issue_created_authorization",
-        lambda *_a, **_k: events.append("authorization") or replace(
-            handoff, authorization_comment_id=123
-        ),
-    )
-    monkeypatch.setattr(
-        orchestrator_module, "run_pr_loop",
-        lambda *_a, **_k: events.append("review") or 0,
-    )
 
     with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
         run_issue_loop(runner, issue_number=56, config=config)
 
-    assert events == ["authorization"]
+    records = [
+        parsed
+        for comment in runner.authorization_comments
+        if (parsed := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    assert len(records) == 1 and records[0].kind == "creation"
     assert runner.comments == []
 
-    # A later ordinary managed issue invocation discovers and reviews the
-    # same head instead of invoking the implementation coder again.
+    # A later ordinary managed issue invocation discovers and enters the real
+    # recovery/activation seam for the same head instead of invoking the
+    # implementation coder again.
     runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
     runner.pr_commit_pages = _provenance_pages(
         "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct"
@@ -4306,11 +4297,23 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
     coder_calls = sum(
         command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
     )
-    assert run_issue_loop(runner, issue_number=56, config=config) == 0
-    assert events == ["authorization", "review"]
+    _stop_issue_resume_after_real_activation(monkeypatch)
+    with pytest.raises(_RealManagedActivationReached):
+        run_issue_loop(runner, issue_number=56, config=config)
+
     assert sum(
         command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
     ) == coder_calls
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert not any(
+        marker in comment
+        for comment in runner.comments
+        for marker in (
+            "AGENT_ISSUE_PR_HANDOFF", "AGENT_STATE: approved",
+            "AGENT_TEST_OBSERVATION", "AGENT_MANAGED_CI_READINESS",
+        )
+    )
 
 
 _RECOVERY_WORKFLOW = """
