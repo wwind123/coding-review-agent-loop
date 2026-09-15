@@ -2186,6 +2186,13 @@ def _reconcile_prepared_planning_handoff(
     handoff = resume.get("planning_shortening")
     if not isinstance(handoff, dict) or handoff.get("publication_state") != "ready":
         return False
+    if handoff.get("attempt_state") not in {"attempted", "unrecoverable"}:
+        print(
+            "skill_runner: prepared shortening publication has an invalid attempt "
+            "state; refusing to reconcile it as a fresh planning turn.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     raw_paths = handoff.get("prepared_carrier_files")
     if (
         not isinstance(raw_paths, list)
@@ -2274,12 +2281,16 @@ def _publish_prepared_plan_transport(
     dry_run: bool,
     artifact_key: str,
     clear_shortening: bool = False,
+    prepared_paths: Sequence[Path] | None = None,
 ) -> None:
     """Persist and publish every prepared sidecar and its final anchor."""
-    paths = _write_prepared_plan_transport_artifacts(
-        prepared=prepared,
-        artifact_key=artifact_key,
-    )
+    if prepared_paths is None:
+        paths = _write_prepared_plan_transport_artifacts(
+            prepared=prepared,
+            artifact_key=artifact_key,
+        )
+    else:
+        paths = list(prepared_paths)
     if dry_run:
         print(f"[dry-run] would post {len(paths)} prepared planning carrier(s)")
         return
@@ -3098,6 +3109,7 @@ def _complete_coder_turn(
     architecture_identity: dict | None = None,
     architecture_contract_version: int | None = None,
     shortening_attempted: bool = False,
+    shortening_handoff: Mapping[str, object] | None = None,
     external_args: Sequence[str] = (),
 ) -> dict:
     """Validate, render, canonicalize, attach (role coder), and post a coder plan.
@@ -3492,6 +3504,7 @@ def _complete_coder_turn(
             architecture_identity=architecture_identity,
             architecture_contract_version=architecture_contract_version,
             shortening_attempted=True,
+            shortening_handoff=handoff,
             external_args=external_args,
         )
         result["producer_usage"] = producer_usage
@@ -3508,6 +3521,33 @@ def _complete_coder_turn(
                 "skill_runner: final planning carrier preflight failed: "
                 f"{planning_preflight.diagnostic or planning_preflight.status}"
             )
+        prepared_paths: list[Path] | None = None
+        if shortening_attempted and isinstance(shortening_handoff, Mapping):
+            # Persist the exact carrier set before writing pending state or
+            # posting. A crash in either publication seam can then reconcile
+            # these bodies by digest without re-rendering or invoking a
+            # competing shortener/planner turn.
+            prepared_paths = _write_prepared_plan_transport_artifacts(
+                prepared=planning_preflight.prepared,
+                artifact_key=f"{issue}-r{new_round_number}-{coder}-plan",
+            )
+            shortening_handoff = {
+                **shortening_handoff,
+                "attempt_state": "attempted",
+                "prepared_carrier_files": [str(path) for path in prepared_paths],
+                "prepared_carrier_digests": [
+                    hashlib.sha256(str(body).encode("utf-8")).hexdigest()
+                    for body in planning_preflight.prepared
+                ],
+                "sidecar_completeness": "prepared",
+                "publication_state": "ready",
+                "failure": "prepared carrier publication pending",
+            }
+            _run_helper(
+                "helpers.state_manager", "write-session",
+                "--issue", str(issue), "--repo", repo,
+                "--fields", json.dumps({"planning_shortening": shortening_handoff}),
+            )
         _publish_prepared_plan_transport(
             issue=issue,
             repo=repo,
@@ -3515,6 +3555,7 @@ def _complete_coder_turn(
             dry_run=False,
             artifact_key=f"{issue}-r{new_round_number}-{coder}-plan",
             clear_shortening=shortening_attempted,
+            prepared_paths=prepared_paths,
         )
     else:
         print(f"[dry-run] would post {coder_cap} plan for {repo}#{issue} (round {new_round_number})")
@@ -3768,6 +3809,7 @@ def _run_external_coder_phase(
                         ),
                         architecture_contract_version=1,
                         shortening_attempted=True,
+                        shortening_handoff=planning_handoff,
                         external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
                     )
                 except _ValidationError as exc:
@@ -4621,6 +4663,7 @@ def _run_host_coder_phase(
                         )
                     sys.exit(2)
                 artifact_key = f"{issue}-r{new_round_number}-claude-plan"
+                prepared_paths: list[Path] | None = None
                 if isinstance(planning_handoff, dict):
                     # Record the complete local carrier set before any remote
                     # write. If the process dies in the publication seam, the
@@ -4629,6 +4672,7 @@ def _run_host_coder_phase(
                         prepared=planning_preflight.prepared,
                         artifact_key=artifact_key,
                     )
+                    prepared_paths = carrier_paths
                     planning_handoff = {
                         **planning_handoff,
                         "attempt_state": "attempted",
@@ -4657,6 +4701,7 @@ def _run_host_coder_phase(
                     dry_run=False,
                     artifact_key=artifact_key,
                     clear_shortening=isinstance(planning_handoff, dict),
+                    prepared_paths=prepared_paths,
                 )
         else:
             print(f"[dry-run] would post plan for {repo}#{issue} (round {new_round_number})")

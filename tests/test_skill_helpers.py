@@ -852,6 +852,61 @@ class TestStateManager:
         )
         assert "pending_comment_bodies" not in json.loads(result.stdout)
 
+    def test_host_publication_posts_the_prepared_transport_carriers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A projected carrier, not the pre-projection anchor, is published."""
+        from helpers import skill_runner
+        from coding_review_agent_loop.round_transport import (
+            PlanningPreflightOutcome,
+        )
+        from coding_review_agent_loop.protocol_markers import TrustedBody
+
+        plan_file = tmp_path / "plan.json"
+        plan_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        prepared = (
+            TrustedBody.current_untrusted_visible("exact sidecar"),
+            TrustedBody.current_untrusted_visible("exact anchor"),
+        )
+        posted: list[str] = []
+
+        def fake_run_helper(*args, **_kwargs):
+            if args[:2] == ("helpers.state_manager", "attach-metadata"):
+                output_file = Path(args[args.index("--output") + 1])
+                output_file.write_text("unprepared anchor", encoding="utf-8")
+            elif args[:2] == ("helpers.gh_ops", "post-issue-comment"):
+                path = Path(args[args.index("--file") + 1])
+                posted.append(path.read_text(encoding="utf-8"))
+
+        monkeypatch.setattr(skill_runner, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(
+            skill_runner,
+            "_run_helper_capture",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        )
+        monkeypatch.setattr(
+            skill_runner,
+            "preflight_planning_publication",
+            lambda *_args, **_kwargs: PlanningPreflightOutcome(
+                status="fits",
+                response_ceiling_chars=46_000,
+                original_response_chars=10,
+                prepared=prepared,
+            ),
+        )
+
+        result = skill_runner._run_host_coder_phase(
+            types.SimpleNamespace(issue=9993, repo="OWNER/REPO"),
+            plan_file,
+            {},
+            False,
+        )
+
+        assert result["is_new_round"] is True
+        assert posted == [str(body) for body in prepared]
+
     def test_attach_metadata_produces_valid_agent_loop_meta(self) -> None:
         """attach-metadata must embed AGENT_LOOP_META that _resume_plan_round recognizes."""
         plan_body = _VALID_PLAN_STATE
