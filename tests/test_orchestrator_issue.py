@@ -4605,6 +4605,9 @@ def test_invalid_post_pr_report_then_issue_resume_runs_real_activation_without_r
             "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n"
             "-- OpenAI Codex"
         ],
+        claude_outputs=[
+            structured_pr_review(state="approved", summary="Reviewed the durable recovery head.")
+        ],
     )
     config = make_config(
         tmp_path, coder="codex", reviewer="claude", managed_ci=True,
@@ -4642,9 +4645,9 @@ def test_invalid_post_pr_report_then_issue_resume_runs_real_activation_without_r
         "Implement issue.\n\nAgent-Issue-Provenance: v1 "
         "repo=owner/repo issue=56 flow=direct"
     )
-    _stop_issue_resume_after_real_activation(monkeypatch)
+    _stop_issue_resume_after_reviewer(monkeypatch)
     recovery_start = len(runner.commands)
-    with pytest.raises(_RealManagedActivationReached):
+    with pytest.raises(_RealManagedReviewReached):
         run_issue_loop(runner, issue_number=56, config=config)
 
     recovery_commands = runner.commands[recovery_start:]
@@ -4658,11 +4661,14 @@ def test_invalid_post_pr_report_then_issue_resume_runs_real_activation_without_r
     ) == coder_calls
     assert runner.labels_posted is False
     assert runner.dispatch_count == 0
+    reviewer_command = next(command for command, _cwd in runner.commands if command[:1] == ["claude"])
+    assert "abc123" in " ".join(reviewer_command)
+    assert any("Reviewed the durable recovery head." in comment for comment in runner.comments)
     assert not any(
         marker in comment
         for comment in runner.comments
         for marker in (
-            "AGENT_ISSUE_PR_HANDOFF", "AGENT_STATE: approved",
+            "AGENT_ISSUE_PR_HANDOFF",
             "AGENT_TEST_OBSERVATION", "AGENT_MANAGED_CI_READINESS",
         )
     )
