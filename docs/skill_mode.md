@@ -443,10 +443,23 @@ Fields written by `state_manager write-session`:
 | `session_id` | Current skill session UUID prefix |
 | `round_number` | Current plan/PR round number |
 | `pending_comment_body` | Path to a comment body not yet posted |
+| `pending_comment_bodies` | Complete ordered set of prepared sidecar/anchor carriers not yet reconciled |
+| `planning_shortening` | Digest-bound planning candidate and at-most-once shortening/handoff state |
 
-The `pending_comment_body` field provides crash recovery: if the session ends
-after writing the comment file but before posting it, the next `build-resume`
-call includes the path so Claude can re-post it.
+The pending comment fields provide crash recovery: if the session ends after
+writing one or more prepared carrier files but before all are posted, the next
+`build-resume` call includes the complete ordered set so the skill can compare
+each carrier with existing comments and post only missing units. Missing files,
+conflicting digests, or partial transport state fail closed; reconciliation is
+idempotent. The singular `pending_comment_body` remains a compatibility read
+path for older sessions.
+
+When a planning candidate needs shortening, `planning_shortening` is written
+before the fresh external turn or host handoff. It retains the original
+response and digest, expected response kind, target, failure, and sidecar
+completeness. A consumed attempt blocks competing planner/shortener turns;
+successful reconciliation clears the record only after the complete prepared
+carrier set is posted.
 
 ## Resume from existing round
 

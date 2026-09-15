@@ -90,6 +90,9 @@ attempt flag. Partial sidecars or anchors fail closed. In host-as-coder mode,
 digest-bound `--shortened-plan-file` re-entry; restart cannot reset the attempt
 or invoke a competing planner. Historical unversioned rounds remain
 legacy-undecided rather than being upgraded by inference.
+Prepared transport is persisted as one ordered sidecar/anchor carrier set;
+resume verifies every file and reconciles already-posted units idempotently
+before clearing the pending record.
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 

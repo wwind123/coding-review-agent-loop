@@ -111,6 +111,19 @@ def test_all_plan_entry_prompts_explain_response_guidance_and_shortening_contrac
     assert "Do not paraphrase" in shortening
 
 
+def test_compact_plan_revision_uses_flush_left_signature(tmp_path):
+    prompt = build_plan_revision_prompt(
+        814,
+        2,
+        "Previous plan",
+        "Blocking review",
+        make_config(tmp_path),
+        compact_context=True,
+    )
+    assert "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- " in prompt
+    assert "\n<!-- AGENT_PLAN_STATE: blocking -->\n    -- " not in prompt
+
+
 def test_legacy_plan_revision_prompt_does_not_invent_matrix_generation(tmp_path):
     config = make_config(tmp_path)
 

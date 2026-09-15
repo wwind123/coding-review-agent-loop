@@ -27,8 +27,20 @@ from coding_review_agent_loop.orchestrator import (
     _log_typed_plan_stage_dispositions,
     _plan_subject,
 )
-from coding_review_agent_loop.comment_rendering import render_typed_plan_stages_section
-from coding_review_agent_loop.protocol import DeferredStage, TypedPlanStages
+from coding_review_agent_loop.comment_rendering import (
+    render_risk_test_matrix_section,
+    render_typed_plan_stages_section,
+)
+from coding_review_agent_loop.protocol import (
+    DeferredStage,
+    TypedPlanStages,
+    parse_risk_test_matrix,
+    risk_test_matrix_identity,
+)
+from coding_review_agent_loop.round_state import (
+    make_approved_plan_context,
+    scope_approved_plan_matrix,
+)
 from coding_review_agent_loop.split_materialization import (
     MaterializedSplitChild,
     SplitMaterializationMetadata,
@@ -74,6 +86,43 @@ def test_unversioned_plan_keeps_legacy_typed_split_input():
     assert [(stage.title, stage.summary) for stage in stages] == [
         ("Legacy split", "Explicit legacy path.")
     ]
+
+
+def test_split_consumer_scopes_exact_hydrated_matrix_sidecar_identity():
+    matrix = parse_risk_test_matrix({
+        "applicability": "applicable",
+        "rows": [{
+            "row_id": "row-stage",
+            "label": "Stage remains bound to the reviewed plan",
+            "entry_path_or_mode": "staged decomposition",
+            "initial_state": "approved plan is hydrated",
+            "event": "split consumer loads the plan",
+            "expected_outcome": "the exact stage row remains enforceable",
+            "forbidden_side_effects": ["Do not infer a different stage."],
+            "proposed_test_level": "integration",
+            "proposed_test_location": "tests/test_split_orchestration.py",
+            "applicability": "applicable",
+            "related_scope_item_ids": ["scope-stage"],
+            "execution_owner": "stage-1",
+        }],
+        "important_exclusions": ["No inferred topology."],
+    })
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        "Approved staged plan\n\n" + render_risk_test_matrix_section(matrix),
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    scoped = scope_approved_plan_matrix(
+        context, execution_owner="stage-1", valid_stage_ids=("stage-1",)
+    )
+
+    assert scoped.risk_test_matrix_identity == identity
+    assert scoped.risk_test_matrix_payload == matrix.to_payload()
+    assert scoped.risk_test_matrix_expected_row_ids == ("row-stage",)
 
 
 def _fresh_v1_plan_for_isolation(strategy: str) -> str:

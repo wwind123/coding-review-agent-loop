@@ -210,6 +210,28 @@ def test_shortening_preserves_ordered_obligation_clauses_and_all_structured_fiel
     assert len(shortened) < len(raw)
 
 
+def test_shortening_accepts_verbatim_clause_with_mid_clause_filler() -> None:
+    source_payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    source_payload["summary"] = (
+        "Please implement file action /src/example.py and run the focused test."
+    )
+    source_payload["plan_steps"] = [
+        "Please use a bounded loop in order to avoid overflow, then run the focused test.",
+        "Please keep the caveat exactly.",
+    ]
+    candidate_payload = deepcopy(source_payload)
+    candidate_payload["summary"] = "implement file action /src/example.py and run the focused test."
+    candidate_payload["plan_steps"] = [
+        "use a bounded loop in order to avoid overflow, run the focused test.",
+        "keep the caveat exactly.",
+    ]
+    source = json.dumps(source_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder"
+    verbatim = json.dumps(candidate_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder"
+    # The candidate keeps the otherwise removable filler verbatim. Matching
+    # must normalize both source and candidate, not require a broken literal.
+    validate_shortened_plan_response(source, verbatim)
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [

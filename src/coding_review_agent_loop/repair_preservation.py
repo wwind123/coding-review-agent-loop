@@ -600,6 +600,13 @@ def _shortening_clauses(value: object) -> tuple[str, ...]:
     return tuple(clauses)
 
 
+def _shortening_match_text(value: object) -> str:
+    """Normalize a prose field using the same removable fillers on both sides."""
+    if not isinstance(value, str):
+        return ""
+    return _normalized(_SHORTENING_FILLER_RE.sub("", value))
+
+
 def _require_ordered_clauses(
     source: object,
     candidate: object,
@@ -610,20 +617,24 @@ def _require_ordered_clauses(
         raise AgentLoopError(
             f"Shortening content preservation failed for {field}: expected string fields."
         )
-    candidate_normalized = _normalized(candidate)
+    # Fillers are removed symmetrically.  This permits either a shortened
+    # clause or the verbatim clause requested by the prompt (for example,
+    # ``in order to`` in the middle of a clause) without weakening ordered
+    # literal matching.
+    candidate_normalized = _shortening_match_text(candidate)
     cursor = 0
     seen: set[str] = set()
     for clause in _shortening_clauses(source):
         if clause in seen:
             continue
         seen.add(clause)
-        position = candidate_normalized.find(clause, cursor)
+        position = candidate_normalized.find(_shortening_match_text(clause), cursor)
         if position < 0:
             raise AgentLoopError(
                 f"Shortening content preservation failed for {field}: preserve the "
                 f"ordered obligation clause `{clause}`."
             )
-        cursor = position + len(clause)
+        cursor = position + len(_shortening_match_text(clause))
 
 
 def validate_shortened_plan_response(

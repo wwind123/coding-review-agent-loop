@@ -85,6 +85,39 @@ def test_planning_policy_uses_unicode_guidance_separate_from_actual_fit() -> Non
     assert oversized.original_response_chars == 60_001
 
 
+def test_planning_preflight_enforces_explicit_model_guidance_in_unicode_chars() -> None:
+    policy = transport.PlanningPublicationPolicy(
+        hard_limit_chars=100,
+        measured_renderer_expansion_chars=10,
+        required_visible_section_chars=5,
+        attached_metadata_chars=7,
+        reference_chars=3,
+        safety_reserve_chars=2,
+    )
+    assert transport.preflight_planning_publication(
+        "✓" * 73, policy=policy, response_chars=73
+    ).status == "fits"
+    over = transport.preflight_planning_publication(
+        "✓", policy=policy, response_chars=74
+    )
+    assert over.status == "shortening-required"
+    assert over.original_response_chars == 74
+    # A rendered carrier supplied without a raw response count is transport
+    # validation only; projection can make it fit without invoking shortening.
+    assert transport.preflight_planning_publication("✓" * 100, policy=policy).status == "fits"
+
+
+def test_planning_preflight_does_not_classify_unrelated_transport_errors_by_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(_body: object) -> tuple[TrustedBody, ...]:
+        raise AgentLoopError("shorten this marker provenance record")
+
+    monkeypatch.setattr(transport, "prepare_round_comment", fail)
+    outcome = transport.preflight_planning_publication("candidate")
+    assert outcome.status == "unrecoverable"
+
+
 def test_oversized_matrix_is_projected_losslessly_before_shortening() -> None:
     matrix = parse_risk_test_matrix(_large_matrix_payload())
     identity = risk_test_matrix_identity(matrix)

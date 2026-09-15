@@ -2861,7 +2861,7 @@ your signature before the AGENT_PLAN_STATE footer. Your response must end with,
 in this exact order:
 
 <!-- AGENT_PLAN_STATE: blocking -->
-    -- {coder_signature}
+-- {coder_signature}
 """
 
 

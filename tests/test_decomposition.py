@@ -32,9 +32,15 @@ from coding_review_agent_loop.decomposition import (
     normalize_execution_recommendation,
     find_existing_execution_decision,
 )
-from coding_review_agent_loop.protocol import ExecutionChildStage, validate_structured_plan_state
+from coding_review_agent_loop.protocol import (
+    ExecutionChildStage,
+    risk_test_matrix_identity,
+    validate_structured_plan_state,
+)
+from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
 from coding_review_agent_loop.github import IssueComment, IssueContext
 from coding_review_agent_loop.child_topology import NeedsHumanDecision
+from coding_review_agent_loop.round_state import make_approved_plan_context
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
     _attach_round_metadata,
@@ -170,6 +176,27 @@ def test_fresh_recommendation_normalizer_preserves_reviewed_allocation_and_ident
     assert retained.status == "none"
     assert retained.deliverables == ()
     assert retained.covered_scope_item_ids == ()
+
+
+def test_decomposition_consumes_the_hydrated_matrix_and_plan_identity():
+    parsed = validate_structured_plan_state(
+        structured_v1_plan_state(), require_execution_strategy_contract=1,
+        require_risk_test_matrix_contract=1,
+    )
+    canonical = render_canonical_plan_state(parsed)
+    context = make_approved_plan_context(canonical)
+    decomposition, retained = normalize_execution_recommendation(
+        parsed.execution_recommendation,
+        approved_plan=context.canonical_text or "",
+        plan_subject=context.plan_subject or "",
+    )
+
+    assert context.matrix_available
+    assert context.risk_test_matrix_identity == risk_test_matrix_identity(
+        parsed.risk_test_matrix, parsed.risk_test_matrix_changes
+    )
+    assert retained.plan_hash == approved_plan_hash(context.canonical_text or "")
+    assert decomposition.topology_source == "approved-plan-v1"
 
 
 def test_legacy_phase_identity_digest_remains_byte_stable():

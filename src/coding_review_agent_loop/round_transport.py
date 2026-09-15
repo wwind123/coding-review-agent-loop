@@ -71,6 +71,10 @@ DEFAULT_REFERENCE_CHARS = 1_000
 DEFAULT_SAFETY_RESERVE_CHARS = 2_000
 
 
+class PlanningCarrierOverflowError(AgentLoopError):
+    """A planning carrier is too large, but may fit after prose shortening."""
+
+
 @dataclass(frozen=True)
 class PlanningPublicationPolicy:
     """The planning response guidance and actual carrier hard limit.
@@ -175,23 +179,33 @@ def preflight_planning_publication(
     body: str | TrustedBody,
     *,
     policy: PlanningPublicationPolicy = DEFAULT_PLANNING_PUBLICATION_POLICY,
+    response_chars: int | None = None,
 ) -> PlanningPreflightOutcome:
-    """Prepare a plan carrier without advancing state or posting a comment."""
-    original_chars = len(str(body))
+    """Prepare a plan carrier without advancing state or posting a comment.
+
+    ``response_chars`` is the Unicode-character count of the model-controlled
+    structured response.  It is intentionally separate from the carrier count:
+    a carrier can fit the GitHub limit while still exceeding the conservative
+    model guidance and therefore requiring the one shortening turn.
+    """
+    original_chars = len(str(body)) if response_chars is None else response_chars
+    if isinstance(original_chars, bool) or not isinstance(original_chars, int) or original_chars < 0:
+        raise ValueError("response_chars must be a non-negative integer")
     try:
         prepared = prepare_round_comment(body)
-    except AgentLoopError as exc:
-        diagnostic = str(exc)
-        status: Literal["shortening-required", "unrecoverable"] = (
-            "shortening-required"
-            if "shorten" in diagnostic.lower() or "oversized" in diagnostic.lower()
-            else "unrecoverable"
-        )
+    except PlanningCarrierOverflowError as exc:
         return PlanningPreflightOutcome(
-            status=status,
+            status="shortening-required",
             response_ceiling_chars=policy.response_ceiling_chars,
             original_response_chars=original_chars,
-            diagnostic=diagnostic,
+            diagnostic=str(exc),
+        )
+    except AgentLoopError as exc:
+        return PlanningPreflightOutcome(
+            status="unrecoverable",
+            response_ceiling_chars=policy.response_ceiling_chars,
+            original_response_chars=original_chars,
+            diagnostic=str(exc),
         )
     if any(len(part) > policy.hard_limit_chars for part in prepared):
         return PlanningPreflightOutcome(
@@ -200,6 +214,18 @@ def preflight_planning_publication(
             original_response_chars=original_chars,
             prepared=prepared,
             diagnostic="Prepared planning carrier exceeds the hard character ceiling.",
+        )
+    if response_chars is not None and original_chars > policy.response_ceiling_chars:
+        return PlanningPreflightOutcome(
+            status="shortening-required",
+            response_ceiling_chars=policy.response_ceiling_chars,
+            original_response_chars=original_chars,
+            prepared=prepared,
+            diagnostic=(
+                "The model-controlled planning response exceeds the conservative "
+                f"Unicode-character guidance ({original_chars:,} > "
+                f"{policy.response_ceiling_chars:,}); shorten it once before publication."
+            ),
         )
     return PlanningPreflightOutcome(
         status="fits",
@@ -710,13 +736,13 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             )
     matches = list(ROUND_RESUME_MARKER_RE.finditer(body_text))
     if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches and not sidecars:
-        raise AgentLoopError(
+        raise PlanningCarrierOverflowError(
             f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response."
         )
     if not matches:
         if sidecars:
             if len(body_text) > MAX_GITHUB_BODY_CHARS:
-                raise AgentLoopError(
+                raise PlanningCarrierOverflowError(
                     f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters after execution sidecar spill."
                 )
             return (*sidecars, trusted_anchor)
@@ -781,7 +807,7 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
 
     anchor = render_anchor(payload)
     if len(anchor) > MAX_GITHUB_BODY_CHARS:
-        raise AgentLoopError(
+        raise PlanningCarrierOverflowError(
             f"Round comment exceeds {MAX_GITHUB_BODY_CHARS} characters even after metadata spill; "
             "shorten the visible response or metadata."
         )

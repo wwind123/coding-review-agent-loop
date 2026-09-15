@@ -200,8 +200,10 @@ from coding_review_agent_loop.repair import (
 )
 from coding_review_agent_loop.repair_preservation import validate_shortened_plan_response
 from coding_review_agent_loop.round_transport import (
+    MAX_GITHUB_BODY_CHARS,
     preflight_planning_publication,
 )
+from coding_review_agent_loop.protocol_markers import TrustedBody, scan_reserved_markers
 from helpers.validate_response import _deserialize_human_requirements, validate_response_text
 
 # ---------------------------------------------------------------------------
@@ -210,6 +212,18 @@ from helpers.validate_response import _deserialize_human_requirements, validate_
 
 _HELPERS = Path(__file__).parent
 _REPAIR_BASE = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repair"
+
+
+def _shortening_artifact_paths(*, coder: str, issue: int, round_number: int) -> dict[str, Path]:
+    """Return stable paths for the single external plan-shortening attempt."""
+    repair_dir = _REPAIR_BASE / f"{issue}-r{round_number}-{coder}-coder"
+    return {
+        "repair_dir": repair_dir,
+        "prompt": repair_dir / "plan-shortening-prompt.md",
+        "output": repair_dir / "plan-shortening-raw.md",
+        "usage": repair_dir / "plan-shortening-usage.json",
+        "evidence": repair_dir / "plan-shortening-response-evidence.json",
+    }
 
 
 class _ValidationError(Exception):
@@ -2029,37 +2043,119 @@ def _reconcile_pending_comment(
     repo: str,
     dry_run: bool,
 ) -> None:
-    body = resume.get("pending_comment_body")
-    if not body:
+    raw_bodies = resume.get("pending_comment_bodies")
+    if isinstance(raw_bodies, list):
+        if not raw_bodies or any(
+            not isinstance(body, str) or not body for body in raw_bodies
+        ):
+            print(
+                "skill_runner: pending planning publication has an invalid carrier set; "
+                "restore the recorded state before resuming.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        body_paths = [Path(str(body)) for body in raw_bodies]
+    else:
+        body = resume.get("pending_comment_body")
+        body_paths = [Path(str(body))] if body else []
+    if not body_paths:
         return
-    body_path = Path(str(body))
-    if not body_path.exists():
-        # Stale reference; clear it
-        _run_helper(
-            "helpers.state_manager", "clear-pending-comment",
-            "--issue", str(issue), "--repo", repo,
+    if any(not path.exists() for path in body_paths):
+        # A missing member of a multi-comment publication is incomplete state,
+        # not stale state. Keep it so resume fails closed.
+        print(
+            "skill_runner: pending planning publication is incomplete; restore all "
+            "recorded carrier files before resuming.",
+            file=sys.stderr,
         )
-        return
-    body_text = body_path.read_text(encoding="utf-8")
-    # Check if already posted by comparing against raw GitHub comment bodies.
-    # Both body_text and the posted comment contain the full AGENT_LOOP_META block,
-    # so a direct (stripped) comparison is sufficient and avoids any parsing dependency.
-    existing_bodies = _fetch_issue_comments_raw(repo, issue)
-    already_posted = body_text.strip() in {b.strip() for b in existing_bodies}
-    if already_posted:
-        _run_helper(
-            "helpers.state_manager", "clear-pending-comment",
-            "--issue", str(issue), "--repo", repo,
+        sys.exit(1)
+    body_texts = [path.read_text(encoding="utf-8") for path in body_paths]
+    try:
+        for body_text in body_texts:
+            if len(body_text) > MAX_GITHUB_BODY_CHARS:
+                raise AgentLoopError(
+                    "pending planning carrier exceeds the hard character ceiling"
+                )
+            TrustedBody.canonical(
+                body_text,
+                expected_tokens=tuple(
+                    occurrence.definition.token
+                    for occurrence in scan_reserved_markers(body_text)
+                ),
+            )
+    except (AgentLoopError, TypeError, ValueError) as exc:
+        print(
+            "skill_runner: pending planning publication contains an invalid or "
+            f"oversized carrier: {exc}",
+            file=sys.stderr,
         )
+        sys.exit(1)
+    existing = {body.strip() for body in _fetch_issue_comments_raw(repo, issue)}
+    if dry_run:
+        print(f"[dry-run] would post {len(body_paths)} pending comment carrier(s)")
         return
-    # Not posted yet; post it now
-    if not dry_run:
+    for body_path, body_text in zip(body_paths, body_texts, strict=True):
+        if body_text.strip() in existing:
+            continue
         _run_helper(
             "helpers.gh_ops", "post-issue-comment",
             "--issue", str(issue), "--file", str(body_path), "--repo", repo,
         )
-    else:
-        print(f"[dry-run] would post pending comment from {body_path}")
+        existing.add(body_text.strip())
+    handoff = resume.get("planning_shortening")
+    if isinstance(handoff, dict) and handoff.get("attempt_state") in {
+        "attempted", "unrecoverable",
+    }:
+        _run_helper(
+            "helpers.state_manager", "write-session",
+            "--issue", str(issue), "--repo", repo,
+            "--fields", json.dumps({"planning_shortening": None}),
+        )
+    _run_helper(
+        "helpers.state_manager", "clear-pending-comment",
+        "--issue", str(issue), "--repo", repo,
+    )
+
+
+def _publish_prepared_plan_transport(
+    *,
+    issue: int,
+    repo: str,
+    prepared: Sequence[object],
+    dry_run: bool,
+    artifact_key: str,
+    clear_shortening: bool = False,
+) -> None:
+    """Persist and publish every prepared sidecar and its final anchor."""
+    transport_dir = _REPAIR_BASE / artifact_key
+    transport_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for index, body in enumerate(prepared):
+        path = transport_dir / f"carrier-{index}.md"
+        _write_text(path, str(body))
+        paths.append(path)
+    if dry_run:
+        print(f"[dry-run] would post {len(paths)} prepared planning carrier(s)")
+        return
+    _run_helper(
+        "helpers.state_manager", "write-pending-comments",
+        "--issue", str(issue), "--repo", repo,
+        "--bodies", json.dumps([str(path) for path in paths]),
+    )
+    for path in paths:
+        _run_helper(
+            "helpers.gh_ops", "post-issue-comment",
+            "--issue", str(issue), "--file", str(path), "--repo", repo,
+        )
+    if clear_shortening:
+        # Clear the attempt before the pending carrier record. If the process
+        # dies between these writes, resume still sees the complete carrier set
+        # and can reconcile it idempotently.
+        _run_helper(
+            "helpers.state_manager", "write-session",
+            "--issue", str(issue), "--repo", repo,
+            "--fields", json.dumps({"planning_shortening": None}),
+        )
     _run_helper(
         "helpers.state_manager", "clear-pending-comment",
         "--issue", str(issue), "--repo", repo,
@@ -3092,7 +3188,8 @@ def _complete_coder_turn(
     )
 
     planning_preflight = preflight_planning_publication(
-        tagged.read_text(encoding="utf-8")
+        tagged.read_text(encoding="utf-8"),
+        response_chars=len(raw_text),
     )
     if planning_preflight.status != "fits":
         if shortening_attempted:
@@ -3100,13 +3197,46 @@ def _complete_coder_turn(
                 "skill_runner: the single plan-shortening attempt did not produce a "
                 f"postable carrier: {planning_preflight.diagnostic or planning_preflight.status}"
             )
+        shortening_paths = _shortening_artifact_paths(
+            coder=coder, issue=issue, round_number=new_round_number
+        )
+        handoff = {
+            "attempt_state": "attempted",
+            "response_kind": kind,
+            "expected_kind": kind,
+            "original_response": raw_text,
+            "original_digest": hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+            "canonical_plan": canonical_text,
+            "response_ceiling_chars": planning_preflight.response_ceiling_chars,
+            "failure": planning_preflight.diagnostic or planning_preflight.status,
+            "sidecar_completeness": (
+                "prepared" if planning_preflight.prepared else "not-prepared"
+            ),
+            "shortening_prompt_file": str(shortening_paths["prompt"]),
+            "shortening_output_file": str(shortening_paths["output"]),
+            "shortening_usage_file": str(shortening_paths["usage"]),
+            "shortening_evidence_file": str(shortening_paths["evidence"]),
+        }
         if planning_preflight.status == "unrecoverable":
+            if not dry_run:
+                _run_helper(
+                    "helpers.state_manager", "write-session",
+                    "--issue", str(issue), "--repo", repo,
+                    "--fields", json.dumps({"planning_shortening": handoff}),
+                )
             raise _ValidationError(
                 "skill_runner: valid plan retained in the coder repair artifact, but "
                 f"its prepared carrier is unrecoverable: {planning_preflight.diagnostic}"
             )
 
-        from coding_review_agent_loop.repair_preservation import validate_shortened_plan_response
+        # Consume the sole shortening allowance durably before invoking the
+        # fresh coder. A restart must never create a competing attempt.
+        if not dry_run:
+            _run_helper(
+                "helpers.state_manager", "write-session",
+                "--issue", str(issue), "--repo", repo,
+                "--fields", json.dumps({"planning_shortening": handoff}),
+            )
         # This invocation is intentionally fresh and separately recorded. The
         # producer response is retained in the repair directory and is the
         # preservation source for the one allowed shortening turn.
@@ -3122,10 +3252,10 @@ def _complete_coder_turn(
             target_chars=planning_preflight.response_ceiling_chars,
             prior_items_raw=next_prior_items_raw,
         )
-        shortening_prompt_file = work_dir / "plan-shortening-prompt.md"
-        shortening_output_file = work_dir / "plan-shortening-raw.md"
-        shortening_usage_file = work_dir / "plan-shortening-usage.json"
-        shortening_evidence_file = work_dir / "plan-shortening-response-evidence.json"
+        shortening_prompt_file = shortening_paths["prompt"]
+        shortening_output_file = shortening_paths["output"]
+        shortening_usage_file = shortening_paths["usage"]
+        shortening_evidence_file = shortening_paths["evidence"]
         _write_text(shortening_prompt_file, shortening_prompt)
         _run_helper(
             "helpers.run_external",
@@ -3140,6 +3270,7 @@ def _complete_coder_turn(
             "--response-evidence-output", str(shortening_evidence_file),
             *( ["--cmd", gemini_cmd] if coder == "gemini" else [] ),
             *external_args,
+            *( ["--dry-run"] if dry_run else [] ),
         )
         shortened_text = shortening_output_file.read_text(encoding="utf-8")
         try:
@@ -3153,7 +3284,10 @@ def _complete_coder_turn(
             )
         except AgentLoopError as exc:
             raise _ValidationError(f"skill_runner: shortened plan rejected: {exc}") from exc
-        raw_output.write_text(shortened_text, encoding="utf-8")
+        # Keep the producer response in repair_dir/raw.md. The shortening
+        # candidate is a separate durable artifact so restart can complete
+        # validation/publication without starting another provider turn.
+        _write_text(shortening_output_file, shortened_text)
         producer_usage = None
         if usage_file.exists():
             try:
@@ -3163,7 +3297,8 @@ def _complete_coder_turn(
         result = _complete_coder_turn(
             coder=coder, coder_cap=coder_cap, issue=issue, repo=repo,
             new_round_number=new_round_number, next_prior_items_raw=next_prior_items_raw,
-            kind=kind, dry_run=dry_run, raw_output=raw_output, work_dir=work_dir,
+            kind=kind, dry_run=dry_run, raw_output=shortening_output_file,
+            work_dir=work_dir,
             usage_file=shortening_usage_file, auto_recover=False,
             response_evidence=None, gemini_cmd=gemini_cmd,
             surfaced_requirement_ids=surfaced_requirement_ids,
@@ -3186,17 +3321,21 @@ def _complete_coder_turn(
         return result
 
     if not dry_run:
-        _run_helper(
-            "helpers.state_manager", "write-pending-comment",
-            "--issue", str(issue), "--repo", repo, "--body", str(tagged),
+        planning_preflight = preflight_planning_publication(
+            tagged.read_text(encoding="utf-8"), response_chars=len(raw_text)
         )
-        _run_helper(
-            "helpers.gh_ops", "post-issue-comment",
-            "--issue", str(issue), "--file", str(tagged), "--repo", repo,
-        )
-        _run_helper(
-            "helpers.state_manager", "clear-pending-comment",
-            "--issue", str(issue), "--repo", repo,
+        if planning_preflight.status != "fits":
+            raise _ValidationError(
+                "skill_runner: final planning carrier preflight failed: "
+                f"{planning_preflight.diagnostic or planning_preflight.status}"
+            )
+        _publish_prepared_plan_transport(
+            issue=issue,
+            repo=repo,
+            prepared=planning_preflight.prepared,
+            dry_run=False,
+            artifact_key=f"{issue}-r{new_round_number}-{coder}-plan",
+            clear_shortening=shortening_attempted,
         )
     else:
         print(f"[dry-run] would post {coder_cap} plan for {repo}#{issue} (round {new_round_number})")
@@ -3229,6 +3368,8 @@ def _run_external_coder_phase(
     gemini_cmd = getattr(args, "gemini_cmd", "gemini")
     phase_info = _external_coder_phase(resume, reviewers)
     phase = phase_info["phase"]
+
+    planning_handoff = resume.get("planning_shortening")
 
     if phase == "approved":
         completed_data = list(resume.get("completed_reviewer_data", []))
@@ -3353,6 +3494,88 @@ def _run_external_coder_phase(
 
     with tempfile.TemporaryDirectory() as tmpstr:
         tmpdir = Path(tmpstr)
+
+        # A crash after the durable attempt transition must resume the
+        # already-produced shortening artifact before considering a planner.
+        # If the provider produced no durable output, fail closed: retrying the
+        # provider would be a second shortening attempt with unknown outcome.
+        if phase != "approved" and isinstance(planning_handoff, dict):
+            attempt_state = planning_handoff.get("attempt_state")
+            if attempt_state in {"attempted", "unrecoverable"}:
+                output_value = planning_handoff.get("shortening_output_file")
+                usage_value = planning_handoff.get("shortening_usage_file")
+                evidence_value = planning_handoff.get("shortening_evidence_file")
+                output_path = Path(output_value) if isinstance(output_value, str) else None
+                usage_path = Path(usage_value) if isinstance(usage_value, str) else None
+                evidence_path = Path(evidence_value) if isinstance(evidence_value, str) else None
+                if (
+                    attempt_state != "attempted"
+                    or output_path is None
+                    or not output_path.exists()
+                ):
+                    print(
+                        "skill_runner: a plan-shortening attempt is already recorded, "
+                        "but no complete shortening artifact is available; repair the "
+                        "persisted recovery artifact instead of starting another planner "
+                        "or shortener turn.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                try:
+                    recovery_evidence = (
+                        json.loads(evidence_path.read_text(encoding="utf-8"))
+                        if evidence_path is not None and evidence_path.exists()
+                        else None
+                    )
+                except (OSError, json.JSONDecodeError):
+                    recovery_evidence = None
+                try:
+                    completed = _complete_coder_turn(
+                        coder=coder, coder_cap=coder_cap, issue=issue, repo=repo,
+                        new_round_number=new_round_number,
+                        next_prior_items_raw=next_prior_items_raw, kind=kind,
+                        dry_run=dry_run, raw_output=output_path, work_dir=tmpdir,
+                        usage_file=(
+                            usage_path if usage_path is not None else output_path
+                        ),
+                        auto_recover=False, response_evidence=recovery_evidence,
+                        gemini_cmd=gemini_cmd,
+                        surfaced_requirement_ids=human_context.surfaced_requirement_ids,
+                        requires_direct_discussion_ack=human_context.requires_direct_discussion_ack,
+                        required_architecture_impact_contract=1,
+                        require_execution_strategy_contract=1,
+                        require_risk_test_matrix_contract=(
+                            1 if risk_test_matrix_contract_required else 0
+                        ),
+                        reject_unsolicited_risk_test_matrix_contract=(
+                            kind == "plan_revision" and not risk_test_matrix_contract_required
+                        ),
+                        prior_canonical_plan=prior_canonical_plan,
+                        prior_risk_test_matrix=prior_risk_test_matrix,
+                        prior_risk_test_matrix_changes=prior_risk_test_matrix_changes,
+                        architecture_identity=(
+                            coder_architecture.identity()
+                            if hasattr(coder_architecture, "identity") else None
+                        ),
+                        architecture_contract_version=1,
+                        shortening_attempted=True,
+                        external_args=(*_run_external_timeout_args(args), *_run_external_antigravity_args(args)),
+                    )
+                except _ValidationError as exc:
+                    print(str(exc), file=sys.stderr)
+                    sys.exit(1)
+                return {
+                    "done": False,
+                    "plan_text": completed["plan_text"],
+                    "plan_subject": completed["subject"],
+                    "new_round_number": new_round_number,
+                    "next_prior_items_raw": next_prior_items_raw,
+                    "is_new_round": True,
+                    "local_completed": set(),
+                    "coder_usage": completed.get("usage"),
+                    "coder_shortening_usage": completed.get("shortening_usage"),
+                }
+
         prompt_file = tmpdir / "coder-prompt.md"
         raw_output = tmpdir / "coder-plan-raw.md"
         usage_file = tmpdir / "coder-usage.json"
@@ -3865,6 +4088,10 @@ def _run_host_coder_phase(
             validate_shortened_plan_response(
                 original_text,
                 candidate_text,
+                prior_items=tuple(
+                    _deserialize_unresolved_item(item)
+                    for item in resume.get("prior_items", [])
+                ),
                 require_architecture_impact_contract=True,
                 require_execution_strategy_contract=True,
                 require_risk_test_matrix_contract=True,
@@ -3879,17 +4106,57 @@ def _run_host_coder_phase(
     # round record stores the deterministic markdown rendering; hashing the
     # source file here would fork an unchanged plan on every invocation.
     raw_plan_text = plan_file.read_text(encoding="utf-8")
+    response_kind = "plan_state"
+    try:
+        raw_payload, _ = json.JSONDecoder().raw_decode(raw_plan_text.lstrip())
+        if isinstance(raw_payload, dict) and raw_payload.get("kind") in {
+            "plan_state", "plan_revision"
+        }:
+            response_kind = str(raw_payload["kind"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        if isinstance(planning_handoff, dict) and planning_handoff.get("expected_kind") in {
+            "plan_state", "plan_revision"
+        }:
+            response_kind = str(planning_handoff["expected_kind"])
     canonical_plan_text = raw_plan_text
     try:
-        from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
-        from coding_review_agent_loop.protocol import validate_structured_plan_state
+        from coding_review_agent_loop.comment_rendering import (
+            render_canonical_plan_revision,
+            render_canonical_plan_state,
+        )
+        from coding_review_agent_loop.protocol import (
+            validate_structured_plan_revision,
+            validate_structured_plan_state,
+        )
 
-        parsed_plan = validate_structured_plan_state(
-            raw_plan_text,
-            require_execution_strategy_contract=1,
+        candidate_prior_items = tuple(
+            _deserialize_unresolved_item(item)
+            for item in _compute_next_prior_items(
+                list(resume.get("prior_items", [])),
+                list(resume.get("completed_reviewer_data", [])),
+                same_status="same-plan",
+                retain_future=False,
+            )
+        )
+        parsed_plan = (
+            validate_structured_plan_revision(
+                raw_plan_text,
+                require_execution_strategy_contract=1,
+                require_risk_test_matrix_contract=1,
+            )
+            if response_kind == "plan_revision"
+            else validate_structured_plan_state(
+                raw_plan_text,
+                require_execution_strategy_contract=1,
+                require_risk_test_matrix_contract=1,
+            )
         )
         if parsed_plan is not None:
-            canonical_plan_text = render_canonical_plan_state(parsed_plan)
+            canonical_plan_text = (
+                render_canonical_plan_revision(parsed_plan, candidate_prior_items)
+                if response_kind == "plan_revision"
+                else render_canonical_plan_state(parsed_plan)
+            )
     except (AgentLoopError, ValueError, TypeError):
         # The normal validation command below remains the authoritative
         # diagnostic for an invalid host plan. Keep the raw text here so a
@@ -3922,14 +4189,14 @@ def _run_host_coder_phase(
         result = _run_helper_capture(
             "helpers.validate_response",
             "--file", str(plan_file),
-            "--kind", "plan_state",
+            "--kind", response_kind,
             "--require-execution-strategy-contract",
             "--require-risk-test-matrix-contract",
         )
         if result.returncode != 0:
             print(f"skill_runner: plan validation failed: {result.stderr.strip()}", file=sys.stderr)
             sys.exit(1)
-        print(f"validation passed: plan_state")
+        print(f"validation passed: {response_kind}")
 
         if not dry_run:
             with tempfile.TemporaryDirectory() as tmpstr:
@@ -3953,26 +4220,39 @@ def _run_host_coder_phase(
                     "--risk-test-matrix-contract-version", "1",
                 )
                 tagged_text = tagged_plan.read_text(encoding="utf-8")
-                planning_preflight = preflight_planning_publication(tagged_text)
+                planning_preflight = preflight_planning_publication(
+                    tagged_text, response_chars=len(raw_plan_text)
+                )
                 if planning_preflight.status != "fits":
-                    handoff = {
-                        "attempt_state": (
-                            "attempt-required"
-                            if planning_preflight.status == "shortening-required"
-                            else "unrecoverable"
-                        ),
-                        "response_kind": "plan_state",
-                        "expected_kind": "plan_state",
-                        "original_response": raw_plan_text,
-                        "original_digest": hashlib.sha256(
-                            raw_plan_text.encode("utf-8")
-                        ).hexdigest(),
-                        "canonical_plan": canonical_plan_text,
-                        "response_ceiling_chars": planning_preflight.response_ceiling_chars,
-                        "failure": planning_preflight.diagnostic
-                        or planning_preflight.status,
-                        "sidecar_completeness": "prepared-but-not-posted",
-                    }
+                    if isinstance(planning_handoff, dict):
+                        # Re-entry already consumed the allowance. Preserve the
+                        # first candidate and attempt state instead of rearming.
+                        handoff = {
+                            **planning_handoff,
+                            "failure": planning_preflight.diagnostic
+                            or planning_preflight.status,
+                            "sidecar_completeness": "prepared-but-not-posted",
+                        }
+                    else:
+                        handoff = {
+                            "attempt_state": (
+                                "attempt-required"
+                                if planning_preflight.status == "shortening-required"
+                                else "unrecoverable"
+                            ),
+                            "response_kind": response_kind,
+                            "expected_kind": response_kind,
+                            "original_response": raw_plan_text,
+                            "original_digest": hashlib.sha256(
+                                raw_plan_text.encode("utf-8")
+                            ).hexdigest(),
+                            "canonical_plan": canonical_plan_text,
+                            "response_ceiling_chars": planning_preflight.response_ceiling_chars,
+                            "failure": planning_preflight.diagnostic
+                            or planning_preflight.status,
+                            "sidecar_completeness": "prepared-but-not-posted",
+                        }
+                    planning_handoff = handoff
                     _run_helper(
                         "helpers.state_manager", "write-session",
                         "--issue", str(issue), "--repo", repo,
@@ -3994,25 +4274,14 @@ def _run_host_coder_phase(
                             file=sys.stderr,
                         )
                     sys.exit(2)
-                _run_helper(
-                    "helpers.state_manager", "write-pending-comment",
-                    "--issue", str(issue), "--repo", repo,
-                    "--body", str(tagged_plan),
+                _publish_prepared_plan_transport(
+                    issue=issue,
+                    repo=repo,
+                    prepared=planning_preflight.prepared,
+                    dry_run=False,
+                    artifact_key=f"{issue}-r{new_round_number}-claude-plan",
+                    clear_shortening=isinstance(planning_handoff, dict),
                 )
-                _run_helper(
-                    "helpers.gh_ops", "post-issue-comment",
-                    "--issue", str(issue), "--file", str(tagged_plan), "--repo", repo,
-                )
-                _run_helper(
-                    "helpers.state_manager", "clear-pending-comment",
-                    "--issue", str(issue), "--repo", repo,
-                )
-                if isinstance(planning_handoff, dict):
-                    _run_helper(
-                        "helpers.state_manager", "write-session",
-                        "--issue", str(issue), "--repo", repo,
-                        "--fields", json.dumps({"planning_shortening": None}),
-                    )
         else:
             print(f"[dry-run] would post plan for {repo}#{issue} (round {new_round_number})")
 

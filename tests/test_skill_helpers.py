@@ -827,6 +827,31 @@ class TestStateManager:
         data = json.loads(result.stdout)
         assert "pending_comment_body" not in data
 
+    def test_write_and_clear_prepared_pending_comment_set(self, tmp_path: Path) -> None:
+        repo = "test/skill-repo"
+        issue = 9998
+        body_paths = [str(tmp_path / "sidecar.md"), str(tmp_path / "anchor.md")]
+        _run(
+            "helpers.state_manager",
+            "write-pending-comments",
+            "--issue", str(issue), "--repo", repo,
+            "--bodies", json.dumps(body_paths),
+        )
+        result = _run(
+            "helpers.state_manager", "read-session",
+            "--issue", str(issue), "--repo", repo,
+        )
+        assert json.loads(result.stdout)["pending_comment_bodies"] == body_paths
+        _run(
+            "helpers.state_manager", "clear-pending-comment",
+            "--issue", str(issue), "--repo", repo,
+        )
+        result = _run(
+            "helpers.state_manager", "read-session",
+            "--issue", str(issue), "--repo", repo,
+        )
+        assert "pending_comment_bodies" not in json.loads(result.stdout)
+
     def test_attach_metadata_produces_valid_agent_loop_meta(self) -> None:
         """attach-metadata must embed AGENT_LOOP_META that _resume_plan_round recognizes."""
         plan_body = _VALID_PLAN_STATE
@@ -963,6 +988,65 @@ class TestStateManager:
             assert second["is_new_round"] is False
             assert second["new_round_number"] == first["new_round_number"]
             assert second["plan_subject"] == first["plan_subject"]
+
+    def test_host_shortening_attempted_state_rejects_second_submission(self, tmp_path: Path) -> None:
+        from helpers import skill_runner
+
+        plan_file = tmp_path / "plan.json"
+        plan_file.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        args = types.SimpleNamespace(
+            issue=9997,
+            repo="OWNER/REPO",
+            shortened_plan_file=None,
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            skill_runner._run_host_coder_phase(
+                args,
+                plan_file,
+                {"planning_shortening": {
+                    "attempt_state": "attempted",
+                    "original_response": _VALID_PLAN_STATE,
+                    "original_digest": __import__("hashlib").sha256(
+                        _VALID_PLAN_STATE.encode("utf-8")
+                    ).hexdigest(),
+                }},
+                True,
+            )
+        assert excinfo.value.code == 1
+
+    def test_pending_transport_reconciles_sidecars_idempotently(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+
+        sidecar = tmp_path / "sidecar.md"
+        anchor = tmp_path / "anchor.md"
+        sidecar.write_text("<!-- AGENT_LOOP_SIDECAR: YQ== -->", encoding="utf-8")
+        anchor.write_text("Visible anchor", encoding="utf-8")
+        monkeypatch.setattr(
+            skill_runner,
+            "_fetch_issue_comments_raw",
+            lambda *_args, **_kwargs: [sidecar.read_text(encoding="utf-8")],
+        )
+        calls: list[tuple[str, ...]] = []
+        monkeypatch.setattr(
+            skill_runner,
+            "_run_helper",
+            lambda *args, **_kwargs: calls.append(tuple(args)),
+        )
+        skill_runner._reconcile_pending_comment(
+            {
+                "pending_comment_bodies": [str(sidecar), str(anchor)],
+                "planning_shortening": {"attempt_state": "attempted"},
+            },
+            9997,
+            "OWNER/REPO",
+            False,
+        )
+        posted = [call for call in calls if call[:2] == ("helpers.gh_ops", "post-issue-comment")]
+        assert len(posted) == 1
+        assert str(anchor) in posted[0]
+        assert any(call[:2] == ("helpers.state_manager", "write-session") for call in calls)
 
     def test_attach_metadata_persists_surfaced_reviewer_requirement_ids(self) -> None:
         requirement_id = "hr-" + "a" * 64
