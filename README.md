@@ -546,6 +546,30 @@ in round audit metadata and recover conservatively after interruption or a
 configuration change. Issue-mode implementation handoffs carry the same PR
 policy, while planning and discussion remain outside this policy.
 
+### Primary-then-panel PR review
+
+The opt-in staged policy lets one configured primary work to exact-head approval
+before an independent secondary audit:
+
+```bash
+agent-loop pr 123 --repo OWNER/REPO \
+  --pr-review-policy primary-then-panel \
+  --primary-reviewer codex \
+  --reviewer codex --reviewer claude --reviewer gemini
+```
+
+The primary is the first and only reviewer in the normal opening phase. Once it
+approves, every secondary reviews the complete current base-to-head diff from a
+common snapshot; secondary prompts are independent and are not finding-check
+prompts. A scoped secondary fix rechecks every active finding owner and the
+primary, then performs a complete exact-head sweep for every secondary missing
+approval. Ambiguous scope, ownership, history, or a reviewer failure selects the
+full board and never treats missing input as approval. `--pr-review-force-full`
+is a durable run latch. The policy is opt-in and does not change the default or
+the CI/merge gates. Use `review-evaluation` with frozen local artifacts to
+compare latency/cost against independent severity-weighted coverage before any
+proposal to change the default.
+
 ## Safety and Permissions
 
 Agents can run commands and change code. Keep their normal permission prompts

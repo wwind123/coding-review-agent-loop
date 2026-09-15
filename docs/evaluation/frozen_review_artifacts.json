@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "runs": [
+    {
+      "run_id": "historical-all-001",
+      "policy": "all-reviewers",
+      "findings": [
+        {"id": "finding-auth", "severity": "high", "contributors": ["OpenAI Codex"]},
+        {"id": "finding-docs", "severity": "low", "contributors": ["Anthropic Claude"]}
+      ],
+      "metrics": {
+        "review_rounds": 2,
+        "coder_followup_rounds": 1,
+        "reviewer_calls": 4,
+        "tokens": 12000,
+        "elapsed_seconds": 180,
+        "estimated_cost": 1.2,
+        "ci_failures": 0,
+        "escaped_defects": 0,
+        "false_positives": 0,
+        "withdrawals": 0,
+        "disagreements": 1,
+        "calls_avoided": 0
+      }
+    },
+    {
+      "run_id": "historical-selective-001",
+      "policy": "selective-intermediate",
+      "findings": [
+        {"id": "finding-auth", "severity": "high", "contributors": ["OpenAI Codex"]},
+        {"id": "finding-docs", "severity": "low", "contributors": ["Anthropic Claude"]}
+      ],
+      "metrics": {
+        "review_rounds": 2,
+        "coder_followup_rounds": 1,
+        "reviewer_calls": 3,
+        "tokens": 9000,
+        "elapsed_seconds": 140,
+        "estimated_cost": 0.9,
+        "ci_failures": 0,
+        "escaped_defects": 0,
+        "false_positives": 0,
+        "withdrawals": 0,
+        "disagreements": 1,
+        "calls_avoided": 1
+      }
+    },
+    {
+      "run_id": "historical-primary-panel-001",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "OpenAI Codex",
+      "primary_approval_round": 1,
+      "panel_approval_round": 2,
+      "findings": [
+        {"id": "finding-auth", "severity": "high", "contributors": ["OpenAI Codex"]},
+        {"id": "finding-escape", "severity": "critical", "contributors": ["Anthropic Claude"]}
+      ],
+      "metrics": {
+        "review_rounds": 2,
+        "coder_followup_rounds": 1,
+        "reviewer_calls": 3,
+        "tokens": 9500,
+        "elapsed_seconds": 150,
+        "estimated_cost": 0.95,
+        "ci_failures": 0,
+        "escaped_defects": 0,
+        "false_positives": 0,
+        "withdrawals": 0,
+        "disagreements": 1,
+        "calls_avoided": 1
+      }
+    }
+  ]
+}
