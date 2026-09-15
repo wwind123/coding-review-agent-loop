@@ -1,0 +1,81 @@
+{
+  "artifact_sha256": "08b81a8a5a45744a944bd1c03b7177f7115f5dd49fdf9098d36a8f0e3484e2f7",
+  "kind": "frozen_review_policy_evaluation",
+  "policies": {
+    "all-reviewers": {
+      "marginal_findings_beyond_primary": {
+        "Anthropic Claude": ["finding-docs"],
+        "OpenAI Codex": ["finding-auth"]
+      },
+      "metrics": {
+        "calls_avoided": {"status": "verified", "value": 0},
+        "ci_failures": {"status": "verified", "value": 0},
+        "coder_followup_rounds": {"status": "verified", "value": 1},
+        "disagreements": {"status": "verified", "value": 1},
+        "elapsed_seconds": {"status": "verified", "value": 180},
+        "escaped_defects": {"status": "verified", "value": 0},
+        "estimated_cost": {"status": "verified", "value": 1.2},
+        "false_positives": {"status": "verified", "value": 0},
+        "review_rounds": {"status": "verified", "value": 2},
+        "reviewer_calls": {"status": "verified", "value": 4},
+        "tokens": {"status": "verified", "value": 12000},
+        "withdrawals": {"status": "verified", "value": 0}
+      },
+      "primary_to_panel_approval_regressions": {"status": "unavailable", "value": null},
+      "run_count": 1,
+      "severity_weighted_marginal_findings": {"Anthropic Claude": 2, "OpenAI Codex": 4},
+      "status": "verified",
+      "valid_unique_findings": 2
+    },
+    "primary-then-panel": {
+      "marginal_findings_beyond_primary": {
+        "Anthropic Claude": ["finding-escape"]
+      },
+      "metrics": {
+        "calls_avoided": {"status": "verified", "value": 1},
+        "ci_failures": {"status": "verified", "value": 0},
+        "coder_followup_rounds": {"status": "verified", "value": 1},
+        "disagreements": {"status": "verified", "value": 1},
+        "elapsed_seconds": {"status": "verified", "value": 150},
+        "escaped_defects": {"status": "verified", "value": 0},
+        "estimated_cost": {"status": "verified", "value": 0.95},
+        "false_positives": {"status": "verified", "value": 0},
+        "review_rounds": {"status": "verified", "value": 2},
+        "reviewer_calls": {"status": "verified", "value": 3},
+        "tokens": {"status": "verified", "value": 9500},
+        "withdrawals": {"status": "verified", "value": 0}
+      },
+      "primary_to_panel_approval_regressions": {"status": "verified", "value": [1]},
+      "run_count": 1,
+      "severity_weighted_marginal_findings": {"Anthropic Claude": 5},
+      "status": "verified",
+      "valid_unique_findings": 2
+    },
+    "selective-intermediate": {
+      "marginal_findings_beyond_primary": {
+        "Anthropic Claude": ["finding-docs"],
+        "OpenAI Codex": ["finding-auth"]
+      },
+      "metrics": {
+        "calls_avoided": {"status": "verified", "value": 1},
+        "ci_failures": {"status": "verified", "value": 0},
+        "coder_followup_rounds": {"status": "verified", "value": 1},
+        "disagreements": {"status": "verified", "value": 1},
+        "elapsed_seconds": {"status": "verified", "value": 140},
+        "escaped_defects": {"status": "verified", "value": 0},
+        "estimated_cost": {"status": "verified", "value": 0.9},
+        "false_positives": {"status": "verified", "value": 0},
+        "review_rounds": {"status": "verified", "value": 2},
+        "reviewer_calls": {"status": "verified", "value": 3},
+        "tokens": {"status": "verified", "value": 9000},
+        "withdrawals": {"status": "verified", "value": 0}
+      },
+      "primary_to_panel_approval_regressions": {"status": "unavailable", "value": null},
+      "run_count": 1,
+      "severity_weighted_marginal_findings": {"Anthropic Claude": 2, "OpenAI Codex": 4},
+      "status": "verified",
+      "valid_unique_findings": 2
+    }
+  },
+  "schema_version": 1
+}

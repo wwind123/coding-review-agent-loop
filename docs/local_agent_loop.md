@@ -1164,13 +1164,44 @@ owners while the unavailable reviewer remains required.
 Scheduler checkpoints are written before reviewer launch and after
 reconciliation. They persist the immutable reviewer/policy/rule contract,
 head pair, selected/paused reviewers, reasons, final-sweep and force-full
-state, and cumulative selective-only calls avoided. Derived approvals and
+state, phase/primary/owner identities, exact-head approval evidence, and
+cumulative scheduler-policy calls avoided. Derived approvals and
 obligations continue to come from reviewer records and the canonical ledger.
 Missing, malformed, contradictory, or legacy scheduler metadata selects the
 full board. A changed reviewer set, policy, or broad-rule digest stops rather
 than weakening an in-flight run. Issue-mode implementation handoffs carry the
 same PR policy; planning and discussion scheduling are intentionally outside
 this feature.
+
+#### Primary-then-panel
+
+`primary-then-panel` is opt-in and requires `--primary-reviewer` plus at least
+one other unique `--reviewer`. The primary must be on the configured board.
+The primary phase repeats on each changed head until exact-head approval; only
+then does the secondary audit launch. Every secondary receives the complete
+base-to-head diff and approved-plan/human context independently from a common
+snapshot. It does not merely validate the primary's findings.
+
+After a secondary finding, a safe narrow descendant invokes all active finding
+owners together with the primary. Their clearance is followed by a mandatory
+complete-diff sweep of every secondary without qualifying approval on the new
+head. Unsafe ownership, scope, history, or change classification selects the
+full board. A force-full latch remains true through resume, including former
+primary phases. Any failure, timeout, unavailability, incomplete output, or
+head mutation remains blocking and invalidates nonmatching approvals.
+
+The offline `review-evaluation` command consumes local frozen JSON artifacts and
+reports unique and severity-weighted marginal findings, process/call/token/time
+metrics, CI/escape outcomes, false positives, withdrawals, disagreements, and
+unavailable measurements. It never invokes a reviewer or mutates GitHub:
+
+```bash
+agent-loop review-evaluation docs/evaluation/frozen_review_artifacts.json \
+  --format text
+```
+
+The policy remains non-default until a separate frozen-history review shows
+severity-weighted marginal coverage justifies its latency and cost tradeoff.
 
 Returning reviewers receive fresh full context and an orchestrator-computed
 diff summary since their previous review, while still being instructed to

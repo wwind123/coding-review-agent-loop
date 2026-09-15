@@ -185,7 +185,22 @@ The default policy invokes all reviewers. Opt-in selective intermediate review
 can pause already-approved reviewers for bounded fixes, but their old approvals
 remain head-bound. Changed scope, incomplete state, and final qualification can
 require a full review. The scheduler contract is immutable across a resume.
-See [selective review](docs/local_agent_loop.md#selective-intermediate-pr-review).
+The opt-in `primary-then-panel` policy adds a phase-aware contract with one
+primary reviewer and a non-empty secondary panel. It keeps the primary as the
+only normal reviewer until exact-head approval, then dispatches an independent
+complete-diff audit to all secondaries from one frozen snapshot. Scoped
+remediation rechecks finding owners plus the primary before a mandatory exact-
+head secondary sweep; unsafe scope/history and the durable force-full latch use
+the complete board. Phase, owner, selection, approval-head, and scheduler-policy
+call-accounting metadata are optional extensions to the legacy scheduler core,
+so old records remain decodable and grant no staged phase authority.
+See [selective and staged review](docs/local_agent_loop.md#selective-intermediate-pr-review).
+
+Frozen policy evaluation is a local read-only boundary. `review-evaluation`
+validates artifacts and deterministically reports severity-weighted marginal
+coverage and process/cost/CI outcomes for all three policies; unavailable
+measurements remain explicit and the evaluator has no GitHub or reviewer-call
+dependency.
 
 Findings have stable IDs, provenance, dispositions, and, where applicable,
 resolution ownership. The coder reports addressed, remaining, and disputed

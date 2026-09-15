@@ -436,6 +436,7 @@ from .review_scheduling import (
     TransitionClassification,
     classify_transition,
     make_contract,
+    policy_capabilities,
     select_reviewers,
 )
 from .unresolved_items import (
@@ -11168,11 +11169,19 @@ def run_pr_loop(
         reviewer_session_ids: dict[AgentName, str | None] = {}
         unavailable_reviewer_failures: dict[AgentName, AgentInvocationError] = {}
         configured_reviewers = reviewers(config)
-        selective_policy = config.pr_review_policy == "selective-intermediate"
+        scheduler_capabilities = policy_capabilities(config.pr_review_policy)
+        # Historical variable name retained for compatibility with helpers and
+        # tests; it now means any scheduler-enabled PR policy.
+        selective_policy = scheduler_capabilities.scheduler_enabled
         scheduler_contract = make_contract(
             tuple(agent_display_name(reviewer) for reviewer in configured_reviewers),
             config.pr_review_policy,
             config.pr_review_broad_rules,
+            (
+                agent_display_name(config.primary_reviewer)
+                if config.primary_reviewer is not None
+                else None
+            ),
         )
         reviewer_acquisition_contract: dict[str, tuple[object, ...]] = {}
         for reviewer in configured_reviewers:
@@ -11225,7 +11234,7 @@ def run_pr_loop(
             configured_reviewers=configured_reviewers,
             reconciliation_mode=(
                 "owner-scoped"
-                if config.pr_review_policy == "selective-intermediate"
+                if scheduler_capabilities.owner_scoped_reconciliation
                 else "aggregate"
             ),
         )
@@ -11677,6 +11686,19 @@ def run_pr_loop(
                     for record in current_head_records
                 ):
                     scheduler_metadata_recovery_full_board = True
+                if scheduler_contract.primary_reviewer is not None and any(
+                    record.metadata.scheduler_metadata_status == "valid"
+                    and (
+                        record.metadata.scheduler_phase is None
+                        or record.metadata.scheduler_primary_reviewer is None
+                    )
+                    for record in historical_records
+                ):
+                    # A pre-staged scheduler payload may decode as valid while
+                    # lacking the phase-aware authority introduced with the
+                    # primary policy. It remains compatible data, but cannot
+                    # authorize a reduced primary/panel selection.
+                    scheduler_metadata_recovery_full_board = True
                 if any(
                     record.metadata.scheduler_metadata_status == "valid"
                     and record.metadata.scheduler_current_sha != record.metadata.subject
@@ -11838,22 +11860,27 @@ def run_pr_loop(
                     final_sweep=final_sweep,
                 )
                 scheduler_diff_context = (
-                    "\nSelective review audit record: the orchestrator classified the transition as "
+                    "\nScheduler audit record: the orchestrator classified the transition as "
                     f"{classification.kind} ({classification.reason}). Previous reviewed SHA: "
                     f"{scheduler_previous_sha or '(none)'}; current SHA: {current_pr_subject}. "
                     "Changed paths observed since that review: "
                     f"{', '.join(classification.changed_paths) or '(unavailable)'}. "
+                    f"Selected phase: {scheduler_decision.phase}; primary: "
+                    f"{scheduler_contract.primary_reviewer or '(none)'}; active owners: "
+                    f"{', '.join(scheduler_decision.active_owners) or '(none)'}. "
                     "Inspect the complete base-to-head diff independently; this summary is not a substitute.\n"
                 )
-                if scheduler_previous_sha not in {None, current_pr_subject}:
-                    scheduler_calls_avoided += scheduler_decision.calls_avoided
+                scheduler_calls_avoided += scheduler_decision.calls_avoided
                 final_sweep_pending = False
                 selected_reviewer_names = set(scheduler_decision.selected_reviewers)
                 log(
                     config,
-                    f"Round {round_number}: selective scheduler {scheduler_decision.reason}; "
+                    f"Round {round_number}: {scheduler_contract.policy} scheduler phase="
+                    f"{scheduler_decision.phase} {scheduler_decision.reason}; "
                     f"selected={', '.join(scheduler_decision.selected_reviewers) or 'none'}; "
-                    f"paused={', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}",
+                    f"paused={', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}; "
+                    f"force_full={scheduler_force_full}; active_owners="
+                    f"{', '.join(scheduler_decision.active_owners) or 'none'}",
                 )
                 if scheduler_decision.selected_reviewers and not skip_reviewers_for_recovery and not conflict_pending:
                     post_pr_comment(
@@ -11863,8 +11890,12 @@ def run_pr_loop(
                         body=_attach_round_metadata(
                             f"PR review scheduling audit: selected {', '.join(scheduler_decision.selected_reviewers)}; "
                             f"paused {', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}; "
-                            f"reason: {scheduler_decision.reason}; "
-                            f"selective-only calls avoided cumulatively: {scheduler_calls_avoided}.",
+                            f"reason: {scheduler_decision.reason}; phase: {scheduler_decision.phase}; "
+                            f"head: {current_pr_subject}; primary: "
+                            f"{scheduler_contract.primary_reviewer or '(none)'}; active owners: "
+                            f"{', '.join(scheduler_decision.active_owners) or '(none)'}; "
+                            f"force-full: {scheduler_force_full}; scheduler-policy calls avoided cumulatively: "
+                            f"{scheduler_calls_avoided}.",
                             PostedRoundMetadata(
                                 flow="pr", role="summary", agent="Orchestrator",
                                 round_number=round_number, subject=current_pr_subject,
@@ -11881,6 +11912,13 @@ def run_pr_loop(
                                 scheduler_final_sweep=final_sweep,
                                 scheduler_force_full=scheduler_force_full,
                                 scheduler_calls_avoided=scheduler_calls_avoided,
+                                scheduler_phase=scheduler_decision.phase,
+                                scheduler_primary_reviewer=scheduler_contract.primary_reviewer,
+                                scheduler_approved_reviewers=tuple(sorted(unchanged_head_approvals)),
+                                scheduler_active_owners=scheduler_decision.active_owners,
+                                scheduler_scope_digest=hashlib.sha256(
+                                    repr(classification.changed_paths).encode("utf-8")
+                                ).hexdigest()[:16],
                                 **_architecture_metadata_fields(config),
                             ),
                         ),
@@ -11973,6 +12011,11 @@ def run_pr_loop(
                             scheduler_final_sweep=(final_sweep if selective_policy else None),
                             scheduler_force_full=(scheduler_force_full if selective_policy else None),
                             scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
+                            scheduler_phase=(scheduler_decision.phase if selective_policy and scheduler_decision is not None else None),
+                            scheduler_primary_reviewer=(scheduler_contract.primary_reviewer if selective_policy else None),
+                            scheduler_approved_reviewers=(tuple(sorted(unchanged_head_approvals)) if selective_policy else ()),
+                            scheduler_active_owners=(scheduler_decision.active_owners if selective_policy and scheduler_decision is not None else ()),
+                            scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                         ),
                     ),
                 )
@@ -12667,8 +12710,10 @@ def run_pr_loop(
                     body=_attach_round_metadata(
                         f"PR review round {round_number} reconciliation: settled reviewers: {settled or 'none'}. "
                         f"Finalization {'stops' if pr_fatal_errors else 'continues'} after reconciliation. "
-                        f"Historical approvals remain SHA-bound; selective-only calls avoided cumulatively: "
-                        f"{scheduler_calls_avoided}.",
+                        f"Historical approvals remain exact-head-bound; scheduler-policy calls avoided "
+                        f"cumulatively: {scheduler_calls_avoided}. Phase: "
+                        f"{scheduler_decision.phase if scheduler_decision is not None else 'full-board'}; "
+                        f"force-full: {scheduler_force_full}.",
                         PostedRoundMetadata(
                             flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
                             subject=current_pr_subject, prior_items=prior_unresolved_items,
@@ -12696,6 +12741,16 @@ def run_pr_loop(
                             scheduler_final_sweep=(final_sweep if selective_policy else None),
                             scheduler_force_full=(scheduler_force_full if selective_policy else None),
                             scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
+                            scheduler_phase=(scheduler_decision.phase if selective_policy and scheduler_decision is not None else None),
+                            scheduler_primary_reviewer=(scheduler_contract.primary_reviewer if selective_policy else None),
+                            scheduler_approved_reviewers=(
+                                tuple(sorted({
+                                    *unchanged_head_approvals,
+                                    *(name for name, _output in approved_review_outputs),
+                                })) if selective_policy else ()
+                            ),
+                            scheduler_active_owners=(scheduler_decision.active_owners if selective_policy and scheduler_decision is not None else ()),
+                            scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                         ),
                     ),
                 )
@@ -12718,7 +12773,7 @@ def run_pr_loop(
                     retain_future=False,
                     reconciliation_mode=(
                         "owner-scoped"
-                        if config.pr_review_policy == "selective-intermediate"
+                        if scheduler_capabilities.owner_scoped_reconciliation
                         else "aggregate"
                     ),
                 )
@@ -12735,7 +12790,7 @@ def run_pr_loop(
                     prior_dispositions,
                     reconciliation_mode=(
                         "owner-scoped"
-                        if config.pr_review_policy == "selective-intermediate"
+                        if scheduler_capabilities.owner_scoped_reconciliation
                         else "aggregate"
                     ),
                 )
@@ -14679,6 +14734,13 @@ def run_pr_loop(
                 scheduler_final_sweep=(final_sweep if selective_policy else None),
                 scheduler_force_full=(scheduler_force_full if selective_policy else None),
                 scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
+                scheduler_phase=(scheduler_decision.phase if selective_policy and scheduler_decision is not None else None),
+                scheduler_primary_reviewer=(scheduler_contract.primary_reviewer if selective_policy else None),
+                scheduler_approved_reviewers=(
+                    tuple(sorted(unchanged_head_approvals)) if selective_policy else ()
+                ),
+                scheduler_active_owners=(scheduler_decision.active_owners if selective_policy and scheduler_decision is not None else ()),
+                scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                 qualification_checkpoint=qualification_checkpoint,
                 **_architecture_metadata_fields(
                     config, impact=getattr(coder_response.marker_value, "architecture_impact", None)
