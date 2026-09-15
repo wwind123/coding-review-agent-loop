@@ -10802,19 +10802,33 @@ def run_pr_loop(
                     ),
                 )
             )
-        if issue_context is not None and recorded_pr_contract is None and config.expected_closing_contract_resolved:
-            # A pre-contract canonical handoff is a legacy recovery record. Do
-            # not retroactively turn its old Refs-only body into a new durable
-            # contract; only newly persisted PR-side records activate the gate.
-            log(
-                config,
-                f"PR #{pr_number}: no PR-side expected-closing record found; retaining legacy "
-                "handoff recovery without inferring a contract from prose",
-            )
-            closing_contract = None
+        legacy_closing_validation_only = (
+            issue_context is not None
+            and recorded_pr_contract is None
+            and config.expected_closing_contract_resolved
+        )
+        if legacy_closing_validation_only:
+            if config.managed_ci:
+                # A pre-contract canonical handoff is a legacy recovery
+                # record. Do not retroactively turn its old Refs-only body
+                # into a new durable contract. Keep the resolved contract for
+                # closing-reference validation, but do not persist a new
+                # PR-side contract solely from the invocation's recovery
+                # context.
+                log(
+                    config,
+                    f"PR #{pr_number}: no PR-side expected-closing record found; retaining legacy "
+                    "handoff recovery without persisting a contract from prose",
+                )
+            else:
+                # Preserve the ordinary legacy issue-resume compatibility
+                # path: a pre-contract Refs-only PR is not retroactively
+                # upgraded into an affirmative closing contract.
+                closing_contract = None
         contract_needs_persisting = (
             closing_contract is not None
             and (recorded_pr_contract is None or recorded_pr_contract != closing_contract)
+            and not legacy_closing_validation_only
         )
         issue_handoff_to_update = None
         if issue_context is not None and recorded_pr_contract is not None:

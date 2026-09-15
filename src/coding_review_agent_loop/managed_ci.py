@@ -2103,7 +2103,7 @@ def revalidate_issue_created_handoff(
     if handoff.repository.casefold() != config.repo.casefold() or handoff.base_ref != config.base:
         raise AgentLoopError("Managed-CI handoff does not belong to this invocation.")
     if handoff.authorization_kind == "fresh":
-        return authorize_fresh_issue_created_resume(
+        refreshed = authorize_fresh_issue_created_resume(
             runner,
             config=config,
             pr_number=handoff.pr_number,
@@ -2111,6 +2111,19 @@ def revalidate_issue_created_handoff(
             metadata=metadata,
             approved_plan_hash=handoff.approved_plan_hash,
         )
+        # A fresh retry may find a continuity terminal for the live head.  It
+        # is still a fresh operator invocation, but the terminal's nonce is
+        # not the nonce embedded in the PR-opening body.  Re-enter the normal
+        # exact-tuple validator so the terminal is checked with the preserved
+        # opening nonce and its trusted label binding before activation.
+        if refreshed.authorization_kind == "continuity":
+            return revalidate_issue_created_handoff(
+                runner,
+                config=config,
+                handoff=refreshed,
+                metadata=metadata,
+            )
+        return refreshed
     # Creation and fresh grants can advance to a continuity terminal, but the
     # PR body remains bound to the opening authorization nonce.  Revalidate
     # that immutable opening tuple rather than treating the continuity record's

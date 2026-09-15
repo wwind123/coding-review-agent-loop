@@ -29,8 +29,10 @@ from coding_review_agent_loop.managed_ci import (
     AuthenticatedIssueCreatedHandoff,
     ManagedCiContract,
     ManagedCiCreationIntent,
+    ManagedCiIssueAuthorization,
     ManagedCiOutcome,
     UNPROTECTED_OVERRIDE_TRAILER,
+    format_issue_created_authorization_comment,
     parse_issue_created_authorization_comment,
     parse_managed_ci_override_record,
 )
@@ -4784,6 +4786,69 @@ def test_managed_issue_legacy_recovery_rejects_unexpected_closing_reference(
         command[:1] in (["claude"], ["codex"])
         for command, _cwd in runner.commands
     )
+
+
+def test_managed_pr_recovery_keeps_closing_reference_gate_without_pr_contract(
+    tmp_path,
+):
+    body = (
+        "Fixes #56\nCloses #999\n\n"
+        f"{UNPROTECTED_OVERRIDE_TRAILER} nonce=opening-nonce"
+    )
+    authorization = ManagedCiIssueAuthorization(
+        kind="creation",
+        repository="OWNER/REPO",
+        issue_number=56,
+        pr_number=77,
+        base_ref="main",
+        head_sha="abc123",
+        actor_login="agent-loop",
+        actor_id=1,
+        protection="voluntary",
+        waiver="allow-unprotected-managed-ci",
+        nonce="opening-nonce",
+        label_event_id=101,
+    )
+    runner = _IssueRecoveryWorkflowRunner(
+        labeled=True,
+        authorization_comments=[{
+            "id": 41,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": str(format_issue_created_authorization_comment(authorization)),
+        }],
+    )
+    runner.pr_payload["body"] = body
+    runner.rest_pr["body"] = body
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="claude",
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        expected_closing_issue_ids=(56,),
+        expected_closing_contract_resolved=True,
+        pre_review_tests=False,
+        invocation_argv=(
+            "agent-loop", "pr", "77", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+
+    with pytest.raises(AgentLoopError, match="outside the expected contract"):
+        orchestrator_module.run_pr_loop(
+            runner,
+            pr_number=77,
+            config=config,
+            workdirs_ready=True,
+        )
+
+    assert runner.comments == []
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
 
 
 def test_managed_issue_authorization_publication_failure_prints_fresh_recovery(
