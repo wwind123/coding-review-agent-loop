@@ -267,6 +267,13 @@ Run `agent-loop <command> --help` for the complete options for one workflow.
 The [full CLI guide](docs/local_agent_loop.md#usage) covers lifecycle and resume
 behavior in detail.
 
+For an issue-created managed-CI PR whose original authorization comment is
+missing or whose implementation response was rejected before a PR number was
+accepted, recovery is deliberately explicit. Use `--managed-ci-fresh` with
+`--managed-ci` and the unprotected waiver; PR mode must also provide
+`--managed-ci-issue <issue-number>`. This creates a new operator grant after
+validating the live PR tuple and does not adopt arbitrary existing PRs.
+
 ## How the Review Loop Behaves
 
 1. The coder implements the issue or updates the existing PR.

@@ -163,12 +163,16 @@ from .managed_ci import (
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
     activate_managed_ci,
+    authorize_fresh_issue_created_resume,
     authenticate_source_managed_resume,
     authenticate_issue_created_handoff,
     dispatch_final_qualification,
     intermediate_managed_checks,
     managed_label_present,
     preflight_managed_ci_creation,
+    find_actor_round_metadata_comment_ids,
+    publish_issue_created_continuity_authorization,
+    publish_issue_created_authorization,
     publish_manual_v2_qualification,
     prepare_v2_merge,
     publish_round_readiness,
@@ -3761,6 +3765,13 @@ def _run_validated_agent(
         role=role,
         classification_text=last_classification_text,
     )
+    if repair_expected_kind == "issue_implementation" and config.managed_ci:
+        message += (
+            " The implementation response was rejected before a PR number was accepted. "
+            "If the coder opened a PR before that rejection, discover and resume that same PR "
+            "with explicit --managed-ci-fresh authorization (including the unprotected waiver); "
+            "do not rerun implementation to recreate it."
+        )
     message += diagnostics.format_for_error()
     raise AgentInvocationError(
         message,
@@ -6192,12 +6203,6 @@ def _implement_approved_issue(
             raise AgentLoopError(
                 "Coder did not create a valid PR; implementation is blocking."
             )
-        _validate_structured_response_tests_with_post_pr_context(
-            implementation_result.tests_run,
-            runner=runner,
-            config=implementation_config,
-            pr_number=implementation_result.pr_number,
-        )
         pr_number = implementation_result.pr_number
     elif isinstance(implementation_result, _TerminalNoPrImplementation):
         _post_no_pr_implementation_terminal_comment(
@@ -6236,8 +6241,27 @@ def _implement_approved_issue(
                 implementation_config,
                 managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
             )
-    else:
-        reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        else:
+            reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        if managed_ci_handoff is not None:
+            managed_ci_handoff = publish_issue_created_authorization(
+                runner,
+                config=implementation_config,
+                handoff=managed_ci_handoff,
+                metadata=initial_pr_context.metadata,
+                approved_plan_hash=plan_hash,
+            )
+    if isinstance(implementation_result, StructuredIssueImplementation):
+        _validate_structured_response_tests_with_post_pr_context(
+            implementation_result.tests_run,
+            runner=runner,
+            config=implementation_config,
+            pr_number=pr_number,
+        )
+        validate_test_observation_citations_within_workdir(
+            implementation_result.test_observations,
+            assigned_workdir=active_workdir(implementation_config),
+        )
     validate_pr_references_issue(
         runner,
         config=implementation_config,
@@ -8699,16 +8723,6 @@ def run_issue_loop(
                 raise AgentLoopError(
                     "Coder did not create a valid PR; implementation is blocking."
                 )
-            _validate_structured_response_tests_with_post_pr_context(
-                implementation_result.tests_run,
-                runner=runner,
-                config=config,
-                pr_number=implementation_result.pr_number,
-            )
-            validate_test_observation_citations_within_workdir(
-                implementation_result.test_observations,
-                assigned_workdir=active_workdir(config),
-            )
             pr_number = implementation_result.pr_number
         else:
             # Clarification remains the legacy terminal alternative.
@@ -8748,8 +8762,25 @@ def run_issue_loop(
                     config,
                     managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
                 )
+            managed_ci_handoff = publish_issue_created_authorization(
+                runner,
+                config=config,
+                handoff=managed_ci_handoff,
+                metadata=initial_pr_context.metadata,
+            )
         else:
             reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        if isinstance(implementation_result, StructuredIssueImplementation):
+            _validate_structured_response_tests_with_post_pr_context(
+                implementation_result.tests_run,
+                runner=runner,
+                config=config,
+                pr_number=pr_number,
+            )
+            validate_test_observation_citations_within_workdir(
+                implementation_result.test_observations,
+                assigned_workdir=active_workdir(config),
+            )
         initial_pr_metadata = initial_pr_context.metadata
         validate_pr_references_issue(
             runner,
@@ -10360,12 +10391,45 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
+        if config.managed_ci_fresh_authorization:
+            fresh_issue_number = managed_ci_issue_number or config.managed_ci_issue_number
+            if fresh_issue_number is None:
+                raise AgentLoopError(
+                    "Managed-CI fresh authorization requires an explicit issue scope in PR mode."
+                )
+            config = dataclasses_replace(
+                config,
+                managed_ci_issue_number=fresh_issue_number,
+            )
+            managed_ci_handoff = authorize_fresh_issue_created_resume(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                issue_number=fresh_issue_number,
+                metadata=initial_pr_context.metadata,
+                approved_plan_hash=(
+                    approved_plan_context.plan_hash
+                    if approved_plan_context is not None else None
+                ),
+            )
+            authenticated_managed_resume = AuthenticatedManagedResume(
+                origin="issue-created",
+                lifecycle=managed_ci_handoff.lifecycle,
+                issue_created_handoff=managed_ci_handoff,
+                override_nonce=managed_ci_handoff.override_nonce,
+            )
         if managed_ci_handoff is not None:
             managed_ci_handoff = revalidate_issue_created_handoff(
                 runner,
                 config=config,
                 handoff=managed_ci_handoff,
                 metadata=initial_pr_context.metadata,
+            )
+            authenticated_managed_resume = AuthenticatedManagedResume(
+                origin="issue-created",
+                lifecycle=managed_ci_handoff.lifecycle,
+                issue_created_handoff=managed_ci_handoff,
+                override_nonce=managed_ci_handoff.override_nonce,
             )
         if managed_pr_origin is None:
             recovered_origin = recover_managed_pr_origin(
@@ -14693,6 +14757,33 @@ def run_pr_loop(
                     latest_coder_metadata,
                 ),
             )
+            if managed_ci_handoff is not None and managed_ci is not None and managed_ci.issue_created_pr:
+                predecessor_head = pr_metadata.head_sha
+                new_head = updated_pr_context.metadata.head_sha
+                if predecessor_head and new_head and predecessor_head != new_head:
+                    round_comment_ids = find_actor_round_metadata_comment_ids(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        actor_login=managed_ci_handoff.trusted_actor_login,
+                        actor_id=managed_ci_handoff.trusted_actor_id,
+                    )
+                    if not round_comment_ids and managed_ci_handoff.authorization_comment_id:
+                        round_comment_ids = (managed_ci_handoff.authorization_comment_id,)
+                    managed_ci_handoff = publish_issue_created_continuity_authorization(
+                        runner,
+                        config=config,
+                        handoff=managed_ci_handoff,
+                        predecessor_head=predecessor_head,
+                        new_head=new_head,
+                        round_comment_ids=round_comment_ids,
+                    )
+                    authenticated_managed_resume = AuthenticatedManagedResume(
+                        origin="issue-created",
+                        lifecycle=managed_ci_handoff.lifecycle,
+                        issue_created_handoff=managed_ci_handoff,
+                        override_nonce=managed_ci_handoff.override_nonce,
+                    )
             log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")
             pre_review_test_pending = True
             if external_recovery_full_board:

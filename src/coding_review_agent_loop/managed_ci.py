@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import secrets
@@ -28,11 +29,13 @@ from .github import (
     get_pr_head_sha,
     get_pr_mergeability,
     parse_strong_issue_reference_evidence,
+    post_verified_trusted_pr_protocol_comment,
 )
 from .logging import log
 from .runner import Runner
 from .workdirs import active_workdir
 from .protocol_markers import (
+    MARKER_BY_TOKEN,
     PR_BODY_SURFACE,
     PR_COMMENT_SURFACE,
     TrustedBody,
@@ -58,6 +61,7 @@ V2_ADOPTION_MARKER = "AGENT_LOOP_MANAGED_CI_V2_PR_ADOPTION"
 V2_ADOPTION_FEATURE_MARKERS = (V2_ADOPTION_MARKER,)
 RECOVERY_MARKER = "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1"
 UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
+ISSUE_AUTHORIZATION_MARKER = "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1"
 _TERMINAL_CI_STATUSES = frozenset({
     "success", "failure", "error", "cancelled", "timed_out",
     "action_required", "startup_failure", "stale",
@@ -200,6 +204,57 @@ class AuthenticatedIssueCreatedHandoff:
     lifecycle: Literal[
         "draft-labeled", "draft-unlabeled-reentry", "ready-unlabeled-reentry"
     ] = "draft-labeled"
+    authorization_kind: Literal["creation", "fresh", "continuity"] = "creation"
+    authorization_comment_id: int | None = None
+    approved_plan_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagedCiIssueAuthorization:
+    """Canonical PR-comment authorization for an issue-created managed PR."""
+
+    kind: Literal["creation", "fresh", "continuity"]
+    repository: str
+    issue_number: int
+    pr_number: int
+    base_ref: str
+    head_sha: str
+    actor_login: str
+    actor_id: int
+    protection: str
+    waiver: str
+    nonce: str
+    label_event_id: int
+    predecessor_head: str | None = None
+    predecessor_comment_id: int | None = None
+    round_comment_ids: tuple[int, ...] = ()
+    approved_plan_hash: str | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "version": 1,
+            "kind": self.kind,
+            "repository": self.repository,
+            "issue": self.issue_number,
+            "pr": self.pr_number,
+            "base": self.base_ref,
+            "head": self.head_sha,
+            "actor": self.actor_login,
+            "actor_id": self.actor_id,
+            "protection": self.protection,
+            "waiver": self.waiver,
+            "nonce": self.nonce,
+            "label_event_id": self.label_event_id,
+        }
+        if self.predecessor_head is not None:
+            payload["predecessor_head"] = self.predecessor_head
+        if self.predecessor_comment_id is not None:
+            payload["predecessor_comment_id"] = self.predecessor_comment_id
+        if self.round_comment_ids:
+            payload["round_comment_ids"] = list(self.round_comment_ids)
+        if self.approved_plan_hash is not None:
+            payload["approved_plan_hash"] = self.approved_plan_hash
+        return payload
 
 
 @dataclass(frozen=True)
@@ -220,6 +275,99 @@ class AuthenticatedManagedResume:
     source_sha: str | None = None
     managed_branch: str | None = None
     override_nonce: str | None = None
+
+
+def _encode_issue_authorization_payload(payload: dict[str, object]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def format_issue_created_authorization_comment(
+    authorization: ManagedCiIssueAuthorization,
+) -> TrustedBody:
+    """Render the complete v1 authorization record for a PR comment only."""
+    encoded = _encode_issue_authorization_payload(authorization.to_payload())
+    return TrustedBody.canonical(
+        f"<!-- {ISSUE_AUTHORIZATION_MARKER}: {encoded} -->",
+        surface=PR_COMMENT_SURFACE,
+        expected_tokens=(ISSUE_AUTHORIZATION_MARKER,),
+    )
+
+
+def parse_issue_created_authorization_comment(
+    body: str,
+) -> ManagedCiIssueAuthorization | None:
+    """Parse one strict authorization record without accepting body copies."""
+    occurrences = scan_reserved_markers(body)
+    matches = [
+        occurrence for occurrence in occurrences
+        if occurrence.definition.token == ISSUE_AUTHORIZATION_MARKER
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise AgentLoopError("Managed-CI issue authorization contains duplicate records.")
+    TrustedBody.canonical(
+        body,
+        surface=PR_COMMENT_SURFACE,
+        expected_tokens=(ISSUE_AUTHORIZATION_MARKER,),
+    )
+    match = MARKER_BY_TOKEN[ISSUE_AUTHORIZATION_MARKER].pattern.fullmatch(matches[0].text)
+    if match is None:
+        raise AgentLoopError("Managed-CI issue authorization record is malformed.")
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(match.group("payload").encode("ascii")).decode("utf-8")
+        )
+    except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AgentLoopError("Managed-CI issue authorization record is not valid JSON.") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise AgentLoopError("Managed-CI issue authorization record has an invalid version.")
+    kind = payload.get("kind")
+    if kind not in {"creation", "fresh", "continuity"}:
+        raise AgentLoopError("Managed-CI issue authorization record has an invalid kind.")
+    required_string_fields = (
+        "repository", "base", "head", "actor", "protection", "waiver", "nonce",
+    )
+    if any(not isinstance(payload.get(field), str) or not payload[field] for field in required_string_fields):
+        raise AgentLoopError("Managed-CI issue authorization record is missing required fields.")
+    integer_fields = ("issue", "pr", "actor_id", "label_event_id")
+    if any(not isinstance(payload.get(field), int) or payload[field] <= 0 for field in integer_fields):
+        raise AgentLoopError("Managed-CI issue authorization record has invalid identity fields.")
+    round_comment_ids = payload.get("round_comment_ids", [])
+    if not isinstance(round_comment_ids, list) or any(
+        not isinstance(value, int) or value <= 0 for value in round_comment_ids
+    ):
+        raise AgentLoopError("Managed-CI issue authorization record has invalid round metadata IDs.")
+    predecessor_head = payload.get("predecessor_head")
+    if predecessor_head is not None and (not isinstance(predecessor_head, str) or not predecessor_head):
+        raise AgentLoopError("Managed-CI issue authorization record has an invalid predecessor head.")
+    predecessor_comment_id = payload.get("predecessor_comment_id")
+    if predecessor_comment_id is not None and (
+        not isinstance(predecessor_comment_id, int) or predecessor_comment_id <= 0
+    ):
+        raise AgentLoopError("Managed-CI issue authorization record has an invalid predecessor comment.")
+    plan_hash = payload.get("approved_plan_hash")
+    if plan_hash is not None and (not isinstance(plan_hash, str) or not plan_hash):
+        raise AgentLoopError("Managed-CI issue authorization record has an invalid plan hash.")
+    return ManagedCiIssueAuthorization(
+        kind=kind,
+        repository=payload["repository"],
+        issue_number=payload["issue"],
+        pr_number=payload["pr"],
+        base_ref=payload["base"],
+        head_sha=payload["head"],
+        actor_login=payload["actor"],
+        actor_id=payload["actor_id"],
+        protection=payload["protection"],
+        waiver=payload["waiver"],
+        nonce=payload["nonce"],
+        label_event_id=payload["label_event_id"],
+        predecessor_head=predecessor_head,
+        predecessor_comment_id=predecessor_comment_id,
+        round_comment_ids=tuple(round_comment_ids),
+        approved_plan_hash=plan_hash,
+    )
 
 
 def parse_managed_ci_override_record(
@@ -1026,6 +1174,522 @@ def authenticate_issue_created_handoff(
     )
 
 
+def _authorization_actor(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+) -> tuple[str, int]:
+    """Authenticate the CLI actor against both GitHub identity sources."""
+    who = _api_json(runner, config, "user", quiet=True)
+    login = who.get("login") if isinstance(who.get("login"), str) else None
+    actor_id = who.get("id") if isinstance(who.get("id"), int) else None
+    advertised = _api_json(
+        runner,
+        config,
+        f"repos/{config.repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR",
+        quiet=True,
+    ).get("value")
+    configured = (config.managed_ci_trusted_actor or "").strip()
+    if (
+        not configured
+        or not isinstance(login, str)
+        or not isinstance(actor_id, int)
+        or not isinstance(advertised, str)
+        or login.casefold() != configured.casefold()
+        or login.casefold() != advertised.casefold()
+    ):
+        raise AgentLoopError(
+            "Managed-CI fresh authorization requires the authenticated GitHub user, "
+            "--managed-ci-trusted-actor, and AGENT_LOOP_MANAGED_ACTOR to match."
+        )
+    return login, actor_id
+
+
+def _authorization_comment_records(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    actor_login: str,
+    actor_id: int,
+) -> list[tuple[int, ManagedCiIssueAuthorization]]:
+    comments = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+    )
+    if comments is None:
+        raise AgentLoopError("Managed-CI authorization comments could not be inspected.")
+    records: list[tuple[int, ManagedCiIssueAuthorization]] = []
+    for comment in comments:
+        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        if ISSUE_AUTHORIZATION_MARKER not in body:
+            continue
+        try:
+            parsed = parse_issue_created_authorization_comment(body)
+        except AgentLoopError as exc:
+            raise AgentLoopError(
+                "Managed-CI authorization comment is malformed; refusing to infer authority."
+            ) from exc
+        if parsed is None:
+            continue
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        if user.get("login") != actor_login or user.get("id") != actor_id:
+            raise AgentLoopError(
+                "Managed-CI authorization comment is not authored by the authenticated actor."
+            )
+        comment_id = comment.get("id")
+        if not isinstance(comment_id, int):
+            raise AgentLoopError("Managed-CI authorization comment has no stable identity.")
+        records.append((comment_id, parsed))
+    return records
+
+
+def find_actor_round_metadata_comment_ids(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    actor_login: str,
+    actor_id: int,
+) -> tuple[int, ...]:
+    """Return authenticated PR-comment IDs carrying durable PR round metadata."""
+    comments = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
+    )
+    if comments is None:
+        raise AgentLoopError("Managed-CI continuity could not inspect PR round metadata comments.")
+    result: list[int] = []
+    for comment in comments:
+        body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        comment_id = comment.get("id")
+        if (
+            "AGENT_LOOP_META:" in body
+            and user.get("login") == actor_login
+            and user.get("id") == actor_id
+            and isinstance(comment_id, int)
+        ):
+            result.append(comment_id)
+    return tuple(sorted(set(result)))
+
+
+def publish_issue_created_authorization(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    metadata: PullRequestMetadata,
+    approved_plan_hash: str | None = None,
+) -> AuthenticatedIssueCreatedHandoff:
+    """Persist the creation checkpoint before validating coder test evidence."""
+    if handoff.override_nonce is None:
+        return handoff
+    event = _active_managed_label_event(runner, config=config, pr_number=handoff.pr_number)
+    if event is None or event[1].casefold() != handoff.trusted_actor_login.casefold() or event[2] != handoff.trusted_actor_id:
+        raise AgentLoopError(
+            "Managed-CI issue-created authorization requires an actor-owned managed-label event."
+        )
+    records = _authorization_comment_records(
+        runner,
+        config=config,
+        pr_number=handoff.pr_number,
+        actor_login=handoff.trusted_actor_login,
+        actor_id=handoff.trusted_actor_id,
+    )
+    expected = ManagedCiIssueAuthorization(
+        kind="creation",
+        repository=config.repo,
+        issue_number=handoff.issue_number,
+        pr_number=handoff.pr_number,
+        base_ref=handoff.base_ref,
+        head_sha=handoff.head_sha,
+        actor_login=handoff.trusted_actor_login,
+        actor_id=handoff.trusted_actor_id,
+        protection=handoff.protection_mode,
+        waiver="allow-unprotected-managed-ci",
+        nonce=handoff.override_nonce,
+        label_event_id=event[0],
+        approved_plan_hash=approved_plan_hash,
+    )
+    for comment_id, record in records:
+        if record == expected:
+            return replace(
+                handoff,
+                active_label_event_id=event[0],
+                authorization_kind="creation",
+                authorization_comment_id=comment_id,
+                approved_plan_hash=approved_plan_hash,
+            )
+        if (
+            record.kind == "creation"
+            and record.repository.casefold() == config.repo.casefold()
+            and record.issue_number == handoff.issue_number
+            and record.pr_number == handoff.pr_number
+        ):
+            raise AgentLoopError(
+                "Managed-CI issue-created authorization has conflicting PR-comment provenance."
+            )
+    body = format_issue_created_authorization_comment(expected)
+    comment_id = post_verified_trusted_pr_protocol_comment(
+        runner,
+        config=config,
+        pr_number=handoff.pr_number,
+        body=body,
+        expected_author_login=handoff.trusted_actor_login,
+        expected_author_id=handoff.trusted_actor_id,
+    )
+    return replace(
+        handoff,
+        active_label_event_id=event[0],
+        authorization_kind="creation",
+        authorization_comment_id=comment_id,
+        approved_plan_hash=approved_plan_hash,
+    )
+
+
+def publish_issue_created_continuity_authorization(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    predecessor_head: str,
+    new_head: str,
+    round_comment_ids: tuple[int, ...],
+) -> AuthenticatedIssueCreatedHandoff:
+    """Authorize one orchestrator-produced fix head through a PR comment.
+
+    A coder push is not authority by itself.  The caller reaches this seam only
+    after the dispatched round and live exact head have been validated; this
+    function binds that predecessor/new-head transition to the prior durable
+    authorization and a non-empty set of round metadata identities.
+    """
+    if handoff.override_nonce is None:
+        return handoff
+    if not predecessor_head or not new_head or predecessor_head == new_head:
+        raise AgentLoopError("Managed-CI head continuity requires two distinct exact heads.")
+    if not round_comment_ids or any(value <= 0 for value in round_comment_ids):
+        raise AgentLoopError("Managed-CI head continuity requires durable round metadata identities.")
+    event = _active_managed_label_event(runner, config=config, pr_number=handoff.pr_number)
+    if (
+        event is None
+        or event[1].casefold() != handoff.trusted_actor_login.casefold()
+        or event[2] != handoff.trusted_actor_id
+    ):
+        raise AgentLoopError("Managed-CI head continuity requires an actor-owned active managed-label event.")
+    live_pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{handoff.pr_number}")
+    live_head = live_pr.get("head") if isinstance(live_pr.get("head"), dict) else {}
+    live_base = live_pr.get("base") if isinstance(live_pr.get("base"), dict) else {}
+    live_author = live_pr.get("user") if isinstance(live_pr.get("user"), dict) else {}
+    if (
+        live_pr.get("state") not in {None, "open", "OPEN"}
+        or live_head.get("sha") != new_head
+        or live_head.get("ref") != handoff.branch
+        or (live_head.get("repo") or {}).get("full_name", "").casefold() != config.repo.casefold()
+        or live_base.get("ref") != handoff.base_ref
+        or live_author.get("login", "").casefold() != handoff.trusted_actor_login.casefold()
+        or live_author.get("id") != handoff.trusted_actor_id
+    ):
+        raise AgentLoopError(
+            "Managed-CI head continuity observed a changed live PR tuple; no continuity record was written."
+        )
+    records = _authorization_comment_records(
+        runner,
+        config=config,
+        pr_number=handoff.pr_number,
+        actor_login=handoff.trusted_actor_login,
+        actor_id=handoff.trusted_actor_id,
+    )
+    predecessor_records = [
+        (comment_id, record)
+        for comment_id, record in records
+        if record.head_sha == predecessor_head
+        and record.repository.casefold() == config.repo.casefold()
+        and record.issue_number == handoff.issue_number
+        and record.pr_number == handoff.pr_number
+        and record.base_ref == handoff.base_ref
+        and record.kind in {"creation", "fresh", "continuity"}
+    ]
+    if not predecessor_records:
+        raise AgentLoopError(
+            "Managed-CI head continuity has no unique prior authorization for the predecessor head."
+        )
+    predecessor_comment_id, predecessor = sorted(predecessor_records, key=lambda item: item[0])[-1]
+    normalized_round_comment_ids = tuple(sorted(set(round_comment_ids)))
+    same_transition = [
+        (comment_id, record)
+        for comment_id, record in records
+        if record.kind == "continuity"
+        and record.repository.casefold() == config.repo.casefold()
+        and record.issue_number == handoff.issue_number
+        and record.pr_number == handoff.pr_number
+        and record.base_ref == handoff.base_ref
+        and record.head_sha == new_head
+        and record.predecessor_head == predecessor_head
+        and record.predecessor_comment_id == predecessor_comment_id
+        and record.round_comment_ids == normalized_round_comment_ids
+        and (record.approved_plan_hash or None) == (handoff.approved_plan_hash or None)
+    ]
+    if same_transition:
+        comment_id, _record = sorted(same_transition, key=lambda item: item[0])[-1]
+        return replace(
+            handoff,
+            head_sha=new_head,
+            active_label_event_id=event[0],
+            authorization_kind="continuity",
+            authorization_comment_id=comment_id,
+        )
+    authorization = ManagedCiIssueAuthorization(
+        kind="continuity",
+        repository=config.repo,
+        issue_number=handoff.issue_number,
+        pr_number=handoff.pr_number,
+        base_ref=handoff.base_ref,
+        head_sha=new_head,
+        actor_login=handoff.trusted_actor_login,
+        actor_id=handoff.trusted_actor_id,
+        protection=predecessor.protection,
+        waiver=predecessor.waiver,
+        nonce=secrets.token_urlsafe(24),
+        label_event_id=event[0],
+        predecessor_head=predecessor_head,
+        predecessor_comment_id=predecessor_comment_id,
+        round_comment_ids=normalized_round_comment_ids,
+        approved_plan_hash=handoff.approved_plan_hash,
+    )
+    for comment_id, record in records:
+        if record == authorization:
+            return replace(
+                handoff,
+                head_sha=new_head,
+                active_label_event_id=event[0],
+                authorization_kind="continuity",
+                authorization_comment_id=comment_id,
+            )
+        if (
+            record.kind == "continuity"
+            and record.repository.casefold() == config.repo.casefold()
+            and record.issue_number == handoff.issue_number
+            and record.pr_number == handoff.pr_number
+            and record.predecessor_head == predecessor_head
+            and record.head_sha == new_head
+            and record != authorization
+        ):
+            raise AgentLoopError("Managed-CI head continuity found a conflicting record; refusing to proceed.")
+    comment_id = post_verified_trusted_pr_protocol_comment(
+        runner,
+        config=config,
+        pr_number=handoff.pr_number,
+        body=format_issue_created_authorization_comment(authorization),
+        expected_author_login=handoff.trusted_actor_login,
+        expected_author_id=handoff.trusted_actor_id,
+    )
+    return replace(
+        handoff,
+        head_sha=new_head,
+        active_label_event_id=event[0],
+        authorization_kind="continuity",
+        authorization_comment_id=comment_id,
+    )
+
+
+def _historical_managed_label_event(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    actor_login: str,
+    actor_id: int,
+) -> tuple[int, str, int] | None:
+    events = _api_list(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
+    )
+    if events is None:
+        return None
+    candidates: list[tuple[int, str, int]] = []
+    for event in events:
+        label = event.get("label") if isinstance(event.get("label"), dict) else {}
+        actor = event.get("actor") if isinstance(event.get("actor"), dict) else {}
+        event_id = event.get("id")
+        login = actor.get("login")
+        identity = actor.get("id")
+        if (
+            label.get("name") == MANAGED_LABEL
+            and event.get("event") == "labeled"
+            and isinstance(event_id, int)
+            and isinstance(login, str)
+            and isinstance(identity, int)
+            and login.casefold() == actor_login.casefold()
+            and identity == actor_id
+        ):
+            candidates.append((event_id, login, identity))
+    return sorted(candidates, key=lambda item: item[0])[-1] if candidates else None
+
+
+def authorize_fresh_issue_created_resume(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    issue_number: int,
+    metadata: PullRequestMetadata,
+    approved_plan_hash: str | None = None,
+) -> AuthenticatedIssueCreatedHandoff:
+    """Create a new operator grant for a PR whose original checkpoint is absent."""
+    if not config.allow_unprotected_managed_ci:
+        raise AgentLoopError(
+            "Managed-CI fresh authorization requires --allow-unprotected-managed-ci."
+        )
+    actor_login, actor_id = _authorization_actor(runner, config=config)
+    branch = metadata.head_branch or ""
+    expected_branch = f"agent-loop/managed-{issue_number}"
+    if branch != expected_branch:
+        raise AgentLoopError(
+            f"Managed-CI fresh authorization requires reserved branch `{expected_branch}`; "
+            f"the live PR uses `{branch or '<missing>'}`."
+        )
+    if not config.base or metadata.base_branch != config.base:
+        raise AgentLoopError("Managed-CI fresh authorization does not match the selected base branch.")
+    if metadata.head_sha is None or metadata.repo.casefold() != config.repo.casefold():
+        raise AgentLoopError("Managed-CI fresh authorization requires a same-repository exact live head.")
+    linked = parse_strong_issue_reference_evidence(
+        metadata.body or "", repo=config.repo, issue_number=issue_number
+    )
+    if len(linked) != 1:
+        raise AgentLoopError(
+            "Managed-CI fresh authorization requires one server-observed closing reference "
+            "to the explicit issue scope."
+        )
+    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    author = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+    labels = {
+        item.get("name") for item in (pr.get("labels") or [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+    if (
+        pr.get("state") not in {None, "open", "OPEN"}
+        or head_repo.get("full_name", "").casefold() != config.repo.casefold()
+        or head.get("ref") != expected_branch
+        or head.get("sha") != metadata.head_sha
+        or base.get("ref") != config.base
+        or author.get("login", "").casefold() != actor_login.casefold()
+        or author.get("id") != actor_id
+    ):
+        raise AgentLoopError(
+            "Managed-CI fresh authorization could not authenticate the live PR tuple; "
+            "the PR was left unchanged."
+        )
+    label_event = _historical_managed_label_event(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        actor_login=actor_login,
+        actor_id=actor_id,
+    )
+    if label_event is None:
+        raise AgentLoopError(
+            "Managed-CI fresh authorization requires an actor-owned managed-label event."
+        )
+    records = _authorization_comment_records(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        actor_login=actor_login,
+        actor_id=actor_id,
+    )
+    existing = [
+        (comment_id, record)
+        for comment_id, record in records
+        if record.kind == "fresh"
+        and record.repository.casefold() == config.repo.casefold()
+        and record.issue_number == issue_number
+        and record.pr_number == pr_number
+        and record.base_ref == config.base
+        and record.head_sha == metadata.head_sha
+        and record.actor_login.casefold() == actor_login.casefold()
+        and record.actor_id == actor_id
+        and (record.approved_plan_hash or None) == (approved_plan_hash or None)
+    ]
+    if existing:
+        comment_id, record = sorted(existing, key=lambda item: item[0])[-1]
+        return AuthenticatedIssueCreatedHandoff(
+            pr_number=pr_number,
+            issue_number=issue_number,
+            repository=config.repo,
+            base_ref=config.base,
+            head_sha=metadata.head_sha,
+            branch=expected_branch,
+            trusted_actor_login=actor_login,
+            trusted_actor_id=actor_id,
+            protection_mode=record.protection,
+            override_nonce=record.nonce,
+            active_label_event_id=record.label_event_id,
+            lifecycle=(
+                "draft-labeled" if MANAGED_LABEL in labels
+                else "draft-unlabeled-reentry" if pr.get("draft") is True
+                else "ready-unlabeled-reentry"
+            ),
+            authorization_kind="fresh",
+            authorization_comment_id=comment_id,
+            approved_plan_hash=record.approved_plan_hash,
+        )
+    for _comment_id, record in records:
+        if (
+            record.kind == "fresh"
+            and record.repository.casefold() == config.repo.casefold()
+            and record.issue_number == issue_number
+            and record.pr_number == pr_number
+        ):
+            raise AgentLoopError(
+                "Managed-CI fresh authorization found a conflicting actor-owned record; refusing to proceed."
+            )
+    authorization = ManagedCiIssueAuthorization(
+        kind="fresh",
+        repository=config.repo,
+        issue_number=issue_number,
+        pr_number=pr_number,
+        base_ref=config.base,
+        head_sha=metadata.head_sha,
+        actor_login=actor_login,
+        actor_id=actor_id,
+        protection="voluntary",
+        waiver="allow-unprotected-managed-ci",
+        nonce=secrets.token_urlsafe(24),
+        label_event_id=label_event[0],
+        approved_plan_hash=approved_plan_hash,
+    )
+    comment_id = post_verified_trusted_pr_protocol_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=format_issue_created_authorization_comment(authorization),
+        expected_author_login=actor_login,
+        expected_author_id=actor_id,
+    )
+    return AuthenticatedIssueCreatedHandoff(
+        pr_number=pr_number,
+        issue_number=issue_number,
+        repository=config.repo,
+        base_ref=config.base,
+        head_sha=metadata.head_sha,
+        branch=expected_branch,
+        trusted_actor_login=actor_login,
+        trusted_actor_id=actor_id,
+        protection_mode="voluntary",
+        override_nonce=authorization.nonce,
+        active_label_event_id=label_event[0],
+        lifecycle=(
+            "draft-labeled" if MANAGED_LABEL in labels
+            else "draft-unlabeled-reentry" if pr.get("draft") is True
+            else "ready-unlabeled-reentry"
+        ),
+        authorization_kind="fresh",
+        authorization_comment_id=comment_id,
+        approved_plan_hash=approved_plan_hash,
+    )
+
+
 def revalidate_issue_created_handoff(
     runner: Runner,
     *,
@@ -1036,6 +1700,15 @@ def revalidate_issue_created_handoff(
     """Re-read an authenticated handoff at PR-loop entry before any writer."""
     if handoff.repository.casefold() != config.repo.casefold() or handoff.base_ref != config.base:
         raise AgentLoopError("Managed-CI handoff does not belong to this invocation.")
+    if handoff.authorization_kind == "fresh":
+        return authorize_fresh_issue_created_resume(
+            runner,
+            config=config,
+            pr_number=handoff.pr_number,
+            issue_number=handoff.issue_number,
+            metadata=metadata,
+            approved_plan_hash=handoff.approved_plan_hash,
+        )
     validated = _issue_created_tuple(
         runner,
         config=config,
@@ -1063,7 +1736,12 @@ def revalidate_issue_created_handoff(
         ):
             raise AgentLoopError("Managed-CI direct-resume label provenance changed before activation.")
         validated = replace(validated, active_label_event_id=handoff.active_label_event_id)
-    return validated
+    return replace(
+        validated,
+        authorization_kind=handoff.authorization_kind,
+        authorization_comment_id=handoff.authorization_comment_id,
+        approved_plan_hash=handoff.approved_plan_hash,
+    )
 
 
 def recover_issue_created_handoff(
@@ -1240,7 +1918,8 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--repo", "--base", "--claude-dir", "--codex-dir", "--gemini-dir", "--antigravity-dir",
     "--architecture-path", "--architecture-read-size", "--architecture-snapshot-max-chars",
     "--architecture-aggregate-max-chars", "--managed-context-max-chars",
-    "--coder", "--reviewer", "--max-rounds", "--managed-ci-trusted-actor",
+    "--coder", "--reviewer", "--max-rounds", "--managed-ci-trusted-actor", "--managed-ci-issue",
+    "--managed-ci-issue-number",
     "--implementation-coder", "--implementation-coder-model",
     "--implementation-codex-reasoning-effort", "--implementation-claude-effort",
     "--claude-effort", "--claude-cmd", "--codex-cmd",
@@ -1291,7 +1970,7 @@ _PR_ONLY_RECOVERY_OPTIONS = frozenset({"--managed-ci-adopt-existing-pr"})
 _MANAGED_PR_ONLY_RECOVERY_OPTIONS = frozenset({"--head", "--title", "--body-file"})
 _MANAGED_RECOVERY_OPTIONS = frozenset({
     "--managed-ci", "--managed-ci-trusted-actor", "--allow-unprotected-managed-ci",
-    "--managed-ci-adopt-existing-pr",
+    "--managed-ci-adopt-existing-pr", "--managed-ci-fresh", "--managed-ci-fresh-authorization",
 })
 def _option_name(token: str) -> str:
     return token.split("=", 1)[0]
@@ -1360,6 +2039,8 @@ def _render_recovery_command(
     managed_ci: bool,
     preserve_managed_options: bool = False,
     include_context: bool = True,
+    fresh_authorization: bool = False,
+    fresh_issue_number: int | None = None,
 ) -> str:
     """Build one parser-valid, shell-quoted recovery command.
 
@@ -1388,6 +2069,10 @@ def _render_recovery_command(
                 command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
             if config.allow_unprotected_managed_ci:
                 command.append("--allow-unprotected-managed-ci")
+            if fresh_authorization:
+                command.append("--managed-ci-fresh")
+                if target == "pr" and fresh_issue_number is not None:
+                    command.extend(("--managed-ci-issue", str(fresh_issue_number)))
         return shlex.join(command)
 
     command = list(config.invocation_argv)
@@ -1441,6 +2126,14 @@ def _render_recovery_command(
             command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
         if config.allow_unprotected_managed_ci and not _has_option(command, "--allow-unprotected-managed-ci"):
             command.append("--allow-unprotected-managed-ci")
+        if fresh_authorization:
+            command = _strip_recovery_options(
+                command,
+                names=frozenset({"--managed-ci-fresh", "--managed-ci-fresh-authorization", "--managed-ci-issue"}),
+            )
+            command.append("--managed-ci-fresh")
+            if target == "pr" and fresh_issue_number is not None:
+                command.extend(("--managed-ci-issue", str(fresh_issue_number)))
     return shlex.join(command)
 
 
@@ -1452,6 +2145,8 @@ def render_managed_ci_resume_command(
     preserve_managed_options: bool = False,
     issue_number: int | None = None,
     include_context: bool = True,
+    fresh_authorization: bool = False,
+    fresh_issue_number: int | None = None,
 ) -> str:
     """Render the deterministic, parser-valid, shell-quoted recovery contract."""
     target: Literal["issue", "pr"] = "pr"
@@ -1481,6 +2176,8 @@ def render_managed_ci_resume_command(
         managed_ci=managed_ci,
         preserve_managed_options=preserve_managed_options,
         include_context=include_context,
+        fresh_authorization=fresh_authorization,
+        fresh_issue_number=fresh_issue_number,
     )
 
 
@@ -1502,10 +2199,23 @@ def _restore_ordinary_ci_after_v2_fallback(
         )
     log(config, f"PR #{pr_number}: removed `{MANAGED_LABEL}`; continuing with ordinary CI ({reason})")
     if config.managed_ci:
+        fresh = render_managed_ci_resume_command(
+            config,
+            pr_number=pr_number,
+            issue_number=config.managed_ci_issue_number,
+            managed_ci=True,
+            fresh_authorization=True,
+            fresh_issue_number=config.managed_ci_issue_number,
+        )
+        remedy = (
+            f"Use the explicit fresh issue-created authorization command: `{fresh}`."
+            if any(marker in reason for marker in ("authorization", "provenance", "older head", "missing"))
+            else "Rerun the managed-CI command after restoring the required workflow state."
+        )
         raise AgentLoopError(
             f"--managed-ci requested qualification, but activation failed ({reason}). "
             f"PR #{pr_number} is now draft and unlabeled; this run did NOT qualify its head. "
-            "Rerun the same managed-CI command to start a fresh cycle."
+            + remedy
         )
 
 
@@ -1565,11 +2275,19 @@ def _release_for_ordinary_recovery(
         )
     log(config, f"PR #{pr_number}: selected ordinary unlabeled recovery ({reason})")
     if config.managed_ci:
+        fresh = render_managed_ci_resume_command(
+            config,
+            pr_number=pr_number,
+            issue_number=config.managed_ci_issue_number,
+            managed_ci=True,
+            fresh_authorization=True,
+            fresh_issue_number=config.managed_ci_issue_number,
+        )
         raise AgentLoopError(
             f"--managed-ci requested qualification, but activation failed ({reason}). "
             f"PR #{pr_number} is now draft and unlabeled; this run did NOT qualify its head. "
-            "The previously advertised manual-merge state is suspended. Rerun the same "
-            "managed-CI command to qualify a fresh live head."
+            "The previously advertised manual-merge state is suspended. Use the explicit "
+            f"fresh issue-created authorization command: `{fresh}`."
         )
     return OrdinaryRecoveryCapability(
         pr_number=pr_number,
@@ -1638,16 +2356,55 @@ def _parse_override_audit(body: str) -> dict[str, str] | None:
 
 def _find_resume_audit(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, actor_login: str, actor_id: int,
-    base_ref: str,
+    base_ref: str, issue_number: int | None = None, live_head: str | None = None,
 ) -> tuple[int, dict[str, str]] | None:
-    """Find exactly one actor-owned old issue audit for resume provenance."""
+    """Find one actor-owned PR-comment authorization for resume provenance."""
     comments = _api_list(runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100")
     if comments is None:
         return None
     candidates: list[tuple[int, dict[str, str]]] = []
+    authorization_candidates: list[tuple[int, ManagedCiIssueAuthorization]] = []
     malformed = False
     for comment in comments:
         body = comment.get("body") if isinstance(comment.get("body"), str) else ""
+        if ISSUE_AUTHORIZATION_MARKER in body:
+            try:
+                authorization = parse_issue_created_authorization_comment(body)
+            except AgentLoopError:
+                malformed = True
+                continue
+            user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+            cid = comment.get("id")
+            if (
+                authorization is None
+                or user.get("login") != actor_login
+                or user.get("id") != actor_id
+                or authorization.repository.casefold() != config.repo.casefold()
+                or authorization.base_ref != base_ref
+                or authorization.pr_number != pr_number
+                or (issue_number is not None and authorization.issue_number != issue_number)
+                or not isinstance(cid, int)
+            ):
+                malformed = True
+                continue
+            candidates.append(
+                (
+                    cid,
+                    {
+                        "nonce": authorization.nonce,
+                        "repo": authorization.repository,
+                        "base": authorization.base_ref,
+                        "head": authorization.head_sha,
+                        "protection": authorization.protection,
+                        "active_label_event_id": str(authorization.label_event_id),
+                        "kind": authorization.kind,
+                        "issue": str(authorization.issue_number),
+                        "pr": str(authorization.pr_number),
+                    },
+                )
+            )
+            authorization_candidates.append((cid, authorization))
+            continue
         if UNPROTECTED_OVERRIDE_TRAILER not in body:
             continue
         parsed = _parse_override_audit(body)
@@ -1663,7 +2420,76 @@ def _find_resume_audit(
             malformed = True
             continue
         candidates.append((cid, parsed))
-    if malformed or not candidates:
+    if malformed:
+        return None
+    if authorization_candidates:
+        # Exact byte-equivalent retries are harmless.  Distinct creation or
+        # continuity payloads are authoritative only when they form one
+        # unique root-to-live-head chain; forks and unexplained heads fail
+        # closed instead of letting the newest comment win.
+        unique: dict[ManagedCiIssueAuthorization, list[int]] = {}
+        for comment_id, authorization in authorization_candidates:
+            unique.setdefault(authorization, []).append(comment_id)
+        records = [
+            (max(comment_ids), authorization)
+            for authorization, comment_ids in unique.items()
+        ]
+        if live_head is None:
+            selected = sorted(records, key=lambda item: item[0])[-1]
+            return (
+                selected[0],
+                {
+                    "nonce": selected[1].nonce,
+                    "repo": selected[1].repository,
+                    "base": selected[1].base_ref,
+                    "head": selected[1].head_sha,
+                    "protection": selected[1].protection,
+                    "active_label_event_id": str(selected[1].label_event_id),
+                    "kind": selected[1].kind,
+                    "issue": str(selected[1].issue_number),
+                    "pr": str(selected[1].pr_number),
+                },
+            )
+        by_comment_id = {comment_id: authorization for comment_id, authorization in records}
+        by_head: dict[str, list[tuple[int, ManagedCiIssueAuthorization]]] = {}
+        for comment_id, authorization in records:
+            by_head.setdefault(authorization.head_sha, []).append((comment_id, authorization))
+        terminal = by_head.get(live_head, [])
+        valid_terminals: list[tuple[int, ManagedCiIssueAuthorization]] = []
+        for terminal_comment_id, terminal_record in terminal:
+            current = terminal_record
+            seen: set[ManagedCiIssueAuthorization] = set()
+            while current.kind == "continuity":
+                if current in seen or current.predecessor_comment_id is None or current.predecessor_head is None:
+                    break
+                seen.add(current)
+                predecessor = by_comment_id.get(current.predecessor_comment_id)
+                if predecessor is None or predecessor.head_sha != current.predecessor_head:
+                    break
+                current = predecessor
+            else:
+                if current.kind in {"creation", "fresh"}:
+                    valid_terminals.append((terminal_comment_id, terminal_record))
+        if len({record for _comment_id, record in valid_terminals}) != 1:
+            return None
+        if valid_terminals:
+            selected = max(valid_terminals, key=lambda item: item[0])
+            return (
+                selected[0],
+                {
+                    "nonce": selected[1].nonce,
+                    "repo": selected[1].repository,
+                    "base": selected[1].base_ref,
+                    "head": selected[1].head_sha,
+                    "protection": selected[1].protection,
+                    "active_label_event_id": str(selected[1].label_event_id),
+                    "kind": selected[1].kind,
+                    "issue": str(selected[1].issue_number),
+                    "pr": str(selected[1].pr_number),
+                },
+            )
+        return None
+    if not candidates:
         return None
     # Multiple valid audits are normal after a safe retry. The newest actor-
     # owned record is the latest provenance, while all malformed/mismatched
@@ -1962,6 +2788,13 @@ def _activate_v2_managed_ci(
             prior_audit = _find_resume_audit(
                 runner, config=config, pr_number=pr_number,
                 actor_login=actor_login, actor_id=actor_id, base_ref=base_ref,
+                issue_number=(
+                    managed_resume.issue_created_handoff.issue_number
+                    if managed_resume is not None
+                    and managed_resume.issue_created_handoff is not None
+                    else None
+                ),
+                live_head=live_sha,
             )
             if prior_audit is None:
                 recovery = _release_for_ordinary_recovery(
@@ -1973,6 +2806,19 @@ def _activate_v2_managed_ci(
                 return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
             resume_audit_id, prior_fields = prior_audit
             resume_provenance_head = prior_fields.get("head")
+            if prior_fields.get("kind") and resume_provenance_head != live_sha:
+                recovery = _release_for_ordinary_recovery(
+                    runner, config=config, pr_number=pr_number, base_ref=base_ref,
+                    expected_head_sha=live_sha, active_event=active_event,
+                    reason=(
+                        "the durable issue-created authorization is bound to an older head; "
+                        "no trusted continuity record authorizes the live head"
+                    ),
+                    recovery_capable=ordinary_recovery_capable,
+                )
+                return ManagedCiContract(
+                    activation_path="ordinary_fallback", ordinary_recovery=recovery,
+                )
         elif protection.state != "strict":
             body = pr.get("body") if isinstance(pr.get("body"), str) else ""
             if not config.allow_unprotected_managed_ci or protection.state not in {"voluntary", "plan_limited"}:

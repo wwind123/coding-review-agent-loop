@@ -27,6 +27,7 @@ from coding_review_agent_loop.managed_ci import (
     READINESS_CONTEXT,
     ManagedCiContract,
     ManagedCiProbeContext,
+    ManagedCiIssueAuthorization,
     UNPROTECTED_OVERRIDE_TRAILER,
     assess_exact_head_protection,
     _dispatch_v2_qualification,
@@ -38,6 +39,11 @@ from coding_review_agent_loop.managed_ci import (
     _api_list,
     activate_managed_ci,
     authenticate_issue_created_handoff,
+    authorize_fresh_issue_created_resume,
+    format_issue_created_authorization_comment,
+    parse_issue_created_authorization_comment,
+    publish_issue_created_continuity_authorization,
+    publish_issue_created_authorization,
     dispatch_final_qualification,
     evaluate_managed_ci_readiness,
     intermediate_managed_checks,
@@ -55,6 +61,7 @@ from coding_review_agent_loop.managed_ci import (
     OrdinaryRecoveryCapability,
     refresh_ordinary_recovery_capability,
     _release_for_ordinary_recovery,
+    _find_resume_audit,
     wait_for_ordinary_recovery,
     wait_for_final_qualification,
 )
@@ -444,6 +451,194 @@ def metadata(*, base_branch="main"):
         head_sha="abc123",
         url="https://github.com/OWNER/REPO/pull/7",
     )
+
+
+class AuthorizationCommentRunner(V2ManagedRunner):
+    """Persist the new authorization record like the GitHub comment API."""
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next(
+            (part for part in args if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if endpoint == "repos/OWNER/REPO/issues/7/comments" and "POST" in args:
+            body = self._form_value(args, "body") or ""
+            if "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in body:
+                comment_id = max(
+                    (int(item.get("id", 0)) for item in self.intent_comments if isinstance(item, dict)),
+                    default=16,
+                ) + 1
+                self.intent_comments.append({
+                    "id": comment_id,
+                    "user": {"login": self.actor_login, "id": self.actor_id},
+                    "body": body,
+                })
+                cmd, cwd_path = self._record_command(args, cwd)
+                return CommandResult(
+                    cmd,
+                    cwd_path,
+                    json.dumps({
+                        "id": comment_id,
+                        "body": body,
+                        "user": {"login": self.actor_login, "id": self.actor_id},
+                    }),
+                    "",
+                    0,
+                )
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def _authorization_handoff(*, head="abc123"):
+    return managed_ci.AuthenticatedIssueCreatedHandoff(
+        pr_number=7,
+        issue_number=643,
+        repository="OWNER/REPO",
+        base_ref="main",
+        head_sha=head,
+        branch="agent-loop/managed-643",
+        trusted_actor_login="agent-loop",
+        trusted_actor_id=1,
+        protection_mode="voluntary",
+        override_nonce="nonce-643",
+    )
+
+
+def test_issue_authorization_round_trip_is_comment_only_and_idempotent(tmp_path):
+    authorization = ManagedCiIssueAuthorization(
+        kind="creation",
+        repository="OWNER/REPO",
+        issue_number=643,
+        pr_number=7,
+        base_ref="main",
+        head_sha="abc123",
+        actor_login="agent-loop",
+        actor_id=1,
+        protection="voluntary",
+        waiver="allow-unprotected-managed-ci",
+        nonce="nonce-643",
+        label_event_id=101,
+    )
+    body = format_issue_created_authorization_comment(authorization)
+    assert parse_issue_created_authorization_comment(str(body)) == authorization
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = _authorization_handoff()
+    first = publish_issue_created_authorization(
+        runner, config=config, handoff=handoff, metadata=metadata()
+    )
+    second = publish_issue_created_authorization(
+        runner, config=config, handoff=handoff, metadata=metadata()
+    )
+    assert first.authorization_comment_id == second.authorization_comment_id == 17
+    assert sum(
+        1 for command, _cwd in runner.commands
+        if "issues/7/comments" in " ".join(command) and "POST" in command
+    ) == 1
+
+
+def test_issue_authorization_continuity_accepts_one_gap_free_head_chain(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    initial = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+    runner.rest_pr["head"]["sha"] = "next-head"
+    continued = publish_issue_created_continuity_authorization(
+        runner,
+        config=config,
+        handoff=initial,
+        predecessor_head="abc123",
+        new_head="next-head",
+        round_comment_ids=(88,),
+    )
+    audit = _find_resume_audit(
+        runner,
+        config=config,
+        pr_number=7,
+        actor_login="agent-loop",
+        actor_id=1,
+        base_ref="main",
+        issue_number=643,
+        live_head="next-head",
+    )
+    assert continued.authorization_kind == "continuity"
+    assert audit is not None
+    assert audit[0] == continued.authorization_comment_id
+    assert audit[1]["head"] == "next-head"
+
+
+def test_fresh_issue_authorization_requires_explicit_scope_and_is_idempotent(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    fresh_metadata = replace(
+        metadata(),
+        head_branch="agent-loop/managed-643",
+        body="Fixes #643",
+    )
+    first = authorize_fresh_issue_created_resume(
+        runner,
+        config=config,
+        pr_number=7,
+        issue_number=643,
+        metadata=fresh_metadata,
+        approved_plan_hash="a" * 64,
+    )
+    second = authorize_fresh_issue_created_resume(
+        runner,
+        config=config,
+        pr_number=7,
+        issue_number=643,
+        metadata=fresh_metadata,
+        approved_plan_hash="a" * 64,
+    )
+    assert first.authorization_kind == second.authorization_kind == "fresh"
+    assert first.authorization_comment_id == second.authorization_comment_id == 17
+    assert first.approved_plan_hash == "a" * 64
+
+
+def test_issue_authorization_forked_head_chain_fails_closed(tmp_path):
+    root = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
+        label_event_id=101,
+    )
+    first = ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="next-head", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="first",
+        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        round_comment_ids=(88,),
+    )
+    fork = replace(first, nonce="fork", round_comment_ids=(89,))
+    comments = [
+        {"id": 41, "user": {"login": "agent-loop", "id": 1}, "body": str(format_issue_created_authorization_comment(root))},
+        {"id": 42, "user": {"login": "agent-loop", "id": 1}, "body": str(format_issue_created_authorization_comment(first))},
+        {"id": 43, "user": {"login": "agent-loop", "id": 1}, "body": str(format_issue_created_authorization_comment(fork))},
+    ]
+    runner = V2ManagedRunner(intent_comments=comments, rest_pr={"head": {"sha": "next-head"}})
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    assert _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="next-head",
+    ) is None
 
 
 def test_readiness_resolves_default_base_and_distinguishes_missing_actor_variable(tmp_path):
@@ -968,6 +1163,30 @@ def test_recovery_renderer_retargets_both_directions_with_parser_valid_argv(tmp_
     assert args.issue_number == 643
     assert not hasattr(args, "managed_ci_adopt_existing_pr")
     assert args.managed_ci_trusted_actor == "agent-loop"
+
+
+def test_fresh_authorization_recovery_renderer_requires_explicit_issue_scope(tmp_path):
+    parser = build_parser()
+    config = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    rendered = render_managed_ci_resume_command(
+        config,
+        pr_number=7,
+        issue_number=643,
+        managed_ci=True,
+        fresh_authorization=True,
+        fresh_issue_number=643,
+    )
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.command == "pr"
+    assert args.managed_ci_fresh_authorization is True
+    assert args.managed_ci_issue == 643
+    assert args.allow_unprotected_managed_ci is True
 
     managed_pr_to_issue = make_config(
         tmp_path,

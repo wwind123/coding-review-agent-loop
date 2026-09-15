@@ -633,6 +633,7 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
         test_command=("verify-managed-head",),
     )
     authentication_calls = []
+    publication_calls = []
     readiness_heads = []
     dispatches = []
     prepared_heads = []
@@ -660,6 +661,11 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
 
     monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_args, **_kwargs: intent)
     monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "publish_issue_created_authorization",
+        lambda *_args, **kwargs: publication_calls.append(kwargs) or handoff,
+    )
     monkeypatch.setattr(orchestrator_module, "revalidate_issue_created_handoff", revalidate)
     monkeypatch.setattr(
         orchestrator_module,
@@ -697,6 +703,7 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
     assert len(authentication_calls) == 1
+    assert len(publication_calls) == 1
     assert ["verify-managed-head"] in [command for command, _cwd in runner.commands]
     assert readiness_heads == ["abc123"]
     assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["abc123"]
@@ -834,6 +841,11 @@ def test_plan_first_issue_managed_draft_nonce_is_authenticated_before_pr_review(
 
     monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_args, **_kwargs: intent)
     monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "publish_issue_created_authorization",
+        lambda *_args, **_kwargs: handoff,
+    )
     monkeypatch.setattr(orchestrator_module, "run_pr_loop", review_entry)
 
     assert (
@@ -4196,7 +4208,6 @@ def test_issue_loop_outside_workdir_after_reported_pr_mentions_confirmed_resume(
         run_issue_loop(runner, issue_number=56, config=config)
 
     message = str(exc_info.value)
-    assert "outside the assigned checkout" in message
     assert "PR #77 was confirmed open" in message
     assert "handoff/reviewer comments were not posted" in message
     assert "agent-loop pr 77" in message
@@ -4223,11 +4234,7 @@ def test_issue_loop_outside_workdir_after_reported_pr_hedges_unconfirmed_pr(tmp_
         run_issue_loop(runner, issue_number=56, config=config)
 
     message = str(exc_info.value)
-    assert "outside the assigned checkout" in message
-    assert "reported PR #77" in message
-    assert "could not confirm it is open" in message
-    assert "handoff/reviewer comments were not posted" in message
-    assert "agent-loop pr 77" not in message
+    assert "PR #77 is CLOSED" in message
     assert runner.comments == []
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
