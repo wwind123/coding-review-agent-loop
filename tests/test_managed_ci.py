@@ -470,11 +470,20 @@ def metadata(*, base_branch="main"):
         base_branch=base_branch,
         head_sha="abc123",
         url="https://github.com/OWNER/REPO/pull/7",
+        body=f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=nonce-643",
     )
 
 
 class AuthorizationCommentRunner(V2ManagedRunner):
     """Persist the new authorization record like the GitHub comment API."""
+
+    def __init__(self, **kwargs):
+        rest_pr = dict(kwargs.pop("rest_pr", {}) or {})
+        rest_pr.setdefault("state", "open")
+        rest_pr.setdefault(
+            "body", f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=nonce-643"
+        )
+        super().__init__(rest_pr=rest_pr, **kwargs)
 
     def _run_locked(self, args, *, cwd, check, input_text=None):
         endpoint = next(
@@ -521,6 +530,163 @@ class IdlessAuthorizationCommentRunner(AuthorizationCommentRunner):
                 "", 0,
             )
         return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+class FailingAuthorizationCommentRunner(AuthorizationCommentRunner):
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next(
+            (part for part in args if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if endpoint == "repos/OWNER/REPO/issues/7/comments" and "POST" in args:
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, "", "comment API unavailable", 1)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+class RacedAuthorizationCommentRunner(AuthorizationCommentRunner):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.pull_reads = 0
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next(
+            (part for part in args if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if endpoint == "repos/OWNER/REPO/pulls/7":
+            self.pull_reads += 1
+            if self.pull_reads == 2:
+                self.rest_pr["head"]["sha"] = "raced-head"
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+class _ActivationReached(Exception):
+    """Stop an orchestrator regression immediately after real activation."""
+
+
+def _stop_after_real_activation(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "_freeze_prompt_architecture",
+        lambda _runner, config, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_open_pr",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(_ActivationReached()),
+    )
+
+
+def _workflow_runner_for_issue_authorization(
+    record: ManagedCiIssueAuthorization | None,
+    *,
+    labeled: bool,
+) -> AuthorizationCommentRunner:
+    body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=opening-nonce"
+    comments = [] if record is None else [{
+        "id": 41,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": str(format_issue_created_authorization_comment(record)),
+    }]
+    return AuthorizationCommentRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        issue_payload={"number": 643},
+        pr_payload={
+            "number": 7,
+            "state": "OPEN",
+            "url": "https://github.com/OWNER/REPO/pull/7",
+            "title": "Managed CI",
+            "body": body,
+            "headRefName": "agent-loop/managed-643",
+            "baseRefName": "main",
+            "headRefOid": "abc123",
+            "comments": [],
+            "reviews": [],
+        },
+        rest_pr={
+            "state": "open",
+            "draft": True,
+            "labels": [{"name": MANAGED_LABEL}] if labeled else [],
+            "body": body,
+        },
+        issue_events=[label_event()],
+        intent_comments=comments,
+    )
+
+
+def test_run_pr_loop_ordinary_resume_uses_real_durable_recovery_and_activation(
+    tmp_path, monkeypatch,
+):
+    record = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        nonce="opening-nonce", label_event_id=101,
+    )
+    runner = _workflow_runner_for_issue_authorization(record, labeled=True)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    _stop_after_real_activation(monkeypatch)
+
+    with pytest.raises(_ActivationReached):
+        orchestrator.run_pr_loop(
+            runner, pr_number=7, config=config, workdirs_ready=True,
+        )
+
+    commands = [command for command, _cwd in runner.commands]
+    assert any(
+        UNPROTECTED_OVERRIDE_TRAILER in " ".join(command)
+        and "issues/7/comments" in " ".join(command)
+        for command in commands
+    )
+    assert not any(
+        command[:5] == [
+            "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
+        ]
+        for command in commands
+    )
+    assert runner.dispatch_count == 0
+    assert runner.comments == []
+
+
+def test_run_pr_loop_fresh_recovery_uses_real_authorization_and_activation(
+    tmp_path, monkeypatch,
+):
+    runner = _workflow_runner_for_issue_authorization(None, labeled=False)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=643,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-fresh",
+            "--managed-ci-issue", "643", "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    _stop_after_real_activation(monkeypatch)
+
+    with pytest.raises(_ActivationReached):
+        orchestrator.run_pr_loop(
+            runner, pr_number=7, config=config, workdirs_ready=True,
+        )
+
+    records = [
+        record
+        for comment in runner.intent_comments
+        if (record := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    assert len(records) == 1
+    assert records[0] is not None and records[0].kind == "fresh"
+    assert runner.labels_posted is True
+    assert runner.dispatch_count == 0
+    assert runner.comments == []
 
 
 def _authorization_handoff(*, head="abc123"):
@@ -597,6 +763,32 @@ def test_creation_authorization_publication_requires_verified_comment_id(tmp_pat
         allow_unprotected_managed_ci=True,
     )
     with pytest.raises(AgentLoopError, match="returned no comment ID"):
+        publish_issue_created_authorization(
+            runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+        )
+    assert runner.intent_comments == []
+
+
+def test_creation_authorization_publication_post_failure_is_not_durable(tmp_path):
+    runner = FailingAuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    with pytest.raises(AgentLoopError, match="Unable to persist.*comment API unavailable"):
+        publish_issue_created_authorization(
+            runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+        )
+    assert runner.intent_comments == []
+
+
+def test_creation_authorization_race_writes_no_record(tmp_path):
+    runner = RacedAuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    with pytest.raises(AgentLoopError, match="opening tuple"):
         publish_issue_created_authorization(
             runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
         )
@@ -824,6 +1016,56 @@ def test_fresh_issue_authorization_requires_explicit_scope_and_is_idempotent(tmp
     assert first.authorization_kind == second.authorization_kind == "fresh"
     assert first.authorization_comment_id == second.authorization_comment_id == 17
     assert first.approved_plan_hash == "a" * 64
+
+
+def test_fresh_authorization_binds_plan_limited_protection_assessment(tmp_path):
+    runner = AuthorizationCommentRunner(
+        issue_events=[label_event()],
+        repo_payload={"private": True},
+        pr_branch_protection_returncode=1,
+        pr_branch_protection_stderr=(
+            "HTTP 403: Upgrade to GitHub Pro or make this repository public"
+        ),
+        pr_effective_rules_returncode=1,
+        pr_effective_rules_stderr=(
+            "HTTP 403: Upgrade to GitHub Pro or make this repository public"
+        ),
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    handoff = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+    )
+
+    assert handoff.protection_mode == "plan_limited"
+    record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
+    assert record is not None
+    assert record.protection == "plan_limited"
+
+
+def test_fresh_authorization_race_writes_no_record_or_label(tmp_path):
+    runner = RacedAuthorizationCommentRunner(
+        issue_events=[label_event()],
+        rest_pr={"labels": []},
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    with pytest.raises(AgentLoopError, match="changed live PR tuple"):
+        authorize_fresh_issue_created_resume(
+            runner, config=config, pr_number=7, issue_number=643,
+            metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+        )
+
+    assert runner.intent_comments == []
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
 
 
 def test_fresh_authorization_reuses_existing_creation_for_same_scope(tmp_path):

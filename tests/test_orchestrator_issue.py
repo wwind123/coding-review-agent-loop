@@ -31,6 +31,7 @@ from coding_review_agent_loop.managed_ci import (
     ManagedCiCreationIntent,
     ManagedCiOutcome,
     UNPROTECTED_OVERRIDE_TRAILER,
+    parse_issue_created_authorization_comment,
     parse_managed_ci_override_record,
 )
 from coding_review_agent_loop.issue_pr_handoff import (
@@ -72,6 +73,7 @@ from coding_review_agent_loop.salvage import (
     latest_salvage_summary,
     post_salvage_comment,
 )
+from coding_review_agent_loop.runner import CommandResult
 from agent_loop_helpers import (
     FakeRunner as _FakeRunner,
     command_index,
@@ -4309,6 +4311,313 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
     assert sum(
         command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
     ) == coder_calls
+
+
+_RECOVERY_WORKFLOW = """
+# agent-loop-managed
+# expected_head_sha
+# AGENT_LOOP_MANAGED_CI_V2
+# AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1
+name: CI
+on:
+  pull_request:
+    types: [opened, unlabeled]
+  workflow_dispatch:
+    inputs:
+      protocol_version: {required: true}
+      pr_number: {required: true}
+      expected_head_sha: {required: true}
+      managed_nonce: {required: true}
+jobs:
+  aggregate:
+    name: final-ci/exact-head
+"""
+
+
+class _IssueRecoveryWorkflowRunner(FakeRunner):
+    """Model the server-backed issue/PR tuple used by real recovery seams."""
+
+    def __init__(self, *, labeled, authorization_comments=None, **kwargs):
+        body = (
+            f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} "
+            "nonce=opening-nonce"
+        )
+        pr_payload = {
+            "number": 77,
+            "state": "OPEN",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+            "title": "Managed recovery",
+            "body": body,
+            "headRefName": "agent-loop/managed-56",
+            "baseRefName": "main",
+            "headRefOid": "abc123",
+            "comments": [],
+            "reviews": [],
+        }
+        pr_payload.update(kwargs.pop("pr_payload", {}))
+        super().__init__(pr_payload=pr_payload, **kwargs)
+        self.rest_pr = {
+            "state": "open",
+            "draft": True,
+            "labels": [{"name": "agent-loop-managed"}] if labeled else [],
+            "body": body,
+            "head": {
+                "repo": {"full_name": "OWNER/REPO"},
+                "sha": "abc123",
+                "ref": "agent-loop/managed-56",
+            },
+            "base": {"ref": "main"},
+            "user": {"login": "agent-loop", "id": 1},
+        }
+        self.authorization_comments = list(authorization_comments or [])
+        self.issue_events = [{
+            "id": 101,
+            "event": "labeled",
+            "label": {"name": "agent-loop-managed"},
+            "actor": {"login": "agent-loop", "id": 1},
+        }]
+        self.labels_posted = False
+        self.dispatch_count = 0
+
+    @staticmethod
+    def _form_value(command, name):
+        prefix = f"{name}="
+        return next(
+            (part[len(prefix):] for part in command if part.startswith(prefix)),
+            None,
+        )
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = list(args)
+        endpoint = next(
+            (part for part in command if part.startswith("repos/")), ""
+        )
+        if command == ["gh", "api", "user"]:
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                recorded, cwd_path, json.dumps({"login": "agent-loop", "id": 1}), "", 0
+            )
+        if endpoint.endswith("/actions/variables/AGENT_LOOP_MANAGED_ACTOR"):
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                recorded, cwd_path, json.dumps({"value": "agent-loop"}), "", 0
+            )
+        if endpoint.startswith(
+            "repos/OWNER/REPO/contents/.github/workflows/ci.yml"
+        ):
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(recorded, cwd_path, _RECOVERY_WORKFLOW, "", 0)
+        if endpoint == "repos/OWNER/REPO/pulls/77":
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(recorded, cwd_path, json.dumps(self.rest_pr), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/issues/77/events?"):
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                recorded, cwd_path, json.dumps(self.issue_events), "", 0
+            )
+        if endpoint.startswith("repos/OWNER/REPO/issues/77/comments?"):
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                recorded, cwd_path, json.dumps(self.authorization_comments), "", 0
+            )
+        if endpoint == "repos/OWNER/REPO/issues/77/comments" and "POST" in command:
+            recorded, cwd_path = self._record_command(args, cwd)
+            body = self._form_value(command, "body") or ""
+            comment_id = max(
+                (comment["id"] for comment in self.authorization_comments),
+                default=40,
+            ) + 1
+            comment = {
+                "id": comment_id,
+                "body": body,
+                "user": {"login": "agent-loop", "id": 1},
+            }
+            self.authorization_comments.append(comment)
+            return CommandResult(recorded, cwd_path, json.dumps(comment), "", 0)
+        if endpoint.startswith("repos/OWNER/REPO/issues/56/timeline?"):
+            recorded, cwd_path = self._record_command(args, cwd)
+            timeline = [{
+                "event": "cross-referenced",
+                "source": {
+                    "issue": {
+                        "number": 77,
+                        "pull_request": {"url": "https://api.github.test/pulls/77"},
+                    }
+                },
+            }]
+            return CommandResult(recorded, cwd_path, json.dumps(timeline), "", 0)
+        if endpoint == "repos/OWNER/REPO/issues/77/labels" and "POST" in command:
+            recorded, cwd_path = self._record_command(args, cwd)
+            self.labels_posted = True
+            self.rest_pr["labels"] = [{"name": "agent-loop-managed"}]
+            return CommandResult(recorded, cwd_path, "{}", "", 0)
+        if endpoint == "repos/OWNER/REPO/commits/main":
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                recorded, cwd_path, json.dumps({"sha": "base-sha"}), "", 0
+            )
+        if endpoint.endswith("/actions/workflows/ci.yml/dispatches"):
+            self.dispatch_count += 1
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+class _RealManagedActivationReached(Exception):
+    pass
+
+
+def _stop_issue_resume_after_real_activation(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_freeze_prompt_architecture",
+        lambda _runner, config, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "validate_open_pr",
+        lambda *_args, **_kwargs: (
+            _ for _ in ()
+        ).throw(_RealManagedActivationReached()),
+    )
+
+
+def test_invalid_post_pr_report_then_issue_resume_runs_real_activation_without_reimplementation(
+    tmp_path, monkeypatch,
+):
+    runner = _IssueRecoveryWorkflowRunner(
+        labeled=True,
+        codex_outputs=[
+            "Fixed issue.\nTests: cd /outside && python -m pytest\n"
+            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n"
+            "-- OpenAI Codex"
+        ],
+    )
+    config = make_config(
+        tmp_path, coder="codex", reviewer="claude", managed_ci=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+    )
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56", trusted_actor="agent-loop",
+        protection_mode="voluntary", audit_nonce="opening-nonce",
+    )
+    handoff = _managed_issue_handoff(nonce="opening-nonce")
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
+    )
+
+    with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    records = [
+        parsed
+        for comment in runner.authorization_comments
+        if (parsed := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    assert len(records) == 1 and records[0].kind == "creation"
+    assert runner.comments == []
+    coder_calls = sum(
+        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
+    )
+
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    runner.pr_commit_pages = _provenance_pages(
+        "Implement issue.\n\nAgent-Issue-Provenance: v1 "
+        "repo=owner/repo issue=56 flow=direct"
+    )
+    _stop_issue_resume_after_real_activation(monkeypatch)
+    with pytest.raises(_RealManagedActivationReached):
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert sum(
+        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
+    ) == coder_calls
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert not any(
+        marker in comment
+        for comment in runner.comments
+        for marker in (
+            "AGENT_ISSUE_PR_HANDOFF", "AGENT_STATE: approved",
+            "AGENT_TEST_OBSERVATION", "AGENT_MANAGED_CI_READINESS",
+        )
+    )
+
+
+def test_pre_pr_number_response_rejection_then_fresh_issue_recovery_uses_real_activation(
+    tmp_path, monkeypatch,
+):
+    valid = structured_issue_implementation(
+        pr_number=77,
+        tests_run=["python3 -m pytest tests/test_managed_ci.py -q"],
+    )
+    payload, end = json.JSONDecoder().raw_decode(valid)
+    payload.pop("architecture_impact")
+    rejected = json.dumps(payload) + valid[end:]
+    runner = _IssueRecoveryWorkflowRunner(
+        labeled=False,
+        codex_outputs=[rejected, rejected],
+    )
+    ordinary_config = make_config(
+        tmp_path, coder="codex", reviewer="claude", managed_ci=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        agent_max_retries=0,
+    )
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56", trusted_actor="agent-loop",
+        protection_mode="voluntary", audit_nonce="opening-nonce",
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *_a, **_k: (None, None, ()),
+    )
+
+    with pytest.raises(AgentLoopError, match="architecture_impact"):
+        run_issue_loop(runner, issue_number=56, config=ordinary_config)
+
+    assert runner.authorization_comments == []
+    assert runner.comments == []
+    coder_calls = sum(
+        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
+    )
+
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    runner.pr_commit_pages = _provenance_pages(
+        "Implement issue.\n\nAgent-Issue-Provenance: v1 "
+        "repo=owner/repo issue=56 flow=direct"
+    )
+    fresh_config = replace(
+        ordinary_config,
+        managed_ci_fresh_authorization=True,
+        invocation_argv=(
+            "agent-loop", "issue", "56", "--managed-ci", "--managed-ci-fresh",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    _stop_issue_resume_after_real_activation(monkeypatch)
+    with pytest.raises(_RealManagedActivationReached):
+        run_issue_loop(runner, issue_number=56, config=fresh_config)
+
+    records = [
+        parsed
+        for comment in runner.authorization_comments
+        if (parsed := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    assert len(records) == 1 and records[0].kind == "fresh"
+    assert sum(
+        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
+    ) == coder_calls
+    assert runner.labels_posted is True
+    assert runner.dispatch_count == 0
+    assert runner.comments == []
 
 
 def test_managed_issue_authorization_publication_failure_prints_fresh_recovery(

@@ -6046,7 +6046,14 @@ def _implement_approved_issue(
             resumed_pr_context = get_pr_review_context(
                 runner, config=implementation_config, pr_number=existing_pr_number
             )
-        if resolved_pr.source == "legacy-closing-reference":
+        # Explicit managed recovery may be resuming a PR whose implementation
+        # report was rejected before the canonical handoff checkpoint. Its
+        # durable authorization is sufficient to enter the PR loop, but must
+        # not launder that rejected report into a canonical handoff.
+        if (
+            resolved_pr.source == "legacy-closing-reference"
+            and not implementation_config.managed_ci
+        ):
             pr_url, pr_head_sha = require_pr_metadata_for_handoff(resumed_pr_context.metadata)
             validate_pr_expected_closing_issues(
                 runner,
@@ -8550,7 +8557,13 @@ def run_issue_loop(
                     pr_number=resolved_pr.pr_number,
                     issue_number=staged_parent_issue,
                 )
-            if resolved_pr.source == "legacy-closing-reference":
+            # Keep rejected issue-implementation evidence rejected during an
+            # explicit managed recovery. The PR loop authenticates the
+            # authorization record independently of this legacy association.
+            if (
+                resolved_pr.source == "legacy-closing-reference"
+                and not config.managed_ci
+            ):
                 pr_context = get_pr_review_context(runner, config=config, pr_number=resolved_pr.pr_number)
                 validate_pr_expected_closing_issues(
                     runner,

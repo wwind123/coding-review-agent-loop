@@ -1939,6 +1939,11 @@ an existing valid creation, fresh, or continuity authorization at that exact
 head instead of publishing a competing grant; conflicting records,
 ambiguous provenance, or changed live state fail closed before labels,
 readiness, review dispatch, qualification, or merge writes.
+The grant records the live voluntary or plan-limited protection assessment,
+and the PR tuple, managed-label event, and authorization-comment set are read
+again immediately before publication. Managed issue recovery from a legacy
+association does not backfill a canonical handoff for a response whose report
+was rejected; authorization and coder evidence remain separate checkpoints.
 
 To retry an interrupted issue-created managed draft on an unprotected
 repository and preserve automatic merging, use the explicit per-invocation

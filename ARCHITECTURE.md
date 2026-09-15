@@ -269,6 +269,11 @@ PR-mode recovery fetches that issue from GitHub, resolves any canonical
 approved-plan identity from its durable comments, and requires a server-side
 issue timeline association to the exact PR; candidate-authored closing text is
 not the source of authorization.
+Creation and fresh-authorization publication re-read the live tuple, managed
+label event, and authorization-comment state immediately before writing, and
+fresh grants bind the observed voluntary or plan-limited protection state.
+Legacy PR discovery during explicit managed issue recovery does not synthesize
+a canonical handoff from an implementation response that failed validation.
 
 Automatic authority across a coder repair head is a narrow execution/data-flow
 transition: the orchestrator must have persisted the blocking round, invoked

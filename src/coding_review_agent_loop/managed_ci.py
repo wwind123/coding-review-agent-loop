@@ -1439,13 +1439,6 @@ def publish_issue_created_authorization(
         raise AgentLoopError(
             "Managed-CI issue-created authorization requires an actor-owned managed-label event."
         )
-    records = _authorization_comment_records(
-        runner,
-        config=config,
-        pr_number=handoff.pr_number,
-        actor_login=handoff.trusted_actor_login,
-        actor_id=handoff.trusted_actor_id,
-    )
     expected = ManagedCiIssueAuthorization(
         kind="creation",
         repository=config.repo,
@@ -1460,6 +1453,40 @@ def publish_issue_created_authorization(
         nonce=handoff.override_nonce,
         label_event_id=event[0],
         approved_plan_hash=approved_plan_hash,
+    )
+    # Authentication may have preceded timeline/comment inspection. Re-read
+    # the complete opening tuple and label event immediately before either an
+    # idempotent success or a publication write so a raced head/base/body or
+    # label transition cannot inherit the earlier authorization.
+    _issue_created_tuple(
+        runner,
+        config=config,
+        pr_number=handoff.pr_number,
+        issue_number=handoff.issue_number,
+        metadata=replace(
+            metadata,
+            head_branch=handoff.branch,
+            head_sha=handoff.head_sha,
+            base_branch=handoff.base_ref,
+        ),
+        expected_branch=handoff.branch,
+        expected_nonce=handoff.override_nonce,
+        protection_mode=handoff.protection_mode,
+        lifecycle="draft-labeled",
+    )
+    current_event = _active_managed_label_event(
+        runner, config=config, pr_number=handoff.pr_number
+    )
+    if current_event != event:
+        raise AgentLoopError(
+            "Managed-CI issue-created authorization label provenance changed before publication."
+        )
+    records = _authorization_comment_records(
+        runner,
+        config=config,
+        pr_number=handoff.pr_number,
+        actor_login=handoff.trusted_actor_login,
+        actor_id=handoff.trusted_actor_id,
     )
     for comment_id, record in records:
         if record == expected:
@@ -1708,6 +1735,19 @@ def authorize_fresh_issue_created_resume(
             "Managed-CI fresh authorization requires --allow-unprotected-managed-ci."
         )
     actor_login, actor_id = _authorization_actor(runner, config=config)
+    protection = assess_exact_head_protection(
+        runner,
+        context=ManagedCiProbeContext(
+            config.repo, config.gh_cmd, active_workdir(config)
+        ),
+        base=config.base,
+    )
+    if protection.state not in {"voluntary", "plan_limited"}:
+        raise AgentLoopError(
+            "Managed-CI fresh authorization is only available for an authenticated "
+            "unprotected or plan-limited base; the current protection assessment is "
+            f"{protection.state}."
+        )
     branch = metadata.head_branch or ""
     expected_branch = f"agent-loop/managed-{issue_number}"
     if branch != expected_branch:
@@ -1752,6 +1792,46 @@ def authorize_fresh_issue_created_resume(
         raise AgentLoopError(
             "Managed-CI fresh authorization requires an actor-owned managed-label event."
         )
+
+    def revalidate_live_authorization_tuple() -> None:
+        live_pr = _api_json(
+            runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True
+        )
+        live_head = live_pr.get("head") if isinstance(live_pr.get("head"), dict) else {}
+        live_base = live_pr.get("base") if isinstance(live_pr.get("base"), dict) else {}
+        live_repo = live_head.get("repo") if isinstance(live_head.get("repo"), dict) else {}
+        live_author = (
+            live_pr.get("user") if isinstance(live_pr.get("user"), dict) else {}
+        )
+        live_labels = {
+            item.get("name")
+            for item in (live_pr.get("labels") or [])
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        live_event = _historical_managed_label_event(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            actor_login=actor_login,
+            actor_id=actor_id,
+        )
+        if (
+            live_pr.get("state") not in {None, "open", "OPEN"}
+            or live_pr.get("draft") is not pr.get("draft")
+            or (MANAGED_LABEL in live_labels) != (MANAGED_LABEL in labels)
+            or live_repo.get("full_name", "").casefold() != config.repo.casefold()
+            or live_head.get("ref") != expected_branch
+            or live_head.get("sha") != metadata.head_sha
+            or live_base.get("ref") != config.base
+            or live_author.get("login", "").casefold() != actor_login.casefold()
+            or live_author.get("id") != actor_id
+            or live_event != label_event
+        ):
+            raise AgentLoopError(
+                "Managed-CI fresh authorization observed a changed live PR tuple; "
+                "no authorization record was written."
+            )
+
     records = _authorization_comment_records(
         runner,
         config=config,
@@ -1770,10 +1850,12 @@ def authorize_fresh_issue_created_resume(
         and record.head_sha == metadata.head_sha
         and record.actor_login.casefold() == actor_login.casefold()
         and record.actor_id == actor_id
+        and record.protection == protection.state
         and record.waiver == "allow-unprotected-managed-ci"
         and (record.approved_plan_hash or None) == (approved_plan_hash or None)
     ]
     if existing:
+        revalidate_live_authorization_tuple()
         distinct_existing = {record for _comment_id, record in existing}
         if len(distinct_existing) > 1:
             creation_records = {
@@ -1853,6 +1935,7 @@ def authorize_fresh_issue_created_resume(
         if record.base_ref != config.base
         or record.actor_login.casefold() != actor_login.casefold()
         or record.actor_id != actor_id
+        or record.protection != protection.state
         or record.waiver != "allow-unprotected-managed-ci"
         or (record.approved_plan_hash or None) != (approved_plan_hash or None)
     ]
@@ -1884,7 +1967,7 @@ def authorize_fresh_issue_created_resume(
         head_sha=metadata.head_sha,
         actor_login=actor_login,
         actor_id=actor_id,
-        protection="voluntary",
+        protection=protection.state,
         waiver="allow-unprotected-managed-ci",
         nonce=secrets.token_urlsafe(24),
         label_event_id=label_event[0],
@@ -1892,6 +1975,19 @@ def authorize_fresh_issue_created_resume(
         predecessor_comment_id=(predecessor[0] if predecessor is not None else None),
         approved_plan_hash=approved_plan_hash,
     )
+    revalidate_live_authorization_tuple()
+    latest_records = _authorization_comment_records(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        actor_login=actor_login,
+        actor_id=actor_id,
+    )
+    if latest_records != records:
+        raise AgentLoopError(
+            "Managed-CI fresh authorization records changed before publication; "
+            "no competing authorization was written."
+        )
     comment_id = post_verified_trusted_pr_protocol_comment(
         runner,
         config=config,
@@ -1909,7 +2005,7 @@ def authorize_fresh_issue_created_resume(
         branch=expected_branch,
         trusted_actor_login=actor_login,
         trusted_actor_id=actor_id,
-        protection_mode="voluntary",
+        protection_mode=protection.state,
         override_nonce=authorization.nonce,
         active_label_event_id=label_event[0],
         lifecycle=(
