@@ -3311,6 +3311,7 @@ def _complete_coder_turn(
         shortening_paths = _shortening_artifact_paths(
             coder=coder, issue=issue, round_number=new_round_number
         )
+        _write_text(shortening_paths["original"], raw_text)
         handoff = {
             "attempt_state": "attempted",
             "response_kind": kind,
@@ -3323,6 +3324,7 @@ def _complete_coder_turn(
             "sidecar_completeness": (
                 "prepared" if planning_preflight.prepared else "not-prepared"
             ),
+            "original_response_file": str(shortening_paths["original"]),
             "shortening_prompt_file": str(shortening_paths["prompt"]),
             "shortening_output_file": str(shortening_paths["output"]),
             "shortening_usage_file": str(shortening_paths["usage"]),
