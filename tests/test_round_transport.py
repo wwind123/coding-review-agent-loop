@@ -24,6 +24,7 @@ from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     UnresolvedReviewItem,
     UNKNOWN_MACHINE_AUTHORITY,
+    parse_risk_test_matrix,
     validate_structured_plan_state,
 )
 from coding_review_agent_loop.review_scheduling import ReviewSchedulingContract
@@ -225,6 +226,82 @@ def test_rendered_oversized_execution_recommendation_keeps_anchor_bounded_and_re
         for item in prepared
     )
     anchor_body.validate_for_surface("issue_comment")
+
+
+def test_large_risk_matrix_uses_compact_anchor_and_lossless_sidecar() -> None:
+    rows = []
+    for index in range(11):
+        rows.append(
+            {
+                "row_id": f"row-{index}",
+                "label": f"Transition {index} " + "label " * 40,
+                "entry_path_or_mode": "auto / staged " + "entry " * 40,
+                "initial_state": "approved primary " + "state " * 40,
+                "event": "panel review completes " + "event " * 40,
+                "expected_outcome": "advance exactly once " + "outcome " * 40,
+                "forbidden_side_effects": ["do not duplicate work " + "effect " * 40],
+                "proposed_test_level": "orchestrator",
+                "proposed_test_location": f"tests/test_orchestrator_pr.py::test_transition_{index}",
+                "applicability": "applicable",
+                "related_scope_item_ids": ["scope-review-policy"],
+                "execution_owner": "one-shot",
+            }
+        )
+    matrix = parse_risk_test_matrix(
+        {
+            "applicability": "applicable",
+            "rows": rows,
+            "important_exclusions": ["No unrelated review modes."],
+        }
+    )
+    section = comment_rendering.render_risk_test_matrix_section(matrix)
+    canonical_plan = _random_text(30_000) + "\n" + section
+    body = _attach_round_metadata(
+        canonical_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="codex",
+            round_number=1,
+            subject="large-matrix-plan",
+            canonical_plan=canonical_plan,
+            risk_test_matrix_contract_version=1,
+            risk_test_matrix_payload=matrix.to_payload(),
+            risk_test_matrix_identity=comment_rendering.risk_test_matrix_identity(matrix),
+            risk_test_matrix_boundary_digest=comment_rendering.risk_test_matrix_identity(matrix),
+        ),
+    )
+    assert len(body) > transport._RISK_MATRIX_COMPACT_AT_CHARS
+
+    prepared = transport.prepare_round_comment(body)
+    anchor = str(prepared[-1])
+
+    assert len(anchor) <= transport.MAX_GITHUB_BODY_CHARS
+    assert "- **Rows:** 11" in anchor
+    assert "`row-0`" in anchor and "`row-10`" in anchor
+    assert "Transition 0" in anchor
+    assert "advance exactly once" not in anchor
+    assert "hydrated losslessly" in anchor
+    marker = list(comment_rendering.RISK_TEST_MATRIX_MARKER_RE.finditer(anchor))[-1]
+    decoded = comment_rendering.decode_risk_test_matrix_marker(
+        marker.group("payload"), bodies=tuple(map(str, prepared))
+    )
+    assert decoded["matrix"] == matrix.to_payload()
+    round_payload = _anchor_payload(anchor)
+    hydrated_round, missing = transport.hydrate_mapping(
+        round_payload, tuple(map(str, prepared))
+    )
+    assert missing == set()
+    assert hydrated_round["canonical_plan"] == canonical_plan
+    with pytest.raises(AgentLoopError, match="sidecar unavailable"):
+        comment_rendering.decode_risk_test_matrix_marker(marker.group("payload"))
+    assert any(
+        '"field":"risk_test_matrix_marker"' in base64.urlsafe_b64decode(
+            transport.ROUND_TRANSPORT_SIDECAR_RE.search(str(item)).group("payload")
+        ).decode()
+        for item in prepared[:-1]
+    )
+    prepared[-1].validate_for_surface("issue_comment")
 
 
 def test_prepare_round_comment_spills_multiple_fields_in_fixed_order() -> None:
