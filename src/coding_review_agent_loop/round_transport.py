@@ -363,7 +363,12 @@ def _prepare_risk_test_matrix_transport(
     if not boundaries:
         return transformed, sidecars, None
     section_boundary = boundaries[-1]
-    transported_match = list(_RISK_TEST_MATRIX_RE.finditer(transformed))[-1]
+    transported_matches = list(_RISK_TEST_MATRIX_RE.finditer(transformed))
+    if not transported_matches:
+        raise AgentLoopError(
+            "Risk test matrix transport rewrite lost its protocol marker."
+        )
+    transported_match = transported_matches[-1]
     rows = matrix.get("rows")
     row_index: list[tuple[str, str, str]] = []
     if isinstance(rows, list):
@@ -580,14 +585,14 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             replaceable_token="AGENT_RISK_TEST_MATRIX",
         )
     elif matrix_sidecars:
-        original_matrix = _RISK_TEST_MATRIX_RE.search(str(trusted_anchor))
-        transported_matrix = _RISK_TEST_MATRIX_RE.search(body_text)
-        if original_matrix is not None and transported_matrix is not None:
+        original_matrices = list(_RISK_TEST_MATRIX_RE.finditer(str(trusted_anchor)))
+        transported_matrices = list(_RISK_TEST_MATRIX_RE.finditer(body_text))
+        if original_matrices and transported_matrices:
             trusted_anchor = _replace_authorized_marker(
                 trusted_anchor,
                 token="AGENT_RISK_TEST_MATRIX",
-                old_text=original_matrix.group(0),
-                new_text=transported_matrix.group(0),
+                old_text=original_matrices[-1].group(0),
+                new_text=transported_matrices[-1].group(0),
             )
     matches = list(ROUND_RESUME_MARKER_RE.finditer(body_text))
     if len(body_text) > MAX_GITHUB_BODY_CHARS and not matches and not sidecars:
