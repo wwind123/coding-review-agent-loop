@@ -351,6 +351,30 @@ def parse_issue_created_authorization_comment(
     plan_hash = payload.get("approved_plan_hash")
     if plan_hash is not None and (not isinstance(plan_hash, str) or not plan_hash):
         raise AgentLoopError("Managed-CI issue authorization record has an invalid plan hash.")
+    allowed_fields = {
+        "version", "kind", "repository", "issue", "pr", "base", "head", "actor",
+        "actor_id", "protection", "waiver", "nonce", "label_event_id",
+        "predecessor_head", "predecessor_comment_id", "round_comment_ids",
+        "approved_plan_hash",
+    }
+    if set(payload) - allowed_fields:
+        raise AgentLoopError("Managed-CI issue authorization record has unknown fields.")
+    if kind == "creation" and (
+        predecessor_head is not None
+        or predecessor_comment_id is not None
+        or round_comment_ids
+    ):
+        raise AgentLoopError(
+            "Managed-CI creation authorization cannot contain continuity fields."
+        )
+    if kind == "continuity" and (
+        predecessor_head is None
+        or predecessor_comment_id is None
+        or not round_comment_ids
+    ):
+        raise AgentLoopError(
+            "Managed-CI continuity authorization requires predecessor and round metadata."
+        )
     return ManagedCiIssueAuthorization(
         kind=kind,
         repository=payload["repository"],
@@ -2188,6 +2212,10 @@ def recover_issue_created_handoff(
             actor_login=handoff.trusted_actor_login,
             actor_id=handoff.trusted_actor_id,
             base_ref=handoff.base_ref,
+            issue_number=handoff.issue_number,
+            live_head=handoff.head_sha,
+            expected_handoff=handoff,
+            expected_protection=(handoff.protection_mode if record is not None else None),
         ) is None:
             raise AgentLoopError(
                 "Managed-CI issue-created resume found malformed or uncorrelated override audit provenance."
@@ -2360,6 +2388,22 @@ def _has_option(argv: list[str], name: str) -> bool:
     return any(_option_name(token) == name for token in argv)
 
 
+def _issue_created_rendering_issue_number(
+    managed_resume: AuthenticatedManagedResume | None,
+    *,
+    origin: str,
+    head_ref: str | None,
+) -> int | None:
+    """Return an issue hint for diagnostics, never for authorization."""
+    if origin != "issue-created":
+        return None
+    handoff = managed_resume.issue_created_handoff if managed_resume is not None else None
+    if handoff is not None and handoff.issue_number > 0:
+        return handoff.issue_number
+    match = re.fullmatch(r"agent-loop/managed-([1-9]\d*)", head_ref or "")
+    return int(match.group(1)) if match is not None else None
+
+
 def _render_recovery_command(
     config: AgentLoopConfig,
     *,
@@ -2398,7 +2442,7 @@ def _render_recovery_command(
                 command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
             if config.allow_unprotected_managed_ci:
                 command.append("--allow-unprotected-managed-ci")
-            if fresh_authorization:
+            if fresh_authorization and (target != "pr" or fresh_issue_number is not None):
                 command.append("--managed-ci-fresh")
                 if target == "pr" and fresh_issue_number is not None:
                     command.extend(("--managed-ci-issue", str(fresh_issue_number)))
@@ -2455,7 +2499,7 @@ def _render_recovery_command(
             command.extend(("--managed-ci-trusted-actor", config.managed_ci_trusted_actor))
         if config.allow_unprotected_managed_ci and not _has_option(command, "--allow-unprotected-managed-ci"):
             command.append("--allow-unprotected-managed-ci")
-        if fresh_authorization:
+        if fresh_authorization and (target != "pr" or fresh_issue_number is not None):
             command = _strip_recovery_options(
                 command,
                 names=frozenset({"--managed-ci-fresh", "--managed-ci-fresh-authorization", "--managed-ci-issue"}),
@@ -2498,6 +2542,12 @@ def render_managed_ci_resume_command(
                 )
                 if positional_index is not None:
                     identifier = int(config.invocation_argv[positional_index])
+    # PR-mode fresh authorization has a required issue scope. Callers often
+    # already have it as ``issue_number`` from authenticated recovery, so use
+    # that value for rendering rather than silently producing a parser-invalid
+    # command when the dedicated rendering argument was omitted.
+    if fresh_authorization and target == "pr" and fresh_issue_number is None:
+        fresh_issue_number = issue_number
     return _render_recovery_command(
         config,
         target=target,
@@ -2528,19 +2578,12 @@ def _restore_ordinary_ci_after_v2_fallback(
         )
     log(config, f"PR #{pr_number}: removed `{MANAGED_LABEL}`; continuing with ordinary CI ({reason})")
     if config.managed_ci:
-        fresh = render_managed_ci_resume_command(
-            config,
-            pr_number=pr_number,
-            issue_number=config.managed_ci_issue_number,
-            managed_ci=True,
-            fresh_authorization=True,
-            fresh_issue_number=config.managed_ci_issue_number,
-        )
-        remedy = (
-            f"Use the explicit fresh issue-created authorization command: `{fresh}`."
-            if any(marker in reason for marker in ("authorization", "provenance", "older head", "missing"))
-            else "Rerun the managed-CI command after restoring the required workflow state."
-        )
+        # This helper is used before an issue-created handoff has been
+        # authenticated. It must not advertise the exceptional issue-created
+        # grant for an adoption/source-managed invocation or invent an issue
+        # scope from configuration. Recovery with an authenticated issue hint
+        # is rendered by _release_for_ordinary_recovery instead.
+        remedy = "Rerun the managed-CI command after restoring the required workflow state."
         raise AgentLoopError(
             f"--managed-ci requested qualification, but activation failed ({reason}). "
             f"PR #{pr_number} is now draft and unlabeled; this run did NOT qualify its head. "
@@ -2697,13 +2740,14 @@ def _find_resume_audit(
     base_ref: str, issue_number: int | None = None, live_head: str | None = None,
     expected_handoff: AuthenticatedIssueCreatedHandoff | None = None,
     expected_protection: str | None = None,
+    require_actor_owned_label_event: bool = False,
 ) -> tuple[int, dict[str, str]] | None:
     """Find one actor-owned PR-comment authorization for resume provenance."""
     comments = _api_list(runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100")
     if comments is None:
         return None
     valid_label_event_ids: set[int] | None = None
-    if expected_handoff is not None:
+    if expected_handoff is not None or require_actor_owned_label_event:
         events = _api_list(
             runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
         )
@@ -2735,6 +2779,11 @@ def _find_resume_audit(
             or (
                 valid_label_event_ids is not None
                 and authorization.label_event_id not in valid_label_event_ids
+            )
+            or (
+                expected_handoff is not None
+                and expected_handoff.active_label_event_id is not None
+                and authorization.label_event_id != expected_handoff.active_label_event_id
             )
         ):
             return False
@@ -2823,6 +2872,12 @@ def _find_resume_audit(
             continue
         candidates.append((cid, parsed))
     if malformed:
+        return None
+    # The legacy trailer-only audit is useful as historical diagnostic text,
+    # but it is not a substitute for the centrally bound authorization record.
+    # If no versioned record exists, it must not authorize an issue-created
+    # resume merely because its comment author is trusted.
+    if candidates and not authorization_candidates and expected_handoff is not None:
         return None
     if authorization_candidates:
         # Exact byte-equivalent retries are harmless.  Distinct creation or
@@ -3040,6 +3095,9 @@ def _activate_v2_managed_ci(
         or ("source-managed" if config.pr_origin_flow == "managed-pr" else "issue-created")
     )
     lifecycle = managed_resume.lifecycle if managed_resume is not None else "draft-labeled"
+    issue_hint = _issue_created_rendering_issue_number(
+        managed_resume, origin=origin, head_ref=head_ref
+    )
 
     # Authenticate durable issue-created authority before any ready/draft or
     # label mutation.  In particular, draft/unlabeled recovery must not POST a
@@ -3058,6 +3116,7 @@ def _activate_v2_managed_ci(
                 expected_head_sha=live_sha, active_event=None,
                 reason="the active managed-label event is temporarily unreadable",
                 recovery_capable=ordinary_recovery_capable,
+                fresh_issue_number=issue_hint,
             )
             return ManagedCiContract(
                 activation_path="ordinary_fallback", ordinary_recovery=recovery,
@@ -3071,6 +3130,7 @@ def _activate_v2_managed_ci(
                 expected_head_sha=live_sha, active_event=preflight_event,
                 reason="the active managed-label event is not actor-owned",
                 recovery_capable=ordinary_recovery_capable,
+                fresh_issue_number=issue_hint,
             )
             return ManagedCiContract(
                 activation_path="ordinary_fallback", ordinary_recovery=None,
@@ -3083,7 +3143,6 @@ def _activate_v2_managed_ci(
         )
         if protection.state != "strict" and managed_resume is not None:
             handoff = managed_resume.issue_created_handoff
-            issue_hint = handoff.issue_number if handoff is not None else None
             if (
                 not config.allow_unprotected_managed_ci
                 or protection.state not in {"voluntary", "plan_limited"}
@@ -3097,6 +3156,7 @@ def _activate_v2_managed_ci(
                         runner, config=config, pr_number=pr_number, base_ref=base_ref,
                         expected_head_sha=live_sha, active_event=existing_event, reason=reason,
                         recovery_capable=ordinary_recovery_capable,
+                        fresh_issue_number=issue_hint,
                     )
                     return ManagedCiContract(
                         activation_path="ordinary_fallback", ordinary_recovery=recovery,
@@ -3111,6 +3171,7 @@ def _activate_v2_managed_ci(
                 actor_login=actor_login, actor_id=actor_id, base_ref=base_ref,
                 issue_number=issue_hint, live_head=live_sha,
                 expected_handoff=handoff, expected_protection=protection.state,
+                require_actor_owned_label_event=True,
             )
             if prior_audit is None:
                 reason = "no fully bound actor-owned issue-created authorization reaches the live head"
@@ -3122,7 +3183,7 @@ def _activate_v2_managed_ci(
                         runner, config=config, pr_number=pr_number, base_ref=base_ref,
                         expected_head_sha=live_sha, active_event=existing_event, reason=reason,
                         recovery_capable=ordinary_recovery_capable,
-                        fresh_issue_number=(issue_hint if origin == "issue-created" else None),
+                        fresh_issue_number=issue_hint,
                     )
                     return ManagedCiContract(
                         activation_path="ordinary_fallback", ordinary_recovery=recovery,
@@ -3159,7 +3220,7 @@ def _activate_v2_managed_ci(
                         runner, config=config, pr_number=pr_number, base_ref=base_ref,
                         expected_head_sha=live_sha, active_event=existing_event,
                         reason=reason, recovery_capable=ordinary_recovery_capable,
-                        fresh_issue_number=(issue_hint if origin == "issue-created" else None),
+                        fresh_issue_number=issue_hint,
                     )
                     return ManagedCiContract(
                         activation_path="ordinary_fallback", ordinary_recovery=recovery,
@@ -3168,6 +3229,45 @@ def _activate_v2_managed_ci(
                     f"--managed-ci requested qualification, but activation failed ({reason}). "
                     f"PR #{pr_number} was left unchanged and this run did NOT qualify its head."
                 )
+
+    # Strict protection removes the need for an unprotected waiver, but it
+    # does not make an unlabeled draft an authenticated managed re-entry. The
+    # label below suppresses the hosted opening route, so require the same
+    # versioned PR-comment authorization checkpoint before applying it. This
+    # guard is limited to issue-created recovery; other origins have separate
+    # authorization contracts.
+    if (
+        managed_resume is not None
+        and origin == "issue-created"
+        and lifecycle == "draft-unlabeled-reentry"
+        and protection.state == "strict"
+    ):
+        prior_audit = _find_resume_audit(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            actor_login=actor_login,
+            actor_id=actor_id,
+            base_ref=base_ref,
+            issue_number=issue_hint,
+            live_head=live_sha,
+            expected_handoff=managed_resume.issue_created_handoff,
+            expected_protection=protection.state,
+            require_actor_owned_label_event=True,
+        )
+        if prior_audit is None:
+            command = render_managed_ci_resume_command(
+                config, pr_number=pr_number, managed_ci=True,
+            )
+            raise AgentLoopError(
+                f"--managed-ci requested qualification, but activation failed because no fully "
+                f"bound actor-owned issue-created authorization reaches live head {live_sha}. "
+                f"PR #{pr_number} was left draft and unlabeled; no label, dispatch, readiness, "
+                f"or qualification write was made. Restore the authorization checkpoint before "
+                f"retrying `{command}`."
+            )
+        resume_audit_id, prior_fields = prior_audit
+        resume_provenance_head = prior_fields.get("head")
 
     # A successful explicit manual run leaves a managed PR ready and
     # unlabeled. Re-entry is a privileged mutation: it is allowed only when
@@ -3295,6 +3395,7 @@ def _activate_v2_managed_ci(
                 expected_head_sha=live_sha, active_event=active_event,
                 reason="the active managed-label event is temporarily unreadable",
                 recovery_capable=ordinary_recovery_capable,
+                fresh_issue_number=issue_hint,
             )
             return ManagedCiContract(
                 activation_path="ordinary_fallback",
@@ -3306,6 +3407,7 @@ def _activate_v2_managed_ci(
                 expected_head_sha=live_sha, active_event=active_event,
                 reason="the active managed-label event is not actor-owned",
                 recovery_capable=ordinary_recovery_capable,
+                fresh_issue_number=issue_hint,
             )
             return ManagedCiContract(
                 activation_path="ordinary_fallback",
@@ -3410,6 +3512,7 @@ def _activate_v2_managed_ci(
                 expected_head_sha=live_sha, active_event=live_event,
                 reason="the immutable resume tuple changed before activation",
                 recovery_capable=ordinary_recovery_capable,
+                fresh_issue_number=issue_hint,
             )
             return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
         if protection.state != "strict":
@@ -3438,6 +3541,7 @@ def _activate_v2_managed_ci(
                     expected_head_sha=live_sha, active_event=active_event,
                     reason="the fresh resume audit could not be recorded",
                     recovery_capable=ordinary_recovery_capable,
+                    fresh_issue_number=issue_hint,
                 )
                 return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
             try:
@@ -3450,6 +3554,7 @@ def _activate_v2_managed_ci(
                     expected_head_sha=live_sha, active_event=active_event,
                     reason="the fresh resume audit response was malformed",
                     recovery_capable=ordinary_recovery_capable,
+                    fresh_issue_number=issue_hint,
                 )
                 return ManagedCiContract(activation_path="ordinary_fallback", ordinary_recovery=recovery)
         else:
@@ -4072,6 +4177,15 @@ def _dispatch_v2_qualification(
             expected_head_sha=expected_head_sha, active_event=event,
             reason=f"fresh intent ledger could not be reconciled ({exc})",
             recovery_capable=contract.ordinary_recovery_capable,
+            fresh_issue_number=(
+                contract.authenticated_resume.issue_created_handoff.issue_number
+                if (
+                    contract.authenticated_resume is not None
+                    and contract.authenticated_resume.origin == "issue-created"
+                    and contract.authenticated_resume.issue_created_handoff is not None
+                )
+                else None
+            ),
         )
         contract.activation_path = "ordinary_fallback"
         contract.ordinary_recovery = recovery
