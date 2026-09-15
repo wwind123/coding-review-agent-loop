@@ -1069,6 +1069,108 @@ class TestStateManager:
             )
         assert excinfo.value.code == 1
 
+    def test_host_initial_oversize_persists_original_before_handoff(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+        from coding_review_agent_loop.round_transport import PlanningPreflightOutcome
+
+        raw_payload, footer_start = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        raw_payload["summary"] = "Please " * 12_000
+        original_text = json.dumps(raw_payload) + _VALID_PLAN_STATE[footer_start:]
+        plan_file = tmp_path / "plan.json"
+        plan_file.write_text(original_text, encoding="utf-8")
+        repair_base = tmp_path / "repair"
+        monkeypatch.setattr(skill_runner, "_REPAIR_BASE", repair_base)
+        state_writes: list[dict] = []
+
+        def fake_run_helper(*args, **_kwargs):
+            if args[:2] == ("helpers.state_manager", "write-session"):
+                fields_index = args.index("--fields")
+                state_writes.append(json.loads(args[fields_index + 1]))
+            elif args[:2] == ("helpers.state_manager", "attach-metadata"):
+                body_file = Path(args[args.index("--body-file") + 1])
+                output_file = Path(args[args.index("--output") + 1])
+                output_file.write_text(body_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+        monkeypatch.setattr(skill_runner, "_run_helper", fake_run_helper)
+        monkeypatch.setattr(
+            skill_runner,
+            "_run_helper_capture",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        )
+        monkeypatch.setattr(
+            skill_runner,
+            "preflight_planning_publication",
+            lambda *_args, **_kwargs: PlanningPreflightOutcome(
+                status="shortening-required",
+                response_ceiling_chars=46_000,
+                original_response_chars=len(original_text),
+                diagnostic="response guidance exceeded",
+            ),
+        )
+
+        args = types.SimpleNamespace(
+            issue=9993,
+            repo="OWNER/REPO",
+            shortened_plan_file=None,
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            skill_runner._run_host_coder_phase(args, plan_file, {"completed_round_number": 0}, False)
+
+        assert excinfo.value.code == 2
+        original_artifact = (
+            repair_base / "9993-r1-claude-coder" / "plan-shortening-original.md"
+        )
+        assert original_artifact.read_text(encoding="utf-8") == original_text
+        handoff = state_writes[-1]["planning_shortening"]
+        assert handoff["attempt_state"] == "attempt-required"
+        assert handoff["attempt_consumed"] is False
+        assert handoff["original_response"] == original_text
+
+    def test_host_reentry_rejects_a_conflicting_candidate_already_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        from helpers import skill_runner
+
+        original_text = _VALID_PLAN_STATE
+        persisted_candidate = tmp_path / "persisted-shortened.json"
+        persisted_candidate.write_text(_VALID_PLAN_STATE, encoding="utf-8")
+        supplied_candidate = tmp_path / "different-shortened.json"
+        payload, footer_start = json.JSONDecoder().raw_decode(_VALID_PLAN_STATE)
+        payload["summary"] = "A different candidate."
+        supplied_candidate.write_text(
+            json.dumps(payload) + _VALID_PLAN_STATE[footer_start:], encoding="utf-8"
+        )
+        args = types.SimpleNamespace(
+            issue=9992,
+            repo="OWNER/REPO",
+            shortened_plan_file=str(supplied_candidate),
+        )
+        handoff = {
+            "attempt_state": "attempt-required",
+            "response_kind": "plan_state",
+            "expected_kind": "plan_state",
+            "original_response": original_text,
+            "original_digest": __import__("hashlib").sha256(
+                original_text.encode("utf-8")
+            ).hexdigest(),
+            "shortening_output_file": str(persisted_candidate),
+            "candidate_digest": __import__("hashlib").sha256(
+                persisted_candidate.read_bytes()
+            ).hexdigest(),
+        }
+        with pytest.raises(SystemExit) as excinfo:
+            skill_runner._run_host_coder_phase(
+                args,
+                tmp_path / "original-plan.json",
+                {"completed_round_number": 0, "planning_shortening": handoff},
+                True,
+            )
+        assert excinfo.value.code == 1
+
     def test_host_shortening_restart_reuses_consumed_candidate_artifact(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

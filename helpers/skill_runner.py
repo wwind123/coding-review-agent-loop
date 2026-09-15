@@ -217,6 +217,11 @@ _REPAIR_BASE = Path(tempfile.gettempdir()) / "coding-review-agent-loop" / "repai
 def _shortening_artifact_paths(*, coder: str, issue: int, round_number: int) -> dict[str, Path]:
     """Return stable paths for the single external plan-shortening attempt."""
     repair_dir = _REPAIR_BASE / f"{issue}-r{round_number}-{coder}-coder"
+    # Host-as-coder planning can enter this path before a coder repair
+    # directory exists.  Create the stable directory at the handoff boundary
+    # so the original candidate is durable before the operator is asked to
+    # perform the one allowed shortening turn.
+    repair_dir.mkdir(parents=True, exist_ok=True)
     return {
         "repair_dir": repair_dir,
         "original": repair_dir / "plan-shortening-original.md",
@@ -3367,9 +3372,30 @@ def _complete_coder_turn(
     )
     if planning_preflight.status != "fits":
         if shortening_attempted:
+            failure = planning_preflight.diagnostic or planning_preflight.status
+            if isinstance(shortening_handoff, Mapping) and not dry_run:
+                # The one provider turn has already been consumed.  Persist a
+                # terminal result before returning so restart reports the
+                # recorded candidate/failure instead of re-entering the
+                # publication path as if another attempt were available.
+                _run_helper(
+                    "helpers.state_manager", "write-session",
+                    "--issue", str(issue), "--repo", repo,
+                    "--fields", json.dumps({
+                        "planning_shortening": {
+                            **shortening_handoff,
+                            "attempt_state": "unrecoverable",
+                            "attempt_consumed": True,
+                            "failure": failure,
+                            "sidecar_completeness": (
+                                "prepared" if planning_preflight.prepared else "not-prepared"
+                            ),
+                        }
+                    }),
+                )
             raise _ValidationError(
                 "skill_runner: the single plan-shortening attempt did not produce a "
-                f"postable carrier: {planning_preflight.diagnostic or planning_preflight.status}"
+                f"postable carrier: {failure}"
             )
         shortening_paths = _shortening_artifact_paths(
             coder=coder, issue=issue, round_number=new_round_number
@@ -3377,6 +3403,7 @@ def _complete_coder_turn(
         _write_text(shortening_paths["original"], raw_text)
         handoff = {
             "attempt_state": "attempted",
+            "attempt_consumed": True,
             "response_kind": kind,
             "expected_kind": kind,
             "original_response": raw_text,
@@ -3417,7 +3444,6 @@ def _complete_coder_turn(
         # producer response is retained in the repair directory and is the
         # preservation source for the one allowed shortening turn.
         prior_items = tuple(_deserialize_unresolved_item(item) for item in next_prior_items_raw)
-        from helpers.prompt_builders import build_plan_shortening_prompt_for_skill
         shortening_prompt = build_plan_shortening_prompt_for_skill(
             raw_text,
             repo=repo,
@@ -3474,6 +3500,19 @@ def _complete_coder_turn(
                 require_risk_test_matrix_contract=bool(require_risk_test_matrix_contract),
             )
         except (AgentLoopError, ValueError, TypeError) as exc:
+            failure = f"shortened plan rejected: {exc}"
+            rejected_handoff = {
+                **handoff,
+                "attempt_state": "unrecoverable",
+                "attempt_consumed": True,
+                "failure": failure,
+            }
+            if not dry_run:
+                _run_helper(
+                    "helpers.state_manager", "write-session",
+                    "--issue", str(issue), "--repo", repo,
+                    "--fields", json.dumps({"planning_shortening": rejected_handoff}),
+                )
             raise _ValidationError(f"skill_runner: shortened plan rejected: {exc}") from exc
         # Keep the producer response in repair_dir/raw.md. The shortening
         # candidate is a separate durable artifact so restart can complete
@@ -4358,24 +4397,54 @@ def _run_host_coder_phase(
                     issue=issue,
                     round_number=int(resume.get("completed_round_number", 0)) + 1,
                 )["output"]
+            persisted_candidate_file.parent.mkdir(parents=True, exist_ok=True)
             # Consume the allowance before validation and before writing the
-            # candidate. A crash after this transition fails closed rather than
-            # allowing a different supplied file to replace the one attempt.
+            # candidate. If an earlier process wrote the stable artifact but
+            # died before the state transition, only the exact same candidate
+            # may complete this handoff; a different file cannot replace it.
             candidate_digest = hashlib.sha256(candidate_text.encode("utf-8")).hexdigest()
+            recorded_candidate_digest = planning_handoff.get("candidate_digest")
+            if (
+                recorded_candidate_digest is not None
+                and recorded_candidate_digest != candidate_digest
+            ):
+                print(
+                    "skill_runner: shortened plan does not match the candidate "
+                    "already recorded for this handoff; re-entry is rejected.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if persisted_candidate_file.exists():
+                try:
+                    existing_candidate = persisted_candidate_file.read_text(encoding="utf-8")
+                except OSError as exc:
+                    print(
+                        f"skill_runner: cannot read the persisted shortening candidate: {exc}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                if existing_candidate and existing_candidate != candidate_text:
+                    print(
+                        "skill_runner: persisted shortening candidate conflicts with "
+                        "the supplied re-entry file; re-entry is rejected.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
             planning_handoff = {
                 **planning_handoff,
                 "attempt_state": "attempted",
+                "attempt_consumed": True,
                 "shortening_output_file": str(persisted_candidate_file),
                 "candidate_digest": candidate_digest,
             }
             resume["planning_shortening"] = planning_handoff
+            _write_text(persisted_candidate_file, candidate_text)
             if not dry_run:
                 _run_helper(
                     "helpers.state_manager", "write-session",
                     "--issue", str(issue), "--repo", repo,
                     "--fields", json.dumps({"planning_shortening": planning_handoff}),
                 )
-            _write_text(persisted_candidate_file, candidate_text)
             handoff_candidate_file = persisted_candidate_file
         else:
             print(
@@ -4460,6 +4529,7 @@ def _run_host_coder_phase(
                 require_risk_test_matrix_contract=True,
             )
         except (AgentLoopError, ValueError, TypeError) as exc:
+            failure = f"shortened candidate rejected: {exc}"
             if not dry_run:
                 _run_helper(
                     "helpers.state_manager", "write-session",
@@ -4467,11 +4537,13 @@ def _run_host_coder_phase(
                     "--fields", json.dumps({
                         "planning_shortening": {
                             **planning_handoff,
-                            "failure": f"shortened candidate rejected: {exc}",
+                            "attempt_state": "unrecoverable",
+                            "attempt_consumed": True,
+                            "failure": failure,
                         }
                     }),
                 )
-            print(f"skill_runner: shortened plan rejected: {exc}", file=sys.stderr)
+            print(f"skill_runner: {failure}", file=sys.stderr)
             sys.exit(1)
     canonical_plan_text = raw_plan_text
     try:
@@ -4623,6 +4695,7 @@ def _run_host_coder_phase(
                                 if planning_preflight.status == "shortening-required"
                                 else "unrecoverable"
                             ),
+                            "attempt_consumed": planning_preflight.status != "shortening-required",
                             "response_kind": response_kind,
                             "expected_kind": response_kind,
                             "original_response": raw_plan_text,
