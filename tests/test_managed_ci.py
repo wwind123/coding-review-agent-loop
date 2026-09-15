@@ -1345,7 +1345,11 @@ def test_continuity_revalidation_never_uses_terminal_nonce_for_opening_body(
         metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
     )
 
-    assert validated.override_nonce == "continuity-nonce"
+    # Tuple revalidation returns the nonce authenticated by the PR body.  The
+    # continuity nonce remains the terminal authorization identity, but must
+    # never be supplied as the body's expected nonce.
+    assert validated.override_nonce == "nonce-643"
+    assert validated.authorization_kind == "continuity"
     assert validated.opening_override_nonce == "nonce-643"
 
 
