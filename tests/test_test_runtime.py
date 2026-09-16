@@ -172,6 +172,35 @@ def test_managed_invocation_parses_absolute_entrypoint_and_module_forms(tmp_path
         runtime.parse_managed_test_invocation([executable, "run-tests", "--timeout-seconds", "1", "--timeout-seconds", "2", "--", "true"])
 
 
+def test_managed_command_parses_supported_execution_prefixes():
+    command = [
+        "MODE=inline", "timeout", "1800", "env", "-u", "AGENT_LOOP_INVOCATION_ID",
+        "/opt/agent-loop", "run-tests", "--memory-dir", "/tmp/cache", "--",
+        "python3", "-m", "pytest", "tests/test_protocol.py", "-q",
+    ]
+    traversal = runtime.managed_wrapper_traversal(command)
+    assert traversal.effective_head_index == 6
+    assert traversal.program_positions == {1, 3, 6}
+
+    parsed = runtime.parse_managed_test_command(command)
+    assert parsed is not None
+    assert parsed.inner_argv == (
+        "python3", "-m", "pytest", "tests/test_protocol.py", "-q"
+    )
+
+    module = runtime.parse_managed_test_command([
+        "nice", "-n5", sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests",
+        "--", "pytest", "tests/test_protocol.py", "-q",
+    ])
+    assert module is not None
+    assert module.inner_argv[-3:] == ("pytest", "tests/test_protocol.py", "-q")
+
+    with pytest.raises(runtime.TestRuntimeConfigurationError):
+        runtime.parse_managed_test_command([
+            "timeout", "1800", "/opt/agent-loop", "run-tests", "--unknown", "--", "true",
+        ])
+
+
 def test_normalization_joins_wrapped_and_bare_commands_without_leaking_values(tmp_path):
     bare = [sys.executable, "-m", "pytest", "tests/test_protocol.py", "-q"]
     wrapped = [

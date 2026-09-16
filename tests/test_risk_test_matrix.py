@@ -686,6 +686,109 @@ def test_m780_05_verified_evidence_requires_a_passing_authoritative_receipt() ->
         )
 
 
+def test_managed_test_wrapper_citation_matches_broker_inner_command() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    citation = evidence["rows"][0]["evidence_citations"][0]
+    citation["command"] = (
+        "/home/test/.local/bin/agent-loop run-tests --timeout-seconds 1800 "
+        "--memory-dir /home/test/.cache/agent-loop -- "
+        "python3 -m pytest tests/test_orchestrator_pr.py -q"
+    )
+
+    parsed = parse_risk_test_matrix_evidence(
+        evidence,
+        matrix=matrix,
+        authoritative_test_observations=[_rich_receipt()],
+    )
+
+    assert parsed.rows[0].status == "verified"
+
+
+def test_module_managed_test_wrapper_citation_matches_broker_inner_command() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    citation = evidence["rows"][0]["evidence_citations"][0]
+    citation["command"] = (
+        "/opt/venv/bin/python -m coding_review_agent_loop.cli run-tests "
+        "--timeout-seconds 1800 --memory-dir /home/test/.cache/agent-loop -- "
+        "python3 -m pytest tests/test_orchestrator_pr.py -q"
+    )
+
+    parsed = parse_risk_test_matrix_evidence(
+        evidence,
+        matrix=matrix,
+        authoritative_test_observations=[_rich_receipt()],
+    )
+
+    assert parsed.rows[0].status == "verified"
+
+
+def test_prefixed_managed_test_wrapper_citation_matches_broker_inner_command() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    citation = evidence["rows"][0]["evidence_citations"][0]
+    citation["command"] = (
+        "MODE=inline timeout 1800 env -u AGENT_LOOP_INVOCATION_ID "
+        "/home/test/.local/bin/agent-loop run-tests --timeout-seconds 1800 "
+        "--memory-dir /home/test/.cache/agent-loop -- "
+        "python3 -m pytest tests/test_orchestrator_pr.py -q"
+    )
+
+    parsed = parse_risk_test_matrix_evidence(
+        evidence,
+        matrix=matrix,
+        authoritative_test_observations=[_rich_receipt()],
+    )
+
+    assert parsed.rows[0].status == "verified"
+
+
+def test_managed_test_wrapper_citation_rejects_different_inner_command() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    citation = evidence["rows"][0]["evidence_citations"][0]
+    citation["command"] = (
+        "agent-loop run-tests --timeout-seconds 1800 -- "
+        "python3 -m pytest tests/test_protocol.py -q"
+    )
+
+    with pytest.raises(AgentLoopError, match="passing.*receipts"):
+        parse_risk_test_matrix_evidence(
+            evidence,
+            matrix=matrix,
+            authoritative_test_observations=[_rich_receipt()],
+        )
+
+
+@pytest.mark.parametrize("command", [
+    "/opt/venv/bin/agent-loop run-tests --unknown -- "
+    "python3 -m pytest tests/test_orchestrator_pr.py -q",
+    "/opt/venv/bin/agent-loop run-tests --timeout-seconds 1 "
+    "--timeout-seconds 2 -- python3 -m pytest tests/test_orchestrator_pr.py -q",
+    "agent-loop run-tests --timeout-seconds 1800 -- "
+    "python3 -m pytest tests/test_orchestrator_pr.py -q",
+])
+def test_managed_test_wrapper_citation_rejects_noncanonical_or_malformed_command(
+    command: str,
+) -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    evidence["rows"][0]["evidence_citations"][0]["command"] = command
+
+    with pytest.raises(AgentLoopError, match="passing.*receipts"):
+        parse_risk_test_matrix_evidence(
+            evidence,
+            matrix=matrix,
+            authoritative_test_observations=[_rich_receipt()],
+        )
+
+
 def _rich_receipt(
     *,
     outcome: str = "passed",

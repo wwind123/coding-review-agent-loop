@@ -3,6 +3,8 @@ import sys
 
 import pytest
 
+import coding_review_agent_loop.test_runtime as runtime
+import coding_review_agent_loop.workdir_guard as workdir_guard
 from agent_loop_helpers import *  # noqa: F403
 
 from coding_review_agent_loop.workdir_guard import (
@@ -26,6 +28,17 @@ def test_managed_run_tests_wrapper_exempts_only_wrapper_and_memory_output(tmp_pa
     ]
     validate_test_commands_within_workdir(
         [shlex.join(wrapper)], assigned_workdir=checkout
+    )
+
+
+def test_workdir_managed_traversal_uses_runtime_contract():
+    tokens = shlex.split(
+        "MODE=inline timeout --kill-after=10s env -u FIRST "
+        "/outside/agent-loop run-tests -- python3 -m pytest tests/test_api.py"
+    )
+
+    assert workdir_guard._wrapper_traversal(tokens, managed=True) == (
+        runtime.managed_wrapper_traversal(tokens)
     )
 
 
