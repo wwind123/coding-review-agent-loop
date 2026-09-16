@@ -3667,3 +3667,27 @@ def test_build_issue_prompt_carries_explicit_managed_creation_contract(tmp_path)
     guidance = prompt[prompt.index("This invocation has authenticated managed-CI v2 enabled."):]
     assert guidance.split("\n", 1)[0] in plan_prompt
     assert "agent-loop will dispatch exact-head qualification after review." in plan_prompt
+
+
+def test_primary_then_panel_review_prompt_demands_independent_complete_diff_audit(tmp_path):
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+    )
+    for reviewer in ("codex", "gemini"):
+        prompt = build_review_prompt(77, 2, config, reviewer=reviewer)
+        assert "opt-in `primary-then-panel` policy" in prompt
+        assert "`codex` is the configured primary reviewer" in prompt
+        assert "independent review of the complete\nbase-to-head diff" in prompt
+        assert "do not merely validate, repeat, or\ntriage findings attributed to the primary" in prompt
+        assert "exact-head sweep for every secondary still missing approval" in prompt
+        assert "stale approval is not approval" in prompt
+        assert "force-full option is durable" in prompt
+        assert "scheduler-enabled PR policies" in prompt
+    default_prompt = build_review_prompt(
+        77, 2, make_config(tmp_path, reviewer=("codex", "gemini")), reviewer="codex"
+    )
+    assert "compatibility `all-reviewers` policy" in default_prompt
+    assert "primary-then-panel" not in default_prompt

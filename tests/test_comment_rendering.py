@@ -2103,3 +2103,35 @@ def test_render_discuss_summary_non_final_agenda_includes_research_brief():
     )
     assert "Research brief for the next round (answer with cited sources):" in rendered
     assert "- Is Gemini CLI still available for enterprise users?" in rendered
+
+
+def test_staged_policy_public_audit_comments_identify_phase_and_neutral_accounting(tmp_path, monkeypatch):
+    from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
+    from coding_review_agent_loop.cli import run_pr_loop
+
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(summary="Primary approves.", reviewer="OpenAI Codex")],
+        gemini_outputs=[structured_pr_review(summary="Gemini audits.", reviewer="Google Gemini")],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+        max_rounds=2,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    audits = [comment for comment in runner.comments if comment.startswith("PR review scheduling audit:")]
+    assert len(audits) == 2
+    assert "phase: primary; head: abc123; primary: Codex; active owners: (none); force-full: False" in audits[0]
+    assert "selected Codex; paused Gemini" in audits[0]
+    assert "phase: secondary-audit; head: abc123; primary: Codex" in audits[1]
+    assert "selected Gemini; paused Codex" in audits[1]
+    for comment in runner.comments:
+        assert "selective-only calls avoided" not in comment
+    assert any("scheduler-policy calls avoided cumulatively: 1." in comment for comment in audits)
+    reconciliations = [c for c in runner.comments if "reconciliation: settled reviewers" in c]
+    assert any("Phase: primary; force-full: False." in c for c in reconciliations)
+    assert any("Phase: secondary-audit; force-full: False." in c for c in reconciliations)
+    for comment in runner.comments:
+        assert "AGENT_ROUND" not in comment.split("<!--")[0]

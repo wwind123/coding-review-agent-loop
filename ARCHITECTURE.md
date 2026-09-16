@@ -190,17 +190,22 @@ primary reviewer and a non-empty secondary panel. It keeps the primary as the
 only normal reviewer until exact-head approval, then dispatches an independent
 complete-diff audit to all secondaries from one frozen snapshot. Scoped
 remediation rechecks finding owners plus the primary before a mandatory exact-
-head secondary sweep; unsafe scope/history and the durable force-full latch use
-the complete board. Phase, owner, selection, approval-head, and scheduler-policy
-call-accounting metadata are optional extensions to the legacy scheduler core,
-so old records remain decodable and grant no staged phase authority.
+head secondary sweep; unsafe scope/history with active findings, head changes
+after panel evidence, and the durable force-full latch use the complete board.
+Whether the panel has opened is reconstructed from the latest valid durable
+phase checkpoint, which never grants approval. For this policy, a full board
+raised by scheduler-metadata recovery also raises the durable latch. Phase,
+owner, selection, approval-head, and scheduler-policy call-accounting metadata
+are optional extensions to the legacy scheduler core, so old records remain
+decodable and grant no staged phase authority.
 See [selective and staged review](docs/local_agent_loop.md#selective-intermediate-pr-review).
 
 Frozen policy evaluation is a local read-only boundary. `review-evaluation`
 validates artifacts and deterministically reports severity-weighted marginal
-coverage and process/cost/CI outcomes for all three policies; unavailable
-measurements remain explicit and the evaluator has no GitHub or reviewer-call
-dependency.
+coverage and process/cost/CI outcomes for all three policies. Every measurement
+is `verified` only with trustworthy run/label provenance; otherwise it is
+explicitly `unavailable`, findings are namespaced by run, and the evaluator has
+no GitHub or reviewer-call dependency.
 
 Findings have stable IDs, provenance, dispositions, and, where applicable,
 resolution ownership. The coder reports addressed, remaining, and disputed

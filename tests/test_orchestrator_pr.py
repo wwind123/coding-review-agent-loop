@@ -9416,3 +9416,750 @@ def test_pr_loop_dispute_note_is_visible_to_reviewer_in_next_round(tmp_path):
     )
     assert disputed_item is not None
     assert any(CODER_DISPUTE_NOTE_PREFIX in note for note in disputed_item.notes)
+
+
+# ---------------------------------------------------------------------------
+# primary-then-panel staged PR review policy (#810)
+# ---------------------------------------------------------------------------
+
+
+def _staged_review(*, reviewer, state="approved", blocking_items=None, dispositions=None, resolved=False):
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "pr_review",
+                "state": state,
+                "summary": f"{reviewer} review",
+                "blocking_items": blocking_items or [],
+                "same_pr_followups": [],
+                "future_followups": [],
+                "prior_item_dispositions": dispositions or [],
+            }
+        )
+        + ("\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->" if resolved else "")
+        + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+    )
+
+
+def _staged_config(tmp_path, **overrides):
+    values = dict(
+        reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+        max_rounds=6,
+    )
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+def _agent_sequence(runner):
+    return [
+        command[0]
+        for command, _cwd in runner.commands
+        if command and command[0] in {"claude", "codex", "gemini", "agy"}
+    ]
+
+
+def _audit_phases(runner):
+    phases = []
+    for comment in runner.comments:
+        if comment.startswith("PR review scheduling audit:"):
+            match = re.search(r"phase: ([a-z-]+); head: ([^;]+);", comment)
+            assert match is not None, comment
+            phases.append((match.group(1), match.group(2)))
+    return phases
+
+
+def _posted_scheduler_metadata(runner):
+    return [
+        record.metadata
+        for record in orchestrator._extract_round_metadata_records(
+            [
+                SimpleNamespace(body=comment["body"])
+                for comment in runner.pr_payload.get("comments", [])
+            ],
+            flow="pr",
+        )
+        if record.metadata.scheduler_metadata_status != "absent"
+    ]
+
+
+def test_staged_primary_blocking_loop_gates_panel_then_independent_audit(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[{"text": "worker cleanup gap", "fix_scope": ["src/worker.py"]}],
+            ),
+            _staged_review(
+                reviewer="OpenAI Codex",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    config = _staged_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # Primary blocks (head abc123), coder fixes, primary re-checks alone
+    # (still the primary phase), then both secondaries audit the new head.
+    assert _agent_sequence(runner) == ["codex", "claude", "codex", "gemini", "agy"]
+    phases = _audit_phases(runner)
+    assert [phase for phase, _head in phases] == ["primary", "primary", "secondary-audit"]
+    assert phases[0][1] == "abc123"
+    assert phases[1][1] == phases[2][1] == "abc123-coder-1"
+    assert not any("final-secondary-sweep" in comment for comment in runner.comments)
+    assert not any("remediation" in phase for phase, _head in phases)
+    # The secondary prompts carry the independent-audit instruction and the
+    # phase audit record rather than a primary-finding validation task.
+    for name in ("gemini", "agy"):
+        prompt = next(command[-1] for command, _cwd in runner.commands if command[:1] == [name])
+        assert "Selected phase: secondary-audit" in prompt
+        assert "Inspect the complete base-to-head diff independently" in prompt
+        assert "do not merely validate, repeat, or\ntriage findings attributed to the primary" in prompt
+    metadata = _posted_scheduler_metadata(runner)
+    assert {item.scheduler_primary_reviewer for item in metadata} == {"Codex"}
+    assert all(item.scheduler_force_full is False for item in metadata)
+    assert metadata[-1].scheduler_calls_avoided >= 2
+
+
+def test_staged_secondary_scoped_remediation_rechecks_owner_and_primary_then_sweeps_others(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    migration_calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_pr_migration_topology",
+        lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(reviewer="OpenAI Codex"),
+            _staged_review(reviewer="OpenAI Codex", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        gemini_outputs=[
+            _staged_review(
+                reviewer="Google Gemini",
+                state="blocking",
+                blocking_items=[{"text": "panel regression", "fix_scope": ["src/worker.py"]}],
+            ),
+            _staged_review(
+                reviewer="Google Gemini",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        antigravity_outputs=[
+            _staged_review(reviewer="Antigravity"),
+            _staged_review(reviewer="Antigravity"),
+        ],
+    )
+    config = _staged_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    sequence = _agent_sequence(runner)
+    # primary -> panel (gemini, agy) -> coder -> remediation (codex + gemini)
+    # -> final exact-head sweep (agy) -> migration gate.
+    assert sequence[:3] == ["codex", "gemini", "agy"]
+    assert sequence[3] == "claude"
+    assert sorted(sequence[4:6]) == ["codex", "gemini"]
+    assert sequence[6:] == ["agy"]
+    assert [phase for phase, _head in _audit_phases(runner)] == [
+        "primary", "secondary-audit", "remediation", "final-secondary-sweep",
+    ]
+    remediation_audit = next(c for c in runner.comments if "phase: remediation" in c)
+    assert "active owners: Gemini" in remediation_audit
+    assert "paused Antigravity" in remediation_audit
+    sweep_audit = next(c for c in runner.comments if "phase: final-secondary-sweep" in c)
+    assert "selected Antigravity" in sweep_audit
+    # Antigravity's old-head approval never counted as final; the migration
+    # gate ran only after the sweep completed.
+    assert len(migration_calls) == 1
+    sweep_index = runner.comments.index(sweep_audit)
+    assert not any(
+        "Alembic" in comment for comment in runner.comments[:sweep_index]
+    )
+
+
+def test_staged_owner_and_primary_clearance_does_not_transition_directly_to_ci(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    migration_calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_pr_migration_topology",
+        lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
+    )
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged without the sweep")
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(reviewer="OpenAI Codex"),
+            _staged_review(reviewer="OpenAI Codex", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        gemini_outputs=[
+            _staged_review(
+                reviewer="Google Gemini",
+                state="blocking",
+                blocking_items=[{"text": "panel regression", "fix_scope": ["src/worker.py"]}],
+            ),
+            _staged_review(
+                reviewer="Google Gemini",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    # Rounds: 1 primary, 2 panel, 3 remediation; the sweep would be round 4.
+    config = _staged_config(tmp_path, max_rounds=3, auto_merge=True)
+
+    with pytest.raises(AgentLoopError, match="exact-head final sweep is missing reviewer approval from Antigravity"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert migration_calls == []
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+    assert _agent_sequence(runner).count("agy") == 1
+
+
+def test_staged_broad_remediation_reactivates_complete_board(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("broad", "diff path 'src/other.py' is outside obligation scopes"),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(reviewer="OpenAI Codex"),
+            _staged_review(reviewer="OpenAI Codex", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        gemini_outputs=[
+            _staged_review(
+                reviewer="Google Gemini",
+                state="blocking",
+                blocking_items=[{"text": "panel regression", "fix_scope": ["src/worker.py"]}],
+            ),
+            _staged_review(
+                reviewer="Google Gemini",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        antigravity_outputs=[
+            _staged_review(reviewer="Antigravity"),
+            _staged_review(reviewer="Antigravity", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+    )
+    config = _staged_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    sequence = _agent_sequence(runner)
+    assert sequence[:4] == ["codex", "gemini", "agy", "claude"]
+    # Every reviewer, including the non-owner Antigravity, reviews the broad head.
+    assert sorted(sequence[4:]) == ["agy", "codex", "gemini"]
+    assert [phase for phase, _head in _audit_phases(runner)] == [
+        "primary", "secondary-audit", "full-board",
+    ]
+    full_board_audit = next(c for c in runner.comments if "phase: full-board" in c)
+    assert "paused none" in full_board_audit
+    assert "outside obligation scopes" in full_board_audit
+
+
+def test_staged_ambiguous_ownership_reactivates_complete_board(tmp_path, monkeypatch):
+    from coding_review_agent_loop.review_scheduling import GitChange, classify_transition
+
+    observed_scopes = []
+
+    def classify_from_ledger(runner, *, checkout, previous_sha, current_sha, scopes, broad_rules, obligations):
+        observed_scopes.append(tuple(scopes))
+        return classify_transition(
+            previous_sha, current_sha, [GitChange("src/worker.py")],
+            scopes=scopes, broad_rules=broad_rules, obligations=obligations,
+        )
+
+    monkeypatch.setattr(orchestrator, "_observe_pr_transition", classify_from_ledger)
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(reviewer="OpenAI Codex"),
+            _staged_review(reviewer="OpenAI Codex", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        gemini_outputs=[
+            # No fix_scope: ownership scope is absent, so remediation is unsafe.
+            _staged_review(reviewer="Google Gemini", state="blocking", blocking_items=["panel regression"]),
+            _staged_review(
+                reviewer="Google Gemini",
+                dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        antigravity_outputs=[
+            _staged_review(reviewer="Antigravity"),
+            _staged_review(reviewer="Antigravity", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+    )
+    config = _staged_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    sequence = _agent_sequence(runner)
+    assert sorted(sequence[4:]) == ["agy", "codex", "gemini"]
+    assert [phase for phase, _head in _audit_phases(runner)][-1] == "full-board"
+    # The finding carried no reviewer scope, so the classifier had nothing to
+    # match the change against and the orchestrator did not guess one.
+    assert observed_scopes == [()]
+    assert any("an obligation has no valid exact fix scope" in comment for comment in runner.comments)
+
+
+def test_staged_force_full_selects_complete_board_from_the_primary_phase(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    config = _staged_config(tmp_path, pr_review_force_full=True, max_rounds=1)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert _agent_sequence(runner) == ["codex", "gemini", "agy"]
+    assert _audit_phases(runner) == [("full-board", "abc123")]
+    assert "force-full: True" in runner.comments[0]
+    assert all(item.scheduler_force_full is True for item in _posted_scheduler_metadata(runner))
+
+
+def test_staged_legacy_scheduler_payload_forces_full_board_and_latches_durably(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    contract = orchestrator.make_contract(("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex")
+    # A pre-phase-aware record: complete legacy mandatory keys, no phase authority.
+    legacy_checkpoint = _attach_round_metadata(
+        "Legacy scheduler checkpoint.",
+        PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=1,
+            subject="abc123",
+            scheduler_contract=contract.as_dict(),
+            scheduler_previous_sha=None,
+            scheduler_current_sha="abc123",
+            scheduler_obligation_digest="0" * 16,
+            scheduler_selected_reviewers=("Codex",),
+            scheduler_paused_reviewers=(("Gemini", "primary phase"), ("Antigravity", "primary phase")),
+            scheduler_reasons=("primary phase",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=2,
+        ),
+    )
+    decoded = orchestrator._extract_round_metadata_records(
+        [SimpleNamespace(body=legacy_checkpoint)], flow="pr"
+    )[0].metadata
+    assert decoded.scheduler_metadata_status == "valid"
+    assert decoded.scheduler_phase is None
+    runner = FakeRunner(
+        pr_payload={"comments": [{"author": {"login": "bot"}, "body": legacy_checkpoint}]},
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(
+                reviewer="OpenAI Codex",
+                state="blocking",
+                blocking_items=[{"text": "gap", "fix_scope": ["src/worker.py"]}],
+            ),
+            _staged_review(reviewer="OpenAI Codex", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        gemini_outputs=[
+            _staged_review(reviewer="Google Gemini"),
+            _staged_review(reviewer="Google Gemini", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        antigravity_outputs=[
+            _staged_review(reviewer="Antigravity"),
+            _staged_review(reviewer="Antigravity", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+    )
+    config = _staged_config(tmp_path, quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    sequence = _agent_sequence(runner)
+    # No reduced primary/panel selection may be inferred from legacy data, and
+    # the recovery latch stays durable for the narrow follow-up round too.
+    assert sequence[:3] == ["codex", "gemini", "agy"]
+    assert sequence[3] == "claude"
+    assert sorted(sequence[4:]) == ["agy", "codex", "gemini"]
+    assert [phase for phase, _head in _audit_phases(runner)] == ["full-board", "full-board"]
+    posted = _posted_scheduler_metadata(runner)
+    assert posted[0].scheduler_force_full is False  # the seeded legacy record
+    assert len(posted) > 3
+    assert all(item.scheduler_force_full is True for item in posted[1:])
+    assert "durable force-full latch" in capsys.readouterr().err
+
+
+def test_staged_legacy_selective_payload_is_contract_drift(tmp_path):
+    contract = orchestrator.make_contract(("Codex", "Gemini"), "selective-intermediate", None)
+    checkpoint = _attach_round_metadata(
+        "Selective checkpoint.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="abc123",
+            scheduler_contract=contract.as_dict(), scheduler_previous_sha=None,
+            scheduler_current_sha="abc123", scheduler_obligation_digest="0" * 16,
+            scheduler_selected_reviewers=("Codex", "Gemini"), scheduler_reasons=("full board",),
+            scheduler_final_sweep=False, scheduler_force_full=False, scheduler_calls_avoided=0,
+        ),
+    )
+    runner = FakeRunner(pr_payload={"comments": [{"author": {"login": "bot"}, "body": checkpoint}]})
+    config = _staged_config(tmp_path, reviewer=("codex", "gemini"))
+    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _agent_sequence(runner) == []
+
+
+def test_staged_primary_drift_is_contract_drift(tmp_path):
+    contract = orchestrator.make_contract(("Codex", "Gemini"), "primary-then-panel", None, "Gemini")
+    checkpoint = _attach_round_metadata(
+        "Staged checkpoint.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="abc123",
+            scheduler_contract=contract.as_dict(), scheduler_previous_sha=None,
+            scheduler_current_sha="abc123", scheduler_obligation_digest="0" * 16,
+            scheduler_selected_reviewers=("Gemini",), scheduler_paused_reviewers=(("Codex", "primary phase"),),
+            scheduler_reasons=("primary phase",), scheduler_final_sweep=False,
+            scheduler_force_full=False, scheduler_calls_avoided=1, scheduler_phase="primary",
+            scheduler_primary_reviewer="Gemini",
+        ),
+    )
+    runner = FakeRunner(pr_payload={"comments": [{"author": {"login": "bot"}, "body": checkpoint}]})
+    config = _staged_config(tmp_path, reviewer=("codex", "gemini"))
+    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+
+def _unavailable(reviewer):
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "agent_unavailable",
+            "retryable": False,
+            "category": "provider",
+            "summary": "The reviewer provider is unavailable.",
+            "suggested_action": "Retry later.",
+        }
+    ) + f"\n<!-- AGENT_UNAVAILABLE -->\n-- {reviewer}"
+
+
+def test_staged_primary_failure_is_not_approval_and_resume_reuses_no_work(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[_unavailable("OpenAI Codex"), _staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    config = _staged_config(tmp_path)
+
+    with pytest.raises(AgentLoopError, match="missing required input from Codex"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _agent_sequence(runner) == ["codex"]
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+    # Resume from the durable comments: the primary is dispatched again, and
+    # only after its approval does the panel run.
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agent_sequence(runner) == ["codex", "codex", "gemini", "agy"]
+    assert [phase for phase, _head in _audit_phases(runner)] == ["primary", "primary", "secondary-audit"]
+
+
+def test_staged_secondary_failure_keeps_healthy_result_and_resume_dispatches_only_outstanding(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_unavailable("Antigravity"), _staged_review(reviewer="Antigravity")],
+    )
+    config = _staged_config(tmp_path, auto_merge=True)
+    merges = []
+
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _agent_sequence(runner) == ["codex", "gemini", "agy"]
+    assert any("Healthy reviewers approved" in comment or "Google Gemini review" in comment for comment in runner.comments)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+    import coding_review_agent_loop.orchestrator as module
+
+    original_merge = module.merge_pr
+    module.merge_pr = lambda *args, **kwargs: merges.append(kwargs)
+    try:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    finally:
+        module.merge_pr = original_merge
+    # Completed exact-head work (Codex, Gemini) is reused once; only the
+    # outstanding secondary is dispatched.
+    assert _agent_sequence(runner) == ["codex", "gemini", "agy", "agy"]
+    assert merges == [{"expected_head_sha": "abc123"}]
+
+
+def test_staged_resume_after_remediation_checkpoint_dispatches_final_sweep_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(reviewer="OpenAI Codex"),
+            _staged_review(reviewer="OpenAI Codex", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        gemini_outputs=[
+            _staged_review(
+                reviewer="Google Gemini",
+                state="blocking",
+                blocking_items=[{"text": "panel regression", "fix_scope": ["src/worker.py"]}],
+            ),
+            _staged_review(reviewer="Google Gemini", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    # Stop right after the remediation round settles (round 3 of 3).
+    first_config = _staged_config(tmp_path, max_rounds=3)
+    with pytest.raises(AgentLoopError, match="missing reviewer approval from Antigravity"):
+        run_pr_loop(runner, pr_number=77, config=first_config)
+    assert _agent_sequence(runner).count("agy") == 1
+
+    runner.antigravity_outputs.append(_staged_review(reviewer="Antigravity"))
+    resumed_config = _staged_config(tmp_path, max_rounds=6)
+    assert run_pr_loop(runner, pr_number=77, config=resumed_config) == 0
+    sequence = _agent_sequence(runner)
+    # Codex and Gemini exact-head approvals are reused; only Antigravity sweeps.
+    assert sequence.count("codex") == 2
+    assert sequence.count("gemini") == 2
+    assert sequence.count("agy") == 2
+    assert sequence[-1] == "agy"
+    assert [phase for phase, _head in _audit_phases(runner)][-1] == "final-secondary-sweep"
+
+
+def test_staged_external_head_change_invalidates_primary_approval_before_panel(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("broad", "external change"),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            _staged_review(reviewer="OpenAI Codex"),
+            _staged_review(reviewer="OpenAI Codex"),
+        ],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    original = orchestrator._run_validated_agent
+    calls = []
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "reviewer" and kwargs.get("agent") == "codex":
+            calls.append(True)
+            if len(calls) == 1:
+                runner.pr_payload["headRefOid"] = "external-head"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    config = _staged_config(tmp_path)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    sequence = _agent_sequence(runner)
+    # The stale primary approval on abc123 never opens the panel: the primary
+    # must approve the external head first, then the secondaries audit it.
+    assert sequence == ["codex", "codex", "gemini", "agy"]
+    phases = _audit_phases(runner)
+    assert [phase for phase, _head in phases][-1] == "secondary-audit"
+    assert phases[-1][1] == "external-head"
+    assert all(head == "external-head" for _phase, head in phases[1:])
+
+
+def test_staged_head_change_during_final_sweep_invalidates_partial_sweep_evidence(tmp_path, monkeypatch):
+    from coding_review_agent_loop.review_scheduling import GitChange, classify_transition
+
+    def classify_from_ledger(runner, *, checkout, previous_sha, current_sha, scopes, broad_rules, obligations):
+        # The scoped remediation touches only the owned path; the external
+        # push after the sweep has no obligation scope to match against.
+        return classify_transition(
+            previous_sha, current_sha, [GitChange("src/worker.py")],
+            scopes=scopes, broad_rules=broad_rules, obligations=obligations,
+        )
+
+    monkeypatch.setattr(orchestrator, "_observe_pr_transition", classify_from_ledger)
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(reviewer="OpenAI Codex"),
+            _staged_review(reviewer="OpenAI Codex", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+            _staged_review(reviewer="OpenAI Codex"),
+        ],
+        gemini_outputs=[
+            _staged_review(
+                reviewer="Google Gemini",
+                state="blocking",
+                blocking_items=[{"text": "panel regression", "fix_scope": ["src/worker.py"]}],
+            ),
+            _staged_review(reviewer="Google Gemini", dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+            _staged_review(reviewer="Google Gemini"),
+        ],
+        antigravity_outputs=[
+            _staged_review(reviewer="Antigravity"),
+            _staged_review(reviewer="Antigravity"),
+            _staged_review(reviewer="Antigravity"),
+        ],
+    )
+    original = orchestrator._run_validated_agent
+    agy_calls = []
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "reviewer" and kwargs.get("agent") == "antigravity":
+            agy_calls.append(True)
+            if len(agy_calls) == 2:
+                # An external actor pushes while the final sweep is settling.
+                runner.pr_payload["headRefOid"] = "pushed-during-sweep"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    config = _staged_config(tmp_path, max_rounds=8)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    phases = _audit_phases(runner)
+    # The sweep on the old head settles, but the pushed head has no obligation
+    # scope to classify against, so every reviewer (including the primary and
+    # the secondaries that had just approved) re-reviews the complete diff.
+    # No partial sweep approval carries across the mutation.
+    assert phases == [
+        ("primary", "abc123"),
+        ("secondary-audit", "abc123"),
+        ("remediation", "abc123-coder-1"),
+        ("final-secondary-sweep", "abc123-coder-1"),
+        ("full-board", "pushed-during-sweep"),
+    ]
+    sequence = _agent_sequence(runner)
+    assert sequence == [
+        "codex", "gemini", "agy", "claude", "codex", "gemini", "agy", "codex", "gemini", "agy",
+    ]
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands[: -1])
+
+
+def test_staged_exact_head_panel_gate_stops_before_migration_and_merge(tmp_path, monkeypatch):
+    migration_calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_pr_migration_topology",
+        lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
+    )
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged on primary approval alone")
+    )
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    config = _staged_config(tmp_path, max_rounds=1, auto_merge=True)
+
+    with pytest.raises(AgentLoopError, match="exact-head final sweep is missing reviewer approval from Gemini, Antigravity"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert migration_calls == []
+    assert _agent_sequence(runner) == ["codex"]
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_staged_unacknowledged_human_requirement_remains_blocking_after_panel_settlement(
+    tmp_path, monkeypatch
+):
+    requirement = HumanReviewRequirement(
+        source_type="PR comment",
+        author="maintainer",
+        created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the audit trail intact.",
+    )
+    original_context = orchestrator.get_pr_review_context
+
+    def context_with_requirement(runner, *args, **kwargs):
+        context = original_context(runner, *args, **kwargs)
+        return dataclasses.replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator, "get_pr_review_context", context_with_requirement)
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex", resolved=True)],
+        # Gemini approves without acknowledging the signed requirement.
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity", resolved=True)],
+    )
+    config = _staged_config(tmp_path, max_rounds=2, auto_merge=True)
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with an unacknowledged requirement")
+    )
+
+    with pytest.raises(AgentLoopError, match=r"blocking issues after round 2.*Orchestrator \(item-1\)"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert _agent_sequence(runner)[:3] == ["codex", "gemini", "agy"]
+    assert any("phase: secondary-audit" in comment for comment in runner.comments)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_staged_ci_failure_remains_blocking_after_unanimous_panel_approval(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+        pr_check_runs_payload={
+            "check_runs": [{"name": "test", "status": "completed", "conclusion": "failure"}]
+        },
+    )
+    config = _staged_config(tmp_path, max_rounds=2, auto_merge=True)
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with CI failure")
+    )
+
+    with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert _agent_sequence(runner) == ["codex", "gemini", "agy"]
+    assert any("GitHub PR checks are failing for PR #77." in comment for comment in runner.comments)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+
+
+def test_staged_policy_does_not_change_existing_policy_selection(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=1)
+    assert config.pr_review_policy == "all-reviewers"
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agent_sequence(runner) == ["codex", "gemini"]
+    assert not any(comment.startswith("PR review scheduling audit:") for comment in runner.comments)
+    assert _posted_scheduler_metadata(runner) == []

@@ -36,6 +36,13 @@ SCHEDULER_PHASES = frozenset(
     }
 )
 
+# Once any of these phases has been checkpointed, the secondary panel has been
+# (or is being) opened.  A later reduced selection is a remediation/sweep, and
+# an unsafe transition must reactivate the complete board.
+PANEL_OPENED_PHASES = frozenset(
+    {"full-board", "secondary-audit", "remediation", "final-secondary-sweep"}
+)
+
 
 @dataclass(frozen=True)
 class ReviewPolicyCapabilities:
@@ -53,6 +60,10 @@ class ReviewPolicyCapabilities:
     phase_aware: bool
     counts_avoided_calls: bool
     requires_primary: bool = False
+    # When metadata recovery forces the complete board, the staged policy
+    # latches that decision durably for the rest of the run and every resume.
+    # The selective policy keeps its historical single-decision override.
+    recovery_latches_force_full: bool = False
 
 
 def policy_capabilities(policy: str) -> ReviewPolicyCapabilities:
@@ -80,6 +91,7 @@ def policy_capabilities(policy: str) -> ReviewPolicyCapabilities:
             phase_aware=True,
             counts_avoided_calls=True,
             requires_primary=True,
+            recovery_latches_force_full=True,
         )
     raise AgentLoopError(f"Unsupported PR review policy: {policy!r}.")
 
@@ -453,17 +465,55 @@ def select_reviewers(
         reason = "compatibility policy" if snapshot.contract.policy == "all-reviewers" else "force-full latch"
         selected_phase = "full-board"
     elif capabilities.requires_primary:
-        # The phase is derived from exact-head approval evidence, not from
-        # comments or a caller-provided claim.  An explicit phase is accepted
-        # for deterministic resume/tests but cannot bypass the primary gate.
+        # The selection is derived from exact-head approval evidence, the
+        # active obligation ledger, and the durable phase checkpoint.  The
+        # checkpoint only says whether the secondary panel has been opened;
+        # it can never bypass the primary gate or grant an approval.
+        checkpoint_phase = phase if phase is not None else snapshot.phase
+        if checkpoint_phase is not None and checkpoint_phase not in SCHEDULER_PHASES:
+            raise AgentLoopError(f"Unsupported scheduler phase checkpoint: {checkpoint_phase!r}.")
+        panel_opened = checkpoint_phase in PANEL_OPENED_PHASES
         primary_approved = primary is not None and primary in approvals
-        if snapshot.obligations and classification.narrow and not final_sweep:
-            owners = {
-                owner
-                for obligation in snapshot.obligations
-                if obligation.active
-                for owner in obligation.pending_owners
-            }
+        active_obligations = tuple(
+            obligation for obligation in snapshot.obligations if obligation.active
+        )
+        pending_owner_set = {
+            owner for obligation in active_obligations for owner in obligation.pending_owners
+        }
+        secondary_owned = bool(pending_owner_set - {primary})
+        if active_obligations and not classification.narrow:
+            # Unsafe ownership, scope, history, or change classification with
+            # any active finding reactivates the complete board before the
+            # primary gate is consulted.
+            selected = available_required
+            selected_phase = "full-board"
+            reason = f"full board required: {classification.reason}"
+        elif panel_opened and not classification.narrow:
+            # Prior panel evidence exists on an older head and the transition
+            # is unsafe; every reviewer must see the complete current head.
+            selected = available_required
+            selected_phase = "full-board"
+            reason = f"full board required after panel evidence: {classification.reason}"
+        elif secondary_owned and not panel_opened:
+            # A secondary-owned finding without panel phase evidence is
+            # contradictory history; never guess ownership or scope.
+            selected = available_required
+            selected_phase = "full-board"
+            reason = "full board required: secondary-owned finding without panel phase evidence"
+        elif active_obligations and not panel_opened:
+            # Primary blocking loop: the primary rechecks its own findings on
+            # each narrow head until it approves the exact head.
+            selected = (
+                (primary,)
+                if primary in available_required and primary not in approvals
+                else ()
+            )
+            selected_phase = "primary"
+            reason = (
+                "primary phase: primary rechecks its findings before the secondary panel"
+            )
+        elif active_obligations:
+            owners = set(pending_owner_set)
             owners.add(primary)
             selected = tuple(
                 name for name in available_required
@@ -473,31 +523,30 @@ def select_reviewers(
             reason = "narrow remediation: finding owners and primary must recheck"
         elif not primary_approved:
             selected = (primary,) if primary in available_required else ()
-            selected_phase = "primary"
-            reason = "primary phase: exact-head primary approval is required before the secondary panel"
-        elif phase in {"final-secondary-sweep", "secondary-audit"} or final_sweep:
+            if panel_opened:
+                selected_phase = "remediation"
+                reason = (
+                    "remediation: exact-head primary approval is outstanding before the "
+                    "final secondary sweep"
+                )
+            else:
+                selected_phase = "primary"
+                reason = (
+                    "primary phase: exact-head primary approval is required before the "
+                    "secondary panel"
+                )
+        else:
             selected = tuple(
                 name
                 for name in available_required
                 if name != primary and name not in approvals
             )
-            selected_phase = "final-secondary-sweep" if final_sweep or phase == "final-secondary-sweep" else "secondary-audit"
-            reason = (
-                "final exact-head secondary sweep for missing approvals"
-                if selected_phase == "final-secondary-sweep"
-                else "independent secondary audit after exact-head primary approval"
-            )
-        else:
-            if not snapshot.obligations:
-                selected = tuple(
-                    name for name in available_required if name != primary and name not in approvals
-                )
+            if panel_opened:
+                selected_phase = "final-secondary-sweep"
+                reason = "final exact-head secondary sweep for missing approvals"
+            else:
                 selected_phase = "secondary-audit"
                 reason = "independent secondary audit after exact-head primary approval"
-            else:
-                selected = available_required
-                selected_phase = "full-board"
-                reason = f"full board required: {classification.reason}"
     elif final_sweep:
         selected = tuple(name for name in available_required if name not in approvals)
         reason = "final exact-head sweep for missing approvals"
@@ -536,7 +585,12 @@ def select_reviewers(
         elif capabilities.requires_primary and selected_phase == "secondary-audit":
             pause_reason = "secondary audit has not selected this already qualifying reviewer"
         elif capabilities.requires_primary and selected_phase == "remediation":
-            pause_reason = "remediation did not identify this reviewer as an owner or primary"
+            pause_reason = (
+                "remediation did not identify this reviewer as an owner or primary; "
+                "an exact-head secondary sweep follows clearance"
+            )
+        elif capabilities.requires_primary and selected_phase == "final-secondary-sweep":
+            pause_reason = "final secondary sweep did not select this reviewer"
         elif final_sweep:
             pause_reason = "qualifying exact-head approval carry"
         elif not classification.narrow or snapshot.force_full:

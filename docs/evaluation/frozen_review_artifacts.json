@@ -5,8 +5,22 @@
       "run_id": "historical-all-001",
       "policy": "all-reviewers",
       "findings": [
-        {"id": "finding-auth", "severity": "high", "contributors": ["OpenAI Codex"]},
-        {"id": "finding-docs", "severity": "low", "contributors": ["Anthropic Claude"]}
+        {
+          "id": "finding-auth",
+          "severity": "high",
+          "contributors": [
+            "OpenAI Codex"
+          ],
+          "valid": true
+        },
+        {
+          "id": "finding-docs",
+          "severity": "low",
+          "contributors": [
+            "Anthropic Claude"
+          ],
+          "valid": true
+        }
       ],
       "metrics": {
         "review_rounds": 2,
@@ -21,14 +35,36 @@
         "withdrawals": 0,
         "disagreements": 1,
         "calls_avoided": 0
+      },
+      "provenance": {
+        "source": "frozen-fixture:agent-loop-run-log",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "frozen-fixture:maintainer-triage",
+        "verified": true
       }
     },
     {
       "run_id": "historical-selective-001",
       "policy": "selective-intermediate",
       "findings": [
-        {"id": "finding-auth", "severity": "high", "contributors": ["OpenAI Codex"]},
-        {"id": "finding-docs", "severity": "low", "contributors": ["Anthropic Claude"]}
+        {
+          "id": "finding-auth",
+          "severity": "high",
+          "contributors": [
+            "OpenAI Codex"
+          ],
+          "valid": true
+        },
+        {
+          "id": "finding-docs",
+          "severity": "low",
+          "contributors": [
+            "Anthropic Claude"
+          ],
+          "valid": true
+        }
       ],
       "metrics": {
         "review_rounds": 2,
@@ -43,6 +79,20 @@
         "withdrawals": 0,
         "disagreements": 1,
         "calls_avoided": 1
+      },
+      "provenance": {
+        "source": "frozen-fixture:agent-loop-run-log",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "frozen-fixture:maintainer-triage",
+        "verified": true
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "frozen-fixture:unlabeled",
+          "verified": false
+        }
       }
     },
     {
@@ -52,8 +102,22 @@
       "primary_approval_round": 1,
       "panel_approval_round": 2,
       "findings": [
-        {"id": "finding-auth", "severity": "high", "contributors": ["OpenAI Codex"]},
-        {"id": "finding-escape", "severity": "critical", "contributors": ["Anthropic Claude"]}
+        {
+          "id": "finding-auth",
+          "severity": "high",
+          "contributors": [
+            "OpenAI Codex"
+          ],
+          "valid": true
+        },
+        {
+          "id": "finding-escape",
+          "severity": "critical",
+          "contributors": [
+            "Anthropic Claude"
+          ],
+          "valid": true
+        }
       ],
       "metrics": {
         "review_rounds": 2,
@@ -68,6 +132,14 @@
         "withdrawals": 0,
         "disagreements": 1,
         "calls_avoided": 1
+      },
+      "provenance": {
+        "source": "frozen-fixture:agent-loop-run-log",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "frozen-fixture:maintainer-triage",
+        "verified": true
       }
     }
   ]

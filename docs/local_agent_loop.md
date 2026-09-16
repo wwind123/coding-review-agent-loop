@@ -1177,18 +1177,40 @@ this feature.
 
 `primary-then-panel` is opt-in and requires `--primary-reviewer` plus at least
 one other unique `--reviewer`. The primary must be on the configured board.
-The primary phase repeats on each changed head until exact-head approval; only
-then does the secondary audit launch. Every secondary receives the complete
-base-to-head diff and approved-plan/human context independently from a common
-snapshot. It does not merely validate the primary's findings.
+The scheduler phases are `primary`, `secondary-audit`, `remediation`,
+`final-secondary-sweep`, and `full-board`:
 
-After a secondary finding, a safe narrow descendant invokes all active finding
-owners together with the primary. Their clearance is followed by a mandatory
-complete-diff sweep of every secondary without qualifying approval on the new
-head. Unsafe ownership, scope, history, or change classification selects the
-full board. A force-full latch remains true through resume, including former
-primary phases. Any failure, timeout, unavailability, incomplete output, or
-head mutation remains blocking and invalidates nonmatching approvals.
+1. `primary`: the primary is the only reviewer. When it blocks and the coder
+   makes a narrow fix, the primary alone rechecks its own findings; this stays
+   in the primary phase until it approves the exact head.
+2. `secondary-audit`: after exact-head primary approval, every secondary
+   receives the complete base-to-head diff and approved-plan/human context
+   independently from a common snapshot. It does not merely validate the
+   primary's findings.
+3. `remediation`: after a secondary finding, a safe narrow descendant invokes
+   every active finding owner together with the primary.
+4. `final-secondary-sweep`: owner/primary clearance is followed by a mandatory
+   complete-diff sweep of every secondary without qualifying approval on the
+   new head, before any CI or merge gate.
+5. `full-board`: any active finding whose change is broad, out of scope,
+   non-textual, missing scope, disputed, or unreconstructible, any head change
+   after panel evidence exists, a secondary-owned finding with no panel phase
+   evidence, or the force-full latch selects the complete board.
+
+Whether the panel has been opened is reconstructed from the durable phase
+checkpoint in the latest valid scheduler record; the checkpoint never grants
+an approval and cannot bypass the primary gate. A secondary that has never
+reviewed is not a "returning" reviewer: its first invocation always receives
+the complete diff, so only reviewers with a prior record need reconstructible
+span history. `--pr-review-force-full` is a monotonic durable latch. For this
+policy, a full board raised by scheduler-metadata recovery (legacy records
+without phase authority, malformed or contradictory records, or a missing
+same-head checkpoint) also raises the durable latch and is persisted in every
+later round record, so a resumed run keeps selecting the complete board.
+Any failure, timeout, unavailability, incomplete output, or head mutation
+remains blocking and invalidates nonmatching approvals; the settled results of
+healthy parallel reviewers are recorded while the failed reviewer stays
+outstanding in the required barrier.
 
 The offline `review-evaluation` command consumes local frozen JSON artifacts and
 reports unique and severity-weighted marginal findings, process/call/token/time
@@ -1199,6 +1221,23 @@ unavailable measurements. It never invokes a reviewer or mutates GitHub:
 agent-loop review-evaluation docs/evaluation/frozen_review_artifacts.json \
   --format text
 ```
+
+Each run in the artifact carries `policy`, `run_id`, `findings`, optional
+`metrics`, `rounds`, `primary_reviewer`, and approval-round fields, plus
+provenance: a run-level `provenance` object (`{"source": ..., "verified":
+true}`) covering metrics, round snapshots, and approval rounds; a
+`label_provenance` object covering the finding `valid` labels; and optional
+per-metric overrides in `metric_provenance`. Every finding must carry an
+explicit boolean `valid` label. A measurement is reported as `verified` only
+when its provenance is verified; unlabeled findings, missing provenance, or
+`verified: false` are reported as `unavailable` with a reason rather than
+estimated. Finding IDs are namespaced by run, so identical IDs across runs never
+collide. Marginal-beyond-primary rows are `not-applicable` for policies whose
+runs declare no primary; a historical full-board run may declare a hypothetical
+`primary_reviewer` to measure what the other reviewers would have added. Runs
+using `primary-then-panel` must declare their primary. The checked-in
+`docs/evaluation/frozen_review_report.json` is regenerated from the fixture
+artifact and asserted by `tests/test_review_evaluation.py`.
 
 The policy remains non-default until a separate frozen-history review shows
 severity-weighted marginal coverage justifies its latency and cost tradeoff.

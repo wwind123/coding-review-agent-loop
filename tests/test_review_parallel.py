@@ -758,3 +758,124 @@ def test_plan_first_parallel_repair_isolated_between_reviewers(tmp_path):
     assert len(repair_calls) == 1
     assert any("Codex approves after repair." in comment for comment in runner.comments)
     assert any("Gemini approves the plan." in comment for comment in runner.comments)
+
+
+def _staged_review(*, reviewer, state="approved", blocking_items=None, dispositions=None):
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "pr_review",
+                "state": state,
+                "summary": f"{reviewer} review",
+                "blocking_items": blocking_items or [],
+                "same_pr_followups": [],
+                "future_followups": [],
+                "prior_item_dispositions": dispositions or [],
+            }
+        )
+        + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
+    )
+
+
+class _SecondaryPanelConcurrencyProbeRunner(FakeRunner):
+    """The two secondaries block until each other has started; the primary
+    must have finished before either one begins."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.gemini_started = threading.Event()
+        self.antigravity_started = threading.Event()
+        self.primary_finished = threading.Event()
+        self.overlap_confirmed = True
+        self.panel_started_before_primary = False
+
+    def run_with_log(self, args, *, cwd, **kwargs):
+        cmd = [str(arg) for arg in args]
+        if cmd[:1] == ["gemini"]:
+            if not self.primary_finished.is_set():
+                self.panel_started_before_primary = True
+            self.gemini_started.set()
+            if not self.antigravity_started.wait(timeout=10):
+                self.overlap_confirmed = False
+        elif cmd[:1] == ["agy"] and "catalog" not in cmd:
+            if not self.primary_finished.is_set():
+                self.panel_started_before_primary = True
+            self.antigravity_started.set()
+            if not self.gemini_started.wait(timeout=10):
+                self.overlap_confirmed = False
+        result = super().run_with_log(args, cwd=cwd, **kwargs)
+        if cmd[:2] == ["codex", "exec"]:
+            self.primary_finished.set()
+        return result
+
+
+def test_primary_then_panel_parallel_panel_runs_from_one_snapshot_after_primary_approval(tmp_path):
+    runner = _SecondaryPanelConcurrencyProbeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        review_parallel=True,
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+        max_rounds=2,
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    agent_commands = [
+        command[0]
+        for command, _cwd in runner.commands
+        if command and command[0] in {"claude", "codex", "gemini", "agy"}
+    ]
+    # The primary runs alone first; the two secondaries only start afterwards
+    # and run concurrently from the same frozen head.
+    assert agent_commands[0] == "codex"
+    assert sorted(agent_commands[1:]) == ["agy", "gemini"]
+    assert runner.overlap_confirmed, "secondary panel reviewers did not run concurrently"
+    assert not runner.panel_started_before_primary
+    assert any("phase: secondary-audit" in comment for comment in runner.comments)
+
+
+def test_primary_then_panel_parallel_panel_failure_keeps_healthy_result_and_blocks_finalization(
+    tmp_path, monkeypatch
+):
+    unavailable = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "agent_unavailable",
+            "retryable": False,
+            "category": "environment",
+            "summary": "The review checkout cannot access the diff.",
+            "suggested_action": "Repair the reviewer sandbox before retrying it.",
+        }
+    ) + "\n<!-- AGENT_UNAVAILABLE -->\n-- Antigravity"
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[unavailable],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        review_parallel=True,
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+        auto_merge=True,
+        max_rounds=3,
+    )
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged without panel approval")
+    )
+
+    with pytest.raises(AgentLoopError, match="missing required input from Antigravity"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert "**Review status: Incomplete**" in runner.comments[-1]
+    assert any("Google Gemini review" in comment for comment in runner.comments)
+    assert not any(command[:1] == ["claude"] for command, _cwd in runner.commands)
+    assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)

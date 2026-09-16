@@ -1020,7 +1020,15 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "scheduler_scope_digest": metadata.scheduler_scope_digest,
     }
     if any(value not in (None, (), []) for value in scheduler_values.values()):
-        payload.update(scheduler_values)
+        # Phase-aware fields are optional: omit empty ones so records written
+        # by the existing policies keep the legacy mandatory key shape.
+        payload.update(
+            {
+                key: value
+                for key, value in scheduler_values.items()
+                if key not in _SCHEDULER_AUXILIARY_KEYS or value not in (None, [])
+            }
+        )
     matrix_present = _risk_test_matrix_metadata_present(metadata)
     matrix_values = {
         "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,

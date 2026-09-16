@@ -919,3 +919,341 @@ def test_machine_obligation_revert_to_failed_head_returns_to_repair_required():
 
     assert reverted[0].lifecycle == "repair_required"
     assert reverted[0].candidate_head_sha is None
+
+
+# ---------------------------------------------------------------------------
+# primary-then-panel staged policy (#810)
+# ---------------------------------------------------------------------------
+
+
+def _primary_contract() -> ReviewSchedulingContract:
+    return ReviewSchedulingContract(
+        required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="primary-then-panel",
+        primary_reviewer="Codex",
+        broad_rules=(".github/**",),
+    )
+
+
+def _obligation(item_id="item-1", owners=("Gemini",), scope=("src/worker.py",)):
+    return ReviewObligation(
+        item_id=item_id,
+        status="blocking",
+        scope=scope,
+        resolution_owners=owners,
+        pending_owners=owners,
+    )
+
+
+def _snapshot(*, obligations=(), phase=None, previous="a" * 40, current="b" * 40, force_full=False):
+    return SchedulerSnapshot(
+        previous_sha=previous,
+        current_sha=current,
+        contract=_primary_contract(),
+        obligations=obligations,
+        force_full=force_full,
+        phase=phase,
+    )
+
+
+NARROW = TransitionClassification("narrow", "scoped fix")
+BROAD = TransitionClassification("broad", "diff path outside obligation scopes")
+
+
+def test_primary_contract_decoding_and_drift_rules():
+    # Absent persisted primary decodes as None and is valid for existing policies.
+    legacy = ReviewSchedulingContract.from_mapping(
+        {
+            "required_reviewers": ["Codex", "Gemini"],
+            "policy": "selective-intermediate",
+            "broad_rules": [".github/**"],
+        }
+    )
+    assert legacy.primary_reviewer is None
+    # The staged policy requires a primary that is a board member and a secondary.
+    with pytest.raises(AgentLoopError, match="member"):
+        ReviewSchedulingContract.from_mapping(
+            {
+                "required_reviewers": ["Codex", "Gemini"],
+                "policy": "primary-then-panel",
+                "primary_reviewer": "Claude",
+                "broad_rules": [],
+            }
+        )
+    with pytest.raises(AgentLoopError, match="at least one secondary"):
+        ReviewSchedulingContract(
+            required_reviewers=("Codex",), policy="primary-then-panel", primary_reviewer="Codex"
+        )
+    with pytest.raises(AgentLoopError, match="only be configured with primary-then-panel"):
+        ReviewSchedulingContract(
+            required_reviewers=("Codex", "Gemini"),
+            policy="selective-intermediate",
+            primary_reviewer="Codex",
+        )
+    # Persisted/configured primary drift is contract inequality (fails closed in the loop).
+    persisted = ReviewSchedulingContract.from_mapping(
+        {**_primary_contract().as_dict(), "primary_reviewer": "Gemini"}
+    )
+    assert persisted != _primary_contract()
+    assert ReviewSchedulingContract.from_mapping(_primary_contract().as_dict()) == _primary_contract()
+
+
+def test_policy_capabilities_are_named_and_existing_policies_unchanged():
+    from coding_review_agent_loop.review_scheduling import policy_capabilities
+
+    compat = policy_capabilities("all-reviewers")
+    assert not compat.scheduler_enabled
+    assert not compat.owner_scoped_reconciliation
+    assert not compat.counts_avoided_calls
+    assert not compat.recovery_latches_force_full
+    selective = policy_capabilities("selective-intermediate")
+    assert selective.scheduler_enabled and selective.owner_scoped_reconciliation
+    assert selective.selective_pausing and selective.counts_avoided_calls
+    assert not selective.phase_aware and not selective.requires_primary
+    assert not selective.recovery_latches_force_full
+    staged = policy_capabilities("primary-then-panel")
+    assert staged.scheduler_enabled and staged.owner_scoped_reconciliation
+    assert staged.selective_pausing and staged.counts_avoided_calls
+    assert staged.phase_aware and staged.requires_primary
+    assert staged.recovery_latches_force_full
+    with pytest.raises(AgentLoopError):
+        policy_capabilities("unknown")
+
+
+def test_primary_blocking_loop_keeps_only_primary_until_exact_head_approval():
+    initial = select_reviewers(
+        _snapshot(previous=None), TransitionClassification("broad", "initial candidate")
+    )
+    assert initial.selected_reviewers == ("Codex",)
+    assert initial.phase == "primary"
+    assert initial.calls_avoided == 2
+    assert dict(initial.paused_reviewers)["Gemini"].startswith("primary phase")
+
+    # Primary blocked, coder made a narrow fix: still the primary phase, not remediation.
+    recheck = select_reviewers(
+        _snapshot(obligations=(_obligation(owners=("Codex",)),), phase="primary"), NARROW
+    )
+    assert recheck.selected_reviewers == ("Codex",)
+    assert recheck.phase == "primary"
+    assert "primary rechecks" in recheck.reason
+
+    # Approval from an older head never carries: the primary is re-selected.
+    stale = select_reviewers(_snapshot(phase="primary"), NARROW, qualifying_approvals=())
+    assert stale.selected_reviewers == ("Codex",)
+    assert stale.phase == "primary"
+
+
+def test_primary_approval_opens_independent_secondary_audit_not_final_sweep():
+    audit = select_reviewers(
+        _snapshot(previous="b" * 40, phase="primary"),
+        TransitionClassification("narrow", "same exact candidate head"),
+        qualifying_approvals=("Codex",),
+        final_sweep=True,
+    )
+    assert audit.selected_reviewers == ("Gemini", "Antigravity")
+    assert audit.phase == "secondary-audit"
+    assert audit.calls_avoided == 0
+    # An explicit caller phase can never bypass the primary gate.
+    gated = select_reviewers(_snapshot(phase="secondary-audit"), NARROW, phase="secondary-audit")
+    assert gated.selected_reviewers == ("Codex",)
+    assert gated.phase == "remediation"
+
+
+def test_scoped_remediation_selects_all_owners_and_primary_then_sweeps_missing():
+    remediation = select_reviewers(
+        _snapshot(
+            obligations=(
+                _obligation("item-1", owners=("Gemini",)),
+                _obligation("item-2", owners=("Antigravity",), scope=("src/api.py",)),
+            ),
+            phase="secondary-audit",
+        ),
+        NARROW,
+    )
+    assert remediation.selected_reviewers == ("Codex", "Gemini", "Antigravity")
+    assert remediation.phase == "remediation"
+    assert remediation.active_owners == ("Antigravity", "Gemini")
+
+    single_owner = select_reviewers(
+        _snapshot(obligations=(_obligation(owners=("Gemini",)),), phase="secondary-audit"), NARROW
+    )
+    assert single_owner.selected_reviewers == ("Codex", "Gemini")
+    assert single_owner.calls_avoided == 1
+    assert "exact-head secondary sweep follows" in dict(single_owner.paused_reviewers)["Antigravity"]
+
+    # Owners and primary cleared: every secondary lacking exact-head approval sweeps.
+    sweep = select_reviewers(
+        _snapshot(previous="b" * 40, phase="remediation"),
+        TransitionClassification("narrow", "same exact candidate head"),
+        qualifying_approvals=("Codex", "Gemini"),
+        final_sweep=True,
+    )
+    assert sweep.selected_reviewers == ("Antigravity",)
+    assert sweep.phase == "final-secondary-sweep"
+    assert sweep.calls_avoided == 0
+
+    # A primary that failed during remediation stays outstanding before the sweep.
+    primary_outstanding = select_reviewers(
+        _snapshot(previous="b" * 40, phase="remediation"),
+        TransitionClassification("narrow", "same exact candidate head"),
+        qualifying_approvals=("Gemini",),
+        final_sweep=True,
+    )
+    assert primary_outstanding.selected_reviewers == ("Codex",)
+    assert primary_outstanding.phase == "remediation"
+
+
+@pytest.mark.parametrize(
+    "classification",
+    [
+        TransitionClassification("broad", "diff path outside obligation scopes"),
+        TransitionClassification("broad", "the active obligation ledger is not reconstructible"),
+        TransitionClassification("broad", "a returning reviewer's history could not be reconstructed"),
+        TransitionClassification("broad", "binary or mode change"),
+    ],
+)
+@pytest.mark.parametrize("phase", ["primary", "secondary-audit", "remediation", "final-secondary-sweep"])
+def test_unsafe_remediation_with_active_findings_selects_complete_board(classification, phase):
+    decision = select_reviewers(
+        _snapshot(obligations=(_obligation(owners=("Gemini",)),), phase=phase), classification
+    )
+    assert decision.selected_reviewers == ("Codex", "Gemini", "Antigravity")
+    assert decision.phase == "full-board"
+    assert decision.paused_reviewers == ()
+    assert decision.calls_avoided == 0
+
+
+def test_broad_head_change_after_panel_evidence_selects_complete_board():
+    decision = select_reviewers(_snapshot(phase="final-secondary-sweep"), BROAD)
+    assert decision.selected_reviewers == ("Codex", "Gemini", "Antigravity")
+    assert decision.phase == "full-board"
+    # Contradictory history: a secondary-owned finding without panel evidence.
+    contradictory = select_reviewers(
+        _snapshot(obligations=(_obligation(owners=("Gemini",)),), phase="primary"), NARROW
+    )
+    assert contradictory.selected_reviewers == ("Codex", "Gemini", "Antigravity")
+    assert contradictory.phase == "full-board"
+    with pytest.raises(AgentLoopError, match="phase checkpoint"):
+        select_reviewers(_snapshot(phase="bogus"), NARROW)
+
+
+def test_force_full_latch_overrides_primary_phase_and_unavailable_is_not_approval():
+    forced = select_reviewers(_snapshot(previous=None, force_full=True), BROAD)
+    assert forced.selected_reviewers == ("Codex", "Gemini", "Antigravity")
+    assert forced.phase == "full-board"
+    assert forced.reason == "force-full latch"
+
+    missing_primary = select_reviewers(
+        _snapshot(previous=None, phase="primary"),
+        BROAD,
+        unavailable_reviewers=("Codex",),
+    )
+    assert missing_primary.selected_reviewers == ()
+    assert missing_primary.phase == "primary"
+    assert "unavailable" in dict(missing_primary.paused_reviewers)["Codex"]
+
+    partial_sweep = select_reviewers(
+        _snapshot(previous="b" * 40, phase="secondary-audit"),
+        TransitionClassification("narrow", "same exact candidate head"),
+        qualifying_approvals=("Codex", "Gemini"),
+        unavailable_reviewers=("Antigravity",),
+        final_sweep=True,
+    )
+    assert partial_sweep.selected_reviewers == ()
+    assert "unavailable" in dict(partial_sweep.paused_reviewers)["Antigravity"]
+
+
+def test_legacy_scheduler_payload_without_phase_is_valid_and_grants_no_phase_authority():
+    legacy_contract = _contract()
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="summary",
+        agent="Orchestrator",
+        round_number=2,
+        subject="b" * 40,
+        scheduler_contract=legacy_contract.as_dict(),
+        scheduler_previous_sha="a" * 40,
+        scheduler_current_sha="b" * 40,
+        scheduler_obligation_digest="0" * 16,
+        scheduler_selected_reviewers=("Codex",),
+        scheduler_paused_reviewers=(("Claude", "narrow transition"), ("Antigravity", "narrow transition")),
+        scheduler_reasons=("narrow transition",),
+        scheduler_final_sweep=False,
+        scheduler_force_full=False,
+        scheduler_calls_avoided=2,
+    )
+    payload = decode_mapping(_encode_round_metadata(metadata))
+    assert "scheduler_phase" not in payload
+    decoded = _decode_round_metadata_mapping(payload)
+    assert decoded.scheduler_metadata_status == "valid"
+    assert decoded.scheduler_phase is None
+    assert decoded.scheduler_primary_reviewer is None
+    assert decoded.scheduler_approved_reviewers == ()
+    # The scheduler itself refuses to treat a missing checkpoint as panel evidence.
+    decision = select_reviewers(
+        _snapshot(previous="b" * 40, phase=None),
+        TransitionClassification("narrow", "same exact candidate head"),
+        qualifying_approvals=("Codex",),
+    )
+    assert decision.phase == "secondary-audit"
+
+
+def test_selective_intermediate_semantics_are_unchanged_by_the_staged_policy():
+    snapshot = SchedulerSnapshot(
+        previous_sha="a" * 40,
+        current_sha="b" * 40,
+        contract=_contract(),
+        obligations=(_obligation(owners=("Codex",)),),
+        phase="secondary-audit",  # ignored by the selective policy
+    )
+    decision = select_reviewers(snapshot, NARROW)
+    assert decision.selected_reviewers == ("Codex",)
+    assert decision.primary_reviewer is None
+    assert decision.calls_avoided == 2
+    broad = select_reviewers(snapshot, BROAD)
+    assert broad.selected_reviewers == ("Claude", "Codex", "Antigravity")
+    compat = select_reviewers(
+        SchedulerSnapshot(
+            previous_sha="a" * 40,
+            current_sha="b" * 40,
+            contract=ReviewSchedulingContract(required_reviewers=("Claude", "Codex")),
+        ),
+        NARROW,
+    )
+    assert compat.selected_reviewers == ("Claude", "Codex")
+    assert compat.calls_avoided == 0
+
+
+def test_staged_pr_scheduler_options_validate_together(tmp_path):
+    args = build_parser().parse_args(
+        [
+            "pr", "77", "--pr-review-policy", "primary-then-panel",
+            "--primary-reviewer", "codex", "--reviewer", "codex", "--reviewer", "gemini",
+        ]
+    )
+    assert args.pr_review_policy == "primary-then-panel"
+    assert args.primary_reviewer == "codex"
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+    )
+    assert config.primary_reviewer == "codex"
+    with pytest.raises(AgentLoopError, match="--primary-reviewer is required"):
+        make_config(tmp_path, reviewer=("codex", "gemini"), pr_review_policy="primary-then-panel")
+    with pytest.raises(AgentLoopError, match="one of the configured"):
+        make_config(
+            tmp_path, reviewer=("codex", "gemini"),
+            pr_review_policy="primary-then-panel", primary_reviewer="claude",
+        )
+    with pytest.raises(AgentLoopError, match="at least one secondary"):
+        make_config(
+            tmp_path, reviewer=("codex",),
+            pr_review_policy="primary-then-panel", primary_reviewer="codex",
+        )
+    with pytest.raises(AgentLoopError, match="requires --pr-review-policy primary-then-panel"):
+        make_config(tmp_path, reviewer=("codex", "gemini"), primary_reviewer="codex")
+    default = make_config(tmp_path, reviewer=("codex", "gemini"))
+    assert default.pr_review_policy == "all-reviewers"
+    assert default.primary_reviewer is None

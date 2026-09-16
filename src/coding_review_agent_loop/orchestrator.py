@@ -11669,8 +11669,9 @@ def run_pr_loop(
                     not scheduler_records
                     or latest_scheduler_record.metadata.scheduler_metadata_status != "valid"
                 ):
-                    # This recovery override applies to the current decision;
-                    # only the explicit operator setting is a durable latch.
+                    # Under selective-intermediate this recovery override
+                    # applies to the current decision only; the staged policy
+                    # additionally latches it durably below.
                     scheduler_metadata_recovery_full_board = True
                 current_scheduler_records = [
                     record
@@ -11708,6 +11709,34 @@ def run_pr_loop(
                     # enclosing audit record's subject. Never derive a
                     # previous transition from that state.
                     scheduler_metadata_recovery_full_board = True
+                if (
+                    scheduler_metadata_recovery_full_board
+                    and scheduler_capabilities.recovery_latches_force_full
+                    and not scheduler_force_full
+                ):
+                    # Recovery-raised full-board scheduling is a monotonic
+                    # durable latch for the staged policy: it is persisted in
+                    # every later round record and survives resume.
+                    scheduler_force_full = True
+                    log(
+                        config,
+                        f"Round {round_number}: scheduler metadata recovery raised the durable "
+                        "force-full latch; the complete board is selected for the rest of the run",
+                    )
+                # The durable phase checkpoint is the latest valid scheduler
+                # record that carries phase authority.  It only reports whether
+                # the secondary panel has been opened; approvals stay exact-head.
+                scheduler_checkpoint_phase: str | None = None
+                if scheduler_capabilities.phase_aware and not scheduler_metadata_recovery_full_board:
+                    scheduler_checkpoint_phase = next(
+                        (
+                            record.metadata.scheduler_phase
+                            for record in reversed(historical_records)
+                            if record.metadata.scheduler_metadata_status == "valid"
+                            and record.metadata.scheduler_phase is not None
+                        ),
+                        None,
+                    )
                 current_coder_record = next(
                     (
                         record for record in reversed(current_head_records)
@@ -11830,7 +11859,15 @@ def run_pr_loop(
                     unreconstructible_history = [
                         name
                         for name in scheduler_contract.required_reviewers
-                        if not _reviewer_history_is_reconstructible(
+                        # Under the staged policy a secondary that has never
+                        # reviewed is not "returning": its first invocation
+                        # always receives the complete base-to-head diff, so
+                        # only reviewers with a prior record need span history.
+                        if not (
+                            scheduler_capabilities.phase_aware
+                            and latest_reviewer_records.get(name) is None
+                        )
+                        and not _reviewer_history_is_reconstructible(
                             runner,
                             checkout=active_workdir(config),
                             record=latest_reviewer_records.get(name),
@@ -11849,6 +11886,7 @@ def run_pr_loop(
                     contract=scheduler_contract,
                     obligations=obligations,
                     force_full=(scheduler_force_full or scheduler_metadata_recovery_full_board),
+                    phase=scheduler_checkpoint_phase,
                 )
                 scheduler_decision = select_reviewers(
                     scheduler_snapshot,
@@ -11858,6 +11896,7 @@ def run_pr_loop(
                         agent_display_name(reviewer) for reviewer in unavailable_reviewer_failures
                     ),
                     final_sweep=final_sweep,
+                    phase=scheduler_checkpoint_phase,
                 )
                 scheduler_diff_context = (
                     "\nScheduler audit record: the orchestrator classified the transition as "
@@ -11879,7 +11918,9 @@ def run_pr_loop(
                     f"{scheduler_decision.phase} {scheduler_decision.reason}; "
                     f"selected={', '.join(scheduler_decision.selected_reviewers) or 'none'}; "
                     f"paused={', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}; "
-                    f"force_full={scheduler_force_full}; active_owners="
+                    f"force_full={scheduler_force_full}; checkpoint_phase="
+                    f"{scheduler_checkpoint_phase or 'none'}; head={current_pr_subject}; "
+                    f"primary={scheduler_contract.primary_reviewer or 'none'}; active_owners="
                     f"{', '.join(scheduler_decision.active_owners) or 'none'}",
                 )
                 if scheduler_decision.selected_reviewers and not skip_reviewers_for_recovery and not conflict_pending:
