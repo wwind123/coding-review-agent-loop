@@ -266,6 +266,12 @@ class AgentLoopConfig:
     # It is intentionally not a CLI option: a later invocation must perform a
     # new preflight rather than accepting a PR-body token it did not create.
     managed_ci_expected_override_nonce: str | None = None
+    # Explicit opt-in for exceptional recovery when the original issue-created
+    # authorization checkpoint was never published or cannot be verified.
+    managed_ci_fresh_authorization: bool = False
+    # PR mode must name the issue scope instead of inferring it from candidate
+    # controlled body text.
+    managed_ci_issue_number: int | None = None
     # True only for the public `agent-loop pr` entry point. Issue-mode
     # implementation hands off to the PR loop too, but must retain the
     # issue-created activation semantics for that first invocation.
@@ -1377,6 +1383,8 @@ def config_from_args(
         managed_ci=getattr(args, "managed_ci", False),
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
         allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),
+        managed_ci_fresh_authorization=getattr(args, "managed_ci_fresh_authorization", False),
+        managed_ci_issue_number=getattr(args, "managed_ci_issue", None),
         managed_ci_pr_mode=getattr(args, "command", None) == "pr",
         invocation_argv=invocation_argv,
         expected_closing_issue_ids=normalize_issue_ids(

@@ -267,6 +267,21 @@ Run `agent-loop <command> --help` for the complete options for one workflow.
 The [full CLI guide](docs/local_agent_loop.md#usage) covers lifecycle and resume
 behavior in detail.
 
+For an issue-created managed-CI PR whose original authorization comment is
+missing, recovery is deliberately explicit. On a voluntary or plan-limited
+base, use `--managed-ci-fresh` with `--managed-ci` and the unprotected waiver;
+PR mode must also provide `--managed-ci-issue <issue-number>`. This creates a
+new operator grant after validating the live PR tuple, fetching the issue and
+canonical plan scope, and confirming a server-observed issue-to-PR association.
+It reuses any valid exact-head authorization and does not adopt arbitrary
+existing PRs. If structured response validation rejected the implementation
+before accepting its PR number, strict protection instead uses ordinary
+same-PR issue/PR discovery and resume; the fresh unprotected grant is not
+available or required for a strict base. If a strict draft was left unlabeled,
+that resume requires the authenticated strict PR tuple and an actor-owned
+historical `agent-loop-managed` label event, then reapplies the label without
+creating a waiver record.
+
 ## How the Review Loop Behaves
 
 1. The coder implements the issue or updates the existing PR.

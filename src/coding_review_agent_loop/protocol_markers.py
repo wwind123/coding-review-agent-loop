@@ -277,6 +277,10 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
             canonicalizer=lambda match: _canonical_key_value_comment(match, token="AGENT_LOOP_MANAGED_CI_QUALIFIED_V2", colon=False),
         ),
         _line_definition("AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1", surfaces=_PR),
+        _b64_definition(
+            "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1",
+            surfaces=frozenset({PR_COMMENT_SURFACE}),
+        ),
         MarkerDefinition(
             token="AGENT_MANAGED_PR_SOURCE_V1",
             pattern=re.compile(r"<!--\s*AGENT_MANAGED_PR_SOURCE_V1\s+(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I),

@@ -66,7 +66,7 @@ Source paths below are relative to
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; perform bounded format repair and reject content-loss or semantic rewrites. |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head. |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. |
-| GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. |
+| GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
 | Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. |
@@ -254,6 +254,54 @@ The unprotected managed-CI waiver is a voluntary tool gate, not a replacement
 for GitHub enforcement. Historical audit markers cannot grant fresh authority;
 the live actor, repository, PR lifecycle, and provenance must be revalidated.
 See [managed CI](docs/local_agent_loop.md#managed-exact-head-ci).
+
+Issue-created managed-CI authorization is a durable orchestration protocol,
+not coder evidence. Once a structurally accepted implementation response
+exposes a PR number, the orchestrator authenticates the live repository, issue,
+PR, actor, base, reserved branch, exact head, and managed-label event, then
+persists a versioned authorization record only as an actor-authored PR comment
+before validating reported test locations. Rejected test evidence remains
+rejected and cannot produce handoff, approval, readiness, dispatch, or
+qualification state. A response rejected before the PR number is accepted is
+never parsed for authority; recovery on a voluntary or plan-limited base
+requires the explicit fresh operator grant in issue or PR mode, with PR mode
+naming the issue scope. A strictly protected base instead uses ordinary
+same-PR issue/PR discovery and resume; a draft/unlabeled re-entry additionally
+requires the authenticated strict PR tuple and an actor-owned historical
+managed-label event before the suppression label is reapplied. It does not
+mint or accept an unprotected grant merely because the waiver flag was supplied.
+PR-mode recovery fetches that issue from GitHub, resolves any canonical
+approved-plan identity from its durable comments, and requires a server-side
+issue timeline association to the exact PR; candidate-authored closing text is
+not the source of authorization. When no PR-side closing-contract record exists,
+the authenticated issue/plan scope supplies the expected set, and the current
+body is checked for unapproved same-repository closing references before managed
+activation can write the suppression label.
+Creation and fresh-authorization publication re-read the live tuple, managed
+label event, and authorization-comment state immediately before writing, and
+fresh grants bind the observed voluntary or plan-limited protection state.
+Legacy PR discovery during explicit managed issue recovery does not synthesize
+a canonical handoff from an implementation response that failed validation.
+Fresh-authorization guidance is emitted only for an authenticated
+issue-created missing/stale authorization with a known issue scope and explicit
+unprotected waiver. Label-event, protection, tuple/publication, intent-ledger,
+adoption, and source-managed failures retain their own prerequisite-specific
+diagnostics rather than advertising an inapplicable grant.
+
+Automatic authority across a coder repair head is a narrow execution/data-flow
+transition: the orchestrator must have persisted the blocking round, invoked
+the coder for that round, validated the response and assigned-checkout head
+advance, re-read the exact live PR tuple, and persist one continuity comment
+binding predecessor head, new head, predecessor authorization, and round
+metadata identities. Those referenced comments are parsed again on resume and
+must be newer than the predecessor authorization, with the blocking reviewer
+record for the predecessor head ordered before the coder record for the
+immediately following round and new head. Resume accepts only
+one unique gap-free chain. Missing,
+forked, stale, unsolicited, or raced links fail closed and direct an eligible
+operator to fresh authorization. PR bodies, branches, labels, draft state,
+commits, and coder-authored comments remain corroboration only; they are not
+authority or a persistence substitute.
 
 ## State and Recovery
 

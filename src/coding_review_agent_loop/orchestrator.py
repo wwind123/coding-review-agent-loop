@@ -163,12 +163,16 @@ from .managed_ci import (
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
     activate_managed_ci,
+    authorize_fresh_issue_created_resume,
     authenticate_source_managed_resume,
     authenticate_issue_created_handoff,
     dispatch_final_qualification,
     intermediate_managed_checks,
     managed_label_present,
     preflight_managed_ci_creation,
+    find_actor_round_metadata_comment_ids,
+    publish_issue_created_continuity_authorization,
+    publish_issue_created_authorization,
     publish_manual_v2_qualification,
     prepare_v2_merge,
     publish_round_readiness,
@@ -2697,6 +2701,7 @@ def _run_validated_agent(
     salvage_context: SalvageContext | None = None,
     operation_description: str | None = None,
     completion_recovery: CompletionRecoveryPolicy | None = None,
+    managed_ci_recovery_protection: str | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -3761,6 +3766,24 @@ def _run_validated_agent(
         role=role,
         classification_text=last_classification_text,
     )
+    if repair_expected_kind == "issue_implementation" and config.managed_ci:
+        message += " The implementation response was rejected before a PR number was accepted."
+        if (
+            config.allow_unprotected_managed_ci
+            and managed_ci_recovery_protection in {"voluntary", "plan_limited"}
+        ):
+            message += (
+                " If the coder opened a PR before that rejection, discover and resume that same PR "
+                "with explicit --managed-ci-fresh authorization (including the unprotected waiver); "
+                "do not rerun implementation to recreate it."
+            )
+        else:
+            message += (
+                " If the coder opened a PR before that rejection, use the ordinary managed-CI "
+                "issue/PR discovery and resume path for that same PR. The exceptional "
+                "unprotected fresh-authorization path is unavailable here; do not rerun "
+                "implementation to recreate the PR."
+            )
     message += diagnostics.format_for_error()
     raise AgentInvocationError(
         message,
@@ -5753,7 +5776,8 @@ def _validate_tests_with_post_pr_context(
         raise AgentLoopError(
             f"{exc}\n\n"
             f"PR #{pr_number} was confirmed open, but the handoff/reviewer comments were not posted because "
-            f"the {report_description} was invalid. Correct the PR/comment if needed, then continue safely with "
+            f"the {report_description} was invalid. The managed-CI authorization checkpoint, when required, "
+            "was persisted before this report was rejected. Correct the PR/comment if needed, then continue safely with "
             f"`agent-loop pr {pr_number}` instead of rerunning implementation and creating a duplicate PR."
         ) from exc
 
@@ -5794,6 +5818,60 @@ def _validate_structured_response_tests_with_post_pr_context(
         pr_number=pr_number,
         report_description="structured test report",
     )
+
+
+def _validate_structured_response_observations_with_post_pr_context(
+    test_observations: Sequence[object] | None,
+    *,
+    runner: Runner,
+    config: AgentLoopConfig,
+    pr_number: int,
+) -> None:
+    """Validate structured receipt citations with the same confirmed-PR diagnostic."""
+    _validate_tests_with_post_pr_context(
+        lambda: validate_test_observation_citations_within_workdir(
+            test_observations,
+            assigned_workdir=active_workdir(config),
+        ),
+        runner=runner,
+        config=config,
+        pr_number=pr_number,
+        report_description="structured test-observation report",
+    )
+
+
+def _publish_issue_authorization_with_recovery(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    metadata: PullRequestMetadata,
+    issue_number: int,
+    approved_plan_hash_value: str | None = None,
+) -> AuthenticatedIssueCreatedHandoff:
+    """Publish the durable checkpoint or give an authority-changing remedy."""
+    try:
+        return publish_issue_created_authorization(
+            runner,
+            config=config,
+            handoff=handoff,
+            metadata=metadata,
+            approved_plan_hash=approved_plan_hash_value,
+        )
+    except AgentLoopError as exc:
+        command = render_managed_ci_resume_command(
+            config,
+            pr_number=handoff.pr_number,
+            issue_number=issue_number,
+            managed_ci=True,
+            fresh_authorization=True,
+            fresh_issue_number=issue_number,
+        )
+        raise AgentLoopError(
+            f"{exc}\n\nManaged-CI authorization publication was interrupted and no "
+            "handoff or qualification was claimed. After verifying the PR, create an "
+            f"explicit new operator authorization with `{command}`."
+        ) from exc
 
 
 def _round_ledger_may_be_incomplete(
@@ -6000,6 +6078,10 @@ def _implement_approved_issue(
             resumed_pr_context = get_pr_review_context(
                 runner, config=implementation_config, pr_number=existing_pr_number
             )
+        # Explicit managed recovery may be resuming a PR whose implementation
+        # report was rejected before the canonical handoff checkpoint. Its
+        # durable authorization is sufficient to enter the PR loop, but must
+        # not launder that rejected report into a canonical handoff.
         if resolved_pr.source == "legacy-closing-reference":
             pr_url, pr_head_sha = require_pr_metadata_for_handoff(resumed_pr_context.metadata)
             validate_pr_expected_closing_issues(
@@ -6008,6 +6090,7 @@ def _implement_approved_issue(
                 pr_number=existing_pr_number,
                 expected_issue_ids=closing_contract.issue_ids,
                 body=resumed_pr_context.metadata.body,
+                reject_unexpected=implementation_config.managed_ci,
             )
             pr_contract = make_pr_contract(
                 repository=implementation_config.repo,
@@ -6026,18 +6109,19 @@ def _implement_approved_issue(
                     expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
                 ),
             )
-            post_issue_pr_handoff_comment(
-                runner,
-                config=implementation_config,
-                issue_number=issue_number,
-                pr_number=existing_pr_number,
-                pr_url=pr_url,
-                pr_head_sha=pr_head_sha,
-                flow="approved-plan-implementation",
-                plan_hash=plan_hash,
-                expected_closing_issue_ids=closing_contract.issue_ids,
-                supersedes_hash=closing_contract.supersedes_hash,
-            )
+            if not implementation_config.managed_ci:
+                post_issue_pr_handoff_comment(
+                    runner,
+                    config=implementation_config,
+                    issue_number=issue_number,
+                    pr_number=existing_pr_number,
+                    pr_url=pr_url,
+                    pr_head_sha=pr_head_sha,
+                    flow="approved-plan-implementation",
+                    plan_hash=plan_hash,
+                    expected_closing_issue_ids=closing_contract.issue_ids,
+                    supersedes_hash=closing_contract.supersedes_hash,
+                )
         if one_shot_parent_issue is not None:
             post_one_shot_impl_handoff_comment(
                 runner,
@@ -6157,6 +6241,10 @@ def _implement_approved_issue(
             parent_issue_context=parent_issue_context,
             human_requirements=implementation_requirements,
         ),
+        managed_ci_recovery_protection=(
+            managed_ci_creation_intent.protection_mode
+            if managed_ci_creation_intent is not None else None
+        ),
     )
     coder_output = coder_response.text
     implementation_result = coder_response.marker_value
@@ -6192,12 +6280,6 @@ def _implement_approved_issue(
             raise AgentLoopError(
                 "Coder did not create a valid PR; implementation is blocking."
             )
-        _validate_structured_response_tests_with_post_pr_context(
-            implementation_result.tests_run,
-            runner=runner,
-            config=implementation_config,
-            pr_number=implementation_result.pr_number,
-        )
         pr_number = implementation_result.pr_number
     elif isinstance(implementation_result, _TerminalNoPrImplementation):
         _post_no_pr_implementation_terminal_comment(
@@ -6236,8 +6318,30 @@ def _implement_approved_issue(
                 implementation_config,
                 managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
             )
+        if managed_ci_handoff is not None:
+            managed_ci_handoff = _publish_issue_authorization_with_recovery(
+                runner,
+                config=implementation_config,
+                handoff=managed_ci_handoff,
+                metadata=initial_pr_context.metadata,
+                issue_number=issue_number,
+                approved_plan_hash_value=plan_hash,
+            )
     else:
         reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+    if isinstance(implementation_result, StructuredIssueImplementation):
+        _validate_structured_response_tests_with_post_pr_context(
+            implementation_result.tests_run,
+            runner=runner,
+            config=implementation_config,
+            pr_number=pr_number,
+        )
+        _validate_structured_response_observations_with_post_pr_context(
+            implementation_result.test_observations,
+            runner=runner,
+            config=implementation_config,
+            pr_number=pr_number,
+        )
     validate_pr_references_issue(
         runner,
         config=implementation_config,
@@ -8490,6 +8594,9 @@ def run_issue_loop(
                     pr_number=resolved_pr.pr_number,
                     issue_number=staged_parent_issue,
                 )
+            # Keep rejected issue-implementation evidence rejected during an
+            # explicit managed recovery. The PR loop authenticates the
+            # authorization record independently of this legacy association.
             if resolved_pr.source == "legacy-closing-reference":
                 pr_context = get_pr_review_context(runner, config=config, pr_number=resolved_pr.pr_number)
                 validate_pr_expected_closing_issues(
@@ -8498,6 +8605,7 @@ def run_issue_loop(
                     pr_number=resolved_pr.pr_number,
                     expected_issue_ids=closing_contract.issue_ids,
                     body=pr_context.metadata.body,
+                    reject_unexpected=config.managed_ci,
                 )
                 pr_url, pr_head_sha = require_pr_metadata_for_handoff(pr_context.metadata)
                 pr_contract = make_pr_contract(
@@ -8521,22 +8629,23 @@ def run_issue_loop(
                         expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
                     ),
                 )
-                post_issue_pr_handoff_comment(
-                    runner,
-                    config=config,
-                    issue_number=issue_number,
-                    pr_number=resolved_pr.pr_number,
-                    pr_url=pr_url,
-                    pr_head_sha=pr_head_sha,
-                    flow=(
-                        "approved-plan-implementation"
-                        if plan_first and recovered_plan_hash is not None
-                        else "issue-implementation"
-                    ),
-                    plan_hash=recovered_plan_hash if plan_first else None,
-                    expected_closing_issue_ids=closing_contract.issue_ids,
-                    supersedes_hash=closing_contract.supersedes_hash,
-                )
+                if not config.managed_ci:
+                    post_issue_pr_handoff_comment(
+                        runner,
+                        config=config,
+                        issue_number=issue_number,
+                        pr_number=resolved_pr.pr_number,
+                        pr_url=pr_url,
+                        pr_head_sha=pr_head_sha,
+                        flow=(
+                            "approved-plan-implementation"
+                            if plan_first and recovered_plan_hash is not None
+                            else "issue-implementation"
+                        ),
+                        plan_hash=recovered_plan_hash if plan_first else None,
+                        expected_closing_issue_ids=closing_contract.issue_ids,
+                        supersedes_hash=closing_contract.supersedes_hash,
+                    )
             return run_pr_loop(
                 runner,
                 pr_number=resolved_pr.pr_number,
@@ -8655,6 +8764,10 @@ def run_issue_loop(
                 parent_issue_context=parent_issue_context,
                 human_requirements=implementation_requirements,
             ),
+            managed_ci_recovery_protection=(
+                managed_ci_creation_intent.protection_mode
+                if managed_ci_creation_intent is not None else None
+            ),
         )
         coder_output = coder_response.text
         coder_session_id = coder_response.session_id
@@ -8699,16 +8812,6 @@ def run_issue_loop(
                 raise AgentLoopError(
                     "Coder did not create a valid PR; implementation is blocking."
                 )
-            _validate_structured_response_tests_with_post_pr_context(
-                implementation_result.tests_run,
-                runner=runner,
-                config=config,
-                pr_number=implementation_result.pr_number,
-            )
-            validate_test_observation_citations_within_workdir(
-                implementation_result.test_observations,
-                assigned_workdir=active_workdir(config),
-            )
             pr_number = implementation_result.pr_number
         else:
             # Clarification remains the legacy terminal alternative.
@@ -8748,8 +8851,28 @@ def run_issue_loop(
                     config,
                     managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
                 )
+            managed_ci_handoff = _publish_issue_authorization_with_recovery(
+                runner,
+                config=config,
+                handoff=managed_ci_handoff,
+                metadata=initial_pr_context.metadata,
+                issue_number=issue_number,
+            )
         else:
             reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
+        if isinstance(implementation_result, StructuredIssueImplementation):
+            _validate_structured_response_tests_with_post_pr_context(
+                implementation_result.tests_run,
+                runner=runner,
+                config=config,
+                pr_number=pr_number,
+            )
+            _validate_structured_response_observations_with_post_pr_context(
+                implementation_result.test_observations,
+                runner=runner,
+                config=config,
+                pr_number=pr_number,
+            )
         initial_pr_metadata = initial_pr_context.metadata
         validate_pr_references_issue(
             runner,
@@ -10360,12 +10483,136 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
+        if config.managed_ci_fresh_authorization:
+            fresh_issue_number = managed_ci_issue_number or config.managed_ci_issue_number
+            if fresh_issue_number is None:
+                raise AgentLoopError(
+                    "Managed-CI fresh authorization requires an explicit issue scope in PR mode."
+                )
+            config = dataclasses_replace(
+                config,
+                managed_ci_issue_number=fresh_issue_number,
+            )
+            if issue_context is None:
+                validate_open_issue(
+                    runner, config=config, issue_number=fresh_issue_number
+                )
+                issue_context = get_issue_context(
+                    runner, config=config, issue_number=fresh_issue_number
+                )
+            elif issue_context.number != fresh_issue_number:
+                raise AgentLoopError(
+                    "Managed-CI fresh authorization issue scope does not match the "
+                    "authenticated issue context."
+                )
+            canonical_handoff = find_latest_issue_pr_handoff(
+                issue_context.comments,
+                issue_number=fresh_issue_number,
+                repo=config.repo,
+            )
+            if canonical_handoff is not None:
+                if canonical_handoff.pr_number != pr_number:
+                    raise AgentLoopError(
+                        "Managed-CI fresh authorization issue scope is already bound to "
+                        "a different canonical PR."
+                    )
+                if canonical_handoff.flow == "approved-plan-implementation":
+                    if not canonical_handoff.plan_hash:
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization found an approved-plan handoff "
+                            "without a canonical plan identity."
+                        )
+                    recovered = recover_approved_plan_context(
+                        issue_context.comments,
+                        expected_hash=canonical_handoff.plan_hash,
+                    )
+                    if not recovered.is_available:
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization could not recover the canonical "
+                            "approved plan for the explicit issue scope."
+                        )
+                    if (
+                        approved_plan_context is not None
+                        and approved_plan_context.plan_hash != recovered.plan_hash
+                    ):
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization approved-plan scope does not "
+                            "match the canonical issue plan."
+                        )
+                    approved_plan_context = recovered
+            else:
+                resumed_plan = _resume_plan_round(
+                    issue_context.comments,
+                    configured_reviewers=reviewers(config),
+                )
+                if resumed_plan is not None:
+                    plan_text, resumed_plan_round = resumed_plan
+                    configured_names = {
+                        agent_display_name(reviewer) for reviewer in reviewers(config)
+                    }
+                    approved_names = {
+                        record.metadata.agent
+                        for record in resumed_plan_round.completed_reviews
+                        if record.metadata.state == "approved"
+                    }
+                    if approved_names != configured_names:
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization found planning state without "
+                            "a complete canonical reviewer approval."
+                        )
+                    recovered_plan_context = make_approved_plan_context(
+                        plan_text,
+                        source_locator=(
+                            f"issue #{fresh_issue_number} canonical approved plan"
+                        ),
+                        expected_hash=approved_plan_hash(plan_text),
+                    )
+                    if (
+                        approved_plan_context is not None
+                        and approved_plan_context.plan_hash
+                        != recovered_plan_context.plan_hash
+                    ):
+                        raise AgentLoopError(
+                            "Managed-CI fresh authorization approved-plan scope does not "
+                            "match the canonical issue plan."
+                        )
+                    approved_plan_context = recovered_plan_context
+                elif approved_plan_context is not None or _extract_round_metadata_records(
+                    issue_context.comments, flow="plan"
+                ):
+                    raise AgentLoopError(
+                        "Managed-CI fresh authorization could not prove a complete canonical "
+                        "approved plan for the explicit issue scope."
+                    )
+            managed_ci_handoff = authorize_fresh_issue_created_resume(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                issue_number=fresh_issue_number,
+                metadata=initial_pr_context.metadata,
+                approved_plan_hash=(
+                    approved_plan_context.plan_hash
+                    if approved_plan_context is not None else None
+                ),
+            )
+            authenticated_managed_resume = AuthenticatedManagedResume(
+                origin="issue-created",
+                lifecycle=managed_ci_handoff.lifecycle,
+                issue_created_handoff=managed_ci_handoff,
+                override_nonce=managed_ci_handoff.override_nonce,
+            )
         if managed_ci_handoff is not None:
             managed_ci_handoff = revalidate_issue_created_handoff(
                 runner,
                 config=config,
                 handoff=managed_ci_handoff,
                 metadata=initial_pr_context.metadata,
+            )
+            authenticated_managed_resume = AuthenticatedManagedResume(
+                origin="issue-created",
+                lifecycle=managed_ci_handoff.lifecycle,
+                issue_created_handoff=managed_ci_handoff,
+                override_nonce=managed_ci_handoff.override_nonce,
             )
         if managed_pr_origin is None:
             recovered_origin = recover_managed_pr_origin(
@@ -10386,6 +10633,81 @@ def run_pr_loop(
                 if managed_ci_handoff is None:
                     reject_forged_protocol_markers(initial_pr_context.metadata.body or "")
                 else:
+                    # Ordinary PR recovery must bind authorization records to
+                    # the canonical server-side issue/plan scope just as the
+                    # explicit fresh path does.  The record's own plan field
+                    # is never allowed to define that scope.
+                    if issue_context is None:
+                        validate_open_issue(
+                            runner,
+                            config=config,
+                            issue_number=managed_ci_handoff.issue_number,
+                        )
+                        issue_context = get_issue_context(
+                            runner,
+                            config=config,
+                            issue_number=managed_ci_handoff.issue_number,
+                        )
+                    canonical_handoff = find_latest_issue_pr_handoff(
+                        issue_context.comments,
+                        issue_number=managed_ci_handoff.issue_number,
+                        repo=config.repo,
+                    )
+                    recovered_scope: ApprovedPlanContext | None = None
+                    if (
+                        canonical_handoff is not None
+                        and canonical_handoff.flow == "approved-plan-implementation"
+                        and canonical_handoff.plan_hash
+                    ):
+                        candidate_scope = recover_approved_plan_context(
+                            issue_context.comments,
+                            expected_hash=canonical_handoff.plan_hash,
+                        )
+                        if not candidate_scope.is_available:
+                            raise AgentLoopError(
+                                "Managed-CI ordinary resume could not recover the canonical approved plan."
+                            )
+                        recovered_scope = candidate_scope
+                    elif canonical_handoff is None:
+                        resumed_plan = _resume_plan_round(
+                            issue_context.comments,
+                            configured_reviewers=reviewers(config),
+                        )
+                        if resumed_plan is not None:
+                            plan_text, resumed_plan_round = resumed_plan
+                            configured_names = {
+                                agent_display_name(reviewer) for reviewer in reviewers(config)
+                            }
+                            approved_names = {
+                                record.metadata.agent
+                                for record in resumed_plan_round.completed_reviews
+                                if record.metadata.state == "approved"
+                            }
+                            if approved_names != configured_names:
+                                raise AgentLoopError(
+                                    "Managed-CI ordinary resume found incomplete canonical plan approval."
+                                )
+                            recovered_scope = make_approved_plan_context(
+                                plan_text,
+                                source_locator=(
+                                    f"issue #{managed_ci_handoff.issue_number} canonical approved plan"
+                                ),
+                                expected_hash=approved_plan_hash(plan_text),
+                            )
+                    if recovered_scope is not None:
+                        if (
+                            approved_plan_context is not None
+                            and approved_plan_context.plan_hash != recovered_scope.plan_hash
+                        ):
+                            raise AgentLoopError(
+                                "Managed-CI ordinary resume approved-plan scope does not match "
+                                "the canonical issue plan."
+                            )
+                        approved_plan_context = recovered_scope
+                        managed_ci_handoff = dataclasses_replace(
+                            managed_ci_handoff,
+                            approved_plan_hash=recovered_scope.plan_hash,
+                        )
                     managed_ci_handoff = revalidate_issue_created_handoff(
                         runner,
                         config=config,
@@ -10441,6 +10763,72 @@ def run_pr_loop(
                 runner, config=config, issue_number=parent_issue_context.number
             )
             parent_issue_context_refreshed = True
+        # Public PR-mode recovery has no issue-mode configuration bit carrying
+        # the immutable closing contract.  Once the issue-created managed
+        # tuple has been authenticated, derive that contract from the
+        # server-backed issue/approved-plan scope before activation.  PR body
+        # references remain validation evidence only and never participate in
+        # this resolution.
+        if (
+            config.managed_ci
+            and config.expected_closing_issue_ids is None
+            and authenticated_managed_resume is not None
+            and authenticated_managed_resume.origin == "issue-created"
+            and issue_context is not None
+        ):
+            issue_scope_handoff = find_latest_issue_pr_handoff(
+                issue_context.comments,
+                issue_number=issue_context.number,
+                repo=config.repo,
+            )
+            if issue_scope_handoff is not None and issue_scope_handoff.pr_number != pr_number:
+                issue_scope_handoff = None
+            plan_additions = (
+                _extract_current_expected_closing_issue_ids(
+                    approved_plan_context.canonical_text
+                )
+                if approved_plan_context is not None
+                and approved_plan_context.canonical_text
+                else None
+            )
+            if (
+                recorded_pr_contract is not None
+                and issue_scope_handoff is not None
+                and tuple(recorded_pr_contract.expected_closing_issue_ids)
+                != tuple(issue_scope_handoff.expected_closing_issue_ids)
+            ):
+                raise AgentLoopError(
+                    "Authenticated issue-side and PR-side expected closing contracts diverge; "
+                    "no managed activation was performed."
+                )
+            closing_contract = resolve_issue_contract(
+                primary_issue=issue_context.number,
+                cli_additions=None,
+                plan_additions=plan_additions,
+                recovered=(
+                    issue_scope_handoff.expected_closing_issue_ids
+                    if issue_scope_handoff is not None
+                    else (
+                        recorded_pr_contract.expected_closing_issue_ids
+                        if recorded_pr_contract is not None
+                        else None
+                    )
+                ),
+                supersede=config.supersede_expected_closing_contract,
+            )
+            reject_parent_from_contract(
+                closing_contract,
+                parent_issue=(
+                    parent_issue_context.number
+                    if parent_issue_context is not None
+                    else None
+                ),
+            )
+            config = dataclasses_replace(
+                config,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+                expected_closing_contract_resolved=True,
+            )
         if config.expected_closing_contract_resolved:
             assert config.expected_closing_issue_ids is not None
             closing_contract = make_pr_contract(
@@ -10524,19 +10912,33 @@ def run_pr_loop(
                     ),
                 )
             )
-        if issue_context is not None and recorded_pr_contract is None and config.expected_closing_contract_resolved:
-            # A pre-contract canonical handoff is a legacy recovery record. Do
-            # not retroactively turn its old Refs-only body into a new durable
-            # contract; only newly persisted PR-side records activate the gate.
-            log(
-                config,
-                f"PR #{pr_number}: no PR-side expected-closing record found; retaining legacy "
-                "handoff recovery without inferring a contract from prose",
-            )
-            closing_contract = None
+        legacy_closing_validation_only = (
+            issue_context is not None
+            and recorded_pr_contract is None
+            and config.expected_closing_contract_resolved
+        )
+        if legacy_closing_validation_only:
+            if config.managed_ci:
+                # A pre-contract canonical handoff is a legacy recovery
+                # record. Do not retroactively turn its old Refs-only body
+                # into a new durable contract. Keep the resolved contract for
+                # closing-reference validation, but do not persist a new
+                # PR-side contract solely from the invocation's recovery
+                # context.
+                log(
+                    config,
+                    f"PR #{pr_number}: no PR-side expected-closing record found; retaining legacy "
+                    "handoff recovery without persisting a contract from prose",
+                )
+            else:
+                # Preserve the ordinary legacy issue-resume compatibility
+                # path: a pre-contract Refs-only PR is not retroactively
+                # upgraded into an affirmative closing contract.
+                closing_contract = None
         contract_needs_persisting = (
             closing_contract is not None
             and (recorded_pr_contract is None or recorded_pr_contract != closing_contract)
+            and not legacy_closing_validation_only
         )
         issue_handoff_to_update = None
         if issue_context is not None and recorded_pr_contract is not None:
@@ -11037,6 +11439,24 @@ def run_pr_loop(
                     "Issue-side and PR-side expected closing contracts disagree before "
                     "supersession; no durable metadata changed."
                 )
+        if (
+            config.managed_ci
+            and authenticated_managed_resume is not None
+            and authenticated_managed_resume.origin == "issue-created"
+            and closing_contract is not None
+        ):
+            # Reject an unapproved same-repository closing reference before
+            # activation can apply the managed suppression label.  The later
+            # per-round check remains necessary because the body can change
+            # after this initial authentication boundary.
+            validate_pr_expected_closing_issues(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                expected_issue_ids=closing_contract.expected_closing_issue_ids,
+                body=initial_pr_context.metadata.body,
+                reject_unexpected=True,
+            )
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(
@@ -11092,6 +11512,7 @@ def run_pr_loop(
                 pr_number=pr_number,
                 expected_issue_ids=closing_contract.expected_closing_issue_ids,
                 body=initial_pr_context.metadata.body,
+                reject_unexpected=config.managed_ci and issue_context is not None,
             )
             if contract_needs_persisting:
                 post_trusted_pr_comment(
@@ -11405,6 +11826,7 @@ def run_pr_loop(
                     pr_number=pr_number,
                     expected_issue_ids=closing_contract.expected_closing_issue_ids,
                     body=pr_metadata.body,
+                    reject_unexpected=config.managed_ci and issue_context is not None,
                 )
             if managed_ci_active(pr_metadata) and pre_review_tests_passed and pr_metadata.head_sha:
                 publish_round_readiness(
@@ -14693,6 +15115,37 @@ def run_pr_loop(
                     latest_coder_metadata,
                 ),
             )
+            if managed_ci_handoff is not None and managed_ci is not None and managed_ci.issue_created_pr:
+                predecessor_head = pr_metadata.head_sha
+                new_head = updated_pr_context.metadata.head_sha
+                if predecessor_head and new_head and predecessor_head != new_head:
+                    round_comment_ids = find_actor_round_metadata_comment_ids(
+                        runner,
+                        config=config,
+                        pr_number=pr_number,
+                        actor_login=managed_ci_handoff.trusted_actor_login,
+                        actor_id=managed_ci_handoff.trusted_actor_id,
+                        predecessor_head=predecessor_head,
+                        new_head=new_head,
+                        round_number=round_number,
+                        after_comment_id=(
+                            managed_ci_handoff.authorization_comment_id or 0
+                        ),
+                    )
+                    managed_ci_handoff = publish_issue_created_continuity_authorization(
+                        runner,
+                        config=config,
+                        handoff=managed_ci_handoff,
+                        predecessor_head=predecessor_head,
+                        new_head=new_head,
+                        round_comment_ids=round_comment_ids,
+                    )
+                    authenticated_managed_resume = AuthenticatedManagedResume(
+                        origin="issue-created",
+                        lifecycle=managed_ci_handoff.lifecycle,
+                        issue_created_handoff=managed_ci_handoff,
+                        override_nonce=managed_ci_handoff.override_nonce,
+                    )
             log(config, f"Round {round_number}: {coder_name} pushed updates for re-review")
             pre_review_test_pending = True
             if external_recovery_full_board:
