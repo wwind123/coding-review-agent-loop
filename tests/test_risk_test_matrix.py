@@ -686,6 +686,44 @@ def test_m780_05_verified_evidence_requires_a_passing_authoritative_receipt() ->
         )
 
 
+def test_managed_test_wrapper_citation_matches_broker_inner_command() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    citation = evidence["rows"][0]["evidence_citations"][0]
+    citation["command"] = (
+        "/home/test/.local/bin/agent-loop run-tests --timeout-seconds 1800 "
+        "--memory-dir /home/test/.cache/agent-loop -- "
+        "python3 -m pytest tests/test_orchestrator_pr.py -q"
+    )
+
+    parsed = parse_risk_test_matrix_evidence(
+        evidence,
+        matrix=matrix,
+        authoritative_test_observations=[_rich_receipt()],
+    )
+
+    assert parsed.rows[0].status == "verified"
+
+
+def test_managed_test_wrapper_citation_rejects_different_inner_command() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _evidence_for_status(identity, "verified")
+    citation = evidence["rows"][0]["evidence_citations"][0]
+    citation["command"] = (
+        "agent-loop run-tests --timeout-seconds 1800 -- "
+        "python3 -m pytest tests/test_protocol.py -q"
+    )
+
+    with pytest.raises(AgentLoopError, match="passing.*receipts"):
+        parse_risk_test_matrix_evidence(
+            evidence,
+            matrix=matrix,
+            authoritative_test_observations=[_rich_receipt()],
+        )
+
+
 def _rich_receipt(
     *,
     outcome: str = "passed",

@@ -9,6 +9,7 @@ import shlex
 from collections.abc import Mapping, Sequence
 import dataclasses
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .errors import AgentLoopError, IssueImplementationConflictError
 from .protocol_markers import sanitize_historical_text
@@ -1470,7 +1471,26 @@ def _citation_matches_observation(
     command = observed("command")
     if isinstance(command, (tuple, list)) and all(isinstance(item, str) for item in command):
         commands.add(shlex.join(command))
-    return citation.command in commands
+    if citation.command in commands:
+        return True
+    wrapped_command = _managed_test_wrapper_inner_command(citation.command)
+    return wrapped_command is not None and wrapped_command in commands
+
+
+def _managed_test_wrapper_inner_command(command: str) -> str | None:
+    """Project an exact ``agent-loop run-tests`` citation to its broker argv."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if len(argv) < 4 or Path(argv[0]).name != "agent-loop" or argv[1] != "run-tests":
+        return None
+    try:
+        separator = argv.index("--", 2)
+    except ValueError:
+        return None
+    inner = argv[separator + 1 :]
+    return shlex.join(inner) if inner else None
 
 
 def _observation_semantics(observation: object) -> tuple[dict[str, object], bool]:
