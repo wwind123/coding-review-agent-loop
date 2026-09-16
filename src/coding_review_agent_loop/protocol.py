@@ -1006,7 +1006,11 @@ def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_
         if operation not in RISK_MATRIX_CHANGE_OPERATIONS:
             raise AgentLoopError(f"{change_context}.operation is invalid.")
         row_ids = tuple(_validate_risk_row_id(item, context=f"{change_context}.row_ids[{i}]") for i, item in enumerate(
-            _risk_bounded_string_list(change["row_ids"], context=f"{change_context}.row_ids")
+            _risk_bounded_string_list(
+                change["row_ids"],
+                context=f"{change_context}.row_ids",
+                max_items=RISK_MATRIX_MAX_ROWS,
+            )
         ))
         if not row_ids:
             raise AgentLoopError(f"{change_context}.row_ids must not be empty.")

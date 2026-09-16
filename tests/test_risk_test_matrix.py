@@ -267,6 +267,40 @@ def test_matrix_level_draft_changes_cannot_hide_behind_one_row_operation() -> No
     )
 
 
+def test_matrix_level_audit_can_cover_the_full_matrix_row_bound() -> None:
+    row_ids = [f"row-{index:02d}" for index in range(24)]
+    previous = {**_matrix(), "rows": [_row(row_id) for row_id in row_ids]}
+    current = {**previous, "important_exclusions": ["A newly explicit exclusion."]}
+
+    parsed = validate_risk_test_matrix_revision(
+        previous,
+        current,
+        [{
+            "operation": "change",
+            "row_ids": row_ids,
+            "rationale": "Clarified exclusions across the complete matrix scope.",
+        }],
+    )
+
+    assert parsed[0].row_ids == tuple(row_ids)
+
+
+def test_matrix_audit_row_ids_remain_bounded_by_the_matrix_row_limit() -> None:
+    previous = _matrix()
+    current = {**previous, "important_exclusions": ["A newly explicit exclusion."]}
+
+    with pytest.raises(AgentLoopError, match="exceeds the 24-item bound"):
+        validate_risk_test_matrix_revision(
+            previous,
+            current,
+            [{
+                "operation": "change",
+                "row_ids": [f"row-{index:02d}" for index in range(25)],
+                "rationale": "An invalid oversized matrix audit.",
+            }],
+        )
+
+
 def test_one_row_matrix_level_and_row_change_share_one_complete_scope_audit() -> None:
     previous = _matrix()
     current = {
