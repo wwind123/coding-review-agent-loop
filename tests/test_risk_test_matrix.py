@@ -285,17 +285,46 @@ def test_matrix_level_audit_can_cover_the_full_matrix_row_bound() -> None:
     assert parsed[0].row_ids == tuple(row_ids)
 
 
-def test_matrix_audit_row_ids_remain_bounded_by_the_matrix_row_limit() -> None:
+def test_matrix_level_audit_can_cover_a_full_replacement_transition_union() -> None:
+    old_ids = [f"old-{index:02d}" for index in range(24)]
+    new_ids = [f"new-{index:02d}" for index in range(24)]
+    previous = {**_matrix(), "rows": [_row(row_id) for row_id in old_ids]}
+    current = {
+        **previous,
+        "rows": [_row(row_id) for row_id in new_ids],
+        "important_exclusions": ["A newly explicit exclusion."],
+    }
+    union = old_ids + new_ids
+    assert len(union) == 48
+
+    parsed = validate_risk_test_matrix_revision(
+        previous,
+        current,
+        [
+            {
+                "operation": "change",
+                "row_ids": union,
+                "rationale": "Clarified exclusions across the complete old/new matrix scope.",
+            },
+            {"operation": "retire", "row_ids": old_ids, "rationale": "Replaced the prior row set."},
+            {"operation": "add", "row_ids": new_ids, "rationale": "Introduced the revised row set."},
+        ],
+    )
+
+    assert parsed[0].row_ids == tuple(union)
+
+
+def test_matrix_audit_row_ids_remain_bounded_by_the_transition_union_limit() -> None:
     previous = _matrix()
     current = {**previous, "important_exclusions": ["A newly explicit exclusion."]}
 
-    with pytest.raises(AgentLoopError, match="exceeds the 24-item bound"):
+    with pytest.raises(AgentLoopError, match="exceeds the 48-item bound"):
         validate_risk_test_matrix_revision(
             previous,
             current,
             [{
                 "operation": "change",
-                "row_ids": [f"row-{index:02d}" for index in range(25)],
+                "row_ids": [f"row-{index:02d}" for index in range(49)],
                 "rationale": "An invalid oversized matrix audit.",
             }],
         )

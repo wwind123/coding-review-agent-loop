@@ -762,6 +762,10 @@ class StructuredPlanState:
 # never accepted as carried review-item IDs.
 RISK_TEST_MATRIX_CONTRACT_VERSION = 1
 RISK_MATRIX_MAX_ROWS = 24
+# A complete-scope audit entry must name the union of prior and revised row
+# IDs. Each side is independently bounded by RISK_MATRIX_MAX_ROWS, so a full
+# replacement revision can legitimately need twice that many IDs.
+RISK_MATRIX_MAX_AUDIT_ROW_IDS = 2 * RISK_MATRIX_MAX_ROWS
 RISK_MATRIX_MAX_EXCLUSIONS = 16
 RISK_MATRIX_MAX_CHANGES = 32
 RISK_MATRIX_MAX_LIST_ITEMS = 12
@@ -1009,7 +1013,7 @@ def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_
             _risk_bounded_string_list(
                 change["row_ids"],
                 context=f"{change_context}.row_ids",
-                max_items=RISK_MATRIX_MAX_ROWS,
+                max_items=RISK_MATRIX_MAX_AUDIT_ROW_IDS,
             )
         ))
         if not row_ids:
