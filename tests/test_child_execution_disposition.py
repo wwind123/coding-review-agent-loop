@@ -1,11 +1,19 @@
 import dataclasses
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from agent_loop_helpers import structured_v1_plan_state
+from agent_loop_helpers import (
+    FakeRunner,
+    make_config,
+    structured_plan_review,
+    structured_v1_plan_state,
+)
+import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.decomposition import (
     ChildDispositionOverride,
+    CreatedPhaseIssue,
     PhaseImplementationHandoffMetadata,
     PlanPhase,
     child_disposition_override_digest,
@@ -15,7 +23,7 @@ from coding_review_agent_loop.decomposition import (
     reconcile_handoff_disposition,
 )
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.github import IssueComment
+from coding_review_agent_loop.github import IssueComment, IssueContext
 from coding_review_agent_loop.orchestrator import (
     CHILD_ROUTE_HUMAN,
     resolve_child_execution_route,
@@ -164,6 +172,90 @@ def test_rtm_direct_ready_and_rtm_planning_child_routes_are_explicit():
     assert planning.is_planning and planning.origin == "phase"
 
 
+@pytest.mark.parametrize(
+    ("disposition", "expected_events", "return_code"),
+    [
+        (EXECUTION_DISPOSITION_DIRECT, ["direct-handoff", "implement"], 6),
+        (EXECUTION_DISPOSITION_PLANNING, ["planning-handoff", "plan"], 7),
+    ],
+)
+def test_rtm_direct_and_planning_dispatch_persists_handoff_before_agent(
+    tmp_path, monkeypatch, disposition, expected_events, return_code
+):
+    events = []
+    phase = _phase(disposition)
+    created = CreatedPhaseIssue(
+        phase=phase,
+        issue_url="https://github.com/OWNER/REPO/issues/56",
+        issue_number=56,
+    )
+    route = resolve_child_execution_route(
+        phase, topology_source="approved-plan-v1"
+    )
+    recommendation = SimpleNamespace(
+        strategy="staged",
+        identity=lambda: {"recommendation_sha256": "recommendation-digest"},
+        child_stages=(SimpleNamespace(stage_id="stage-one"),),
+    )
+    context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Child contract",
+        body="Child body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+    )
+    parent_context = dataclasses.replace(
+        context,
+        number=55,
+        title="Parent",
+        url="https://github.com/OWNER/REPO/issues/55",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "post_phase_implementation_handoff_comment",
+        lambda *_args, **_kwargs: events.append("direct-handoff"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_post_child_planning_handoff",
+        lambda *_args, **_kwargs: events.append("planning-handoff"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_implement_approved_issue",
+        lambda *_args, **_kwargs: events.append("implement") or 6,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_child_planning_cycle",
+        lambda *_args, **_kwargs: events.append("plan") or 7,
+    )
+    result = orchestrator._dispatch_decomposition_child(
+        FakeRunner(),
+        config=make_config(tmp_path),
+        memory=None,
+        usage_context=SimpleNamespace(),
+        parent_issue=55,
+        approved_plan="Approved parent plan.",
+        plan_hash="plan-hash",
+        plan_subject="plan-subject",
+        recommendation=recommendation,
+        approved_plan_context=SimpleNamespace(
+            matrix_available=False, risk_test_matrix_payload=None
+        ),
+        created=created,
+        phase_index=1,
+        route=route,
+        child_issue_context=context,
+        parent_issue_context=parent_context,
+        coder_session_id=None,
+        existing_handoff=None,
+    )
+    assert result == return_code
+    assert events == expected_events
+
+
 def test_rtm_incomplete_direct_rejected_and_recovery_absence_is_legacy_ambiguous():
     payload = _fresh_staged_payload()
     stage = payload["execution_recommendation"]["child_stages"][0]
@@ -274,6 +366,65 @@ def test_rtm_human_stage_keeps_stop_and_rejects_override():
             topology_source="approved-plan-v1",
             overrides=(_override(EXECUTION_DISPOSITION_DIRECT),),
         )
+
+
+def test_rtm_nested_staged_child_stops_before_topology_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    payload = _fresh_staged_payload()
+    plan = _plan_text(payload)
+    child = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Planning child",
+        body="Fresh staged child body.",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+    )
+    parent = dataclasses.replace(
+        child,
+        number=55,
+        title="Parent",
+        url="https://github.com/OWNER/REPO/issues/55",
+    )
+    monkeypatch.setattr(orchestrator, "_infer_staged_parent_issue", lambda _context: 55)
+    monkeypatch.setattr(
+        orchestrator,
+        "_fresh_phase_marker_payload",
+        lambda _context: {"source": "approved-plan-v1"},
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        claude_outputs=[plan],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = make_config(
+        tmp_path,
+        plan_execution_mode="auto",
+        execution_strategy_contract_required=True,
+    )
+    result = orchestrator._run_plan_first_loop(
+        runner,
+        issue_number=56,
+        config=config,
+        memory=None,
+        issue_context=child,
+        requested_policy="auto",
+        usage_context=orchestrator._new_usage_context(config),
+    )
+    assert result == 2
+    output = capsys.readouterr().out
+    assert '"reason": "nested-staged-child"' in output
+    bodies = "\n".join(runner.comments)
+    assert "AGENT_PLAN_EXECUTION_DECISION" not in bodies
+    assert "AGENT_PLAN_TOPOLOGY_CHECKPOINT" not in bodies
+    assert "AGENT_PLAN_DECOMPOSITION" not in bodies
+    assert "AGENT_PLAN_PHASE_IMPLEMENTATION" not in bodies
+    assert not any(command[:3] == ["gh", "issue", "create"] for command, _cwd in runner.commands)
 
 
 def test_rtm_multi_stage_overrides_scope_independently_and_dedupe():
