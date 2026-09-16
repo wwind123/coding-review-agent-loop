@@ -1104,6 +1104,44 @@ def test_continuity_publication_rejects_distinct_predecessor_authorizations(tmp_
     )
 
 
+def test_continuity_publication_rejects_different_head_fork(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    initial = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+    runner.intent_comments.extend([
+        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="head-a", round_number=2),
+    ])
+    runner.rest_pr["head"]["sha"] = "head-a"
+    publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=initial, predecessor_head="abc123",
+        new_head="head-a", round_comment_ids=(88, 89),
+    )
+
+    runner.intent_comments.extend([
+        _round_comment(90, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(91, role="coder", subject="head-b", round_number=2),
+    ])
+    runner.rest_pr["head"]["sha"] = "head-b"
+    with pytest.raises(AgentLoopError, match="forked predecessor"):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=initial, predecessor_head="abc123",
+            new_head="head-b", round_comment_ids=(90, 91),
+        )
+
+    assert not any(
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in " ".join(command)
+        and "POST" in command
+        and "head-b" in " ".join(command)
+        for command, _cwd in runner.commands
+    )
+
+
 def test_continuity_publication_rejects_missing_correlated_round_metadata(tmp_path):
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     config = make_config(
@@ -1250,6 +1288,45 @@ def test_continuity_resume_rejects_two_valid_metadata_forks(tmp_path):
     assert _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
         base_ref="main", issue_number=643, live_head="next-head",
+    ) is None
+
+
+@pytest.mark.parametrize("live_head", ["head-a", "head-b"])
+def test_continuity_resume_rejects_different_head_fork(tmp_path, live_head):
+    root = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
+        label_event_id=101,
+    )
+    first = ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="head-a", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="first",
+        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        round_comment_ids=(42, 43),
+    )
+    second = replace(
+        first, head_sha="head-b", nonce="second", round_comment_ids=(44, 45)
+    )
+    comments = [
+        {"id": 41, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(root))},
+        _round_comment(42, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(43, role="coder", subject="head-a", round_number=2),
+        _round_comment(44, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(45, role="coder", subject="head-b", round_number=2),
+        {"id": 46, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(first))},
+        {"id": 47, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(second))},
+    ]
+    runner = V2ManagedRunner(intent_comments=comments)
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+
+    assert _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head=live_head,
     ) is None
 
 
@@ -2978,6 +3055,65 @@ def test_strict_draft_unlabeled_reentry_uses_historical_label_event(tmp_path):
     assert runner.labels_posted is True
     assert runner.dispatch_count == 0
     assert any(command[:5] == [
+        "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
+    ] for command, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize(
+    "issue_events",
+    [[], [{
+        "id": 101,
+        "event": "labeled",
+        "label": {"name": MANAGED_LABEL},
+        "actor": {"login": "someone-else", "id": 2},
+    }]],
+)
+def test_strict_draft_unlabeled_reentry_requires_actor_owned_label_history(
+    tmp_path, issue_events
+):
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={
+            "state": "open", "draft": True, "labels": [],
+            "head": {
+                "repo": {"full_name": "OWNER/REPO"},
+                "sha": "coder-round-head",
+                "ref": "agent-loop/managed-643",
+            },
+        },
+        issue_events=issue_events,
+        intent_comments=[],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop", "--allow-unprotected-managed-ci",
+        ),
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match="no actor-owned historical managed-label event authenticates strict re-entry",
+    ):
+        activate_managed_ci(
+            runner, config=config, pr_number=7, metadata=replace(
+                _ready_issue_metadata(), head_sha="coder-round-head"
+            ),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created", lifecycle="draft-unlabeled-reentry",
+                issue_created_handoff=replace(
+                    _authorization_handoff(head="coder-round-head"),
+                    protection_mode="strict",
+                ),
+            ),
+        )
+
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert not any(command[:5] == [
         "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
     ] for command, _cwd in runner.commands)
 

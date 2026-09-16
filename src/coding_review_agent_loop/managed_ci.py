@@ -1697,6 +1697,19 @@ def publish_issue_created_continuity_authorization(
             "Managed-CI head continuity found conflicting prior authorizations for the predecessor head; refusing to proceed."
         )
     predecessor_comment_id, predecessor = sorted(predecessor_records, key=lambda item: item[0])[-1]
+    predecessor_children = [
+        record
+        for _comment_id, record in records
+        if (
+            record.kind == "continuity"
+            and record.predecessor_head == predecessor_head
+            and record.predecessor_comment_id == predecessor_comment_id
+        )
+    ]
+    if any(record.head_sha != new_head for record in predecessor_children):
+        raise AgentLoopError(
+            "Managed-CI head continuity found a forked predecessor authorization; refusing to proceed."
+        )
     normalized_round_comment_ids = tuple(sorted(set(round_comment_ids)))
 
     def revalidate_before_publication(authorization: ManagedCiIssueAuthorization) -> None:
@@ -3137,6 +3150,19 @@ def _find_resume_audit(
         by_head: dict[str, list[tuple[int, ManagedCiIssueAuthorization]]] = {}
         for comment_id, authorization in records:
             by_head.setdefault(authorization.head_sha, []).append((comment_id, authorization))
+        children_by_predecessor: dict[tuple[int, str], set[str]] = {}
+        for _comment_id, authorization in records:
+            if (
+                authorization.kind == "continuity"
+                and authorization.predecessor_comment_id is not None
+                and authorization.predecessor_head is not None
+            ):
+                children_by_predecessor.setdefault(
+                    (authorization.predecessor_comment_id, authorization.predecessor_head),
+                    set(),
+                ).add(authorization.head_sha)
+        if any(len(heads) > 1 for heads in children_by_predecessor.values()):
+            return None
         terminal = by_head.get(live_head, [])
         valid_terminals: list[tuple[int, ManagedCiIssueAuthorization]] = []
         for terminal_comment_id, terminal_record in terminal:
