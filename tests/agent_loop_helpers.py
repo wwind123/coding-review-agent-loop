@@ -1602,6 +1602,7 @@ def structured_issue_implementation(
     human_requirement_dispositions: list[dict[str, str]] | None = None,
     checked_discussion_directly: bool = False,
     tests_run: list[str] | None = None,
+    test_observations: list[dict[str, str]] | None = None,
     reviewer: str = "Anthropic Claude",
 ) -> str:
     ids = human_requirement_ids or []
@@ -1631,6 +1632,8 @@ def structured_issue_implementation(
     }
     if tests_run is not None:
         payload["tests_run"] = tests_run
+    if test_observations is not None:
+        payload["test_observations"] = test_observations
     return json.dumps(payload) + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
 
 

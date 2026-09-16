@@ -5808,6 +5808,26 @@ def _validate_structured_response_tests_with_post_pr_context(
     )
 
 
+def _validate_structured_response_observations_with_post_pr_context(
+    test_observations: Sequence[object] | None,
+    *,
+    runner: Runner,
+    config: AgentLoopConfig,
+    pr_number: int,
+) -> None:
+    """Validate structured receipt citations with the same confirmed-PR diagnostic."""
+    _validate_tests_with_post_pr_context(
+        lambda: validate_test_observation_citations_within_workdir(
+            test_observations,
+            assigned_workdir=active_workdir(config),
+        ),
+        runner=runner,
+        config=config,
+        pr_number=pr_number,
+        report_description="structured test-observation report",
+    )
+
+
 def _publish_issue_authorization_with_recovery(
     runner: Runner,
     *,
@@ -6300,9 +6320,11 @@ def _implement_approved_issue(
             config=implementation_config,
             pr_number=pr_number,
         )
-        validate_test_observation_citations_within_workdir(
+        _validate_structured_response_observations_with_post_pr_context(
             implementation_result.test_observations,
-            assigned_workdir=active_workdir(implementation_config),
+            runner=runner,
+            config=implementation_config,
+            pr_number=pr_number,
         )
     validate_pr_references_issue(
         runner,
@@ -8825,9 +8847,11 @@ def run_issue_loop(
                 config=config,
                 pr_number=pr_number,
             )
-            validate_test_observation_citations_within_workdir(
+            _validate_structured_response_observations_with_post_pr_context(
                 implementation_result.test_observations,
-                assigned_workdir=active_workdir(config),
+                runner=runner,
+                config=config,
+                pr_number=pr_number,
             )
         initial_pr_metadata = initial_pr_context.metadata
         validate_pr_references_issue(

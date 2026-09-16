@@ -559,6 +559,27 @@ class RacedAuthorizationCommentRunner(AuthorizationCommentRunner):
         return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
 
 
+class ContinuityAuthorizationSetRaceRunner(AuthorizationCommentRunner):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.authorization_comment_reads = 0
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next(
+            (part for part in args if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if endpoint == "repos/OWNER/REPO/issues/7/comments?per_page=100":
+            self.authorization_comment_reads += 1
+            if self.authorization_comment_reads == 4:
+                root = next(
+                    item
+                    for item in self.intent_comments
+                    if "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in item.get("body", "")
+                )
+                self.intent_comments.append(dict(root, id=int(root["id"]) + 100))
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
 class _ActivationReached(Exception):
     """Stop an orchestrator regression immediately after real activation."""
 
@@ -964,6 +985,123 @@ def test_issue_authorization_continuity_accepts_one_gap_free_head_chain(tmp_path
     assert audit is not None
     assert audit[0] == continued.authorization_comment_id
     assert audit[1]["head"] == "next-head"
+
+
+def test_continuity_publication_rechecks_live_tuple_before_writing(tmp_path):
+    root = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        nonce="nonce-643", label_event_id=101,
+    )
+    runner = RacedAuthorizationCommentRunner(
+        issue_events=[label_event()],
+        intent_comments=[
+            {"id": 41, "user": {"login": "agent-loop", "id": 1},
+             "body": str(format_issue_created_authorization_comment(root))},
+            _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+            _round_comment(89, role="coder", subject="next-head", round_number=2),
+        ],
+    )
+    runner.rest_pr["head"]["sha"] = "next-head"
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    with pytest.raises(AgentLoopError, match="changed live PR tuple"):
+        publish_issue_created_continuity_authorization(
+            runner,
+            config=config,
+            handoff=_authorization_handoff(),
+            predecessor_head="abc123",
+            new_head="next-head",
+            round_comment_ids=(88, 89),
+        )
+
+    assert not any(
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in " ".join(command)
+        and "POST" in command
+        for command, _cwd in runner.commands
+    )
+
+
+def test_continuity_publication_rechecks_authorization_set_before_writing(tmp_path):
+    root = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        nonce="nonce-643", label_event_id=101,
+    )
+    runner = ContinuityAuthorizationSetRaceRunner(
+        issue_events=[label_event()],
+        intent_comments=[
+            {"id": 41, "user": {"login": "agent-loop", "id": 1},
+             "body": str(format_issue_created_authorization_comment(root))},
+            _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+            _round_comment(89, role="coder", subject="next-head", round_number=2),
+        ],
+    )
+    runner.rest_pr["head"]["sha"] = "next-head"
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    with pytest.raises(AgentLoopError, match="authorization records changed"):
+        publish_issue_created_continuity_authorization(
+            runner,
+            config=config,
+            handoff=_authorization_handoff(),
+            predecessor_head="abc123",
+            new_head="next-head",
+            round_comment_ids=(88, 89),
+        )
+
+    assert not any(
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in " ".join(command)
+        and "POST" in command
+        for command, _cwd in runner.commands
+    )
+
+
+def test_continuity_publication_rejects_distinct_predecessor_authorizations(tmp_path):
+    root = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        nonce="root", label_event_id=101,
+    )
+    competing = replace(root, kind="fresh", nonce="competing")
+    runner = AuthorizationCommentRunner(
+        issue_events=[label_event()],
+        intent_comments=[
+            {"id": 41, "user": {"login": "agent-loop", "id": 1},
+             "body": str(format_issue_created_authorization_comment(root))},
+            {"id": 42, "user": {"login": "agent-loop", "id": 1},
+             "body": str(format_issue_created_authorization_comment(competing))},
+            _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+            _round_comment(89, role="coder", subject="next-head", round_number=2),
+        ],
+    )
+    runner.rest_pr["head"]["sha"] = "next-head"
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    with pytest.raises(AgentLoopError, match="conflicting prior authorizations"):
+        publish_issue_created_continuity_authorization(
+            runner,
+            config=config,
+            handoff=_authorization_handoff(),
+            predecessor_head="abc123",
+            new_head="next-head",
+            round_comment_ids=(88, 89),
+        )
+
+    assert not any(
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in " ".join(command)
+        and "POST" in command
+        for command, _cwd in runner.commands
+    )
 
 
 def test_continuity_publication_rejects_missing_correlated_round_metadata(tmp_path):

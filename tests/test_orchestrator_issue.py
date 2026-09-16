@@ -4257,8 +4257,16 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
     runner = _IssueRecoveryWorkflowRunner(
         labeled=True,
         codex_outputs=[
-            "Fixed issue.\nTests: cd /outside && python -m pytest\n"
-            "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+            structured_issue_implementation(
+                pr_number=77,
+                tests_run=["python3 -m pytest"],
+                test_observations=[{
+                    "command": "cd /outside && python -m pytest",
+                    "receipt_id": "outside-receipt",
+                    "claim": "current-result",
+                }],
+                reviewer="OpenAI Codex",
+            )
         ],
         claude_outputs=[
             structured_pr_review(
@@ -4331,6 +4339,76 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
             "AGENT_TEST_OBSERVATION", "AGENT_MANAGED_CI_READINESS",
         )
     )
+
+
+def test_approved_plan_invalid_post_pr_observation_keeps_authorization_resumable(
+    tmp_path, monkeypatch,
+):
+    runner = _IssueRecoveryWorkflowRunner(
+        labeled=True,
+        codex_outputs=[
+            structured_issue_implementation(
+                pr_number=77,
+                tests_run=["python3 -m pytest"],
+                test_observations=[{
+                    "command": "cd /outside && python -m pytest",
+                    "receipt_id": "outside-receipt",
+                    "claim": "current-result",
+                }],
+                reviewer="OpenAI Codex",
+            )
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="claude",
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    issue_context = get_issue_context(runner, config=config, issue_number=56)
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="agent-loop",
+        protection_mode="voluntary",
+        audit_nonce="opening-nonce",
+    )
+    handoff = _managed_issue_handoff(nonce="opening-nonce")
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
+    )
+
+    with pytest.raises(AgentLoopError) as exc_info:
+        orchestrator_module._implement_approved_issue(
+            runner,
+            issue_number=56,
+            approved_plan="Plan:\n- Preserve managed recovery.",
+            config=config,
+            memory=None,
+            issue_context=issue_context,
+            coder_session_id=None,
+            usage_context=orchestrator_module._new_usage_context(config),
+        )
+
+    message = str(exc_info.value)
+    assert "structured test-observation report was invalid" in message
+    assert "PR #77 was confirmed open" in message
+    assert "authorization checkpoint" in message
+    assert "agent-loop pr 77" in message
+    records = [
+        parsed
+        for comment in runner.authorization_comments
+        if (parsed := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    assert len(records) == 1 and records[0].kind == "creation"
+    assert runner.comments == []
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
 
 
 _RECOVERY_WORKFLOW = """

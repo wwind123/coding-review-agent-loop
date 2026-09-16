@@ -1573,6 +1573,49 @@ def publish_issue_created_authorization(
     )
 
 
+def _continuity_live_pr_tuple(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    new_head: str,
+) -> tuple[object, ...]:
+    """Read the immutable PR tuple used by a continuity publication."""
+    live_pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{handoff.pr_number}")
+    live_head = live_pr.get("head") if isinstance(live_pr.get("head"), dict) else {}
+    live_base = live_pr.get("base") if isinstance(live_pr.get("base"), dict) else {}
+    live_author = live_pr.get("user") if isinstance(live_pr.get("user"), dict) else {}
+    head_repo = live_head.get("repo") if isinstance(live_head.get("repo"), dict) else {}
+    labels = tuple(sorted(
+        item.get("name")
+        for item in (live_pr.get("labels") or [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    ))
+    if (
+        live_pr.get("state") not in {None, "open", "OPEN"}
+        or live_head.get("sha") != new_head
+        or live_head.get("ref") != handoff.branch
+        or head_repo.get("full_name", "").casefold() != config.repo.casefold()
+        or live_base.get("ref") != handoff.base_ref
+        or live_author.get("login", "").casefold() != handoff.trusted_actor_login.casefold()
+        or live_author.get("id") != handoff.trusted_actor_id
+    ):
+        raise AgentLoopError(
+            "Managed-CI head continuity observed a changed live PR tuple; no continuity record was written."
+        )
+    return (
+        live_pr.get("state"),
+        live_pr.get("draft"),
+        live_head.get("repo", {}).get("full_name") if isinstance(live_head.get("repo"), dict) else None,
+        live_head.get("ref"),
+        live_head.get("sha"),
+        live_base.get("ref"),
+        live_author.get("login"),
+        live_author.get("id"),
+        labels,
+    )
+
+
 def publish_issue_created_continuity_authorization(
     runner: Runner,
     *,
@@ -1602,22 +1645,12 @@ def publish_issue_created_continuity_authorization(
         or event[2] != handoff.trusted_actor_id
     ):
         raise AgentLoopError("Managed-CI head continuity requires an actor-owned active managed-label event.")
-    live_pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{handoff.pr_number}")
-    live_head = live_pr.get("head") if isinstance(live_pr.get("head"), dict) else {}
-    live_base = live_pr.get("base") if isinstance(live_pr.get("base"), dict) else {}
-    live_author = live_pr.get("user") if isinstance(live_pr.get("user"), dict) else {}
-    if (
-        live_pr.get("state") not in {None, "open", "OPEN"}
-        or live_head.get("sha") != new_head
-        or live_head.get("ref") != handoff.branch
-        or (live_head.get("repo") or {}).get("full_name", "").casefold() != config.repo.casefold()
-        or live_base.get("ref") != handoff.base_ref
-        or live_author.get("login", "").casefold() != handoff.trusted_actor_login.casefold()
-        or live_author.get("id") != handoff.trusted_actor_id
-    ):
-        raise AgentLoopError(
-            "Managed-CI head continuity observed a changed live PR tuple; no continuity record was written."
-        )
+    live_tuple = _continuity_live_pr_tuple(
+        runner,
+        config=config,
+        handoff=handoff,
+        new_head=new_head,
+    )
     records = _authorization_comment_records(
         runner,
         config=config,
@@ -1639,8 +1672,51 @@ def publish_issue_created_continuity_authorization(
         raise AgentLoopError(
             "Managed-CI head continuity has no unique prior authorization for the predecessor head."
         )
+    if len({record for _comment_id, record in predecessor_records}) != 1:
+        raise AgentLoopError(
+            "Managed-CI head continuity found conflicting prior authorizations for the predecessor head; refusing to proceed."
+        )
     predecessor_comment_id, predecessor = sorted(predecessor_records, key=lambda item: item[0])[-1]
     normalized_round_comment_ids = tuple(sorted(set(round_comment_ids)))
+
+    def revalidate_before_publication(authorization: ManagedCiIssueAuthorization) -> None:
+        """Reject a live tuple, label, round, or authorization race before writing."""
+        current_event = _active_managed_label_event(
+            runner, config=config, pr_number=handoff.pr_number
+        )
+        current_tuple = _continuity_live_pr_tuple(
+            runner,
+            config=config,
+            handoff=handoff,
+            new_head=new_head,
+        )
+        if current_event != event or current_tuple != live_tuple:
+            raise AgentLoopError(
+                "Managed-CI head continuity observed a changed live PR tuple or active "
+                "managed-label event; no continuity record was written."
+            )
+        current_round_comments = _api_list(
+            runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
+        )
+        if current_round_comments is None or not _continuity_round_metadata_is_valid(
+            current_round_comments, authorization=authorization
+        ):
+            raise AgentLoopError(
+                "Managed-CI head continuity requires authenticated, correlated round metadata."
+            )
+        current_records = _authorization_comment_records(
+            runner,
+            config=config,
+            pr_number=handoff.pr_number,
+            actor_login=handoff.trusted_actor_login,
+            actor_id=handoff.trusted_actor_id,
+        )
+        if current_records != records:
+            raise AgentLoopError(
+                "Managed-CI head continuity authorization records changed before publication; "
+                "no continuity record was written."
+            )
+
     same_transition = [
         (comment_id, record)
         for comment_id, record in records
@@ -1653,19 +1729,20 @@ def publish_issue_created_continuity_authorization(
         and record.predecessor_head == predecessor_head
         and record.predecessor_comment_id == predecessor_comment_id
         and record.round_comment_ids == normalized_round_comment_ids
+        and record.actor_login.casefold() == handoff.trusted_actor_login.casefold()
+        and record.actor_id == handoff.trusted_actor_id
+        and record.protection == predecessor.protection
+        and record.waiver == predecessor.waiver
+        and record.label_event_id == event[0]
         and (record.approved_plan_hash or None) == (handoff.approved_plan_hash or None)
     ]
     if same_transition:
-        comment_id, existing_record = sorted(same_transition, key=lambda item: item[0])[-1]
-        round_comments = _api_list(
-            runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
-        )
-        if round_comments is None or not _continuity_round_metadata_is_valid(
-            round_comments, authorization=existing_record
-        ):
+        if len({record for _comment_id, record in same_transition}) != 1:
             raise AgentLoopError(
-                "Managed-CI head continuity record does not reference correlated round metadata."
+                "Managed-CI head continuity found a conflicting record; refusing to proceed."
             )
+        comment_id, existing_record = sorted(same_transition, key=lambda item: item[0])[-1]
+        revalidate_before_publication(existing_record)
         return replace(
             handoff,
             head_sha=new_head,
@@ -1701,6 +1778,7 @@ def publish_issue_created_continuity_authorization(
         raise AgentLoopError(
             "Managed-CI head continuity requires authenticated, correlated round metadata."
         )
+    revalidate_before_publication(authorization)
     for comment_id, record in records:
         if record == authorization:
             return replace(
