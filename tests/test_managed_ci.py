@@ -799,7 +799,8 @@ def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_gr
     assert resumed is not None
     assert resumed.issue_created_handoff is not None
     assert resumed.issue_created_handoff.authorization_kind == "continuity"
-    assert resumed.issue_created_handoff.override_nonce == continuity.override_nonce
+    assert resumed.issue_created_handoff.override_nonce == records[1][1].nonce
+    assert resumed.issue_created_handoff.override_nonce != records[0][1].nonce
     assert resumed.issue_created_handoff.opening_override_nonce == "opening-nonce"
     assert captured["activation"] is not None
     reviewer_command = next(
@@ -1394,10 +1395,9 @@ def test_continuity_revalidation_never_uses_terminal_nonce_for_opening_body(
         metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
     )
 
-    # Tuple revalidation returns the nonce authenticated by the PR body.  The
-    # continuity nonce remains the terminal authorization identity, but must
-    # never be supplied as the body's expected nonce.
-    assert validated.override_nonce == "nonce-643"
+    # Tuple revalidation uses the opening nonce for the PR body, while the
+    # continuity nonce remains the terminal authorization identity.
+    assert validated.override_nonce == "continuity-nonce"
     assert validated.authorization_kind == "continuity"
     assert validated.opening_override_nonce == "nonce-643"
 

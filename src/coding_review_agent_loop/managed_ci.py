@@ -1672,6 +1672,7 @@ def publish_issue_created_continuity_authorization(
             active_label_event_id=event[0],
             authorization_kind="continuity",
             authorization_comment_id=comment_id,
+            override_nonce=existing_record.nonce,
         )
     authorization = ManagedCiIssueAuthorization(
         kind="continuity",
@@ -1708,6 +1709,7 @@ def publish_issue_created_continuity_authorization(
                 active_label_event_id=event[0],
                 authorization_kind="continuity",
                 authorization_comment_id=comment_id,
+                override_nonce=authorization.nonce,
             )
         if (
             record.kind == "continuity"
@@ -1733,6 +1735,7 @@ def publish_issue_created_continuity_authorization(
         active_label_event_id=event[0],
         authorization_kind="continuity",
         authorization_comment_id=comment_id,
+        override_nonce=authorization.nonce,
     )
 
 
@@ -2161,10 +2164,16 @@ def revalidate_issue_created_handoff(
         ):
             raise AgentLoopError("Managed-CI direct-resume label provenance changed before activation.")
         validated = replace(validated, active_label_event_id=handoff.active_label_event_id)
+    # `_issue_created_tuple` deliberately returns the nonce authenticated by
+    # the PR-opening body.  That nonce is only the body-validation binding;
+    # retain the handoff's terminal nonce as the managed-resume identity so a
+    # continuity retry cannot silently fall back to the opening grant.
+    terminal_override_nonce = handoff.override_nonce
     return replace(
         validated,
         authorization_kind=handoff.authorization_kind,
         authorization_comment_id=handoff.authorization_comment_id,
+        override_nonce=terminal_override_nonce,
         opening_override_nonce=opening_override_nonce,
         approved_plan_hash=handoff.approved_plan_hash,
     )
