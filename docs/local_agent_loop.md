@@ -1473,6 +1473,13 @@ explicit CLI IDs as the complete contract. Direct `pr` without a declaration or
 recovered contract remains contract-unknown and does not infer expected issues
 from linked-issue prose, `Refs`, or related URLs.
 
+On public `pr --managed-ci` recovery of an authenticated issue-created PR, the
+issue scope (and any authenticated approved-plan additions) supplies the
+immutable contract when no PR-side record exists. The current PR body is then
+checked for unexpected same-repository closing references before managed-CI
+activation can apply its suppression label; body text remains evidence for this
+validation, never the source of the expected set.
+
 The normalized set is persisted in the schema-version-1 issue handoff and in a
 canonical PR-side `AGENT_PR_EXPECTED_CLOSING_ISSUES` record. Recovery requires
 the issue and PR records to agree, while a validated one-sided write or

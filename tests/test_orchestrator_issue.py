@@ -4831,7 +4831,7 @@ def test_managed_pr_recovery_keeps_closing_reference_gate_without_pr_contract(
         label_event_id=101,
     )
     runner = _IssueRecoveryWorkflowRunner(
-        labeled=True,
+        labeled=False,
         authorization_comments=[{
             "id": 41,
             "user": {"login": "agent-loop", "id": 1},
@@ -4848,8 +4848,6 @@ def test_managed_pr_recovery_keeps_closing_reference_gate_without_pr_contract(
         managed_ci_pr_mode=True,
         managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
-        expected_closing_issue_ids=(56,),
-        expected_closing_contract_resolved=True,
         pre_review_tests=False,
         invocation_argv=(
             "agent-loop", "pr", "77", "--managed-ci",
@@ -4868,6 +4866,12 @@ def test_managed_pr_recovery_keeps_closing_reference_gate_without_pr_contract(
 
     assert runner.comments == []
     assert runner.labels_posted is False
+    assert not any(
+        command[:3] == ["gh", "api", "--method"]
+        and "issues/77/labels" in " ".join(command)
+        and "POST" in command
+        for command, _cwd in runner.commands
+    )
     assert runner.dispatch_count == 0
     assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
 

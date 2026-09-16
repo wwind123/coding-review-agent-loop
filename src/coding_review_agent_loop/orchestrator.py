@@ -10719,6 +10719,72 @@ def run_pr_loop(
                 runner, config=config, issue_number=parent_issue_context.number
             )
             parent_issue_context_refreshed = True
+        # Public PR-mode recovery has no issue-mode configuration bit carrying
+        # the immutable closing contract.  Once the issue-created managed
+        # tuple has been authenticated, derive that contract from the
+        # server-backed issue/approved-plan scope before activation.  PR body
+        # references remain validation evidence only and never participate in
+        # this resolution.
+        if (
+            config.managed_ci
+            and config.expected_closing_issue_ids is None
+            and authenticated_managed_resume is not None
+            and authenticated_managed_resume.origin == "issue-created"
+            and issue_context is not None
+        ):
+            issue_scope_handoff = find_latest_issue_pr_handoff(
+                issue_context.comments,
+                issue_number=issue_context.number,
+                repo=config.repo,
+            )
+            if issue_scope_handoff is not None and issue_scope_handoff.pr_number != pr_number:
+                issue_scope_handoff = None
+            plan_additions = (
+                _extract_current_expected_closing_issue_ids(
+                    approved_plan_context.canonical_text
+                )
+                if approved_plan_context is not None
+                and approved_plan_context.canonical_text
+                else None
+            )
+            if (
+                recorded_pr_contract is not None
+                and issue_scope_handoff is not None
+                and tuple(recorded_pr_contract.expected_closing_issue_ids)
+                != tuple(issue_scope_handoff.expected_closing_issue_ids)
+            ):
+                raise AgentLoopError(
+                    "Authenticated issue-side and PR-side expected closing contracts diverge; "
+                    "no managed activation was performed."
+                )
+            closing_contract = resolve_issue_contract(
+                primary_issue=issue_context.number,
+                cli_additions=None,
+                plan_additions=plan_additions,
+                recovered=(
+                    issue_scope_handoff.expected_closing_issue_ids
+                    if issue_scope_handoff is not None
+                    else (
+                        recorded_pr_contract.expected_closing_issue_ids
+                        if recorded_pr_contract is not None
+                        else None
+                    )
+                ),
+                supersede=config.supersede_expected_closing_contract,
+            )
+            reject_parent_from_contract(
+                closing_contract,
+                parent_issue=(
+                    parent_issue_context.number
+                    if parent_issue_context is not None
+                    else None
+                ),
+            )
+            config = dataclasses_replace(
+                config,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+                expected_closing_contract_resolved=True,
+            )
         if config.expected_closing_contract_resolved:
             assert config.expected_closing_issue_ids is not None
             closing_contract = make_pr_contract(
@@ -11329,6 +11395,24 @@ def run_pr_loop(
                     "Issue-side and PR-side expected closing contracts disagree before "
                     "supersession; no durable metadata changed."
                 )
+        if (
+            config.managed_ci
+            and authenticated_managed_resume is not None
+            and authenticated_managed_resume.origin == "issue-created"
+            and closing_contract is not None
+        ):
+            # Reject an unapproved same-repository closing reference before
+            # activation can apply the managed suppression label.  The later
+            # per-round check remains necessary because the body can change
+            # after this initial authentication boundary.
+            validate_pr_expected_closing_issues(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                expected_issue_ids=closing_contract.expected_closing_issue_ids,
+                body=initial_pr_context.metadata.body,
+                reject_unexpected=True,
+            )
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(
