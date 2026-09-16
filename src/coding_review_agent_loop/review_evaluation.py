@@ -350,25 +350,46 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
                 )
             else:
                 metric_rows[key] = {"value": sum(values), "status": "verified"}
+        # Primary-to-panel regressions are a whole-policy measurement: every
+        # primary-bearing run must carry both approval-round endpoints with
+        # verified run provenance, otherwise a partial list would make an
+        # incomplete dataset look complete.  Missing data is reported as
+        # unavailable, naming the affected runs, never silently dropped.
         regressions: list[float | int] = []
-        regression_reason: str | None = None
+        runs_missing_rounds: list[str] = []
+        runs_without_provenance: list[str] = []
         for run in policy_runs:
+            run_id = str(run.get("run_id"))
             first = _number(run.get("primary_approval_round"))
             last = _number(run.get("panel_approval_round"))
             if first is None or last is None:
+                runs_missing_rounds.append(run_id)
                 continue
             if not _is_verified(run.get("provenance")):
-                regression_reason = "approval-round data lacks verified run provenance"
+                runs_without_provenance.append(run_id)
                 continue
             regressions.append(last - first)
         if not policy_runs or runs_with_primary == 0:
             regression_row: dict[str, object] = _not_applicable(
                 "no run for this policy declares a primary reviewer"
             )
-        elif regressions:
-            regression_row = {"value": regressions, "status": "verified"}
+        elif runs_with_primary != len(policy_runs):
+            regression_row = _unavailable("only some runs declare a primary reviewer")
+        elif runs_missing_rounds or runs_without_provenance:
+            reasons: list[str] = []
+            if runs_missing_rounds:
+                reasons.append(
+                    "approval-round measurement absent for runs: "
+                    + ", ".join(runs_missing_rounds)
+                )
+            if runs_without_provenance:
+                reasons.append(
+                    "approval-round data lacks verified run provenance for runs: "
+                    + ", ".join(runs_without_provenance)
+                )
+            regression_row = _unavailable("; ".join(reasons))
         else:
-            regression_row = _unavailable(regression_reason)
+            regression_row = {"value": regressions, "status": "verified"}
         report["policies"][policy] = {
             "run_count": len(policy_runs),
             "status": "verified" if policy_runs else "unavailable",

@@ -142,6 +142,39 @@ def test_metrics_without_verified_provenance_are_unavailable():
     assert only_verified["metrics"]["calls_avoided"] == {"value": 3, "status": "verified"}
 
 
+def test_partial_approval_round_data_makes_regressions_unavailable_not_partially_verified():
+    complete = _run(run_id="complete")
+    missing_panel = _run(run_id="missing-panel", panel_approval_round=None)
+    row = evaluate_frozen_artifacts(
+        {"schema_version": 1, "runs": [complete, missing_panel]}
+    )["policies"]["primary-then-panel"]["primary_to_panel_approval_regressions"]
+    assert row["status"] == "unavailable"
+    assert row["value"] is None
+    assert "missing-panel" in row["reason"]
+    assert "complete" not in row["reason"].replace("incomplete", "")
+
+    missing_primary = _run(run_id="missing-primary", primary_approval_round=None)
+    row = evaluate_frozen_artifacts(
+        {"schema_version": 1, "runs": [complete, missing_primary]}
+    )["policies"]["primary-then-panel"]["primary_to_panel_approval_regressions"]
+    assert row["status"] == "unavailable"
+    assert "missing-primary" in row["reason"]
+
+    unverified = _run(run_id="unverified", provenance={"source": "log", "verified": False})
+    row = evaluate_frozen_artifacts(
+        {"schema_version": 1, "runs": [complete, unverified]}
+    )["policies"]["primary-then-panel"]["primary_to_panel_approval_regressions"]
+    assert row["status"] == "unavailable"
+    assert "unverified" in row["reason"]
+    assert "provenance" in row["reason"]
+
+    both_complete = _run(run_id="second", primary_approval_round=2, panel_approval_round=2)
+    row = evaluate_frozen_artifacts(
+        {"schema_version": 1, "runs": [complete, both_complete]}
+    )["policies"]["primary-then-panel"]["primary_to_panel_approval_regressions"]
+    assert row == {"value": [2, 0], "status": "verified"}
+
+
 def test_findings_are_namespaced_by_run_and_marginal_rows_are_not_applicable_without_primary():
     report = evaluate_frozen_artifacts(
         {

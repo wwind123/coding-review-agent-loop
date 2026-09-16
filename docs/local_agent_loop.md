@@ -1235,7 +1235,11 @@ estimated. Finding IDs are namespaced by run, so identical IDs across runs never
 collide. Marginal-beyond-primary rows are `not-applicable` for policies whose
 runs declare no primary; a historical full-board run may declare a hypothetical
 `primary_reviewer` to measure what the other reviewers would have added. Runs
-using `primary-then-panel` must declare their primary. The checked-in
+using `primary-then-panel` must declare their primary. Primary-to-panel
+approval regressions are a whole-policy measurement: if any primary-bearing run
+lacks either approval-round endpoint or verified run provenance, the row is
+`unavailable` naming those runs rather than a partial list of the complete
+runs. The checked-in
 `docs/evaluation/frozen_review_report.json` is regenerated from the fixture
 artifact and asserted by `tests/test_review_evaluation.py`.
 
