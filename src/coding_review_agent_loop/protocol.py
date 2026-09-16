@@ -9,11 +9,11 @@ import shlex
 from collections.abc import Mapping, Sequence
 import dataclasses
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from .errors import AgentLoopError, IssueImplementationConflictError
 from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
+from .test_runtime import TestRuntimeConfigurationError, parse_managed_test_command
 
 PUBLIC_RESPONSE_MARKER = "=== AGENT_LOOP_PUBLIC_RESPONSE_BELOW ==="
 
@@ -1478,19 +1478,14 @@ def _citation_matches_observation(
 
 
 def _managed_test_wrapper_inner_command(command: str) -> str | None:
-    """Project an exact ``agent-loop run-tests`` citation to its broker argv."""
+    """Project a managed-wrapper citation to its broker argv."""
     try:
-        argv = shlex.split(command)
-    except ValueError:
+        parsed = parse_managed_test_command(shlex.split(command))
+    except (ValueError, TestRuntimeConfigurationError):
         return None
-    if len(argv) < 4 or Path(argv[0]).name != "agent-loop" or argv[1] != "run-tests":
+    if parsed is None:
         return None
-    try:
-        separator = argv.index("--", 2)
-    except ValueError:
-        return None
-    inner = argv[separator + 1 :]
-    return shlex.join(inner) if inner else None
+    return shlex.join(parsed.inner_argv)
 
 
 def _observation_semantics(observation: object) -> tuple[dict[str, object], bool]:

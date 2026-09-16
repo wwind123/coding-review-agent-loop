@@ -24,6 +24,7 @@ import time
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from statistics import median
 from typing import Iterable, Mapping, Sequence
@@ -339,6 +340,217 @@ def parse_managed_test_invocation(argv: Sequence[str]) -> ManagedTestInvocation 
             "managed run-tests requires `--` followed by a non-empty inner command."
         )
     return ManagedTestInvocation(tokens[index:], timeout, memory_dir, tokens[:prefix_len])
+
+
+_MANAGED_EXECUTION_PREFIX_VALUE_OPTIONS = {
+    "env": {"-u", "--unset"},
+    "timeout": {"-k", "--kill-after", "-s", "--signal"},
+    "nice": {"-n", "--adjustment"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+}
+_MANAGED_EXECUTION_PREFIX_FLAG_OPTIONS = {
+    "env": {"-i", "--ignore-environment"},
+    "timeout": {"--foreground", "--preserve-status", "-v", "--verbose"},
+    "nice": set(),
+    "stdbuf": set(),
+    "nohup": set(),
+    "time": {"-p"},
+    "command": {"-p"},
+}
+_MANAGED_EXECUTION_PREFIXES = frozenset(_MANAGED_EXECUTION_PREFIX_FLAG_OPTIONS)
+_MANAGED_EXECUTION_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_MANAGED_TIMEOUT_DURATION_RE = re.compile(
+    r"(?P<number>[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?P<suffix>[smhd])?$",
+    re.ASCII,
+)
+_MANAGED_NICE_ADJUSTMENT_RE = re.compile(r"[+-]?[0-9]+$", re.ASCII)
+_MANAGED_STDBUF_SIZE_RE = re.compile(
+    r"\+?(?P<size>[0-9]+)(?P<suffix>[KMGTPE](?:i?B)?|k)?$", re.ASCII,
+)
+_MANAGED_TIMEOUT_SUFFIX_MULTIPLIERS = {None: 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+_MANAGED_STDBUF_SUFFIX_POWERS = {
+    None: 0,
+    "k": 1,
+    "K": 1,
+    "KB": 1,
+    "KiB": 1,
+    "M": 2,
+    "MB": 2,
+    "MiB": 2,
+    "G": 3,
+    "GB": 3,
+    "GiB": 3,
+    "T": 4,
+    "TB": 4,
+    "TiB": 4,
+    "P": 5,
+    "PB": 5,
+    "PiB": 5,
+    "E": 6,
+    "EB": 6,
+    "EiB": 6,
+}
+_MANAGED_SIGNAL_NAMES = frozenset(
+    name.removeprefix("SIG")
+    for name, value in vars(signal).items()
+    if re.fullmatch(r"SIG[A-Z0-9]+", name) and isinstance(value, int)
+)
+_MANAGED_MAX_NICE_ADJUSTMENT = (1 << 31) - 1
+_MANAGED_MIN_NICE_ADJUSTMENT = -(1 << 31)
+_MANAGED_MAX_TIMEOUT_SECONDS = (1 << 63) - 1
+_MANAGED_MAX_STDBUF_SIZE = (1 << 64) - 1
+
+
+def _managed_prefix_path_like(token: str) -> bool:
+    return (
+        "/" in token
+        or "\\" in token
+        or token.startswith("~")
+        or token.startswith("$HOME/")
+    )
+
+
+def _managed_prefix_timeout_duration(value: str) -> bool:
+    match = _MANAGED_TIMEOUT_DURATION_RE.fullmatch(value)
+    if match is None or len(match.group("number")) > 64:
+        return False
+    try:
+        with localcontext() as context:
+            context.prec = 96
+            seconds = Decimal(match.group("number")) * _MANAGED_TIMEOUT_SUFFIX_MULTIPLIERS[
+                match.group("suffix")
+            ]
+    except InvalidOperation:
+        return False
+    return seconds.is_finite() and seconds <= _MANAGED_MAX_TIMEOUT_SECONDS
+
+
+def _managed_prefix_stdbuf_size(value: str) -> bool:
+    match = _MANAGED_STDBUF_SIZE_RE.fullmatch(value)
+    if match is None or len(match.group("size")) > 20:
+        return False
+    size = int(match.group("size"))
+    multiplier = 1024 ** _MANAGED_STDBUF_SUFFIX_POWERS[match.group("suffix")]
+    return size <= _MANAGED_MAX_STDBUF_SIZE // multiplier
+
+
+def _managed_prefix_option_value_valid(wrapper: str, option: str, value: str) -> bool:
+    if not value:
+        return False
+    if wrapper == "env":
+        return "=" not in value
+    if wrapper == "nice":
+        if not _MANAGED_NICE_ADJUSTMENT_RE.fullmatch(value) or len(value.lstrip("+-")) > 10:
+            return False
+        adjustment = int(value)
+        return _MANAGED_MIN_NICE_ADJUSTMENT <= adjustment <= _MANAGED_MAX_NICE_ADJUSTMENT
+    if wrapper == "timeout":
+        if option in {"-k", "--kill-after"}:
+            return _managed_prefix_timeout_duration(value)
+        if option in {"-s", "--signal"}:
+            if re.fullmatch(r"[0-9]+", value, re.ASCII):
+                if len(value) > 3:
+                    return False
+                return int(value) == 0 or int(value) in signal.valid_signals()
+            return value.upper().removeprefix("SIG") in _MANAGED_SIGNAL_NAMES
+    if wrapper == "stdbuf":
+        if value == "L":
+            return option not in {"-i", "--input"}
+        return _managed_prefix_stdbuf_size(value)
+    return False
+
+
+def _consume_managed_execution_prefix_options(
+    tokens: Sequence[str], start: int, wrapper: str,
+) -> int | None:
+    value_options = _MANAGED_EXECUTION_PREFIX_VALUE_OPTIONS.get(wrapper, set())
+    flag_options = _MANAGED_EXECUTION_PREFIX_FLAG_OPTIONS[wrapper]
+    index = start
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1
+        if not token.startswith("-") or _managed_prefix_path_like(token):
+            return index
+        option, equals, option_value = token.partition("=")
+        if option in value_options:
+            if equals:
+                if not option.startswith("--") or not _managed_prefix_option_value_valid(
+                    wrapper, option, option_value
+                ):
+                    return None
+                index += 1
+                continue
+            if option.startswith("-") and not option.startswith("--") and len(token) > len(option):
+                if not _managed_prefix_option_value_valid(wrapper, option, token[len(option):]):
+                    return None
+                index += 1
+                continue
+            if index + 1 >= len(tokens) or not _managed_prefix_option_value_valid(
+                wrapper, option, tokens[index + 1]
+            ):
+                return None
+            index += 2
+            continue
+        if token.startswith("-") and not token.startswith("--"):
+            attached_option = next(
+                (
+                    known
+                    for known in value_options
+                    if token.startswith(known) and len(token) > len(known)
+                ),
+                None,
+            )
+            if attached_option is not None:
+                if not _managed_prefix_option_value_valid(
+                    wrapper, attached_option, token[len(attached_option):]
+                ):
+                    return None
+                index += 1
+                continue
+        if token not in flag_options:
+            return None
+        index += 1
+    return index
+
+
+def _managed_execution_prefix_head(tokens: Sequence[str]) -> int | None:
+    """Find the exact-command suffix after transparent shell execution prefixes."""
+    index = 0
+    assignments_allowed = True
+    while index < len(tokens):
+        if _MANAGED_EXECUTION_ASSIGNMENT_RE.match(tokens[index]) and assignments_allowed:
+            index += 1
+            continue
+        wrapper = tokens[index].rsplit("/", 1)[-1]
+        if wrapper not in _MANAGED_EXECUTION_PREFIXES:
+            return index
+        next_index = _consume_managed_execution_prefix_options(tokens, index + 1, wrapper)
+        if next_index is None:
+            return None
+        if wrapper == "timeout":
+            if next_index >= len(tokens) or not _managed_prefix_timeout_duration(tokens[next_index]):
+                return None
+            next_index += 1
+        if next_index >= len(tokens):
+            return None
+        index = next_index
+        assignments_allowed = wrapper == "env"
+    return None
+
+
+def parse_managed_test_command(argv: Sequence[str]) -> ManagedTestInvocation | None:
+    """Parse a managed wrapper after supported shell execution prefixes.
+
+    Prefix recognition is deliberately conservative.  Once a prefix is seen,
+    its options must be valid before the canonical managed invocation parser is
+    applied to the remaining launcher and its options.
+    """
+    tokens = tuple(str(item) for item in argv)
+    prefix_head = _managed_execution_prefix_head(tokens)
+    if prefix_head is None:
+        return None
+    return parse_managed_test_invocation(tokens[prefix_head:])
 
 
 def resolve_wrapper_prefix() -> tuple[str, ...] | None:
