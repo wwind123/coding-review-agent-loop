@@ -1235,7 +1235,12 @@ estimated. Finding `severity` labels must be one of `critical`, `high`,
 `medium`, `low`, or `info` (case-insensitive); any other label is rejected at
 load time rather than silently weighted as zero, and a valid finding with no
 severity label makes the severity-weighted row `unavailable`, naming the
-finding, instead of dropping it from the comparison. Finding IDs are namespaced
+finding, instead of dropping it from the comparison. Every finding must also
+carry `contributors`: a non-empty array of nonblank reviewer identities that
+raised it. Absent, wrong-typed, empty, or partially invalid contributor data is
+rejected at load time and by direct evaluation, so a valid finding is never
+silently dropped from unique, marginal, or severity-weighted coverage while the
+row still reports `verified`. Finding IDs are namespaced
 by run, so identical IDs across runs never collide; two records with the same
 `policy` and `run_id` are rejected so distinct findings can never be collapsed
 into one. Marginal-beyond-primary rows are `not-applicable` for policies whose

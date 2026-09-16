@@ -54,11 +54,31 @@ def _as_list(value: object, label: str) -> list[object]:
     return value
 
 
-def _finding_contributors(finding: Mapping[str, object]) -> tuple[str, ...]:
-    raw = finding.get("contributors", finding.get("reviewers", ()))
+def _finding_contributors(finding: Mapping[str, object], label: str) -> tuple[str, ...]:
+    """Return the deduplicated reviewer identities that contributed a finding.
+
+    Contributor metadata must be a non-empty array of nonblank reviewer
+    identities.  Absent, wrong-typed, empty, or partially invalid contributor
+    data fails closed: silently normalizing it to an empty tuple would drop a
+    valid finding from unique, marginal, and severity-weighted coverage while
+    the row still reported ``verified``.
+    """
+    raw = finding.get("contributors", finding.get("reviewers"))
+    if raw is None:
+        raise AgentLoopError(f"Frozen evaluation finding {label} has no contributors array.")
     if not isinstance(raw, list):
-        return ()
-    return tuple(dict.fromkeys(name.strip() for name in raw if isinstance(name, str) and name.strip()))
+        raise AgentLoopError(f"Frozen evaluation finding {label} contributors must be an array of reviewer names.")
+    names: list[str] = []
+    for index, name in enumerate(raw):
+        if not isinstance(name, str) or not name.strip():
+            raise AgentLoopError(
+                f"Frozen evaluation finding {label} contributor {index} must be a non-empty reviewer name."
+            )
+        names.append(name.strip())
+    contributors = tuple(dict.fromkeys(names))
+    if not contributors:
+        raise AgentLoopError(f"Frozen evaluation finding {label} must name at least one contributor.")
+    return contributors
 
 
 def _finding_id(finding: Mapping[str, object]) -> str | None:
@@ -190,7 +210,7 @@ def _validate_run(run: object, index: int) -> dict[str, object]:
         normalized_findings.append(
             {
                 "id": finding_id,
-                "contributors": list(_finding_contributors(finding)),
+                "contributors": list(_finding_contributors(finding, f"{run_id}/{finding_id}")),
                 # ``None`` means no severity label; it is never weighted as zero.
                 "severity": _severity(finding.get("severity"), f"{run_id}/{finding_id}"),
                 # ``None`` means unlabeled: never inferred as valid.
@@ -315,10 +335,13 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
                     continue
                 if valid is not True:
                     continue
-                finding_id = finding.get("id")
-                contributors = tuple(finding.get("contributors", ()))
-                if not isinstance(finding_id, str) or not contributors:
-                    continue
+                finding_id = _finding_id(finding)
+                if finding_id is None:
+                    raise AgentLoopError(f"Frozen evaluation run {run_id} contains a valid finding without an ID.")
+                # Re-validate rather than skip: a valid finding must never be
+                # dropped from coverage because its contributor data is absent
+                # or malformed.
+                contributors = _finding_contributors(finding, f"{run_id}/{finding_id}")
                 key = (run_id, finding_id)
                 valid_finding_keys.add(key)
                 if isinstance(primary, str) and primary in contributors:

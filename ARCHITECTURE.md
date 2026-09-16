@@ -205,8 +205,9 @@ validates artifacts and deterministically reports severity-weighted marginal
 coverage and process/cost/CI outcomes for all three policies. Every measurement
 is `verified` only with trustworthy run/label provenance; otherwise it is
 explicitly `unavailable`, findings are namespaced by run with unique per-policy
-run identities and validated severity labels, and the evaluator has no GitHub or
-reviewer-call dependency.
+run identities, validated severity labels, and validated non-empty contributor
+arrays (a valid finding is never silently dropped from coverage), and the
+evaluator has no GitHub or reviewer-call dependency.
 
 Findings have stable IDs, provenance, dispositions, and, where applicable,
 resolution ownership. The coder reports addressed, remaining, and disputed

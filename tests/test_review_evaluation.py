@@ -289,6 +289,60 @@ def test_severity_labels_are_case_insensitive_and_weighted_after_validation(tmp_
     assert row["severity_weighted_marginal_findings"] == {"status": "verified", "value": {"secondary": 5}}
 
 
+@pytest.mark.parametrize(
+    "contributors",
+    [
+        None,  # absent key entirely
+        "secondary",  # wrong type: string instead of array
+        [],  # empty array
+        ["primary", ""],  # partially invalid: blank entry
+        ["primary", "   "],  # partially invalid: whitespace-only entry
+        ["primary", 3],  # partially invalid: non-string entry
+        [None],
+        {"name": "secondary"},  # wrong type: object
+    ],
+)
+def test_missing_or_malformed_contributors_on_a_valid_finding_fail_closed(tmp_path, contributors):
+    finding = {"id": "security-gap", "severity": "critical", "valid": True}
+    if contributors is not None:
+        finding["contributors"] = contributors
+    run = _run(findings=[
+        {"id": "primary-finding", "severity": "high", "valid": True, "contributors": ["primary"]},
+        finding,
+    ])
+    path = tmp_path / "runs.json"
+    path.write_text(json.dumps({"schema_version": 1, "runs": [run]}), encoding="utf-8")
+    with pytest.raises(AgentLoopError, match="contributor"):
+        load_frozen_artifacts(path)
+    # Direct evaluation of an unvalidated artifact must not silently drop the
+    # valid finding and publish a verified unique-coverage count of one.
+    with pytest.raises(AgentLoopError, match="contributor"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [run]})
+
+
+def test_contributors_are_stripped_and_deduplicated_but_never_dropped(tmp_path):
+    path = tmp_path / "runs.json"
+    path.write_text(
+        json.dumps({"schema_version": 1, "runs": [_run(findings=[
+            {"id": "primary-finding", "severity": "high", "valid": True, "contributors": ["primary"]},
+            {"id": "shared", "severity": "critical", "valid": True, "reviewers": [" secondary ", "secondary", "other"]},
+        ])]}),
+        encoding="utf-8",
+    )
+    loaded = load_frozen_artifacts(path)
+    assert loaded["runs"][0]["findings"][1]["contributors"] == ["secondary", "other"]
+    row = evaluate_frozen_artifacts(loaded)["policies"]["primary-then-panel"]
+    assert row["valid_unique_findings"] == {"value": 2, "status": "verified"}
+    assert row["marginal_findings_beyond_primary"]["value"] == {
+        "other": ["r1:shared"],
+        "secondary": ["r1:shared"],
+    }
+    assert row["severity_weighted_marginal_findings"] == {
+        "status": "verified",
+        "value": {"other": 5, "secondary": 5},
+    }
+
+
 def test_duplicate_run_identity_within_a_policy_is_rejected_not_collapsed(tmp_path):
     first = _run(run_id="pr-1", findings=[
         {"id": "finding-1", "severity": "high", "valid": True, "contributors": ["primary"]},
@@ -332,8 +386,16 @@ def test_duplicate_run_identity_within_a_policy_is_rejected_not_collapsed(tmp_pa
 @pytest.mark.parametrize(
     "overrides, message",
     [
-        ({"findings": [{"id": "dup", "valid": True}, {"id": "dup", "valid": True}]}, "repeats finding ID"),
-        ({"findings": [{"id": "x", "severity": "urgent", "valid": True}]}, "unsupported severity"),
+        (
+            {"findings": [
+                {"id": "dup", "valid": True, "contributors": ["primary"]},
+                {"id": "dup", "valid": True, "contributors": ["primary"]},
+            ]},
+            "repeats finding ID",
+        ),
+        ({"findings": [{"id": "x", "severity": "urgent", "valid": True, "contributors": ["primary"]}]}, "unsupported severity"),
+        ({"findings": [{"id": "x", "severity": "high", "valid": True}]}, "no contributors array"),
+        ({"findings": [{"id": "x", "severity": "high", "valid": False, "contributors": []}]}, "at least one contributor"),
         ({"findings": [{"id": "x", "valid": "yes"}]}, "valid label must be boolean"),
         ({"primary_reviewer": None}, "without a primary_reviewer"),
         ({"provenance": {"source": "", "verified": True}}, "non-empty source"),
