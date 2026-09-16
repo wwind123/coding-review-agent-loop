@@ -3499,48 +3499,43 @@ def _activate_v2_managed_ci(
                     + remedy
                 )
 
-    # Strict protection removes the need for an unprotected waiver, but it
-    # does not make an unlabeled draft an authenticated managed re-entry. The
-    # label below suppresses the hosted opening route, so require the same
-    # versioned PR-comment authorization checkpoint before applying it. This
-    # guard is limited to issue-created recovery; other origins have separate
-    # authorization contracts.
+    # Strict protection removes the need for an unprotected waiver and its
+    # versioned PR-comment authorization record. An unlabeled draft still
+    # needs evidence that this exact issue-created PR previously entered the
+    # managed lifecycle before this invocation reapplies the suppression
+    # label. The authenticated strict tuple plus an actor-owned historical
+    # label event is that separate strict-protection proof; waiver records are
+    # deliberately not accepted or minted for this path.
     if (
         managed_resume is not None
         and origin == "issue-created"
         and lifecycle == "draft-unlabeled-reentry"
         and protection.state == "strict"
     ):
-        prior_audit = (
-            _find_resume_audit(
-                runner,
-                config=config,
-                pr_number=pr_number,
-                actor_login=actor_login,
-                actor_id=actor_id,
-                base_ref=base_ref,
-                issue_number=issue_hint,
-                live_head=live_sha,
-                expected_handoff=managed_resume.issue_created_handoff,
-                expected_protection=protection.state,
-                require_actor_owned_label_event=True,
-            )
-            if managed_resume.issue_created_handoff is not None
-            else None
+        historical_label_events = _managed_label_event_history(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            actor_login=actor_login,
+            actor_id=actor_id,
         )
-        if prior_audit is None:
+        if historical_label_events is None:
+            reason = "the actor-owned managed-label history is temporarily unreadable"
+        elif not historical_label_events:
+            reason = "no actor-owned historical managed-label event authenticates strict re-entry"
+        else:
+            reason = None
+        if reason is not None:
             command = render_managed_ci_resume_command(
                 config, pr_number=pr_number, managed_ci=True,
             )
             raise AgentLoopError(
-                f"--managed-ci requested qualification, but activation failed because no fully "
-                f"bound actor-owned issue-created authorization reaches live head {live_sha}. "
+                f"--managed-ci requested qualification, but activation failed because {reason}. "
                 f"PR #{pr_number} was left draft and unlabeled; no label, dispatch, readiness, "
-                f"or qualification write was made. Restore the authorization checkpoint before "
-                f"retrying `{command}`."
+                f"or qualification write was made. Reapply `{MANAGED_LABEL}` as the configured "
+                f"trusted actor through the repository's managed-CI controls, then retry "
+                f"`{command}`."
             )
-        resume_audit_id, prior_fields = prior_audit
-        resume_provenance_head = prior_fields.get("head")
 
     # A successful explicit manual run leaves a managed PR ready and
     # unlabeled. Re-entry is a privileged mutation: it is allowed only when

@@ -266,8 +266,10 @@ qualification state. A response rejected before the PR number is accepted is
 never parsed for authority; recovery on a voluntary or plan-limited base
 requires the explicit fresh operator grant in issue or PR mode, with PR mode
 naming the issue scope. A strictly protected base instead uses ordinary
-same-PR issue/PR discovery and resume; it does not mint or accept an
-unprotected grant merely because the waiver flag was supplied.
+same-PR issue/PR discovery and resume; a draft/unlabeled re-entry additionally
+requires the authenticated strict PR tuple and an actor-owned historical
+managed-label event before the suppression label is reapplied. It does not
+mint or accept an unprotected grant merely because the waiver flag was supplied.
 PR-mode recovery fetches that issue from GitHub, resolves any canonical
 approved-plan identity from its durable comments, and requires a server-side
 issue timeline association to the exact PR; candidate-authored closing text is

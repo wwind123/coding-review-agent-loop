@@ -1965,8 +1965,10 @@ For a strictly protected base, no unprotected authorization record is needed
 and `--managed-ci-fresh` is not a valid remedy. If the response was rejected
 before its PR number was accepted, use the ordinary same-PR issue/PR discovery
 and managed-CI resume path instead; it reauthenticates the strict PR tuple and
-does not rerun implementation. The strict path never mints or accepts a
-waiver nonce merely because `--allow-unprotected-managed-ci` was supplied.
+does not rerun implementation. A strict draft/unlabeled re-entry additionally
+requires an actor-owned historical `agent-loop-managed` label event before it
+reapplies the label. The strict path never mints or accepts a waiver nonce
+merely because `--allow-unprotected-managed-ci` was supplied.
 
 To retry an interrupted issue-created managed draft on an unprotected
 repository and preserve automatic merging, use the explicit per-invocation
@@ -1998,8 +2000,10 @@ An implicit `--auto-merge` invocation leaves that state ready and unlabeled,
 prints the exact flow-preserving retry, and performs no label, body, comment,
 dispatch, or readiness write. Draft/labeled and ready/unlabeled are the normal
 accepted lifecycle states; an explicit `--managed-ci` retry may also re-admit
-the draft/unlabeled state left by a failed explicit managed run. Other mixed
-states stop before agents run.
+the draft/unlabeled state left by a failed explicit managed run. On a strict
+base, that state is reauthenticated from the strict PR tuple plus the
+actor-owned historical label event; it does not require or create the
+unprotected authorization record. Other mixed states stop before agents run.
 
 Base resolution records whether the value came from an explicit `--base`, the
 repository default, or live PR metadata. This base provenance crosses the

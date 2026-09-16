@@ -2933,7 +2933,7 @@ def test_explicit_managed_issue_resume_reclaims_draft_unlabeled_state(tmp_path):
     )
 
 
-def test_strict_draft_unlabeled_missing_authorization_does_not_apply_label(tmp_path):
+def test_strict_draft_unlabeled_reentry_uses_historical_label_event(tmp_path):
     runner = V2ManagedRunner(
         workflow=SUPPRESSING_V2_WORKFLOW,
         rest_pr={
@@ -2957,25 +2957,29 @@ def test_strict_draft_unlabeled_missing_authorization_does_not_apply_label(tmp_p
         ),
     )
 
-    with pytest.raises(AgentLoopError, match="no fully bound actor-owned issue-created authorization"):
-        activate_managed_ci(
-            runner, config=config, pr_number=7, metadata=replace(
-                _ready_issue_metadata(), head_sha="coder-round-head"
+    contract = activate_managed_ci(
+        runner, config=config, pr_number=7, metadata=replace(
+            _ready_issue_metadata(), head_sha="coder-round-head"
+        ),
+        managed_resume=AuthenticatedManagedResume(
+            origin="issue-created", lifecycle="draft-unlabeled-reentry",
+            issue_created_handoff=replace(
+                _authorization_handoff(head="coder-round-head"),
+                protection_mode="strict",
             ),
-            managed_resume=AuthenticatedManagedResume(
-                origin="issue-created", lifecycle="draft-unlabeled-reentry",
-                issue_created_handoff=_authorization_handoff(head="coder-round-head"),
-            ),
-        )
-
-    assert runner.labels_posted is False
-    assert runner.dispatch_count == 0
-    assert not any(
-        command[:5] == [
-            "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
-        ]
-        for command, _cwd in runner.commands
+        ),
     )
+
+    assert contract is not None
+    assert contract.origin == "issue-created"
+    assert contract.lifecycle == "draft-unlabeled-reentry"
+    assert contract.protection_mode == "strict"
+    assert contract.audit_nonce is None
+    assert runner.labels_posted is True
+    assert runner.dispatch_count == 0
+    assert any(command[:5] == [
+        "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
+    ] for command, _cwd in runner.commands)
 
 
 def test_draft_unlabeled_stale_authorization_does_not_apply_label(tmp_path):

@@ -277,7 +277,10 @@ It reuses any valid exact-head authorization and does not adopt arbitrary
 existing PRs. If structured response validation rejected the implementation
 before accepting its PR number, strict protection instead uses ordinary
 same-PR issue/PR discovery and resume; the fresh unprotected grant is not
-available or required for a strict base.
+available or required for a strict base. If a strict draft was left unlabeled,
+that resume requires the authenticated strict PR tuple and an actor-owned
+historical `agent-loop-managed` label event, then reapplies the label without
+creating a waiver record.
 
 ## How the Review Loop Behaves
 
