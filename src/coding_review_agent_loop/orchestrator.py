@@ -12059,10 +12059,7 @@ def run_pr_loop(
                                     )
                                     if (
                                         not child_plan_context.is_available
-                                        or not (
-                                            child_plan_context.canonical_text
-                                            or child_plan_context.matrix_available
-                                        )
+                                        or not child_plan_context.canonical_text
                                     ):
                                         raise AgentLoopError(
                                             "Fresh decomposition child phase was routed to child "

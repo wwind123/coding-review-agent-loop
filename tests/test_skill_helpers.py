@@ -2976,6 +2976,75 @@ class TestSkillApprovedPlanRecovery:
             "owner/repo", 7, {"body": "A direct PR without a linked issue."}
         ) is None
 
+    @pytest.mark.parametrize(
+        "fault", [None, "parent_hash_copy", "missing_child_plan", "contradictory_handoff"]
+    )
+    def test_planning_handoff_uses_distinct_reviewed_child_plan(
+        self, monkeypatch, fault
+    ) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.decomposition import approved_plan_hash
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+        from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+        from test_child_plan_provenance import fresh_child_contexts, fresh_staged_plan
+
+        rendered_parent_plan = fresh_staged_plan(
+            first_disposition="requires-child-planning"
+        )
+        parent_payload, _ = json.JSONDecoder().raw_decode(rendered_parent_plan)
+        parent_plan = json.dumps(parent_payload) + "\n<!-- AGENT_PLAN_STATE:" + rendered_parent_plan.split(
+            "\n<!-- AGENT_PLAN_STATE:", 1
+        )[1]
+        child_plan = "Reviewed child plan.\n\n## Scope\n- Implement the selected design."
+        child, parent = fresh_child_contexts(
+            parent_plan,
+            handoff_execution_disposition="requires-child-planning",
+            child_plan=child_plan,
+        )
+        child_comments = [item.body for item in child.comments]
+        child_comments[-1] = format_issue_pr_handoff_comment(
+            issue_number=56, pr_number=7,
+            pr_url="https://github.com/owner/repo/pull/7", pr_head_sha="head-7",
+            flow="approved-plan-implementation",
+            plan_hash=(
+                approved_plan_hash(parent_plan)
+                if fault == "parent_hash_copy" else approved_plan_hash(child_plan)
+            ),
+        )
+        if fault == "missing_child_plan":
+            child_comments = child_comments[1:]
+        parent_comments = [item.body for item in parent.comments]
+        if fault == "contradictory_handoff":
+            parent_comments[-1] = _replace_phase_handoff_payload(
+                parent_comments[-1], execution_disposition="direct-implementation"
+            )
+        monkeypatch.setattr(
+            sr, "_fetch_issue_comments_raw",
+            lambda repo, issue: child_comments if issue == 56 else parent_comments,
+        )
+        monkeypatch.setattr(sr, "_fetch_issue_json", lambda repo, issue: {"body": child.body})
+        contract = make_pr_contract(
+            repository="owner/repo", pr_number=7,
+            origin_flow="approved-plan-implementation", primary_issue_number=56,
+            expected_closing_issue_ids=(56,),
+        )
+        pr_info = {
+            "body": "Fixes #56",
+            "comments": [{"body": format_pr_contract_comment(contract)}],
+        }
+        if fault:
+            with pytest.raises(
+                AgentLoopError,
+                match="parent phase hash|approved child plan|carries no override digest",
+            ):
+                sr._recover_skill_pr_plan_context("owner/repo", 7, pr_info)
+        else:
+            context = sr._recover_skill_pr_plan_context("owner/repo", 7, pr_info)
+            assert context is not None
+            assert context.canonical_text == child_plan
+            assert context.plan_hash == approved_plan_hash(child_plan)
+
     def test_partial_same_head_resume_keeps_only_matching_plan_approval(self) -> None:
         import helpers.skill_runner as sr
         from coding_review_agent_loop.round_state import make_approved_plan_context

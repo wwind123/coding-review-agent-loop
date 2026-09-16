@@ -136,6 +136,7 @@ from coding_review_agent_loop.decomposition import (
     phase_identity,
     collect_child_disposition_overrides,
     reconcile_handoff_disposition,
+    validate_separately_planned_child_matrix,
 )
 from coding_review_agent_loop.protocol import (
     EXECUTION_DISPOSITION_DIRECT,

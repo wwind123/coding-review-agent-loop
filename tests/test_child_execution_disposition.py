@@ -332,6 +332,25 @@ def test_rtm_override_bound_handoff_survives_only_with_exact_record():
         reconcile_handoff_disposition(_phase(), handoff, (override, superseding))
 
 
+def test_rtm_contradictory_handoff_reconciliation_rejects_each_binding_fault():
+    planning = _override(EXECUTION_DISPOSITION_PLANNING)
+    with pytest.raises(AgentLoopError, match="carries no override digest"):
+        reconcile_handoff_disposition(
+            _phase(), _handoff(EXECUTION_DISPOSITION_PLANNING), ()
+        )
+
+    handoff = _handoff(EXECUTION_DISPOSITION_PLANNING, digest=planning.digest)
+    wrong_identity = dataclasses.replace(planning, parent_issue=999)
+    with pytest.raises(AgentLoopError, match="different parent, plan hash, or stage"):
+        reconcile_handoff_disposition(_phase(), handoff, (wrong_identity,))
+
+    wrong_disposition = dataclasses.replace(
+        planning, disposition=EXECUTION_DISPOSITION_DIRECT
+    )
+    with pytest.raises(AgentLoopError, match="differs from the recorded handoff disposition"):
+        reconcile_handoff_disposition(_phase(), handoff, (wrong_disposition,))
+
+
 def test_rtm_rerun_idempotent_and_rtm_flag_cannot_switch_after_handoff():
     handoff = _handoff()
     first = resolve_child_execution_route(
@@ -366,6 +385,61 @@ def test_rtm_human_stage_keeps_stop_and_rejects_override():
             topology_source="approved-plan-v1",
             overrides=(_override(EXECUTION_DISPOSITION_DIRECT),),
         )
+
+
+def test_rtm_human_first_stage_workflow_stops_without_handoff_and_other_override_is_ignored(
+    tmp_path, monkeypatch, capsys
+):
+    approved_plan = "Approved mixed topology."
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+
+    human_phase = dataclasses.replace(
+        _phase(automation="human-action"),
+        stage_id="human-stage",
+        execution_disposition="human-owned",
+    )
+    agent_phase = dataclasses.replace(
+        _phase(EXECUTION_DISPOSITION_PLANNING), stage_id="stage-two", position=2
+    )
+    created = (
+        CreatedPhaseIssue(human_phase, "human-url", 56),
+        CreatedPhaseIssue(agent_phase, "agent-url", 57),
+    )
+    other_override = format_child_disposition_override_comment(
+        parent_issue=55,
+        plan_hash=approved_plan_hash(approved_plan),
+        stage_id="stage-two",
+        disposition=EXECUTION_DISPOSITION_DIRECT,
+        rationale="Only the later agent stage changes route.",
+    )
+    parent = IssueContext(
+        number=55, repo="OWNER/REPO", title="Parent", body="Parent", url="parent-url",
+        comments=(IssueComment(author="human", created_at=None, body=other_override),),
+    )
+    child = dataclasses.replace(parent, number=56, title="Human", comments=())
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    monkeypatch.setattr(
+        orchestrator, "post_phase_implementation_handoff_comment",
+        lambda *_args, **_kwargs: pytest.fail("human stage must not post a handoff"),
+    )
+    recommendation = SimpleNamespace(
+        strategy="staged",
+        identity=lambda: {"recommendation_sha256": "digest"},
+        child_stages=(human_phase, agent_phase),
+    )
+    result = orchestrator._dispatch_first_decomposition_phase(
+        FakeRunner(), config=make_config(tmp_path), memory=None,
+        usage_context=SimpleNamespace(), issue_number=55,
+        current_plan=approved_plan, plan_subject="subject", created=created,
+        recommendation=recommendation,
+        approved_plan_context=SimpleNamespace(matrix_available=False),
+        issue_context=parent, mode="implement-by-phase", coder_session_id=None,
+    )
+    assert result == 0
+    assert "first phase requires human work" in capsys.readouterr().out
 
 
 def test_rtm_nested_staged_child_stops_before_topology_mutation(
@@ -456,6 +530,37 @@ def test_rtm_multi_stage_overrides_scope_independently_and_dedupe():
     )
     assert len(scoped) == 1
     assert scoped[0].stage_id == "stage-one"
+    second_scoped = collect_child_disposition_overrides(
+        parent_comments=comments,
+        parent_issue=55,
+        plan_hash="plan-hash",
+        topology_stage_ids=("stage-one", "stage-two"),
+        routed_stage_id="stage-two",
+    )
+    assert len(second_scoped) == 1
+    first_route = resolve_child_execution_route(
+        _phase(), topology_source="approved-plan-v1", overrides=scoped
+    )
+    second_phase = dataclasses.replace(
+        _phase(EXECUTION_DISPOSITION_PLANNING), stage_id="stage-two"
+    )
+    second_route = resolve_child_execution_route(
+        second_phase, topology_source="approved-plan-v1", overrides=second_scoped
+    )
+    assert first_route.disposition == EXECUTION_DISPOSITION_PLANNING
+    assert first_route.override_digest == scoped[0].digest
+    assert second_route.disposition == EXECUTION_DISPOSITION_DIRECT
+    assert second_route.override_digest == second_scoped[0].digest
+
+    first_handoff = _handoff(first_route.disposition, digest=first_route.override_digest)
+    second_handoff = dataclasses.replace(
+        _handoff(second_route.disposition, digest=second_route.override_digest),
+        stage_id="stage-two",
+        phase_index=2,
+        child_issue_number=57,
+    )
+    assert first_handoff.override_digest == scoped[0].digest
+    assert second_handoff.override_digest == second_scoped[0].digest
 
 
 def test_rtm_override_topology_rejection_precedes_stage_scoping():
