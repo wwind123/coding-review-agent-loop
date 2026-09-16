@@ -78,7 +78,7 @@ from coding_review_agent_loop.config import resolve_base_branch
 
 from fixtures.managed_ci import current_router, historical_router, local_router
 
-from agent_loop_helpers import FakeRunner, make_config
+from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
 
 
 WORKFLOW = """
@@ -563,6 +563,10 @@ class _ActivationReached(Exception):
     """Stop an orchestrator regression immediately after real activation."""
 
 
+class _ReviewReached(Exception):
+    """Stop after the first real reviewer publication."""
+
+
 def _stop_after_real_activation(monkeypatch, captured_resume=None):
     monkeypatch.setattr(
         orchestrator,
@@ -582,6 +586,32 @@ def _stop_after_real_activation(monkeypatch, captured_resume=None):
         "activate_managed_ci",
         activate_then_stop,
     )
+
+
+def _stop_after_real_reviewer(monkeypatch, captured=None):
+    monkeypatch.setattr(
+        orchestrator,
+        "_freeze_prompt_architecture",
+        lambda _runner, config, **_kwargs: config,
+    )
+    real_activate_managed_ci = orchestrator.activate_managed_ci
+    real_post_pr_comment = orchestrator.post_pr_comment
+
+    def activate_and_capture(*args, **kwargs):
+        result = real_activate_managed_ci(*args, **kwargs)
+        if captured is not None:
+            captured["activation"] = result
+            captured["managed_resume"] = kwargs.get("managed_resume")
+        return result
+
+    def post_and_stop(*args, **kwargs):
+        result = real_post_pr_comment(*args, **kwargs)
+        if str(kwargs.get("body") or "").startswith("**Review verdict:"):
+            raise _ReviewReached
+        return result
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate_and_capture)
+    monkeypatch.setattr(orchestrator, "post_pr_comment", post_and_stop)
 
 
 def _workflow_runner_for_issue_authorization(
@@ -700,7 +730,17 @@ def test_run_pr_loop_fresh_recovery_uses_real_authorization_and_activation(
 def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_grant(
     tmp_path, monkeypatch,
 ):
-    runner = _workflow_runner_for_issue_authorization(None, labeled=True)
+    runner = _workflow_runner_for_issue_authorization(
+        None,
+        labeled=True,
+    )
+    runner.codex_outputs = [
+        structured_pr_review(
+            state="approved",
+            summary="Reviewed the continuity-authorized exact head.",
+            reviewer="OpenAI Codex",
+        )
+    ]
     root = publish_issue_created_authorization(
         runner, config=make_config(
             tmp_path, managed_ci=True, managed_ci_pr_mode=True,
@@ -741,9 +781,9 @@ def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_gr
         ),
     )
     captured = {}
-    _stop_after_real_activation(monkeypatch, captured)
+    _stop_after_real_reviewer(monkeypatch, captured)
 
-    with pytest.raises(_ActivationReached) as exc_info:
+    with pytest.raises(_ReviewReached):
         orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     records = [
@@ -761,6 +801,15 @@ def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_gr
     assert resumed.issue_created_handoff.authorization_kind == "continuity"
     assert resumed.issue_created_handoff.override_nonce == continuity.override_nonce
     assert resumed.issue_created_handoff.opening_override_nonce == "opening-nonce"
+    assert captured["activation"] is not None
+    reviewer_command = next(
+        command for command, _cwd in runner.commands if command[:2] == ["codex", "exec"]
+    )
+    assert "next-head" in " ".join(reviewer_command)
+    assert any(
+        "Reviewed the continuity-authorized exact head." in comment
+        for comment in runner.comments
+    )
     assert sum(
         "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in " ".join(command)
         and "POST" in command

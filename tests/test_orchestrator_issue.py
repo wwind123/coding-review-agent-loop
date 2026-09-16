@@ -4260,6 +4260,13 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
             "Fixed issue.\nTests: cd /outside && python -m pytest\n"
             "<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
         ],
+        claude_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="Reviewed the post-report recovery head.",
+                reviewer="Anthropic Claude",
+            )
+        ],
     )
     config = make_config(
         tmp_path, coder="codex", reviewer="claude", managed_ci=True,
@@ -4299,8 +4306,8 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
     coder_calls = sum(
         command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
     )
-    _stop_issue_resume_after_real_activation(monkeypatch)
-    with pytest.raises(_RealManagedActivationReached):
+    _stop_issue_resume_after_reviewer(monkeypatch)
+    with pytest.raises(_RealManagedReviewReached):
         run_issue_loop(runner, issue_number=56, config=config)
 
     assert sum(
@@ -4308,11 +4315,19 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
     ) == coder_calls
     assert runner.labels_posted is False
     assert runner.dispatch_count == 0
+    reviewer_command = next(
+        command for command, _cwd in runner.commands if command[:1] == ["claude"]
+    )
+    assert "abc123" in " ".join(reviewer_command)
+    assert any(
+        "Reviewed the post-report recovery head." in comment
+        for comment in runner.comments
+    )
     assert not any(
         marker in comment
         for comment in runner.comments
         for marker in (
-            "AGENT_ISSUE_PR_HANDOFF", "AGENT_STATE: approved",
+            "AGENT_ISSUE_PR_HANDOFF",
             "AGENT_TEST_OBSERVATION", "AGENT_MANAGED_CI_READINESS",
         )
     )
@@ -4935,6 +4950,13 @@ def test_issue_fresh_recovery_discovers_pre_handoff_pr_without_reimplementing(
         pr_commit_pages=_provenance_pages(
             "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=direct"
         ),
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="Reviewed the fresh-recovery exact head.",
+                reviewer="OpenAI Codex",
+            )
+        ],
     )
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_fresh_authorization=True,
@@ -4945,9 +4967,9 @@ def test_issue_fresh_recovery_discovers_pre_handoff_pr_without_reimplementing(
             "--allow-unprotected-managed-ci",
         ),
     )
-    _stop_issue_resume_after_real_activation(monkeypatch)
+    _stop_issue_resume_after_reviewer(monkeypatch)
 
-    with pytest.raises(_RealManagedActivationReached):
+    with pytest.raises(_RealManagedReviewReached):
         run_issue_loop(runner, issue_number=56, config=config)
 
     records = [
@@ -4959,7 +4981,12 @@ def test_issue_fresh_recovery_discovers_pre_handoff_pr_without_reimplementing(
     assert len(records) == 1 and records[0].kind == "fresh"
     assert runner.labels_posted is True
     assert runner.dispatch_count == 0
-    assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
+    assert sum(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands) == 1
+    assert any(
+        "Reviewed the fresh-recovery exact head." in comment
+        for comment in runner.comments
+    )
+
 
 def test_issue_loop_outside_workdir_after_reported_pr_hedges_unconfirmed_pr(tmp_path):
     runner = FakeRunner(
