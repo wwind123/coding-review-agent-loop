@@ -2533,6 +2533,36 @@ def test_suppressing_v2_preflight_falls_back_without_override_and_uses_nonce_wit
     assert intent.audit_nonce
 
 
+def test_strict_preflight_does_not_mint_unprotected_authorization_nonce(tmp_path):
+    active_rule = {
+        "enforcement": "active",
+        "bypass_actors": [],
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": FINAL_CONTEXT}]},
+        }],
+    }
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"body": "Fixes #643"},
+        pr_branch_protection_payload={"contexts": []},
+        pr_effective_rules_payload=[{"ruleset_id": 8}],
+        pr_rulesets_payload={8: active_rule},
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    intent = preflight_managed_ci_creation(runner, config=config, issue_number=643)
+
+    assert intent is not None
+    assert intent.protection_mode == "strict"
+    assert intent.audit_nonce is None
+
+
 def test_override_activation_requires_the_preflight_nonce_and_releases_label_on_mismatch(tmp_path):
     nonce = "nonce-from-preflight"
     runner = V2ManagedRunner(

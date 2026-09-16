@@ -268,13 +268,16 @@ The [full CLI guide](docs/local_agent_loop.md#usage) covers lifecycle and resume
 behavior in detail.
 
 For an issue-created managed-CI PR whose original authorization comment is
-missing or whose implementation response was rejected before a PR number was
-accepted, recovery is deliberately explicit. Use `--managed-ci-fresh` with
-`--managed-ci` and the unprotected waiver; PR mode must also provide
-`--managed-ci-issue <issue-number>`. This creates a new operator grant after
-validating the live PR tuple, fetching the issue and canonical plan scope, and
-confirming a server-observed issue-to-PR association. It reuses any valid
-exact-head authorization and does not adopt arbitrary existing PRs.
+missing, recovery is deliberately explicit. On a voluntary or plan-limited
+base, use `--managed-ci-fresh` with `--managed-ci` and the unprotected waiver;
+PR mode must also provide `--managed-ci-issue <issue-number>`. This creates a
+new operator grant after validating the live PR tuple, fetching the issue and
+canonical plan scope, and confirming a server-observed issue-to-PR association.
+It reuses any valid exact-head authorization and does not adopt arbitrary
+existing PRs. If structured response validation rejected the implementation
+before accepting its PR number, strict protection instead uses ordinary
+same-PR issue/PR discovery and resume; the fresh unprotected grant is not
+available or required for a strict base.
 
 ## How the Review Loop Behaves
 

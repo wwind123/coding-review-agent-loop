@@ -1927,8 +1927,9 @@ managed CI. A rejected post-PR test report therefore stays rejected without a
 handoff or approval, while the same authorized head remains resumable.
 
 If structured response validation fails before a PR number is accepted, no
-creation authorization is synthesized from the rejected response. On a later
-issue-mode recovery, use the explicit fresh grant:
+creation authorization is synthesized from the rejected response. Recovery
+depends on the live protection assessment. For a voluntary or plan-limited
+base, a later issue-mode recovery uses the explicit fresh grant:
 
 ```bash
 agent-loop issue <issue-number> --managed-ci --managed-ci-fresh \
@@ -1959,6 +1960,13 @@ and the PR tuple, managed-label event, and authorization-comment set are read
 again immediately before publication. Managed issue recovery from a legacy
 association does not backfill a canonical handoff for a response whose report
 was rejected; authorization and coder evidence remain separate checkpoints.
+
+For a strictly protected base, no unprotected authorization record is needed
+and `--managed-ci-fresh` is not a valid remedy. If the response was rejected
+before its PR number was accepted, use the ordinary same-PR issue/PR discovery
+and managed-CI resume path instead; it reauthenticates the strict PR tuple and
+does not rerun implementation. The strict path never mints or accepts a
+waiver nonce merely because `--allow-unprotected-managed-ci` was supplied.
 
 To retry an interrupted issue-created managed draft on an unprotected
 repository and preserve automatic merging, use the explicit per-invocation

@@ -1063,7 +1063,12 @@ def preflight_managed_ci_creation(
         branch=branch or f"agent-loop/managed-{issue_number}",
         trusted_actor=readiness.actor or config.managed_ci_trusted_actor,
         protection_mode=readiness.protection.state,
-        audit_nonce=secrets.token_urlsafe(18) if config.allow_unprotected_managed_ci else None,
+        audit_nonce=(
+            secrets.token_urlsafe(18)
+            if config.allow_unprotected_managed_ci
+            and readiness.protection.state in {"voluntary", "plan_limited"}
+            else None
+        ),
     )
 
 
