@@ -372,6 +372,21 @@ def parse_issue_created_authorization_comment(
         raise AgentLoopError(
             "Managed-CI creation authorization cannot contain continuity fields."
         )
+    if kind in {"creation", "fresh", "continuity"} and (
+        payload["protection"] not in {"voluntary", "plan_limited"}
+        or payload["waiver"] != "allow-unprotected-managed-ci"
+    ):
+        raise AgentLoopError(
+            "Managed-CI issue authorization has an invalid protection or waiver context."
+        )
+    if kind == "fresh" and (
+        round_comment_ids
+        or (predecessor_head is None) != (predecessor_comment_id is None)
+    ):
+        raise AgentLoopError(
+            "Managed-CI fresh authorization cannot contain round metadata and must "
+            "contain both predecessor fields or neither."
+        )
     if kind == "continuity" and (
         predecessor_head is None
         or predecessor_comment_id is None

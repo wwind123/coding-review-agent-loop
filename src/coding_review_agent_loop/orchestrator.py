@@ -2701,6 +2701,7 @@ def _run_validated_agent(
     salvage_context: SalvageContext | None = None,
     operation_description: str | None = None,
     completion_recovery: CompletionRecoveryPolicy | None = None,
+    managed_ci_recovery_protection: str | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -3766,12 +3767,23 @@ def _run_validated_agent(
         classification_text=last_classification_text,
     )
     if repair_expected_kind == "issue_implementation" and config.managed_ci:
-        message += (
-            " The implementation response was rejected before a PR number was accepted. "
-            "If the coder opened a PR before that rejection, discover and resume that same PR "
-            "with explicit --managed-ci-fresh authorization (including the unprotected waiver); "
-            "do not rerun implementation to recreate it."
-        )
+        message += " The implementation response was rejected before a PR number was accepted."
+        if (
+            config.allow_unprotected_managed_ci
+            and managed_ci_recovery_protection in {"voluntary", "plan_limited"}
+        ):
+            message += (
+                " If the coder opened a PR before that rejection, discover and resume that same PR "
+                "with explicit --managed-ci-fresh authorization (including the unprotected waiver); "
+                "do not rerun implementation to recreate it."
+            )
+        else:
+            message += (
+                " If the coder opened a PR before that rejection, use the ordinary managed-CI "
+                "issue/PR discovery and resume path for that same PR. The exceptional "
+                "unprotected fresh-authorization path is unavailable here; do not rerun "
+                "implementation to recreate the PR."
+            )
     message += diagnostics.format_for_error()
     raise AgentInvocationError(
         message,
@@ -6228,6 +6240,10 @@ def _implement_approved_issue(
             approved_plan_context=approved_plan_context,
             parent_issue_context=parent_issue_context,
             human_requirements=implementation_requirements,
+        ),
+        managed_ci_recovery_protection=(
+            managed_ci_creation_intent.protection_mode
+            if managed_ci_creation_intent is not None else None
         ),
     )
     coder_output = coder_response.text
@@ -8747,6 +8763,10 @@ def run_issue_loop(
                 approved_plan_context=None,
                 parent_issue_context=parent_issue_context,
                 human_requirements=implementation_requirements,
+            ),
+            managed_ci_recovery_protection=(
+                managed_ci_creation_intent.protection_mode
+                if managed_ci_creation_intent is not None else None
             ),
         )
         coder_output = coder_response.text

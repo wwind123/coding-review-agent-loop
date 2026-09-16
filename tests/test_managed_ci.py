@@ -3196,6 +3196,125 @@ def test_issue_authorization_parser_enforces_kind_specific_schema(tmp_path, kind
     with pytest.raises(AgentLoopError, match="continuity|continuity fields"):
         parse_issue_created_authorization_comment(body)
 
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"round_comment_ids": [88]},
+        {"predecessor_head": "old-head"},
+        {"predecessor_comment_id": 41},
+        {"protection": "strict"},
+        {"waiver": "not-the-explicit-waiver"},
+    ],
+)
+def test_issue_authorization_parser_rejects_noncanonical_fresh_schema(changes):
+    record = ManagedCiIssueAuthorization(
+        kind="fresh",
+        repository="OWNER/REPO",
+        issue_number=643,
+        pr_number=7,
+        base_ref="main",
+        head_sha="abc123",
+        actor_login="agent-loop",
+        actor_id=1,
+        protection="voluntary",
+        waiver="allow-unprotected-managed-ci",
+        nonce="nonce",
+        label_event_id=101,
+    )
+    payload = record.to_payload()
+    payload.update(changes)
+    encoded = managed_ci._encode_issue_authorization_payload(payload)
+    body = f"<!-- {managed_ci.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
+
+    with pytest.raises(AgentLoopError, match="fresh authorization|protection or waiver"):
+        parse_issue_created_authorization_comment(body)
+
+
+def test_activation_rejects_malformed_fresh_authorization_before_label_or_dispatch(tmp_path):
+    record = ManagedCiIssueAuthorization(
+        kind="fresh",
+        repository="OWNER/REPO",
+        issue_number=643,
+        pr_number=7,
+        base_ref="main",
+        head_sha="abc123",
+        actor_login="agent-loop",
+        actor_id=1,
+        protection="voluntary",
+        waiver="allow-unprotected-managed-ci",
+        nonce="fresh",
+        label_event_id=101,
+        predecessor_head="old-head",
+    )
+    encoded = managed_ci._encode_issue_authorization_payload(record.to_payload())
+    malformed_body = f"<!-- {managed_ci.ISSUE_AUTHORIZATION_MARKER}: {encoded} -->"
+    runner = V2ManagedRunner(
+        workflow=SUPPRESSING_V2_WORKFLOW,
+        rest_pr={"state": "open", "draft": True, "labels": []},
+        issue_events=[label_event()],
+        intent_comments=[{
+            "id": 41,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": malformed_body,
+        }],
+    )
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+        ),
+    )
+    handoff = replace(
+        _authorization_handoff(),
+        lifecycle="draft-unlabeled-reentry",
+        opening_override_nonce="nonce-643",
+        authorization_kind="fresh",
+        authorization_comment_id=41,
+        override_nonce="fresh",
+    )
+
+    assert _find_resume_audit(
+        runner,
+        config=config,
+        pr_number=7,
+        actor_login="agent-loop",
+        actor_id=1,
+        base_ref="main",
+        issue_number=643,
+        live_head="abc123",
+        require_actor_owned_label_event=True,
+    ) is None
+
+    with pytest.raises(AgentLoopError, match="--managed-ci-fresh"):
+        activate_managed_ci(
+            runner,
+            config=config,
+            pr_number=7,
+            metadata=replace(metadata(), head_branch="agent-loop/managed-643"),
+            managed_resume=AuthenticatedManagedResume(
+                origin="issue-created",
+                lifecycle="draft-unlabeled-reentry",
+                issue_created_handoff=handoff,
+            ),
+        )
+
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    assert not any(
+        command[:5] == [
+            "gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels"
+        ]
+        for command, _cwd in runner.commands
+    )
+
+
 def test_recovery_renderer_finds_issue_identifier_after_options_and_consumes_stdin_value(tmp_path):
     parser = build_parser()
     config = make_config(

@@ -4861,6 +4861,81 @@ def test_pre_pr_number_response_rejection_then_fresh_issue_recovery_uses_real_ac
     )
 
 
+def test_strict_pre_pr_number_rejection_directs_ordinary_discovery_without_reimplementation(
+    tmp_path, monkeypatch,
+):
+    valid = structured_issue_implementation(
+        pr_number=77,
+        tests_run=["python3 -m pytest tests/test_managed_ci.py -q"],
+    )
+    payload, end = json.JSONDecoder().raw_decode(valid)
+    payload.pop("architecture_impact")
+    rejected = json.dumps(payload) + valid[end:]
+    runner = _IssueRecoveryWorkflowRunner(
+        labeled=True,
+        codex_outputs=[rejected],
+        claude_outputs=[
+            structured_pr_review(
+                state="approved", summary="Reviewed the strict recovered PR."
+            )
+        ],
+        pr_branch_protection_payload={"contexts": ["final-ci/exact-head"]},
+    )
+    config = make_config(
+        tmp_path,
+        coder="codex",
+        reviewer="claude",
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        agent_max_retries=0,
+        invocation_argv=(
+            "agent-loop", "issue", "56", "--managed-ci",
+            "--managed-ci-trusted-actor", "agent-loop",
+        ),
+    )
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56",
+        trusted_actor="agent-loop",
+        protection_mode="strict",
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *_a, **_k: (None, None, ()),
+    )
+
+    with pytest.raises(AgentLoopError, match="ordinary managed-CI") as exc_info:
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    message = str(exc_info.value)
+    assert "--managed-ci-fresh" not in message
+    assert "unprotected fresh-authorization path is unavailable" in message
+    coder_calls = sum(
+        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
+    )
+
+    # The PR was created before the structured response was rejected. Ordinary
+    # issue discovery can now reach that same strict draft without invoking the
+    # implementation coder again.
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    runner.pr_payload["body"] = "Fixes #56"
+    runner.rest_pr["body"] = "Fixes #56"
+    runner.pr_commit_pages = _provenance_pages(
+        "Implement issue.\n\nAgent-Issue-Provenance: v1 "
+        "repo=owner/repo issue=56 flow=direct"
+    )
+    _stop_issue_resume_after_reviewer(monkeypatch)
+    with pytest.raises(_RealManagedReviewReached):
+        run_issue_loop(runner, issue_number=56, config=config)
+
+    assert sum(
+        command[:2] == ["codex", "exec"] for command, _cwd in runner.commands
+    ) == coder_calls
+
+
 def test_managed_issue_legacy_recovery_rejects_unexpected_closing_reference(
     tmp_path,
 ):
