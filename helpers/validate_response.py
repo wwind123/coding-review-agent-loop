@@ -104,6 +104,7 @@ def validate_response_text(
     delivered_risk_test_matrix_identity: str | None = None,
     authoritative_test_observations=None,
     delivered_risk_test_matrix_row_ids=None,
+    require_child_dispositions: bool | None = None,
 ) -> object:
     """Validate response text with the same context used by the helper CLI.
 
@@ -145,12 +146,18 @@ def validate_response_text(
         if not isinstance(item, dict) or item
     ]
 
+    # This helper validates fresh coder output.  A fresh generation-1 turn
+    # must declare every child stage's execution disposition (#808) unless the
+    # caller explicitly opts out for a recovery re-parse.
+    if require_child_dispositions is None:
+        require_child_dispositions = require_execution_strategy_contract == 1
     if kind == "plan_state":
         parsed = validate_structured_plan_state(
             text,
             required_architecture_impact_contract=required_architecture_impact_contract,
             require_execution_strategy_contract=require_execution_strategy_contract,
             require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+            require_child_dispositions=require_child_dispositions,
         )
         if parsed is None:
             if required_architecture_impact_contract == 1:
@@ -218,6 +225,7 @@ def validate_response_text(
         require_execution_strategy_contract=require_execution_strategy_contract,
         require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
+        require_child_dispositions=require_child_dispositions,
     )
     if parsed is None:
         raise AgentLoopError("Response did not parse as a structured plan_revision.")

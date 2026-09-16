@@ -8,6 +8,7 @@ import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
+    PlanPhase,
     RecordedPhase,
     approved_plan_hash,
     format_one_shot_impl_handoff_comment,
@@ -102,14 +103,19 @@ def _fresh_v1_plan_for_isolation(strategy: str) -> str:
                 "title": "Intermediate behavior",
                 "summary": "Deliver the independently verifiable intermediate behavior.",
                 "deliverables": ["The intermediate behavior."],
-                "non_goals": [],
+                "non_goals": ["Do not change unrelated behavior."],
                 "acceptance_criteria": ["The intermediate behavior passes."],
                 "depends_on_stage_ids": [],
                 "dependency_notes": "No dependencies.",
                 "automation": "agent-pr",
                 "rollout_risk": "low",
-                "compatibility_constraints": [],
+                "compatibility_constraints": ["Preserve existing callers."],
                 "covered_scope_item_ids": ["scope-1"],
+                "execution_disposition": {
+                    "disposition": "direct-implementation",
+                    "rationale": "The reviewed stage is a complete implementation contract.",
+                    "unresolved_design_decisions": [],
+                },
             }],
             "final_integration_work": {
                 "status": "required",
@@ -185,7 +191,27 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         events.append("decompose")
         return (
             CreatedPhaseIssue(
-                phase=RecordedPhase(title="legacy-model-phase", automation="agent-pr"),
+                    phase=PlanPhase(
+                        title="Intermediate behavior",
+                        scope="Deliver the independently verifiable behavior.",
+                        non_goals="Do not change unrelated behavior.",
+                        dependency_notes="No dependencies.",
+                        rollout_risk="low",
+                        validation="Run focused tests.",
+                        parent_context="Approved parent stage.",
+                        automation="agent-pr",
+                        stage_id="stage-1",
+                        position=1,
+                        deliverables=("The intermediate behavior.",),
+                        non_goals_items=("Do not change unrelated behavior.",),
+                        acceptance_criteria=("The intermediate behavior passes.",),
+                        compatibility_constraints=("Preserve existing callers.",),
+                        covered_scope_item_ids=("scope-1",),
+                        execution_disposition="direct-implementation",
+                        disposition_rationale=(
+                            "The reviewed stage is a complete implementation contract."
+                        ),
+                    ),
                 issue_url="https://github.com/OWNER/REPO/issues/101",
                 issue_number=101,
             ),

@@ -42,6 +42,52 @@ typed stages remain legacy-undecided. A bounded repair can only reformat a
 complete recoverable v1 source; missing or partial strategy data requires a new
 planner turn.
 
+### Child execution dispositions
+
+Every child in a fresh staged generation-1 recommendation has a reviewed
+execution disposition. The planner makes the semantic choice and plan
+reviewers approve or block it. `agent-pr` stages use
+`direct-implementation` when the approved parent slice is a complete contract,
+or `requires-child-planning` when design choices remain. `human-action` and
+`manual-close` stages use `human-owned`. The orchestrator validates only the
+typed declaration, internal consistency, direct-readiness fields, and
+provenance; it does not infer readiness from issue size, file count, or prose.
+
+Direct readiness requires no unresolved design decisions and non-empty
+non-goals, dependency notes, compatibility constraints, and rationale. A
+direct child records its handoff and implements from the approved parent phase
+without a duplicate plan review. A planning-required child records a planning
+handoff before any planning agent runs, then runs
+`agent-loop issue <child> --plan-first --plan-execution-mode auto`. Only after
+that child plan is reviewed may a one-shot child recommendation reach an
+implementation coder. If the child itself recommends a staged topology, the
+run stops for human handling under #720 before persisting nested topology work.
+
+The effective route is deterministic. A recorded handoff wins and is
+reconciled first. Without one, one valid signed override may select the route;
+otherwise the reviewed phase declaration is used. Missing legacy metadata or
+an unsupported topology source fails closed to child planning. Direct routing
+always reuses the reviewed parent phase's readiness evidence—override metadata
+cannot supply it. Human-owned stages remain a stop. Plain issue mode cannot
+switch a planning route, and `--plan-first` cannot switch a direct route.
+
+Signed overrides are durable JSON records in a comment signed by a human
+reviewer. They identify the parent issue, approved plan hash, stable stage ID,
+new disposition, and rationale. Discovery first rejects misaddressed or
+out-of-topology records, then scopes, deduplicates, and conflict-checks records
+for the routed stage. Conflicting records never use latest-wins ordering. The
+handoff stores the canonical record digest; every resume and PR validation
+must rediscover that exact record. Deleting, editing, adding after dispatch, or
+superseding an applied record causes a fail-closed human-repair stop.
+
+PR provenance follows the reconciled route. A direct child's PR binds to the
+approved parent phase plan hash. A child-planned PR binds to the child's own
+reviewed plan hash while retaining and validating its parent identity,
+decomposition summary, and inherited risk-matrix obligations. Reruns reuse the
+checkpoint, handoff, child plan, implementation handoff, and canonical PR, so
+the route cannot change because context was truncated or the command was run
+again.
+
 ### Risk-based mode and transition matrices
 
 For planning work involving multiple modes, lifecycle transitions,

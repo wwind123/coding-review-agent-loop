@@ -90,6 +90,9 @@ def test_fresh_plan_prompts_show_the_exact_one_shot_contract_shape(tmp_path):
         assert '"retained_parent_work": {"status": "none"' in prompt
         assert '"final_integration_work": {"status": "none"' in prompt
         assert "Do not include non-empty top-level legacy" in prompt
+        assert "Every child stage must declare a reviewed disposition" in prompt
+        assert "`direct-implementation` or `requires-child-planning`" in prompt
+        assert "`human-action` and `manual-close` use `human-owned`" in prompt
     assert "omit child stages" not in initial.lower()
 
 

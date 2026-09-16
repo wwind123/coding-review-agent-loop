@@ -60,6 +60,19 @@ def test_local_agent_loop_doc_has_decision_heading_and_table():
     assert "`--materialize-split-issues`" in text
 
 
+def test_docs_explain_reviewed_child_execution_dispositions():
+    local = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    for text in (local, readme, architecture):
+        assert "direct-implementation" in text
+        assert "requires-child-planning" in text
+        assert "planner" in text.lower()
+        assert "review" in text.lower()
+    assert "override metadata\ncannot supply it" in local
+    assert "reviewed child plan" in architecture
+
+
 def test_local_agent_loop_doc_warns_about_combining_mechanisms():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     section_start = text.index(f"### {HEADING_TEXT}")

@@ -1813,6 +1813,16 @@ unknown, uncovered, or split scope IDs and any mismatch between strategy and
 conditional delivery fields. This recommendation does not select the current
 execution mode or change issue count in Stage 1.
 
+For every child stage, review the planner's semantic execution disposition as
+part of the implementation contract. Approve `direct-implementation` only
+when the stage has no unresolved design decisions and its deliverables,
+non-goals, dependencies, compatibility constraints, and acceptance criteria
+are complete enough to implement without another planning round. Approve
+`requires-child-planning` when the child needs its own reviewed plan, and
+`human-owned` only for `human-action` or `manual-close`. The orchestrator
+checks typed fields, consistency, and provenance; it does not infer semantic
+readiness from issue size, file count, or prose.
+
 For an applicable risk-based mode/transition matrix, check meaningful
 combinations, contradictory outcomes, important exclusions, owner allocation,
 and whether each proposed test can reach the intended workflow transition.
@@ -1843,7 +1853,9 @@ exactly `{constraint_id, scope_item_ids, rationale}`. Allocations are exactly
 `{status, deliverables, acceptance_criteria, covered_scope_item_ids}`; child
 stages are exactly `{stage_id, position, title, summary, deliverables,
 non_goals, acceptance_criteria, depends_on_stage_ids, dependency_notes,
-automation, rollout_risk, compatibility_constraints, covered_scope_item_ids}`.
+automation, rollout_risk, compatibility_constraints, covered_scope_item_ids,
+execution_disposition}`. The disposition object has exactly
+`{disposition, rationale, unresolved_design_decisions}`.
 
 For one-shot, set `child_stages` to an empty array, use a delivery covering
 every scope-item ID exactly once, and set retained-parent and final-integration
@@ -1855,7 +1867,15 @@ keep coupling groups together, and provide at least two real allocations. A
 single child with no retained or final work is invalid; recommend one-shot.
 `none` allocations have three empty arrays; `required` allocations have all
 three arrays non-empty. Automation is exactly `agent-pr`, `human-action`, or
-`manual-close`. Preserve issue references and tracker actions in existing
+`manual-close`. Every child stage must declare a reviewed disposition:
+`agent-pr` uses `direct-implementation` or `requires-child-planning`, while
+`human-action` and `manual-close` use `human-owned`. Direct implementation
+requires an empty `unresolved_design_decisions` list and non-empty `non_goals`,
+`compatibility_constraints`, `dependency_notes`, and disposition `rationale`.
+Planning-required children may retain unresolved decisions but still require a
+non-empty rationale. The planner makes this semantic recommendation, plan
+reviewers approve or block it, and the orchestrator validates typed fields,
+consistency, and approved-parent provenance. Preserve issue references and tracker actions in existing
 non-child typed categories. Do not include non-empty top-level legacy
 `child_stages` in a v1 response: a versioned response has exactly one
 reviewed topology. The enriched v1 stages under `execution_recommendation`

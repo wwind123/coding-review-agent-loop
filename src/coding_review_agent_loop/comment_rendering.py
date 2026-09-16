@@ -811,6 +811,25 @@ def render_execution_recommendation_section(
                     ),
                 ]
             )
+            # Rendered only when declared so canonical text of plans approved
+            # before the disposition contract (#808) is unchanged.
+            if stage.execution_disposition is not None:
+                disposition = stage.execution_disposition
+                lines.extend(
+                    [
+                        "  - `execution_disposition`:",
+                        f"    - `disposition`: `{sanitize_historical_text(disposition.disposition)}`",
+                        f"    - `rationale`: {sanitize_historical_text(disposition.rationale)}",
+                        "    - `unresolved_design_decisions`:",
+                        *(
+                            [
+                                f"      - {sanitize_historical_text(value)}"
+                                for value in disposition.unresolved_design_decisions
+                            ]
+                            or ["      - None"]
+                        ),
+                    ]
+                )
     else:
         lines.append("- None")
 

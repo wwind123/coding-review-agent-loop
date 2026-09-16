@@ -401,7 +401,7 @@ Plan-first mode supports five post-approval choices:
 | `implement-one-shot` | Implement the approved plan in one PR. |
 | `decompose-only` | Create detailed child issues for the approved phases and stop. |
 | `implement-by-phase` | Create the phase issues and implement only the first phase. |
-| `auto` | After approval, select one-shot or by-phase from the reviewed recommendation. |
+| `auto` | After approval, select one-shot or by-phase, then route each staged child from its reviewed disposition. |
 
 Example:
 
@@ -419,6 +419,17 @@ work. `auto` cannot be combined with either `--materialize-split-issues` or
 `--split-stage`, because its topology is unknown until approval. Read
 [Phased decomposition versus split materialization](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization)
 before filing child issues.
+
+For fresh staged plans, the planner declares each child as
+`direct-implementation`, `requires-child-planning`, or `human-owned`, and plan
+reviewers approve or block that semantic choice. The orchestrator checks typed
+readiness fields and approved-parent provenance; it does not infer readiness
+from issue size or file count. A direct child uses the parent stage contract
+without duplicate planning. A planning-required child records its route first,
+then must run with `--plan-first` and complete its own reviewed plan before
+implementation. Recorded routes survive reruns and cannot be switched with CLI
+flags. See the detailed
+[child execution disposition contract](docs/local_agent_loop.md#child-execution-dispositions).
 
 ### Approved follow-up dedupe
 
