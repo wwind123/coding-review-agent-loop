@@ -173,11 +173,16 @@ def test_managed_invocation_parses_absolute_entrypoint_and_module_forms(tmp_path
 
 
 def test_managed_command_parses_supported_execution_prefixes():
-    parsed = runtime.parse_managed_test_command([
+    command = [
         "MODE=inline", "timeout", "1800", "env", "-u", "AGENT_LOOP_INVOCATION_ID",
         "/opt/agent-loop", "run-tests", "--memory-dir", "/tmp/cache", "--",
         "python3", "-m", "pytest", "tests/test_protocol.py", "-q",
-    ])
+    ]
+    traversal = runtime.managed_wrapper_traversal(command)
+    assert traversal.effective_head_index == 6
+    assert traversal.program_positions == {1, 3, 6}
+
+    parsed = runtime.parse_managed_test_command(command)
     assert parsed is not None
     assert parsed.inner_argv == (
         "python3", "-m", "pytest", "tests/test_protocol.py", "-q"

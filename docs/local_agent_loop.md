@@ -3141,7 +3141,8 @@ alone suppress a command. The finite foreground watchdog, containment,
 assigned-cwd checks, and operator configuration remain in force.
 
 Managed-wrapper recognition also traverses supported execution prefixes, using
-the same command-head parser as ordinary reports. Examples include
+the canonical managed-wrapper traversal shared by receipt citations and report
+validation. Examples include
 `env -u AGENT_LOOP_INVOCATION_ID /absolute/agent-loop run-tests -- pytest` and
 `pwd && timeout 1800 env MODE=inline /absolute/agent-loop run-tests -- pytest`.
 The conservative prefix contract supports `env` unsets/assignments/empty

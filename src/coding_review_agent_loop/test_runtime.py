@@ -212,6 +212,15 @@ class ManagedTestInvocation:
 
 
 @dataclass(frozen=True)
+class ManagedWrapperTraversal:
+    """The wrapper traversal result shared by managed and report parsing."""
+
+    recognized_prefix: bool
+    program_positions: set[int]
+    effective_head_index: int | None
+
+
+@dataclass(frozen=True)
 class RuntimeRecommendation:
     command: str
     fingerprint: str
@@ -514,9 +523,11 @@ def _consume_managed_execution_prefix_options(
     return index
 
 
-def _managed_execution_prefix_head(tokens: Sequence[str]) -> int | None:
-    """Find the exact-command suffix after transparent shell execution prefixes."""
+def managed_wrapper_traversal(tokens: Sequence[str]) -> ManagedWrapperTraversal:
+    """Traverse supported execution prefixes before a managed test command."""
+    positions: set[int] = set()
     index = 0
+    recognized_prefix = False
     assignments_allowed = True
     while index < len(tokens):
         if _MANAGED_EXECUTION_ASSIGNMENT_RE.match(tokens[index]) and assignments_allowed:
@@ -524,19 +535,22 @@ def _managed_execution_prefix_head(tokens: Sequence[str]) -> int | None:
             continue
         wrapper = tokens[index].rsplit("/", 1)[-1]
         if wrapper not in _MANAGED_EXECUTION_PREFIXES:
-            return index
+            positions.add(index)
+            return ManagedWrapperTraversal(recognized_prefix, positions, index)
+        recognized_prefix = True
+        positions.add(index)
         next_index = _consume_managed_execution_prefix_options(tokens, index + 1, wrapper)
         if next_index is None:
-            return None
+            return ManagedWrapperTraversal(True, positions, None)
         if wrapper == "timeout":
             if next_index >= len(tokens) or not _managed_prefix_timeout_duration(tokens[next_index]):
-                return None
+                return ManagedWrapperTraversal(True, positions, None)
             next_index += 1
         if next_index >= len(tokens):
-            return None
+            return ManagedWrapperTraversal(True, positions, None)
         index = next_index
         assignments_allowed = wrapper == "env"
-    return None
+    return ManagedWrapperTraversal(recognized_prefix, positions, None)
 
 
 def parse_managed_test_command(argv: Sequence[str]) -> ManagedTestInvocation | None:
@@ -547,7 +561,7 @@ def parse_managed_test_command(argv: Sequence[str]) -> ManagedTestInvocation | N
     applied to the remaining launcher and its options.
     """
     tokens = tuple(str(item) for item in argv)
-    prefix_head = _managed_execution_prefix_head(tokens)
+    prefix_head = managed_wrapper_traversal(tokens).effective_head_index
     if prefix_head is None:
         return None
     return parse_managed_test_invocation(tokens[prefix_head:])
