@@ -211,10 +211,129 @@ def test_findings_are_namespaced_by_run_and_marginal_rows_are_not_applicable_wit
     assert hypothetical["marginal_findings_beyond_primary"]["status"] == "verified"
 
 
+def test_missing_severity_on_valid_marginal_finding_makes_weighted_row_unavailable():
+    report = evaluate_frozen_artifacts(
+        {
+            "schema_version": 1,
+            "runs": [
+                _run(findings=[
+                    {"id": "primary-finding", "severity": "high", "valid": True, "contributors": ["primary"]},
+                    {"id": "weighted", "severity": "low", "valid": True, "contributors": ["secondary"]},
+                    # A serious finding whose severity label is absent must not
+                    # silently weigh zero and vanish from the comparison.
+                    {"id": "unlabeled-severity", "valid": True, "contributors": ["secondary"]},
+                ]),
+            ],
+        }
+    )["policies"]["primary-then-panel"]
+    # Unique and marginal coverage do not depend on severity and stay verified.
+    assert report["valid_unique_findings"] == {"value": 3, "status": "verified"}
+    assert report["marginal_findings_beyond_primary"]["status"] == "verified"
+    assert report["marginal_findings_beyond_primary"]["value"] == {
+        "secondary": ["r1:unlabeled-severity", "r1:weighted"],
+    }
+    weighted = report["severity_weighted_marginal_findings"]
+    assert weighted["status"] == "unavailable"
+    assert weighted["value"] is None
+    assert "r1:unlabeled-severity" in weighted["reason"]
+    assert weighted["unweighted_findings"] == 1
+    assert "severity-weighted marginal findings: unavailable" in render_evaluation_report(
+        {"policies": {"primary-then-panel": report}}, human=True
+    )
+
+    # A missing severity on an invalid or primary-covered finding never enters
+    # the weighted sum, so the weighted row stays verified.
+    unaffected = evaluate_frozen_artifacts(
+        {
+            "schema_version": 1,
+            "runs": [
+                _run(findings=[
+                    {"id": "primary-finding", "valid": True, "contributors": ["primary"]},
+                    {"id": "withdrawn", "valid": False, "contributors": ["secondary"]},
+                    {"id": "panel-finding", "severity": "critical", "valid": True, "contributors": ["secondary"]},
+                ]),
+            ],
+        }
+    )["policies"]["primary-then-panel"]
+    assert unaffected["severity_weighted_marginal_findings"] == {"status": "verified", "value": {"secondary": 5}}
+
+
+@pytest.mark.parametrize("severity", ["blocker", "", "  ", "HIGHEST", 3, True, ["high"]])
+def test_unknown_severity_on_a_finding_fails_closed_instead_of_weighing_zero(tmp_path, severity):
+    run = _run(findings=[
+        {"id": "primary-finding", "severity": "high", "valid": True, "contributors": ["primary"]},
+        {"id": "odd", "severity": severity, "valid": True, "contributors": ["secondary"]},
+    ])
+    path = tmp_path / "runs.json"
+    path.write_text(json.dumps({"schema_version": 1, "runs": [run]}), encoding="utf-8")
+    with pytest.raises(AgentLoopError, match="severity"):
+        load_frozen_artifacts(path)
+    # Direct evaluation of an unvalidated artifact fails the same way rather
+    # than publishing a verified weighted row that omits the finding.
+    with pytest.raises(AgentLoopError, match="severity"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [run]})
+
+
+def test_severity_labels_are_case_insensitive_and_weighted_after_validation(tmp_path):
+    path = tmp_path / "runs.json"
+    path.write_text(
+        json.dumps({"schema_version": 1, "runs": [_run(findings=[
+            {"id": "primary-finding", "severity": "High", "valid": True, "contributors": ["primary"]},
+            {"id": "panel-finding", "severity": " CRITICAL ", "valid": True, "contributors": ["secondary"]},
+        ])]}),
+        encoding="utf-8",
+    )
+    loaded = load_frozen_artifacts(path)
+    assert [finding["severity"] for finding in loaded["runs"][0]["findings"]] == ["high", "critical"]
+    row = evaluate_frozen_artifacts(loaded)["policies"]["primary-then-panel"]
+    assert row["severity_weighted_marginal_findings"] == {"status": "verified", "value": {"secondary": 5}}
+
+
+def test_duplicate_run_identity_within_a_policy_is_rejected_not_collapsed(tmp_path):
+    first = _run(run_id="pr-1", findings=[
+        {"id": "finding-1", "severity": "high", "valid": True, "contributors": ["primary"]},
+    ])
+    second = _run(run_id="pr-1", findings=[
+        {"id": "finding-1", "severity": "critical", "valid": True, "contributors": ["secondary"]},
+    ])
+    path = tmp_path / "runs.json"
+    path.write_text(json.dumps({"schema_version": 1, "runs": [first, second]}), encoding="utf-8")
+    with pytest.raises(AgentLoopError, match="repeat run ID 'pr-1' for policy 'primary-then-panel'"):
+        load_frozen_artifacts(path)
+    # The evaluator itself refuses the collision even when validation is
+    # bypassed, so the two distinct findings can never be collapsed into one.
+    with pytest.raises(AgentLoopError, match="repeat run ID"):
+        evaluate_frozen_artifacts({"schema_version": 1, "runs": [first, second]})
+
+    # Distinct run IDs for the same records keep both findings visible.
+    distinct = evaluate_frozen_artifacts(
+        {"schema_version": 1, "runs": [first, dict(second, run_id="pr-2")]}
+    )["policies"]["primary-then-panel"]
+    assert distinct["valid_unique_findings"] == {"value": 2, "status": "verified"}
+    assert distinct["marginal_findings_beyond_primary"]["value"] == {"secondary": ["pr-2:finding-1"]}
+    assert distinct["severity_weighted_marginal_findings"] == {"status": "verified", "value": {"secondary": 5}}
+
+    # The same run ID under a different policy is a different namespace, not a
+    # duplicate: policies are compared independently.
+    cross_policy = evaluate_frozen_artifacts(
+        {"schema_version": 1, "runs": [first, dict(second, policy="all-reviewers")]}
+    )
+    assert cross_policy["policies"]["primary-then-panel"]["valid_unique_findings"]["value"] == 1
+    assert cross_policy["policies"]["all-reviewers"]["valid_unique_findings"]["value"] == 1
+
+    # Omitted run IDs default to the record index and therefore stay unique.
+    indexed = [dict(_run(), run_id=None) for _ in range(2)]
+    for run in indexed:
+        del run["run_id"]
+    path.write_text(json.dumps({"schema_version": 1, "runs": indexed}), encoding="utf-8")
+    assert [run["run_id"] for run in load_frozen_artifacts(path)["runs"]] == ["1", "2"]
+
+
 @pytest.mark.parametrize(
     "overrides, message",
     [
         ({"findings": [{"id": "dup", "valid": True}, {"id": "dup", "valid": True}]}, "repeats finding ID"),
+        ({"findings": [{"id": "x", "severity": "urgent", "valid": True}]}, "unsupported severity"),
         ({"findings": [{"id": "x", "valid": "yes"}]}, "valid label must be boolean"),
         ({"primary_reviewer": None}, "without a primary_reviewer"),
         ({"provenance": {"source": "", "verified": True}}, "non-empty source"),

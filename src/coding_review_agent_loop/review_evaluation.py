@@ -118,6 +118,44 @@ def _is_verified(provenance: Mapping[str, object] | None) -> bool:
     return provenance is not None and provenance.get("verified") is True
 
 
+def _severity(value: object, label: str) -> str | None:
+    """Return a canonical severity label, ``None`` when absent, or fail closed.
+
+    A severity outside ``SEVERITY_WEIGHTS`` is rejected rather than silently
+    weighted as zero, which would erase a serious finding from the
+    severity-weighted comparison.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise AgentLoopError(f"Frozen evaluation finding {label} severity must be a non-empty string or null.")
+    severity = value.strip().lower()
+    if severity not in SEVERITY_WEIGHTS:
+        raise AgentLoopError(
+            f"Frozen evaluation finding {label} has unsupported severity {value!r}; "
+            f"expected one of: {', '.join(SEVERITY_WEIGHTS)}."
+        )
+    return severity
+
+
+def _reject_duplicate_runs(runs: list[Mapping[str, object]]) -> None:
+    """Fail closed when two records share a policy and run ID.
+
+    Findings are namespaced by ``(run_id, finding_id)`` within a policy, so a
+    repeated run identity would silently collapse distinct findings and
+    undercount coverage.
+    """
+    seen: set[tuple[str, str]] = set()
+    for run in runs:
+        key = (str(run.get("policy")), str(run.get("run_id")))
+        if key in seen:
+            raise AgentLoopError(
+                f"Frozen evaluation artifacts repeat run ID {key[1]!r} for policy {key[0]!r}; "
+                "run identities must be unique within a policy."
+            )
+        seen.add(key)
+
+
 def _validate_run(run: object, index: int) -> dict[str, object]:
     if not isinstance(run, dict):
         raise AgentLoopError(f"Frozen evaluation run {index} must be an object.")
@@ -153,7 +191,8 @@ def _validate_run(run: object, index: int) -> dict[str, object]:
             {
                 "id": finding_id,
                 "contributors": list(_finding_contributors(finding)),
-                "severity": finding.get("severity") if isinstance(finding.get("severity"), str) else None,
+                # ``None`` means no severity label; it is never weighted as zero.
+                "severity": _severity(finding.get("severity"), f"{run_id}/{finding_id}"),
                 # ``None`` means unlabeled: never inferred as valid.
                 "valid": valid,
             }
@@ -198,7 +237,9 @@ def load_frozen_artifacts(path: str | Path) -> dict[str, object]:
     runs = payload.get("runs")
     if not isinstance(runs, list):
         raise AgentLoopError("Frozen evaluation artifacts require a runs array.")
-    return {"schema_version": 1, "runs": [_validate_run(run, index) for index, run in enumerate(runs)]}
+    validated = [_validate_run(run, index) for index, run in enumerate(runs)]
+    _reject_duplicate_runs(validated)
+    return {"schema_version": 1, "runs": validated}
 
 
 def _unavailable(reason: str | None = None) -> dict[str, object]:
@@ -240,6 +281,7 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
     runs = artifacts.get("runs")
     if not isinstance(runs, list):
         raise AgentLoopError("Validated frozen artifacts require a runs array.")
+    _reject_duplicate_runs([run for run in runs if isinstance(run, dict)])
     canonical = json.dumps(dict(artifacts), separators=(",", ":"), sort_keys=True, ensure_ascii=False)
     report: dict[str, object] = {
         "schema_version": 1,
@@ -254,6 +296,7 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
         valid_finding_keys: set[tuple[str, str]] = set()
         primary_covered: set[tuple[str, str]] = set()
         unlabeled_findings = 0
+        unweighted_findings: list[str] = []
         unverified_label_runs: list[str] = []
         runs_with_primary = 0
         for run in policy_runs:
@@ -280,11 +323,15 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
                 valid_finding_keys.add(key)
                 if isinstance(primary, str) and primary in contributors:
                     primary_covered.add(key)
-                weight = SEVERITY_WEIGHTS.get(str(finding.get("severity")).lower(), 0)
+                severity = _severity(finding.get("severity"), f"{run_id}/{finding_id}")
+                if severity is None and key not in primary_covered:
+                    # Only marginal findings enter the weighted sum; a missing
+                    # severity on one of them makes the sum unavailable.
+                    unweighted_findings.append(f"{run_id}:{finding_id}")
                 for reviewer in contributors:
                     finding_by_reviewer[reviewer].add(key)
-                    if key not in primary_covered:
-                        weighted_by_reviewer[reviewer] += weight
+                    if key not in primary_covered and severity is not None:
+                        weighted_by_reviewer[reviewer] += SEVERITY_WEIGHTS[severity]
         labels_verified = bool(policy_runs) and not unverified_label_runs and unlabeled_findings == 0
         coverage_reason = None
         if not policy_runs:
@@ -324,14 +371,22 @@ def evaluate_frozen_artifacts(artifacts: Mapping[str, object]) -> dict[str, obje
                     if keys - primary_covered
                 },
             }
-            weighted = {
-                "status": "verified",
-                "value": {
-                    reviewer: weight
-                    for reviewer, weight in sorted(weighted_by_reviewer.items())
-                    if weight
-                },
-            }
+            if unweighted_findings:
+                # A valid finding without a severity label cannot be weighted;
+                # reporting a partial sum as verified would hide it.
+                weighted = _unavailable(
+                    "valid finding(s) have no severity label: " + ", ".join(sorted(unweighted_findings))
+                )
+                weighted["unweighted_findings"] = len(unweighted_findings)
+            else:
+                weighted = {
+                    "status": "verified",
+                    "value": {
+                        reviewer: weight
+                        for reviewer, weight in sorted(weighted_by_reviewer.items())
+                        if weight
+                    },
+                }
         metric_rows: dict[str, object] = {}
         for key in _METRIC_KEYS:
             if not policy_runs:

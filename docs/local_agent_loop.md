@@ -1231,8 +1231,14 @@ per-metric overrides in `metric_provenance`. Every finding must carry an
 explicit boolean `valid` label. A measurement is reported as `verified` only
 when its provenance is verified; unlabeled findings, missing provenance, or
 `verified: false` are reported as `unavailable` with a reason rather than
-estimated. Finding IDs are namespaced by run, so identical IDs across runs never
-collide. Marginal-beyond-primary rows are `not-applicable` for policies whose
+estimated. Finding `severity` labels must be one of `critical`, `high`,
+`medium`, `low`, or `info` (case-insensitive); any other label is rejected at
+load time rather than silently weighted as zero, and a valid finding with no
+severity label makes the severity-weighted row `unavailable`, naming the
+finding, instead of dropping it from the comparison. Finding IDs are namespaced
+by run, so identical IDs across runs never collide; two records with the same
+`policy` and `run_id` are rejected so distinct findings can never be collapsed
+into one. Marginal-beyond-primary rows are `not-applicable` for policies whose
 runs declare no primary; a historical full-board run may declare a hypothetical
 `primary_reviewer` to measure what the other reviewers would have added. Runs
 using `primary-then-panel` must declare their primary. Primary-to-panel
