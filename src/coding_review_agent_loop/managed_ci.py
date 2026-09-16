@@ -1697,13 +1697,18 @@ def publish_issue_created_continuity_authorization(
             "Managed-CI head continuity found conflicting prior authorizations for the predecessor head; refusing to proceed."
         )
     predecessor_comment_id, predecessor = sorted(predecessor_records, key=lambda item: item[0])[-1]
+    predecessor_comment_ids = {
+        comment_id
+        for comment_id, record in predecessor_records
+        if record == predecessor
+    }
     predecessor_children = [
         record
         for _comment_id, record in records
         if (
             record.kind == "continuity"
             and record.predecessor_head == predecessor_head
-            and record.predecessor_comment_id == predecessor_comment_id
+            and record.predecessor_comment_id in predecessor_comment_ids
         )
     ]
     if any(record.head_sha != new_head for record in predecessor_children):
@@ -1760,7 +1765,7 @@ def publish_issue_created_continuity_authorization(
         and record.base_ref == handoff.base_ref
         and record.head_sha == new_head
         and record.predecessor_head == predecessor_head
-        and record.predecessor_comment_id == predecessor_comment_id
+        and record.predecessor_comment_id in predecessor_comment_ids
         and record.round_comment_ids == normalized_round_comment_ids
         and record.actor_login.casefold() == handoff.trusted_actor_login.casefold()
         and record.actor_id == handoff.trusted_actor_id
@@ -1900,6 +1905,30 @@ def _managed_label_event_history(
         ):
             candidates.append((event_id, login, identity))
     return sorted(candidates, key=lambda item: item[0])
+
+
+def _timeline_source_repository(source_issue: dict[str, object]) -> str | None:
+    """Return the repository identity GitHub attached to a timeline issue."""
+    repository = source_issue.get("repository")
+    if isinstance(repository, dict):
+        full_name = repository.get("full_name")
+        if isinstance(full_name, str) and full_name:
+            return full_name
+
+    repository_url = source_issue.get("repository_url")
+    if not isinstance(repository_url, str) or not repository_url:
+        return None
+    parts = [part for part in urlparse(repository_url).path.split("/") if part]
+    try:
+        repos_index = next(index for index, part in enumerate(parts) if part.casefold() == "repos")
+    except StopIteration:
+        return None
+    if repos_index + 2 >= len(parts):
+        return None
+    owner, name = parts[repos_index + 1:repos_index + 3]
+    if not owner or not name:
+        return None
+    return f"{owner}/{name}"
 
 
 def authorize_fresh_issue_created_resume(
@@ -2100,6 +2129,10 @@ def authorize_fresh_issue_created_resume(
                 timeline_event.get("event") == "cross-referenced"
                 and source_issue.get("number") == pr_number
                 and isinstance(source_issue.get("pull_request"), dict)
+                and (
+                    source_repository := _timeline_source_repository(source_issue)
+                ) is not None
+                and source_repository.casefold() == config.repo.casefold()
             ):
                 associated = True
                 break
@@ -3150,17 +3183,22 @@ def _find_resume_audit(
         by_head: dict[str, list[tuple[int, ManagedCiIssueAuthorization]]] = {}
         for comment_id, authorization in records:
             by_head.setdefault(authorization.head_sha, []).append((comment_id, authorization))
-        children_by_predecessor: dict[tuple[int, str], set[str]] = {}
+        # A retry may publish byte-equivalent copies of one authorization with
+        # different comment IDs.  Treat those IDs as aliases of one logical
+        # predecessor before checking outgoing edges; otherwise a fork can be
+        # hidden by putting each child on a different duplicate copy.
+        children_by_predecessor: dict[ManagedCiIssueAuthorization, set[str]] = {}
         for _comment_id, authorization in records:
             if (
                 authorization.kind == "continuity"
                 and authorization.predecessor_comment_id is not None
                 and authorization.predecessor_head is not None
             ):
-                children_by_predecessor.setdefault(
-                    (authorization.predecessor_comment_id, authorization.predecessor_head),
-                    set(),
-                ).add(authorization.head_sha)
+                predecessor = by_comment_id.get(authorization.predecessor_comment_id)
+                if predecessor is not None and predecessor.head_sha == authorization.predecessor_head:
+                    children_by_predecessor.setdefault(predecessor, set()).add(
+                        authorization.head_sha
+                    )
         if any(len(heads) > 1 for heads in children_by_predecessor.values()):
             return None
         terminal = by_head.get(live_head, [])

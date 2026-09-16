@@ -4544,6 +4544,7 @@ class _IssueRecoveryWorkflowRunner(FakeRunner):
                 "source": {
                     "issue": {
                         "number": 77,
+                        "repository_url": "https://api.github.test/repos/OWNER/REPO",
                         "pull_request": {"url": "https://api.github.test/pulls/77"},
                     }
                 },

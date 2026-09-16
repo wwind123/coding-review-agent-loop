@@ -226,7 +226,11 @@ class V2ManagedRunner(ManagedRunner):
         self.unreadable_issue_events_after_label = unreadable_issue_events_after_label
         self.issue_timeline = list(issue_timeline or [{
             "event": "cross-referenced",
-            "source": {"issue": {"number": 7, "pull_request": {"url": "https://api.github.test/pulls/7"}}},
+            "source": {"issue": {
+                "number": 7,
+                "repository_url": "https://api.github.test/repos/OWNER/REPO",
+                "pull_request": {"url": "https://api.github.test/pulls/7"},
+            }},
         }])
         self.compare_payload = compare_payload
         self.labels_posted = False
@@ -1142,6 +1146,65 @@ def test_continuity_publication_rejects_different_head_fork(tmp_path):
     )
 
 
+def test_continuity_fork_through_duplicate_predecessor_aliases_fails_closed(tmp_path):
+    root = ManagedCiIssueAuthorization(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
+        label_event_id=101,
+    )
+    first = ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="head-a", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="first",
+        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        round_comment_ids=(88, 89),
+    )
+    second = replace(
+        first, head_sha="head-b", nonce="second", predecessor_comment_id=42,
+        round_comment_ids=(90, 91),
+    )
+    comments = [
+        {"id": 41, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(root))},
+        {"id": 42, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(root))},
+        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="head-a", round_number=2),
+        {"id": 100, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(first))},
+        _round_comment(90, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(91, role="coder", subject="head-b", round_number=2),
+        {"id": 101, "user": {"login": "agent-loop", "id": 1},
+         "body": str(format_issue_created_authorization_comment(second))},
+    ]
+    runner = AuthorizationCommentRunner(
+        issue_events=[label_event()], intent_comments=comments,
+    )
+    runner.rest_pr["head"]["sha"] = "head-b"
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    with pytest.raises(AgentLoopError, match="forked predecessor"):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=_authorization_handoff(),
+            predecessor_head="abc123", new_head="head-b", round_comment_ids=(90, 91),
+        )
+
+    assert not any(
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in " ".join(command)
+        and "POST" in command
+        for command, _cwd in runner.commands
+    )
+    for live_head in ("head-a", "head-b"):
+        assert _find_resume_audit(
+            runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+            base_ref="main", issue_number=643, live_head=live_head,
+        ) is None
+
+
 def test_continuity_publication_rejects_missing_correlated_round_metadata(tmp_path):
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     config = make_config(
@@ -1723,6 +1786,36 @@ def test_fresh_authorization_rejects_missing_server_issue_association(tmp_path):
             runner, config=config, pr_number=7, issue_number=643,
             metadata=replace(metadata(), head_branch="agent-loop/managed-643", body="Fixes #643"),
         )
+
+
+def test_fresh_authorization_rejects_same_number_foreign_repository_association(tmp_path):
+    runner = AuthorizationCommentRunner(
+        issue_events=[label_event()],
+        issue_timeline=[{
+            "event": "cross-referenced",
+            "source": {"issue": {
+                "number": 7,
+                "repository_url": "https://api.github.com/repos/OTHER/REPO",
+                "pull_request": {"url": "https://api.github.com/repos/OTHER/REPO/pulls/7"},
+            }},
+        }],
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+
+    with pytest.raises(AgentLoopError, match="server-observed issue-to-PR association"):
+        authorize_fresh_issue_created_resume(
+            runner, config=config, pr_number=7, issue_number=643,
+            metadata=replace(metadata(), head_branch="agent-loop/managed-643", body="Fixes #643"),
+        )
+
+    assert not any(
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in " ".join(command)
+        and "POST" in command
+        for command, _cwd in runner.commands
+    )
 
 
 def test_creation_plus_fresh_at_same_head_selects_fresh_grant(tmp_path):
