@@ -966,3 +966,81 @@ def test_legacy_coder_checkpoint_recovers_failed_head_from_scheduler_provenance(
     assert record.authority == MACHINE_AUTHORITY
     assert record.obligation_kind == "managed-exact-head-ci"
     assert record.failed_head_sha == "oldhead123"
+
+
+def test_staged_scheduler_phase_fields_roundtrip_and_fail_closed_when_contradictory() -> None:
+    contract = ReviewSchedulingContract(
+        required_reviewers=("Codex", "Gemini"),
+        policy="primary-then-panel",
+        primary_reviewer="Codex",
+        broad_rules=("src/**",),
+    )
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="summary",
+        agent="Orchestrator",
+        round_number=2,
+        subject="newhead123",
+        scheduler_contract=contract.as_dict(),
+        scheduler_previous_sha="oldhead123",
+        scheduler_current_sha="newhead123",
+        scheduler_obligation_digest="0123456789abcdef",
+        scheduler_selected_reviewers=("Gemini",),
+        scheduler_paused_reviewers=(("Codex", "qualifying exact-head approval carried"),),
+        scheduler_reasons=("independent secondary audit",),
+        scheduler_final_sweep=False,
+        scheduler_force_full=True,
+        scheduler_calls_avoided=1,
+        scheduler_phase="secondary-audit",
+        scheduler_primary_reviewer="Codex",
+        scheduler_approved_reviewers=("Codex",),
+        scheduler_active_owners=(),
+        scheduler_scope_digest="fedcba9876543210",
+    )
+    payload = transport.decode_mapping(_encode_round_metadata(metadata))
+    decoded = _decode_round_metadata_mapping(payload)
+    assert decoded.scheduler_metadata_status == "valid"
+    assert decoded.scheduler_phase == "secondary-audit"
+    assert decoded.scheduler_primary_reviewer == "Codex"
+    assert decoded.scheduler_approved_reviewers == ("Codex",)
+    assert decoded.scheduler_force_full is True
+    assert decoded.scheduler_scope_digest == "fedcba9876543210"
+
+    # Malformed new authority fails closed: the record is invalid, not legacy.
+    for key, bad in (
+        ("scheduler_phase", "panel"),
+        ("scheduler_primary_reviewer", "Gemini"),
+        ("scheduler_approved_reviewers", ["Claude"]),
+        ("scheduler_approved_reviewers", ["Codex", "Codex"]),
+        ("scheduler_active_owners", [""]),
+        ("scheduler_scope_digest", "not-hex"),
+    ):
+        contradictory = _decode_round_metadata_mapping({**payload, key: bad})
+        assert contradictory.scheduler_metadata_status == "invalid", key
+        assert contradictory.scheduler_contract is None, key
+
+    # Legacy records without the phase fields remain valid with no phase authority.
+    legacy = {
+        key: value
+        for key, value in payload.items()
+        if key not in {
+            "scheduler_phase",
+            "scheduler_primary_reviewer",
+            "scheduler_approved_reviewers",
+            "scheduler_active_owners",
+            "scheduler_scope_digest",
+        }
+    }
+    legacy["scheduler_contract"] = {**contract.as_dict(), "policy": "selective-intermediate", "primary_reviewer": None}
+    legacy_decoded = _decode_round_metadata_mapping(legacy)
+    assert legacy_decoded.scheduler_metadata_status == "valid"
+    assert legacy_decoded.scheduler_phase is None
+    assert legacy_decoded.scheduler_primary_reviewer is None
+    # Only auxiliary keys without the mandatory core is a partial record.
+    partial = _decode_round_metadata_mapping(
+        {
+            "flow": "pr", "role": "summary", "agent": "Orchestrator",
+            "round_number": 2, "subject": "newhead123", "scheduler_phase": "primary",
+        }
+    )
+    assert partial.scheduler_metadata_status == "invalid"

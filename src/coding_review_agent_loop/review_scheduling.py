@@ -1,4 +1,4 @@
-"""Pure scheduling and diff classification for selective PR re-review.
+"""Pure scheduling and diff classification for staged PR re-review.
 
 The selective policy is intentionally conservative.  This module contains no
 GitHub or agent calls so the decision can be unit tested and replayed from the
@@ -22,7 +22,82 @@ MAX_FIX_SCOPE_ENTRIES = 32
 MAX_FIX_SCOPE_PATH_BYTES = 240
 MAX_FIX_SCOPE_BYTES = 4096
 
-PR_REVIEW_POLICIES = frozenset({"all-reviewers", "selective-intermediate"})
+PR_REVIEW_POLICIES = frozenset(
+    {"all-reviewers", "selective-intermediate", "primary-then-panel"}
+)
+
+SCHEDULER_PHASES = frozenset(
+    {
+        "full-board",
+        "primary",
+        "secondary-audit",
+        "remediation",
+        "final-secondary-sweep",
+    }
+)
+
+# Once any of these phases has been checkpointed, the secondary panel has been
+# (or is being) opened.  A later reduced selection is a remediation/sweep, and
+# an unsafe transition must reactivate the complete board.
+PANEL_OPENED_PHASES = frozenset(
+    {"full-board", "secondary-audit", "remediation", "final-secondary-sweep"}
+)
+
+
+@dataclass(frozen=True)
+class ReviewPolicyCapabilities:
+    """Named scheduler capabilities shared by every orchestration safety gate.
+
+    Keeping these properties explicit avoids making unrelated behavior depend on
+    one policy-name equality check.  The all-reviewers policy deliberately has
+    no scheduler optimization, while both opt-in policies use the same durable
+    ownership, resume, and exact-head safety boundaries.
+    """
+
+    scheduler_enabled: bool
+    owner_scoped_reconciliation: bool
+    selective_pausing: bool
+    phase_aware: bool
+    counts_avoided_calls: bool
+    requires_primary: bool = False
+    # When metadata recovery forces the complete board, the staged policy
+    # latches that decision durably for the rest of the run and every resume.
+    # The selective policy keeps its historical single-decision override.
+    recovery_latches_force_full: bool = False
+
+
+def policy_capabilities(policy: str) -> ReviewPolicyCapabilities:
+    if policy == "all-reviewers":
+        return ReviewPolicyCapabilities(
+            scheduler_enabled=False,
+            owner_scoped_reconciliation=False,
+            selective_pausing=False,
+            phase_aware=False,
+            counts_avoided_calls=False,
+        )
+    if policy == "selective-intermediate":
+        return ReviewPolicyCapabilities(
+            scheduler_enabled=True,
+            owner_scoped_reconciliation=True,
+            selective_pausing=True,
+            phase_aware=False,
+            counts_avoided_calls=True,
+        )
+    if policy == "primary-then-panel":
+        return ReviewPolicyCapabilities(
+            scheduler_enabled=True,
+            owner_scoped_reconciliation=True,
+            selective_pausing=True,
+            phase_aware=True,
+            counts_avoided_calls=True,
+            requires_primary=True,
+            recovery_latches_force_full=True,
+        )
+    raise AgentLoopError(f"Unsupported PR review policy: {policy!r}.")
+
+
+# Descriptive alias for callers that prefer the longer name.
+review_policy_capabilities = policy_capabilities
 
 # These are patterns, rather than prose categories, so their interpretation is
 # stable across machines and can be bound into a persisted contract digest.
@@ -155,6 +230,7 @@ class ReviewSchedulingContract:
     policy: str = "all-reviewers"
     broad_rules: tuple[str, ...] = field(default_factory=lambda: DEFAULT_BROAD_RULES)
     broad_rules_digest: str | None = None
+    primary_reviewer: str | None = None
 
     def __post_init__(self) -> None:
         reviewers = tuple(self.required_reviewers)
@@ -164,13 +240,29 @@ class ReviewSchedulingContract:
             or len(set(reviewers)) != len(reviewers)
         ):
             raise AgentLoopError("Scheduler contract requires a unique reviewer set.")
-        if self.policy not in PR_REVIEW_POLICIES:
-            raise AgentLoopError(f"Unsupported PR review policy: {self.policy!r}.")
+        capabilities = policy_capabilities(self.policy)
+        primary = self.primary_reviewer
+        if primary is not None and (not isinstance(primary, str) or not primary):
+            raise AgentLoopError("Scheduler primary reviewer must be a non-empty string.")
+        if capabilities.requires_primary:
+            if len(reviewers) < 2:
+                raise AgentLoopError(
+                    "primary-then-panel requires one primary and at least one secondary reviewer."
+                )
+            if primary not in reviewers:
+                raise AgentLoopError(
+                    "primary-then-panel primary reviewer must be a member of the reviewer board."
+                )
+        elif primary is not None:
+            raise AgentLoopError(
+                "A primary reviewer may only be configured with primary-then-panel."
+            )
         rules = normalize_broad_rules(self.broad_rules)
         digest = broad_rules_digest(rules)
         if self.broad_rules_digest is not None and self.broad_rules_digest != digest:
             raise AgentLoopError("Scheduler broad-rule digest does not match its rules.")
         object.__setattr__(self, "required_reviewers", reviewers)
+        object.__setattr__(self, "primary_reviewer", primary)
         object.__setattr__(self, "broad_rules", rules)
         object.__setattr__(self, "broad_rules_digest", digest)
 
@@ -178,6 +270,7 @@ class ReviewSchedulingContract:
         return {
             "required_reviewers": list(self.required_reviewers),
             "policy": self.policy,
+            "primary_reviewer": self.primary_reviewer,
             "broad_rules": list(self.broad_rules),
             "broad_rules_digest": self.broad_rules_digest,
         }
@@ -189,16 +282,19 @@ class ReviewSchedulingContract:
         reviewers = value.get("required_reviewers")
         rules = value.get("broad_rules")
         policy = value.get("policy")
+        primary = value.get("primary_reviewer")
         if (
             not isinstance(reviewers, list)
             or not isinstance(rules, list)
             or any(not isinstance(item, str) or not item for item in reviewers)
             or not isinstance(policy, str)
+            or (primary is not None and not isinstance(primary, str))
         ):
             raise AgentLoopError("Incomplete scheduler contract.")
         return cls(
             required_reviewers=tuple(reviewers),
             policy=policy,
+            primary_reviewer=primary,
             broad_rules=tuple(rules),
             broad_rules_digest=(
                 str(value["broad_rules_digest"])
@@ -251,6 +347,7 @@ class SchedulerSnapshot:
     contract: ReviewSchedulingContract
     obligations: tuple[ReviewObligation, ...] = ()
     force_full: bool = False
+    phase: str | None = None
 
 
 @dataclass(frozen=True)
@@ -261,6 +358,9 @@ class SchedulingDecision:
     classification: TransitionClassification
     final_sweep: bool = False
     calls_avoided: int = 0
+    phase: str = "full-board"
+    primary_reviewer: str | None = None
+    active_owners: tuple[str, ...] = ()
 
 
 def _path_matches(path: str, pattern: str) -> bool:
@@ -351,21 +451,110 @@ def select_reviewers(
     qualifying_approvals: Sequence[str] = (),
     unavailable_reviewers: Sequence[str] = (),
     final_sweep: bool = False,
+    phase: str | None = None,
 ) -> SchedulingDecision:
     """Choose the board for one round; unavailable reviewers remain required."""
     required = snapshot.contract.required_reviewers
     unavailable = set(unavailable_reviewers)
     available_required = tuple(name for name in required if name not in unavailable)
     approvals = set(qualifying_approvals)
+    capabilities = policy_capabilities(snapshot.contract.policy)
+    primary = snapshot.contract.primary_reviewer
     if snapshot.contract.policy == "all-reviewers" or snapshot.force_full:
         selected = available_required
         reason = "compatibility policy" if snapshot.contract.policy == "all-reviewers" else "force-full latch"
+        selected_phase = "full-board"
+    elif capabilities.requires_primary:
+        # The selection is derived from exact-head approval evidence, the
+        # active obligation ledger, and the durable phase checkpoint.  The
+        # checkpoint only says whether the secondary panel has been opened;
+        # it can never bypass the primary gate or grant an approval.
+        checkpoint_phase = phase if phase is not None else snapshot.phase
+        if checkpoint_phase is not None and checkpoint_phase not in SCHEDULER_PHASES:
+            raise AgentLoopError(f"Unsupported scheduler phase checkpoint: {checkpoint_phase!r}.")
+        panel_opened = checkpoint_phase in PANEL_OPENED_PHASES
+        primary_approved = primary is not None and primary in approvals
+        active_obligations = tuple(
+            obligation for obligation in snapshot.obligations if obligation.active
+        )
+        pending_owner_set = {
+            owner for obligation in active_obligations for owner in obligation.pending_owners
+        }
+        secondary_owned = bool(pending_owner_set - {primary})
+        if active_obligations and not classification.narrow:
+            # Unsafe ownership, scope, history, or change classification with
+            # any active finding reactivates the complete board before the
+            # primary gate is consulted.
+            selected = available_required
+            selected_phase = "full-board"
+            reason = f"full board required: {classification.reason}"
+        elif panel_opened and not classification.narrow:
+            # Prior panel evidence exists on an older head and the transition
+            # is unsafe; every reviewer must see the complete current head.
+            selected = available_required
+            selected_phase = "full-board"
+            reason = f"full board required after panel evidence: {classification.reason}"
+        elif secondary_owned and not panel_opened:
+            # A secondary-owned finding without panel phase evidence is
+            # contradictory history; never guess ownership or scope.
+            selected = available_required
+            selected_phase = "full-board"
+            reason = "full board required: secondary-owned finding without panel phase evidence"
+        elif active_obligations and not panel_opened:
+            # Primary blocking loop: the primary rechecks its own findings on
+            # each narrow head until it approves the exact head.
+            selected = (
+                (primary,)
+                if primary in available_required and primary not in approvals
+                else ()
+            )
+            selected_phase = "primary"
+            reason = (
+                "primary phase: primary rechecks its findings before the secondary panel"
+            )
+        elif active_obligations:
+            owners = set(pending_owner_set)
+            owners.add(primary)
+            selected = tuple(
+                name for name in available_required
+                if name in owners and name not in approvals
+            )
+            selected_phase = "remediation"
+            reason = "narrow remediation: finding owners and primary must recheck"
+        elif not primary_approved:
+            selected = (primary,) if primary in available_required else ()
+            if panel_opened:
+                selected_phase = "remediation"
+                reason = (
+                    "remediation: exact-head primary approval is outstanding before the "
+                    "final secondary sweep"
+                )
+            else:
+                selected_phase = "primary"
+                reason = (
+                    "primary phase: exact-head primary approval is required before the "
+                    "secondary panel"
+                )
+        else:
+            selected = tuple(
+                name
+                for name in available_required
+                if name != primary and name not in approvals
+            )
+            if panel_opened:
+                selected_phase = "final-secondary-sweep"
+                reason = "final exact-head secondary sweep for missing approvals"
+            else:
+                selected_phase = "secondary-audit"
+                reason = "independent secondary audit after exact-head primary approval"
     elif final_sweep:
         selected = tuple(name for name in available_required if name not in approvals)
         reason = "final exact-head sweep for missing approvals"
+        selected_phase = "final-secondary-sweep"
     elif not classification.narrow:
         selected = available_required
         reason = f"full board required: {classification.reason}"
+        selected_phase = "full-board"
     else:
         owners = {
             owner
@@ -375,9 +564,11 @@ def select_reviewers(
         }
         selected = tuple(name for name in available_required if name in owners)
         reason = "narrow transition: pending resolution owners and co-owners"
+        selected_phase = "remediation"
         if not selected and available_required:
             selected = available_required
             reason = "narrow transition was not actionable without pending owners"
+            selected_phase = "full-board"
     selected_set = set(selected)
     paused: list[tuple[str, str]] = []
     for name in required:
@@ -389,6 +580,17 @@ def select_reviewers(
             pause_reason = "qualifying exact-head approval carried; no new turn needed"
         elif snapshot.contract.policy == "all-reviewers":
             pause_reason = "compatibility scheduling did not select this reviewer"
+        elif capabilities.requires_primary and selected_phase == "primary":
+            pause_reason = "primary phase; secondary panel waits for exact-head primary approval"
+        elif capabilities.requires_primary and selected_phase == "secondary-audit":
+            pause_reason = "secondary audit has not selected this already qualifying reviewer"
+        elif capabilities.requires_primary and selected_phase == "remediation":
+            pause_reason = (
+                "remediation did not identify this reviewer as an owner or primary; "
+                "an exact-head secondary sweep follows clearance"
+            )
+        elif capabilities.requires_primary and selected_phase == "final-secondary-sweep":
+            pause_reason = "final secondary sweep did not select this reviewer"
         elif final_sweep:
             pause_reason = "qualifying exact-head approval carry"
         elif not classification.narrow or snapshot.force_full:
@@ -397,7 +599,17 @@ def select_reviewers(
             pause_reason = "selective intermediate pause; no pending obligation ownership"
         paused.append((name, pause_reason))
     eligible = len(tuple(name for name in required if name not in approvals and name not in unavailable))
-    avoided = max(0, eligible - len(selected)) if snapshot.contract.policy == "selective-intermediate" and not final_sweep else 0
+    avoided = max(0, eligible - len(selected)) if capabilities.counts_avoided_calls else 0
+    active_owners = tuple(
+        sorted(
+            {
+                owner
+                for obligation in snapshot.obligations
+                if obligation.active
+                for owner in obligation.pending_owners
+            }
+        )
+    )
     return SchedulingDecision(
         selected_reviewers=selected,
         paused_reviewers=tuple(paused),
@@ -405,12 +617,21 @@ def select_reviewers(
         classification=classification,
         final_sweep=final_sweep,
         calls_avoided=avoided,
+        phase=selected_phase,
+        primary_reviewer=primary,
+        active_owners=active_owners,
     )
 
 
-def make_contract(required_reviewers: Sequence[str], policy: str, broad_rules: Sequence[str] | None = None) -> ReviewSchedulingContract:
+def make_contract(
+    required_reviewers: Sequence[str],
+    policy: str,
+    broad_rules: Sequence[str] | None = None,
+    primary_reviewer: str | None = None,
+) -> ReviewSchedulingContract:
     return ReviewSchedulingContract(
         required_reviewers=tuple(required_reviewers),
         policy=policy,
+        primary_reviewer=primary_reviewer,
         broad_rules=normalize_broad_rules(broad_rules),
     )

@@ -54,7 +54,7 @@ from .protocol import (
     risk_test_matrix_identity,
     sanitize_risk_test_matrix,
 )
-from .review_scheduling import ReviewSchedulingContract
+from .review_scheduling import ReviewSchedulingContract, SCHEDULER_PHASES
 from .unresolved_items import _apply_unresolved_item_dispositions
 
 
@@ -146,6 +146,13 @@ class PostedRoundMetadata:
     scheduler_final_sweep: bool | None = None
     scheduler_force_full: bool | None = None
     scheduler_calls_avoided: int | None = None
+    # Phase-aware scheduler authority is optional so pre-staged-policy records
+    # remain valid legacy metadata and cannot silently authorize a reduced set.
+    scheduler_phase: str | None = None
+    scheduler_primary_reviewer: str | None = None
+    scheduler_approved_reviewers: tuple[str, ...] = ()
+    scheduler_active_owners: tuple[str, ...] = ()
+    scheduler_scope_digest: str | None = None
     # This is an in-memory decode-quality signal, deliberately not serialized.
     # ``absent`` is the legacy-compatible state; ``invalid`` means scheduler
     # fields were present but could not be reconstructed safely.
@@ -198,6 +205,11 @@ class PostedRoundMetadata:
                 self.scheduler_final_sweep,
                 self.scheduler_force_full,
                 self.scheduler_calls_avoided,
+                self.scheduler_phase,
+                self.scheduler_primary_reviewer,
+                self.scheduler_approved_reviewers,
+                self.scheduler_active_owners,
+                self.scheduler_scope_digest,
             )
         ):
             object.__setattr__(self, "scheduler_metadata_status", "valid")
@@ -684,6 +696,15 @@ _SCHEDULER_METADATA_KEYS = frozenset(
         "scheduler_calls_avoided",
     }
 )
+_SCHEDULER_AUXILIARY_KEYS = frozenset(
+    {
+        "scheduler_phase",
+        "scheduler_primary_reviewer",
+        "scheduler_approved_reviewers",
+        "scheduler_active_owners",
+        "scheduler_scope_digest",
+    }
+)
 
 
 def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]:
@@ -693,7 +714,8 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
     A malformed or partial record therefore becomes legacy metadata instead of
     being allowed to select a smaller reviewer set during resume.
     """
-    if not (_SCHEDULER_METADATA_KEYS & payload.keys()):
+    scheduler_keys = _SCHEDULER_METADATA_KEYS | _SCHEDULER_AUXILIARY_KEYS
+    if not (scheduler_keys & payload.keys()):
         return {"scheduler_metadata_status": "absent"}
     required = _SCHEDULER_METADATA_KEYS
     if not required.issubset(payload.keys()):
@@ -747,6 +769,34 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
             raise ValueError("invalid scheduler boolean")
         if isinstance(calls_avoided, bool) or not isinstance(calls_avoided, int) or calls_avoided < 0:
             raise ValueError("invalid avoided-call count")
+        phase = payload.get("scheduler_phase")
+        if phase is not None and (not isinstance(phase, str) or phase not in SCHEDULER_PHASES):
+            raise ValueError("invalid scheduler phase")
+        primary = payload.get("scheduler_primary_reviewer")
+        if primary is not None and (
+            not isinstance(primary, str) or primary != contract.primary_reviewer
+        ):
+            raise ValueError("contradictory scheduler primary reviewer")
+        approved = payload.get("scheduler_approved_reviewers", [])
+        if (
+            not isinstance(approved, list)
+            or any(not isinstance(name, str) for name in approved)
+            or len(set(approved)) != len(approved)
+            or not set(approved).issubset(contract.required_reviewers)
+        ):
+            raise ValueError("invalid scheduler approval set")
+        owners = payload.get("scheduler_active_owners", [])
+        if (
+            not isinstance(owners, list)
+            or any(not isinstance(name, str) or not name for name in owners)
+            or len(set(owners)) != len(owners)
+        ):
+            raise ValueError("invalid scheduler owner set")
+        scope_digest = payload.get("scheduler_scope_digest")
+        if scope_digest is not None and (
+            not isinstance(scope_digest, str) or not re.fullmatch(r"[0-9a-f]{16}", scope_digest)
+        ):
+            raise ValueError("invalid scheduler scope digest")
     except (AgentLoopError, TypeError, ValueError, KeyError):
         return {"scheduler_metadata_status": "invalid"}
     return {
@@ -760,6 +810,11 @@ def _decode_scheduler_fields(payload: Mapping[str, object]) -> dict[str, object]
         "scheduler_final_sweep": final_sweep,
         "scheduler_force_full": force_full,
         "scheduler_calls_avoided": calls_avoided,
+        "scheduler_phase": phase,
+        "scheduler_primary_reviewer": primary,
+        "scheduler_approved_reviewers": tuple(approved),
+        "scheduler_active_owners": tuple(owners),
+        "scheduler_scope_digest": scope_digest,
         "scheduler_metadata_status": "valid",
     }
 
@@ -958,9 +1013,22 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "scheduler_final_sweep": metadata.scheduler_final_sweep,
         "scheduler_force_full": metadata.scheduler_force_full,
         "scheduler_calls_avoided": metadata.scheduler_calls_avoided,
+        "scheduler_phase": metadata.scheduler_phase,
+        "scheduler_primary_reviewer": metadata.scheduler_primary_reviewer,
+        "scheduler_approved_reviewers": list(metadata.scheduler_approved_reviewers),
+        "scheduler_active_owners": list(metadata.scheduler_active_owners),
+        "scheduler_scope_digest": metadata.scheduler_scope_digest,
     }
     if any(value not in (None, (), []) for value in scheduler_values.values()):
-        payload.update(scheduler_values)
+        # Phase-aware fields are optional: omit empty ones so records written
+        # by the existing policies keep the legacy mandatory key shape.
+        payload.update(
+            {
+                key: value
+                for key, value in scheduler_values.items()
+                if key not in _SCHEDULER_AUXILIARY_KEYS or value not in (None, [])
+            }
+        )
     matrix_present = _risk_test_matrix_metadata_present(metadata)
     matrix_values = {
         "risk_test_matrix_contract_version": metadata.risk_test_matrix_contract_version,

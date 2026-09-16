@@ -1164,13 +1164,98 @@ owners while the unavailable reviewer remains required.
 Scheduler checkpoints are written before reviewer launch and after
 reconciliation. They persist the immutable reviewer/policy/rule contract,
 head pair, selected/paused reviewers, reasons, final-sweep and force-full
-state, and cumulative selective-only calls avoided. Derived approvals and
+state, phase/primary/owner identities, exact-head approval evidence, and
+cumulative scheduler-policy calls avoided. Derived approvals and
 obligations continue to come from reviewer records and the canonical ledger.
 Missing, malformed, contradictory, or legacy scheduler metadata selects the
 full board. A changed reviewer set, policy, or broad-rule digest stops rather
 than weakening an in-flight run. Issue-mode implementation handoffs carry the
 same PR policy; planning and discussion scheduling are intentionally outside
 this feature.
+
+#### Primary-then-panel
+
+`primary-then-panel` is opt-in and requires `--primary-reviewer` plus at least
+one other unique `--reviewer`. The primary must be on the configured board.
+The scheduler phases are `primary`, `secondary-audit`, `remediation`,
+`final-secondary-sweep`, and `full-board`:
+
+1. `primary`: the primary is the only reviewer. When it blocks and the coder
+   makes a narrow fix, the primary alone rechecks its own findings; this stays
+   in the primary phase until it approves the exact head.
+2. `secondary-audit`: after exact-head primary approval, every secondary
+   receives the complete base-to-head diff and approved-plan/human context
+   independently from a common snapshot. It does not merely validate the
+   primary's findings.
+3. `remediation`: after a secondary finding, a safe narrow descendant invokes
+   every active finding owner together with the primary.
+4. `final-secondary-sweep`: owner/primary clearance is followed by a mandatory
+   complete-diff sweep of every secondary without qualifying approval on the
+   new head, before any CI or merge gate.
+5. `full-board`: any active finding whose change is broad, out of scope,
+   non-textual, missing scope, disputed, or unreconstructible, any head change
+   after panel evidence exists, a secondary-owned finding with no panel phase
+   evidence, or the force-full latch selects the complete board.
+
+Whether the panel has been opened is reconstructed from the durable phase
+checkpoint in the latest valid scheduler record; the checkpoint never grants
+an approval and cannot bypass the primary gate. A secondary that has never
+reviewed is not a "returning" reviewer: its first invocation always receives
+the complete diff, so only reviewers with a prior record need reconstructible
+span history. `--pr-review-force-full` is a monotonic durable latch. For this
+policy, a full board raised by scheduler-metadata recovery (legacy records
+without phase authority, malformed or contradictory records, or a missing
+same-head checkpoint) also raises the durable latch and is persisted in every
+later round record, so a resumed run keeps selecting the complete board.
+Any failure, timeout, unavailability, incomplete output, or head mutation
+remains blocking and invalidates nonmatching approvals; the settled results of
+healthy parallel reviewers are recorded while the failed reviewer stays
+outstanding in the required barrier.
+
+The offline `review-evaluation` command consumes local frozen JSON artifacts and
+reports unique and severity-weighted marginal findings, process/call/token/time
+metrics, CI/escape outcomes, false positives, withdrawals, disagreements, and
+unavailable measurements. It never invokes a reviewer or mutates GitHub:
+
+```bash
+agent-loop review-evaluation docs/evaluation/frozen_review_artifacts.json \
+  --format text
+```
+
+Each run in the artifact carries `policy`, `run_id`, `findings`, optional
+`metrics`, `rounds`, `primary_reviewer`, and approval-round fields, plus
+provenance: a run-level `provenance` object (`{"source": ..., "verified":
+true}`) covering metrics, round snapshots, and approval rounds; a
+`label_provenance` object covering the finding `valid` labels; and optional
+per-metric overrides in `metric_provenance`. Every finding must carry an
+explicit boolean `valid` label. A measurement is reported as `verified` only
+when its provenance is verified; unlabeled findings, missing provenance, or
+`verified: false` are reported as `unavailable` with a reason rather than
+estimated. Finding `severity` labels must be one of `critical`, `high`,
+`medium`, `low`, or `info` (case-insensitive); any other label is rejected at
+load time rather than silently weighted as zero, and a valid finding with no
+severity label makes the severity-weighted row `unavailable`, naming the
+finding, instead of dropping it from the comparison. Every finding must also
+carry `contributors`: a non-empty array of nonblank reviewer identities that
+raised it. Absent, wrong-typed, empty, or partially invalid contributor data is
+rejected at load time and by direct evaluation, so a valid finding is never
+silently dropped from unique, marginal, or severity-weighted coverage while the
+row still reports `verified`. Finding IDs are namespaced
+by run, so identical IDs across runs never collide; two records with the same
+`policy` and `run_id` are rejected so distinct findings can never be collapsed
+into one. Marginal-beyond-primary rows are `not-applicable` for policies whose
+runs declare no primary; a historical full-board run may declare a hypothetical
+`primary_reviewer` to measure what the other reviewers would have added. Runs
+using `primary-then-panel` must declare their primary. Primary-to-panel
+approval regressions are a whole-policy measurement: if any primary-bearing run
+lacks either approval-round endpoint or verified run provenance, the row is
+`unavailable` naming those runs rather than a partial list of the complete
+runs. The checked-in
+`docs/evaluation/frozen_review_report.json` is regenerated from the fixture
+artifact and asserted by `tests/test_review_evaluation.py`.
+
+The policy remains non-default until a separate frozen-history review shows
+severity-weighted marginal coverage justifies its latency and cost tradeoff.
 
 Returning reviewers receive fresh full context and an orchestrator-computed
 diff summary since their previous review, while still being instructed to

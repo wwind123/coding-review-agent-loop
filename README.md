@@ -561,6 +561,38 @@ in round audit metadata and recover conservatively after interruption or a
 configuration change. Issue-mode implementation handoffs carry the same PR
 policy, while planning and discussion remain outside this policy.
 
+### Primary-then-panel PR review
+
+The opt-in staged policy lets one configured primary work to exact-head approval
+before an independent secondary audit:
+
+```bash
+agent-loop pr 123 --repo OWNER/REPO \
+  --pr-review-policy primary-then-panel \
+  --primary-reviewer codex \
+  --reviewer codex --reviewer claude --reviewer gemini
+```
+
+The primary is the first and only reviewer in the normal opening phase, and it
+alone rechecks its own findings on each narrow fix until it approves the exact
+head. Once it approves, every secondary reviews the complete current
+base-to-head diff from a common snapshot in the `secondary-audit` phase;
+secondary prompts are independent and are not finding-check prompts. A scoped
+secondary fix enters `remediation`, which rechecks every active finding owner
+and the primary, then performs a complete exact-head `final-secondary-sweep`
+for every secondary missing approval. Any active finding with a broad,
+ambiguous, out-of-scope, or unreconstructible change, and any head change after
+panel evidence exists, selects the complete board and never treats missing
+input as approval. `--pr-review-force-full` is a durable run latch; a full
+board raised by scheduler-metadata recovery (legacy, malformed, or
+contradictory records) latches the same way for the rest of the run. Public
+audit comments and logs name the phase, exact head, primary, active owners,
+force-full state, and policy-neutral cumulative calls avoided. The policy is
+opt-in and does not change the default or the CI/merge gates. Use
+`review-evaluation` with frozen local artifacts to compare latency/cost against
+independent severity-weighted coverage before any proposal to change the
+default; measurements without verified provenance are reported as unavailable.
+
 ## Safety and Permissions
 
 Agents can run commands and change code. Keep their normal permission prompts

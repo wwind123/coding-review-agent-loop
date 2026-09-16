@@ -3246,7 +3246,7 @@ Before approving, self-check every `future_followups` entry: if it is trivial
 or local to the current PR, reclassify it as `same_pr_followups` and return
 `blocking`, or omit it if it is only a nit.
 
-For selective-intermediate PR scheduling, a finding may be an object instead
+For scheduler-enabled PR policies, a finding may be an object instead
 of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
 optional `fix_scope` must contain only exact normalized repository-relative
 POSIX paths. Never use globs, directories, absolute paths, or traversal.
@@ -3584,6 +3584,21 @@ follow-ups for compatibility, but prefer `### Future follow-ups`.
 
 
 def _pr_review_scheduling_guidance(config: AgentLoopConfig) -> str:
+    if config.pr_review_policy == "primary-then-panel":
+        primary = config.primary_reviewer or "(missing; configuration is invalid)"
+        return f"""PR review scheduling is using the opt-in `primary-then-panel` policy.
+`{primary}` is the configured primary reviewer. The primary must approve the exact
+current head before the secondary panel starts. After that approval, every
+configured secondary reviewer receives an independent review of the complete
+base-to-head diff and the approved-plan/human-requirement context. Secondary
+reviewers must reach their own conclusions; do not merely validate, repeat, or
+triage findings attributed to the primary. A remediation round rechecks every
+active finding owner together with the primary, then performs an independent
+exact-head sweep for every secondary still missing approval. Any mutation,
+ambiguous ownership/scope/history, reviewer failure, or unavailable reviewer is
+conservative: stale approval is not approval and the required barrier remains
+blocking. The operator's force-full option is durable for the rest of the run.
+"""
     if config.pr_review_policy != "selective-intermediate":
         return (
             "PR review scheduling is using the compatibility `all-reviewers` policy: "
@@ -3796,7 +3811,7 @@ Before approving, self-check every `future_followups` entry: if it is trivial
 or local to the current PR, reclassify it as `same_pr_followups` and return
 `blocking`, or omit it if it is only a nit.
 
-For selective-intermediate PR scheduling, a finding may be an object instead
+For scheduler-enabled PR policies, a finding may be an object instead
 of a string: `{{"text": "...", "fix_scope": ["src/exact_file.py"]}}`. The
 optional `fix_scope` must contain only exact normalized repository-relative
 POSIX paths. Never use globs, directories, absolute paths, or traversal.

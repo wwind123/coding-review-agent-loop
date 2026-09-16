@@ -85,6 +85,11 @@ from .test_runtime import (
     resolve_timeout_seconds,
 )
 from .local_test_evidence import broker_client_from_environment
+from .review_evaluation import (
+    evaluate_frozen_artifacts,
+    load_frozen_artifacts,
+    render_evaluation_report,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -709,11 +714,22 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.add_argument(
             "--pr-review-policy",
-            choices=("all-reviewers", "selective-intermediate"),
+            choices=("all-reviewers", "selective-intermediate", "primary-then-panel"),
             default="all-reviewers",
             help=(
                 "PR review scheduling policy. The default invokes every configured reviewer; "
-                "selective-intermediate pauses approved reviewers only for bounded narrow fixes."
+                "selective-intermediate pauses approved reviewers only for bounded narrow fixes; "
+                "primary-then-panel gates an independent secondary audit on one primary approval."
+            ),
+        )
+        subparser.add_argument(
+            "--primary-reviewer",
+            type=normalize_agent_name,
+            choices=("claude", "codex", "gemini", "antigravity"),
+            default=None,
+            help=(
+                "Reviewer that must approve each head before the secondary panel runs; "
+                "required only with --pr-review-policy primary-then-panel."
             ),
         )
         subparser.add_argument(
@@ -723,7 +739,7 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             metavar="PATH_PATTERN",
             help=(
-                "Path pattern that forces the full PR reviewer board under selective-intermediate. "
+                "Path pattern that forces the full PR reviewer board under scheduler policies. "
                 "Repeat to replace the deterministic default rule list."
             ),
         )
@@ -1112,6 +1128,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_containment_options(containment_preflight)
 
+    evaluation = subparsers.add_parser(
+        "review-evaluation",
+        aliases=("evaluate-reviews", "evaluate-review"),
+        help="Compare frozen PR review policies offline without reviewer or GitHub calls.",
+    )
+    evaluation.add_argument("artifacts", type=Path, help="Local validated frozen run-artifact JSON file.")
+    evaluation.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default="json",
+        help="Report format (default: json).",
+    )
+    evaluation.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional local output path; stdout is used when omitted.",
+    )
+
     return parser
 
 
@@ -1193,6 +1228,18 @@ def _resolve_task_text(args: argparse.Namespace) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command in {"review-evaluation", "evaluate-reviews", "evaluate-review"}:
+        try:
+            report = evaluate_frozen_artifacts(load_frozen_artifacts(args.artifacts))
+            rendered = render_evaluation_report(report, human=args.format == "text")
+            if args.output is None:
+                print(rendered, end="")
+            else:
+                args.output.write_text(rendered, encoding="utf-8")
+            return 0
+        except (AgentLoopError, OSError, ValueError) as exc:
+            print(f"agent-loop: {exc}", file=sys.stderr)
+            return 1
     if args.command == "containment-preflight":
         try:
             policy = policy_from_values(vars(args))

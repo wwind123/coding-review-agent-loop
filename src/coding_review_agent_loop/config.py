@@ -155,6 +155,8 @@ class AgentLoopConfig:
     # PR-only intermediate scheduling.  ``all-reviewers`` preserves the
     # historical contract; selective scheduling is explicitly opt-in.
     pr_review_policy: str = "all-reviewers"
+    # Primary reviewer used only by the staged primary-then-panel policy.
+    primary_reviewer: AgentName | None = None
     pr_review_broad_rules: tuple[str, ...] = DEFAULT_BROAD_RULES
     pr_review_force_full: bool = False
     auto_agent_dirs: tuple[AgentName, ...] = ()
@@ -459,7 +461,28 @@ class AgentLoopConfig:
             raise AgentLoopError("--pr-review-context-mode must be either 'full' or 'compact'.")
         if self.pr_review_policy not in PR_REVIEW_POLICIES:
             raise AgentLoopError(
-                "--pr-review-policy must be either 'all-reviewers' or 'selective-intermediate'."
+                "--pr-review-policy must be 'all-reviewers', 'selective-intermediate', "
+                "or 'primary-then-panel'."
+            )
+        configured_reviewers = tuple(self.reviewer)
+        if not configured_reviewers or len(set(configured_reviewers)) != len(configured_reviewers):
+            raise AgentLoopError("Reviewer configuration must be a unique, non-empty board.")
+        if self.pr_review_policy == "primary-then-panel":
+            if len(configured_reviewers) < 2:
+                raise AgentLoopError(
+                    "--pr-review-policy primary-then-panel requires at least one secondary reviewer."
+                )
+            if self.primary_reviewer is None:
+                raise AgentLoopError(
+                    "--primary-reviewer is required with --pr-review-policy primary-then-panel."
+                )
+            if self.primary_reviewer not in configured_reviewers:
+                raise AgentLoopError(
+                    "--primary-reviewer must be one of the configured --reviewer agents."
+                )
+        elif self.primary_reviewer is not None:
+            raise AgentLoopError(
+                "--primary-reviewer requires --pr-review-policy primary-then-panel."
             )
         object.__setattr__(self, "pr_review_broad_rules", normalize_broad_rules(self.pr_review_broad_rules))
         if self.discuss_research not in DISCUSS_RESEARCH_MODES:
@@ -1440,6 +1463,7 @@ def config_from_args(
         architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
         managed_context_max_chars=getattr(args, "managed_context_max_chars", 80_000),
         pr_review_policy=getattr(args, "pr_review_policy", None) or "all-reviewers",
+        primary_reviewer=getattr(args, "primary_reviewer", None),
         pr_review_broad_rules=tuple(
             getattr(args, "pr_review_broad_rules", None)
             if getattr(args, "pr_review_broad_rules", None) is not None
