@@ -6245,7 +6245,12 @@ class TestRunImplementByPhase:
             start = stdout.find("{")
         return json.loads(stdout[start:].strip())
 
-    def _phase(self, *, automation: str = "agent-pr"):
+    def _phase(
+        self,
+        *,
+        automation: str = "agent-pr",
+        disposition: str = "direct-implementation",
+    ):
         import coding_review_agent_loop.decomposition as decomp
 
         return decomp.PlanPhase(
@@ -6258,7 +6263,28 @@ class TestRunImplementByPhase:
             parent_context="Approved plan slice: add schema helpers.",
             automation=automation,
             depends_on=(),
+            stage_id="stage-one",
+            position=1,
+            deliverables=("Schema helpers",),
+            non_goals_items=("Unrelated behavior",),
+            acceptance_criteria=("Focused tests pass",),
+            compatibility_constraints=("Preserve existing callers",),
+            covered_scope_item_ids=("scope-1",),
+            execution_disposition=(
+                "human-owned" if automation != "agent-pr" else disposition
+            ),
+            disposition_rationale="The reviewed stage declares its execution route.",
         )
+
+    def _fresh_decomposition_result(self, *, reused: bool = False) -> dict:
+        return {
+            "reused": reused,
+            "topology_source": "approved-plan-v1",
+            "strategy": "staged",
+            "execution_strategy_contract_version": 1,
+            "recommendation_digest": "recommendation-digest",
+            "plan_subject": "plan-subject",
+        }
 
     def _args(self, tmp_path, *, dry_run: bool = False):
         plan = tmp_path / "plan.md"
@@ -6383,6 +6409,181 @@ class TestRunImplementByPhase:
         output = self._last_json(capsys.readouterr().out)
         assert output["state"] == "handoff-exists"
         assert output["child_issue"] == 123
+
+    def test_fresh_planning_route_posts_handoff_and_stops_before_coder(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        from coding_review_agent_loop.github import IssueComment, IssueContext
+
+        phase = self._phase(disposition="direct-implementation")
+        created = decomp.CreatedPhaseIssue(
+            phase=phase,
+            issue_url="https://github.com/test/skill-repo/issues/123",
+            issue_number=123,
+        )
+        override_body = decomp.format_child_disposition_override_comment(
+            parent_issue=77,
+            plan_hash="abc123",
+            stage_id="stage-one",
+            disposition="requires-child-planning",
+            rationale="Require a reviewed child plan.",
+        )
+        override = decomp.parse_child_disposition_override_records(
+            override_body, comment_locator="parent comment 1"
+        )[0][0]
+        parent_ctx = IssueContext(
+            number=77, repo="test/skill-repo", title="Parent", body="Body", url="u",
+            comments=(IssueComment(author="human", created_at=None, body=override_body),),
+            human_requirements=(),
+        )
+        child_ctx = IssueContext(
+            number=123, repo="test/skill-repo", title="Child", body="Body", url="child",
+            comments=(), human_requirements=(),
+        )
+        posted: list[dict] = []
+
+        monkeypatch.setattr(
+            sr,
+            "_run_decomposition_for_skill",
+            lambda **_kwargs: (
+                self._fresh_decomposition_result(), (created,), parent_ctx,
+                types.SimpleNamespace(repo="test/skill-repo"), object(), "abc123",
+                "Approved parent plan", str(tmp_path),
+            ),
+        )
+        monkeypatch.setattr(gh, "get_issue_context", lambda *_args, **_kwargs: child_ctx)
+        monkeypatch.setattr(
+            decomp, "post_phase_implementation_handoff_comment",
+            lambda *_args, **kwargs: posted.append(kwargs),
+        )
+        monkeypatch.setattr(
+            sr, "_run_child_or_one_shot_implementation",
+            lambda **_kwargs: pytest.fail("planning route must not invoke the implementation coder"),
+        )
+
+        sr.cmd_run_implement_by_phase(self._args(tmp_path))
+
+        assert len(posted) == 1
+        assert posted[0]["execution_disposition"] == "requires-child-planning"
+        assert posted[0]["override_digest"] == override.digest
+        output = self._last_json(capsys.readouterr().out)
+        assert output["state"] == "child-planning-required"
+        assert output["override_digest"] == override.digest
+        assert output["resume_hint"] == (
+            "agent-loop issue 123 --plan-first --plan-execution-mode auto"
+        )
+
+    def test_fresh_direct_route_implements_and_posts_direct_handoff(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        from coding_review_agent_loop.github import IssueContext
+
+        phase = self._phase()
+        created = decomp.CreatedPhaseIssue(
+            phase=phase,
+            issue_url="https://github.com/test/skill-repo/issues/123",
+            issue_number=123,
+        )
+        context = IssueContext(
+            number=123, repo="test/skill-repo", title="Child", body="Body", url="child",
+            comments=(), human_requirements=(),
+        )
+        posted: list[dict] = []
+        implemented: list[int] = []
+
+        monkeypatch.setattr(
+            sr,
+            "_run_decomposition_for_skill",
+            lambda **_kwargs: (
+                self._fresh_decomposition_result(), (created,),
+                types.SimpleNamespace(comments=(), human_requirements=()),
+                types.SimpleNamespace(repo="test/skill-repo"), object(), "abc123",
+                "Approved parent plan", str(tmp_path),
+            ),
+        )
+        monkeypatch.setattr(gh, "get_issue_context", lambda *_args, **_kwargs: context)
+        monkeypatch.setattr(
+            sr, "_run_child_or_one_shot_implementation",
+            lambda **kwargs: implemented.append(kwargs["issue"]) or {"pr": 456},
+        )
+        monkeypatch.setattr(
+            decomp, "post_phase_implementation_handoff_comment",
+            lambda *_args, **kwargs: posted.append(kwargs),
+        )
+
+        sr.cmd_run_implement_by_phase(self._args(tmp_path))
+
+        assert implemented == [123]
+        assert len(posted) == 1
+        assert posted[0]["execution_disposition"] == "direct-implementation"
+        assert posted[0]["override_digest"] is None
+        assert self._last_json(capsys.readouterr().out)["state"] == "implemented"
+
+    def test_existing_fresh_planning_handoff_reports_plan_first_resume_hint(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        import helpers.skill_runner as sr
+        import coding_review_agent_loop.decomposition as decomp
+        import coding_review_agent_loop.github as gh
+        from coding_review_agent_loop.github import IssueComment, IssueContext
+
+        phase = self._phase(disposition="requires-child-planning")
+        created = decomp.CreatedPhaseIssue(
+            phase=phase,
+            issue_url="https://github.com/test/skill-repo/issues/123",
+            issue_number=123,
+        )
+        marker = decomp.format_phase_implementation_handoff_comment(
+            parent_issue=77,
+            mode="implement-by-phase",
+            plan_hash="abc123",
+            phase_index=1,
+            created=created,
+            strategy="staged",
+            topology_source="approved-plan-v1",
+            execution_strategy_contract_version=1,
+            recommendation_digest="recommendation-digest",
+            plan_subject="plan-subject",
+            execution_disposition="requires-child-planning",
+        )
+        parent_ctx = IssueContext(
+            number=77, repo="test/skill-repo", title="Parent", body="Body", url="u",
+            comments=(IssueComment(author="bot", created_at=None, body=marker),),
+            human_requirements=(),
+        )
+        child_ctx = IssueContext(
+            number=123, repo="test/skill-repo", title="Child", body="Body", url="child",
+            comments=(), human_requirements=(),
+        )
+        monkeypatch.setattr(
+            sr,
+            "_run_decomposition_for_skill",
+            lambda **_kwargs: (
+                self._fresh_decomposition_result(reused=True), (created,), parent_ctx,
+                types.SimpleNamespace(repo="test/skill-repo"), object(), "abc123",
+                "Approved parent plan", str(tmp_path),
+            ),
+        )
+        monkeypatch.setattr(gh, "get_issue_context", lambda *_args, **_kwargs: child_ctx)
+        monkeypatch.setattr(
+            sr, "_run_child_or_one_shot_implementation",
+            lambda **_kwargs: pytest.fail("existing planning handoff must not invoke coder"),
+        )
+
+        sr.cmd_run_implement_by_phase(self._args(tmp_path))
+
+        output = self._last_json(capsys.readouterr().out)
+        assert output["state"] == "handoff-exists"
+        assert output["execution_disposition"] == "requires-child-planning"
+        assert output["resume_hint"] == (
+            "agent-loop issue 123 --plan-first --plan-execution-mode auto"
+        )
 
     def test_human_first_phase_stops_without_handoff(self, monkeypatch, tmp_path, capsys) -> None:
         import helpers.skill_runner as sr

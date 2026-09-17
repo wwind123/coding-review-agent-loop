@@ -381,6 +381,64 @@ def test_fresh_one_shot_materialization_rerun_reuses_split_child_and_pr(
 @pytest.mark.parametrize("strategy", ["one-shot", "staged"])
 def test_auto_dry_run_previews_without_approval_bound_mutation(tmp_path, capsys, strategy):
     plan = _fresh_v1_plan_for_isolation(strategy)
+    if strategy == "staged":
+        payload, end = json.JSONDecoder().raw_decode(plan.lstrip())
+        recommendation = payload["execution_recommendation"]
+        recommendation["scope_items"].extend([
+            {
+                "scope_item_id": "scope-3",
+                "requirement": "Resolve child design choices.",
+                "acceptance_criteria": ["The child plan is reviewed."],
+            },
+            {
+                "scope_item_id": "scope-4",
+                "requirement": "Complete the operator-owned rollout.",
+                "acceptance_criteria": ["The operator confirms rollout."],
+            },
+        ])
+        recommendation["child_stages"].extend([
+            {
+                "stage_id": "stage-2",
+                "position": 2,
+                "title": "Design-dependent behavior",
+                "summary": "Review unresolved child design choices.",
+                "deliverables": ["A reviewed child plan."],
+                "non_goals": ["Do not implement before review."],
+                "acceptance_criteria": ["The child plan is approved."],
+                "depends_on_stage_ids": ["stage-1"],
+                "dependency_notes": "Starts after stage 1.",
+                "automation": "agent-pr",
+                "rollout_risk": "medium",
+                "compatibility_constraints": ["Preserve stage 1 behavior."],
+                "covered_scope_item_ids": ["scope-3"],
+                "execution_disposition": {
+                    "disposition": "requires-child-planning",
+                    "rationale": "The child must resolve a reviewed design choice.",
+                    "unresolved_design_decisions": ["Choose the final adapter."],
+                },
+            },
+            {
+                "stage_id": "stage-3",
+                "position": 3,
+                "title": "Operator rollout",
+                "summary": "Complete the operator-owned rollout.",
+                "deliverables": ["Operator rollout."],
+                "non_goals": ["Do not automate the operator decision."],
+                "acceptance_criteria": ["The operator confirms rollout."],
+                "depends_on_stage_ids": ["stage-2"],
+                "dependency_notes": "Starts after the reviewed child plan.",
+                "automation": "human-action",
+                "rollout_risk": "medium",
+                "compatibility_constraints": ["Preserve automated stages."],
+                "covered_scope_item_ids": ["scope-4"],
+                "execution_disposition": {
+                    "disposition": "human-owned",
+                    "rationale": "The final rollout requires an operator decision.",
+                    "unresolved_design_decisions": [],
+                },
+            },
+        ])
+        plan = json.dumps(payload) + plan.lstrip()[end:]
     runner = FakeRunner(
         claude_outputs=[plan],
         codex_outputs=[structured_plan_review(state="approved")],
@@ -398,7 +456,15 @@ def test_auto_dry_run_previews_without_approval_bound_mutation(tmp_path, capsys,
         plan_first=True,
     ) == 0
 
-    assert "dry-run preview" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "dry-run preview" in output
+    if strategy == "staged":
+        assert "stage-1: Intermediate behavior" in output
+        assert "declared disposition: direct-implementation; resolved route: direct-implementation" in output
+        assert "stage-2: Design-dependent behavior" in output
+        assert "declared disposition: requires-child-planning; resolved route: requires-child-planning" in output
+        assert "stage-3: Operator rollout" in output
+        assert "declared disposition: human-owned; resolved route: human" in output
     assert runner.issues == []
     assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
     assert not any("AGENT_PLAN_DECOMPOSITION" in comment for comment in runner.comments)

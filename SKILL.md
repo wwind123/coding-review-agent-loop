@@ -243,14 +243,24 @@ approved parent plan using an
 `implement-by-phase` decomposition marker, creates or reuses child phase issues,
 and then inspects phase 1:
 
-- If phase 1 is `agent-pr`, it records a phase handoff marker on the parent and
-  runs the external coder against the child issue, using that phase's
-  `parent_context` as the approved implementation plan. It does not write the
-  one-shot implementation marker used by `run-implement`.
+- If phase 1 is `agent-pr` and its resolved execution disposition is
+  `direct-implementation`, it records a direct phase handoff marker on the
+  parent and runs the external coder against the child issue, using that
+  phase's `parent_context` as the approved implementation plan. It does not
+  write the one-shot implementation marker used by `run-implement`.
+- If phase 1 resolves to `requires-child-planning`, it records the planning
+  handoff on the parent, does not invoke the implementation coder, and prints
+  JSON with state `child-planning-required`. The skill host must follow the
+  returned `resume_hint` to run the child with `--plan-first
+  --plan-execution-mode auto`; implementation may begin only after that child
+  plan is reviewed and approved.
 - If phase 1 is `human-action` or `manual-close`, it prints JSON identifying the
   child issue and stops without posting a phase handoff or running the coder.
-- If a matching phase handoff marker already exists, it prints a resume hint for
-  the child issue and does not invoke the coder again.
+- If a matching phase handoff marker already exists, it prints state
+  `handoff-exists` and a disposition-aware `resume_hint` for the child issue,
+  and does not invoke the coder again. Planning handoffs include
+  `--plan-first --plan-execution-mode auto`; direct handoffs use the plain
+  child issue command.
 
 `--dry-run` parses the decomposition and runs the implementation dry-run stub,
 but it does not create child issues, post markers, push branches, or open a real

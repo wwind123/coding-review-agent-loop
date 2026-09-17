@@ -442,6 +442,62 @@ def test_rtm_human_first_stage_workflow_stops_without_handoff_and_other_override
     assert "first phase requires human work" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("override_location", ["parent", "child"])
+def test_rtm_human_first_stage_workflow_rejects_override_without_handoff(
+    tmp_path, monkeypatch, override_location
+):
+    approved_plan = "Approved mixed topology."
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+
+    human_phase = dataclasses.replace(
+        _phase(automation="human-action"),
+        stage_id="human-stage",
+        execution_disposition="human-owned",
+    )
+    created = (CreatedPhaseIssue(human_phase, "human-url", 56),)
+    human_override = format_child_disposition_override_comment(
+        parent_issue=55,
+        plan_hash=approved_plan_hash(approved_plan),
+        stage_id="human-stage",
+        disposition=EXECUTION_DISPOSITION_DIRECT,
+        rationale="Request automated execution.",
+    )
+    override_comment = IssueComment(author="human", created_at=None, body=human_override)
+    parent = IssueContext(
+        number=55, repo="OWNER/REPO", title="Parent", body="Parent", url="parent-url",
+        comments=(override_comment,) if override_location == "parent" else (),
+    )
+    child = dataclasses.replace(
+        parent,
+        number=56,
+        title="Human",
+        comments=(override_comment,) if override_location == "child" else (),
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    monkeypatch.setattr(
+        orchestrator, "post_phase_implementation_handoff_comment",
+        lambda *_args, **_kwargs: pytest.fail("rejected human override must not post a handoff"),
+    )
+    recommendation = SimpleNamespace(
+        strategy="staged",
+        identity=lambda: {"recommendation_sha256": "digest"},
+        child_stages=(human_phase,),
+    )
+
+    with pytest.raises(AgentLoopError, match="Human-owned stages"):
+        orchestrator._dispatch_first_decomposition_phase(
+            FakeRunner(), config=make_config(tmp_path), memory=None,
+            usage_context=SimpleNamespace(), issue_number=55,
+            current_plan=approved_plan, plan_subject="subject", created=created,
+            recommendation=recommendation,
+            approved_plan_context=SimpleNamespace(matrix_available=False),
+            issue_context=parent, mode="implement-by-phase", coder_session_id=None,
+        )
+
+
 def test_rtm_nested_staged_child_stops_before_topology_mutation(
     tmp_path, monkeypatch, capsys
 ):
