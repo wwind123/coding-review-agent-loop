@@ -1,3 +1,5 @@
+import base64
+import dataclasses
 import json
 
 import pytest
@@ -6,6 +8,7 @@ from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
+    DecompositionMetadata,
     ExecutionDecision,
     ExecutionAllocation,
     ExecutionCouplingConstraint,
@@ -16,8 +19,17 @@ from coding_review_agent_loop.decomposition import (
     RecordedPhase,
     RetainedParentScope,
     TopologyCheckpoint,
+    PhaseImplementationHandoffMetadata,
+    _decode_phase_implementation_handoff_metadata,
+    _decode_metadata,
+    _encode_phase_implementation_handoff_metadata,
+    _encode_metadata,
+    _fresh_phase_payload,
+    _phase_from_payload,
     approved_plan_hash,
+    child_disposition_override_digest,
     format_phase_issue_body,
+    handoff_effective_disposition,
     find_existing_phase_implementation_handoff,
     find_existing_decomposition,
     find_existing_topology_checkpoint,
@@ -32,7 +44,12 @@ from coding_review_agent_loop.decomposition import (
     normalize_execution_recommendation,
     find_existing_execution_decision,
 )
-from coding_review_agent_loop.protocol import ExecutionChildStage, validate_structured_plan_state
+from coding_review_agent_loop.protocol import (
+    EXECUTION_DISPOSITION_DIRECT,
+    EXECUTION_DISPOSITION_PLANNING,
+    ExecutionChildStage,
+    validate_structured_plan_state,
+)
 from coding_review_agent_loop.github import IssueComment, IssueContext
 from coding_review_agent_loop.child_topology import NeedsHumanDecision
 from coding_review_agent_loop.orchestrator import (
@@ -783,6 +800,158 @@ def test_format_phase_body_points_to_parent_for_complete_constraints():
 
     assert "The linked parent issue is the source of truth" in body
     assert "complete historical constraint context" not in body
+
+
+def test_child_disposition_persistence_is_optional_and_legacy_stable():
+    legacy = dataclasses.replace(_phase("Disposition phase"), stage_id="stage-one", position=1)
+    legacy_payload = _fresh_phase_payload(legacy)
+    assert legacy_payload == {
+        "stage_id": "stage-one",
+        "position": 1,
+        "title": "Disposition phase",
+        "summary": "Implement Disposition phase.",
+        "deliverables": [],
+        "non_goals": [],
+        "acceptance_criteria": [],
+        "depends_on_stage_ids": [],
+        "dependency_notes": "Follow the parent plan.",
+        "automation": "agent-pr",
+        "rollout_risk": "low.",
+        "compatibility_constraints": [],
+        "covered_scope_item_ids": [],
+        "parent_context": "Approved parent constraints.",
+    }
+    restored_legacy = _phase_from_payload(legacy_payload, fresh=True)
+    assert restored_legacy.execution_disposition is None
+    assert _fresh_phase_payload(restored_legacy) == legacy_payload
+    # Pin the pre-disposition phase identity: the additive field must not
+    # perturb already-recorded checkpoints that do not carry it.
+    legacy_identity = phase_identity(
+        parent_issue=55,
+        plan_hash="parent-plan",
+        topology_source="approved-plan-v1",
+        phase_index=1,
+        phase=legacy,
+        stage_id="stage-one",
+        execution_strategy_contract_version=1,
+    )
+    assert legacy_identity == "b4ccf9463522f008bfe7a70758f66710fd1491af8141f7bfc18196237aa3dd03"
+    assert legacy_identity == phase_identity(
+        parent_issue=55,
+        plan_hash="parent-plan",
+        topology_source="approved-plan-v1",
+        phase_index=1,
+        phase=dataclasses.replace(legacy, execution_disposition=None),
+        stage_id="stage-one",
+        execution_strategy_contract_version=1,
+    )
+
+    planning = dataclasses.replace(
+        legacy,
+        execution_disposition=EXECUTION_DISPOSITION_PLANNING,
+        disposition_rationale="Resolve the remaining design choice first.",
+        unresolved_design_decisions=("Choose the storage representation.",),
+    )
+    planning_payload = _fresh_phase_payload(planning)
+    assert planning_payload["execution_disposition"] == {
+        "disposition": EXECUTION_DISPOSITION_PLANNING,
+        "rationale": planning.disposition_rationale,
+        "unresolved_design_decisions": list(planning.unresolved_design_decisions),
+    }
+    restored_planning = _phase_from_payload(planning_payload, fresh=True)
+    assert restored_planning.execution_disposition == EXECUTION_DISPOSITION_PLANNING
+    assert restored_planning.disposition_rationale == planning.disposition_rationale
+    assert restored_planning.unresolved_design_decisions == planning.unresolved_design_decisions
+    assert _fresh_phase_payload(restored_planning) == planning_payload
+
+    decomposition_metadata = DecompositionMetadata(
+        parent_issue=55,
+        plan_hash="parent-plan",
+        mode="implement-by-phase",
+        phase_count=2,
+        phase_titles=("Direct child", "Planning child"),
+        automation=("agent-pr", "agent-pr"),
+        children=(("Direct child", "direct-url", 56), ("Planning child", "plan-url", 57)),
+        topology_source="approved-plan-v1",
+        final_integration_work=ExecutionAllocation("none", (), (), ()),
+        strategy="staged",
+        execution_strategy_contract_version=1,
+        recommendation_digest="r" * 64,
+        plan_subject="s" * 64,
+        stage_ids=("stage-one", "stage-two"),
+        phase_identities=("identity-one", "identity-two"),
+        dispositions=(EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING),
+    )
+    assert _decode_metadata(_encode_metadata(decomposition_metadata)) == decomposition_metadata
+    legacy_metadata = dataclasses.replace(decomposition_metadata, dispositions=())
+    encoded_legacy_metadata = _encode_metadata(legacy_metadata)
+    assert "dispositions" not in json.loads(
+        base64.urlsafe_b64decode(encoded_legacy_metadata).decode("utf-8")
+    )
+    assert _decode_metadata(encoded_legacy_metadata) == legacy_metadata
+
+    metadata = PhaseImplementationHandoffMetadata(
+        parent_issue=55,
+        plan_hash="parent-plan",
+        mode="implement-by-phase",
+        phase_index=1,
+        phase_title=legacy.title,
+        automation="agent-pr",
+        child_issue_number=56,
+        child_issue_url="https://github.com/OWNER/REPO/issues/56",
+        strategy="staged",
+        topology_source="approved-plan-v1",
+        execution_strategy_contract_version=1,
+        recommendation_digest="r" * 64,
+        stage_id="stage-one",
+        plan_subject="s" * 64,
+        execution_disposition=EXECUTION_DISPOSITION_PLANNING,
+        override_digest="d" * 64,
+    )
+    assert _decode_phase_implementation_handoff_metadata(
+        _encode_phase_implementation_handoff_metadata(metadata)
+    ) == metadata
+    legacy_handoff = dataclasses.replace(
+        metadata, execution_disposition=None, override_digest=None
+    )
+    decoded_legacy = _decode_phase_implementation_handoff_metadata(
+        _encode_phase_implementation_handoff_metadata(legacy_handoff)
+    )
+    assert decoded_legacy == legacy_handoff
+    assert handoff_effective_disposition(decoded_legacy) == EXECUTION_DISPOSITION_DIRECT
+
+
+def test_child_disposition_digest_and_issue_instructions_are_canonical():
+    payload = {
+        "kind": "child-execution-disposition-override",
+        "schema_version": 1,
+        "parent_issue": 55,
+        "plan_hash": "parent-plan",
+        "stage_id": "stage-one",
+        "disposition": EXECUTION_DISPOSITION_PLANNING,
+        "rationale": "Require reviewed design decisions.",
+    }
+    assert child_disposition_override_digest(payload) == child_disposition_override_digest(
+        dict(reversed(tuple(payload.items())))
+    )
+    direct = dataclasses.replace(
+        _phase("Direct child"), execution_disposition=EXECUTION_DISPOSITION_DIRECT
+    )
+    planning = dataclasses.replace(
+        _phase("Planning child"), execution_disposition=EXECUTION_DISPOSITION_PLANNING
+    )
+    direct_body = format_phase_issue_body(
+        repo="OWNER/REPO", parent_issue=55, approved_plan="Parent plan",
+        phase=direct, created_so_far=(),
+    )
+    planning_body = format_phase_issue_body(
+        repo="OWNER/REPO", parent_issue=55, approved_plan="Parent plan",
+        phase=planning, created_so_far=(),
+    )
+    assert "implementation-ready" in direct_body
+    assert "do not run it with `--plan-first`" in direct_body
+    assert "requires its own reviewed plan" in planning_body
+    assert "--plan-first --plan-execution-mode auto" in planning_body
 
 
 def test_topology_checkpoint_stores_shared_context_once_and_round_trips(tmp_path):

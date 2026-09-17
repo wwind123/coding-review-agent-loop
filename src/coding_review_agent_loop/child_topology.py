@@ -55,6 +55,48 @@ class NeedsHumanDecision:
 
 
 @dataclass(frozen=True)
+class NestedTopologyDecision:
+    """A side-effect-free stop for a planning child whose own plan is staged (#808).
+
+    Hierarchical (nested) child topologies are excluded until #720; the child
+    plan is approved but nothing is persisted, decomposed, or dispatched.
+    """
+
+    parent_issue: int
+    child_issue: int
+    plan_hash: str
+    requested_policy: str
+    guidance: str = (
+        "The child's reviewed recommendation is staged, which would create a nested "
+        "child topology. Hierarchical execution is tracked in #720; a human must "
+        "either re-plan the child as one-shot or split it manually. No decision "
+        "record, checkpoint, summary, child issue, handoff, or coder work was created."
+    )
+
+    @property
+    def state(self) -> str:
+        return "needs-human"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "reason": "nested-staged-child",
+            "parent": self.parent_issue,
+            "child": self.child_issue,
+            "plan_hash": self.plan_hash,
+            "requested_policy": self.requested_policy,
+            "guidance": self.guidance,
+        }
+
+    def __str__(self) -> str:
+        return (
+            f"Planning child #{self.child_issue} of parent #{self.parent_issue} approved a "
+            f"staged recommendation (plan {self.plan_hash}) and needs a human decision: "
+            f"{self.guidance}"
+        )
+
+
+@dataclass(frozen=True)
 class ChildTopologyPreflight:
     """The count and identity portion of a topology preflight."""
 

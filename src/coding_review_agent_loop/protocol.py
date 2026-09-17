@@ -557,6 +557,49 @@ class TypedPlanStages:
 EXECUTION_STRATEGY_CONTRACT_VERSION = 1
 EXECUTION_TOPOLOGY_SOURCE = "approved-plan-v1"
 EXECUTION_AUTOMATION_CLASSES = frozenset({"agent-pr", "human-action", "manual-close"})
+# Per-child execution dispositions (#808).  The planner makes the semantic
+# readiness decision, plan reviewers approve or block it, and the orchestrator
+# validates only the typed fields, their consistency, and provenance.
+EXECUTION_DISPOSITION_DIRECT = "direct-implementation"
+EXECUTION_DISPOSITION_PLANNING = "requires-child-planning"
+EXECUTION_DISPOSITION_HUMAN = "human-owned"
+EXECUTION_DISPOSITION_VALUES = frozenset(
+    {EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING, EXECUTION_DISPOSITION_HUMAN}
+)
+EXECUTION_DISPOSITIONS_FOR_AUTOMATION: dict[str, frozenset[str]] = {
+    "agent-pr": frozenset({EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING}),
+    "human-action": frozenset({EXECUTION_DISPOSITION_HUMAN}),
+    "manual-close": frozenset({EXECUTION_DISPOSITION_HUMAN}),
+}
+
+
+def validate_direct_readiness(
+    *,
+    non_goals: Sequence[str],
+    compatibility_constraints: Sequence[str],
+    dependency_notes: str | None,
+    rationale: str | None,
+    unresolved_design_decisions: Sequence[str],
+) -> tuple[str, ...]:
+    """Return the direct-readiness invariants violated by reviewed stage fields.
+
+    This is the single shared validator used by the planner-turn validator,
+    the routing seam, and the signed-override path.  It judges only the
+    reviewed stage/phase fields it is given; callers must never feed override
+    metadata into it.  An empty result means the stage is direct-ready.
+    """
+    problems: list[str] = []
+    if tuple(unresolved_design_decisions):
+        problems.append("unresolved_design_decisions must be empty")
+    if not any(str(item).strip() for item in non_goals):
+        problems.append("non_goals must be non-empty")
+    if not any(str(item).strip() for item in compatibility_constraints):
+        problems.append("compatibility_constraints must be non-empty")
+    if not isinstance(dependency_notes, str) or not dependency_notes.strip():
+        problems.append("dependency_notes must be non-empty")
+    if not isinstance(rationale, str) or not rationale.strip():
+        problems.append("execution_disposition.rationale must be non-empty")
+    return tuple(problems)
 
 
 @dataclass(frozen=True)
@@ -582,6 +625,25 @@ class ExecutionAllocation:
 
 
 @dataclass(frozen=True)
+class ExecutionDisposition:
+    """The reviewed per-child execution disposition (#808)."""
+
+    disposition: str
+    rationale: str
+    unresolved_design_decisions: tuple[str, ...] = ()
+
+    def to_payload(self) -> dict[str, object]:
+        clean = sanitize_historical_text
+        return {
+            "disposition": clean(self.disposition),
+            "rationale": clean(self.rationale),
+            "unresolved_design_decisions": [
+                clean(value) for value in self.unresolved_design_decisions
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class ExecutionChildStage:
     stage_id: str
     position: int
@@ -596,6 +658,9 @@ class ExecutionChildStage:
     rollout_risk: str
     compatibility_constraints: tuple[str, ...]
     covered_scope_item_ids: tuple[str, ...]
+    # ``None`` only for recovery parsing of plans approved before #808
+    # (legacy-ambiguous).  Fresh planner and revision responses must declare it.
+    execution_disposition: ExecutionDisposition | None = None
 
 
 @dataclass(frozen=True)
@@ -665,6 +730,12 @@ class ExecutionStrategyRecommendation:
                     "rollout_risk": clean(stage.rollout_risk),
                     "compatibility_constraints": [clean(value) for value in stage.compatibility_constraints],
                     "covered_scope_item_ids": [clean(value) for value in stage.covered_scope_item_ids],
+                    # Emitted only when declared so digests of plans approved
+                    # before the disposition contract remain byte-stable.
+                    **(
+                        {"execution_disposition": stage.execution_disposition.to_payload()}
+                        if stage.execution_disposition is not None else {}
+                    ),
                 }
                 for stage in self.child_stages
             ],
@@ -2631,8 +2702,61 @@ def _expect_execution_allocation(
     return ExecutionAllocation(status, deliverables, criteria, covered)
 
 
+def _expect_execution_disposition(
+    value: object,
+    *,
+    context: str,
+    automation: str,
+    non_goals: Sequence[str],
+    compatibility_constraints: Sequence[str],
+    dependency_notes: str,
+) -> ExecutionDisposition:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(
+        payload,
+        context=context,
+        required={"disposition", "rationale", "unresolved_design_decisions"},
+    )
+    disposition = _expect_non_empty_string(payload["disposition"], context=f"{context}.disposition")
+    if disposition not in EXECUTION_DISPOSITION_VALUES:
+        raise AgentLoopError(
+            f"{context}.disposition must be one of: {', '.join(sorted(EXECUTION_DISPOSITION_VALUES))}."
+        )
+    allowed = EXECUTION_DISPOSITIONS_FOR_AUTOMATION.get(automation, frozenset())
+    if disposition not in allowed:
+        raise AgentLoopError(
+            f"{context}.disposition `{disposition}` contradicts automation `{automation}`; "
+            f"`{automation}` stages must declare {' or '.join(sorted(allowed))}."
+        )
+    rationale = _expect_non_empty_string(payload["rationale"], context=f"{context}.rationale")
+    unresolved = _expect_string_list(
+        payload["unresolved_design_decisions"],
+        context=f"{context}.unresolved_design_decisions",
+        item_context=f"{context}.unresolved_design_decisions",
+    )
+    if disposition == EXECUTION_DISPOSITION_DIRECT:
+        problems = validate_direct_readiness(
+            non_goals=non_goals,
+            compatibility_constraints=compatibility_constraints,
+            dependency_notes=dependency_notes,
+            rationale=rationale,
+            unresolved_design_decisions=unresolved,
+        )
+        if problems:
+            raise AgentLoopError(
+                f"{context} declares direct-implementation but the stage is not direct-ready: "
+                + "; ".join(problems)
+                + ". Declare requires-child-planning or complete the stage contract."
+            )
+    return ExecutionDisposition(
+        disposition=disposition,
+        rationale=rationale,
+        unresolved_design_decisions=unresolved,
+    )
+
+
 def _expect_execution_recommendation(
-    value: object, *, context: str
+    value: object, *, context: str, require_child_dispositions: bool = False
 ) -> ExecutionStrategyRecommendation:
     payload = _expect_object(value, context=context)
     required = {
@@ -2721,6 +2845,7 @@ def _expect_execution_recommendation(
                 "acceptance_criteria", "depends_on_stage_ids", "dependency_notes", "automation",
                 "rollout_risk", "compatibility_constraints", "covered_scope_item_ids",
             },
+            optional={"execution_disposition"},
         )
         stage_id = _expect_item_id(item["stage_id"], context=f"{item_context}.stage_id")
         if stage_id in stage_ids:
@@ -2747,6 +2872,26 @@ def _expect_execution_recommendation(
         if unknown_coverage:
             raise AgentLoopError(f"{item_context}.covered_scope_item_ids contains unknown IDs: {', '.join(unknown_coverage)}.")
         stage_ids.add(stage_id)
+        stage_non_goals = _expect_string_list(item["non_goals"], context=f"{item_context}.non_goals", item_context=f"{item_context}.non_goals")
+        stage_dependency_notes = _expect_non_empty_string(item["dependency_notes"], context=f"{item_context}.dependency_notes")
+        stage_compatibility = _expect_string_list(item["compatibility_constraints"], context=f"{item_context}.compatibility_constraints", item_context=f"{item_context}.compatibility_constraints")
+        execution_disposition: ExecutionDisposition | None = None
+        if "execution_disposition" in item:
+            execution_disposition = _expect_execution_disposition(
+                item["execution_disposition"],
+                context=f"{item_context}.execution_disposition",
+                automation=automation,
+                non_goals=stage_non_goals,
+                compatibility_constraints=stage_compatibility,
+                dependency_notes=stage_dependency_notes,
+            )
+        elif require_child_dispositions:
+            raise AgentLoopError(
+                f"{item_context}.execution_disposition is required for every child stage in a "
+                "fresh generation-1 response: declare `direct-implementation` or "
+                "`requires-child-planning` for agent-pr stages and `human-owned` for "
+                "human-action/manual-close stages."
+            )
         child_stages.append(
             ExecutionChildStage(
                 stage_id=stage_id,
@@ -2754,14 +2899,15 @@ def _expect_execution_recommendation(
                 title=_expect_non_empty_string(item["title"], context=f"{item_context}.title"),
                 summary=_expect_non_empty_string(item["summary"], context=f"{item_context}.summary"),
                 deliverables=_expect_string_list(item["deliverables"], context=f"{item_context}.deliverables", item_context=f"{item_context}.deliverables", min_length=1),
-                non_goals=_expect_string_list(item["non_goals"], context=f"{item_context}.non_goals", item_context=f"{item_context}.non_goals"),
+                non_goals=stage_non_goals,
                 acceptance_criteria=_expect_string_list(item["acceptance_criteria"], context=f"{item_context}.acceptance_criteria", item_context=f"{item_context}.acceptance_criteria", min_length=1),
                 depends_on_stage_ids=depends,
-                dependency_notes=_expect_non_empty_string(item["dependency_notes"], context=f"{item_context}.dependency_notes"),
+                dependency_notes=stage_dependency_notes,
                 automation=automation,
                 rollout_risk=_expect_non_empty_string(item["rollout_risk"], context=f"{item_context}.rollout_risk"),
-                compatibility_constraints=_expect_string_list(item["compatibility_constraints"], context=f"{item_context}.compatibility_constraints", item_context=f"{item_context}.compatibility_constraints"),
+                compatibility_constraints=stage_compatibility,
                 covered_scope_item_ids=covered,
+                execution_disposition=execution_disposition,
             )
         )
 
@@ -2838,7 +2984,11 @@ def _expect_execution_recommendation(
 
 
 def _parse_execution_contract_fields(
-    payload: dict[str, object], *, context: str, required: bool
+    payload: dict[str, object],
+    *,
+    context: str,
+    required: bool,
+    require_child_dispositions: bool = False,
 ) -> tuple[int | None, ExecutionStrategyRecommendation | None]:
     has_version = "execution_strategy_contract_version" in payload
     has_recommendation = "execution_recommendation" in payload
@@ -2858,7 +3008,9 @@ def _parse_execution_contract_fields(
     if version != EXECUTION_STRATEGY_CONTRACT_VERSION:
         raise AgentLoopError(f"{context}.execution_strategy_contract_version must be 1.")
     recommendation = _expect_execution_recommendation(
-        payload["execution_recommendation"], context=f"{context}.execution_recommendation"
+        payload["execution_recommendation"],
+        context=f"{context}.execution_recommendation",
+        require_child_dispositions=require_child_dispositions,
     )
     # Generation 1 has one reviewed topology. The legacy top-level
     # ``child_stages`` category is executable only for unversioned historical
@@ -2878,7 +3030,12 @@ def _parse_execution_contract_fields(
 def parse_execution_recommendation_payload(
     value: object, *, context: str = "execution_recommendation"
 ) -> ExecutionStrategyRecommendation:
-    """Validate a recovered recommendation before any bounded repair."""
+    """Validate a recovered recommendation before any bounded repair.
+
+    Recovery parsing tolerates an absent per-child ``execution_disposition``
+    (legacy-ambiguous) so plans approved before #808 keep their recorded
+    recommendation digest; fresh planner turns require it.
+    """
     return _expect_execution_recommendation(value, context=context)
 
 
@@ -4008,6 +4165,7 @@ def validate_structured_plan_revision(
     require_execution_strategy_contract: int = 0,
     require_risk_test_matrix_contract: int = 0,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
+    require_child_dispositions: bool = False,
 ) -> StructuredPlanRevision | None:
     payload = _extract_structured_plan_revision_payload(text)
     if payload is None:
@@ -4047,6 +4205,7 @@ def validate_structured_plan_revision(
         payload,
         context="plan_revision",
         required=require_execution_strategy_contract == 1,
+        require_child_dispositions=require_child_dispositions,
     )
     risk_version, risk_matrix, risk_changes = _parse_risk_test_matrix_contract_fields(
         payload,
@@ -4115,6 +4274,7 @@ def validate_structured_plan_state(
     required_architecture_impact_contract: int = 0,
     require_execution_strategy_contract: int = 0,
     require_risk_test_matrix_contract: int = 0,
+    require_child_dispositions: bool = False,
 ) -> StructuredPlanState | None:
     payload = _extract_structured_plan_state_payload(text)
     if payload is None:
@@ -4147,6 +4307,7 @@ def validate_structured_plan_state(
         payload,
         context="plan_state",
         required=require_execution_strategy_contract == 1,
+        require_child_dispositions=require_child_dispositions,
     )
     risk_version, risk_matrix, risk_changes = _parse_risk_test_matrix_contract_fields(
         payload,

@@ -68,8 +68,14 @@ from .decomposition import (
     phase_identity,
     post_topology_checkpoint,
     TopologyCheckpoint,
+    ChildDispositionOverride,
+    PhaseImplementationHandoffMetadata,
+    collect_child_disposition_overrides,
+    phase_direct_readiness_problems,
+    reconcile_handoff_disposition,
 )
-from .child_topology import NeedsHumanDecision
+from .protocol import EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING
+from .child_topology import NeedsHumanDecision, NestedTopologyDecision
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
@@ -4006,6 +4012,9 @@ def _require_plan_state_or_clarification(
         required_architecture_impact_contract=required_architecture_impact_contract,
         require_execution_strategy_contract=require_execution_strategy_contract,
         require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+        # Fresh planner turns must declare every child's execution
+        # disposition (#808); recovery parsing elsewhere tolerates absence.
+        require_child_dispositions=require_execution_strategy_contract == 1,
     )
     if structured_plan is None:
         raise AgentLoopError(
@@ -4201,6 +4210,7 @@ def _validate_plan_revision_response(
         require_execution_strategy_contract=(1 if require_execution_strategy_contract else 0),
         require_risk_test_matrix_contract=(1 if require_risk_test_matrix_contract else 0),
         reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
+        require_child_dispositions=bool(require_execution_strategy_contract),
     )
     if parsed is not None:
         allowed_ids = {item.item_id for item in unresolved_items}
@@ -4894,6 +4904,688 @@ def _resolve_execution_policy(
     )
 
 
+CHILD_ROUTE_HUMAN = "human"
+
+
+@dataclass(frozen=True)
+class ChildExecutionRoute:
+    """The deterministic route selected for one materialized child (#808).
+
+    ``disposition`` is ``direct-implementation``, ``requires-child-planning``,
+    or ``human``.  ``override_digest`` is the digest of the signed override that
+    selected the route (recorded in the handoff), if any.  ``origin`` is a
+    diagnostic only: ``phase``, ``handoff``, ``override``, ``automation``,
+    ``legacy-ambiguous``, or ``unsupported-source``.
+    """
+
+    disposition: str
+    override_digest: str | None = None
+    origin: str = "phase"
+
+    @property
+    def is_direct(self) -> bool:
+        return self.disposition == EXECUTION_DISPOSITION_DIRECT
+
+    @property
+    def is_planning(self) -> bool:
+        return self.disposition == EXECUTION_DISPOSITION_PLANNING
+
+    @property
+    def is_human(self) -> bool:
+        return self.disposition == CHILD_ROUTE_HUMAN
+
+
+def resolve_child_execution_route(
+    phase,
+    *,
+    topology_source: str,
+    recorded_handoff: PhaseImplementationHandoffMetadata | None = None,
+    overrides: Sequence[ChildDispositionOverride] = (),
+) -> ChildExecutionRoute:
+    """The one routing seam shared by parent dispatch and direct child entry.
+
+    Effective-disposition algorithm, evaluated in order:
+
+    (a) A non-``agent-pr`` stage routes to ``human``; an override naming it is
+        a human-decision error.
+    (b) With a recorded handoff, the handoff's disposition (legacy absent =
+        direct) is confirmed by the shared reconciliation rule and returned
+        without re-validation.  A distinct override that disagrees with an
+        already recorded route is an error (override after dispatch).
+    (c) Without a handoff, identical override records collapse by digest; more
+        than one distinct record for the stage is an error (no latest-wins).
+        A single override sets the effective disposition; otherwise the
+        persisted phase disposition is used, and ``None`` (legacy-ambiguous)
+        or a non-``approved-plan-v1`` source resolves to child planning.
+    (d) A direct result is accepted only when the persisted approved parent
+        phase fields alone pass the shared direct-readiness validator.
+        Override records never supply readiness evidence.
+
+    ``overrides`` must already be the stage-scoped, topology-validated set for
+    this phase (see ``collect_child_disposition_overrides``).
+    """
+    stage_label = getattr(phase, "stage_id", None) or str(getattr(phase, "position", None) or "?")
+    phase_disposition = getattr(phase, "execution_disposition", None)
+    if phase.automation != "agent-pr":
+        if overrides:
+            record = overrides[0]
+            raise AgentLoopError(
+                "Human decision required: signed child-disposition override at "
+                f"{record.comment_locator} names stage `{stage_label}`, which is a "
+                f"{phase.automation} stage. Human-owned stages keep their human stop and can "
+                "never be converted to an agent-pr route; remove the record before rerunning."
+            )
+        return ChildExecutionRoute(CHILD_ROUTE_HUMAN, None, "automation")
+    if recorded_handoff is not None:
+        effective = reconcile_handoff_disposition(phase, recorded_handoff, overrides)
+        disagreeing = [
+            record for record in overrides
+            if record.disposition != effective
+            and record.digest != recorded_handoff.override_digest
+        ]
+        if disagreeing:
+            raise AgentLoopError(
+                f"Human decision required: stage `{stage_label}` was already dispatched with "
+                f"disposition `{effective}` (recorded phase handoff), but the signed override at "
+                f"{disagreeing[0].comment_locator} now requests `{disagreeing[0].disposition}`. "
+                "An override cannot change a recorded route; remove the record or repair the "
+                "handoff manually."
+            )
+        return ChildExecutionRoute(effective, recorded_handoff.override_digest, "handoff")
+    distinct: dict[str, ChildDispositionOverride] = {}
+    for record in overrides:
+        distinct.setdefault(record.digest, record)
+    if len(distinct) > 1:
+        raise AgentLoopError(
+            f"Human decision required: stage `{stage_label}` has {len(distinct)} distinct signed "
+            "child-disposition override records ("
+            + "; ".join(
+                f"{record.comment_locator} -> {record.disposition}" for record in distinct.values()
+            )
+            + "). Comment order never selects one; remove the superseded record(s) before rerunning."
+        )
+    override = next(iter(distinct.values()), None)
+    if override is not None:
+        effective, digest, origin = override.disposition, override.digest, "override"
+    elif topology_source != EXECUTION_TOPOLOGY_SOURCE:
+        effective, digest, origin = EXECUTION_DISPOSITION_PLANNING, None, "unsupported-source"
+    elif phase_disposition is None:
+        effective, digest, origin = EXECUTION_DISPOSITION_PLANNING, None, "legacy-ambiguous"
+    elif phase_disposition in {EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING}:
+        effective, digest, origin = phase_disposition, None, "phase"
+    else:
+        raise AgentLoopError(
+            f"Human decision required: stage `{stage_label}` is an agent-pr stage whose persisted "
+            f"disposition `{phase_disposition}` is contradictory; repair the approved topology."
+        )
+    if effective == EXECUTION_DISPOSITION_DIRECT:
+        problems = phase_direct_readiness_problems(phase)
+        if problems:
+            requested_by = (
+                f"the signed override at {override.comment_locator}"
+                if override is not None else "the persisted approved phase"
+            )
+            raise AgentLoopError(
+                f"Human decision required: {requested_by} selects direct-implementation for stage "
+                f"`{stage_label}`, but the reviewed parent stage alone is not direct-ready: "
+                + "; ".join(problems)
+                + ". Override records never supply readiness evidence; revise the parent plan "
+                "or route the child to planning."
+            )
+    return ChildExecutionRoute(effective, digest, origin)
+
+
+def _fresh_phase_marker_payload(issue_context: IssueContext) -> dict[str, object] | None:
+    """Return the fresh approved-plan-v1 phase identity payload carried by an issue."""
+    bodies = [issue_context.body or ""]
+    bodies.extend(comment.body or "" for comment in issue_context.comments)
+    payloads: list[dict[str, object]] = []
+    for body in bodies:
+        for match in PHASE_IDENTITY_MARKER_RE.finditer(body):
+            payload = _decode_json_payload(
+                match.group("payload"), marker_name="AGENT_PLAN_PHASE_IDENTITY"
+            )
+            if payload.get("source") == EXECUTION_TOPOLOGY_SOURCE:
+                payloads.append(payload)
+    if not payloads:
+        return None
+    if any(payload != payloads[0] for payload in payloads[1:]):
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} carries conflicting fresh phase identities; "
+            "repair the child issue provenance before rerunning."
+        )
+    return payloads[0]
+
+
+@dataclass(frozen=True)
+class _FreshChildProvenance:
+    """A materialized fresh decomposition child resolved for direct entry."""
+
+    parent_issue: int
+    plan_hash: str
+    plan_subject: str
+    approved_plan: str
+    parent_plan_context: ApprovedPlanContext
+    recommendation: ExecutionStrategyRecommendation
+    decomposition: PlanDecomposition
+    created: CreatedPhaseIssue
+    phase_index: int
+    stage_id: str
+    handoff: PhaseImplementationHandoffMetadata | None
+    overrides: tuple[ChildDispositionOverride, ...]
+    route: ChildExecutionRoute
+
+
+def _resolve_fresh_child_provenance(
+    *,
+    issue_context: IssueContext,
+    parent_issue_context: IssueContext | None,
+) -> _FreshChildProvenance | None:
+    """Bind a directly entered child to its approved parent phase and route it.
+
+    Returns ``None`` for issues without fresh approved-plan-v1 phase provenance
+    (split-materialized, hand-created, and legacy children keep today's
+    behavior).  Any broken fresh provenance fails closed.
+    """
+    payload = _fresh_phase_marker_payload(issue_context)
+    if payload is None:
+        return None
+    parent_issue = payload.get("parent_issue")
+    plan_hash = payload.get("plan_hash")
+    phase_index = payload.get("phase_index")
+    stage_id = payload.get("stage_id")
+    digest = payload.get("recommendation_digest")
+    if (
+        not isinstance(parent_issue, int) or isinstance(parent_issue, bool)
+        or not isinstance(plan_hash, str) or not plan_hash
+        or not isinstance(phase_index, int) or isinstance(phase_index, bool) or phase_index < 1
+        or not isinstance(stage_id, str) or not stage_id.strip()
+        or not isinstance(digest, str) or not digest
+        or payload.get("strategy") != "staged"
+        or payload.get("execution_strategy_contract_version") != 1
+    ):
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} carries an invalid fresh phase identity; "
+            "repair the child issue provenance before rerunning."
+        )
+    if parent_issue_context is None or parent_issue_context.number != parent_issue:
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} names parent #{parent_issue} in its fresh phase "
+            "identity, but that parent context could not be resolved."
+        )
+    parent_plan_context = recover_approved_plan_context(
+        parent_issue_context.comments, expected_hash=plan_hash
+    )
+    if not parent_plan_context.is_available or not parent_plan_context.canonical_text:
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} is a fresh decomposition child of #{parent_issue}, "
+            f"but the approved parent plan {plan_hash} could not be recovered: "
+            f"{parent_plan_context.diagnostic or 'no diagnostic available'}"
+        )
+    approved_plan = parent_plan_context.canonical_text
+    plan_subject = parent_plan_context.plan_subject or _plan_subject(approved_plan)
+    recommendation = recover_execution_recommendation(
+        parent_issue_context.comments, expected_digest=digest
+    )
+    decomposition, _retained = normalize_execution_recommendation(
+        recommendation, approved_plan=approved_plan, plan_subject=plan_subject
+    )
+    if phase_index > len(decomposition.phases):
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} references phase {phase_index}, which is outside "
+            "the approved parent topology."
+        )
+    phase = decomposition.phases[phase_index - 1]
+    expected_identity = phase_identity(
+        parent_issue=parent_issue,
+        plan_hash=plan_hash,
+        topology_source=EXECUTION_TOPOLOGY_SOURCE,
+        phase_index=phase_index,
+        phase=phase,
+        stage_id=phase.stage_id,
+        execution_strategy_contract_version=1,
+    )
+    if (
+        phase.stage_id != stage_id
+        or payload.get("identity") != expected_identity
+        or digest != decomposition.recommendation_digest
+    ):
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} fresh phase identity does not match the approved "
+            "parent topology; repair the child issue provenance before rerunning."
+        )
+    summary = find_existing_decomposition(
+        parent_issue_context.comments,
+        parent_issue=parent_issue,
+        plan_hash=plan_hash,
+        strategy="staged",
+        topology_source=EXECUTION_TOPOLOGY_SOURCE,
+        recommendation_digest=decomposition.recommendation_digest,
+        plan_subject=plan_subject,
+    )
+    if summary is None or summary.mode not in {"decompose-only", "implement-by-phase"}:
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} has no matching canonical parent topology summary "
+            f"on #{parent_issue}; repair the decomposition record before rerunning."
+        )
+    handoffs = tuple(
+        handoff
+        for handoff in find_phase_implementation_handoffs_for_parent(
+            parent_issue_context.comments, parent_issue=parent_issue
+        )
+        if handoff.plan_hash == plan_hash and (
+            handoff.phase_index == phase_index
+            or handoff.stage_id == stage_id
+            or handoff.child_issue_number == issue_context.number
+        )
+    )
+    if len(handoffs) > 1:
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} has multiple parent phase handoffs; repair the "
+            "handoff provenance before rerunning."
+        )
+    handoff = handoffs[0] if handoffs else None
+    if handoff is not None and (
+        handoff.child_issue_number != issue_context.number
+        or handoff.phase_index != phase_index
+        or handoff.stage_id != stage_id
+        or handoff.mode != "implement-by-phase"
+        or handoff.topology_source != EXECUTION_TOPOLOGY_SOURCE
+        or handoff.recommendation_digest != decomposition.recommendation_digest
+    ):
+        raise AgentLoopError(
+            f"Issue #{issue_context.number} phase handoff disagrees with the approved parent "
+            "topology; repair the handoff before rerunning."
+        )
+    overrides = collect_child_disposition_overrides(
+        parent_comments=parent_issue_context.comments,
+        child_comments=issue_context.comments,
+        parent_issue=parent_issue,
+        plan_hash=plan_hash,
+        topology_stage_ids=tuple(item.stage_id or "" for item in decomposition.phases),
+        routed_stage_id=stage_id,
+        child_stage_id=stage_id,
+        child_issue_number=issue_context.number,
+    )
+    route = resolve_child_execution_route(
+        phase,
+        topology_source=EXECUTION_TOPOLOGY_SOURCE,
+        recorded_handoff=handoff,
+        overrides=overrides,
+    )
+    return _FreshChildProvenance(
+        parent_issue=parent_issue,
+        plan_hash=plan_hash,
+        plan_subject=plan_subject,
+        approved_plan=approved_plan,
+        parent_plan_context=parent_plan_context,
+        recommendation=recommendation,
+        decomposition=decomposition,
+        created=CreatedPhaseIssue(
+            phase=phase,
+            issue_url=issue_context.url,
+            issue_number=issue_context.number,
+            origin="adopted",
+        ),
+        phase_index=phase_index,
+        stage_id=stage_id,
+        handoff=handoff,
+        overrides=overrides,
+        route=route,
+    )
+
+
+def _child_resume_hint(child_issue_number: int, disposition: str) -> str:
+    if disposition == EXECUTION_DISPOSITION_PLANNING:
+        return f"agent-loop issue {child_issue_number} --plan-first --plan-execution-mode auto"
+    return f"agent-loop issue {child_issue_number}"
+
+
+def _post_child_planning_handoff(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    parent_issue: int,
+    plan_hash: str,
+    plan_subject: str,
+    phase_index: int,
+    created: CreatedPhaseIssue,
+    recommendation: ExecutionStrategyRecommendation,
+    inherited_matrix_row_ids: Sequence[str],
+    override_digest: str | None,
+) -> None:
+    """Record the requires-child-planning handoff before any planning agent runs.
+
+    Both entry paths (parent first-child dispatch and direct child entry) post
+    this identical idempotent record with the same identity and override
+    digest rules, so a rerun at any later stage finds it and posts nothing.
+    """
+    post_phase_implementation_handoff_comment(
+        runner,
+        config=config,
+        parent_issue=parent_issue,
+        mode="implement-by-phase",
+        plan_hash=plan_hash,
+        phase_index=phase_index,
+        created=created,
+        strategy=recommendation.strategy,
+        topology_source=EXECUTION_TOPOLOGY_SOURCE,
+        execution_strategy_contract_version=1,
+        recommendation_digest=str(recommendation.identity()["recommendation_sha256"]),
+        plan_subject=plan_subject,
+        inherited_matrix_row_ids=inherited_matrix_row_ids,
+        execution_disposition=EXECUTION_DISPOSITION_PLANNING,
+        override_digest=override_digest,
+    )
+
+
+def _run_child_planning_cycle(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    memory,
+    usage_context: RunUsageContext,
+    parent_issue: int,
+    child_issue_number: int,
+) -> int:
+    """Run the child's own plan/review cycle (policy ``auto``) after its handoff."""
+    child_config = dataclasses_replace(config, plan_execution_mode="auto")
+    child_issue_context = get_issue_context(
+        runner, config=child_config, issue_number=child_issue_number
+    )
+    log(
+        config,
+        f"Issue #{parent_issue}: child #{child_issue_number} requires its own reviewed plan; "
+        "starting the child plan-first cycle with policy auto before any implementation coder",
+    )
+    return _run_plan_first_loop(
+        runner,
+        issue_number=child_issue_number,
+        config=child_config,
+        memory=memory,
+        issue_context=child_issue_context,
+        requested_policy="auto",
+        usage_context=usage_context,
+    )
+
+
+def _dispatch_decomposition_child(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    memory,
+    usage_context: RunUsageContext,
+    parent_issue: int,
+    approved_plan: str,
+    plan_hash: str,
+    plan_subject: str,
+    recommendation: ExecutionStrategyRecommendation | None,
+    approved_plan_context: ApprovedPlanContext,
+    created: CreatedPhaseIssue,
+    phase_index: int,
+    route: ChildExecutionRoute,
+    child_issue_context: IssueContext,
+    parent_issue_context: IssueContext,
+    coder_session_id: str | None,
+    existing_handoff: PhaseImplementationHandoffMetadata | None,
+) -> int:
+    """Dispatch one materialized child along its resolved route.
+
+    Shared by the parent implement-by-phase path and the direct child-issue
+    entry.  The handoff is persisted before any coder or planning work; when
+    a matching handoff already exists it is reused, never re-posted.
+    """
+    if created.issue_number is None:
+        raise AgentLoopError(
+            "Cannot implement decomposed phase because its child issue number "
+            "was not available from GitHub CLI output."
+        )
+    if route.is_human:
+        raise AgentLoopError(
+            f"Issue #{created.issue_number} is a {created.phase.automation} stage; no agent "
+            "implementation or planning is dispatched for human-owned stages."
+        )
+    stage_id = (
+        getattr(created.phase, "stage_id", None)
+        or str(getattr(created.phase, "position", None) or phase_index)
+    )
+    inherited_matrix_row_ids = risk_matrix_row_ids_for_owner(
+        approved_plan_context.risk_test_matrix_payload
+        if approved_plan_context.matrix_available else None,
+        stage_id,
+    )
+    if route.is_planning:
+        if recommendation is None:
+            raise AgentLoopError(
+                "Child planning requires a fresh approved-plan-v1 topology; legacy topologies "
+                "cannot route a child to planning."
+            )
+        if existing_handoff is None:
+            # Persistence before any planning agent runs.
+            _post_child_planning_handoff(
+                runner,
+                config=config,
+                parent_issue=parent_issue,
+                plan_hash=plan_hash,
+                plan_subject=plan_subject,
+                phase_index=phase_index,
+                created=created,
+                recommendation=recommendation,
+                inherited_matrix_row_ids=inherited_matrix_row_ids,
+                override_digest=route.override_digest,
+            )
+        return _run_child_planning_cycle(
+            runner,
+            config=config,
+            memory=memory,
+            usage_context=usage_context,
+            parent_issue=parent_issue,
+            child_issue_number=created.issue_number,
+        )
+    if existing_handoff is None:
+        # Persist the parent-owned assignment before child execution so
+        # PR validation and crash recovery see the same phase identity.
+        post_phase_implementation_handoff_comment(
+            runner,
+            config=config,
+            parent_issue=parent_issue,
+            mode="implement-by-phase",
+            plan_hash=plan_hash,
+            phase_index=phase_index,
+            created=created,
+            strategy=recommendation.strategy if recommendation is not None else None,
+            topology_source=EXECUTION_TOPOLOGY_SOURCE if recommendation is not None else None,
+            execution_strategy_contract_version=1 if recommendation is not None else None,
+            recommendation_digest=(
+                str(recommendation.identity()["recommendation_sha256"])
+                if recommendation is not None else None
+            ),
+            plan_subject=plan_subject,
+            inherited_matrix_row_ids=inherited_matrix_row_ids,
+            execution_disposition=(
+                EXECUTION_DISPOSITION_DIRECT if recommendation is not None else None
+            ),
+            override_digest=route.override_digest if recommendation is not None else None,
+        )
+    child_plan_context = make_approved_plan_context(
+        approved_plan,
+        source_locator=f"issue #{parent_issue} topology checkpoint phase {phase_index}",
+        expected_hash=plan_hash,
+        expected_subject=plan_subject,
+    )
+    child_plan_context = scope_approved_plan_matrix(
+        child_plan_context,
+        execution_owner=stage_id,
+        valid_stage_ids=tuple(
+            phase.stage_id or str(phase.position)
+            for phase in recommendation.child_stages
+        ) if recommendation is not None else (),
+    )
+    return _implement_approved_issue(
+        runner,
+        issue_number=created.issue_number,
+        approved_plan=created.phase.parent_context or approved_plan,
+        config=config,
+        memory=memory,
+        issue_context=child_issue_context,
+        approved_plan_context=child_plan_context,
+        parent_issue_context=parent_issue_context,
+        coder_session_id=coder_session_id,
+        usage_context=usage_context,
+        execution_recommendation=recommendation,
+    )
+
+
+def _dispatch_first_decomposition_phase(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    memory,
+    usage_context: RunUsageContext,
+    issue_number: int,
+    current_plan: str,
+    plan_subject: str,
+    created: Sequence[CreatedPhaseIssue],
+    recommendation: ExecutionStrategyRecommendation | None,
+    approved_plan_context: ApprovedPlanContext,
+    issue_context: IssueContext,
+    mode: str,
+    coder_session_id: str | None,
+) -> int:
+    """Route and dispatch the first phase after implement-by-phase decomposition."""
+    first_agent_phase = next(
+        (item for item in created if item.phase.automation == "agent-pr"),
+        None,
+    )
+    first_phase = created[0] if created else None
+    if first_phase is None:
+        raise AgentLoopError("Plan decomposition produced no phases.")
+    plan_hash = approved_plan_hash(current_plan)
+    fresh = recommendation is not None
+    topology_stage_ids = tuple(
+        getattr(item.phase, "stage_id", None) or str(index)
+        for index, item in enumerate(created, start=1)
+    )
+    first_stage_id = topology_stage_ids[0]
+    if first_phase.phase.automation != "agent-pr":
+        if fresh and not config.dry_run:
+            # Stage-scoped validation: an override naming the human stage is a
+            # human-decision error; a valid override for another stage is
+            # neither an error nor an input here.
+            child_comments: Sequence[object] = ()
+            if first_phase.issue_number is not None:
+                child_comments = get_issue_context(
+                    runner, config=config, issue_number=first_phase.issue_number
+                ).comments
+            overrides = collect_child_disposition_overrides(
+                parent_comments=issue_context.comments,
+                child_comments=child_comments,
+                parent_issue=issue_number,
+                plan_hash=plan_hash,
+                topology_stage_ids=topology_stage_ids,
+                routed_stage_id=first_stage_id,
+                child_stage_id=first_stage_id,
+                child_issue_number=first_phase.issue_number,
+            )
+            resolve_child_execution_route(
+                first_phase.phase,
+                topology_source=EXECUTION_TOPOLOGY_SOURCE,
+                recorded_handoff=None,
+                overrides=overrides,
+            )
+        print(
+            f"Issue #{issue_number} approved plan decomposed; first phase requires human work "
+            f"({first_phase.phase.automation}), so implementation is stopping."
+        )
+        return 0
+    if config.dry_run:
+        declared = getattr(first_phase.phase, "execution_disposition", None) or "legacy-ambiguous"
+        print(
+            f"Issue #{issue_number} dry-run decomposed the approved plan; "
+            "phase implementation is not started. "
+            f"First phase `{first_stage_id}` declared disposition: {declared}."
+        )
+        return 0
+    if first_agent_phase is None or first_agent_phase.issue_number is None:
+        raise AgentLoopError(
+            "Cannot implement first decomposed phase because its child issue number "
+            "was not available from GitHub CLI output."
+        )
+    parent_issue_context = get_issue_context(
+        runner, config=config, issue_number=issue_number
+    )
+    handoff = find_existing_phase_implementation_handoff(
+        parent_issue_context.comments,
+        parent_issue=issue_number,
+        plan_hash=plan_hash,
+        mode=mode,
+        phase_index=1,
+        child_issue_number=first_agent_phase.issue_number,
+    )
+    if not fresh:
+        if handoff is not None:
+            print(
+                f"Issue #{issue_number} approved plan already handed off to child issue "
+                f"#{handoff.child_issue_number}; resume directly with "
+                f"`agent-loop issue {handoff.child_issue_number}`."
+            )
+            return 0
+        route = ChildExecutionRoute(EXECUTION_DISPOSITION_DIRECT, None, "legacy-topology")
+        overrides: tuple[ChildDispositionOverride, ...] = ()
+    else:
+        child_issue_context = get_issue_context(
+            runner, config=config, issue_number=first_agent_phase.issue_number
+        )
+        overrides = collect_child_disposition_overrides(
+            parent_comments=parent_issue_context.comments,
+            child_comments=child_issue_context.comments,
+            parent_issue=issue_number,
+            plan_hash=plan_hash,
+            topology_stage_ids=topology_stage_ids,
+            routed_stage_id=first_stage_id,
+            child_stage_id=first_stage_id,
+            child_issue_number=first_agent_phase.issue_number,
+        )
+        route = resolve_child_execution_route(
+            first_agent_phase.phase,
+            topology_source=EXECUTION_TOPOLOGY_SOURCE,
+            recorded_handoff=handoff,
+            overrides=overrides,
+        )
+        if handoff is not None:
+            # Reconciliation ran inside the seam; the hint follows the
+            # recorded route so it never guides into the conflicting form.
+            print(
+                f"Issue #{issue_number} approved plan already handed off to child issue "
+                f"#{handoff.child_issue_number} with disposition `{route.disposition}`; "
+                f"resume directly with `{_child_resume_hint(handoff.child_issue_number, route.disposition)}`."
+            )
+            return 0
+    if not fresh:
+        child_issue_context = get_issue_context(
+            runner, config=config, issue_number=first_agent_phase.issue_number
+        )
+    return _dispatch_decomposition_child(
+        runner,
+        config=config,
+        memory=memory,
+        usage_context=usage_context,
+        parent_issue=issue_number,
+        approved_plan=current_plan,
+        plan_hash=plan_hash,
+        plan_subject=plan_subject,
+        recommendation=recommendation,
+        approved_plan_context=approved_plan_context,
+        created=first_agent_phase,
+        phase_index=1,
+        route=route,
+        child_issue_context=child_issue_context,
+        parent_issue_context=parent_issue_context,
+        coder_session_id=coder_session_id,
+        existing_handoff=handoff,
+    )
+
+
 def _print_dry_run_execution_preview(
     *,
     issue_number: int,
@@ -4924,6 +5616,14 @@ def _print_dry_run_execution_preview(
             f"{phase.position}. {phase.stage_id}: {phase.title} "
             f"[{phase.automation}]; depends on: {dependencies}; covers: {covered}"
         )
+        declared = phase.execution_disposition or "legacy-ambiguous"
+        try:
+            route_text = resolve_child_execution_route(
+                phase, topology_source=EXECUTION_TOPOLOGY_SOURCE
+            ).disposition
+        except AgentLoopError as exc:
+            route_text = f"human decision required ({exc})"
+        print(f"   declared disposition: {declared}; resolved route: {route_text}")
     first = decomposition.phases[0] if decomposition.phases else None
     if first is None:
         print("No first phase is available; dispatch is skipped.")
@@ -5269,6 +5969,26 @@ def _preflight_fresh_staged_topology(
             raise AgentLoopError(
                 "Fresh staged phase implementation handoff does not match its canonical child phase."
             )
+        # Shared reconciliation rule (#808). Always discover signed records:
+        # an equal phase/handoff disposition still must reject an override
+        # added after dispatch, and an override-bound handoff must prove that
+        # its exact record remains discoverable and unsuperseded.
+        child_comments: Sequence[object] = ()
+        if adopted.issue_number is not None and not config.dry_run:
+            child_comments = get_issue_context(
+                runner, config=config, issue_number=adopted.issue_number
+            ).comments
+        stage_overrides = collect_child_disposition_overrides(
+            parent_comments=issue_context.comments,
+            child_comments=child_comments,
+            parent_issue=issue_number,
+            plan_hash=plan_hash,
+            topology_stage_ids=tuple(item.stage_id or "" for item in decomposition.phases),
+            routed_stage_id=phase.stage_id or "",
+            child_stage_id=phase.stage_id,
+            child_issue_number=adopted.issue_number,
+        )
+        reconcile_handoff_disposition(phase, handoff, stage_overrides)
     return preflight_children
 
 
@@ -7625,6 +8345,26 @@ def _run_plan_first_loop(
             )
             mode = resolved_execution.action
             canonical_strategy = resolved_execution.strategy
+            if (
+                canonical_strategy == "staged"
+                and mode != "plan-only"
+                and staged_parent_number is not None
+                and _fresh_phase_marker_payload(issue_context) is not None
+            ):
+                # Nested-topology guard (#808): a planning child whose own
+                # reviewed recommendation is staged stops for a human decision
+                # before any decision record, checkpoint, summary, child
+                # issue, handoff, or coder work.  Hierarchical execution is
+                # tracked in #720.
+                nested = NestedTopologyDecision(
+                    parent_issue=staged_parent_number,
+                    child_issue=issue_number,
+                    plan_hash=plan_hash,
+                    requested_policy=resolved_execution.requested_policy,
+                )
+                log(config, str(nested))
+                print(json.dumps(nested.as_dict(), sort_keys=True))
+                return 2
             normalized_topology = None
             if recommendation is not None and canonical_strategy == "staged":
                 normalized_topology = normalize_execution_recommendation(
@@ -7777,118 +8517,20 @@ def _run_plan_first_loop(
                 if mode == "decompose-only":
                     print(f"Issue #{issue_number} approved plan decomposed into child issues.")
                     return 0
-                first_agent_phase = next(
-                    (item for item in created if item.phase.automation == "agent-pr"),
-                    None,
-                )
-                first_phase = created[0] if created else None
-                if first_phase is None:
-                    raise AgentLoopError("Plan decomposition produced no phases.")
-                if first_phase.phase.automation != "agent-pr":
-                    print(
-                        f"Issue #{issue_number} approved plan decomposed; first phase requires human work "
-                        f"({first_phase.phase.automation}), so implementation is stopping."
-                    )
-                    return 0
-                if config.dry_run:
-                    print(
-                        f"Issue #{issue_number} dry-run decomposed the approved plan; "
-                        "phase implementation is not started."
-                    )
-                    return 0
-                if first_agent_phase is None or first_agent_phase.issue_number is None:
-                    raise AgentLoopError(
-                        "Cannot implement first decomposed phase because its child issue number "
-                        "was not available from GitHub CLI output."
-                    )
-                parent_issue_context = get_issue_context(
-                    runner, config=config, issue_number=issue_number
-                )
-                plan_hash = approved_plan_hash(current_plan)
-                handoff = find_existing_phase_implementation_handoff(
-                    issue_context.comments,
-                    parent_issue=issue_number,
-                    plan_hash=plan_hash,
-                    mode=mode,
-                    phase_index=1,
-                    child_issue_number=first_agent_phase.issue_number,
-                )
-                if handoff is not None:
-                    print(
-                        f"Issue #{issue_number} approved plan already handed off to child issue "
-                        f"#{handoff.child_issue_number}; resume directly with "
-                        f"`agent-loop issue {handoff.child_issue_number}`."
-                    )
-                    return 0
-                child_issue_context = get_issue_context(
+                return _dispatch_first_decomposition_phase(
                     runner,
-                    config=config,
-                    issue_number=first_agent_phase.issue_number,
-                )
-                phase_parent_context = first_agent_phase.phase.parent_context or current_plan
-                first_stage_id = (
-                    getattr(first_agent_phase.phase, "stage_id", None)
-                    or str(getattr(first_agent_phase.phase, "position", 1))
-                )
-                inherited_matrix_row_ids = risk_matrix_row_ids_for_owner(
-                    approved_plan_context.risk_test_matrix_payload
-                    if approved_plan_context.matrix_available else None,
-                    first_stage_id,
-                )
-                # Persist the parent-owned assignment before child execution so
-                # PR validation and crash recovery see the same phase identity.
-                post_phase_implementation_handoff_comment(
-                    runner,
-                    config=config,
-                    parent_issue=issue_number,
-                    mode=mode,
-                    plan_hash=plan_hash,
-                    phase_index=1,
-                    created=first_agent_phase,
-                    strategy=(
-                        recommendation.strategy
-                        if recommendation is not None else None
-                    ),
-                    topology_source=(
-                        EXECUTION_TOPOLOGY_SOURCE
-                        if recommendation is not None else None
-                    ),
-                    execution_strategy_contract_version=(
-                        1 if recommendation is not None else None
-                    ),
-                    recommendation_digest=(
-                        str(recommendation.identity()["recommendation_sha256"])
-                        if recommendation is not None else None
-                    ),
-                    plan_subject=plan_subject,
-                    inherited_matrix_row_ids=inherited_matrix_row_ids,
-                )
-                child_plan_context = make_approved_plan_context(
-                    current_plan,
-                    source_locator=f"issue #{issue_number} topology checkpoint phase 1",
-                    expected_hash=plan_hash,
-                    expected_subject=plan_subject,
-                )
-                child_plan_context = scope_approved_plan_matrix(
-                    child_plan_context,
-                    execution_owner=first_stage_id,
-                    valid_stage_ids=tuple(
-                        phase.stage_id or str(phase.position)
-                        for phase in recommendation.child_stages
-                    ) if recommendation is not None else (),
-                )
-                return _implement_approved_issue(
-                    runner,
-                    issue_number=first_agent_phase.issue_number,
-                    approved_plan=phase_parent_context,
                     config=config,
                     memory=memory,
-                    issue_context=child_issue_context,
-                    approved_plan_context=child_plan_context,
-                    parent_issue_context=parent_issue_context,
-                    coder_session_id=coder_session_id,
                     usage_context=usage_context,
-                    execution_recommendation=recommendation,
+                    issue_number=issue_number,
+                    current_plan=current_plan,
+                    plan_subject=plan_subject,
+                    created=created,
+                    recommendation=recommendation,
+                    approved_plan_context=approved_plan_context,
+                    issue_context=issue_context,
+                    mode=mode,
+                    coder_session_id=coder_session_id,
                 )
 
             if mode == "implement-one-shot":
@@ -7912,6 +8554,15 @@ def _run_plan_first_loop(
                 target_issue_number = issue_number
                 target_issue_context = issue_context
                 staged_parent_issue: int | None = None
+                if (
+                    staged_parent_number is not None
+                    and parent_issue_context is not None
+                    and _fresh_phase_marker_payload(issue_context) is not None
+                ):
+                    # A separately planned decomposition child (#808)
+                    # implements its own one-shot recommendation with the
+                    # parent recorded as the staged parent.
+                    staged_parent_issue = staged_parent_number
                 # Explicit child stages are the parent plan's bounded remainder;
                 # legacy deferred entries preserve the same historical parent-owned
                 # behavior. Dependencies/actions alone must not suppress handoff.
@@ -8368,6 +9019,94 @@ def run_issue_loop(
             if staged_parent_issue is not None
             else None
         )
+
+        # Direct child-issue entry (#808): a materialized fresh decomposition
+        # child is routed through the same seam as parent dispatch.  CLI flags
+        # never switch a recorded or declared route.
+        fresh_child = _resolve_fresh_child_provenance(
+            issue_context=issue_context,
+            parent_issue_context=parent_issue_context,
+        )
+        if fresh_child is not None:
+            route = fresh_child.route
+            log(
+                config,
+                f"Issue #{issue_number}: fresh decomposition child of #{fresh_child.parent_issue} "
+                f"stage `{fresh_child.stage_id}` resolved route `{route.disposition}` "
+                f"(origin={route.origin})",
+            )
+            if route.is_human:
+                raise AgentLoopError(
+                    f"Issue #{issue_number} is stage `{fresh_child.stage_id}` of parent "
+                    f"#{fresh_child.parent_issue} with automation "
+                    f"`{fresh_child.created.phase.automation}`; human-owned stages are never "
+                    "implemented or planned by agent-loop."
+                )
+            if route.is_direct:
+                if plan_first:
+                    raise AgentLoopError(
+                        f"Issue #{issue_number} is stage `{fresh_child.stage_id}` of parent "
+                        f"#{fresh_child.parent_issue} with "
+                        f"{'recorded' if fresh_child.handoff is not None else 'reviewed'} "
+                        "disposition `direct-implementation`; `--plan-first` cannot switch it to "
+                        f"child planning. Rerun `agent-loop issue {issue_number}` without "
+                        "`--plan-first`, or (before dispatch) post a signed "
+                        "child-execution-disposition-override record on the parent issue."
+                    )
+                memory = prepare_agent_memory(runner, config)
+                return _dispatch_decomposition_child(
+                    runner,
+                    config=config,
+                    memory=memory,
+                    usage_context=usage_context,
+                    parent_issue=fresh_child.parent_issue,
+                    approved_plan=fresh_child.approved_plan,
+                    plan_hash=fresh_child.plan_hash,
+                    plan_subject=fresh_child.plan_subject,
+                    recommendation=fresh_child.recommendation,
+                    approved_plan_context=fresh_child.parent_plan_context,
+                    created=fresh_child.created,
+                    phase_index=fresh_child.phase_index,
+                    route=route,
+                    child_issue_context=issue_context,
+                    parent_issue_context=parent_issue_context,
+                    coder_session_id=None,
+                    existing_handoff=fresh_child.handoff,
+                )
+            if not plan_first:
+                raise AgentLoopError(
+                    f"Issue #{issue_number} is stage `{fresh_child.stage_id}` of parent "
+                    f"#{fresh_child.parent_issue} with "
+                    f"{'recorded' if fresh_child.handoff is not None else 'reviewed'} "
+                    "disposition `requires-child-planning`; plain issue mode cannot switch it to "
+                    "direct implementation. Rerun "
+                    f"`{_child_resume_hint(issue_number, EXECUTION_DISPOSITION_PLANNING)}`, or "
+                    "(before dispatch) post a signed child-execution-disposition-override record "
+                    "on the parent issue."
+                )
+            if fresh_child.handoff is None and not config.dry_run:
+                # Post the planning handoff before any planning agent runs,
+                # using the same identity and override-digest rules as
+                # parent dispatch; a rerun finds it and posts nothing new.
+                _post_child_planning_handoff(
+                    runner,
+                    config=config,
+                    parent_issue=fresh_child.parent_issue,
+                    plan_hash=fresh_child.plan_hash,
+                    plan_subject=fresh_child.plan_subject,
+                    phase_index=fresh_child.phase_index,
+                    created=fresh_child.created,
+                    recommendation=fresh_child.recommendation,
+                    inherited_matrix_row_ids=risk_matrix_row_ids_for_owner(
+                        fresh_child.parent_plan_context.risk_test_matrix_payload
+                        if fresh_child.parent_plan_context.matrix_available else None,
+                        fresh_child.stage_id,
+                    ),
+                    override_digest=route.override_digest,
+                )
+                parent_issue_context = get_issue_context(
+                    runner, config=config, issue_number=fresh_child.parent_issue
+                )
 
         recovered_plan_hash: str | None = None
         recovered_plan_additions: tuple[int, ...] | None = None
@@ -11022,6 +11761,7 @@ def run_pr_loop(
             # full-matrix path without relying on branch-local state.
             fresh_phase = False
             phase_handoff = None
+            handoff_disposition = None
             stable_stage_id = None
             normalized = None
             if issue_handoff is not None and issue_handoff.pr_number != pr_number:
@@ -11250,13 +11990,33 @@ def run_pr_loop(
                                         "Fresh decomposition child implementation handoff has an "
                                         "unbound or incomplete parent matrix assignment."
                                     )
+                                if phase_handoff is not None:
+                                    # Shared reconciliation rule (#808): the
+                                    # PR binds to the reconciled handoff
+                                    # disposition, never to the phase alone.
+                                    stage_overrides = collect_child_disposition_overrides(
+                                        parent_comments=parent_issue_context.comments,
+                                        child_comments=issue_context.comments,
+                                        parent_issue=parent_issue_context.number,
+                                        plan_hash=phase_plan_hash,
+                                        topology_stage_ids=tuple(
+                                            item.stage_id or "" for item in normalized.phases
+                                        ),
+                                        routed_stage_id=stable_stage_id,
+                                        child_stage_id=stable_stage_id,
+                                        child_issue_number=issue_context.number,
+                                    )
+                                    handoff_disposition = reconcile_handoff_disposition(
+                                        phase, phase_handoff, stage_overrides
+                                    )
                                 if phase_handoff is not None and (
                                     phase_handoff.plan_hash != phase_plan_hash
                                     or phase_handoff.mode != "implement-by-phase"
                                     or phase_handoff.child_issue_number != issue_context.number
                                     or phase_handoff.phase_index != phase_index
                                     or (
-                                        issue_handoff is not None
+                                        handoff_disposition == EXECUTION_DISPOSITION_DIRECT
+                                        and issue_handoff is not None
                                         and issue_handoff.plan_hash != phase_plan_hash
                                     )
                                     or phase_handoff.strategy != "staged"
@@ -11277,6 +12037,45 @@ def run_pr_loop(
                                         "Fresh decomposition child phase has no matching canonical "
                                         "implementation handoff."
                                     )
+                                if handoff_disposition == EXECUTION_DISPOSITION_PLANNING:
+                                    # A planning child's PR binds to its
+                                    # reviewed child plan hash; the parent
+                                    # identity, summary, and inherited rows
+                                    # were validated above.
+                                    if (
+                                        issue_handoff is None
+                                        or not issue_handoff.plan_hash
+                                        or issue_handoff.plan_hash == phase_plan_hash
+                                    ):
+                                        raise AgentLoopError(
+                                            "Fresh decomposition child phase was routed to child "
+                                            "planning, but its issue-to-PR handoff copies the parent "
+                                            "phase hash instead of a reviewed child plan hash; a "
+                                            "parent-hash copy is never child provenance."
+                                        )
+                                    child_plan_context = recover_approved_plan_context(
+                                        issue_context.comments,
+                                        expected_hash=issue_handoff.plan_hash,
+                                    )
+                                    if (
+                                        not child_plan_context.is_available
+                                        or not child_plan_context.canonical_text
+                                    ):
+                                        raise AgentLoopError(
+                                            "Fresh decomposition child phase was routed to child "
+                                            f"planning, but no reviewed approved child plan "
+                                            f"{issue_handoff.plan_hash} is recoverable on the child "
+                                            "issue; repair the child plan round or the issue-to-PR "
+                                            "provenance."
+                                        )
+                                    validate_separately_planned_child_matrix(
+                                        parent_plan_context.risk_test_matrix_payload
+                                        if parent_plan_context.matrix_available else None,
+                                        child_plan_context.risk_test_matrix_payload
+                                        if child_plan_context.matrix_available else None,
+                                        execution_owner=stable_stage_id,
+                                    )
+                                    approved_plan_context = child_plan_context
                                 if phase_handoff is None:
                                     # A fresh child phase without a parent-owned
                                     # implementation handoff is independently
@@ -11384,6 +12183,7 @@ def run_pr_loop(
                     if (
                         fresh_phase
                         and phase_handoff is not None
+                        and handoff_disposition == EXECUTION_DISPOSITION_DIRECT
                         and approved_plan_context.matrix_available
                     ):
                         approved_plan_context = scope_approved_plan_matrix(

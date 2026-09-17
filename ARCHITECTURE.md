@@ -174,6 +174,28 @@ bounded to the first eligible `agent-pr` child while the parent remains open.
 Repair may preserve a complete v1 source, but cannot synthesize missing
 recommendation data.
 
+Each fresh staged child also carries a reviewed execution disposition. The
+planner chooses `direct-implementation`, `requires-child-planning`, or the
+automation-bound `human-owned` stop, and plan reviewers approve that semantic
+claim. The orchestrator's routing seam validates typed readiness fields and
+approved-parent provenance, applies at most one topology-valid signed override,
+and otherwise fails ambiguous legacy metadata closed to planning. Overrides
+cannot provide readiness evidence. Direct children bind implementation and PR
+provenance to the parent phase; planning children persist a planning handoff
+before invoking a child plan/review cycle and later bind their PR to that
+reviewed child plan.
+
+The phase handoff is the durable no-switch boundary. Its effective disposition
+and optional override-record digest are reconciled identically during parent
+preflight, direct child entry, PR recovery, and skill-mode recovery. An
+override-bound mismatch is accepted only while the exact signed record remains
+discoverable and matches the parent, plan, stage, and disposition; edited,
+deleted, post-handoff, conflicting, or superseding records stop for human
+repair. Human-owned stages bypass handoff reconciliation and preserve their
+existing stop. A planning child that recommends another staged topology stops
+before decision persistence or decomposition because hierarchical execution is
+owned by #720.
+
 ### Review and Feedback
 
 All selected reviewers receive the same pre-round snapshot. Parallel execution

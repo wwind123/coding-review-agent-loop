@@ -1,6 +1,7 @@
 import json
 import re
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -13,6 +14,8 @@ from coding_review_agent_loop.comment_rendering import (
 )
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
+    PhaseImplementationHandoffMetadata,
+    PlanPhase,
     RecordedPhase,
     approved_plan_hash,
     format_decomposition_parent_summary,
@@ -61,6 +64,8 @@ from coding_review_agent_loop.prompts import (
 import coding_review_agent_loop.test_runtime as runtime
 from coding_review_agent_loop.protocol_markers import PR_BODY_SURFACE
 from coding_review_agent_loop.protocol import (
+    EXECUTION_DISPOSITION_DIRECT,
+    EXECUTION_DISPOSITION_PLANNING,
     ApprovedFollowup,
     ParsedPlanReview,
     PlanReviewItems,
@@ -69,6 +74,176 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
     validate_structured_issue_implementation,
 )
+
+
+def _fresh_child_route_fixture(disposition, *, handoff=None):
+    phase = PlanPhase(
+        title="Child", scope="Implement child.", non_goals="No unrelated work.",
+        dependency_notes="No dependencies.", rollout_risk="low",
+        validation="Run focused tests.", parent_context="Approved slice.",
+        automation="agent-pr", stage_id="stage-one", position=1,
+        deliverables=("Child",), non_goals_items=("Unrelated work",),
+        acceptance_criteria=("Tests pass",), compatibility_constraints=("Preserve API",),
+        covered_scope_item_ids=("scope-1",), execution_disposition=disposition,
+        disposition_rationale="Reviewed route.",
+    )
+    route = orchestrator_module.resolve_child_execution_route(
+        phase, topology_source="approved-plan-v1", recorded_handoff=handoff
+    )
+    issue = IssueContext(
+        number=56, repo="OWNER/REPO", title="Child", body="Child", url="child-url", comments=()
+    )
+    parent = replace(issue, number=55, title="Parent", url="parent-url")
+    return SimpleNamespace(
+        parent_issue=55, plan_hash="plan-hash", plan_subject="plan-subject",
+        approved_plan="Approved parent plan", parent_plan_context=SimpleNamespace(
+            matrix_available=False, risk_test_matrix_payload=None
+        ), recommendation=SimpleNamespace(
+            strategy="staged", identity=lambda: {"recommendation_sha256": "digest"},
+            child_stages=(phase,),
+        ), decomposition=SimpleNamespace(phases=(phase,)),
+        created=CreatedPhaseIssue(phase=phase, issue_url=issue.url, issue_number=56),
+        phase_index=1, stage_id="stage-one", handoff=handoff, overrides=(), route=route,
+    ), issue, parent
+
+
+@pytest.mark.parametrize(
+    ("disposition", "plan_first", "message"),
+    [
+        (EXECUTION_DISPOSITION_PLANNING, False, "--plan-first --plan-execution-mode auto"),
+        (EXECUTION_DISPOSITION_DIRECT, True, "without `--plan-first`"),
+    ],
+)
+def test_fresh_child_issue_flags_cannot_switch_reviewed_route(
+    tmp_path, monkeypatch, disposition, plan_first, message
+):
+    fresh, issue, parent = _fresh_child_route_fixture(disposition)
+    monkeypatch.setattr(
+        orchestrator_module, "get_issue_context",
+        lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
+    )
+    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
+    with pytest.raises(AgentLoopError, match=re.escape(message)):
+        run_issue_loop(
+            _FakeRunner(), issue_number=56, config=make_config(tmp_path), plan_first=plan_first
+        )
+
+
+def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
+    tmp_path, monkeypatch
+):
+    fresh, issue, parent = _fresh_child_route_fixture(EXECUTION_DISPOSITION_PLANNING)
+    override_digest = "d" * 64
+    fresh.route = replace(fresh.route, override_digest=override_digest)
+    events = []
+    handoff_calls = []
+    monkeypatch.setattr(
+        orchestrator_module, "get_issue_context",
+        lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
+    )
+    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
+    monkeypatch.setattr(
+        orchestrator_module, "_post_child_planning_handoff",
+        lambda *_args, **kwargs: (handoff_calls.append(kwargs), events.append("handoff")),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "_run_plan_first_loop",
+        lambda *_args, **_kwargs: events.append("planner") or 19,
+    )
+    assert run_issue_loop(
+        _FakeRunner(), issue_number=56, config=make_config(tmp_path), plan_first=True
+    ) == 19
+    assert events == ["handoff", "planner"]
+    assert len(handoff_calls) == 1
+    assert handoff_calls[0]["parent_issue"] == 55
+    assert handoff_calls[0]["plan_hash"] == "plan-hash"
+    assert handoff_calls[0]["plan_subject"] == "plan-subject"
+    assert handoff_calls[0]["phase_index"] == 1
+    assert handoff_calls[0]["created"] == fresh.created
+    assert handoff_calls[0]["recommendation"] == fresh.recommendation
+    assert handoff_calls[0]["inherited_matrix_row_ids"] == ()
+    assert handoff_calls[0]["override_digest"] == override_digest
+
+    recorded = PhaseImplementationHandoffMetadata(
+        parent_issue=55, plan_hash="plan-hash", mode="implement-by-phase",
+        phase_index=1, phase_title="Child", automation="agent-pr",
+        child_issue_number=56, child_issue_url="child-url", strategy="staged",
+        topology_source="approved-plan-v1", execution_strategy_contract_version=1,
+        recommendation_digest="digest", stage_id="stage-one", plan_subject="plan-subject",
+        execution_disposition=EXECUTION_DISPOSITION_PLANNING,
+    )
+    resumed, _, _ = _fresh_child_route_fixture(
+        EXECUTION_DISPOSITION_PLANNING, handoff=recorded
+    )
+    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: resumed)
+    assert run_issue_loop(
+        _FakeRunner(), issue_number=56, config=make_config(tmp_path), plan_first=True
+    ) == 19
+    assert events == ["handoff", "planner", "planner"]
+
+
+def test_direct_child_entry_dispatches_through_shared_child_dispatch(tmp_path, monkeypatch):
+    fresh, issue, parent = _fresh_child_route_fixture(EXECUTION_DISPOSITION_DIRECT)
+    calls = []
+    monkeypatch.setattr(
+        orchestrator_module, "get_issue_context",
+        lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
+    )
+    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
+    monkeypatch.setattr(orchestrator_module, "prepare_agent_memory", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator_module, "_dispatch_decomposition_child",
+        lambda *_args, **kwargs: calls.append(kwargs) or 23,
+    )
+    assert run_issue_loop(_FakeRunner(), issue_number=56, config=make_config(tmp_path)) == 23
+    assert len(calls) == 1
+    assert calls[0]["route"].is_direct
+    assert calls[0]["existing_handoff"] is None
+
+
+@pytest.mark.parametrize(
+    ("disposition", "expected_hint"),
+    [
+        (
+            EXECUTION_DISPOSITION_PLANNING,
+            "agent-loop issue 56 --plan-first --plan-execution-mode auto",
+        ),
+        (EXECUTION_DISPOSITION_DIRECT, "agent-loop issue 56`"),
+    ],
+)
+def test_parent_rerun_resume_hint_follows_recorded_disposition(
+    tmp_path, monkeypatch, capsys, disposition, expected_hint
+):
+    fresh, child, parent = _fresh_child_route_fixture(disposition)
+    handoff = PhaseImplementationHandoffMetadata(
+        parent_issue=55, plan_hash="plan-hash", mode="implement-by-phase",
+        phase_index=1, phase_title="Child", automation="agent-pr",
+        child_issue_number=56, child_issue_url="child-url", strategy="staged",
+        topology_source="approved-plan-v1", execution_strategy_contract_version=1,
+        recommendation_digest="digest", stage_id="stage-one", plan_subject="plan-subject",
+        execution_disposition=disposition,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "find_existing_phase_implementation_handoff",
+        lambda *_args, **_kwargs: handoff,
+    )
+    result = orchestrator_module._dispatch_first_decomposition_phase(
+        _FakeRunner(), config=make_config(tmp_path), memory=None,
+        usage_context=SimpleNamespace(), issue_number=55,
+        current_plan="Approved parent plan", plan_subject="plan-subject",
+        created=(fresh.created,), recommendation=fresh.recommendation,
+        approved_plan_context=fresh.parent_plan_context, issue_context=parent,
+        mode="implement-by-phase", coder_session_id=None,
+    )
+    assert result == 0
+    assert expected_hint in capsys.readouterr().out
 from coding_review_agent_loop.salvage import (
     SalvageContext,
     capture_salvage_artifacts,

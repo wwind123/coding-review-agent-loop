@@ -8,6 +8,7 @@ import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
+    PlanPhase,
     RecordedPhase,
     approved_plan_hash,
     format_one_shot_impl_handoff_comment,
@@ -102,14 +103,19 @@ def _fresh_v1_plan_for_isolation(strategy: str) -> str:
                 "title": "Intermediate behavior",
                 "summary": "Deliver the independently verifiable intermediate behavior.",
                 "deliverables": ["The intermediate behavior."],
-                "non_goals": [],
+                "non_goals": ["Do not change unrelated behavior."],
                 "acceptance_criteria": ["The intermediate behavior passes."],
                 "depends_on_stage_ids": [],
                 "dependency_notes": "No dependencies.",
                 "automation": "agent-pr",
                 "rollout_risk": "low",
-                "compatibility_constraints": [],
+                "compatibility_constraints": ["Preserve existing callers."],
                 "covered_scope_item_ids": ["scope-1"],
+                "execution_disposition": {
+                    "disposition": "direct-implementation",
+                    "rationale": "The reviewed stage is a complete implementation contract.",
+                    "unresolved_design_decisions": [],
+                },
             }],
             "final_integration_work": {
                 "status": "required",
@@ -185,7 +191,27 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         events.append("decompose")
         return (
             CreatedPhaseIssue(
-                phase=RecordedPhase(title="legacy-model-phase", automation="agent-pr"),
+                    phase=PlanPhase(
+                        title="Intermediate behavior",
+                        scope="Deliver the independently verifiable behavior.",
+                        non_goals="Do not change unrelated behavior.",
+                        dependency_notes="No dependencies.",
+                        rollout_risk="low",
+                        validation="Run focused tests.",
+                        parent_context="Approved parent stage.",
+                        automation="agent-pr",
+                        stage_id="stage-1",
+                        position=1,
+                        deliverables=("The intermediate behavior.",),
+                        non_goals_items=("Do not change unrelated behavior.",),
+                        acceptance_criteria=("The intermediate behavior passes.",),
+                        compatibility_constraints=("Preserve existing callers.",),
+                        covered_scope_item_ids=("scope-1",),
+                        execution_disposition="direct-implementation",
+                        disposition_rationale=(
+                            "The reviewed stage is a complete implementation contract."
+                        ),
+                    ),
                 issue_url="https://github.com/OWNER/REPO/issues/101",
                 issue_number=101,
             ),
@@ -355,6 +381,64 @@ def test_fresh_one_shot_materialization_rerun_reuses_split_child_and_pr(
 @pytest.mark.parametrize("strategy", ["one-shot", "staged"])
 def test_auto_dry_run_previews_without_approval_bound_mutation(tmp_path, capsys, strategy):
     plan = _fresh_v1_plan_for_isolation(strategy)
+    if strategy == "staged":
+        payload, end = json.JSONDecoder().raw_decode(plan.lstrip())
+        recommendation = payload["execution_recommendation"]
+        recommendation["scope_items"].extend([
+            {
+                "scope_item_id": "scope-3",
+                "requirement": "Resolve child design choices.",
+                "acceptance_criteria": ["The child plan is reviewed."],
+            },
+            {
+                "scope_item_id": "scope-4",
+                "requirement": "Complete the operator-owned rollout.",
+                "acceptance_criteria": ["The operator confirms rollout."],
+            },
+        ])
+        recommendation["child_stages"].extend([
+            {
+                "stage_id": "stage-2",
+                "position": 2,
+                "title": "Design-dependent behavior",
+                "summary": "Review unresolved child design choices.",
+                "deliverables": ["A reviewed child plan."],
+                "non_goals": ["Do not implement before review."],
+                "acceptance_criteria": ["The child plan is approved."],
+                "depends_on_stage_ids": ["stage-1"],
+                "dependency_notes": "Starts after stage 1.",
+                "automation": "agent-pr",
+                "rollout_risk": "medium",
+                "compatibility_constraints": ["Preserve stage 1 behavior."],
+                "covered_scope_item_ids": ["scope-3"],
+                "execution_disposition": {
+                    "disposition": "requires-child-planning",
+                    "rationale": "The child must resolve a reviewed design choice.",
+                    "unresolved_design_decisions": ["Choose the final adapter."],
+                },
+            },
+            {
+                "stage_id": "stage-3",
+                "position": 3,
+                "title": "Operator rollout",
+                "summary": "Complete the operator-owned rollout.",
+                "deliverables": ["Operator rollout."],
+                "non_goals": ["Do not automate the operator decision."],
+                "acceptance_criteria": ["The operator confirms rollout."],
+                "depends_on_stage_ids": ["stage-2"],
+                "dependency_notes": "Starts after the reviewed child plan.",
+                "automation": "human-action",
+                "rollout_risk": "medium",
+                "compatibility_constraints": ["Preserve automated stages."],
+                "covered_scope_item_ids": ["scope-4"],
+                "execution_disposition": {
+                    "disposition": "human-owned",
+                    "rationale": "The final rollout requires an operator decision.",
+                    "unresolved_design_decisions": [],
+                },
+            },
+        ])
+        plan = json.dumps(payload) + plan.lstrip()[end:]
     runner = FakeRunner(
         claude_outputs=[plan],
         codex_outputs=[structured_plan_review(state="approved")],
@@ -372,7 +456,15 @@ def test_auto_dry_run_previews_without_approval_bound_mutation(tmp_path, capsys,
         plan_first=True,
     ) == 0
 
-    assert "dry-run preview" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "dry-run preview" in output
+    if strategy == "staged":
+        assert "stage-1: Intermediate behavior" in output
+        assert "declared disposition: direct-implementation; resolved route: direct-implementation" in output
+        assert "stage-2: Design-dependent behavior" in output
+        assert "declared disposition: requires-child-planning; resolved route: requires-child-planning" in output
+        assert "stage-3: Operator rollout" in output
+        assert "declared disposition: human-owned; resolved route: human" in output
     assert runner.issues == []
     assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
     assert not any("AGENT_PLAN_DECOMPOSITION" in comment for comment in runner.comments)

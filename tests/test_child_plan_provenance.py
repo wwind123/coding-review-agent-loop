@@ -11,6 +11,8 @@ from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue, PlanPhase, TopologyCheckpoint, approved_plan_hash,
     format_decomposition_parent_summary, format_phase_issue_body,
     format_phase_implementation_handoff_comment,
+    format_child_disposition_override_comment,
+    parse_child_disposition_override_records,
     PHASE_IMPLEMENTATION_MARKER_RE,
     normalize_execution_recommendation,
     format_topology_checkpoint, phase_identity,
@@ -61,7 +63,7 @@ def replace_phase_handoff_payload(body, **updates):
     return body[:marker.start("payload")] + encoded + body[marker.end("payload"):]
 
 
-def fresh_staged_plan():
+def fresh_staged_plan(*, first_disposition=None):
     raw = structured_v1_plan_state()
     payload, end = json.JSONDecoder().raw_decode(raw)
     payload["summary"] = "Fresh staged parent plan."
@@ -124,6 +126,18 @@ def fresh_staged_plan():
         },
         "caveats": [],
     }
+    if first_disposition is not None:
+        payload["execution_recommendation"]["child_stages"][0]["execution_disposition"] = {
+            "disposition": first_disposition,
+            "rationale": "The reviewed parent selects this route.",
+            "unresolved_design_decisions": [],
+        }
+        payload["execution_recommendation"]["child_stages"][0]["non_goals"] = [
+            "No unrelated changes."
+        ]
+        payload["execution_recommendation"]["child_stages"][0][
+            "compatibility_constraints"
+        ] = ["Preserve callers."]
     plan = json.dumps(payload) + raw[end:]
     from coding_review_agent_loop.protocol import validate_structured_plan_state
 
@@ -186,6 +200,9 @@ def fresh_child_contexts(
     summary_mode="implement-by-phase",
     handoff_mode="implement-by-phase",
     inherited_matrix_row_ids=(),
+    handoff_execution_disposition=None,
+    handoff_override_digest=None,
+    child_plan=None,
 ):
     raw_payload, _ = json.JSONDecoder().raw_decode(plan)
     from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
@@ -261,12 +278,28 @@ def fresh_child_contexts(
         recommendation_digest=normalized.recommendation_digest,
         plan_subject=orchestrator._plan_subject(plan),
         inherited_matrix_row_ids=inherited_matrix_row_ids,
+        execution_disposition=handoff_execution_disposition,
+        override_digest=handoff_override_digest,
     )
     parent = IssueContext(
         number=55, repo="OWNER/REPO", title="Parent", body="Parent scope.",
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary), comment(handoff)),
     )
+    if child_plan is not None:
+        child_hash = approved_plan_hash(child_plan)
+        child = dataclasses.replace(
+            child,
+            comments=(
+                comment(plan_record(child_plan)),
+                comment(format_issue_pr_handoff_comment(
+                    issue_number=56, pr_number=77,
+                    pr_url="https://github.com/OWNER/REPO/pull/77",
+                    pr_head_sha="abc123", flow="approved-plan-implementation",
+                    plan_hash=child_hash,
+                )),
+            ),
+        )
     return child, parent
 
 
@@ -479,6 +512,242 @@ def test_cli_run_pr_loop_requires_child_plan_without_parent_phase_handoff(
     with pytest.raises(AgentLoopError, match="approved child plan"):
         orchestrator.run_pr_loop(runner, pr_number=77, config=config)
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("fault", [None, "parent_hash_copy", "missing_child_plan"])
+def test_planning_handoff_pr_binds_to_distinct_reviewed_child_plan(
+    tmp_path, monkeypatch, fault
+):
+    parent_plan = fresh_staged_plan(first_disposition="requires-child-planning")
+    child_plan = "Reviewed child plan.\n\n## Scope\n- Implement the selected child design."
+    child, parent = fresh_child_contexts(
+        parent_plan,
+        handoff_execution_disposition="requires-child-planning",
+        child_plan=child_plan,
+    )
+    if fault == "parent_hash_copy":
+        child = dataclasses.replace(
+            child,
+            comments=child.comments[:-1] + (
+                comment(format_issue_pr_handoff_comment(
+                    issue_number=56, pr_number=77,
+                    pr_url="https://github.com/OWNER/REPO/pull/77",
+                    pr_head_sha="abc123", flow="approved-plan-implementation",
+                    plan_hash=approved_plan_hash(parent_plan),
+                )),
+            ),
+        )
+    elif fault == "missing_child_plan":
+        child = dataclasses.replace(child, comments=child.comments[1:])
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={
+            "number": 77, "body": "Fixes #56",
+            "url": "https://github.com/OWNER/REPO/pull/77",
+        },
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    if fault == "parent_hash_copy":
+        with pytest.raises(AgentLoopError, match="parent phase hash"):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+    elif fault == "missing_child_plan":
+        with pytest.raises(AgentLoopError, match="no reviewed approved child plan"):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+    else:
+        assert orchestrator.run_pr_loop(
+            runner, pr_number=77, config=make_config(tmp_path)
+        ) == 0
+        prompt = next(
+            command[-1] for command, _cwd in runner.commands
+            if command[:2] == ["codex", "exec"]
+        )
+        assert "Implement the selected child design" in prompt
+        assert "Fresh staged parent plan" not in prompt.split(
+            "Approved implementation plan context", 1
+        )[1].split("Target child/primary issue context", 1)[0]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_direct_and_legacy_handoff_pr_still_require_parent_phase_hash(
+    tmp_path, monkeypatch, legacy
+):
+    plan = fresh_staged_plan(
+        first_disposition=None if legacy else "direct-implementation"
+    )
+    child, parent = fresh_child_contexts(
+        plan,
+        handoff_execution_disposition=(
+            None if legacy else "direct-implementation"
+        ),
+    )
+    child = dataclasses.replace(
+        child,
+        comments=(comment(format_issue_pr_handoff_comment(
+            issue_number=56, pr_number=77,
+            pr_url="https://github.com/OWNER/REPO/pull/77", pr_head_sha="abc123",
+            flow="approved-plan-implementation", plan_hash="wrong-child-hash",
+        )),),
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(pr_payload={"number": 77, "body": "Fixes #56", "url": "pr-url"})
+    with pytest.raises(AgentLoopError, match="implementation handoff disagrees"):
+        orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("entry", ["issue", "pr"])
+def test_contradictory_unbound_handoff_fails_closed_in_workflow_paths(
+    tmp_path, monkeypatch, entry
+):
+    plan = fresh_staged_plan(first_disposition="direct-implementation")
+    child, parent = fresh_child_contexts(
+        plan, handoff_execution_disposition="requires-child-planning"
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(
+        pr_payload={"number": 77, "body": "Fixes #56", "url": "pr-url"},
+        claude_outputs=["A coder must never run."],
+        codex_outputs=["A reviewer must never run."],
+    )
+    with pytest.raises(AgentLoopError, match="carries no override digest"):
+        if entry == "issue":
+            orchestrator.run_issue_loop(
+                runner, issue_number=56, config=make_config(tmp_path)
+            )
+        else:
+            orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+    assert not any(command[:1] == ["claude"] for command, _cwd in runner.commands)
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    assert runner.issue_comments == []
+
+
+@pytest.mark.parametrize(
+    ("declared", "effective"),
+    [
+        ("requires-child-planning", "direct-implementation"),
+        ("direct-implementation", "requires-child-planning"),
+    ],
+)
+def test_override_bound_handoff_survives_child_entry_and_pr_validation(
+    tmp_path, monkeypatch, declared, effective
+):
+    plan = fresh_staged_plan(first_disposition=declared)
+    plan_hash = approved_plan_hash(plan)
+    override_body = format_child_disposition_override_comment(
+        parent_issue=55, plan_hash=plan_hash, stage_id="stage-one",
+        disposition=effective, rationale="Durably select the reviewed alternate route.",
+    )
+    records, ignored = parse_child_disposition_override_records(
+        override_body, comment_locator="parent issue #55 comment"
+    )
+    assert not ignored and len(records) == 1
+    child_plan = (
+        "Reviewed child plan.\n\n## Scope\n- Implement the selected child design."
+        if effective == "requires-child-planning" else None
+    )
+    child, parent = fresh_child_contexts(
+        plan,
+        handoff_execution_disposition=effective,
+        handoff_override_digest=records[0].digest,
+        child_plan=child_plan,
+    )
+    parent = dataclasses.replace(
+        parent, comments=parent.comments + (comment(override_body),)
+    )
+    raw_payload, _ = json.JSONDecoder().raw_decode(plan)
+    from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
+
+    recommendation = parse_execution_recommendation_payload(
+        raw_payload["execution_recommendation"], context="test recommendation"
+    )
+    normalized, retained = normalize_execution_recommendation(
+        recommendation, approved_plan=plan, plan_subject=_plan_subject(plan)
+    )
+    created = (
+        CreatedPhaseIssue(normalized.phases[0], child.url, child.number),
+        CreatedPhaseIssue(
+            normalized.phases[1], "https://github.com/OWNER/REPO/issues/57", 57
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator, "create_decomposition_child_issues",
+        lambda *_args, **_kwargs: created,
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    assert orchestrator._preflight_fresh_staged_topology(
+        FakeRunner(), issue_number=55, approved_plan=plan,
+        config=make_config(tmp_path), issue_context=parent,
+        mode="implement-by-phase", normalized_topology=(normalized, retained),
+    ) == created
+
+    resolved = orchestrator._resolve_fresh_child_provenance(
+        issue_context=child, parent_issue_context=parent
+    )
+    assert resolved is not None
+    assert resolved.route.disposition == effective
+    assert resolved.route.override_digest == records[0].digest
+
+    runner = FakeRunner(
+        pr_payload={"number": 77, "body": "Fixes #56", "url": "pr-url"},
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+    )
+    assert orchestrator.run_pr_loop(
+        runner, pr_number=77, config=make_config(tmp_path)
+    ) == 0
+
+    without_record = dataclasses.replace(parent, comments=parent.comments[:-1])
+    with pytest.raises(AgentLoopError, match="undiscoverable"):
+        orchestrator._resolve_fresh_child_provenance(
+            issue_context=child, parent_issue_context=without_record
+        )
+
+
+@pytest.mark.parametrize("with_legacy_handoff", [False, True])
+def test_legacy_ambiguous_child_workflow_plans_unless_legacy_handoff_exists(
+    tmp_path, monkeypatch, with_legacy_handoff
+):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    if not with_legacy_handoff:
+        parent = dataclasses.replace(parent, comments=parent.comments[:-1])
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    dispatched = []
+    monkeypatch.setattr(orchestrator, "prepare_agent_memory", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator, "_dispatch_decomposition_child",
+        lambda *_args, **kwargs: dispatched.append(kwargs) or 0,
+    )
+    runner = FakeRunner()
+    if with_legacy_handoff:
+        assert orchestrator.run_issue_loop(
+            runner, issue_number=56, config=make_config(tmp_path)
+        ) == 0
+        assert dispatched and dispatched[0]["route"].is_direct
+        assert dispatched[0]["existing_handoff"].execution_disposition is None
+    else:
+        with pytest.raises(AgentLoopError, match="--plan-first"):
+            orchestrator.run_issue_loop(
+                runner, issue_number=56, config=make_config(tmp_path)
+            )
+        assert dispatched == []
 
 
 def _matrix_row(row_id, owner, *, expected="The transition completes."):

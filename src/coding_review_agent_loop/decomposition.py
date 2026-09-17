@@ -25,18 +25,25 @@ from .protocol import (
     ArchitectureImpact,
     ChildStage,
     EXECUTION_AUTOMATION_CLASSES,
+    EXECUTION_DISPOSITION_DIRECT,
+    EXECUTION_DISPOSITION_HUMAN,
+    EXECUTION_DISPOSITION_PLANNING,
+    EXECUTION_DISPOSITION_VALUES,
     EXECUTION_STRATEGY_CONTRACT_VERSION,
     EXECUTION_TOPOLOGY_SOURCE,
     ExecutionAllocation,
     ExecutionChildStage,
     ExecutionCouplingConstraint,
+    ExecutionDisposition,
     ExecutionScopeItem,
     ExecutionStrategyRecommendation,
     RiskTestMatrix,
     parse_architecture_impact,
     parse_risk_test_matrix,
     parse_execution_recommendation_payload,
+    parse_signed_human_requirement_body,
     sanitize_architecture_impact,
+    validate_direct_readiness,
 )
 from .round_transport import MAX_GITHUB_BODY_CHARS
 
@@ -94,6 +101,12 @@ class PlanPhase:
     depends_on_stage_ids: tuple[str, ...] = ()
     compatibility_constraints: tuple[str, ...] = ()
     covered_scope_item_ids: tuple[str, ...] = ()
+    # Reviewed per-child execution disposition (#808).  ``None`` means the
+    # approved plan predates the contract (legacy-ambiguous) and the routing
+    # seam must fail closed to planning or a human decision.
+    execution_disposition: str | None = None
+    disposition_rationale: str | None = None
+    unresolved_design_decisions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +170,8 @@ class DecompositionMetadata:
     plan_subject: str | None = None
     stage_ids: tuple[str, ...] = ()
     phase_identities: tuple[str, ...] = ()
+    # Per-phase reviewed dispositions, encoded only when at least one is set.
+    dispositions: tuple[str | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -193,6 +208,16 @@ class PhaseImplementationHandoffMetadata:
     stage_id: str | None = None
     plan_subject: str | None = None
     inherited_matrix_row_ids: tuple[str, ...] = ()
+    # Effective disposition recorded at dispatch (#808).  A handoff without
+    # the field is a legacy handoff, which resume and PR validation treat as
+    # ``direct-implementation`` with no override.
+    execution_disposition: str | None = None
+    override_digest: str | None = None
+
+
+def handoff_effective_disposition(handoff: PhaseImplementationHandoffMetadata) -> str:
+    """Return the disposition a recorded phase handoff binds (legacy = direct)."""
+    return handoff.execution_disposition or EXECUTION_DISPOSITION_DIRECT
 
 
 @dataclass(frozen=True)
@@ -326,6 +351,18 @@ def normalize_execution_recommendation(
                 depends_on_stage_ids=stage.depends_on_stage_ids,
                 compatibility_constraints=stage.compatibility_constraints,
                 covered_scope_item_ids=stage.covered_scope_item_ids,
+                execution_disposition=(
+                    stage.execution_disposition.disposition
+                    if stage.execution_disposition is not None else None
+                ),
+                disposition_rationale=(
+                    stage.execution_disposition.rationale
+                    if stage.execution_disposition is not None else None
+                ),
+                unresolved_design_decisions=(
+                    stage.execution_disposition.unresolved_design_decisions
+                    if stage.execution_disposition is not None else ()
+                ),
             )
         )
 
@@ -625,7 +662,30 @@ def _fresh_phase_payload(phase: PlanPhase) -> dict[str, object]:
         "compatibility_constraints": list(phase.compatibility_constraints),
         "covered_scope_item_ids": list(phase.covered_scope_item_ids),
         "parent_context": phase.parent_context,
+        # Emitted only when declared so identities and checkpoints of plans
+        # approved before #808 remain byte-identical.
+        **(
+            {
+                "execution_disposition": {
+                    "disposition": phase.execution_disposition,
+                    "rationale": phase.disposition_rationale or "",
+                    "unresolved_design_decisions": list(phase.unresolved_design_decisions),
+                }
+            }
+            if phase.execution_disposition is not None else {}
+        ),
     }
+
+
+def phase_direct_readiness_problems(phase: PlanPhase) -> tuple[str, ...]:
+    """Judge direct readiness on the persisted reviewed phase fields only."""
+    return validate_direct_readiness(
+        non_goals=phase.non_goals_items,
+        compatibility_constraints=phase.compatibility_constraints,
+        dependency_notes=phase.dependency_notes,
+        rationale=phase.disposition_rationale,
+        unresolved_design_decisions=phase.unresolved_design_decisions,
+    )
 
 
 def phase_identity(
@@ -900,6 +960,25 @@ def _phase_from_payload(
             or values["validation"] is None
         ):
             raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+        disposition_payload = payload.get("execution_disposition")
+        execution_disposition: str | None = None
+        disposition_rationale: str | None = None
+        unresolved_design_decisions: tuple[str, ...] = ()
+        if disposition_payload is not None:
+            if (
+                not isinstance(disposition_payload, dict)
+                or disposition_payload.get("disposition") not in EXECUTION_DISPOSITION_VALUES
+                or not isinstance(disposition_payload.get("rationale"), str)
+                or not isinstance(disposition_payload.get("unresolved_design_decisions"), list)
+                or any(
+                    not isinstance(item, str)
+                    for item in disposition_payload["unresolved_design_decisions"]
+                )
+            ):
+                raise AgentLoopError("Invalid AGENT_PLAN_TOPOLOGY_CHECKPOINT payload.")
+            execution_disposition = str(disposition_payload["disposition"])
+            disposition_rationale = str(disposition_payload["rationale"])
+            unresolved_design_decisions = tuple(disposition_payload["unresolved_design_decisions"])
         return PlanPhase(
             **values,
             depends_on=(),
@@ -911,6 +990,9 @@ def _phase_from_payload(
             depends_on_stage_ids=tuple(payload["depends_on_stage_ids"]),
             compatibility_constraints=tuple(payload["compatibility_constraints"]),
             covered_scope_item_ids=tuple(payload["covered_scope_item_ids"]),
+            execution_disposition=execution_disposition,
+            disposition_rationale=disposition_rationale,
+            unresolved_design_decisions=unresolved_design_decisions,
         )
 
     depends = payload.get("depends_on", [])
@@ -1220,11 +1302,25 @@ def format_phase_issue_body(
     inherited_matrix_row_ids: Sequence[str] = (),
 ) -> str:
     parent_url = f"https://github.com/{repo}/issues/{parent_issue}"
-    if phase.automation == "agent-pr":
+    disposition = getattr(phase, "execution_disposition", None)
+    if phase.automation == "agent-pr" and disposition == EXECUTION_DISPOSITION_PLANNING:
+        execution = (
+            "This child requires its own reviewed plan before any implementation: the "
+            "approved parent plan does not resolve every design decision for this stage. "
+            "Run `agent-loop issue <this issue number> --plan-first --plan-execution-mode auto` "
+            "so a child plan is produced and reviewed first; plain issue mode fails closed "
+            "for this stage. Keep the eventual PR scoped to this phase."
+        )
+    elif phase.automation == "agent-pr":
         execution = (
             "Run `agent-loop issue <this issue number>` to implement this phase in its own PR. "
             "Keep the PR scoped to this phase."
         )
+        if disposition == EXECUTION_DISPOSITION_DIRECT:
+            execution += (
+                " The reviewed parent stage is a complete implementation contract "
+                "(implementation-ready); do not run it with `--plan-first`."
+            )
     elif phase.automation == "human-action":
         execution = (
             "This phase requires human action before agent implementation continues. A human should perform "
@@ -1289,6 +1385,8 @@ def format_phase_issue_body(
             ]
         )
         body += "\n" + "\n".join(reviewed_lines)
+        if disposition is not None:
+            body += "\n\n" + "\n".join(_phase_disposition_lines(phase))
         if inherited_matrix_row_ids:
             body += "\n\n## Inherited parent risk-matrix obligations\n" + "\n".join(
                 f"- {sanitize_historical_text(row_id)}" for row_id in inherited_matrix_row_ids
@@ -1307,6 +1405,34 @@ def format_phase_issue_body(
             inherited_matrix_row_ids=inherited_matrix_row_ids,
         )
     return body
+
+
+def _phase_disposition_lines(phase: PlanPhase) -> list[str]:
+    """Render the reviewed execution disposition section of a fresh child body."""
+    disposition = getattr(phase, "execution_disposition", None)
+    if disposition is None:
+        return []
+    if disposition == EXECUTION_DISPOSITION_DIRECT:
+        meaning = "Implementation-ready: the approved parent-plan slice is a complete implementation contract."
+    elif disposition == EXECUTION_DISPOSITION_PLANNING:
+        meaning = (
+            "Requires its own reviewed plan: run this child with `--plan-first` before any "
+            "implementation coder."
+        )
+    else:
+        meaning = "Human-owned stage: no agent implementation or planning is dispatched."
+    lines = [
+        "## Execution disposition",
+        sanitize_historical_text(disposition),
+        meaning,
+        "Rationale: " + sanitize_historical_text(phase.disposition_rationale or ""),
+        "Unresolved design decisions:",
+        *(
+            [f"- {sanitize_historical_text(value)}" for value in phase.unresolved_design_decisions]
+            or ["- None."]
+        ),
+    ]
+    return lines
 
 
 def _fresh_phase_content_matches(
@@ -1350,6 +1476,7 @@ def _fresh_phase_content_matches(
             or ["- None."]
         ),
         "Covered scope items: " + ", ".join(phase.covered_scope_item_ids),
+        *_phase_disposition_lines(phase),
     ]
     if inherited_matrix_row_ids:
         fragments.extend(
@@ -1923,6 +2050,8 @@ def _encode_metadata(metadata: DecompositionMetadata) -> str:
                 "phase_identities": list(metadata.phase_identities),
             }
         )
+        if any(item is not None for item in metadata.dispositions):
+            payload["dispositions"] = list(metadata.dispositions)
         if metadata.retained_parent_scope is not None:
             retained = payload["retained_parent_scope"]
             assert isinstance(retained, dict)
@@ -2030,7 +2159,19 @@ def _decode_metadata(encoded: str) -> DecompositionMetadata:
             plan_subject=(str(payload["plan_subject"]) if payload.get("plan_subject") is not None else None),
             stage_ids=tuple(str(item) for item in payload.get("stage_ids", [])),
             phase_identities=tuple(str(item) for item in payload.get("phase_identities", [])),
+            dispositions=tuple(
+                (str(item) if item is not None else None)
+                for item in payload.get("dispositions", [])
+            ),
         )
+        if metadata.dispositions and (
+            len(metadata.dispositions) != metadata.phase_count
+            or any(
+                item is not None and item not in EXECUTION_DISPOSITION_VALUES
+                for item in metadata.dispositions
+            )
+        ):
+            raise AgentLoopError("Invalid AGENT_PLAN_DECOMPOSITION disposition metadata.")
         if metadata.topology_source == EXECUTION_TOPOLOGY_SOURCE:
             if (
                 metadata.strategy not in {"one-shot", "staged"}
@@ -2074,6 +2215,14 @@ def _encode_phase_implementation_handoff_metadata(
                     {"inherited_matrix_row_ids": list(metadata.inherited_matrix_row_ids)}
                     if metadata.inherited_matrix_row_ids else {}
                 ),
+                **(
+                    {"execution_disposition": metadata.execution_disposition}
+                    if metadata.execution_disposition is not None else {}
+                ),
+                **(
+                    {"override_digest": metadata.override_digest}
+                    if metadata.override_digest is not None else {}
+                ),
             }
         )
     return _encode_json_payload(payload)
@@ -2110,10 +2259,27 @@ def _decode_phase_implementation_handoff_metadata(encoded: str) -> PhaseImplemen
             inherited_matrix_row_ids=tuple(
                 str(item) for item in payload.get("inherited_matrix_row_ids", [])
             ),
+            execution_disposition=(
+                str(payload["execution_disposition"])
+                if payload.get("execution_disposition") is not None else None
+            ),
+            override_digest=(
+                str(payload["override_digest"])
+                if payload.get("override_digest") is not None else None
+            ),
         )
+        if metadata.execution_disposition is not None and metadata.execution_disposition not in {
+            EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING,
+        }:
+            raise AgentLoopError("Invalid execution disposition in phase handoff.")
+        if metadata.override_digest is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", metadata.override_digest
+        ):
+            raise AgentLoopError("Invalid override digest in phase handoff.")
         fresh_fields = {
             "strategy", "topology_source", "execution_strategy_contract_version",
             "recommendation_digest", "stage_id", "plan_subject",
+            "execution_disposition", "override_digest",
         }
         inherited_ids = payload.get("inherited_matrix_row_ids", [])
         if not isinstance(inherited_ids, list) or any(
@@ -2359,6 +2525,10 @@ def format_decomposition_parent_summary(
             for index, item in enumerate(created, start=1)
         ),
         phase_identities=phase_identities,
+        dispositions=(
+            tuple(getattr(item.phase, "execution_disposition", None) for item in created)
+            if topology_source == EXECUTION_TOPOLOGY_SOURCE else ()
+        ),
     )
     lines = [
         f"Approved plan decomposed for issue #{parent_issue}.",
@@ -2420,6 +2590,14 @@ def format_decomposition_parent_summary(
         lines.append(
             f"| {index}. {item.phase.title} | {item.phase.automation} | {child} | {item.phase.rollout_risk}{human_note} |"
         )
+    if any(item is not None for item in metadata.dispositions):
+        lines.extend(["", "Reviewed execution dispositions:"])
+        for index, item in enumerate(created, start=1):
+            disposition = getattr(item.phase, "execution_disposition", None)
+            lines.append(
+                f"- {index}. {sanitize_historical_text(item.phase.title)}: "
+                f"{sanitize_historical_text(disposition or 'legacy-ambiguous (routes to child planning)')}"
+            )
     lines.extend(
         [
             "",
@@ -2445,11 +2623,21 @@ def format_phase_implementation_handoff_comment(
     recommendation_digest: str | None = None,
     plan_subject: str | None = None,
     inherited_matrix_row_ids: Sequence[str] = (),
+    execution_disposition: str | None = None,
+    override_digest: str | None = None,
 ) -> str:
     if created.issue_number is None:
         raise AgentLoopError(
             "Cannot record decomposed phase implementation handoff because the child issue number is unavailable."
         )
+    if execution_disposition is not None and execution_disposition not in {
+        EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING,
+    }:
+        raise AgentLoopError(
+            f"A phase handoff cannot record execution disposition `{execution_disposition}`."
+        )
+    if execution_disposition is None and override_digest is not None:
+        raise AgentLoopError("A phase handoff override digest requires an explicit disposition.")
     metadata = PhaseImplementationHandoffMetadata(
         parent_issue=parent_issue,
         plan_hash=plan_hash,
@@ -2466,17 +2654,42 @@ def format_phase_implementation_handoff_comment(
         stage_id=getattr(created.phase, "stage_id", None),
         plan_subject=plan_subject,
         inherited_matrix_row_ids=tuple(inherited_matrix_row_ids),
+        execution_disposition=(
+            execution_disposition if topology_source == EXECUTION_TOPOLOGY_SOURCE else None
+        ),
+        override_digest=(
+            override_digest if topology_source == EXECUTION_TOPOLOGY_SOURCE else None
+        ),
     )
     child = created.issue_url or f"#{created.issue_number}"
+    planning = metadata.execution_disposition == EXECUTION_DISPOSITION_PLANNING
+    if planning:
+        headline = (
+            f"Approved plan for issue #{parent_issue} requires child planning for phase "
+            f"{phase_index}: {child}."
+        )
+        resume = (
+            "Parent reruns will not automatically re-run this child. The child must produce "
+            "and review its own plan before any implementation coder; resume directly with "
+            f"`agent-loop issue {created.issue_number} --plan-first --plan-execution-mode auto`."
+        )
+    else:
+        headline = (
+            f"Approved plan implementation for issue #{parent_issue} handed off to phase "
+            f"{phase_index}: {child}."
+        )
+        resume = (
+            "Parent reruns will not automatically re-run this child implementation. "
+            f"Resume directly with `agent-loop issue {created.issue_number}`."
+        )
     lines = [
-        f"Approved plan implementation for issue #{parent_issue} handed off to phase {phase_index}: {child}.",
+        headline,
         "",
         f"Mode: {mode}",
         f"Phase: {created.phase.title}",
         f"Automation: {created.phase.automation}",
         "",
-        "Parent reruns will not automatically re-run this child implementation. "
-        f"Resume directly with `agent-loop issue {created.issue_number}`.",
+        resume,
         "",
         f"<!-- AGENT_PLAN_PHASE_IMPLEMENTATION: {_encode_phase_implementation_handoff_metadata(metadata)} -->",
         "-- coding-review-agent-loop",
@@ -2484,6 +2697,10 @@ def format_phase_implementation_handoff_comment(
     if topology_source == EXECUTION_TOPOLOGY_SOURCE:
         lines.insert(5, f"Canonical strategy: {strategy} (source: {topology_source})")
         lines.insert(6, f"Stable stage ID: {getattr(created.phase, 'stage_id', None)}")
+        if metadata.execution_disposition is not None:
+            lines.insert(7, f"Execution disposition: {metadata.execution_disposition}")
+        if metadata.override_digest is not None:
+            lines.insert(8, f"Applied signed override digest: {metadata.override_digest}")
     return "\n".join(lines)
 
 
@@ -2502,6 +2719,8 @@ def post_phase_implementation_handoff_comment(
     recommendation_digest: str | None = None,
     plan_subject: str | None = None,
     inherited_matrix_row_ids: Sequence[str] = (),
+    execution_disposition: str | None = None,
+    override_digest: str | None = None,
 ) -> None:
     post_issue_comment(
         runner,
@@ -2520,10 +2739,293 @@ def post_phase_implementation_handoff_comment(
                 recommendation_digest=recommendation_digest,
                 plan_subject=plan_subject,
                 inherited_matrix_row_ids=inherited_matrix_row_ids,
+                execution_disposition=execution_disposition,
+                override_digest=override_digest,
             ),
             expected_tokens=("AGENT_PLAN_PHASE_IMPLEMENTATION",),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Signed child-disposition overrides and the shared reconciliation rule (#808)
+# ---------------------------------------------------------------------------
+
+CHILD_DISPOSITION_OVERRIDE_KIND = "child-execution-disposition-override"
+CHILD_DISPOSITION_OVERRIDE_SCHEMA_VERSION = 1
+_OVERRIDE_RECORD_KEYS = frozenset(
+    {"kind", "schema_version", "parent_issue", "plan_hash", "stage_id", "disposition", "rationale"}
+)
+_FENCED_JSON_RE = re.compile(r"```(?:json)?[ \t]*\n(?P<body>.*?)\n```", re.S | re.I)
+
+
+@dataclass(frozen=True)
+class ChildDispositionOverride:
+    """One signed, durable human override of a child's execution disposition."""
+
+    parent_issue: int
+    plan_hash: str
+    stage_id: str
+    disposition: str
+    rationale: str
+    digest: str
+    comment_locator: str
+
+    def record_payload(self) -> dict[str, object]:
+        return {
+            "kind": CHILD_DISPOSITION_OVERRIDE_KIND,
+            "schema_version": CHILD_DISPOSITION_OVERRIDE_SCHEMA_VERSION,
+            "parent_issue": self.parent_issue,
+            "plan_hash": self.plan_hash,
+            "stage_id": self.stage_id,
+            "disposition": self.disposition,
+            "rationale": self.rationale,
+        }
+
+
+def child_disposition_override_digest(record: dict[str, object]) -> str:
+    """The one record digest shared by discovery, the handoff writer, and reconciliation."""
+    canonical = json.dumps(
+        {key: record[key] for key in sorted(_OVERRIDE_RECORD_KEYS)},
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def format_child_disposition_override_comment(
+    *,
+    parent_issue: int,
+    plan_hash: str,
+    stage_id: str,
+    disposition: str,
+    rationale: str,
+) -> str:
+    """Render the signed override record format documented for human reviewers."""
+    record = {
+        "kind": CHILD_DISPOSITION_OVERRIDE_KIND,
+        "schema_version": CHILD_DISPOSITION_OVERRIDE_SCHEMA_VERSION,
+        "parent_issue": parent_issue,
+        "plan_hash": plan_hash,
+        "stage_id": stage_id,
+        "disposition": disposition,
+        "rationale": rationale,
+    }
+    return (
+        "Child execution disposition override:\n\n```json\n"
+        + json.dumps(record, indent=2, sort_keys=True)
+        + "\n```\n-- Human Reviewer"
+    )
+
+
+def parse_child_disposition_override_records(
+    body: str | None, *, comment_locator: str
+) -> tuple[tuple[ChildDispositionOverride, ...], tuple[str, ...]]:
+    """Return (signed valid records, ignored-record diagnostics) for one comment.
+
+    Only bodies carrying the standalone ``-- Human Reviewer`` signature are
+    considered.  Malformed records are ignored (reported) rather than raised
+    so an unsigned or half-written comment can never change a route.
+    """
+    signed = parse_signed_human_requirement_body(body)
+    if signed is None:
+        return (), ()
+    records: list[ChildDispositionOverride] = []
+    ignored: list[str] = []
+    for match in _FENCED_JSON_RE.finditer(signed):
+        try:
+            payload = json.loads(match.group("body"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("kind") != CHILD_DISPOSITION_OVERRIDE_KIND:
+            continue
+        problem = _override_record_problem(payload)
+        if problem is not None:
+            ignored.append(f"{comment_locator}: malformed override record ignored ({problem})")
+            continue
+        records.append(
+            ChildDispositionOverride(
+                parent_issue=int(payload["parent_issue"]),
+                plan_hash=str(payload["plan_hash"]),
+                stage_id=str(payload["stage_id"]),
+                disposition=str(payload["disposition"]),
+                rationale=str(payload["rationale"]),
+                digest=child_disposition_override_digest(payload),
+                comment_locator=comment_locator,
+            )
+        )
+    return tuple(records), tuple(ignored)
+
+
+def _override_record_problem(payload: dict[str, object]) -> str | None:
+    keys = set(payload)
+    if keys != _OVERRIDE_RECORD_KEYS:
+        missing = sorted(_OVERRIDE_RECORD_KEYS - keys)
+        unknown = sorted(keys - _OVERRIDE_RECORD_KEYS)
+        return f"missing keys {missing}, unknown keys {unknown}"
+    if payload.get("schema_version") != CHILD_DISPOSITION_OVERRIDE_SCHEMA_VERSION:
+        return "schema_version must be 1"
+    parent = payload.get("parent_issue")
+    if not isinstance(parent, int) or isinstance(parent, bool) or parent < 1:
+        return "parent_issue must be a positive integer"
+    for key in ("plan_hash", "stage_id", "rationale"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return f"{key} must be a non-empty string"
+    if payload.get("disposition") not in {EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING}:
+        return "disposition must be direct-implementation or requires-child-planning"
+    return None
+
+
+def collect_child_disposition_overrides(
+    *,
+    parent_comments: Sequence[object],
+    child_comments: Sequence[object] = (),
+    parent_issue: int,
+    plan_hash: str,
+    topology_stage_ids: Sequence[str],
+    routed_stage_id: str,
+    child_stage_id: str | None = None,
+    child_issue_number: int | None = None,
+    ignored_sink: list[str] | None = None,
+) -> tuple[ChildDispositionOverride, ...]:
+    """Two-step signed override discovery.
+
+    Step 1 (topology validation) raises a human-decision error for any signed
+    record whose parent issue or plan hash does not match the bound topology,
+    whose stage is not part of that topology, or, for a record found on a
+    child issue, whose stage is not that child's own stage.  Step 2 (stage
+    scoping) returns only records for ``routed_stage_id`` with identical
+    duplicates collapsed by digest.  Valid records for other stages are
+    neither errors nor inputs for the current route.
+    """
+    found: list[ChildDispositionOverride] = []
+    sources = [(f"parent issue #{parent_issue}", parent_comments, None)]
+    if child_issue_number is not None:
+        sources.append((f"child issue #{child_issue_number}", child_comments, child_stage_id))
+    elif child_comments:
+        sources.append(("child issue", child_comments, child_stage_id))
+    for label, comments, local_stage_id in sources:
+        for index, comment in enumerate(comments, start=1):
+            body = getattr(comment, "body", None)
+            if not isinstance(body, str):
+                continue
+            locator = f"{label} comment {index}"
+            records, ignored = parse_child_disposition_override_records(
+                body, comment_locator=locator
+            )
+            if ignored_sink is not None:
+                ignored_sink.extend(ignored)
+            for record in records:
+                if record.parent_issue != parent_issue or record.plan_hash != plan_hash:
+                    raise AgentLoopError(
+                        "Human decision required: signed child-disposition override at "
+                        f"{record.comment_locator} names parent #{record.parent_issue} / plan "
+                        f"{record.plan_hash}, but the bound topology is parent #{parent_issue} / "
+                        f"plan {plan_hash}. Remove or correct the record before rerunning."
+                    )
+                if record.stage_id not in tuple(topology_stage_ids):
+                    raise AgentLoopError(
+                        "Human decision required: signed child-disposition override at "
+                        f"{record.comment_locator} names stage `{record.stage_id}`, which is not a "
+                        "stage of the bound topology. Remove or correct the record before rerunning."
+                    )
+                if local_stage_id is not None and record.stage_id != local_stage_id:
+                    raise AgentLoopError(
+                        "Human decision required: signed child-disposition override at "
+                        f"{record.comment_locator} names stage `{record.stage_id}`, but that child "
+                        f"issue is stage `{local_stage_id}`. Post stage overrides for other children "
+                        "on the parent issue or on their own child issue."
+                    )
+                found.append(record)
+    scoped: list[ChildDispositionOverride] = []
+    seen: set[str] = set()
+    for record in found:
+        if record.stage_id != routed_stage_id or record.digest in seen:
+            continue
+        seen.add(record.digest)
+        scoped.append(record)
+    return tuple(scoped)
+
+
+def reconcile_handoff_disposition(
+    phase: PlanPhase,
+    handoff: PhaseImplementationHandoffMetadata,
+    stage_overrides: Sequence[ChildDispositionOverride],
+) -> str:
+    """The single handoff/phase reconciliation rule shared by every entry path.
+
+    Equal dispositions (legacy absent = direct, phase ``None`` = compatible)
+    are accepted.  A differing disposition is accepted only when the handoff's
+    recorded override digest resolves to exactly one discoverable signed record
+    whose parent issue, plan hash, stage, and disposition all equal the
+    handoff's, and no other distinct record exists for that stage.  Every
+    other mismatch fails closed with a human-repair request.  Direct readiness
+    is never re-judged here and override metadata never supplies evidence.
+    """
+    handoff_disposition = handoff_effective_disposition(handoff)
+    phase_disposition = getattr(phase, "execution_disposition", None)
+    # Once dispatch is durable, the handoff is the route authority.  A
+    # previously unbound handoff cannot acquire an override after the fact,
+    # even when that record happens to request the same disposition.  An
+    # override-bound handoff must continue to resolve to exactly its recorded
+    # digest with no distinct record for the stage.  Checking this before the
+    # equal-disposition fast path prevents comment order or a later edit from
+    # silently changing the durable route.
+    digest = handoff.override_digest
+    if digest is None:
+        if stage_overrides:
+            record = stage_overrides[0]
+            raise AgentLoopError(
+                f"Human repair required: phase handoff for stage `{handoff.stage_id}` already "
+                f"records disposition `{handoff_disposition}`, but the signed override at "
+                f"{record.comment_locator} was not bound by that handoff. An override cannot be "
+                "added after dispatch; remove the record or repair the handoff manually."
+            )
+        if phase_disposition is None or phase_disposition == handoff_disposition:
+            return handoff_disposition
+        raise AgentLoopError(
+            f"Human repair required: phase handoff for stage `{handoff.stage_id}` records "
+            f"disposition `{handoff_disposition}`, but the persisted approved phase declares "
+            f"`{phase_disposition}` and the handoff carries no override digest. Restore the signed override "
+            "record or repair the handoff; the orchestrator never re-resolves this route."
+        )
+    prefix = (
+        f"Human repair required: phase handoff for stage `{handoff.stage_id}` records "
+        f"disposition `{handoff_disposition}` with override digest {digest}"
+    )
+    matches = [record for record in stage_overrides if record.digest == digest]
+    if not matches:
+        raise AgentLoopError(
+            f"{prefix}, but that digest is undiscoverable on the child or parent "
+            "issue (the signed record was deleted, edited, or never posted). Restore the exact "
+            "record or repair the handoff."
+        )
+    record = matches[0]
+    if (
+        record.parent_issue != handoff.parent_issue
+        or record.plan_hash != handoff.plan_hash
+        or record.stage_id != handoff.stage_id
+    ):
+        raise AgentLoopError(
+            f"{prefix}, but the signed record names a different parent, plan "
+            "hash, or stage than the handoff. Repair the handoff or the record."
+        )
+    if record.disposition != handoff_disposition:
+        raise AgentLoopError(
+            f"{prefix}, but the signed record declares "
+            f"`{record.disposition}`, which differs from the recorded handoff disposition. "
+            "Repair the handoff or the record."
+        )
+    others = sorted({item.digest for item in stage_overrides} - {digest})
+    if others:
+        raise AgentLoopError(
+            f"{prefix}, but the applied override is superseded by a later distinct signed "
+            f"record for the same stage ({', '.join(others)}). The orchestrator never chooses "
+            "between conflicting records; remove the superseding record or repair the handoff."
+        )
+    return handoff_disposition
 
 
 def post_decomposition_parent_summary(
