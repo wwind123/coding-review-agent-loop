@@ -663,6 +663,38 @@ def test_override_bound_handoff_survives_child_entry_and_pr_validation(
     parent = dataclasses.replace(
         parent, comments=parent.comments + (comment(override_body),)
     )
+    raw_payload, _ = json.JSONDecoder().raw_decode(plan)
+    from coding_review_agent_loop.protocol import parse_execution_recommendation_payload
+
+    recommendation = parse_execution_recommendation_payload(
+        raw_payload["execution_recommendation"], context="test recommendation"
+    )
+    normalized, retained = normalize_execution_recommendation(
+        recommendation, approved_plan=plan, plan_subject=_plan_subject(plan)
+    )
+    created = (
+        CreatedPhaseIssue(normalized.phases[0], child.url, child.number),
+        CreatedPhaseIssue(
+            normalized.phases[1], "https://github.com/OWNER/REPO/issues/57", 57
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator, "create_decomposition_child_issues",
+        lambda *_args, **_kwargs: created,
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    assert orchestrator._preflight_fresh_staged_topology(
+        FakeRunner(), issue_number=55, approved_plan=plan,
+        config=make_config(tmp_path), issue_context=parent,
+        mode="implement-by-phase", normalized_topology=(normalized, retained),
+    ) == created
+
     resolved = orchestrator._resolve_fresh_child_provenance(
         issue_context=child, parent_issue_context=parent
     )
@@ -670,10 +702,6 @@ def test_override_bound_handoff_survives_child_entry_and_pr_validation(
     assert resolved.route.disposition == effective
     assert resolved.route.override_digest == records[0].digest
 
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
-        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
-    )
     runner = FakeRunner(
         pr_payload={"number": 77, "body": "Fixes #56", "url": "pr-url"},
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
