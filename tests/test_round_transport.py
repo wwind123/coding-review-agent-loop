@@ -98,14 +98,22 @@ def test_encode_decode_mapping_round_trip_and_legacy_base64() -> None:
     assert transport.decode_mapping(legacy) == payload
 
 
-def _diagnostic_payload(*, attempt: int = 1, digest: str | None = None, diagnostic: str = "missing audit"):
+def _diagnostic_payload(
+    *,
+    attempt: int = 1,
+    digest: str | None = None,
+    diagnostic: str = "missing audit",
+    target_coder_round: int = 1,
+    prior_plan_subject: str | None = None,
+    candidate_kind: str = "plan_state",
+):
     return PlanValidationDiagnosticPayload(
         repository="OWNER/REPO",
         issue_number=813,
         planning_generation=1,
-        target_coder_round=1,
-        prior_plan_subject=None,
-        candidate_kind="plan_state",
+        target_coder_round=target_coder_round,
+        prior_plan_subject=prior_plan_subject,
+        candidate_kind=candidate_kind,
         architecture_contract_version=1,
         execution_strategy_contract_version=1,
         risk_test_matrix_contract_version=1,
@@ -201,7 +209,10 @@ def test_verified_canonical_plan_success_semantically_supersedes_diagnostic() ->
         "Canonical plan",
         PostedRoundMetadata(
             flow="plan", role="coder", agent="Claude", round_number=1,
-            subject="a" * 64, canonical_plan="Canonical plan",
+            subject="a" * 64, prior_plan_subject=None, canonical_plan="Canonical plan",
+            architecture_contract_version=1,
+            execution_strategy_contract_version=1,
+            risk_test_matrix_contract_version=1,
         ),
     )
     success = IssueComment(
@@ -218,6 +229,57 @@ def test_verified_canonical_plan_success_semantically_supersedes_diagnostic() ->
         execution_strategy_contract_version=1,
         risk_test_matrix_contract_version=1,
     ) is None
+
+
+def test_unrelated_canonical_plan_context_does_not_supersede_diagnostic() -> None:
+    previous_subject = "a" * 64
+    other_subject = "b" * 64
+    diagnostic = _diagnostic_comment(
+        _diagnostic_payload(
+            target_coder_round=2,
+            prior_plan_subject=previous_subject,
+            candidate_kind="plan_revision",
+        ),
+        comment_id=303,
+    )
+    canonical = _attach_round_metadata(
+        "Unrelated canonical revision",
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=2,
+            subject="c" * 64,
+            prior_plan_subject=other_subject,
+            canonical_plan="Unrelated canonical revision",
+            architecture_contract_version=1,
+            execution_strategy_contract_version=1,
+            risk_test_matrix_contract_version=1,
+        ),
+    )
+    success = IssueComment(
+        author="agent",
+        author_id=7,
+        comment_id=304,
+        created_at="2026-01-02T00:00:00Z",
+        body=str(canonical),
+    )
+    recovered = recover_plan_validation_diagnostic(
+        (diagnostic, success),
+        repository="OWNER/REPO",
+        issue_number=813,
+        expected_author_login="agent",
+        expected_author_id=7,
+        planning_generation=1,
+        target_coder_round=2,
+        prior_plan_subject=previous_subject,
+        candidate_kind="plan_revision",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=1,
+        risk_test_matrix_contract_version=1,
+    )
+    assert recovered is not None
+    assert recovered.failure_attempt == 1
 
 
 def test_is_round_transport_sidecar() -> None:

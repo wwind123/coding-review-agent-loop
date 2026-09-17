@@ -114,6 +114,7 @@ from .github import (
     post_trusted_pr_comment,
     post_verified_trusted_issue_round_comment,
     post_verified_trusted_issue_protocol_comment,
+    reset_authenticated_github_actor,
     resolve_authenticated_github_actor,
     reject_forged_protocol_markers,
     search_issues,
@@ -2764,6 +2765,10 @@ def _run_validated_agent(
     # re-parsing the message.
     terminal_public_response: str | None = None
     plan_validation_exhaustion: DeterministicPlanValidationExhaustion | None = None
+    # This latch is reset per invocation attempt and set only at the exact
+    # structured-validator capture point. It prevents a stale typed candidate
+    # from reaching the persistence callback after an ineligible path.
+    plan_validation_capture_eligible = False
     completion_recovery_attempted = False
     # Keep the detection guard separate from the replay marker: a failed
     # stability check must not make the next ordinary retry look like a replay.
@@ -2845,6 +2850,7 @@ def _run_validated_agent(
         # deterministic failure of this invocation. A later timeout, provider,
         # marker-safety, or containment failure must clear it.
         plan_validation_exhaustion = None
+        plan_validation_capture_eligible = False
         if result.log_path is not None:
             log_paths.append(result.log_path)
         text = result.text
@@ -3209,6 +3215,7 @@ def _run_validated_agent(
                     and structured_kind in {"plan_state", "plan_revision"}
                     and structured_kind == repair_expected_kind
                 ):
+                    plan_validation_capture_eligible = True
                     plan_validation_exhaustion = DeterministicPlanValidationExhaustion(
                         candidate_kind=repair_expected_kind,
                         candidate_text=text,
@@ -3823,7 +3830,7 @@ def _run_validated_agent(
                 "implementation to recreate the PR."
             )
     message += diagnostics.format_for_error()
-    if last_failure_category != "deterministic":
+    if last_failure_category != "deterministic" or not plan_validation_capture_eligible:
         plan_validation_exhaustion = None
     invocation_error = AgentInvocationError(
         message,
@@ -7836,6 +7843,7 @@ def _run_plan_first_loop(
                     agent=coder_name,
                     round_number=1,
                     subject=_plan_subject(current_plan),
+                    prior_plan_subject=None,
                     prior_items=(),
                     canonical_plan=canonical_plan,
                     raw_structured_coder_response=raw_structured_coder_response,
@@ -9211,6 +9219,7 @@ def _run_plan_first_loop(
                     agent=coder_name,
                     round_number=round_number + 1,
                     subject=_plan_subject(current_plan),
+                    prior_plan_subject=current_plan_subject,
                     prior_items=tuple(unresolved_items),
                     canonical_plan=canonical_plan,
                     raw_structured_coder_response=raw_structured_coder_response,
@@ -9298,6 +9307,7 @@ def run_issue_loop(
 ) -> int:
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
+    reset_authenticated_github_actor(runner)
     try:
         requested_policy = _normalize_requested_execution_policy(
             config,

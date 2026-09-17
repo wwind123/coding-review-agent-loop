@@ -1699,13 +1699,17 @@ def _merge_issue_comment_transport_identity(
     REST read is a fail-closed recovery error; returning shape-only comments
     would make a real durable record silently disappear from resume selection.
     """
-    if not any(
+    marker_in_projection = any(
         isinstance(comment.body, str)
         and "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.body
         for comment in comments
-    ):
-        return comments
+    )
+    # ``gh issue view --comments`` is itself a bounded projection.  A full
+    # page without the marker may simply mean that the durable record is on a
+    # later REST page, so probe REST at the projection boundary too.
     page_size = 100
+    if not marker_in_projection and len(comments) < page_size:
+        return comments
     page = 1
     raw_transport_comments: list[object] = []
     seen_ids: set[int] = set()
@@ -1765,9 +1769,12 @@ def _merge_issue_comment_transport_identity(
     for comment in transport_comments:
         by_key.setdefault((comment.author, comment.created_at, comment.body), []).append(comment)
     merged: list[IssueComment] = []
+    matched_transport_ids: set[int] = set()
     for comment in comments:
         candidates = by_key.get((comment.author, comment.created_at, comment.body), [])
         transport = candidates.pop(0) if candidates else None
+        if transport is not None and transport.comment_id is not None:
+            matched_transport_ids.add(transport.comment_id)
         if (
             isinstance(comment.body, str)
             and "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.body
@@ -1790,6 +1797,18 @@ def _merge_issue_comment_transport_identity(
                 author_id=(transport.author_id if transport is not None else comment.author_id),
             )
         )
+    # The GraphQL projection can omit older comments once it reaches its
+    # connection cap.  Add only authenticated diagnostic records discovered
+    # by REST; ordinary comments remain sourced from the existing projection
+    # and are not duplicated into prompt context.
+    for transport in transport_comments:
+        if (
+            transport.comment_id is not None
+            and transport.comment_id not in matched_transport_ids
+            and isinstance(transport.body, str)
+            and "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in transport.body
+        ):
+            merged.append(transport)
     return tuple(sorted(merged, key=_comment_sort_key))
 
 
@@ -1940,6 +1959,18 @@ def resolve_authenticated_github_actor(
         )
     setattr(runner, "_agent_loop_authenticated_actor", (login, actor_id))
     return login, actor_id
+
+
+def reset_authenticated_github_actor(runner: Runner) -> None:
+    """Start a fresh invocation-scoped actor cache.
+
+    A ``Runner`` can be reused by tests and embedding callers across separate
+    issue invocations.  Reusing its cached identity across those boundaries
+    would make an actor change invisible and could incorrectly authenticate
+    historical records.
+    """
+    if hasattr(runner, "_agent_loop_authenticated_actor"):
+        delattr(runner, "_agent_loop_authenticated_actor")
 
 
 def _post_trusted_protocol_comment(

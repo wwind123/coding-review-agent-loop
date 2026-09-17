@@ -77,6 +77,12 @@ class PostedRoundMetadata:
     agent: str
     round_number: int
     subject: str
+    # For plan coder rounds, bind the published candidate to the exact plan
+    # subject that was supplied as its revision input.  ``None`` is the
+    # intentional value for a fresh plan.  Older metadata omits this field
+    # and therefore cannot supersede a newer authenticated diagnostic for a
+    # revision context.
+    prior_plan_subject: str | None = None
     prior_items: tuple[UnresolvedReviewItem, ...] = ()
     dispositions: tuple[ReviewItemDisposition, ...] = ()
     new_items: tuple[UnresolvedReviewItem, ...] = ()
@@ -689,6 +695,11 @@ def _authenticated_canonical_plan_success_exists(
     expected_author_login: str,
     expected_author_id: int,
     target_coder_round: int,
+    prior_plan_subject: str | None,
+    candidate_kind: str,
+    architecture_contract_version: int | None,
+    execution_strategy_contract_version: int | None,
+    risk_test_matrix_contract_version: int | None,
 ) -> bool:
     bodies = tuple(
         body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
@@ -720,6 +731,14 @@ def _authenticated_canonical_plan_success_exists(
             and metadata.role == "coder"
             and metadata.round_number == target_coder_round
             and metadata.canonical_plan
+            and metadata.prior_plan_subject == prior_plan_subject
+            and metadata.architecture_contract_version == architecture_contract_version
+            and metadata.execution_strategy_contract_version == execution_strategy_contract_version
+            and metadata.risk_test_matrix_contract_version == risk_test_matrix_contract_version
+            and (
+                (candidate_kind == "plan_state" and target_coder_round == 1)
+                or (candidate_kind == "plan_revision" and target_coder_round > 1)
+            )
         ):
             return True
     return False
@@ -798,6 +817,11 @@ def recover_plan_validation_diagnostic(
         expected_author_login=expected_author_login,
         expected_author_id=expected_author_id,
         target_coder_round=target_coder_round,
+        prior_plan_subject=prior_plan_subject,
+        candidate_kind=candidate_kind,
+        architecture_contract_version=architecture_contract_version,
+        execution_strategy_contract_version=execution_strategy_contract_version,
+        risk_test_matrix_contract_version=risk_test_matrix_contract_version,
     ):
         return None
     highest_attempt = max(item.payload.failure_attempt for item in candidates)
@@ -1351,6 +1375,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "agent": metadata.agent,
         "round_number": metadata.round_number,
         "subject": metadata.subject,
+        "prior_plan_subject": metadata.prior_plan_subject,
         "prior_items": [_serialize_unresolved_item(item) for item in metadata.prior_items],
         "dispositions": [_serialize_disposition(item) for item in metadata.dispositions],
         "new_items": [_serialize_unresolved_item(item) for item in metadata.new_items],
@@ -1460,6 +1485,11 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             agent=str(payload["agent"]),
             round_number=int(payload["round_number"]),
             subject=str(payload["subject"]),
+            prior_plan_subject=(
+                str(payload["prior_plan_subject"])
+                if payload.get("prior_plan_subject") is not None
+                else None
+            ),
             prior_items=tuple(_deserialize_unresolved_item(item) for item in payload.get("prior_items", [])),
             dispositions=tuple(_deserialize_disposition(item) for item in payload.get("dispositions", [])),
             new_items=tuple(_deserialize_unresolved_item(item) for item in payload.get("new_items", [])),

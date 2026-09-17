@@ -231,6 +231,110 @@ def test_plan_validation_diagnostic_survives_a_new_invocation_and_is_superseded(
     assert len(runner.verified_round_bodies) == 2
 
 
+@pytest.mark.parametrize("context_mode", ["compact", "full"])
+def test_revision_success_supersedes_diagnostic_before_a_later_same_invocation_prompt(
+    tmp_path, context_mode
+):
+    """A verified replacement must not leak its old correction into round N+1."""
+    initial_plan = structured_plan_state(summary="Existing plan.")
+    initial_subject = orchestrator._plan_subject(initial_plan)
+    initial_comment = orchestrator._attach_round_metadata(
+        initial_plan,
+        orchestrator.PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Anthropic Claude",
+            round_number=1,
+            subject=initial_subject,
+            prior_plan_subject=None,
+            canonical_plan=initial_plan,
+            raw_structured_coder_response=initial_plan,
+            state="blocking",
+            architecture_contract_version=1,
+        ),
+    )
+    diagnostic = PlanValidationDiagnosticPayload(
+        repository="OWNER/REPO",
+        issue_number=56,
+        planning_generation=1,
+        target_coder_round=2,
+        prior_plan_subject=initial_subject,
+        candidate_kind="plan_revision",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=None,
+        risk_test_matrix_contract_version=None,
+        expected_producer_login="agent",
+        expected_producer_id=7,
+        failure_attempt=1,
+        candidate_digest="c" * 64,
+        category="deterministic",
+        diagnostic="the round-two correction must not survive its replacement",
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=str(encode_plan_validation_diagnostic_body(diagnostic)),
+        claude_outputs=[
+            structured_plan_revision(summary="Replacement revision."),
+            structured_plan_revision(
+                summary="Later revision.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                summary="The existing plan needs one correction.",
+                blocking_plan_issues=["Add the missing verification step."],
+            ),
+            structured_plan_review(
+                state="blocking",
+                summary="The replacement still needs one correction.",
+                blocking_plan_issues=["Clarify the rollback step."],
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+            structured_plan_review(
+                summary="The later revision is approved.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+        ],
+        gemini_outputs=[],
+    )
+    runner.issue_comments.insert(
+        0,
+        {
+            "author": {"login": "history", "id": 99},
+            "createdAt": "2026-09-17T05:00:00Z",
+            "body": str(initial_comment),
+            "id": 699,
+        },
+    )
+    config = make_config(
+        tmp_path,
+        reviewer="codex",
+        planning_context_mode=context_mode,
+        max_rounds=3,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompts = [
+        command[-1]
+        for command, _cwd in runner.commands
+        if command[:1] == ["claude"]
+    ]
+    assert len(planner_prompts) == 2
+    assert "the round-two correction must not survive its replacement" in planner_prompts[0]
+    assert "the round-two correction must not survive its replacement" not in planner_prompts[1]
+    assert len(runner.verified_round_bodies) == 1
+
+
 # ---------------------------------------------------------------------------
 # CLI / config plumbing
 # ---------------------------------------------------------------------------
