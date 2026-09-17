@@ -1132,9 +1132,10 @@ class FakeRunner(_FakeRunner):
 
 
 class _PlanDiagnosticRunner(_FakeRunner):
-    def __init__(self, *, post_returncode=0):
+    def __init__(self, *, post_returncode=0, issue_number=813):
         super().__init__()
         self.post_returncode = post_returncode
+        self.issue_number = issue_number
         self.diagnostic_posts = []
 
     def _run_locked(self, args, *, cwd, check, input_text=None):
@@ -1146,7 +1147,7 @@ class _PlanDiagnosticRunner(_FakeRunner):
             )
         if command[:4] == ["gh", "api", "--method", "POST"]:
             endpoint = command[4] if len(command) > 4 else ""
-            if endpoint == "repos/OWNER/REPO/issues/813/comments":
+            if endpoint == f"repos/OWNER/REPO/issues/{self.issue_number}/comments":
                 recorded, cwd_path = self._record_command(args, cwd)
                 body = json.loads(input_text or "{}")["body"]
                 self.diagnostic_posts.append(body)
@@ -1167,6 +1168,98 @@ class _PlanDiagnosticRunner(_FakeRunner):
                     0,
                 )
         return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+class _PaginatedIssueCommentsRunner(_FakeRunner):
+    def __init__(self, pages):
+        super().__init__(issue_comments=[])
+        self.pages = pages
+        self.rest_comment_requests = []
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = list(args)
+        if command[:2] == ["gh", "api"] and len(command) > 2 and command[2].startswith(
+            "repos/OWNER/REPO/issues/56/comments?"
+        ):
+            recorded, cwd_path = self._record_command(args, cwd)
+            query = command[2].split("?", 1)[1]
+            self.rest_comment_requests.append(query)
+            page = int(dict(part.split("=", 1) for part in query.split("&"))["page"])
+            return CommandResult(
+                recorded,
+                cwd_path,
+                json.dumps(self.pages[page - 1]),
+                "",
+                0,
+            )
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def test_issue_comment_recovery_parses_rest_user_identity_across_all_pages(tmp_path):
+    marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
+    first_page = [
+        {"id": index + 1, "body": f"ordinary {index}", "user": {"login": "agent", "id": 7}}
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "id": 101,
+            "created_at": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+            "user": {"login": "agent", "id": 7},
+        }
+    ]
+    runner = _PaginatedIssueCommentsRunner([first_page, second_page])
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+        }
+    ]
+    context = get_issue_context(
+        runner,
+        config=make_config(tmp_path),
+        issue_number=56,
+    )
+
+    recovered = next(comment for comment in context.comments if comment.body == marker_body)
+    assert recovered.author == "agent"
+    assert recovered.author_id == 7
+    assert recovered.comment_id == 101
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+
+
+def test_issue_comment_recovery_fails_closed_when_a_later_rest_page_is_unavailable(tmp_path):
+    marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
+
+    class IncompleteRunner(_PaginatedIssueCommentsRunner):
+        def _run_locked(self, args, *, cwd, check, input_text=None):
+            command = list(args)
+            if command[:2] == ["gh", "api"] and len(command) > 2 and command[2].startswith(
+                "repos/OWNER/REPO/issues/56/comments?"
+            ):
+                recorded, cwd_path = self._record_command(args, cwd)
+                page = int(command[2].rsplit("=", 1)[1])
+                if page == 2:
+                    return CommandResult(recorded, cwd_path, "", "network failure", 1)
+            return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    runner = IncompleteRunner(
+        [[
+            {"id": index + 1, "body": f"ordinary {index}", "user": {"login": "agent", "id": 7}}
+            for index in range(100)
+        ]]
+    )
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+        }
+    ]
+    with pytest.raises(AgentLoopError, match="incomplete"):
+        get_issue_context(runner, config=make_config(tmp_path), issue_number=56)
 
 
 def test_exhausted_fresh_plan_validation_diagnostic_survives_resume(tmp_path):
@@ -1268,6 +1361,32 @@ def test_validation_record_post_failure_preserves_original_error(tmp_path):
     assert "original deterministic validator cause" in str(raised.value)
     assert "not persisted" in str(raised.value)
     assert runner.diagnostic_posts
+
+
+def test_exhausted_plan_validation_persists_from_the_planning_orchestration_path(
+    tmp_path, monkeypatch
+):
+    invalid_payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    invalid_payload.pop("architecture_impact")
+    invalid_candidate = (
+        json.dumps(invalid_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [invalid_candidate]
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *args, **kwargs: (None, None, []),
+    )
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert error.value.plan_validation_exhaustion is not None
+    assert len(runner.diagnostic_posts) == 1
+    assert "not persisted" not in str(error.value)
 
 
 def _add_default_requirement_disposition(

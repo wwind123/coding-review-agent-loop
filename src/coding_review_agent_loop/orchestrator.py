@@ -112,6 +112,7 @@ from .github import (
     post_pr_comment,
     post_trusted_pr_contract_record,
     post_trusted_pr_comment,
+    post_verified_trusted_issue_round_comment,
     post_verified_trusted_issue_protocol_comment,
     resolve_authenticated_github_actor,
     reject_forged_protocol_markers,
@@ -3203,6 +3204,7 @@ def _run_validated_agent(
                     public_text_is_transient = True
                 if (
                     last_failure_category == "deterministic"
+                    and not marker_safety_failure
                     and repair_expected_kind in {"plan_state", "plan_revision"}
                     and structured_kind in {"plan_state", "plan_revision"}
                     and structured_kind == repair_expected_kind
@@ -7568,6 +7570,74 @@ def _persist_exhausted_plan_validation_diagnostic(
         ) from exc
 
 
+def _post_plan_coder_round_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    body: TrustedBody,
+    diagnostic: PlanValidationDiagnosticTransport | None,
+    target_coder_round: int,
+    prior_plan_subject: str | None,
+    candidate_kind: Literal["plan_state", "plan_revision"],
+    require_execution_strategy_contract: bool,
+    require_risk_test_matrix_contract: bool,
+) -> bool:
+    """Publish a plan coder round and report whether it superseded a diagnostic.
+
+    A canonical coder round only clears an in-memory diagnostic when the
+    diagnostic's complete payload context matches this candidate and the
+    round has crossed the authenticated REST publication seam.  Unrelated or
+    stale diagnostics retain their normal history and cannot be cleared by a
+    successful plan.
+    """
+    architecture_version, execution_version, matrix_version = _plan_validation_contract_versions(
+        require_execution_strategy_contract=require_execution_strategy_contract,
+        require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+    )
+    supersedes = diagnostic is not None and diagnostic.payload.matches_context(
+        repository=config.repo,
+        issue_number=issue_number,
+        planning_generation=1,
+        target_coder_round=target_coder_round,
+        prior_plan_subject=prior_plan_subject,
+        candidate_kind=candidate_kind,
+        architecture_contract_version=architecture_version,
+        execution_strategy_contract_version=execution_version,
+        risk_test_matrix_contract_version=matrix_version,
+    )
+    if not supersedes:
+        post_issue_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=body,
+        )
+        return False
+    actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    posted = post_verified_trusted_issue_round_comment(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        body=body,
+        expected_author_login=actor_login,
+        expected_author_id=actor_id,
+    )
+    if (
+        posted.comment_id is None
+        or posted.comment_id < 1
+        or posted.author != actor_login
+        or posted.author_id != actor_id
+        or not isinstance(posted.created_at, str)
+        or not posted.created_at
+        or not isinstance(posted.body, str)
+    ):
+        raise AgentLoopError(
+            "Verified canonical plan publication returned an incomplete transport wrapper."
+        )
+    return True
+
+
 def _launch_reviewer_turns(
     runner: Runner,
     pending: Sequence[AgentName],
@@ -7758,13 +7828,9 @@ def _run_plan_first_loop(
             public_plan_output = normalize_freeform_signature(
                 plan_output, agent=config.coder, config=config, model_used=plan_response.model_used
             )
-        post_issue_comment(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            body=_attach_round_metadata(
-                public_plan_output,
-                PostedRoundMetadata(
+        plan_round_body = _attach_round_metadata(
+            public_plan_output,
+            PostedRoundMetadata(
                     flow="plan",
                     role="coder",
                     agent=coder_name,
@@ -7822,9 +7888,21 @@ def _run_plan_first_loop(
                         if structured_plan is not None and structured_plan.risk_test_matrix is not None
                         else None
                     ),
-                ),
-            ),
+            )
         )
+        if _post_plan_coder_round_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=plan_round_body,
+            diagnostic=plan_validation_diagnostic,
+            target_coder_round=1,
+            prior_plan_subject=None,
+            candidate_kind="plan_state",
+            require_execution_strategy_contract=require_fresh_execution_contract,
+            require_risk_test_matrix_contract=require_fresh_matrix_contract,
+        ):
+            plan_validation_diagnostic = None
         start_round_number = 1
         resumed_round: ResumedReviewRound | None = None
         current_coder_output = plan_output
@@ -9125,13 +9203,9 @@ def _run_plan_first_loop(
                 plan_response.text, agent=config.coder, config=config, model_used=plan_response.model_used
             )
         coder_session_id = plan_response.session_id
-        post_issue_comment(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            body=_attach_round_metadata(
-                public_comment,
-                PostedRoundMetadata(
+        plan_round_body = _attach_round_metadata(
+            public_comment,
+            PostedRoundMetadata(
                     flow="plan",
                     role="coder",
                     agent=coder_name,
@@ -9189,9 +9263,21 @@ def _run_plan_first_loop(
                     ),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
-                ),
-            ),
+            )
         )
+        if _post_plan_coder_round_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=plan_round_body,
+            diagnostic=plan_validation_diagnostic,
+            target_coder_round=round_number + 1,
+            prior_plan_subject=current_plan_subject,
+            candidate_kind="plan_revision",
+            require_execution_strategy_contract=require_fresh_execution_contract,
+            require_risk_test_matrix_contract=require_fresh_matrix_contract,
+        ):
+            plan_validation_diagnostic = None
         resumed_round = None
 
     raise AgentLoopError(

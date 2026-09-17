@@ -1292,19 +1292,22 @@ def _parse_issue_comments(raw_comments: object) -> tuple[IssueComment, ...]:
     for raw_comment in raw_comments:
         if not isinstance(raw_comment, dict):
             continue
+        # GraphQL issue views expose the producer as ``author`` while the
+        # REST issue-comment endpoint exposes the same identity as ``user``.
+        # Keep one parser for both projections so transport authentication is
+        # based on the live REST identity rather than comment ordering.
+        author = raw_comment.get("author") or raw_comment.get("user")
+        raw_id = raw_comment.get("id")
+        if not isinstance(raw_id, int) or isinstance(raw_id, bool):
+            raw_id = raw_comment.get("databaseId")
+        comment_id = raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None
         comments.append(
             IssueComment(
-                author=_author_login(raw_comment.get("author")),
-                created_at=raw_comment.get("createdAt") or raw_comment.get("created_at"),
+                author=_author_login(author),
+                created_at=_optional_str(raw_comment.get("createdAt")) or _optional_str(raw_comment.get("created_at")),
                 body=_optional_str(raw_comment.get("body")),
-                comment_id=(
-                    raw_comment.get("id")
-                    if isinstance(raw_comment.get("id"), int)
-                    else raw_comment.get("databaseId")
-                    if isinstance(raw_comment.get("databaseId"), int)
-                    else None
-                ),
-                author_id=_author_id(raw_comment.get("author")),
+                comment_id=comment_id,
+                author_id=_author_id(author),
             )
         )
     return tuple(sorted(comments, key=_comment_sort_key))
@@ -1687,31 +1690,77 @@ def _merge_issue_comment_transport_identity(
     issue_number: int,
     comments: tuple[IssueComment, ...],
 ) -> tuple[IssueComment, ...]:
-    """Attach numeric REST identities only when a durable audit marker exists."""
+    """Attach numeric REST identities only when a durable audit marker exists.
+
+    ``gh issue view --comments`` supplies the convenient GraphQL projection,
+    but it does not expose the numeric comment/user IDs required by the
+    authenticated diagnostic protocol.  The REST endpoint is therefore read
+    to completion and matched by immutable visible fields.  An incomplete
+    REST read is a fail-closed recovery error; returning shape-only comments
+    would make a real durable record silently disappear from resume selection.
+    """
     if not any(
         isinstance(comment.body, str)
         and "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.body
         for comment in comments
     ):
         return comments
-    result = runner.run(
-        [
-            config.gh_cmd,
-            "api",
-            f"repos/{config.repo}/issues/{issue_number}/comments?per_page=100",
-        ],
-        cwd=active_workdir(config),
-        check=False,
-    )
-    if result.returncode != 0:
-        return comments
-    try:
-        raw_comments = json.loads(result.stdout or "[]")
-    except json.JSONDecodeError:
-        return comments
-    if not isinstance(raw_comments, list):
-        return comments
-    transport_comments = _parse_issue_comments(raw_comments)
+    page_size = 100
+    page = 1
+    raw_transport_comments: list[object] = []
+    seen_ids: set[int] = set()
+    # This is only a loop guard.  GitHub's endpoint is finite, but a broken
+    # proxy must not turn recovery into an unbounded operation.
+    max_pages = 10_000
+    while page <= max_pages:
+        result = runner.run(
+            [
+                config.gh_cmd,
+                "api",
+                f"repos/{config.repo}/issues/{issue_number}/comments?per_page={page_size}&page={page}",
+            ],
+            cwd=active_workdir(config),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AgentLoopError(
+                f"GitHub issue comment recovery for issue #{issue_number} is incomplete; "
+                "trusted planning diagnostics cannot be resumed safely."
+            )
+        try:
+            raw_page = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError(
+                f"GitHub issue comment recovery for issue #{issue_number} returned malformed JSON."
+            ) from exc
+        if not isinstance(raw_page, list):
+            raise AgentLoopError(
+                f"GitHub issue comment recovery for issue #{issue_number} returned a non-list page."
+            )
+        raw_transport_comments.extend(raw_page)
+        for raw_comment in raw_page:
+            if not isinstance(raw_comment, dict):
+                raise AgentLoopError(
+                    f"GitHub issue comment recovery for issue #{issue_number} returned an incomplete page."
+                )
+            comment_id = raw_comment.get("id")
+            if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id < 1:
+                raise AgentLoopError(
+                    f"GitHub issue comment recovery for issue #{issue_number} returned a comment without a numeric ID."
+                )
+            if comment_id in seen_ids:
+                raise AgentLoopError(
+                    f"GitHub issue comment recovery for issue #{issue_number} repeated a comment ID."
+                )
+            seen_ids.add(comment_id)
+        if len(raw_page) < page_size:
+            break
+        page += 1
+    else:
+        raise AgentLoopError(
+            f"GitHub issue comment recovery for issue #{issue_number} exceeded its pagination bound."
+        )
+    transport_comments = _parse_issue_comments(raw_transport_comments)
     by_key: dict[tuple[str | None, str | None, str | None], list[IssueComment]] = {}
     for comment in transport_comments:
         by_key.setdefault((comment.author, comment.created_at, comment.body), []).append(comment)
@@ -1719,6 +1768,21 @@ def _merge_issue_comment_transport_identity(
     for comment in comments:
         candidates = by_key.get((comment.author, comment.created_at, comment.body), [])
         transport = candidates.pop(0) if candidates else None
+        if (
+            isinstance(comment.body, str)
+            and "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.body
+            and (
+                transport is None
+                or transport.comment_id is None
+                or transport.author is None
+                or transport.author_id is None
+                or transport.created_at is None
+            )
+        ):
+            raise AgentLoopError(
+                f"GitHub issue comment recovery for issue #{issue_number} could not authenticate "
+                "a planning diagnostic against the live REST record."
+            )
         merged.append(
             replace(
                 comment,
@@ -2126,6 +2190,37 @@ def post_verified_trusted_issue_protocol_comment(
         comment_id=payload["id"],
         author_id=author_id,
     )
+
+
+def post_verified_trusted_issue_round_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    body: TrustedBody,
+    expected_author_login: str,
+    expected_author_id: int,
+) -> IssueComment:
+    """Post a round comment through the verified REST seam.
+
+    Large canonical round comments may be split into transport sidecars and a
+    final anchor.  Return the verified wrapper for that final anchor, which is
+    the comment whose round metadata drives recovery and supersession.
+    """
+    bodies = prepare_round_comment(body)
+    posted: IssueComment | None = None
+    for prepared in bodies:
+        posted = post_verified_trusted_issue_protocol_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=prepared,
+            expected_author_login=expected_author_login,
+            expected_author_id=expected_author_id,
+        )
+    if posted is None:  # pragma: no cover - prepare_round_comment always returns an anchor
+        raise AgentLoopError("Verified issue round posting produced no comment wrapper.")
+    return posted
 
 
 def _post_comment_body(runner: Runner, *, config: AgentLoopConfig, command: list[str], body: str) -> None:

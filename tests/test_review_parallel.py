@@ -10,11 +10,17 @@ import pytest
 import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import AgentLoopError, build_parser, run_issue_loop, run_pr_loop
 from coding_review_agent_loop.errors import QuotaResetExceededError
+from coding_review_agent_loop.round_state import (
+    PlanValidationDiagnosticPayload,
+    encode_plan_validation_diagnostic_body,
+)
+from coding_review_agent_loop.runner import CommandResult
 from agent_loop_helpers import (
     FakeRunner,
     make_config,
     structured_coder_followup,
     structured_plan_review,
+    structured_plan_revision,
     structured_plan_state,
     structured_pr_review,
 )
@@ -24,6 +30,157 @@ def _initial_plan() -> str:
     return structured_plan_state(
         state="blocking", summary="Initial plan.", plan_steps=["Make the change."]
     )
+
+
+class _PlanDiagnosticParallelRunner(FakeRunner):
+    """Expose the REST identity seam while retaining the normal issue fixture."""
+
+    def __init__(self, *, diagnostic_body, claude_outputs, codex_outputs, gemini_outputs):
+        super().__init__(
+            claude_outputs=claude_outputs,
+            codex_outputs=codex_outputs,
+            gemini_outputs=gemini_outputs,
+            issue_comments=[
+                {
+                    "author": {"login": "agent", "id": 7},
+                    "createdAt": "2026-09-17T05:30:00Z",
+                    "body": diagnostic_body,
+                    "id": 700,
+                }
+            ],
+        )
+        self.verified_round_bodies = []
+
+    def _rest_comment(self, raw_comment, index):
+        author = raw_comment.get("author") or raw_comment.get("user") or {}
+        login = author.get("login") if isinstance(author, dict) else None
+        return {
+            "id": raw_comment.get("id") or 1000 + index,
+            "created_at": raw_comment.get("createdAt") or raw_comment.get("created_at"),
+            "body": raw_comment.get("body"),
+            "user": {"login": login or "coding-review-agent-loop", "id": 7 if login == "agent" else 99},
+        }
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = list(args)
+        if command == ["gh", "api", "user"]:
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(recorded, cwd_path, json.dumps({"login": "agent", "id": 7}), "", 0)
+        if command[:4] == ["gh", "api", "--method", "POST"]:
+            endpoint = command[4] if len(command) > 4 else ""
+            if endpoint == "repos/OWNER/REPO/issues/56/comments":
+                recorded, cwd_path = self._record_command(args, cwd)
+                body = json.loads(input_text or "{}")["body"]
+                self.verified_round_bodies.append(body)
+                comment = {
+                    "author": {"login": "agent", "id": 7},
+                    "createdAt": "2026-09-17T05:31:00Z",
+                    "body": body,
+                    "id": 701 + len(self.verified_round_bodies),
+                }
+                self.issue_comments.append(comment)
+                return CommandResult(
+                    recorded,
+                    cwd_path,
+                    json.dumps(
+                        {
+                            "id": comment["id"],
+                            "created_at": comment["createdAt"],
+                            "body": body,
+                            "user": {"login": "agent", "id": 7},
+                        }
+                    ),
+                    "",
+                    0,
+                )
+        if command[:2] == ["gh", "api"] and len(command) > 2 and command[2].startswith(
+            "repos/OWNER/REPO/issues/56/comments?"
+        ):
+            recorded, cwd_path = self._record_command(args, cwd)
+            query = dict(part.split("=", 1) for part in command[2].split("?", 1)[1].split("&"))
+            page = int(query["page"])
+            raw_comments = [self._rest_comment(comment, index) for index, comment in enumerate(self.issue_comments)]
+            start = (page - 1) * int(query["per_page"])
+            end = start + int(query["per_page"])
+            return CommandResult(recorded, cwd_path, json.dumps(raw_comments[start:end]), "", 0)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+@pytest.mark.parametrize("context_mode", ["compact", "full"])
+def test_plan_parallel_revision_supersedes_diagnostic_without_leaking_it_to_next_prompt(
+    tmp_path, context_mode
+):
+    payload = PlanValidationDiagnosticPayload(
+        repository="OWNER/REPO",
+        issue_number=56,
+        planning_generation=1,
+        target_coder_round=1,
+        prior_plan_subject=None,
+        candidate_kind="plan_state",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=None,
+        risk_test_matrix_contract_version=None,
+        expected_producer_login="agent",
+        expected_producer_id=7,
+        failure_attempt=1,
+        candidate_digest="a" * 64,
+        category="deterministic",
+        diagnostic="missing matrix-level audit operation",
+    )
+    diagnostic_body = str(encode_plan_validation_diagnostic_body(payload))
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=diagnostic_body,
+        claude_outputs=[
+            structured_plan_state(summary="Replacement initial plan."),
+            structured_plan_revision(summary="Revision after the blocking review."),
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                summary="Codex found one plan issue.",
+                blocking_plan_issues=["Add the missing verification step."],
+            ),
+            structured_plan_review(
+                summary="Codex approves the revised plan.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                summary="Gemini approves the initial plan.",
+                reviewer="Google Gemini",
+            ),
+            structured_plan_review(
+                summary="Gemini approves the revised plan.",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        review_parallel=True,
+        planning_context_mode=context_mode,
+        max_rounds=2,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompts = [
+        command[-1]
+        for command, _cwd in runner.commands
+        if command[:1] == ["claude"]
+    ]
+    assert len(planner_prompts) == 2
+    assert "missing matrix-level audit operation" in planner_prompts[0]
+    assert "missing matrix-level audit operation" not in planner_prompts[1]
+    assert len(runner.verified_round_bodies) == 1
+    assert all("901" not in body for body in runner.verified_round_bodies)
 
 
 # ---------------------------------------------------------------------------
