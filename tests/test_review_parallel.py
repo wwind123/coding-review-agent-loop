@@ -252,6 +252,11 @@ def test_plan_validation_diagnostic_survives_a_new_invocation_and_is_superseded(
     assert "Trusted orchestration correction record" in planner_prompts[1]
     assert "Failed validation attempt: 1" in planner_prompts[1]
     assert "Exact bounded validator diagnostic" in planner_prompts[1]
+    assert planner_prompts[1].count(
+        "plan_state must include architecture_impact for this fresh contract turn."
+    ) == 1
+    assert "AGENT_PLAN_VALIDATION_DIAGNOSTIC" not in planner_prompts[1]
+    assert "2026-09-17T05:31:00Z" not in planner_prompts[1]
     assert len(runner.verified_round_bodies) == 2
 
 

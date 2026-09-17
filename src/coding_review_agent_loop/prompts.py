@@ -27,7 +27,11 @@ from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provena
 from .memory import AgentMemoryContext, format_agent_memory_context
 from .managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
 from .salvage import AGENT_SALVAGE_MARKER_RE
-from .round_transport import MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS, is_round_transport_sidecar
+from .round_transport import (
+    MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS,
+    PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE,
+    is_round_transport_sidecar,
+)
 from .protocol import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
@@ -648,6 +652,13 @@ def _is_salvage_breadcrumb_comment(comment) -> bool:
     return bool(comment.body) and bool(AGENT_SALVAGE_MARKER_RE.search(comment.body))
 
 
+def _is_plan_validation_diagnostic_comment(comment) -> bool:
+    """Keep durable correction records out of ordinary issue prose."""
+    return bool(comment.body) and bool(
+        PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.search(comment.body)
+    )
+
+
 def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000) -> str:
     raw_body = issue_context.body if issue_context.body else "(none)"
     body = _truncate_issue_text(raw_body, max_chars=max_chars // 3, label="Issue body")
@@ -666,14 +677,14 @@ def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000
         "",
         "Comments, oldest to newest:",
     ]
-    # AGENT_SALVAGE breadcrumb comments carry a bounded but potentially large
-    # embedded patch/metadata payload for cross-workdir salvage discovery
-    # (#507); they are consumed separately via latest_salvage_context and
-    # would otherwise bloat/displace real discussion in this raw rendering.
+    # Durable machine records are consumed through authenticated, typed paths.
+    # Rendering them again as ordinary issue prose would duplicate trusted
+    # context and expose active reserved syntax to the planner.
     visible_comments = tuple(
         comment
         for comment in issue_context.comments
         if not _is_salvage_breadcrumb_comment(comment)
+        and not _is_plan_validation_diagnostic_comment(comment)
         and not (comment.body and is_round_transport_sidecar(comment.body))
     )
     if visible_comments:
