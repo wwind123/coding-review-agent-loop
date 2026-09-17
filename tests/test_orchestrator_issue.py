@@ -1268,6 +1268,60 @@ def test_issue_comment_recovery_discovers_diagnostic_beyond_graphql_projection(t
     assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
 
 
+def test_issue_comment_recovery_discovers_canonical_round_transport(
+    tmp_path,
+):
+    canonical_plan = structured_plan_state(summary="Historical canonical plan.")
+    canonical_body = _attach_round_metadata(
+        canonical_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject=_plan_subject(canonical_plan),
+            canonical_plan=canonical_plan,
+            raw_structured_coder_response=canonical_plan,
+            architecture_contract_version=1,
+            state="approved",
+        ),
+    )
+    first_page = [
+        {
+            "id": index + 1,
+            "body": f"ordinary {index}",
+            "created_at": f"2026-09-17T04:00:{index:02d}Z",
+            "user": {"login": "agent", "id": 7},
+        }
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "id": 101,
+            "created_at": "2026-09-17T05:30:00Z",
+            "body": str(canonical_body),
+            "user": {"login": "agent", "id": 7},
+        }
+    ]
+    runner = _PaginatedIssueCommentsRunner([first_page, second_page])
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": f"2026-09-17T04:00:{index:02d}Z",
+            "body": f"ordinary {index}",
+        }
+        for index in range(100)
+    ]
+
+    context = get_issue_context(runner, config=make_config(tmp_path), issue_number=56)
+
+    recovered = next(comment for comment in context.comments if comment.body == str(canonical_body))
+    assert recovered.comment_id == 101
+    assert recovered.author == "agent"
+    assert recovered.author_id == 7
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+
+
 def test_issue_comment_recovery_fails_closed_when_a_later_rest_page_is_unavailable(tmp_path):
     marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
 

@@ -7950,7 +7950,11 @@ def _run_plan_first_loop(
         prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
             item.item_id: [] for item in prior_unresolved_items
         }
-        round_new_unresolved_items: list[UnresolvedReviewItem] = []
+        round_new_unresolved_items: list[UnresolvedReviewItem] = list(
+            current_resume.current_round_new_items
+            if current_resume is not None and current_resume.reconciled
+            else ()
+        )
         current_plan_subject = _plan_subject(current_plan)
         round_ledger_incomplete = _round_ledger_may_be_incomplete(
             current_resume=current_resume,
@@ -8297,7 +8301,10 @@ def _run_plan_first_loop(
                 blocking_reviews.append((reviewer_name, review_output))
             else:
                 approved_review_outputs.append((reviewer_name, review_output))
-            if resumed_record is None or resumed_record.metadata.phase == "publication":
+            if resumed_record is None or (
+                resumed_record.metadata.phase == "publication"
+                and not (current_resume is not None and current_resume.reconciled)
+            ):
                 for item in parsed_review.items.blocking:
                     tracked_item = _next_unresolved_item(
                         item_number=next_unresolved_item_number,

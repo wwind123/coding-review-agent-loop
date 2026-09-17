@@ -19,6 +19,7 @@ from coding_review_agent_loop.round_state import (
     _encode_round_metadata,
     _extract_round_metadata_records,
     _prior_item_ledger_signature,
+    _plan_subject,
     decode_plan_validation_diagnostic_body,
     encode_plan_validation_diagnostic_body,
     recover_plan_validation_diagnostic,
@@ -209,7 +210,7 @@ def test_verified_canonical_plan_success_semantically_supersedes_diagnostic() ->
         "Canonical plan",
         PostedRoundMetadata(
             flow="plan", role="coder", agent="Claude", round_number=1,
-            subject="a" * 64, prior_plan_subject=None, canonical_plan="Canonical plan",
+            subject=_plan_subject("Canonical plan"), prior_plan_subject=None, canonical_plan="Canonical plan",
             architecture_contract_version=1,
             execution_strategy_contract_version=1,
             risk_test_matrix_contract_version=1,

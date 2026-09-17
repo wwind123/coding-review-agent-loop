@@ -36,7 +36,10 @@ from .issue_pr_provenance import (
     compare_issue_pr_provenance,
     parse_issue_pr_provenance_messages,
 )
-from .round_transport import MAX_GITHUB_BODY_CHARS, prepare_round_comment
+from .round_transport import (
+    MAX_GITHUB_BODY_CHARS,
+    prepare_round_comment,
+)
 from .protocol import parse_signed_human_requirement_body
 from .protocol_markers import (
     ISSUE_BODY_SURFACE,
@@ -1033,7 +1036,12 @@ def _author_login(raw: object) -> str | None:
 
 
 def _author_id(raw: object) -> int | None:
-    if isinstance(raw, dict) and isinstance(raw.get("id"), int):
+    if (
+        isinstance(raw, dict)
+        and isinstance(raw.get("id"), int)
+        and not isinstance(raw.get("id"), bool)
+        and raw["id"] > 0
+    ):
         return raw["id"]
     return None
 
@@ -1300,7 +1308,15 @@ def _parse_issue_comments(raw_comments: object) -> tuple[IssueComment, ...]:
         raw_id = raw_comment.get("id")
         if not isinstance(raw_id, int) or isinstance(raw_id, bool):
             raw_id = raw_comment.get("databaseId")
-        comment_id = raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None
+        comment_id = (
+            raw_id
+            if (
+                isinstance(raw_id, int)
+                and not isinstance(raw_id, bool)
+                and raw_id > 0
+            )
+            else None
+        )
         comments.append(
             IssueComment(
                 author=_author_login(author),
@@ -1798,15 +1814,23 @@ def _merge_issue_comment_transport_identity(
             )
         )
     # The GraphQL projection can omit older comments once it reaches its
-    # connection cap.  Add only authenticated diagnostic records discovered
-    # by REST; ordinary comments remain sourced from the existing projection
-    # and are not duplicated into prompt context.
+    # connection cap.  Add only authenticated protocol transport records
+    # discovered by REST; ordinary comments remain sourced from the existing
+    # projection and are not duplicated into prompt context.  Round anchors
+    # and sidecars are needed together: a canonical plan may use sidecars, and
+    # the authenticated canonical anchor is what semantically supersedes a
+    # diagnostic during later recovery.
+    transport_marker_names = (
+        "AGENT_PLAN_VALIDATION_DIAGNOSTIC",
+        "AGENT_LOOP_META",
+        "AGENT_LOOP_SIDECAR",
+    )
     for transport in transport_comments:
         if (
             transport.comment_id is not None
             and transport.comment_id not in matched_transport_ids
             and isinstance(transport.body, str)
-            and "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in transport.body
+            and any(marker in transport.body for marker in transport_marker_names)
         ):
             merged.append(transport)
     return tuple(sorted(merged, key=_comment_sort_key))
@@ -1936,7 +1960,13 @@ def resolve_authenticated_github_actor(
     cached = getattr(runner, "_agent_loop_authenticated_actor", None)
     if isinstance(cached, tuple) and len(cached) == 2:
         login, actor_id = cached
-        if isinstance(login, str) and isinstance(actor_id, int):
+        if (
+            isinstance(login, str)
+            and bool(login)
+            and isinstance(actor_id, int)
+            and not isinstance(actor_id, bool)
+            and actor_id > 0
+        ):
             return login, actor_id
     if config.dry_run:
         raise AgentLoopError("Authenticated GitHub actor is unavailable in dry-run mode.")
@@ -1953,7 +1983,13 @@ def resolve_authenticated_github_actor(
         raise AgentLoopError("Authenticated GitHub actor response was not valid JSON.") from exc
     login = payload.get("login") if isinstance(payload, dict) else None
     actor_id = payload.get("id") if isinstance(payload, dict) else None
-    if not isinstance(login, str) or not login or not isinstance(actor_id, int) or actor_id < 1:
+    if (
+        not isinstance(login, str)
+        or not login
+        or not isinstance(actor_id, int)
+        or isinstance(actor_id, bool)
+        or actor_id < 1
+    ):
         raise AgentLoopError(
             "Authenticated GitHub actor response lacked a login and immutable user ID."
         )
@@ -2189,7 +2225,12 @@ def post_verified_trusted_issue_protocol_comment(
         raise AgentLoopError(
             f"Trusted issue protocol record for issue #{issue_number} returned invalid JSON."
         ) from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("id"), int) or payload["id"] < 1:
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("id"), int)
+        or isinstance(payload.get("id"), bool)
+        or payload["id"] < 1
+    ):
         raise AgentLoopError(
             f"Trusted issue protocol record for issue #{issue_number} returned no numeric comment ID."
         )
@@ -2210,6 +2251,16 @@ def post_verified_trusted_issue_protocol_comment(
         )
     login = returned_user.get("login") or returned_user.get("slug")
     author_id = returned_user.get("id")
+    if (
+        not isinstance(login, str)
+        or not login
+        or not isinstance(author_id, int)
+        or isinstance(author_id, bool)
+        or author_id < 1
+    ):
+        raise AgentLoopError(
+            f"Trusted issue protocol record for issue #{issue_number} returned an invalid author identity."
+        )
     if login != expected_author_login or author_id != expected_author_id:
         raise AgentLoopError(
             f"Trusted issue protocol record for issue #{issue_number} was authored by an unexpected actor."

@@ -426,6 +426,10 @@ class ResumedReviewRound:
     local_test_evidence: str | None = None
     qualification_checkpoint: QualificationCheckpoint | None = None
     plan_validation_diagnostic: "PlanValidationDiagnosticTransport | None" = None
+    # Parallel publication checkpoints intentionally omit provisional item
+    # numbers. A settled reconciliation record carries the authoritative
+    # items; preserve them on resume instead of minting duplicate IDs.
+    current_round_new_items: tuple[UnresolvedReviewItem, ...] = ()
 
 
 PLAN_VALIDATION_DIAGNOSTIC_SUFFIX = "[diagnostic truncated]"
@@ -731,6 +735,7 @@ def _authenticated_canonical_plan_success_exists(
             and metadata.role == "coder"
             and metadata.round_number == target_coder_round
             and metadata.canonical_plan
+            and _plan_subject(metadata.canonical_plan) == metadata.subject
             and metadata.prior_plan_subject == prior_plan_subject
             and metadata.architecture_contract_version == architecture_contract_version
             and metadata.execution_strategy_contract_version == execution_strategy_contract_version
@@ -2899,6 +2904,14 @@ def _resume_plan_round(
         if metadata.role != "reviewer" or metadata.agent not in configured_reviewer_names:
             continue
         reviewer_records[metadata.agent] = record
+    settled_new_items: list[UnresolvedReviewItem] = []
+    settled_item_ids: set[str] = set()
+    for record in current_round_records:
+        for item in record.metadata.new_items:
+            if item.item_id in settled_item_ids:
+                continue
+            settled_item_ids.add(item.item_id)
+            settled_new_items.append(item)
     return (
         current_plan,
         ResumedReviewRound(
@@ -2915,6 +2928,7 @@ def _resume_plan_round(
             reconciled=any(record.metadata.role == "summary" for record in current_round_records),
             coder_metadata=latest_coder_record.metadata,
             local_test_evidence=latest_coder_record.metadata.local_test_evidence,
+            current_round_new_items=tuple(settled_new_items),
         ),
     )
 

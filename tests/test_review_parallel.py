@@ -232,6 +232,72 @@ def test_plan_validation_diagnostic_survives_a_new_invocation_and_is_superseded(
 
 
 @pytest.mark.parametrize("context_mode", ["compact", "full"])
+def test_plan_parallel_revision_validation_exhaustion_survives_resume(
+    tmp_path, context_mode
+):
+    invalid_payload = json.loads(
+        structured_plan_revision(summary="Rejected revision.").split("\n", 1)[0]
+    )
+    invalid_payload.pop("architecture_impact")
+    invalid_revision = (
+        json.dumps(invalid_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=None,
+        claude_outputs=[structured_plan_state(summary="Initial plan."), invalid_revision],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                summary="The plan needs one correction.",
+                blocking_plan_issues=["Add the missing verification step."],
+            )
+        ],
+        gemini_outputs=[],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        review_parallel=True,
+        planning_context_mode=context_mode,
+        max_rounds=2,
+        agent_max_retries=0,
+    )
+
+    with patch.object(orchestrator, "_run_structured_repair", return_value=(None, None, [])):
+        with pytest.raises(AgentInvocationError) as error:
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert error.value.plan_validation_exhaustion is not None
+    diagnostic_comments = [
+        comment for comment in runner.issue_comments
+        if "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.get("body", "")
+    ]
+    assert len(diagnostic_comments) == 1
+
+    runner.claude_outputs = [structured_plan_revision(summary="Recovered revision.")]
+    runner.codex_outputs = [
+        structured_plan_review(
+            state="approved",
+            summary="The recovered revision is approved.",
+            prior_plan_item_dispositions=[
+                {"item_id": "item-1", "disposition": "resolved"}
+            ],
+        )
+    ]
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompts = [
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["claude"]
+    ]
+    assert len(planner_prompts) == 3
+    assert "Trusted orchestration correction record" in planner_prompts[-1]
+    assert "Add the missing verification step." in planner_prompts[-1]
+    assert len([command for command, _cwd in runner.commands if command[:2] == ["codex", "exec"]]) == 2
+    assert len(runner.verified_round_bodies) == 2
+
+
+@pytest.mark.parametrize("context_mode", ["compact", "full"])
 def test_revision_success_supersedes_diagnostic_before_a_later_same_invocation_prompt(
     tmp_path, context_mode
 ):

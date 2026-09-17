@@ -1174,7 +1174,9 @@ Execution model:
   changes: it aggregates outcomes, numbers unresolved items, and may begin
   coder work only in configured `--reviewer` order. It then posts a neutral
   reconciliation checkpoint; this summary is not a reviewer verdict and is
-  excluded from reviewer/approval selection.
+  excluded from reviewer/approval selection. On resume, settled `new_items`
+  from that reconciliation checkpoint remain authoritative; provisional
+  publication checkpoints do not cause those items to be numbered again.
 - Only after every healthy outcome is applied does the orchestrator raise a
   fatal failure, if any: a quota-reset failure takes priority; otherwise the
   first failure in configured `--reviewer` order. Because healthy reviewers
