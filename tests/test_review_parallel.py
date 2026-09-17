@@ -9,7 +9,7 @@ import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import AgentLoopError, build_parser, run_issue_loop, run_pr_loop
-from coding_review_agent_loop.errors import QuotaResetExceededError
+from coding_review_agent_loop.errors import AgentInvocationError, QuotaResetExceededError
 from coding_review_agent_loop.round_state import (
     PlanValidationDiagnosticPayload,
     encode_plan_validation_diagnostic_body,
@@ -40,14 +40,18 @@ class _PlanDiagnosticParallelRunner(FakeRunner):
             claude_outputs=claude_outputs,
             codex_outputs=codex_outputs,
             gemini_outputs=gemini_outputs,
-            issue_comments=[
-                {
-                    "author": {"login": "agent", "id": 7},
-                    "createdAt": "2026-09-17T05:30:00Z",
-                    "body": diagnostic_body,
-                    "id": 700,
-                }
-            ],
+            issue_comments=(
+                [
+                    {
+                        "author": {"login": "agent", "id": 7},
+                        "createdAt": "2026-09-17T05:30:00Z",
+                        "body": diagnostic_body,
+                        "id": 700,
+                    }
+                ]
+                if diagnostic_body is not None
+                else []
+            ),
         )
         self.verified_round_bodies = []
 
@@ -181,6 +185,50 @@ def test_plan_parallel_revision_supersedes_diagnostic_without_leaking_it_to_next
     assert "missing matrix-level audit operation" not in planner_prompts[1]
     assert len(runner.verified_round_bodies) == 1
     assert all("901" not in body for body in runner.verified_round_bodies)
+
+
+def test_plan_validation_diagnostic_survives_a_new_invocation_and_is_superseded(
+    tmp_path, monkeypatch
+):
+    invalid_payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    invalid_payload.pop("architecture_impact")
+    invalid_candidate = (
+        json.dumps(invalid_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=None,
+        claude_outputs=[invalid_candidate],
+        codex_outputs=[],
+        gemini_outputs=[],
+    )
+    config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
+
+    with patch.object(
+        orchestrator,
+        "_run_structured_repair",
+        return_value=(None, None, []),
+    ):
+        with pytest.raises(AgentInvocationError) as error:
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert error.value.plan_validation_exhaustion is not None
+    assert len(runner.verified_round_bodies) == 1
+
+    runner.claude_outputs = [structured_plan_state(summary="Recovered plan.")]
+    runner.codex_outputs = [structured_plan_review(summary="The recovered plan is approved.")]
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompts = [
+        command[-1]
+        for command, _cwd in runner.commands
+        if command[:1] == ["claude"]
+    ]
+    assert len(planner_prompts) == 2
+    assert "Trusted orchestration correction record" in planner_prompts[1]
+    assert "Failed validation attempt: 1" in planner_prompts[1]
+    assert "Exact bounded validator diagnostic" in planner_prompts[1]
+    assert len(runner.verified_round_bodies) == 2
 
 
 # ---------------------------------------------------------------------------
