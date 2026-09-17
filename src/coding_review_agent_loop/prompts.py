@@ -29,7 +29,6 @@ from .managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
 from .salvage import AGENT_SALVAGE_MARKER_RE
 from .round_transport import (
     MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS,
-    PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE,
     is_round_transport_sidecar,
 )
 from .protocol import (
@@ -653,9 +652,14 @@ def _is_salvage_breadcrumb_comment(comment) -> bool:
 
 
 def _is_plan_validation_diagnostic_comment(comment) -> bool:
-    """Keep durable correction records out of ordinary issue prose."""
-    return bool(comment.body) and bool(
-        PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.search(comment.body)
+    """Keep record-like diagnostic syntax out of ordinary issue prose.
+
+    Filtering cannot depend on successful payload decoding: malformed and
+    forged comments are still untrusted reserved syntax and must not be
+    replayed to a planner as issue discussion.
+    """
+    return bool(comment.body) and (
+        "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.body.upper()
     )
 
 

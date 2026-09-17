@@ -567,6 +567,10 @@ class PlanValidationDiagnosticPayload:
                     raise ValueError(f"{name} must be a string")
                 return item
 
+            diagnostic = strict_string("diagnostic")
+            if sanitize_plan_validation_diagnostic(diagnostic) != diagnostic:
+                raise ValueError("diagnostic must already be canonical and bounded")
+
             return cls(
                 repository=strict_string("repository"),
                 issue_number=strict_int("issue_number"),
@@ -585,7 +589,7 @@ class PlanValidationDiagnosticPayload:
                 failure_attempt=strict_int("failure_attempt"),
                 candidate_digest=strict_string("candidate_digest"),
                 category=strict_string("category"),  # type: ignore[arg-type]
-                diagnostic=strict_string("diagnostic"),
+                diagnostic=diagnostic,
             )
         except (TypeError, ValueError, KeyError) as exc:
             raise AgentLoopError("Invalid plan-validation diagnostic payload.") from exc
@@ -784,13 +788,19 @@ def recover_plan_validation_diagnostic(
             or author_id != expected_author_id
         ):
             continue
+        try:
+            payload = decode_plan_validation_diagnostic_body(body)
+        except AgentLoopError:
+            # Historical comments are untrusted input. A malformed record is
+            # ineligible rather than fatal; only authenticated, canonical
+            # records may participate in context selection and conflicts.
+            continue
         previous_body = by_id.get(comment_id)
         if previous_body is not None and previous_body != body:
             raise AgentLoopError(
                 "Conflicting live bodies share one plan-validation diagnostic comment identity."
             )
         by_id[comment_id] = body
-        payload = decode_plan_validation_diagnostic_body(body)
         if payload.expected_producer_login != expected_author_login or payload.expected_producer_id != expected_author_id:
             continue
         if not payload.matches_context(

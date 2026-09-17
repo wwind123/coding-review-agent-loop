@@ -149,6 +149,65 @@ def test_plan_validation_payload_roundtrip_is_pre_post_only_and_bounded() -> Non
     assert len(sanitize_plan_validation_diagnostic("z" * 20_000)) == 4096
 
 
+@pytest.mark.parametrize(
+    "unsafe_diagnostic",
+    (
+        "z" * 4097,
+        "password=do-not-trust-persisted-secrets",
+        "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: nested -->",
+    ),
+)
+def test_plan_validation_decoder_rejects_noncanonical_diagnostic(
+    unsafe_diagnostic: str,
+) -> None:
+    mapping = _diagnostic_payload().as_dict()
+    mapping["diagnostic"] = unsafe_diagnostic
+    body = (
+        "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: "
+        f"{transport.encode_mapping(mapping)} -->"
+    )
+
+    with pytest.raises(AgentLoopError, match="Invalid plan-validation diagnostic"):
+        decode_plan_validation_diagnostic_body(body)
+
+
+def test_plan_validation_recovery_ignores_malformed_records() -> None:
+    valid = _diagnostic_comment(_diagnostic_payload(attempt=2), comment_id=402)
+    invalid_mapping = _diagnostic_payload(attempt=9).as_dict()
+    invalid_mapping["diagnostic"] = "secret=must-not-be-normalized"
+    invalid_body = (
+        "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: "
+        f"{transport.encode_mapping(invalid_mapping)} -->"
+    )
+    comments = (
+        IssueComment(
+            author="agent", author_id=7, comment_id=400,
+            created_at="2026-01-01T00:00:00Z",
+            body="<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC broken -->",
+        ),
+        IssueComment(
+            author="agent", author_id=7, comment_id=401,
+            created_at="2026-01-01T00:00:01Z", body=invalid_body,
+        ),
+        valid,
+    )
+
+    selected = recover_plan_validation_diagnostic(
+        comments,
+        repository="OWNER/REPO", issue_number=813,
+        expected_author_login="agent", expected_author_id=7,
+        planning_generation=1, target_coder_round=1,
+        prior_plan_subject=None, candidate_kind="plan_state",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=1,
+        risk_test_matrix_contract_version=1,
+    )
+
+    assert selected is not None
+    assert selected.server_comment_id == 402
+    assert selected.failure_attempt == 2
+
+
 def test_plan_validation_recovery_selects_highest_payload_attempt_not_comment_order() -> None:
     comments = (
         _diagnostic_comment(_diagnostic_payload(attempt=1), comment_id=101, created_at="2026-01-01T00:00:00Z"),
