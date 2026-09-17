@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -55,6 +56,21 @@ class IssueImplementationConflictError(AgentLoopError):
         )
 
 
+@dataclass(frozen=True)
+class DeterministicPlanValidationExhaustion:
+    """The final rejected structured planning candidate after retry exhaustion.
+
+    The candidate is retained only in memory so the orchestrator can compute
+    provenance.  Durable recovery stores the digest and bounded validator
+    diagnostic, never this raw candidate.
+    """
+
+    candidate_kind: str
+    candidate_text: str
+    diagnostic: str
+    candidate_digest: str
+
+
 class AgentInvocationError(AgentLoopError):
     """Raised when an agent invocation fails after retries/repair.
 
@@ -71,6 +87,7 @@ class AgentInvocationError(AgentLoopError):
         failure_category: str | None = None,
         terminal_public_response: str | None = None,
         containment: "ContainmentEvidence | None" = None,
+        plan_validation_exhaustion: DeterministicPlanValidationExhaustion | None = None,
     ) -> None:
         super().__init__(message)
         self.failure_category = failure_category
@@ -80,6 +97,7 @@ class AgentInvocationError(AgentLoopError):
         # failure path, which is unchanged.
         self.terminal_public_response = terminal_public_response
         self.containment = containment
+        self.plan_validation_exhaustion = plan_validation_exhaustion
 
 
 class QuotaResetExceededError(AgentLoopError):

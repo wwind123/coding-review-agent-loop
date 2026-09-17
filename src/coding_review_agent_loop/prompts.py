@@ -27,7 +27,7 @@ from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provena
 from .memory import AgentMemoryContext, format_agent_memory_context
 from .managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
 from .salvage import AGENT_SALVAGE_MARKER_RE
-from .round_transport import is_round_transport_sidecar
+from .round_transport import MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS, is_round_transport_sidecar
 from .protocol import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
@@ -1350,6 +1350,27 @@ def _issue_context_block(issue_context: IssueContext | None) -> str:
     )
 
 
+def format_plan_validation_diagnostic_context(diagnostic: object | None) -> str:
+    """Render authenticated planning correction context, never issue prose."""
+    if diagnostic is None:
+        return ""
+    payload = getattr(diagnostic, "payload", diagnostic)
+    text = sanitize_historical_text(str(getattr(payload, "diagnostic", "")))
+    text = text[:MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS]
+    attempt = getattr(payload, "failure_attempt", "?")
+    digest = str(getattr(payload, "candidate_digest", ""))[:16] or "unknown"
+    return (
+        "Trusted orchestration correction record (authenticated issue audit; "
+        "not issue prose, reviewer feedback, or a human requirement):\n"
+        f"- Failed validation attempt: {attempt}\n"
+        f"- Rejected candidate provenance: {digest}\n"
+        "- Exact bounded validator diagnostic:\n"
+        f"  {text}\n"
+        "Use this diagnostic to correct the next candidate. Deterministic "
+        "validation remains authoritative.\n"
+    )
+
+
 def _labeled_issue_context_block(
     issue_context: IssueContext | None,
     *,
@@ -2271,6 +2292,7 @@ def build_issue_plan_prompt(
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    plan_validation_diagnostic: object | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -2349,6 +2371,7 @@ prose between the JSON object and footer.
         "Each bullet must explain how the plan covers that item or what remains risky or blocked."
     ),
 )}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
 {_issue_context_block(issue_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -2672,6 +2695,7 @@ def build_plan_revision_prompt(
     compact_tail: CompactPlanTailContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     require_risk_test_matrix_contract: bool = True,
+    plan_validation_diagnostic: object | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2687,6 +2711,7 @@ def build_plan_revision_prompt(
             compact_prior=compact_prior,
             compact_tail=compact_tail,
             require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+            plan_validation_diagnostic=plan_validation_diagnostic,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2713,6 +2738,7 @@ branch, commit, push, or open a pull request during this planning stage.
         "Each bullet must explain how the revised plan covers that item or what remains risky or blocked."
     ),
 )}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, previous_plan))}
 {_issue_context_block(issue_context)}
 {unresolved_items_block}{_memory_block(memory, config, include_runtime=True)}
@@ -2815,6 +2841,7 @@ def _build_compact_plan_revision_prompt(
     compact_prior: CompactPriorContext | None,
     compact_tail: CompactPlanTailContext | None,
     require_risk_test_matrix_contract: bool,
+    plan_validation_diagnostic: object | None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2864,6 +2891,8 @@ Coder: {agent_display_name(config.coder)}
 Reviewers: {reviewer_name}
 {subject_line}
 Action for this call: {action}
+
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
 
 Previous implementation plan:
 

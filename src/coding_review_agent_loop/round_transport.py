@@ -13,11 +13,17 @@ from .errors import AgentLoopError
 from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
 
 MAX_GITHUB_BODY_CHARS = 60_000
+MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS = 4096
 ROUND_RESUME_MARKER_RE = re.compile(
     r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_:-]+)\s*-->", re.I
 )
 ROUND_TRANSPORT_SIDECAR_RE = re.compile(
     r"<!--\s*AGENT_LOOP_SIDECAR:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I
+)
+PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE = re.compile(
+    r"<!--\s*AGENT_PLAN_VALIDATION_DIAGNOSTIC:\s*"
+    r"(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
+    re.I,
 )
 _EXECUTION_RECOMMENDATION_RE = re.compile(
     r"<!--\s*AGENT_EXECUTION_RECOMMENDATION:\s*"

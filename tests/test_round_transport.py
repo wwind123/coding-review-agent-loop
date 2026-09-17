@@ -10,6 +10,7 @@ import coding_review_agent_loop.round_transport as transport
 import coding_review_agent_loop.comment_rendering as comment_rendering
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.round_state import (
+    PlanValidationDiagnosticPayload,
     PostedRoundMetadata,
     QualificationCheckpoint,
     _attach_round_metadata,
@@ -18,7 +19,12 @@ from coding_review_agent_loop.round_state import (
     _encode_round_metadata,
     _extract_round_metadata_records,
     _prior_item_ledger_signature,
+    decode_plan_validation_diagnostic_body,
+    encode_plan_validation_diagnostic_body,
+    recover_plan_validation_diagnostic,
+    sanitize_plan_validation_diagnostic,
 )
+from coding_review_agent_loop.github import IssueComment
 from coding_review_agent_loop.protocol import (
     MACHINE_AUTHORITY,
     ReviewItemDisposition,
@@ -90,6 +96,128 @@ def test_encode_decode_mapping_round_trip_and_legacy_base64() -> None:
     assert transport.decode_mapping(transport.encode_mapping(payload)) == payload
     legacy = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
     assert transport.decode_mapping(legacy) == payload
+
+
+def _diagnostic_payload(*, attempt: int = 1, digest: str | None = None, diagnostic: str = "missing audit"):
+    return PlanValidationDiagnosticPayload(
+        repository="OWNER/REPO",
+        issue_number=813,
+        planning_generation=1,
+        target_coder_round=1,
+        prior_plan_subject=None,
+        candidate_kind="plan_state",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=1,
+        risk_test_matrix_contract_version=1,
+        expected_producer_login="agent",
+        expected_producer_id=7,
+        failure_attempt=attempt,
+        candidate_digest=digest or (str(attempt) * 64),
+        category="deterministic",
+        diagnostic=diagnostic,
+    )
+
+
+def _diagnostic_comment(payload: PlanValidationDiagnosticPayload, *, comment_id: int, created_at: str = "2026-01-01T00:00:00Z", author: str = "agent", author_id: int = 7):
+    return IssueComment(
+        author=author,
+        created_at=created_at,
+        body=str(encode_plan_validation_diagnostic_body(payload)),
+        comment_id=comment_id,
+        author_id=author_id,
+    )
+
+
+def test_plan_validation_payload_roundtrip_is_pre_post_only_and_bounded() -> None:
+    payload = _diagnostic_payload(diagnostic="x" * 20_000)
+    body = encode_plan_validation_diagnostic_body(payload)
+
+    assert "987654" not in str(body)
+    assert "2026-01-01" not in str(body)
+    assert len(payload.diagnostic) == 4096
+    assert payload.diagnostic.endswith("[diagnostic truncated]")
+    assert decode_plan_validation_diagnostic_body(str(body)) == payload
+    assert len(sanitize_plan_validation_diagnostic("z" * 20_000)) == 4096
+
+
+def test_plan_validation_recovery_selects_highest_payload_attempt_not_comment_order() -> None:
+    comments = (
+        _diagnostic_comment(_diagnostic_payload(attempt=1), comment_id=101, created_at="2026-01-01T00:00:00Z"),
+        _diagnostic_comment(_diagnostic_payload(attempt=3), comment_id=103, created_at="2025-01-01T00:00:00Z"),
+        _diagnostic_comment(_diagnostic_payload(attempt=2), comment_id=102, created_at="2027-01-01T00:00:00Z"),
+    )
+    selected = recover_plan_validation_diagnostic(
+        comments,
+        repository="OWNER/REPO",
+        issue_number=813,
+        expected_author_login="agent",
+        expected_author_id=7,
+        planning_generation=1,
+        target_coder_round=1,
+        prior_plan_subject=None,
+        candidate_kind="plan_state",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=1,
+        risk_test_matrix_contract_version=1,
+    )
+    assert selected is not None
+    assert selected.failure_attempt == 3
+    assert selected.server_comment_id == 103
+
+
+def test_plan_validation_recovery_rejects_highest_attempt_conflicts_and_spoofs() -> None:
+    comments = (
+        _diagnostic_comment(_diagnostic_payload(attempt=2, digest="a" * 64), comment_id=201),
+        _diagnostic_comment(_diagnostic_payload(attempt=2, digest="b" * 64), comment_id=202),
+    )
+    with pytest.raises(AgentLoopError, match="highest failure attempt"):
+        recover_plan_validation_diagnostic(
+            comments,
+            repository="OWNER/REPO", issue_number=813,
+            expected_author_login="agent", expected_author_id=7,
+            planning_generation=1, target_coder_round=1,
+            prior_plan_subject=None, candidate_kind="plan_state",
+            architecture_contract_version=1,
+            execution_strategy_contract_version=1,
+            risk_test_matrix_contract_version=1,
+        )
+
+    spoof = _diagnostic_comment(_diagnostic_payload(), comment_id=203, author="lookalike", author_id=8)
+    assert recover_plan_validation_diagnostic(
+        (spoof,),
+        repository="OWNER/REPO", issue_number=813,
+        expected_author_login="agent", expected_author_id=7,
+        planning_generation=1, target_coder_round=1,
+        prior_plan_subject=None, candidate_kind="plan_state",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=1,
+        risk_test_matrix_contract_version=1,
+    ) is None
+
+
+def test_verified_canonical_plan_success_semantically_supersedes_diagnostic() -> None:
+    diagnostic = _diagnostic_comment(_diagnostic_payload(), comment_id=301)
+    canonical = _attach_round_metadata(
+        "Canonical plan",
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=1,
+            subject="a" * 64, canonical_plan="Canonical plan",
+        ),
+    )
+    success = IssueComment(
+        author="agent", author_id=7, comment_id=302,
+        created_at="2026-01-02T00:00:00Z", body=str(canonical),
+    )
+    assert recover_plan_validation_diagnostic(
+        (diagnostic, success),
+        repository="OWNER/REPO", issue_number=813,
+        expected_author_login="agent", expected_author_id=7,
+        planning_generation=1, target_coder_round=1,
+        prior_plan_subject=None, candidate_kind="plan_state",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=1,
+        risk_test_matrix_contract_version=1,
+    ) is None
 
 
 def test_is_round_transport_sidecar() -> None:

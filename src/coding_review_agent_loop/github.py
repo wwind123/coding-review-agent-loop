@@ -10,7 +10,7 @@ import os
 import re
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -73,6 +73,12 @@ class IssueComment:
     author: str | None
     created_at: str | None
     body: str | None
+    comment_id: int | None = None
+    author_id: int | None = None
+
+    @property
+    def id(self) -> int | None:
+        return self.comment_id
 
 
 @dataclass(frozen=True)
@@ -1291,6 +1297,14 @@ def _parse_issue_comments(raw_comments: object) -> tuple[IssueComment, ...]:
                 author=_author_login(raw_comment.get("author")),
                 created_at=raw_comment.get("createdAt") or raw_comment.get("created_at"),
                 body=_optional_str(raw_comment.get("body")),
+                comment_id=(
+                    raw_comment.get("id")
+                    if isinstance(raw_comment.get("id"), int)
+                    else raw_comment.get("databaseId")
+                    if isinstance(raw_comment.get("databaseId"), int)
+                    else None
+                ),
+                author_id=_author_id(raw_comment.get("author")),
             )
         )
     return tuple(sorted(comments, key=_comment_sort_key))
@@ -1666,6 +1680,55 @@ def _comment_sort_key(comment: IssueComment) -> str:
     return comment.created_at or ""
 
 
+def _merge_issue_comment_transport_identity(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    comments: tuple[IssueComment, ...],
+) -> tuple[IssueComment, ...]:
+    """Attach numeric REST identities only when a durable audit marker exists."""
+    if not any(
+        isinstance(comment.body, str)
+        and "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.body
+        for comment in comments
+    ):
+        return comments
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "api",
+            f"repos/{config.repo}/issues/{issue_number}/comments?per_page=100",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return comments
+    try:
+        raw_comments = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return comments
+    if not isinstance(raw_comments, list):
+        return comments
+    transport_comments = _parse_issue_comments(raw_comments)
+    by_key: dict[tuple[str | None, str | None, str | None], list[IssueComment]] = {}
+    for comment in transport_comments:
+        by_key.setdefault((comment.author, comment.created_at, comment.body), []).append(comment)
+    merged: list[IssueComment] = []
+    for comment in comments:
+        candidates = by_key.get((comment.author, comment.created_at, comment.body), [])
+        transport = candidates.pop(0) if candidates else None
+        merged.append(
+            replace(
+                comment,
+                comment_id=(transport.comment_id if transport is not None else comment.comment_id),
+                author_id=(transport.author_id if transport is not None else comment.author_id),
+            )
+        )
+    return tuple(sorted(merged, key=_comment_sort_key))
+
+
 def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: int) -> IssueContext:
     if config.dry_run:
         return IssueContext(
@@ -1693,7 +1756,12 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
         cwd=active_workdir(config),
     )
     data = json.loads(result.stdout or "{}")
-    comments = _parse_issue_comments(data.get("comments"))
+    comments = _merge_issue_comment_transport_identity(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        comments=_parse_issue_comments(data.get("comments")),
+    )
     return IssueContext(
         number=int(data.get("number") or issue_number),
         repo=config.repo,
@@ -1774,6 +1842,40 @@ def post_issue_comment(
 def reject_forged_protocol_markers(body: str) -> None:
     """Reject reserved records before any temp-file, runner, or remote mutation."""
     TrustedBody.current_untrusted_visible(body)
+
+
+def resolve_authenticated_github_actor(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+) -> tuple[str, int]:
+    """Resolve and cache the invocation actor used by trusted issue records."""
+    cached = getattr(runner, "_agent_loop_authenticated_actor", None)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        login, actor_id = cached
+        if isinstance(login, str) and isinstance(actor_id, int):
+            return login, actor_id
+    if config.dry_run:
+        raise AgentLoopError("Authenticated GitHub actor is unavailable in dry-run mode.")
+    result = runner.run(
+        [config.gh_cmd, "api", "user"],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError("Unable to resolve the authenticated GitHub actor.")
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError("Authenticated GitHub actor response was not valid JSON.") from exc
+    login = payload.get("login") if isinstance(payload, dict) else None
+    actor_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(login, str) or not login or not isinstance(actor_id, int) or actor_id < 1:
+        raise AgentLoopError(
+            "Authenticated GitHub actor response lacked a login and immutable user ID."
+        )
+    setattr(runner, "_agent_loop_authenticated_actor", (login, actor_id))
+    return login, actor_id
 
 
 def _post_trusted_protocol_comment(
@@ -1951,6 +2053,79 @@ def post_trusted_issue_comment(
         _post_trusted_protocol_comment(
             runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared
         )
+
+
+def post_verified_trusted_issue_protocol_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    body: TrustedBody,
+    expected_author_login: str,
+    expected_author_id: int,
+) -> IssueComment:
+    """Post one issue protocol record and verify the live server envelope."""
+    if not isinstance(body, TrustedBody):
+        raise AgentLoopError("Verified trusted issue protocol posting requires a TrustedBody.")
+    body.validate_for_surface(ISSUE_COMMENT_SURFACE)
+    result = runner.run(
+        [
+            config.gh_cmd,
+            "api",
+            "--method",
+            "POST",
+            f"repos/{config.repo}/issues/{issue_number}/comments",
+            "--input",
+            "-",
+        ],
+        cwd=active_workdir(config),
+        input_text=json.dumps({"body": str(body)}, separators=(",", ":")),
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise AgentLoopError(
+            f"Unable to persist the trusted issue protocol record for issue #{issue_number}."
+            + (f" {detail}" if detail else "")
+        )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(
+            f"Trusted issue protocol record for issue #{issue_number} returned invalid JSON."
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("id"), int) or payload["id"] < 1:
+        raise AgentLoopError(
+            f"Trusted issue protocol record for issue #{issue_number} returned no numeric comment ID."
+        )
+    returned_body = payload.get("body")
+    if returned_body != str(body):
+        raise AgentLoopError(
+            f"Trusted issue protocol record for issue #{issue_number} returned a different body."
+        )
+    created_at = payload.get("created_at") or payload.get("createdAt")
+    if not isinstance(created_at, str) or not created_at:
+        raise AgentLoopError(
+            f"Trusted issue protocol record for issue #{issue_number} returned no server timestamp."
+        )
+    returned_user = payload.get("user") or payload.get("author")
+    if not isinstance(returned_user, dict):
+        raise AgentLoopError(
+            f"Trusted issue protocol record for issue #{issue_number} returned no author identity."
+        )
+    login = returned_user.get("login") or returned_user.get("slug")
+    author_id = returned_user.get("id")
+    if login != expected_author_login or author_id != expected_author_id:
+        raise AgentLoopError(
+            f"Trusted issue protocol record for issue #{issue_number} was authored by an unexpected actor."
+        )
+    return IssueComment(
+        author=login,
+        created_at=created_at,
+        body=returned_body,
+        comment_id=payload["id"],
+        author_id=author_id,
+    )
 
 
 def _post_comment_body(runner: Runner, *, config: AgentLoopConfig, command: list[str], body: str) -> None:

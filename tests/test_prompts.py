@@ -9,6 +9,7 @@ from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
 from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
+from coding_review_agent_loop.round_state import PlanValidationDiagnosticPayload, PlanValidationDiagnosticTransport
 import coding_review_agent_loop.test_runtime as runtime
 import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.prompts import (
@@ -88,6 +89,36 @@ def test_fresh_plan_prompts_show_the_exact_one_shot_contract_shape(tmp_path):
         assert '"execution_recommendation"' in prompt
         assert '"child_stages": []' in prompt
         assert '"retained_parent_work": {"status": "none"' in prompt
+
+
+def test_plan_prompts_render_authenticated_validation_diagnostic_as_trusted_context(tmp_path):
+    config = make_config(tmp_path)
+    payload = PlanValidationDiagnosticPayload(
+        repository="OWNER/REPO", issue_number=813, planning_generation=1,
+        target_coder_round=1, prior_plan_subject=None, candidate_kind="plan_state",
+        architecture_contract_version=1, execution_strategy_contract_version=1,
+        risk_test_matrix_contract_version=1, expected_producer_login="agent",
+        expected_producer_id=7, failure_attempt=2, candidate_digest="a" * 64,
+        category="deterministic", diagnostic="missing complete-scope audit operation",
+    )
+    diagnostic = PlanValidationDiagnosticTransport(
+        payload=payload, server_comment_id=99,
+        authoritative_created_at="2026-01-01T00:00:00Z",
+        exact_live_body="server body", live_producer_login="agent", live_producer_id=7,
+    )
+    initial = build_issue_plan_prompt(
+        813, config, plan_validation_diagnostic=diagnostic,
+    )
+    revision = build_plan_revision_prompt(
+        813, 2, "Previous plan", "Blocking review", config,
+        plan_validation_diagnostic=diagnostic,
+    )
+    for prompt in (initial, revision):
+        assert "Trusted orchestration correction record" in prompt
+        assert "missing complete-scope audit operation" in prompt
+        assert "not issue prose, reviewer feedback, or a human requirement" in prompt
+        assert "server body" not in prompt
+        assert "99" not in prompt
         assert '"final_integration_work": {"status": "none"' in prompt
         assert "Do not include non-empty top-level legacy" in prompt
         assert "Every child stage must declare a reviewed disposition" in prompt

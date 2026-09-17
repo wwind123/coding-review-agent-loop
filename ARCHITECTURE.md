@@ -139,6 +139,35 @@ distinct workflows, with typed topology and durable checkpoints. They are not
 inferred by creating an issue for every sentence mentioning deferred work.
 See [decomposition boundaries](docs/local_agent_loop.md#phased-decomposition-versus-split-materialization).
 
+#### Deterministic planning-validation recovery
+
+When a fresh plan or plan revision exhausts deterministic validation retries,
+the orchestrator retains the final rejected candidate only in memory for its
+digest and provenance. It writes one bounded planning-validation diagnostic
+record to the issue only after resolving the authenticated actor and verifying
+the returned comment body, numeric server comment identity, server creation
+time, and producer identity. The immutable payload contains repository/issue
+context, planning generation and target round, prior plan subject, contract
+versions, expected producer identity, failure attempt, candidate digest,
+deterministic category, and a sanitized diagnostic capped at 4096 characters.
+
+Server-assigned identity and live body values are transport-wrapper metadata;
+they are never encoded into or patched into the payload. On resume, live issue
+comments are reauthenticated against the invocation actor and exact body,
+then same-context records are ordered only by payload failure attempt. The
+unique highest attempt is injected as trusted orchestration correction context
+into initial, full, compact, and parallel planning prompts. Timestamps,
+comment order, candidate-digest matching, issue prose, reviewer findings, and
+human requirements do not select or authorize the diagnostic. A conflicting
+highest attempt fails closed; stale, malformed, actor-mismatched, and legacy
+records are ignored. A newly verified canonical coder plan comment semantically
+supersedes matching diagnostics without deleting or rewriting history.
+
+If actor lookup, posting, or wrapper verification fails, the original
+validator diagnostic remains the terminal cause and the invalid candidate is
+never accepted as canonical plan state. Provider, timeout, quota, marker-safety,
+and containment failures are ineligible for this planning-only record.
+
 #### Generation-1 reviewed execution strategy
 
 Fresh planning and revision turns carry `execution_strategy_contract_version: 1`
