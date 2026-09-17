@@ -2059,6 +2059,11 @@ def test_coder_followup_prompts_require_structured_json(tmp_path, builder):
     assert '"human_requirements": {' in prompt
     assert "The JSON `state` must match the `AGENT_STATE` footer exactly." in prompt
     assert "Use this mandatory structured JSON follow-up format" in prompt
+    assert "include `risk_test_matrix_evidence` as a JSON object with exactly `matrix_identity` and `rows`" in prompt
+    assert '"workflow_path_claim":"<path exercised>"' in prompt
+    assert '"evidence_citations"' in prompt
+    assert "Do not emit `risk_test_matrix_evidence` as an array" in prompt
+    assert "`coverage_level`" in prompt
     assert "compatibility fallback" not in prompt
     assert "Legacy markdown replies" not in prompt
 
