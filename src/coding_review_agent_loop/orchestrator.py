@@ -79,6 +79,7 @@ from .child_topology import NeedsHumanDecision, NestedTopologyDecision
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
+    DeterministicPlanValidationExhaustion,
     FreshContractIntegrityError,
     IssueImplementationConflictError,
     QuotaResetExceededError,
@@ -111,6 +112,10 @@ from .github import (
     post_pr_comment,
     post_trusted_pr_contract_record,
     post_trusted_pr_comment,
+    post_verified_trusted_issue_round_comment,
+    post_verified_trusted_issue_protocol_comment,
+    reset_authenticated_github_actor,
+    resolve_authenticated_github_actor,
     reject_forged_protocol_markers,
     search_issues,
     validate_open_issue,
@@ -435,6 +440,12 @@ from .round_state import (
     _serialize_disposition,
     _serialize_unresolved_item,
     _strip_round_metadata,
+    PlanValidationDiagnosticPayload,
+    PlanValidationDiagnosticTransport,
+    encode_plan_validation_diagnostic_body,
+    has_plan_validation_diagnostic_marker,
+    recover_plan_validation_diagnostic,
+    sanitize_plan_validation_diagnostic,
 )
 from .round_transport import is_round_transport_sidecar
 from .protocol_markers import TrustedBody, sanitize_historical_text, scan_reserved_markers
@@ -2681,6 +2692,40 @@ def _log_repair_attempts(config: AgentLoopConfig, prefix: str, attempts: Sequenc
         )
 
 
+def _capture_terminal_plan_repair_rejection(
+    attempt: RepairAttemptResult,
+    *,
+    repair_expected_kind: str | None,
+    validate: Callable[[str], object],
+) -> DeterministicPlanValidationExhaustion | None:
+    """Capture a deterministically rejected final planning repair candidate.
+
+    Repair diagnostics can also describe preservation checks or backend output,
+    so re-run the authoritative validator and retain only its exact diagnostic.
+    Shape and marker-safety checks keep unrelated or unsafe repair output out of
+    the durable planning-diagnostic channel.
+    """
+    candidate = attempt.output
+    if (
+        attempt.outcome != "invalid_output"
+        or repair_expected_kind not in {"plan_state", "plan_revision"}
+        or _recognized_structured_public_response_kind(candidate) != repair_expected_kind
+    ):
+        return None
+    try:
+        validate(candidate)
+    except AgentLoopError as exc:
+        if "Current untrusted GitHub text contains reserved protocol marker(s):" in str(exc):
+            return None
+        return DeterministicPlanValidationExhaustion(
+            candidate_kind=repair_expected_kind,
+            candidate_text=candidate,
+            diagnostic=str(exc),
+            candidate_digest=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+        )
+    return None
+
+
 def _run_validated_agent(
     runner: Runner,
     *,
@@ -2709,6 +2754,9 @@ def _run_validated_agent(
     operation_description: str | None = None,
     completion_recovery: CompletionRecoveryPolicy | None = None,
     managed_ci_recovery_protection: str | None = None,
+    plan_validation_failure_handler: Callable[
+        [DeterministicPlanValidationExhaustion, AgentInvocationError], None
+    ] | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -2750,6 +2798,11 @@ def _run_validated_agent(
     # AgentInvocationError so callers/tests can assert on it without
     # re-parsing the message.
     terminal_public_response: str | None = None
+    plan_validation_exhaustion: DeterministicPlanValidationExhaustion | None = None
+    # This latch is reset per invocation attempt and set only at the exact
+    # structured-validator capture point. It prevents a stale typed candidate
+    # from reaching the persistence callback after an ineligible path.
+    plan_validation_capture_eligible = False
     completion_recovery_attempted = False
     # Keep the detection guard separate from the replay marker: a failed
     # stability check must not make the next ordinary retry look like a replay.
@@ -2827,6 +2880,11 @@ def _run_validated_agent(
             executable_replacement_replay_pending = False
             next_timeout_seconds = timeout_seconds
         last_result = result
+        # A typed planning-validation candidate is valid only for the final
+        # deterministic failure of this invocation. A later timeout, provider,
+        # marker-safety, or containment failure must clear it.
+        plan_validation_exhaustion = None
+        plan_validation_capture_eligible = False
         if result.log_path is not None:
             log_paths.append(result.log_path)
         text = result.text
@@ -3184,6 +3242,20 @@ def _run_validated_agent(
                 if result.command_result is not None and result.command_result.capture_diagnostics:
                     last_failure_category = "transient"
                     public_text_is_transient = True
+                if (
+                    last_failure_category == "deterministic"
+                    and not marker_safety_failure
+                    and repair_expected_kind in {"plan_state", "plan_revision"}
+                    and structured_kind in {"plan_state", "plan_revision"}
+                    and structured_kind == repair_expected_kind
+                ):
+                    plan_validation_capture_eligible = True
+                    plan_validation_exhaustion = DeterministicPlanValidationExhaustion(
+                        candidate_kind=repair_expected_kind,
+                        candidate_text=text,
+                        diagnostic=str(exc),
+                        candidate_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    )
                 if (
                     completion_recovery is not None
                     and not completion_recovery_attempted
@@ -3574,19 +3646,45 @@ def _run_validated_agent(
                         repair_kwargs=repair_kwargs,
                     )
                     _log_repair_attempts(config, agent_name, repair_attempts)
-                    fresh_contract_integrity = any(
-                        attempt.outcome == "fresh_contract_integrity"
-                        for attempt in repair_attempts
-                    )
-                    if fresh_contract_integrity:
+                    terminal_repair = repair_attempts[-1] if repair_attempts else None
+                    if (
+                        terminal_repair is not None
+                        and terminal_repair.outcome == "fresh_contract_integrity"
+                    ):
                         # A fresh planning response with no mechanically
                         # recoverable recommendation must get a new planner
                         # invocation. It is not safe for the repair model to
-                        # synthesize topology, but it is also not a terminal
-                        # provider failure.
+                        # synthesize topology. The original structured
+                        # validator rejection remains the authoritative
+                        # candidate and diagnostic for terminal persistence.
                         should_retry = True
                         last_failure_category = "fresh-contract-integrity"
                         last_classification_text = "fresh planning contract requires a new planner turn"
+                    elif terminal_repair is not None:
+                        repaired_exhaustion = _capture_terminal_plan_repair_rejection(
+                            terminal_repair,
+                            repair_expected_kind=repair_expected_kind,
+                            validate=validate,
+                        )
+                        if repaired_exhaustion is not None:
+                            # The repair candidate, rather than the source
+                            # candidate, is the final deterministic rejection.
+                            plan_validation_exhaustion = repaired_exhaustion
+                            plan_validation_capture_eligible = True
+                            last_failure_category = "deterministic"
+                            last_classification_text = (
+                                f"structured {repair_expected_kind} repair failed trusted validation"
+                            )
+                        else:
+                            # A terminal repair transport/provider failure (or
+                            # non-matching/unsafe output) cannot persist stale
+                            # source-candidate provenance.
+                            plan_validation_exhaustion = None
+                            plan_validation_capture_eligible = False
+                            if terminal_repair.outcome == "timeout":
+                                last_failure_category = "timeout"
+                            elif terminal_repair.outcome != "invalid_output":
+                                last_failure_category = "repair-provider-failure"
                     if repaired is not None:
                         if repaired_marker is None:
                             repair_detail = (
@@ -3792,12 +3890,24 @@ def _run_validated_agent(
                 "implementation to recreate the PR."
             )
     message += diagnostics.format_for_error()
-    raise AgentInvocationError(
+    if (
+        last_failure_category not in {"deterministic", "fresh-contract-integrity"}
+        or not plan_validation_capture_eligible
+    ):
+        plan_validation_exhaustion = None
+    invocation_error = AgentInvocationError(
         message,
         failure_category=last_failure_category,
         terminal_public_response=terminal_public_response,
         containment=last_result.containment if last_result is not None else None,
+        plan_validation_exhaustion=plan_validation_exhaustion,
     )
+    if (
+        plan_validation_failure_handler is not None
+        and plan_validation_exhaustion is not None
+    ):
+        plan_validation_failure_handler(plan_validation_exhaustion, invocation_error)
+    raise invocation_error
 
 
 @dataclass(frozen=True)
@@ -7408,6 +7518,196 @@ class _ReviewerTurnResult:
     error: AgentLoopError | None = None
 
 
+def _plan_validation_contract_versions(
+    *,
+    require_execution_strategy_contract: bool,
+    require_risk_test_matrix_contract: bool,
+) -> tuple[int, int | None, int | None]:
+    return (
+        1,
+        1 if require_execution_strategy_contract else None,
+        1 if require_risk_test_matrix_contract else None,
+    )
+
+
+def _recover_current_plan_validation_diagnostic(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    issue_number: int,
+    target_coder_round: int,
+    prior_plan_subject: str | None,
+    candidate_kind: Literal["plan_state", "plan_revision"],
+    require_execution_strategy_contract: bool,
+    require_risk_test_matrix_contract: bool,
+) -> PlanValidationDiagnosticTransport | None:
+    if not has_plan_validation_diagnostic_marker(issue_context.comments):
+        return None
+    actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    architecture_version, execution_version, matrix_version = _plan_validation_contract_versions(
+        require_execution_strategy_contract=require_execution_strategy_contract,
+        require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+    )
+    return recover_plan_validation_diagnostic(
+        issue_context.comments,
+        repository=config.repo,
+        issue_number=issue_number,
+        expected_author_login=actor_login,
+        expected_author_id=actor_id,
+        planning_generation=1,
+        target_coder_round=target_coder_round,
+        prior_plan_subject=prior_plan_subject,
+        candidate_kind=candidate_kind,
+        architecture_contract_version=architecture_version,
+        execution_strategy_contract_version=execution_version,
+        risk_test_matrix_contract_version=matrix_version,
+    )
+
+
+def _persist_exhausted_plan_validation_diagnostic(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    issue_number: int,
+    original_error: AgentInvocationError,
+    exhaustion: DeterministicPlanValidationExhaustion,
+    target_coder_round: int,
+    prior_plan_subject: str | None,
+    candidate_kind: Literal["plan_state", "plan_revision"],
+    require_execution_strategy_contract: bool,
+    require_risk_test_matrix_contract: bool,
+) -> None:
+    """Write one authenticated bounded diagnostic, preserving the validator error."""
+    try:
+        actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+        architecture_version, execution_version, matrix_version = _plan_validation_contract_versions(
+            require_execution_strategy_contract=require_execution_strategy_contract,
+            require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+        )
+        current = recover_plan_validation_diagnostic(
+            issue_context.comments,
+            repository=config.repo,
+            issue_number=issue_number,
+            expected_author_login=actor_login,
+            expected_author_id=actor_id,
+            planning_generation=1,
+            target_coder_round=target_coder_round,
+            prior_plan_subject=prior_plan_subject,
+            candidate_kind=candidate_kind,
+            architecture_contract_version=architecture_version,
+            execution_strategy_contract_version=execution_version,
+            risk_test_matrix_contract_version=matrix_version,
+        )
+        payload = PlanValidationDiagnosticPayload(
+            repository=config.repo,
+            issue_number=issue_number,
+            planning_generation=1,
+            target_coder_round=target_coder_round,
+            prior_plan_subject=prior_plan_subject,
+            candidate_kind=candidate_kind,
+            architecture_contract_version=architecture_version,
+            execution_strategy_contract_version=execution_version,
+            risk_test_matrix_contract_version=matrix_version,
+            expected_producer_login=actor_login,
+            expected_producer_id=actor_id,
+            failure_attempt=(current.failure_attempt + 1 if current is not None else 1),
+            candidate_digest=exhaustion.candidate_digest,
+            category="deterministic",
+            diagnostic=sanitize_plan_validation_diagnostic(exhaustion.diagnostic),
+        )
+        body = encode_plan_validation_diagnostic_body(payload)
+        posted = post_verified_trusted_issue_protocol_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=body,
+            expected_author_login=actor_login,
+            expected_author_id=actor_id,
+        )
+        if posted.body != str(body) or posted.comment_id is None or posted.author_id != actor_id:
+            raise AgentLoopError("Verified diagnostic transport wrapper did not round-trip safely.")
+        log(config, "Persisted an authenticated plan-validation diagnostic audit record.")
+    except Exception as exc:
+        detail = sanitize_plan_validation_diagnostic(str(exc))
+        raise AgentInvocationError(
+            f"{original_error}\nDiagnostic persistence note: the bounded handoff record was not persisted. {detail}",
+            failure_category=original_error.failure_category,
+            terminal_public_response=original_error.terminal_public_response,
+            containment=original_error.containment,
+            plan_validation_exhaustion=exhaustion,
+        ) from exc
+
+
+def _post_plan_coder_round_comment(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+    body: TrustedBody,
+    diagnostic: PlanValidationDiagnosticTransport | None,
+    target_coder_round: int,
+    prior_plan_subject: str | None,
+    candidate_kind: Literal["plan_state", "plan_revision"],
+    require_execution_strategy_contract: bool,
+    require_risk_test_matrix_contract: bool,
+) -> bool:
+    """Publish a plan coder round and report whether it superseded a diagnostic.
+
+    A canonical coder round only clears an in-memory diagnostic when the
+    diagnostic's complete payload context matches this candidate and the
+    round has crossed the authenticated REST publication seam.  Unrelated or
+    stale diagnostics retain their normal history and cannot be cleared by a
+    successful plan.
+    """
+    architecture_version, execution_version, matrix_version = _plan_validation_contract_versions(
+        require_execution_strategy_contract=require_execution_strategy_contract,
+        require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+    )
+    supersedes = diagnostic is not None and diagnostic.payload.matches_context(
+        repository=config.repo,
+        issue_number=issue_number,
+        planning_generation=1,
+        target_coder_round=target_coder_round,
+        prior_plan_subject=prior_plan_subject,
+        candidate_kind=candidate_kind,
+        architecture_contract_version=architecture_version,
+        execution_strategy_contract_version=execution_version,
+        risk_test_matrix_contract_version=matrix_version,
+    )
+    if not supersedes:
+        post_issue_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=body,
+        )
+        return False
+    actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    posted = post_verified_trusted_issue_round_comment(
+        runner,
+        config=config,
+        issue_number=issue_number,
+        body=body,
+        expected_author_login=actor_login,
+        expected_author_id=actor_id,
+    )
+    if (
+        posted.comment_id is None
+        or posted.comment_id < 1
+        or posted.author != actor_login
+        or posted.author_id != actor_id
+        or not isinstance(posted.created_at, str)
+        or not posted.created_at
+        or not isinstance(posted.body, str)
+    ):
+        raise AgentLoopError(
+            "Verified canonical plan publication returned an incomplete transport wrapper."
+        )
+    return True
+
+
 def _launch_reviewer_turns(
     runner: Runner,
     pending: Sequence[AgentName],
@@ -7484,7 +7784,19 @@ def _run_plan_first_loop(
     compact_prior_summaries: list[str] = []
     next_unresolved_item_number = 1
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
+    plan_validation_diagnostic: PlanValidationDiagnosticTransport | None = None
     if resume_state is None:
+        plan_validation_diagnostic = _recover_current_plan_validation_diagnostic(
+            runner,
+            config=config,
+            issue_context=issue_context,
+            issue_number=issue_number,
+            target_coder_round=1,
+            prior_plan_subject=None,
+            candidate_kind="plan_state",
+            require_execution_strategy_contract=require_fresh_execution_contract,
+            require_risk_test_matrix_contract=require_fresh_matrix_contract,
+        )
         log(config, f"Planning issue #{issue_number}: invoking {coder_name} (context mode: full)")
         plan_human_requirements_context = render_coder_human_requirements_prompt_context(
             issue_context.human_requirements,
@@ -7495,7 +7807,13 @@ def _run_plan_first_loop(
             runner,
             agent=config.coder,
             config=config,
-            prompt=build_issue_plan_prompt(issue_number, config, memory, issue_context=issue_context),
+            prompt=build_issue_plan_prompt(
+                issue_number,
+                config,
+                memory,
+                issue_context=issue_context,
+                plan_validation_diagnostic=plan_validation_diagnostic,
+            ),
             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking --> or <!-- AGENT_CLARIFY -->",
             validate=lambda text, human_requirements=issue_context.human_requirements: _validate_response_with_human_requirements(
                 text,
@@ -7524,6 +7842,19 @@ def _run_plan_first_loop(
             require_execution_strategy_contract=require_fresh_execution_contract,
             require_risk_test_matrix_contract=require_fresh_matrix_contract,
             operation_description="planning",
+            plan_validation_failure_handler=lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
+                runner,
+                config=config,
+                issue_context=issue_context,
+                issue_number=issue_number,
+                original_error=error,
+                exhaustion=exhaustion,
+                target_coder_round=1,
+                prior_plan_subject=None,
+                candidate_kind="plan_state",
+                require_execution_strategy_contract=require_fresh_execution_contract,
+                require_risk_test_matrix_contract=require_fresh_matrix_contract,
+            ),
         )
         plan_output = plan_response.text
         coder_session_id = plan_response.session_id
@@ -7567,18 +7898,15 @@ def _run_plan_first_loop(
             public_plan_output = normalize_freeform_signature(
                 plan_output, agent=config.coder, config=config, model_used=plan_response.model_used
             )
-        post_issue_comment(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            body=_attach_round_metadata(
-                public_plan_output,
-                PostedRoundMetadata(
+        plan_round_body = _attach_round_metadata(
+            public_plan_output,
+            PostedRoundMetadata(
                     flow="plan",
                     role="coder",
                     agent=coder_name,
                     round_number=1,
                     subject=_plan_subject(current_plan),
+                    prior_plan_subject=None,
                     prior_items=(),
                     canonical_plan=canonical_plan,
                     raw_structured_coder_response=raw_structured_coder_response,
@@ -7631,9 +7959,21 @@ def _run_plan_first_loop(
                         if structured_plan is not None and structured_plan.risk_test_matrix is not None
                         else None
                     ),
-                ),
-            ),
+            )
         )
+        if _post_plan_coder_round_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=plan_round_body,
+            diagnostic=plan_validation_diagnostic,
+            target_coder_round=1,
+            prior_plan_subject=None,
+            candidate_kind="plan_state",
+            require_execution_strategy_contract=require_fresh_execution_contract,
+            require_risk_test_matrix_contract=require_fresh_matrix_contract,
+        ):
+            plan_validation_diagnostic = None
         start_round_number = 1
         resumed_round: ResumedReviewRound | None = None
         current_coder_output = plan_output
@@ -7655,6 +7995,17 @@ def _run_plan_first_loop(
             and resumed_round.coder_metadata is not None
             and resumed_round.coder_metadata.risk_test_matrix_contract_version == 1
         )
+        plan_validation_diagnostic = _recover_current_plan_validation_diagnostic(
+            runner,
+            config=config,
+            issue_context=issue_context,
+            issue_number=issue_number,
+            target_coder_round=start_round_number + 1,
+            prior_plan_subject=_plan_subject(current_plan),
+            candidate_kind="plan_revision",
+            require_execution_strategy_contract=require_fresh_execution_contract,
+            require_risk_test_matrix_contract=require_fresh_matrix_contract,
+        )
 
     for round_number in range(start_round_number, config.max_rounds + 1):
         current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
@@ -7662,7 +8013,11 @@ def _run_plan_first_loop(
         prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
             item.item_id: [] for item in prior_unresolved_items
         }
-        round_new_unresolved_items: list[UnresolvedReviewItem] = []
+        round_new_unresolved_items: list[UnresolvedReviewItem] = list(
+            current_resume.current_round_new_items
+            if current_resume is not None and current_resume.reconciled
+            else ()
+        )
         current_plan_subject = _plan_subject(current_plan)
         round_ledger_incomplete = _round_ledger_may_be_incomplete(
             current_resume=current_resume,
@@ -8009,7 +8364,10 @@ def _run_plan_first_loop(
                 blocking_reviews.append((reviewer_name, review_output))
             else:
                 approved_review_outputs.append((reviewer_name, review_output))
-            if resumed_record is None or resumed_record.metadata.phase == "publication":
+            if resumed_record is None or (
+                resumed_record.metadata.phase == "publication"
+                and not (current_resume is not None and current_resume.reconciled)
+            ):
                 for item in parsed_review.items.blocking:
                     tracked_item = _next_unresolved_item(
                         item_number=next_unresolved_item_number,
@@ -8827,6 +9185,7 @@ def _run_plan_first_loop(
                     action="Revise the implementation plan to address the blocking plan review.",
                 ),
                 require_risk_test_matrix_contract=require_fresh_matrix_contract,
+                plan_validation_diagnostic=plan_validation_diagnostic,
             ),
             session_id=coder_session_id,
             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
@@ -8863,6 +9222,19 @@ def _run_plan_first_loop(
             repair_allowed_prior_item_ids=tuple(item.item_id for item in must_fix_items),
             ledger_incomplete=round_ledger_incomplete,
             operation_description="plan revision",
+            plan_validation_failure_handler=lambda exhaustion, error: _persist_exhausted_plan_validation_diagnostic(
+                runner,
+                config=config,
+                issue_context=issue_context,
+                issue_number=issue_number,
+                original_error=error,
+                exhaustion=exhaustion,
+                target_coder_round=round_number + 1,
+                prior_plan_subject=current_plan_subject,
+                candidate_kind="plan_revision",
+                require_execution_strategy_contract=require_fresh_execution_contract,
+                require_risk_test_matrix_contract=require_fresh_matrix_contract,
+            ),
         )
         canonical_plan: str | None = None
         public_comment = plan_response.text
@@ -8909,18 +9281,15 @@ def _run_plan_first_loop(
                 plan_response.text, agent=config.coder, config=config, model_used=plan_response.model_used
             )
         coder_session_id = plan_response.session_id
-        post_issue_comment(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            body=_attach_round_metadata(
-                public_comment,
-                PostedRoundMetadata(
+        plan_round_body = _attach_round_metadata(
+            public_comment,
+            PostedRoundMetadata(
                     flow="plan",
                     role="coder",
                     agent=coder_name,
                     round_number=round_number + 1,
                     subject=_plan_subject(current_plan),
+                    prior_plan_subject=current_plan_subject,
                     prior_items=tuple(unresolved_items),
                     canonical_plan=canonical_plan,
                     raw_structured_coder_response=raw_structured_coder_response,
@@ -8973,9 +9342,21 @@ def _run_plan_first_loop(
                     ),
                     acquisition_outcome=plan_response.acquisition_outcome,
                     acquisition_returncode=plan_response.acquisition_returncode,
-                ),
-            ),
+            )
         )
+        if _post_plan_coder_round_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=plan_round_body,
+            diagnostic=plan_validation_diagnostic,
+            target_coder_round=round_number + 1,
+            prior_plan_subject=current_plan_subject,
+            candidate_kind="plan_revision",
+            require_execution_strategy_contract=require_fresh_execution_contract,
+            require_risk_test_matrix_contract=require_fresh_matrix_contract,
+        ):
+            plan_validation_diagnostic = None
         resumed_round = None
 
     raise AgentLoopError(
@@ -8996,6 +9377,7 @@ def run_issue_loop(
 ) -> int:
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
+    reset_authenticated_github_actor(runner)
     try:
         requested_policy = _normalize_requested_execution_policy(
             config,

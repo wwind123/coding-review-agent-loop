@@ -13,7 +13,14 @@ from typing import Literal
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .errors import AgentLoopError
-from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, encode_mapping, hydrate_mapping
+from .round_transport import (
+    MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS,
+    PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE,
+    ROUND_RESUME_MARKER_RE,
+    decode_mapping,
+    encode_mapping,
+    hydrate_mapping,
+)
 from .comment_rendering import (
     EXECUTION_RECOMMENDATION_MARKER_RE,
     decode_execution_recommendation_marker,
@@ -21,7 +28,12 @@ from .comment_rendering import (
     decode_risk_test_matrix_marker,
 )
 from .local_test_evidence import canonicalize_bounded_evidence
-from .protocol_markers import TrustedBody, scan_reserved_markers
+from .protocol_markers import (
+    ISSUE_COMMENT_SURFACE,
+    TrustedBody,
+    sanitize_historical_text,
+    scan_reserved_markers,
+)
 from .workdir_guard import validate_checkout_inspected_evidence
 from .protocol import (
     HTML_COMMENT_RE,
@@ -65,6 +77,12 @@ class PostedRoundMetadata:
     agent: str
     round_number: int
     subject: str
+    # For plan coder rounds, bind the published candidate to the exact plan
+    # subject that was supplied as its revision input.  ``None`` is the
+    # intentional value for a fresh plan.  Older metadata omits this field
+    # and therefore cannot supersede a newer authenticated diagnostic for a
+    # revision context.
+    prior_plan_subject: str | None = None
     prior_items: tuple[UnresolvedReviewItem, ...] = ()
     dispositions: tuple[ReviewItemDisposition, ...] = ()
     new_items: tuple[UnresolvedReviewItem, ...] = ()
@@ -407,6 +425,428 @@ class ResumedReviewRound:
     coder_metadata: PostedRoundMetadata | None = None
     local_test_evidence: str | None = None
     qualification_checkpoint: QualificationCheckpoint | None = None
+    plan_validation_diagnostic: "PlanValidationDiagnosticTransport | None" = None
+    # Parallel publication checkpoints intentionally omit provisional item
+    # numbers. A settled reconciliation record carries the authoritative
+    # items; preserve them on resume instead of minting duplicate IDs.
+    current_round_new_items: tuple[UnresolvedReviewItem, ...] = ()
+
+
+PLAN_VALIDATION_DIAGNOSTIC_SUFFIX = "[diagnostic truncated]"
+_PLAN_VALIDATION_SENSITIVE_RE = re.compile(
+    r"(?ix)"
+    r"(?:ghp_[A-Za-z0-9_\-]+|github_pat_[A-Za-z0-9_\-]+|sk-[A-Za-z0-9_\-]+|"
+    r"xox[baprs]-[A-Za-z0-9-]+|"
+    r"(?:authorization|password|secret|api[_-]?key|access[_-]?token)\s*[:=]\s*\S+)"
+)
+
+
+def sanitize_plan_validation_diagnostic(value: object) -> str:
+    """Return the bounded, marker-safe diagnostic shared by storage and prompts."""
+    text = value if isinstance(value, str) else str(value)
+    text = sanitize_historical_text(text)
+    text = _PLAN_VALIDATION_SENSITIVE_RE.sub("[redacted]", text)
+    text = "".join(
+        character
+        for character in text
+        if character in "\n\r\t" or ord(character) >= 32
+    ).strip()
+    if not text:
+        text = "deterministic plan validation failed"
+    if len(text) <= MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS:
+        return text
+    available = MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS - len(PLAN_VALIDATION_DIAGNOSTIC_SUFFIX)
+    return text[:available].rstrip() + PLAN_VALIDATION_DIAGNOSTIC_SUFFIX
+
+
+@dataclass(frozen=True)
+class PlanValidationDiagnosticPayload:
+    """Immutable values known before the diagnostic comment is posted."""
+
+    repository: str
+    issue_number: int
+    planning_generation: int
+    target_coder_round: int
+    prior_plan_subject: str | None
+    candidate_kind: Literal["plan_state", "plan_revision"]
+    architecture_contract_version: int | None
+    execution_strategy_contract_version: int | None
+    risk_test_matrix_contract_version: int | None
+    expected_producer_login: str
+    expected_producer_id: int
+    failure_attempt: int
+    candidate_digest: str
+    category: Literal["deterministic"]
+    diagnostic: str
+
+    def __post_init__(self) -> None:
+        if not self.repository.strip() or self.issue_number < 1:
+            raise ValueError("diagnostic payload requires a repository and issue")
+        if self.planning_generation < 1 or self.target_coder_round < 1:
+            raise ValueError("diagnostic payload requires positive planning coordinates")
+        if self.prior_plan_subject is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.prior_plan_subject
+        ):
+            raise ValueError("invalid prior plan subject")
+        if self.candidate_kind not in {"plan_state", "plan_revision"}:
+            raise ValueError("invalid planning candidate kind")
+        for version in (
+            self.architecture_contract_version,
+            self.execution_strategy_contract_version,
+            self.risk_test_matrix_contract_version,
+        ):
+            if version is not None and version != 1:
+                raise ValueError("unsupported planning contract version")
+        if not self.expected_producer_login.strip() or self.expected_producer_id < 1:
+            raise ValueError("diagnostic payload requires an authenticated producer")
+        if self.failure_attempt < 1:
+            raise ValueError("diagnostic payload requires a positive attempt")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.candidate_digest):
+            raise ValueError("invalid candidate digest")
+        if self.category != "deterministic":
+            raise ValueError("only deterministic diagnostics are durable")
+        bounded = sanitize_plan_validation_diagnostic(self.diagnostic)
+        if bounded != self.diagnostic:
+            object.__setattr__(self, "diagnostic", bounded)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "plan_validation_diagnostic",
+            "repository": self.repository,
+            "issue_number": self.issue_number,
+            "planning_generation": self.planning_generation,
+            "target_coder_round": self.target_coder_round,
+            "prior_plan_subject": self.prior_plan_subject,
+            "candidate_kind": self.candidate_kind,
+            "architecture_contract_version": self.architecture_contract_version,
+            "execution_strategy_contract_version": self.execution_strategy_contract_version,
+            "risk_test_matrix_contract_version": self.risk_test_matrix_contract_version,
+            "expected_producer_login": self.expected_producer_login,
+            "expected_producer_id": self.expected_producer_id,
+            "failure_attempt": self.failure_attempt,
+            "candidate_digest": self.candidate_digest,
+            "category": self.category,
+            "diagnostic": self.diagnostic,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "PlanValidationDiagnosticPayload":
+        expected_keys = {
+            "schema_version", "kind", "repository", "issue_number",
+            "planning_generation", "target_coder_round", "prior_plan_subject",
+            "candidate_kind", "architecture_contract_version",
+            "execution_strategy_contract_version", "risk_test_matrix_contract_version",
+            "expected_producer_login", "expected_producer_id", "failure_attempt",
+            "candidate_digest", "category", "diagnostic",
+        }
+        if (
+            set(value) != expected_keys
+            or not isinstance(value.get("schema_version"), int)
+            or isinstance(value.get("schema_version"), bool)
+            or value.get("schema_version") != 1
+            or value.get("kind") != "plan_validation_diagnostic"
+        ):
+            raise AgentLoopError("Invalid plan-validation diagnostic payload shape.")
+        try:
+            def strict_int(name: str) -> int:
+                item = value[name]
+                if not isinstance(item, int) or isinstance(item, bool):
+                    raise ValueError(f"{name} must be an integer")
+                return item
+
+            def optional_int(name: str) -> int | None:
+                item = value[name]
+                if item is None:
+                    return None
+                return strict_int(name)
+
+            def strict_string(name: str) -> str:
+                item = value[name]
+                if not isinstance(item, str):
+                    raise ValueError(f"{name} must be a string")
+                return item
+
+            diagnostic = strict_string("diagnostic")
+            if sanitize_plan_validation_diagnostic(diagnostic) != diagnostic:
+                raise ValueError("diagnostic must already be canonical and bounded")
+
+            return cls(
+                repository=strict_string("repository"),
+                issue_number=strict_int("issue_number"),
+                planning_generation=strict_int("planning_generation"),
+                target_coder_round=strict_int("target_coder_round"),
+                prior_plan_subject=(
+                    strict_string("prior_plan_subject")
+                    if value["prior_plan_subject"] is not None else None
+                ),
+                candidate_kind=strict_string("candidate_kind"),  # type: ignore[arg-type]
+                architecture_contract_version=optional_int("architecture_contract_version"),
+                execution_strategy_contract_version=optional_int("execution_strategy_contract_version"),
+                risk_test_matrix_contract_version=optional_int("risk_test_matrix_contract_version"),
+                expected_producer_login=strict_string("expected_producer_login"),
+                expected_producer_id=strict_int("expected_producer_id"),
+                failure_attempt=strict_int("failure_attempt"),
+                candidate_digest=strict_string("candidate_digest"),
+                category=strict_string("category"),  # type: ignore[arg-type]
+                diagnostic=diagnostic,
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise AgentLoopError("Invalid plan-validation diagnostic payload.") from exc
+
+    def matches_context(
+        self,
+        *,
+        repository: str,
+        issue_number: int,
+        planning_generation: int,
+        target_coder_round: int,
+        prior_plan_subject: str | None,
+        candidate_kind: str,
+        architecture_contract_version: int | None,
+        execution_strategy_contract_version: int | None,
+        risk_test_matrix_contract_version: int | None,
+    ) -> bool:
+        return (
+            self.repository == repository
+            and self.issue_number == issue_number
+            and self.planning_generation == planning_generation
+            and self.target_coder_round == target_coder_round
+            and self.prior_plan_subject == prior_plan_subject
+            and self.candidate_kind == candidate_kind
+            and self.architecture_contract_version == architecture_contract_version
+            and self.execution_strategy_contract_version == execution_strategy_contract_version
+            and self.risk_test_matrix_contract_version == risk_test_matrix_contract_version
+        )
+
+
+@dataclass(frozen=True)
+class PlanValidationDiagnosticTransport:
+    """Authenticated live transport values wrapped around one immutable payload."""
+
+    payload: PlanValidationDiagnosticPayload
+    server_comment_id: int
+    authoritative_created_at: str
+    exact_live_body: str
+    live_producer_login: str
+    live_producer_id: int
+
+    @property
+    def diagnostic(self) -> str:
+        return self.payload.diagnostic
+
+    @property
+    def failure_attempt(self) -> int:
+        return self.payload.failure_attempt
+
+    @property
+    def candidate_digest_prefix(self) -> str:
+        return self.payload.candidate_digest[:16]
+
+
+def encode_plan_validation_diagnostic_body(
+    payload: PlanValidationDiagnosticPayload,
+) -> TrustedBody:
+    """Encode only the immutable pre-POST diagnostic payload."""
+    encoded = encode_mapping(payload.as_dict())
+    return TrustedBody.canonical(
+        f"<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: {encoded} -->",
+        surface=ISSUE_COMMENT_SURFACE,
+        expected_tokens=("AGENT_PLAN_VALIDATION_DIAGNOSTIC",),
+    )
+
+
+def decode_plan_validation_diagnostic_body(
+    body: str,
+) -> PlanValidationDiagnosticPayload:
+    matches = tuple(PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.finditer(body))
+    if len(matches) != 1 or body.strip() != matches[0].group(0):
+        raise AgentLoopError("Plan-validation diagnostic is not an exact canonical record.")
+    encoded = matches[0].group("payload")
+    try:
+        mapping = decode_mapping(encoded)
+        if encode_mapping(mapping) != encoded:
+            raise ValueError("noncanonical mapping")
+        TrustedBody.canonical(
+            body,
+            surface=ISSUE_COMMENT_SURFACE,
+            expected_tokens=("AGENT_PLAN_VALIDATION_DIAGNOSTIC",),
+        )
+        return PlanValidationDiagnosticPayload.from_mapping(mapping)
+    except (AgentLoopError, TypeError, ValueError, KeyError) as exc:
+        if isinstance(exc, AgentLoopError) and str(exc).startswith("Invalid plan-validation"):
+            raise
+        raise AgentLoopError("Invalid plan-validation diagnostic record.") from exc
+
+
+def has_plan_validation_diagnostic_marker(comments: Sequence[object]) -> bool:
+    return any(
+        isinstance(getattr(comment, "body", None), str)
+        and PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.search(getattr(comment, "body", ""))
+        for comment in comments
+    )
+
+
+def _comment_identity(comment: object) -> tuple[int | None, str | None, int | None, str | None]:
+    comment_id = getattr(comment, "comment_id", None)
+    if comment_id is None:
+        comment_id = getattr(comment, "id", None)
+    author_login = getattr(comment, "author", None)
+    author_id = getattr(comment, "author_id", None)
+    created_at = getattr(comment, "created_at", None)
+    return comment_id, author_login, author_id, created_at
+
+
+def _authenticated_canonical_plan_success_exists(
+    comments: Sequence[object],
+    *,
+    expected_author_login: str,
+    expected_author_id: int,
+    target_coder_round: int,
+    prior_plan_subject: str | None,
+    candidate_kind: str,
+    architecture_contract_version: int | None,
+    execution_strategy_contract_version: int | None,
+    risk_test_matrix_contract_version: int | None,
+) -> bool:
+    bodies = tuple(
+        body for comment in comments if isinstance((body := getattr(comment, "body", None)), str)
+    )
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str) or not ROUND_RESUME_MARKER_RE.search(body):
+            continue
+        comment_id, author_login, author_id, created_at = _comment_identity(comment)
+        if (
+            not isinstance(comment_id, int)
+            or comment_id < 1
+            or not isinstance(created_at, str)
+            or not created_at
+            or author_login != expected_author_login
+            or author_id != expected_author_id
+        ):
+            continue
+        try:
+            match = list(ROUND_RESUME_MARKER_RE.finditer(body))[-1]
+            payload, missing = hydrate_mapping(decode_mapping(match.group("payload")), bodies)
+            if missing:
+                continue
+            metadata = _decode_round_metadata_mapping(payload)
+        except (AgentLoopError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            continue
+        if (
+            metadata.flow == "plan"
+            and metadata.role == "coder"
+            and metadata.round_number == target_coder_round
+            and metadata.canonical_plan
+            and _plan_subject(metadata.canonical_plan) == metadata.subject
+            and metadata.prior_plan_subject == prior_plan_subject
+            and metadata.architecture_contract_version == architecture_contract_version
+            and metadata.execution_strategy_contract_version == execution_strategy_contract_version
+            and metadata.risk_test_matrix_contract_version == risk_test_matrix_contract_version
+            and (
+                (candidate_kind == "plan_state" and target_coder_round == 1)
+                or (candidate_kind == "plan_revision" and target_coder_round > 1)
+            )
+        ):
+            return True
+    return False
+
+
+def recover_plan_validation_diagnostic(
+    comments: Sequence[object],
+    *,
+    repository: str,
+    issue_number: int,
+    expected_author_login: str,
+    expected_author_id: int,
+    planning_generation: int,
+    target_coder_round: int,
+    prior_plan_subject: str | None,
+    candidate_kind: str,
+    architecture_contract_version: int | None,
+    execution_strategy_contract_version: int | None,
+    risk_test_matrix_contract_version: int | None,
+) -> PlanValidationDiagnosticTransport | None:
+    """Recover one authenticated current diagnostic using payload attempt order."""
+    if not expected_author_login or expected_author_id < 1:
+        raise AgentLoopError("Plan-validation diagnostic recovery requires an authenticated actor.")
+    candidates: list[PlanValidationDiagnosticTransport] = []
+    by_id: dict[int, str] = {}
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str) or not PLAN_VALIDATION_DIAGNOSTIC_MARKER_RE.search(body):
+            continue
+        comment_id, author_login, author_id, created_at = _comment_identity(comment)
+        # Old or shape-only comments are not trusted recovery records.
+        if (
+            not isinstance(comment_id, int)
+            or comment_id < 1
+            or not isinstance(created_at, str)
+            or not created_at
+            or author_login != expected_author_login
+            or author_id != expected_author_id
+        ):
+            continue
+        try:
+            payload = decode_plan_validation_diagnostic_body(body)
+        except AgentLoopError:
+            # Historical comments are untrusted input. A malformed record is
+            # ineligible rather than fatal; only authenticated, canonical
+            # records may participate in context selection and conflicts.
+            continue
+        previous_body = by_id.get(comment_id)
+        if previous_body is not None and previous_body != body:
+            raise AgentLoopError(
+                "Conflicting live bodies share one plan-validation diagnostic comment identity."
+            )
+        by_id[comment_id] = body
+        if payload.expected_producer_login != expected_author_login or payload.expected_producer_id != expected_author_id:
+            continue
+        if not payload.matches_context(
+            repository=repository,
+            issue_number=issue_number,
+            planning_generation=planning_generation,
+            target_coder_round=target_coder_round,
+            prior_plan_subject=prior_plan_subject,
+            candidate_kind=candidate_kind,
+            architecture_contract_version=architecture_contract_version,
+            execution_strategy_contract_version=execution_strategy_contract_version,
+            risk_test_matrix_contract_version=risk_test_matrix_contract_version,
+        ):
+            continue
+        candidates.append(
+            PlanValidationDiagnosticTransport(
+                payload=payload,
+                server_comment_id=comment_id,
+                authoritative_created_at=created_at,
+                exact_live_body=body,
+                live_producer_login=author_login,
+                live_producer_id=author_id,
+            )
+        )
+    if not candidates:
+        return None
+    if _authenticated_canonical_plan_success_exists(
+        comments,
+        expected_author_login=expected_author_login,
+        expected_author_id=expected_author_id,
+        target_coder_round=target_coder_round,
+        prior_plan_subject=prior_plan_subject,
+        candidate_kind=candidate_kind,
+        architecture_contract_version=architecture_contract_version,
+        execution_strategy_contract_version=execution_strategy_contract_version,
+        risk_test_matrix_contract_version=risk_test_matrix_contract_version,
+    ):
+        return None
+    highest_attempt = max(item.payload.failure_attempt for item in candidates)
+    highest = [item for item in candidates if item.payload.failure_attempt == highest_attempt]
+    distinct_payloads = {json.dumps(item.payload.as_dict(), sort_keys=True) for item in highest}
+    if len(distinct_payloads) > 1:
+        raise AgentLoopError(
+            "Conflicting authenticated plan-validation diagnostics claim the highest failure attempt."
+        )
+    return highest[0]
 
 
 @dataclass(frozen=True)
@@ -950,6 +1390,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "agent": metadata.agent,
         "round_number": metadata.round_number,
         "subject": metadata.subject,
+        "prior_plan_subject": metadata.prior_plan_subject,
         "prior_items": [_serialize_unresolved_item(item) for item in metadata.prior_items],
         "dispositions": [_serialize_disposition(item) for item in metadata.dispositions],
         "new_items": [_serialize_unresolved_item(item) for item in metadata.new_items],
@@ -1059,6 +1500,11 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             agent=str(payload["agent"]),
             round_number=int(payload["round_number"]),
             subject=str(payload["subject"]),
+            prior_plan_subject=(
+                str(payload["prior_plan_subject"])
+                if payload.get("prior_plan_subject") is not None
+                else None
+            ),
             prior_items=tuple(_deserialize_unresolved_item(item) for item in payload.get("prior_items", [])),
             dispositions=tuple(_deserialize_disposition(item) for item in payload.get("dispositions", [])),
             new_items=tuple(_deserialize_unresolved_item(item) for item in payload.get("new_items", [])),
@@ -2468,6 +2914,14 @@ def _resume_plan_round(
         if metadata.role != "reviewer" or metadata.agent not in configured_reviewer_names:
             continue
         reviewer_records[metadata.agent] = record
+    settled_new_items: list[UnresolvedReviewItem] = []
+    settled_item_ids: set[str] = set()
+    for record in current_round_records:
+        for item in record.metadata.new_items:
+            if item.item_id in settled_item_ids:
+                continue
+            settled_item_ids.add(item.item_id)
+            settled_new_items.append(item)
     return (
         current_plan,
         ResumedReviewRound(
@@ -2484,6 +2938,7 @@ def _resume_plan_round(
             reconciled=any(record.metadata.role == "summary" for record in current_round_records),
             coder_metadata=latest_coder_record.metadata,
             local_test_evidence=latest_coder_record.metadata.local_test_evidence,
+            current_round_new_items=tuple(settled_new_items),
         ),
     )
 

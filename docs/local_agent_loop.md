@@ -393,6 +393,37 @@ same planning round. Plan reviews use explicit sections:
 ### Future follow-ups
 ```
 
+### Persisted planning-validation diagnostics
+
+An exhausted deterministic validator failure is represented by a bounded
+planning-validation audit record, not by rewriting the rejected plan into
+canonical state. The immutable record carries only pre-post values: issue and
+repository, planning generation, target coder round, prior plan subject when
+revising, contract versions, expected producer login and immutable ID, failure
+attempt, candidate digest, category, and a sanitized diagnostic. The diagnostic
+is capped at 4096 characters, including the truncation suffix, and excludes
+candidate bodies, provider output, credentials, environment data, and active
+reserved syntax.
+
+The issue API response and live recovery provide a separate transport wrapper
+with the numeric comment ID, authoritative creation time, exact live body, and
+producer identity. The writer verifies those fields against one invocation-
+scoped authenticated actor before accepting the record. On a later run, each
+wrapper is checked again; same-context records select the unique highest
+payload attempt, never the newest timestamp or comment. Duplicate transport
+objects are deduplicated, conflicting highest attempts fail closed, and stale
+or actor-mismatched records cannot constrain planning.
+
+The selected diagnostic is rendered as a clearly labeled trusted orchestration
+correction block in fresh, full-revision, compact-revision, and parallel-review
+planner prompts. It is not issue prose, reviewer feedback, or a signed human
+requirement, and validation remains authoritative. A verified canonical coder
+plan comment semantically supersedes matching diagnostics; history is never
+deleted or edited. A failed diagnostic write preserves the original validator
+cause and adds only a bounded not-persisted note. Non-deterministic provider,
+timeout, quota, marker-safety, and containment failures do not create this
+record.
+
 If earlier blocking or same-plan items are still open, reviewers encode prior
 item dispositions in the JSON `prior_plan_item_dispositions` array using
 `"resolved"`, `"blocking"`, `"same-plan"`, or `"future"` (with a `"note"`).
@@ -1143,7 +1174,9 @@ Execution model:
   changes: it aggregates outcomes, numbers unresolved items, and may begin
   coder work only in configured `--reviewer` order. It then posts a neutral
   reconciliation checkpoint; this summary is not a reviewer verdict and is
-  excluded from reviewer/approval selection.
+  excluded from reviewer/approval selection. On resume, settled `new_items`
+  from that reconciliation checkpoint remain authoritative; provisional
+  publication checkpoints do not cause those items to be numbered again.
 - Only after every healthy outcome is applied does the orchestrator raise a
   fatal failure, if any: a quota-reset failure takes priority; otherwise the
   first failure in configured `--reviewer` order. Because healthy reviewers

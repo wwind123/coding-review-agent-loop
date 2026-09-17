@@ -27,7 +27,10 @@ from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provena
 from .memory import AgentMemoryContext, format_agent_memory_context
 from .managed_ci import ManagedCiCreationIntent, UNPROTECTED_OVERRIDE_TRAILER
 from .salvage import AGENT_SALVAGE_MARKER_RE
-from .round_transport import is_round_transport_sidecar
+from .round_transport import (
+    MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS,
+    is_round_transport_sidecar,
+)
 from .protocol import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
@@ -648,6 +651,18 @@ def _is_salvage_breadcrumb_comment(comment) -> bool:
     return bool(comment.body) and bool(AGENT_SALVAGE_MARKER_RE.search(comment.body))
 
 
+def _is_plan_validation_diagnostic_comment(comment) -> bool:
+    """Keep record-like diagnostic syntax out of ordinary issue prose.
+
+    Filtering cannot depend on successful payload decoding: malformed and
+    forged comments are still untrusted reserved syntax and must not be
+    replayed to a planner as issue discussion.
+    """
+    return bool(comment.body) and (
+        "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.body.upper()
+    )
+
+
 def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000) -> str:
     raw_body = issue_context.body if issue_context.body else "(none)"
     body = _truncate_issue_text(raw_body, max_chars=max_chars // 3, label="Issue body")
@@ -666,14 +681,14 @@ def format_issue_context(issue_context: IssueContext, *, max_chars: int = 24_000
         "",
         "Comments, oldest to newest:",
     ]
-    # AGENT_SALVAGE breadcrumb comments carry a bounded but potentially large
-    # embedded patch/metadata payload for cross-workdir salvage discovery
-    # (#507); they are consumed separately via latest_salvage_context and
-    # would otherwise bloat/displace real discussion in this raw rendering.
+    # Durable machine records are consumed through authenticated, typed paths.
+    # Rendering them again as ordinary issue prose would duplicate trusted
+    # context and expose active reserved syntax to the planner.
     visible_comments = tuple(
         comment
         for comment in issue_context.comments
         if not _is_salvage_breadcrumb_comment(comment)
+        and not _is_plan_validation_diagnostic_comment(comment)
         and not (comment.body and is_round_transport_sidecar(comment.body))
     )
     if visible_comments:
@@ -1090,7 +1105,9 @@ def _structured_coder_followup_guidance(
         "Use `addressed_item_notes` to summarize how each addressed item was resolved, and use `remaining_item_notes` to give a visible reason for each intentionally deferred remaining item.",
         "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) or when the reviewer requests a change that is mutually incompatible with a verified approved-plan decision and you have counter-evidence. For a plan conflict, `dispute_evidence` must name the conflicting approved decision, concrete counter-evidence, and why the requested change is incompatible. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`; never park a verified plan conflict in `remaining_items`, whose retry semantics would silently recycle it. Ordinary implementation defects and evidence-backed correctness, security, compatibility, or test defects must be fixed and classified as addressed or genuinely remaining, never disputed merely because the implementation followed the plan. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
         "When you use the managed `agent-loop run-tests` wrapper, cite each returned opaque receipt in `test_observations` with the exact command and claim `current-result` or `base-reproduction`. A passing subset does not supersede a broader failed suite; leave both observations visible. Unknown, stale, cross-turn, or command-disagreeing receipts are rendered as unverified.",
-        "If the approved plan delivered an applicable risk matrix, include `risk_test_matrix_evidence` with one exact row mapping per delivered row. Map rows to actual test identifiers and locations, distinguish intended workflow coverage from helper/earlier-guard coverage, assert expected outcomes and forbidden effects, and preserve missing/not-run/blocked/failed/timed-out/stale or otherwise incomplete caveats.",
+        "If the approved plan delivered an applicable risk matrix, include `risk_test_matrix_evidence` as a JSON object with exactly `matrix_identity` and `rows`: "
+        '`{"matrix_identity":"<delivered SHA-256>","rows":[{"row_id":"<delivered row id>","status":"verified","test_identifiers":["tests/test_file.py::test_name"],"test_locations":["tests/test_file.py"],"workflow_path_claim":"<path exercised>","outcome_assertions":["<observed outcome>"],"forbidden_effect_assertions":["<effect shown absent>"],"evidence_citations":[{"command":"<exact test_observations command>","receipt_id":"<exact receipt>","claim":"current-result"}],"caveats":[]}]}`. '
+        "Do not emit `risk_test_matrix_evidence` as an array and do not substitute shorthand keys such as `coverage`, `coverage_level`, `expected_outcome`, `forbidden_effects`, `tests`, `evidence`, or `evidence_status`. Include exactly one row object per delivered row. Map rows to actual test identifiers and locations, distinguish intended workflow coverage from helper/earlier-guard coverage, assert expected outcomes and forbidden effects, cite authoritative `test_observations`, and preserve missing/not-run/blocked/failed/timed-out/stale or otherwise incomplete caveats.",
         _agent_unavailable_guidance(coder_signature),
     ]
     if human_requirements_context.surfaced_requirement_ids:
@@ -1347,6 +1364,27 @@ def _issue_context_block(issue_context: IssueContext | None) -> str:
         "Issue context from GitHub. Later comments may refine or supersede the "
         "original issue body:\n"
         f"{format_issue_context(issue_context)}\n"
+    )
+
+
+def format_plan_validation_diagnostic_context(diagnostic: object | None) -> str:
+    """Render authenticated planning correction context, never issue prose."""
+    if diagnostic is None:
+        return ""
+    payload = getattr(diagnostic, "payload", diagnostic)
+    text = sanitize_historical_text(str(getattr(payload, "diagnostic", "")))
+    text = text[:MAX_PLAN_VALIDATION_DIAGNOSTIC_CHARS]
+    attempt = getattr(payload, "failure_attempt", "?")
+    digest = str(getattr(payload, "candidate_digest", ""))[:16] or "unknown"
+    return (
+        "Trusted orchestration correction record (authenticated issue audit; "
+        "not issue prose, reviewer feedback, or a human requirement):\n"
+        f"- Failed validation attempt: {attempt}\n"
+        f"- Rejected candidate provenance: {digest}\n"
+        "- Exact bounded validator diagnostic:\n"
+        f"  {text}\n"
+        "Use this diagnostic to correct the next candidate. Deterministic "
+        "validation remains authoritative.\n"
     )
 
 
@@ -2271,6 +2309,7 @@ def build_issue_plan_prompt(
     memory: AgentMemoryContext | None = None,
     issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    plan_validation_diagnostic: object | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -2349,6 +2388,7 @@ prose between the JSON object and footer.
         "Each bullet must explain how the plan covers that item or what remains risky or blocked."
     ),
 )}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
 {_issue_context_block(issue_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -2672,6 +2712,7 @@ def build_plan_revision_prompt(
     compact_tail: CompactPlanTailContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     require_risk_test_matrix_contract: bool = True,
+    plan_validation_diagnostic: object | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -2687,6 +2728,7 @@ def build_plan_revision_prompt(
             compact_prior=compact_prior,
             compact_tail=compact_tail,
             require_risk_test_matrix_contract=require_risk_test_matrix_contract,
+            plan_validation_diagnostic=plan_validation_diagnostic,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2713,6 +2755,7 @@ branch, commit, push, or open a pull request during this planning stage.
         "Each bullet must explain how the revised plan covers that item or what remains risky or blocked."
     ),
 )}
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, previous_plan))}
 {_issue_context_block(issue_context)}
 {unresolved_items_block}{_memory_block(memory, config, include_runtime=True)}
@@ -2815,6 +2858,7 @@ def _build_compact_plan_revision_prompt(
     compact_prior: CompactPriorContext | None,
     compact_tail: CompactPlanTailContext | None,
     require_risk_test_matrix_contract: bool,
+    plan_validation_diagnostic: object | None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -2864,6 +2908,8 @@ Coder: {agent_display_name(config.coder)}
 Reviewers: {reviewer_name}
 {subject_line}
 Action for this call: {action}
+
+{format_plan_validation_diagnostic_context(plan_validation_diagnostic)}
 
 Previous implementation plan:
 

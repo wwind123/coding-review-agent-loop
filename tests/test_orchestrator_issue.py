@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from dataclasses import replace
@@ -21,7 +22,11 @@ from coding_review_agent_loop.decomposition import (
     format_decomposition_parent_summary,
     format_one_shot_impl_handoff_comment,
 )
-from coding_review_agent_loop.errors import QuotaResetExceededError
+from coding_review_agent_loop.errors import (
+    AgentInvocationError,
+    DeterministicPlanValidationExhaustion,
+    QuotaResetExceededError,
+)
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
     IssueComment,
@@ -1125,6 +1130,487 @@ class FakeRunner(_FakeRunner):
                 ]
         kwargs.setdefault("pr_payload", {"body": "Fixes #56"})
         super().__init__(**kwargs)
+
+
+class _PlanDiagnosticRunner(_FakeRunner):
+    def __init__(self, *, post_returncode=0, issue_number=813):
+        super().__init__()
+        self.post_returncode = post_returncode
+        self.issue_number = issue_number
+        self.diagnostic_posts = []
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = list(args)
+        if command == ["gh", "api", "user"]:
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                recorded, cwd_path, json.dumps({"login": "agent", "id": 7}), "", 0
+            )
+        if command[:4] == ["gh", "api", "--method", "POST"]:
+            endpoint = command[4] if len(command) > 4 else ""
+            if endpoint == f"repos/OWNER/REPO/issues/{self.issue_number}/comments":
+                recorded, cwd_path = self._record_command(args, cwd)
+                body = json.loads(input_text or "{}")["body"]
+                self.diagnostic_posts.append(body)
+                if self.post_returncode:
+                    return CommandResult(recorded, cwd_path, "", "post failed", self.post_returncode)
+                return CommandResult(
+                    recorded,
+                    cwd_path,
+                    json.dumps(
+                        {
+                            "id": 901,
+                            "created_at": "2026-09-17T05:30:00Z",
+                            "body": body,
+                            "user": {"login": "agent", "id": 7},
+                        }
+                    ),
+                    "",
+                    0,
+                )
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+class _PaginatedIssueCommentsRunner(_FakeRunner):
+    def __init__(self, pages):
+        super().__init__(issue_comments=[])
+        self.pages = pages
+        self.rest_comment_requests = []
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = list(args)
+        if command[:2] == ["gh", "api"] and len(command) > 2 and command[2].startswith(
+            "repos/OWNER/REPO/issues/56/comments?"
+        ):
+            recorded, cwd_path = self._record_command(args, cwd)
+            query = command[2].split("?", 1)[1]
+            self.rest_comment_requests.append(query)
+            page = int(dict(part.split("=", 1) for part in query.split("&"))["page"])
+            return CommandResult(
+                recorded,
+                cwd_path,
+                json.dumps(self.pages[page - 1]),
+                "",
+                0,
+            )
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def test_issue_comment_recovery_parses_rest_user_identity_across_all_pages(tmp_path):
+    marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
+    first_page = [
+        {"id": index + 1, "body": f"ordinary {index}", "user": {"login": "agent", "id": 7}}
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "id": 101,
+            "created_at": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+            "user": {"login": "agent", "id": 7},
+        }
+    ]
+    runner = _PaginatedIssueCommentsRunner([first_page, second_page])
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+        }
+    ]
+    context = get_issue_context(
+        runner,
+        config=make_config(tmp_path),
+        issue_number=56,
+    )
+
+    recovered = next(comment for comment in context.comments if comment.body == marker_body)
+    assert recovered.author == "agent"
+    assert recovered.author_id == 7
+    assert recovered.comment_id == 101
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+
+
+def test_issue_comment_recovery_discovers_diagnostic_beyond_graphql_projection(tmp_path):
+    marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
+    first_page = [
+        {
+            "id": index + 1,
+            "body": f"ordinary {index}",
+            "created_at": f"2026-09-17T04:00:{index:02d}Z",
+            "user": {"login": "agent", "id": 7},
+        }
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "id": 101,
+            "created_at": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+            "user": {"login": "agent", "id": 7},
+        }
+    ]
+    runner = _PaginatedIssueCommentsRunner([first_page, second_page])
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": f"2026-09-17T04:00:{index:02d}Z",
+            "body": f"ordinary {index}",
+        }
+        for index in range(100)
+    ]
+
+    context = get_issue_context(runner, config=make_config(tmp_path), issue_number=56)
+
+    recovered = next(comment for comment in context.comments if comment.body == marker_body)
+    assert recovered.comment_id == 101
+    assert recovered.author == "agent"
+    assert recovered.author_id == 7
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+
+
+def test_issue_comment_recovery_discovers_canonical_round_transport(
+    tmp_path,
+):
+    canonical_plan = structured_plan_state(summary="Historical canonical plan.")
+    canonical_body = _attach_round_metadata(
+        canonical_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject=_plan_subject(canonical_plan),
+            canonical_plan=canonical_plan,
+            raw_structured_coder_response=canonical_plan,
+            architecture_contract_version=1,
+            state="approved",
+        ),
+    )
+    first_page = [
+        {
+            "id": index + 1,
+            "body": f"ordinary {index}",
+            "created_at": f"2026-09-17T04:00:{index:02d}Z",
+            "user": {"login": "agent", "id": 7},
+        }
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "id": 101,
+            "created_at": "2026-09-17T05:30:00Z",
+            "body": str(canonical_body),
+            "user": {"login": "agent", "id": 7},
+        }
+    ]
+    runner = _PaginatedIssueCommentsRunner([first_page, second_page])
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": f"2026-09-17T04:00:{index:02d}Z",
+            "body": f"ordinary {index}",
+        }
+        for index in range(100)
+    ]
+
+    context = get_issue_context(runner, config=make_config(tmp_path), issue_number=56)
+
+    recovered = next(comment for comment in context.comments if comment.body == str(canonical_body))
+    assert recovered.comment_id == 101
+    assert recovered.author == "agent"
+    assert recovered.author_id == 7
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+
+
+def test_issue_comment_recovery_fails_closed_when_a_later_rest_page_is_unavailable(tmp_path):
+    marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
+
+    class IncompleteRunner(_PaginatedIssueCommentsRunner):
+        def _run_locked(self, args, *, cwd, check, input_text=None):
+            command = list(args)
+            if command[:2] == ["gh", "api"] and len(command) > 2 and command[2].startswith(
+                "repos/OWNER/REPO/issues/56/comments?"
+            ):
+                recorded, cwd_path = self._record_command(args, cwd)
+                page = int(command[2].rsplit("=", 1)[1])
+                if page == 2:
+                    return CommandResult(recorded, cwd_path, "", "network failure", 1)
+            return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    runner = IncompleteRunner(
+        [[
+            {"id": index + 1, "body": f"ordinary {index}", "user": {"login": "agent", "id": 7}}
+            for index in range(100)
+        ]]
+    )
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+        }
+    ]
+    with pytest.raises(AgentLoopError, match="incomplete"):
+        get_issue_context(runner, config=make_config(tmp_path), issue_number=56)
+
+
+def test_exhausted_fresh_plan_validation_diagnostic_survives_resume(tmp_path):
+    runner = _PlanDiagnosticRunner()
+    config = make_config(tmp_path, execution_strategy_contract_required=True)
+    issue_context = IssueContext(
+        number=813,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/813",
+        comments=(),
+    )
+    original_error = AgentInvocationError(
+        "deterministic validator rejected the plan",
+        failure_category="deterministic",
+    )
+    exhaustion = DeterministicPlanValidationExhaustion(
+        candidate_kind="plan_state",
+        candidate_text='{"kind":"plan_state"}',
+        diagnostic="missing complete-scope audit operation",
+        candidate_digest="a" * 64,
+    )
+    orchestrator_module._persist_exhausted_plan_validation_diagnostic(
+        runner,
+        config=config,
+        issue_context=issue_context,
+        issue_number=813,
+        original_error=original_error,
+        exhaustion=exhaustion,
+        target_coder_round=1,
+        prior_plan_subject=None,
+        candidate_kind="plan_state",
+        require_execution_strategy_contract=True,
+        require_risk_test_matrix_contract=True,
+    )
+    assert len(runner.diagnostic_posts) == 1
+    body = runner.diagnostic_posts[0]
+    assert "901" not in body
+    assert "2026-09-17T05:30:00Z" not in body
+    resumed_context = replace(
+        issue_context,
+        comments=(
+            IssueComment(
+                author="agent",
+                author_id=7,
+                comment_id=901,
+                created_at="2026-09-17T05:30:00Z",
+                body=body,
+            ),
+        ),
+    )
+    diagnostic = orchestrator_module._recover_current_plan_validation_diagnostic(
+        runner,
+        config=config,
+        issue_context=resumed_context,
+        issue_number=813,
+        target_coder_round=1,
+        prior_plan_subject=None,
+        candidate_kind="plan_state",
+        require_execution_strategy_contract=True,
+        require_risk_test_matrix_contract=True,
+    )
+    assert diagnostic is not None
+    assert diagnostic.failure_attempt == 1
+    assert diagnostic.diagnostic == "missing complete-scope audit operation"
+
+
+def test_validation_record_post_failure_preserves_original_error(tmp_path):
+    runner = _PlanDiagnosticRunner(post_returncode=1)
+    config = make_config(tmp_path, execution_strategy_contract_required=True)
+    issue_context = IssueContext(
+        number=813, repo="OWNER/REPO", title="Issue", body="Issue", url=None, comments=()
+    )
+    original_error = AgentInvocationError(
+        "original deterministic validator cause",
+        failure_category="deterministic",
+    )
+    exhaustion = DeterministicPlanValidationExhaustion(
+        candidate_kind="plan_revision",
+        candidate_text='{"kind":"plan_revision"}',
+        diagnostic="revision validation failed",
+        candidate_digest="b" * 64,
+    )
+    with pytest.raises(AgentInvocationError) as raised:
+        orchestrator_module._persist_exhausted_plan_validation_diagnostic(
+            runner,
+            config=config,
+            issue_context=issue_context,
+            issue_number=813,
+            original_error=original_error,
+            exhaustion=exhaustion,
+            target_coder_round=2,
+            prior_plan_subject="c" * 64,
+            candidate_kind="plan_revision",
+            require_execution_strategy_contract=True,
+            require_risk_test_matrix_contract=True,
+        )
+    assert "original deterministic validator cause" in str(raised.value)
+    assert "not persisted" in str(raised.value)
+    assert runner.diagnostic_posts
+
+
+def test_exhausted_plan_validation_persists_from_the_planning_orchestration_path(
+    tmp_path, monkeypatch
+):
+    invalid_payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    invalid_payload.pop("architecture_impact")
+    invalid_candidate = (
+        json.dumps(invalid_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [invalid_candidate]
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *args, **kwargs: (None, None, []),
+    )
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert error.value.plan_validation_exhaustion is not None
+    assert len(runner.diagnostic_posts) == 1
+    assert "not persisted" not in str(error.value)
+
+
+@pytest.mark.parametrize("missing_contract", ["execution", "matrix"])
+def test_exhausted_fresh_contract_integrity_persists_validation_diagnostic(
+    tmp_path, missing_contract
+):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    if missing_contract == "execution":
+        payload.pop("execution_recommendation")
+        expected_diagnostic = "execution_recommendation"
+    else:
+        payload.pop("risk_test_matrix")
+        payload.pop("risk_test_matrix_changes")
+        payload.pop("risk_test_matrix_contract_version")
+        expected_diagnostic = "risk_test_matrix"
+    candidate = (
+        json.dumps(payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [candidate]
+    config = make_config(
+        tmp_path,
+        agent_max_retries=0,
+        execution_strategy_contract_required=True,
+    )
+
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None
+    assert expected_diagnostic in exhaustion.diagnostic
+    assert exhaustion.candidate_digest == hashlib.sha256(candidate.encode()).hexdigest()
+    assert len(runner.diagnostic_posts) == 1
+
+
+def test_invalid_terminal_plan_repair_replaces_persisted_candidate_provenance(
+    tmp_path, monkeypatch
+):
+    source_payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    source_payload.pop("architecture_impact")
+    source_candidate = (
+        json.dumps(source_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    repair_payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    repair_payload.pop("summary")
+    repair_candidate = (
+        json.dumps(repair_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    repair_attempt = SimpleNamespace(
+        backend="gemini",
+        model="repair-model",
+        prompt="",
+        output=repair_candidate,
+        returncode=0,
+        outcome="invalid_output",
+        diagnostic="combined backend text that must not be persisted",
+        log_path=None,
+        fallback_planned=False,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *args, **kwargs: (repair_candidate, None, [repair_attempt]),
+    )
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [source_candidate]
+
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, agent_max_retries=0),
+            plan_first=True,
+        )
+
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None
+    assert exhaustion.candidate_text == repair_candidate
+    assert exhaustion.candidate_digest == hashlib.sha256(repair_candidate.encode()).hexdigest()
+    assert "plan_state is missing required field(s): summary" in exhaustion.diagnostic
+    assert "combined backend text" not in exhaustion.diagnostic
+    assert len(runner.diagnostic_posts) == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "returncode", "expected_category"),
+    [("timeout", None, "timeout"), ("nonzero_exit", 1, "repair-provider-failure")],
+)
+def test_terminal_plan_repair_provider_failure_does_not_persist_stale_diagnostic(
+    tmp_path, monkeypatch, outcome, returncode, expected_category
+):
+    payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    payload.pop("architecture_impact")
+    candidate = (
+        json.dumps(payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    repair_attempt = SimpleNamespace(
+        backend="gemini",
+        model="repair-model",
+        prompt="",
+        output="",
+        returncode=returncode,
+        outcome=outcome,
+        diagnostic="repair transport or provider failed",
+        log_path=None,
+        fallback_planned=False,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *args, **kwargs: (None, None, [repair_attempt]),
+    )
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [candidate]
+
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, agent_max_retries=0),
+            plan_first=True,
+        )
+
+    assert error.value.failure_category == expected_category
+    assert error.value.plan_validation_exhaustion is None
+    assert runner.diagnostic_posts == []
 
 
 def _add_default_requirement_disposition(

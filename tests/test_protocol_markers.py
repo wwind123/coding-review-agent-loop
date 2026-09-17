@@ -155,7 +155,7 @@ def test_ordinary_issue_comment_writer_enforces_issue_comment_surface():
 
 def test_source_inventory_has_no_unregistered_protocol_literals():
     assert_source_inventory(Path(__file__).parents[1])
-    assert len(RESERVED_MARKER_REGISTRY) == 28
+    assert len(RESERVED_MARKER_REGISTRY) == 29
 
 
 def test_issue_provenance_trailer_is_not_a_reserved_marker_or_forged_body_record():

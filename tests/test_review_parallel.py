@@ -9,12 +9,18 @@ import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import AgentLoopError, build_parser, run_issue_loop, run_pr_loop
-from coding_review_agent_loop.errors import QuotaResetExceededError
+from coding_review_agent_loop.errors import AgentInvocationError, QuotaResetExceededError
+from coding_review_agent_loop.round_state import (
+    PlanValidationDiagnosticPayload,
+    encode_plan_validation_diagnostic_body,
+)
+from coding_review_agent_loop.runner import CommandResult
 from agent_loop_helpers import (
     FakeRunner,
     make_config,
     structured_coder_followup,
     structured_plan_review,
+    structured_plan_revision,
     structured_plan_state,
     structured_pr_review,
 )
@@ -24,6 +30,522 @@ def _initial_plan() -> str:
     return structured_plan_state(
         state="blocking", summary="Initial plan.", plan_steps=["Make the change."]
     )
+
+
+class _PlanDiagnosticParallelRunner(FakeRunner):
+    """Expose the REST identity seam while retaining the normal issue fixture."""
+
+    def __init__(
+        self,
+        *,
+        diagnostic_body,
+        claude_outputs,
+        codex_outputs,
+        gemini_outputs,
+        actor_login="agent",
+        actor_id=7,
+    ):
+        self.actor_login = actor_login
+        self.actor_id = actor_id
+        super().__init__(
+            claude_outputs=claude_outputs,
+            codex_outputs=codex_outputs,
+            gemini_outputs=gemini_outputs,
+            issue_comments=(
+                [
+                    {
+                        "author": {"login": "agent", "id": 7},
+                        "createdAt": "2026-09-17T05:30:00Z",
+                        "body": diagnostic_body,
+                        "id": 700,
+                    }
+                ]
+                if diagnostic_body is not None
+                else []
+            ),
+        )
+        self.verified_round_bodies = []
+
+    def _rest_comment(self, raw_comment, index):
+        author = raw_comment.get("author") or raw_comment.get("user") or {}
+        login = author.get("login") if isinstance(author, dict) else None
+        author_id = author.get("id") if isinstance(author, dict) else None
+        return {
+            "id": raw_comment.get("id") or 1000 + index,
+            "created_at": raw_comment.get("createdAt") or raw_comment.get("created_at"),
+            "body": raw_comment.get("body"),
+            "user": {
+                "login": login or "coding-review-agent-loop",
+                "id": author_id if isinstance(author_id, int) else 99,
+            },
+        }
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = list(args)
+        if command == ["gh", "api", "user"]:
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                recorded,
+                cwd_path,
+                json.dumps({"login": self.actor_login, "id": self.actor_id}),
+                "",
+                0,
+            )
+        if command[:4] == ["gh", "api", "--method", "POST"]:
+            endpoint = command[4] if len(command) > 4 else ""
+            if endpoint == "repos/OWNER/REPO/issues/56/comments":
+                recorded, cwd_path = self._record_command(args, cwd)
+                body = json.loads(input_text or "{}")["body"]
+                self.verified_round_bodies.append(body)
+                comment = {
+                    "author": {"login": self.actor_login, "id": self.actor_id},
+                    "createdAt": "2026-09-17T05:31:00Z",
+                    "body": body,
+                    "id": 701 + len(self.verified_round_bodies),
+                }
+                self.issue_comments.append(comment)
+                return CommandResult(
+                    recorded,
+                    cwd_path,
+                    json.dumps(
+                        {
+                            "id": comment["id"],
+                            "created_at": comment["createdAt"],
+                            "body": body,
+                            "user": {
+                                "login": self.actor_login,
+                                "id": self.actor_id,
+                            },
+                        }
+                    ),
+                    "",
+                    0,
+                )
+        if command[:2] == ["gh", "api"] and len(command) > 2 and command[2].startswith(
+            "repos/OWNER/REPO/issues/56/comments?"
+        ):
+            recorded, cwd_path = self._record_command(args, cwd)
+            query = dict(part.split("=", 1) for part in command[2].split("?", 1)[1].split("&"))
+            page = int(query["page"])
+            raw_comments = [self._rest_comment(comment, index) for index, comment in enumerate(self.issue_comments)]
+            start = (page - 1) * int(query["per_page"])
+            end = start + int(query["per_page"])
+            return CommandResult(recorded, cwd_path, json.dumps(raw_comments[start:end]), "", 0)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+@pytest.mark.parametrize("context_mode", ["compact", "full"])
+def test_plan_parallel_revision_supersedes_diagnostic_without_leaking_it_to_next_prompt(
+    tmp_path, context_mode
+):
+    payload = PlanValidationDiagnosticPayload(
+        repository="OWNER/REPO",
+        issue_number=56,
+        planning_generation=1,
+        target_coder_round=1,
+        prior_plan_subject=None,
+        candidate_kind="plan_state",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=None,
+        risk_test_matrix_contract_version=None,
+        expected_producer_login="agent",
+        expected_producer_id=7,
+        failure_attempt=1,
+        candidate_digest="a" * 64,
+        category="deterministic",
+        diagnostic="missing matrix-level audit operation",
+    )
+    diagnostic_body = str(encode_plan_validation_diagnostic_body(payload))
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=diagnostic_body,
+        claude_outputs=[
+            structured_plan_state(summary="Replacement initial plan."),
+            structured_plan_revision(summary="Revision after the blocking review."),
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                summary="Codex found one plan issue.",
+                blocking_plan_issues=["Add the missing verification step."],
+            ),
+            structured_plan_review(
+                summary="Codex approves the revised plan.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                summary="Gemini approves the initial plan.",
+                reviewer="Google Gemini",
+            ),
+            structured_plan_review(
+                summary="Gemini approves the revised plan.",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini"),
+        review_parallel=True,
+        planning_context_mode=context_mode,
+        max_rounds=2,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompts = [
+        command[-1]
+        for command, _cwd in runner.commands
+        if command[:1] == ["claude"]
+    ]
+    assert len(planner_prompts) == 2
+    assert "missing matrix-level audit operation" in planner_prompts[0]
+    assert "missing matrix-level audit operation" not in planner_prompts[1]
+    assert len(runner.verified_round_bodies) == 1
+    assert all("901" not in body for body in runner.verified_round_bodies)
+
+
+def test_plan_validation_diagnostic_survives_a_new_invocation_and_is_superseded(
+    tmp_path, monkeypatch
+):
+    invalid_payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    invalid_payload.pop("architecture_impact")
+    invalid_candidate = (
+        json.dumps(invalid_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=None,
+        claude_outputs=[invalid_candidate],
+        codex_outputs=[],
+        gemini_outputs=[],
+    )
+    config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
+
+    with patch.object(
+        orchestrator,
+        "_run_structured_repair",
+        return_value=(None, None, []),
+    ):
+        with pytest.raises(AgentInvocationError) as error:
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert error.value.plan_validation_exhaustion is not None
+    assert len(runner.verified_round_bodies) == 1
+
+    runner.claude_outputs = [structured_plan_state(summary="Recovered plan.")]
+    runner.codex_outputs = [structured_plan_review(summary="The recovered plan is approved.")]
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompts = [
+        command[-1]
+        for command, _cwd in runner.commands
+        if command[:1] == ["claude"]
+    ]
+    assert len(planner_prompts) == 2
+    assert "Trusted orchestration correction record" in planner_prompts[1]
+    assert "Failed validation attempt: 1" in planner_prompts[1]
+    assert "Exact bounded validator diagnostic" in planner_prompts[1]
+    assert planner_prompts[1].count(
+        "plan_state must include architecture_impact for this fresh contract turn."
+    ) == 1
+    assert "AGENT_PLAN_VALIDATION_DIAGNOSTIC" not in planner_prompts[1]
+    assert "2026-09-17T05:31:00Z" not in planner_prompts[1]
+    assert len(runner.verified_round_bodies) == 2
+
+
+@pytest.mark.parametrize("context_mode", ["compact", "full"])
+def test_plan_parallel_revision_validation_exhaustion_survives_resume(
+    tmp_path, context_mode
+):
+    invalid_payload = json.loads(
+        structured_plan_revision(summary="Rejected revision.").split("\n", 1)[0]
+    )
+    invalid_payload.pop("architecture_impact")
+    invalid_revision = (
+        json.dumps(invalid_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=None,
+        claude_outputs=[structured_plan_state(summary="Initial plan."), invalid_revision],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                summary="The plan needs one correction.",
+                blocking_plan_issues=["Add the missing verification step."],
+            )
+        ],
+        gemini_outputs=[],
+    )
+    config = make_config(
+        tmp_path,
+        reviewer=("codex",),
+        review_parallel=True,
+        planning_context_mode=context_mode,
+        max_rounds=2,
+        agent_max_retries=0,
+    )
+
+    with patch.object(orchestrator, "_run_structured_repair", return_value=(None, None, [])):
+        with pytest.raises(AgentInvocationError) as error:
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert error.value.plan_validation_exhaustion is not None
+    diagnostic_comments = [
+        comment for comment in runner.issue_comments
+        if "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.get("body", "")
+    ]
+    assert len(diagnostic_comments) == 1
+
+    runner.claude_outputs = [structured_plan_revision(summary="Recovered revision.")]
+    runner.codex_outputs = [
+        structured_plan_review(
+            state="approved",
+            summary="The recovered revision is approved.",
+            prior_plan_item_dispositions=[
+                {"item_id": "item-1", "disposition": "resolved"}
+            ],
+        )
+    ]
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompts = [
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["claude"]
+    ]
+    assert len(planner_prompts) == 3
+    assert "Trusted orchestration correction record" in planner_prompts[-1]
+    assert "Add the missing verification step." in planner_prompts[-1]
+    assert len([command for command, _cwd in runner.commands if command[:2] == ["codex", "exec"]]) == 2
+    assert len(runner.verified_round_bodies) == 2
+
+
+def test_repeated_exhausted_plan_failures_select_highest_attempt_across_invocations(
+    tmp_path,
+):
+    invalid_payload = json.loads(
+        structured_plan_state(summary="Rejected plan.").split("\n", 1)[0]
+    )
+    invalid_payload.pop("architecture_impact")
+    invalid_candidate = (
+        json.dumps(invalid_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=None,
+        claude_outputs=[invalid_candidate],
+        codex_outputs=[],
+        gemini_outputs=[],
+    )
+    config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
+
+    with patch.object(orchestrator, "_run_structured_repair", return_value=(None, None, [])):
+        with pytest.raises(AgentInvocationError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    runner.claude_outputs = [invalid_candidate]
+    with patch.object(orchestrator, "_run_structured_repair", return_value=(None, None, [])):
+        with pytest.raises(AgentInvocationError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    runner.claude_outputs = [structured_plan_state(summary="Recovered plan.")]
+    runner.codex_outputs = [structured_plan_review(summary="The recovered plan is approved.")]
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    diagnostic_bodies = [
+        comment["body"]
+        for comment in runner.issue_comments
+        if "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.get("body", "")
+    ]
+    assert len(diagnostic_bodies) == 2
+    planner_prompts = [
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["claude"]
+    ]
+    assert "Failed validation attempt: 2" in planner_prompts[-1]
+
+
+def test_plan_validation_diagnostic_is_ignored_after_actor_change(tmp_path):
+    payload = PlanValidationDiagnosticPayload(
+        repository="OWNER/REPO",
+        issue_number=56,
+        planning_generation=1,
+        target_coder_round=1,
+        prior_plan_subject=None,
+        candidate_kind="plan_state",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=None,
+        risk_test_matrix_contract_version=None,
+        expected_producer_login="agent",
+        expected_producer_id=7,
+        failure_attempt=1,
+        candidate_digest="a" * 64,
+        category="deterministic",
+        diagnostic="old actor diagnostic",
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=str(encode_plan_validation_diagnostic_body(payload)),
+        claude_outputs=[structured_plan_state(summary="Recovered by the new actor.")],
+        codex_outputs=[structured_plan_review(summary="The recovered plan is approved.")],
+        gemini_outputs=[],
+    )
+    runner.actor_login = "different-agent"
+    runner.actor_id = 8
+    config = make_config(tmp_path, max_rounds=1)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompt = next(
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["claude"]
+    )
+    assert "old actor diagnostic" not in planner_prompt
+    assert sum(
+        "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.get("body", "")
+        for comment in runner.issue_comments
+    ) == 1
+
+
+def test_plan_validation_diagnostic_with_stale_context_is_ignored_in_workflow(tmp_path):
+    payload = PlanValidationDiagnosticPayload(
+        repository="OWNER/REPO",
+        issue_number=56,
+        planning_generation=1,
+        target_coder_round=2,
+        prior_plan_subject="b" * 64,
+        candidate_kind="plan_revision",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=None,
+        risk_test_matrix_contract_version=None,
+        expected_producer_login="agent",
+        expected_producer_id=7,
+        failure_attempt=4,
+        candidate_digest="b" * 64,
+        category="deterministic",
+        diagnostic="stale revision diagnostic",
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=str(encode_plan_validation_diagnostic_body(payload)),
+        claude_outputs=[structured_plan_state(summary="Fresh plan ignores stale record.")],
+        codex_outputs=[structured_plan_review(summary="The fresh plan is approved.")],
+        gemini_outputs=[],
+    )
+    config = make_config(tmp_path, max_rounds=1)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompt = next(
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["claude"]
+    )
+    assert "stale revision diagnostic" not in planner_prompt
+
+
+@pytest.mark.parametrize("context_mode", ["compact", "full"])
+def test_revision_success_supersedes_diagnostic_before_a_later_same_invocation_prompt(
+    tmp_path, context_mode
+):
+    """A verified replacement must not leak its old correction into round N+1."""
+    initial_plan = structured_plan_state(summary="Existing plan.")
+    initial_subject = orchestrator._plan_subject(initial_plan)
+    initial_comment = orchestrator._attach_round_metadata(
+        initial_plan,
+        orchestrator.PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Anthropic Claude",
+            round_number=1,
+            subject=initial_subject,
+            prior_plan_subject=None,
+            canonical_plan=initial_plan,
+            raw_structured_coder_response=initial_plan,
+            state="blocking",
+            architecture_contract_version=1,
+        ),
+    )
+    diagnostic = PlanValidationDiagnosticPayload(
+        repository="OWNER/REPO",
+        issue_number=56,
+        planning_generation=1,
+        target_coder_round=2,
+        prior_plan_subject=initial_subject,
+        candidate_kind="plan_revision",
+        architecture_contract_version=1,
+        execution_strategy_contract_version=None,
+        risk_test_matrix_contract_version=None,
+        expected_producer_login="agent",
+        expected_producer_id=7,
+        failure_attempt=1,
+        candidate_digest="c" * 64,
+        category="deterministic",
+        diagnostic="the round-two correction must not survive its replacement",
+    )
+    runner = _PlanDiagnosticParallelRunner(
+        diagnostic_body=str(encode_plan_validation_diagnostic_body(diagnostic)),
+        claude_outputs=[
+            structured_plan_revision(summary="Replacement revision."),
+            structured_plan_revision(
+                summary="Later revision.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                summary="The existing plan needs one correction.",
+                blocking_plan_issues=["Add the missing verification step."],
+            ),
+            structured_plan_review(
+                state="blocking",
+                summary="The replacement still needs one correction.",
+                blocking_plan_issues=["Clarify the rollback step."],
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+            structured_plan_review(
+                summary="The later revision is approved.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "resolved"},
+                ],
+            ),
+        ],
+        gemini_outputs=[],
+    )
+    runner.issue_comments.insert(
+        0,
+        {
+            "author": {"login": "history", "id": 99},
+            "createdAt": "2026-09-17T05:00:00Z",
+            "body": str(initial_comment),
+            "id": 699,
+        },
+    )
+    config = make_config(
+        tmp_path,
+        reviewer="codex",
+        planning_context_mode=context_mode,
+        max_rounds=3,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    planner_prompts = [
+        command[-1]
+        for command, _cwd in runner.commands
+        if command[:1] == ["claude"]
+    ]
+    assert len(planner_prompts) == 2
+    assert "the round-two correction must not survive its replacement" in planner_prompts[0]
+    assert "the round-two correction must not survive its replacement" not in planner_prompts[1]
+    assert len(runner.verified_round_bodies) == 1
 
 
 # ---------------------------------------------------------------------------
