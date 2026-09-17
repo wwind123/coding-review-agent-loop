@@ -2692,6 +2692,40 @@ def _log_repair_attempts(config: AgentLoopConfig, prefix: str, attempts: Sequenc
         )
 
 
+def _capture_terminal_plan_repair_rejection(
+    attempt: RepairAttemptResult,
+    *,
+    repair_expected_kind: str | None,
+    validate: Callable[[str], object],
+) -> DeterministicPlanValidationExhaustion | None:
+    """Capture a deterministically rejected final planning repair candidate.
+
+    Repair diagnostics can also describe preservation checks or backend output,
+    so re-run the authoritative validator and retain only its exact diagnostic.
+    Shape and marker-safety checks keep unrelated or unsafe repair output out of
+    the durable planning-diagnostic channel.
+    """
+    candidate = attempt.output
+    if (
+        attempt.outcome != "invalid_output"
+        or repair_expected_kind not in {"plan_state", "plan_revision"}
+        or _recognized_structured_public_response_kind(candidate) != repair_expected_kind
+    ):
+        return None
+    try:
+        validate(candidate)
+    except AgentLoopError as exc:
+        if "Current untrusted GitHub text contains reserved protocol marker(s):" in str(exc):
+            return None
+        return DeterministicPlanValidationExhaustion(
+            candidate_kind=repair_expected_kind,
+            candidate_text=candidate,
+            diagnostic=str(exc),
+            candidate_digest=hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+        )
+    return None
+
+
 def _run_validated_agent(
     runner: Runner,
     *,
@@ -3612,19 +3646,45 @@ def _run_validated_agent(
                         repair_kwargs=repair_kwargs,
                     )
                     _log_repair_attempts(config, agent_name, repair_attempts)
-                    fresh_contract_integrity = any(
-                        attempt.outcome == "fresh_contract_integrity"
-                        for attempt in repair_attempts
-                    )
-                    if fresh_contract_integrity:
+                    terminal_repair = repair_attempts[-1] if repair_attempts else None
+                    if (
+                        terminal_repair is not None
+                        and terminal_repair.outcome == "fresh_contract_integrity"
+                    ):
                         # A fresh planning response with no mechanically
                         # recoverable recommendation must get a new planner
                         # invocation. It is not safe for the repair model to
-                        # synthesize topology, but it is also not a terminal
-                        # provider failure.
+                        # synthesize topology. The original structured
+                        # validator rejection remains the authoritative
+                        # candidate and diagnostic for terminal persistence.
                         should_retry = True
                         last_failure_category = "fresh-contract-integrity"
                         last_classification_text = "fresh planning contract requires a new planner turn"
+                    elif terminal_repair is not None:
+                        repaired_exhaustion = _capture_terminal_plan_repair_rejection(
+                            terminal_repair,
+                            repair_expected_kind=repair_expected_kind,
+                            validate=validate,
+                        )
+                        if repaired_exhaustion is not None:
+                            # The repair candidate, rather than the source
+                            # candidate, is the final deterministic rejection.
+                            plan_validation_exhaustion = repaired_exhaustion
+                            plan_validation_capture_eligible = True
+                            last_failure_category = "deterministic"
+                            last_classification_text = (
+                                f"structured {repair_expected_kind} repair failed trusted validation"
+                            )
+                        else:
+                            # A terminal repair transport/provider failure (or
+                            # non-matching/unsafe output) cannot persist stale
+                            # source-candidate provenance.
+                            plan_validation_exhaustion = None
+                            plan_validation_capture_eligible = False
+                            if terminal_repair.outcome == "timeout":
+                                last_failure_category = "timeout"
+                            elif terminal_repair.outcome != "invalid_output":
+                                last_failure_category = "repair-provider-failure"
                     if repaired is not None:
                         if repaired_marker is None:
                             repair_detail = (
@@ -3830,7 +3890,10 @@ def _run_validated_agent(
                 "implementation to recreate the PR."
             )
     message += diagnostics.format_for_error()
-    if last_failure_category != "deterministic" or not plan_validation_capture_eligible:
+    if (
+        last_failure_category not in {"deterministic", "fresh-contract-integrity"}
+        or not plan_validation_capture_eligible
+    ):
         plan_validation_exhaustion = None
     invocation_error = AgentInvocationError(
         message,

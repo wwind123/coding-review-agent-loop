@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from dataclasses import replace
@@ -1479,6 +1480,137 @@ def test_exhausted_plan_validation_persists_from_the_planning_orchestration_path
     assert error.value.plan_validation_exhaustion is not None
     assert len(runner.diagnostic_posts) == 1
     assert "not persisted" not in str(error.value)
+
+
+@pytest.mark.parametrize("missing_contract", ["execution", "matrix"])
+def test_exhausted_fresh_contract_integrity_persists_validation_diagnostic(
+    tmp_path, missing_contract
+):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    if missing_contract == "execution":
+        payload.pop("execution_recommendation")
+        expected_diagnostic = "execution_recommendation"
+    else:
+        payload.pop("risk_test_matrix")
+        payload.pop("risk_test_matrix_changes")
+        payload.pop("risk_test_matrix_contract_version")
+        expected_diagnostic = "risk_test_matrix"
+    candidate = (
+        json.dumps(payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [candidate]
+    config = make_config(
+        tmp_path,
+        agent_max_retries=0,
+        execution_strategy_contract_required=True,
+    )
+
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None
+    assert expected_diagnostic in exhaustion.diagnostic
+    assert exhaustion.candidate_digest == hashlib.sha256(candidate.encode()).hexdigest()
+    assert len(runner.diagnostic_posts) == 1
+
+
+def test_invalid_terminal_plan_repair_replaces_persisted_candidate_provenance(
+    tmp_path, monkeypatch
+):
+    source_payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    source_payload.pop("architecture_impact")
+    source_candidate = (
+        json.dumps(source_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    repair_payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    repair_payload.pop("summary")
+    repair_candidate = (
+        json.dumps(repair_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    repair_attempt = SimpleNamespace(
+        backend="gemini",
+        model="repair-model",
+        prompt="",
+        output=repair_candidate,
+        returncode=0,
+        outcome="invalid_output",
+        diagnostic="combined backend text that must not be persisted",
+        log_path=None,
+        fallback_planned=False,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *args, **kwargs: (repair_candidate, None, [repair_attempt]),
+    )
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [source_candidate]
+
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, agent_max_retries=0),
+            plan_first=True,
+        )
+
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None
+    assert exhaustion.candidate_text == repair_candidate
+    assert exhaustion.candidate_digest == hashlib.sha256(repair_candidate.encode()).hexdigest()
+    assert "plan_state is missing required field(s): summary" in exhaustion.diagnostic
+    assert "combined backend text" not in exhaustion.diagnostic
+    assert len(runner.diagnostic_posts) == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "returncode", "expected_category"),
+    [("timeout", None, "timeout"), ("nonzero_exit", 1, "repair-provider-failure")],
+)
+def test_terminal_plan_repair_provider_failure_does_not_persist_stale_diagnostic(
+    tmp_path, monkeypatch, outcome, returncode, expected_category
+):
+    payload = json.loads(structured_plan_state().split("\n", 1)[0])
+    payload.pop("architecture_impact")
+    candidate = (
+        json.dumps(payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    repair_attempt = SimpleNamespace(
+        backend="gemini",
+        model="repair-model",
+        prompt="",
+        output="",
+        returncode=returncode,
+        outcome=outcome,
+        diagnostic="repair transport or provider failed",
+        log_path=None,
+        fallback_planned=False,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_structured_repair",
+        lambda *args, **kwargs: (None, None, [repair_attempt]),
+    )
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [candidate]
+
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, agent_max_retries=0),
+            plan_first=True,
+        )
+
+    assert error.value.failure_category == expected_category
+    assert error.value.plan_validation_exhaustion is None
+    assert runner.diagnostic_posts == []
 
 
 def _add_default_requirement_disposition(
