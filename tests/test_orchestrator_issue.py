@@ -133,7 +133,10 @@ def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
     tmp_path, monkeypatch
 ):
     fresh, issue, parent = _fresh_child_route_fixture(EXECUTION_DISPOSITION_PLANNING)
+    override_digest = "d" * 64
+    fresh.route = replace(fresh.route, override_digest=override_digest)
     events = []
+    handoff_calls = []
     monkeypatch.setattr(
         orchestrator_module, "get_issue_context",
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
@@ -141,7 +144,7 @@ def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
     monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
     monkeypatch.setattr(
         orchestrator_module, "_post_child_planning_handoff",
-        lambda *_args, **_kwargs: events.append("handoff"),
+        lambda *_args, **kwargs: (handoff_calls.append(kwargs), events.append("handoff")),
     )
     monkeypatch.setattr(
         orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
@@ -154,6 +157,15 @@ def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
         _FakeRunner(), issue_number=56, config=make_config(tmp_path), plan_first=True
     ) == 19
     assert events == ["handoff", "planner"]
+    assert len(handoff_calls) == 1
+    assert handoff_calls[0]["parent_issue"] == 55
+    assert handoff_calls[0]["plan_hash"] == "plan-hash"
+    assert handoff_calls[0]["plan_subject"] == "plan-subject"
+    assert handoff_calls[0]["phase_index"] == 1
+    assert handoff_calls[0]["created"] == fresh.created
+    assert handoff_calls[0]["recommendation"] == fresh.recommendation
+    assert handoff_calls[0]["inherited_matrix_row_ids"] == ()
+    assert handoff_calls[0]["override_digest"] == override_digest
 
     recorded = PhaseImplementationHandoffMetadata(
         parent_issue=55, plan_hash="plan-hash", mode="implement-by-phase",

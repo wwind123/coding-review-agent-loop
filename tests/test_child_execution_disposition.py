@@ -501,7 +501,9 @@ def test_rtm_nested_staged_child_stops_before_topology_mutation(
     assert not any(command[:3] == ["gh", "issue", "create"] for command, _cwd in runner.commands)
 
 
-def test_rtm_multi_stage_overrides_scope_independently_and_dedupe():
+def test_rtm_multi_stage_overrides_scope_independently_and_dedupe(
+    tmp_path, monkeypatch
+):
     first_body = format_child_disposition_override_comment(
         parent_issue=55,
         plan_hash="plan-hash",
@@ -552,15 +554,58 @@ def test_rtm_multi_stage_overrides_scope_independently_and_dedupe():
     assert second_route.disposition == EXECUTION_DISPOSITION_DIRECT
     assert second_route.override_digest == second_scoped[0].digest
 
-    first_handoff = _handoff(first_route.disposition, digest=first_route.override_digest)
-    second_handoff = dataclasses.replace(
-        _handoff(second_route.disposition, digest=second_route.override_digest),
-        stage_id="stage-two",
-        phase_index=2,
-        child_issue_number=57,
+    recorded_handoffs = []
+    monkeypatch.setattr(
+        orchestrator,
+        "_post_child_planning_handoff",
+        lambda *_args, **kwargs: recorded_handoffs.append(("stage-one", kwargs)),
     )
-    assert first_handoff.override_digest == scoped[0].digest
-    assert second_handoff.override_digest == second_scoped[0].digest
+    monkeypatch.setattr(
+        orchestrator,
+        "post_phase_implementation_handoff_comment",
+        lambda *_args, **kwargs: recorded_handoffs.append(("stage-two", kwargs)),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_run_child_planning_cycle", lambda *_args, **_kwargs: 0
+    )
+    monkeypatch.setattr(
+        orchestrator, "_implement_approved_issue", lambda *_args, **_kwargs: 0
+    )
+    recommendation = SimpleNamespace(
+        strategy="staged",
+        identity=lambda: {"recommendation_sha256": "recommendation-digest"},
+        child_stages=(
+            SimpleNamespace(stage_id="stage-one"),
+            SimpleNamespace(stage_id="stage-two"),
+        ),
+    )
+    parent = IssueContext(
+        number=55, repo="OWNER/REPO", title="Parent", body="Parent",
+        url="parent-url", comments=(),
+    )
+    for index, (phase, route, issue_number) in enumerate(
+        ((_phase(), first_route, 56), (second_phase, second_route, 57)), start=1
+    ):
+        child = dataclasses.replace(
+            parent, number=issue_number, title=phase.title, url=f"child-{issue_number}"
+        )
+        assert orchestrator._dispatch_decomposition_child(
+            FakeRunner(), config=make_config(tmp_path), memory=None,
+            usage_context=SimpleNamespace(), parent_issue=55,
+            approved_plan="Approved parent plan.", plan_hash="plan-hash",
+            plan_subject="plan-subject", recommendation=recommendation,
+            approved_plan_context=SimpleNamespace(
+                matrix_available=False, risk_test_matrix_payload=None
+            ),
+            created=CreatedPhaseIssue(phase, child.url, issue_number),
+            phase_index=index, route=route, child_issue_context=child,
+            parent_issue_context=parent, coder_session_id=None,
+            existing_handoff=None,
+        ) == 0
+
+    assert [stage for stage, _kwargs in recorded_handoffs] == ["stage-one", "stage-two"]
+    assert recorded_handoffs[0][1]["override_digest"] == scoped[0].digest
+    assert recorded_handoffs[1][1]["override_digest"] == second_scoped[0].digest
 
 
 def test_rtm_override_topology_rejection_precedes_stage_scoping():

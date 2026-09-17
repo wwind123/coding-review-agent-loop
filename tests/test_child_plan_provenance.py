@@ -570,12 +570,18 @@ def test_planning_handoff_pr_binds_to_distinct_reviewed_child_plan(
         )[1].split("Target child/primary issue context", 1)[0]
 
 
+@pytest.mark.parametrize("legacy", [False, True])
 def test_direct_and_legacy_handoff_pr_still_require_parent_phase_hash(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, legacy
 ):
-    plan = fresh_staged_plan(first_disposition="direct-implementation")
+    plan = fresh_staged_plan(
+        first_disposition=None if legacy else "direct-implementation"
+    )
     child, parent = fresh_child_contexts(
-        plan, handoff_execution_disposition="direct-implementation"
+        plan,
+        handoff_execution_disposition=(
+            None if legacy else "direct-implementation"
+        ),
     )
     child = dataclasses.replace(
         child,

@@ -3045,6 +3045,59 @@ class TestSkillApprovedPlanRecovery:
             assert context.canonical_text == child_plan
             assert context.plan_hash == approved_plan_hash(child_plan)
 
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_direct_and_legacy_handoff_require_parent_phase_hash(
+        self, monkeypatch, legacy
+    ) -> None:
+        import helpers.skill_runner as sr
+        from coding_review_agent_loop.decomposition import approved_plan_hash
+        from coding_review_agent_loop.errors import AgentLoopError
+        from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+        from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+        from test_child_plan_provenance import fresh_child_contexts, fresh_staged_plan
+
+        rendered_parent_plan = fresh_staged_plan(
+            first_disposition=None if legacy else "direct-implementation"
+        )
+        parent_payload, _ = json.JSONDecoder().raw_decode(rendered_parent_plan)
+        parent_plan = json.dumps(parent_payload) + "\n<!-- AGENT_PLAN_STATE:" + rendered_parent_plan.split(
+            "\n<!-- AGENT_PLAN_STATE:", 1
+        )[1]
+        child, parent = fresh_child_contexts(
+            parent_plan,
+            handoff_execution_disposition=(
+                None if legacy else "direct-implementation"
+            ),
+        )
+        child_comments = [
+            format_issue_pr_handoff_comment(
+                issue_number=56, pr_number=7,
+                pr_url="https://github.com/owner/repo/pull/7", pr_head_sha="head-7",
+                flow="approved-plan-implementation", plan_hash="wrong-child-hash",
+            )
+        ]
+        parent_comments = [item.body for item in parent.comments]
+        monkeypatch.setattr(
+            sr, "_fetch_issue_comments_raw",
+            lambda repo, issue: child_comments if issue == 56 else parent_comments,
+        )
+        monkeypatch.setattr(sr, "_fetch_issue_json", lambda repo, issue: {"body": child.body})
+        contract = make_pr_contract(
+            repository="owner/repo", pr_number=7,
+            origin_flow="approved-plan-implementation", primary_issue_number=56,
+            expected_closing_issue_ids=(56,),
+        )
+
+        with pytest.raises(AgentLoopError, match="implementation handoff disagrees"):
+            sr._recover_skill_pr_plan_context(
+                "owner/repo", 7,
+                {
+                    "body": "Fixes #56",
+                    "comments": [{"body": format_pr_contract_comment(contract)}],
+                },
+            )
+        assert approved_plan_hash(parent_plan) != "wrong-child-hash"
+
     def test_partial_same_head_resume_keeps_only_matching_plan_approval(self) -> None:
         import helpers.skill_runner as sr
         from coding_review_agent_loop.round_state import make_approved_plan_context
