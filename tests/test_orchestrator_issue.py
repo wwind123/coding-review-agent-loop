@@ -21,7 +21,11 @@ from coding_review_agent_loop.decomposition import (
     format_decomposition_parent_summary,
     format_one_shot_impl_handoff_comment,
 )
-from coding_review_agent_loop.errors import QuotaResetExceededError
+from coding_review_agent_loop.errors import (
+    AgentInvocationError,
+    DeterministicPlanValidationExhaustion,
+    QuotaResetExceededError,
+)
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
     IssueComment,
@@ -1125,6 +1129,145 @@ class FakeRunner(_FakeRunner):
                 ]
         kwargs.setdefault("pr_payload", {"body": "Fixes #56"})
         super().__init__(**kwargs)
+
+
+class _PlanDiagnosticRunner(_FakeRunner):
+    def __init__(self, *, post_returncode=0):
+        super().__init__()
+        self.post_returncode = post_returncode
+        self.diagnostic_posts = []
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = list(args)
+        if command == ["gh", "api", "user"]:
+            recorded, cwd_path = self._record_command(args, cwd)
+            return CommandResult(
+                recorded, cwd_path, json.dumps({"login": "agent", "id": 7}), "", 0
+            )
+        if command[:4] == ["gh", "api", "--method", "POST"]:
+            endpoint = command[4] if len(command) > 4 else ""
+            if endpoint == "repos/OWNER/REPO/issues/813/comments":
+                recorded, cwd_path = self._record_command(args, cwd)
+                body = json.loads(input_text or "{}")["body"]
+                self.diagnostic_posts.append(body)
+                if self.post_returncode:
+                    return CommandResult(recorded, cwd_path, "", "post failed", self.post_returncode)
+                return CommandResult(
+                    recorded,
+                    cwd_path,
+                    json.dumps(
+                        {
+                            "id": 901,
+                            "created_at": "2026-09-17T05:30:00Z",
+                            "body": body,
+                            "user": {"login": "agent", "id": 7},
+                        }
+                    ),
+                    "",
+                    0,
+                )
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def test_exhausted_fresh_plan_validation_diagnostic_survives_resume(tmp_path):
+    runner = _PlanDiagnosticRunner()
+    config = make_config(tmp_path, execution_strategy_contract_required=True)
+    issue_context = IssueContext(
+        number=813,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/813",
+        comments=(),
+    )
+    original_error = AgentInvocationError(
+        "deterministic validator rejected the plan",
+        failure_category="deterministic",
+    )
+    exhaustion = DeterministicPlanValidationExhaustion(
+        candidate_kind="plan_state",
+        candidate_text='{"kind":"plan_state"}',
+        diagnostic="missing complete-scope audit operation",
+        candidate_digest="a" * 64,
+    )
+    orchestrator_module._persist_exhausted_plan_validation_diagnostic(
+        runner,
+        config=config,
+        issue_context=issue_context,
+        issue_number=813,
+        original_error=original_error,
+        exhaustion=exhaustion,
+        target_coder_round=1,
+        prior_plan_subject=None,
+        candidate_kind="plan_state",
+        require_execution_strategy_contract=True,
+        require_risk_test_matrix_contract=True,
+    )
+    assert len(runner.diagnostic_posts) == 1
+    body = runner.diagnostic_posts[0]
+    assert "901" not in body
+    assert "2026-09-17T05:30:00Z" not in body
+    resumed_context = replace(
+        issue_context,
+        comments=(
+            IssueComment(
+                author="agent",
+                author_id=7,
+                comment_id=901,
+                created_at="2026-09-17T05:30:00Z",
+                body=body,
+            ),
+        ),
+    )
+    diagnostic = orchestrator_module._recover_current_plan_validation_diagnostic(
+        runner,
+        config=config,
+        issue_context=resumed_context,
+        issue_number=813,
+        target_coder_round=1,
+        prior_plan_subject=None,
+        candidate_kind="plan_state",
+        require_execution_strategy_contract=True,
+        require_risk_test_matrix_contract=True,
+    )
+    assert diagnostic is not None
+    assert diagnostic.failure_attempt == 1
+    assert diagnostic.diagnostic == "missing complete-scope audit operation"
+
+
+def test_validation_record_post_failure_preserves_original_error(tmp_path):
+    runner = _PlanDiagnosticRunner(post_returncode=1)
+    config = make_config(tmp_path, execution_strategy_contract_required=True)
+    issue_context = IssueContext(
+        number=813, repo="OWNER/REPO", title="Issue", body="Issue", url=None, comments=()
+    )
+    original_error = AgentInvocationError(
+        "original deterministic validator cause",
+        failure_category="deterministic",
+    )
+    exhaustion = DeterministicPlanValidationExhaustion(
+        candidate_kind="plan_revision",
+        candidate_text='{"kind":"plan_revision"}',
+        diagnostic="revision validation failed",
+        candidate_digest="b" * 64,
+    )
+    with pytest.raises(AgentInvocationError) as raised:
+        orchestrator_module._persist_exhausted_plan_validation_diagnostic(
+            runner,
+            config=config,
+            issue_context=issue_context,
+            issue_number=813,
+            original_error=original_error,
+            exhaustion=exhaustion,
+            target_coder_round=2,
+            prior_plan_subject="c" * 64,
+            candidate_kind="plan_revision",
+            require_execution_strategy_contract=True,
+            require_risk_test_matrix_contract=True,
+        )
+    assert "original deterministic validator cause" in str(raised.value)
+    assert "not persisted" in str(raised.value)
+    assert runner.diagnostic_posts
 
 
 def _add_default_requirement_disposition(
