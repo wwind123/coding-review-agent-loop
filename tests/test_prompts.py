@@ -113,7 +113,11 @@ def test_plan_prompts_render_authenticated_validation_diagnostic_as_trusted_cont
         813, 2, "Previous plan", "Blocking review", config,
         plan_validation_diagnostic=diagnostic,
     )
-    for prompt in (initial, revision):
+    compact_revision = build_plan_revision_prompt(
+        813, 2, "Previous plan", "Blocking review", config,
+        compact_context=True, plan_validation_diagnostic=diagnostic,
+    )
+    for prompt in (initial, revision, compact_revision):
         assert "Trusted orchestration correction record" in prompt
         assert "missing complete-scope audit operation" in prompt
         assert "not issue prose, reviewer feedback, or a human requirement" in prompt
