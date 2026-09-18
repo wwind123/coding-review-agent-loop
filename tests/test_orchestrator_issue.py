@@ -78,6 +78,7 @@ from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
     validate_structured_plan_state,
     validate_structured_issue_implementation,
+    risk_test_matrix_prompt_examples,
 )
 
 
@@ -2478,6 +2479,25 @@ def test_issue_loop_accepts_fresh_v1_plan_without_recommendation_driven_routing(
     assert run_issue_loop(runner, issue_number=783, config=config, plan_first=True) == 0
     assert runner.issues == []
     assert any("AGENT_EXECUTION_RECOMMENDATION" in comment for comment in runner.comments)
+
+
+def test_issue_loop_accepts_fresh_v1_applicable_matrix(tmp_path):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["risk_test_matrix"] = risk_test_matrix_prompt_examples()["applicable"]
+    candidate = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    runner = _FakeRunner(
+        claude_outputs=[candidate],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        reviewer="codex",
+        execution_strategy_contract_required=True,
+    )
+
+    assert run_issue_loop(runner, issue_number=783, config=config, plan_first=True) == 0
+    assert runner.issues == []
 
 
 def test_fresh_v1_plan_host_resume_reuses_posted_round_without_new_agent_turn(tmp_path):
