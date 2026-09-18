@@ -3436,3 +3436,29 @@ timeouts are lower-bound evidence, never successes. Samples are retained up to
 20 per command/fingerprint cohort and 200 cohorts, and stale after 30 days or
 relevant lockfile, configuration, target, or fixture changes. Persistence is
 best-effort and uses an advisory lock plus atomic replacement.
+
+### Semantic revision assembly
+
+The phase-1 semantic planning foundation separates model decisions from wire
+serialization. A `plan_revision_patch` v1 carries only a response summary,
+prior-item dispositions, an authenticated base round/identity, and bounded
+semantic operations. Whole-field replacements require complete generation-1
+values. Matrix edits require complete rows; additions declare their final
+position; splits declare ordered targets; and merges declare their complete
+lineage. Derived metadata, audit entries, ordering, identities, sidecars, and
+protocol markers are not writable operation targets.
+
+The deterministic assembler hydrates an authenticated blocking base, validates
+all operations before mutation, and then emits the existing generation-1
+`plan_revision` object. Matrix operations are simultaneous and independent of
+patch-array order. Unchanged fields and rows remain sourced from the
+authenticated canonical JSON, audits are normalized in fixed operation-class
+order, and an empty complete matrix scope is represented by the `matrix`
+sentinel. Metadata coverage does not hide precise row-operation entries.
+
+The assembled canonical JSON, aggregate identity, response form, base binding,
+and raw patch provenance can be carried in round metadata. The canonical
+sidecar is the restart authority; raw patch text cannot be reparsed as state.
+This phase does not activate semantic prompts or retrofit old records. Prompt
+pinning, eligibility, bounded repair, and prospective publication seeding are
+the activation phase's responsibility.

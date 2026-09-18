@@ -5842,3 +5842,424 @@ def validate_structured_discuss_agenda(text: str) -> ParsedDiscussAgenda:
     if parsed is not None:
         return parsed
     raise AgentLoopError("Discuss agenda did not use the required structured format.")
+
+
+# Semantic plan revisions -------------------------------------------------
+#
+# These types intentionally live beside the generation-1 wire validators.  A
+# semantic patch is a bounded input to the deterministic assembler; it is not
+# itself a replacement for the generation-1 ``plan_revision`` object.
+PLAN_REVISION_PATCH_SCHEMA_VERSION = 1
+SEMANTIC_PATCH_CONTRACT_VERSION = 1
+PLAN_REVISION_PATCH_KIND = "plan_revision_patch"
+PLAN_REVISION_PATCH_OPERATION_KEYS = frozenset(
+    {
+        "replace",
+        "matrix_add",
+        "matrix_edit",
+        "matrix_retire",
+        "matrix_split",
+        "matrix_merge",
+        "matrix_metadata_replace",
+    }
+)
+PLAN_REVISION_PATCH_REPLACEABLE_FIELDS = frozenset(
+    {
+        "summary",
+        "plan_steps",
+        "architecture_impact",
+        "additional_closing_issue_ids",
+        "human_requirement_dispositions",
+        "execution_recommendation",
+        "external_dependencies",
+        "deferred_work",
+        "plan_actions",
+        "deferred_stages",
+    }
+)
+_PLAN_REVISION_PATCH_IDENTITY_RE = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True)
+class RiskTestMatrixMetadata:
+    """The model-authored metadata portion of a matrix replacement."""
+
+    applicability: str
+    important_exclusions: tuple[str, ...]
+    not_applicable_rationale: str | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "applicability": self.applicability,
+            "important_exclusions": [
+                sanitize_historical_text(item) for item in self.important_exclusions
+            ],
+        }
+        if self.not_applicable_rationale is not None:
+            payload["not_applicable_rationale"] = sanitize_historical_text(
+                self.not_applicable_rationale
+            )
+        return payload
+
+
+@dataclass(frozen=True)
+class PlanRevisionPatchOperation:
+    """One exact-key semantic operation.
+
+    A single tagged representation keeps parsing and serialization uniform,
+    while the assembler validates which attributes are meaningful for each
+    ``op``.  Parsed row values are complete generation-1 rows, never partial
+    deltas.
+    """
+
+    op: str
+    field: str | None = None
+    value: object | None = None
+    row: RiskTestMatrixRow | None = None
+    row_id: str | None = None
+    final_position: int | None = None
+    source_row_id: str | None = None
+    target_rows: tuple[RiskTestMatrixRow, ...] = ()
+    source_row_ids: tuple[str, ...] = ()
+    target_row: RiskTestMatrixRow | None = None
+    audit_operation: str | None = None
+    rationale: str | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        if self.op == "replace":
+            return {"op": self.op, "field": self.field, "value": _patch_value_payload(self.value)}
+        if self.op == "matrix_add":
+            return {
+                "op": self.op,
+                "row": self.row.to_payload() if self.row is not None else None,
+                "final_position": self.final_position,
+                "rationale": self.rationale,
+            }
+        if self.op in {"matrix_edit", "matrix_retire"}:
+            payload: dict[str, object] = {
+                "op": self.op,
+                "row_id": self.row_id,
+                "rationale": self.rationale,
+            }
+            if self.op == "matrix_edit":
+                payload["row"] = self.row.to_payload() if self.row is not None else None
+            return payload
+        if self.op == "matrix_split":
+            return {
+                "op": self.op,
+                "source_row_id": self.source_row_id,
+                "target_rows": [row.to_payload() for row in self.target_rows],
+                "rationale": self.rationale,
+            }
+        if self.op == "matrix_merge":
+            return {
+                "op": self.op,
+                "source_row_ids": list(self.source_row_ids),
+                "target_row": self.target_row.to_payload() if self.target_row is not None else None,
+                "rationale": self.rationale,
+            }
+        return {
+            "op": self.op,
+            "value": self.value.to_payload() if isinstance(self.value, RiskTestMatrixMetadata) else self.value,
+            "audit_operation": self.audit_operation,
+            "rationale": self.rationale,
+        }
+
+
+@dataclass(frozen=True)
+class PlanRevisionPatch:
+    schema_version: int
+    kind: str
+    semantic_patch_contract_version: int
+    state: str
+    summary: str
+    prior_plan_item_dispositions: tuple[ReviewItemDisposition, ...]
+    base_round_number: int
+    base_state_identity: str
+    operations: tuple[PlanRevisionPatchOperation, ...]
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "semantic_patch_contract_version": self.semantic_patch_contract_version,
+            "state": self.state,
+            "summary": sanitize_historical_text(self.summary),
+            "prior_plan_item_dispositions": [
+                {
+                    "item_id": item.item_id,
+                    "disposition": item.disposition,
+                    **({"note": item.note} if item.note is not None else {}),
+                }
+                for item in self.prior_plan_item_dispositions
+            ],
+            "base_round_number": self.base_round_number,
+            "base_state_identity": self.base_state_identity,
+            "operations": [operation.to_payload() for operation in self.operations],
+        }
+
+
+def _patch_value_payload(value: object) -> object:
+    if isinstance(value, ArchitectureImpact):
+        return dataclasses.asdict(value)
+    if isinstance(value, ExecutionStrategyRecommendation):
+        return value.to_payload()
+    if isinstance(value, HumanRequirementDisposition):
+        return dataclasses.asdict(value)
+    if isinstance(value, tuple):
+        return [_patch_value_payload(item) for item in value]
+    if isinstance(value, list):
+        return [_patch_value_payload(item) for item in value]
+    if isinstance(value, DeferredStage):
+        return {"title": value.title, "summary": value.summary}
+    if isinstance(value, TypedPlanStages):
+        return {
+            "child_stages": [dataclasses.asdict(item) for item in value.child_stages],
+            "external_dependencies": [_patch_value_payload(item) for item in value.external_dependencies],
+            "deferred_work": [_patch_value_payload(item) for item in value.deferred_work],
+            "plan_actions": [_patch_value_payload(item) for item in value.plan_actions],
+        }
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    return value
+
+
+def _parse_complete_risk_test_matrix_row(value: object, *, context: str) -> RiskTestMatrixRow:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(payload, context=context, required=set(RISK_TEST_MATRIX_ROW_KEYS))
+    return RiskTestMatrixRow(
+        row_id=_validate_risk_row_id(payload["row_id"], context=f"{context}.row_id"),
+        label=_risk_bounded_string(payload["label"], context=f"{context}.label"),
+        entry_path_or_mode=_risk_bounded_string(payload["entry_path_or_mode"], context=f"{context}.entry_path_or_mode"),
+        initial_state=_risk_bounded_string(payload["initial_state"], context=f"{context}.initial_state"),
+        event=_risk_bounded_string(payload["event"], context=f"{context}.event"),
+        expected_outcome=_risk_bounded_string(payload["expected_outcome"], context=f"{context}.expected_outcome"),
+        forbidden_side_effects=_risk_bounded_string_list(
+            payload["forbidden_side_effects"], context=f"{context}.forbidden_side_effects"
+        ),
+        proposed_test_level=_risk_bounded_string(payload["proposed_test_level"], context=f"{context}.proposed_test_level"),
+        proposed_test_location=_risk_bounded_string(payload["proposed_test_location"], context=f"{context}.proposed_test_location"),
+        applicability=_risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64),
+        related_scope_item_ids=_risk_bounded_string_list(
+            payload["related_scope_item_ids"], context=f"{context}.related_scope_item_ids"
+        ),
+        execution_owner=_validate_risk_owner(payload["execution_owner"], context=f"{context}.execution_owner"),
+    )
+
+
+def parse_risk_test_matrix_row(value: object, *, context: str = "risk_test_matrix_row") -> RiskTestMatrixRow:
+    """Parse one complete row for semantic matrix operations."""
+    row = _parse_complete_risk_test_matrix_row(value, context=context)
+    if row.applicability not in {"applicable", "required", "not-applicable"}:
+        raise AgentLoopError(f"{context}.applicability is invalid.")
+    return row
+
+
+def _parse_plan_patch_field_value(field_name: str, value: object, *, context: str) -> object:
+    if field_name == "summary":
+        return _expect_non_empty_string(value, context=context)
+    if field_name == "plan_steps":
+        return _expect_string_list(value, context=context, item_context=context, min_length=1)
+    if field_name == "architecture_impact":
+        return _parse_architecture_impact(value, context=context)
+    if field_name == "additional_closing_issue_ids":
+        return _expect_optional_issue_id_list({field_name: value}, field_name, context=context)
+    if field_name == "human_requirement_dispositions":
+        return _expect_human_requirement_dispositions(value, context=context)
+    if field_name == "execution_recommendation":
+        return _expect_execution_recommendation(value, context=context)
+    if field_name in {"external_dependencies", "deferred_work", "plan_actions", "deferred_stages"}:
+        return _expect_deferred_stage_list({field_name: value}, field_name, context=context)
+    raise AgentLoopError(f"{context} is not a writable semantic plan field.")
+
+
+def _parse_matrix_metadata(value: object, *, context: str) -> RiskTestMatrixMetadata:
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(
+        payload,
+        context=context,
+        required={"applicability", "important_exclusions"},
+        optional={"not_applicable_rationale"},
+    )
+    applicability = _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64)
+    if applicability not in RISK_MATRIX_APPLICABILITY:
+        raise AgentLoopError(f"{context}.applicability must be `applicable` or `not-applicable`.")
+    rationale_value = payload.get("not_applicable_rationale")
+    rationale = None if rationale_value is None else _risk_bounded_string(
+        rationale_value, context=f"{context}.not_applicable_rationale", max_bytes=2_048
+    )
+    if applicability == "not-applicable" and not rationale:
+        raise AgentLoopError(f"{context}.not_applicable_rationale must be non-empty for a not-applicable matrix.")
+    return RiskTestMatrixMetadata(
+        applicability=applicability,
+        important_exclusions=_risk_bounded_string_list(
+            payload["important_exclusions"],
+            context=f"{context}.important_exclusions",
+            max_items=RISK_MATRIX_MAX_EXCLUSIONS,
+        ),
+        not_applicable_rationale=rationale,
+    )
+
+
+def _parse_plan_revision_patch_operation(value: object, *, context: str) -> PlanRevisionPatchOperation:
+    payload = _expect_object(value, context=context)
+    op = _expect_non_empty_string(payload.get("op"), context=f"{context}.op")
+    if op not in PLAN_REVISION_PATCH_OPERATION_KEYS:
+        raise AgentLoopError(f"{context}.op is unknown: {op!r}.")
+    if op == "replace":
+        _expect_exact_keys(payload, context=context, required={"op", "field", "value"})
+        field_name = _expect_non_empty_string(payload["field"], context=f"{context}.field")
+        if field_name not in PLAN_REVISION_PATCH_REPLACEABLE_FIELDS:
+            raise AgentLoopError(f"{context}.field `{field_name}` is derived or not writable.")
+        return PlanRevisionPatchOperation(
+            op=op,
+            field=field_name,
+            value=_parse_plan_patch_field_value(field_name, payload["value"], context=f"{context}.value"),
+        )
+    if op == "matrix_add":
+        _expect_exact_keys(payload, context=context, required={"op", "row", "final_position", "rationale"})
+        position = _expect_int(payload["final_position"], context=f"{context}.final_position")
+        if position < 0:
+            raise AgentLoopError(f"{context}.final_position must be non-negative.")
+        return PlanRevisionPatchOperation(
+            op=op,
+            row=parse_risk_test_matrix_row(payload["row"], context=f"{context}.row"),
+            final_position=position,
+            rationale=_risk_bounded_string(payload["rationale"], context=f"{context}.rationale", max_bytes=2_048),
+        )
+    if op == "matrix_edit":
+        _expect_exact_keys(payload, context=context, required={"op", "row_id", "row", "rationale"})
+        return PlanRevisionPatchOperation(
+            op=op,
+            row_id=_validate_risk_row_id(payload["row_id"], context=f"{context}.row_id"),
+            row=parse_risk_test_matrix_row(payload["row"], context=f"{context}.row"),
+            rationale=_risk_bounded_string(payload["rationale"], context=f"{context}.rationale", max_bytes=2_048),
+        )
+    if op == "matrix_retire":
+        _expect_exact_keys(payload, context=context, required={"op", "row_id", "rationale"})
+        return PlanRevisionPatchOperation(
+            op=op,
+            row_id=_validate_risk_row_id(payload["row_id"], context=f"{context}.row_id"),
+            rationale=_risk_bounded_string(payload["rationale"], context=f"{context}.rationale", max_bytes=2_048),
+        )
+    if op == "matrix_split":
+        _expect_exact_keys(payload, context=context, required={"op", "source_row_id", "target_rows", "rationale"})
+        source = _validate_risk_row_id(payload["source_row_id"], context=f"{context}.source_row_id")
+        targets_payload = payload["target_rows"]
+        if not isinstance(targets_payload, list) or len(targets_payload) < 2:
+            raise AgentLoopError(f"{context}.target_rows must contain at least two complete rows.")
+        targets = tuple(
+            parse_risk_test_matrix_row(item, context=f"{context}.target_rows[{index}]")
+            for index, item in enumerate(targets_payload)
+        )
+        if len({row.row_id for row in targets}) != len(targets):
+            raise AgentLoopError(f"{context}.target_rows contains duplicate row IDs.")
+        return PlanRevisionPatchOperation(
+            op=op,
+            source_row_id=source,
+            target_rows=targets,
+            rationale=_risk_bounded_string(payload["rationale"], context=f"{context}.rationale", max_bytes=2_048),
+        )
+    if op == "matrix_merge":
+        _expect_exact_keys(payload, context=context, required={"op", "source_row_ids", "target_row", "rationale"})
+        sources_payload = payload["source_row_ids"]
+        if not isinstance(sources_payload, list) or len(sources_payload) < 2:
+            raise AgentLoopError(f"{context}.source_row_ids must contain at least two row IDs.")
+        sources = tuple(
+            _validate_risk_row_id(item, context=f"{context}.source_row_ids[{index}]")
+            for index, item in enumerate(sources_payload)
+        )
+        if len(set(sources)) != len(sources):
+            raise AgentLoopError(f"{context}.source_row_ids must contain distinct row IDs.")
+        return PlanRevisionPatchOperation(
+            op=op,
+            source_row_ids=sources,
+            target_row=parse_risk_test_matrix_row(payload["target_row"], context=f"{context}.target_row"),
+            rationale=_risk_bounded_string(payload["rationale"], context=f"{context}.rationale", max_bytes=2_048),
+        )
+    _expect_exact_keys(payload, context=context, required={"op", "value", "audit_operation", "rationale"})
+    audit_operation = _risk_bounded_string(payload["audit_operation"], context=f"{context}.audit_operation", max_bytes=32)
+    if audit_operation not in {"change", "split", "merge"}:
+        raise AgentLoopError(f"{context}.audit_operation must be change, split, or merge.")
+    return PlanRevisionPatchOperation(
+        op=op,
+        value=_parse_matrix_metadata(payload["value"], context=f"{context}.value"),
+        audit_operation=audit_operation,
+        rationale=_risk_bounded_string(payload["rationale"], context=f"{context}.rationale", max_bytes=2_048),
+    )
+
+
+def parse_plan_revision_patch(value: object, *, context: str = "plan_revision_patch") -> PlanRevisionPatch:
+    """Strictly parse a revision-only semantic patch contract v1."""
+    if isinstance(value, PlanRevisionPatch):
+        return value
+    payload = _expect_object(value, context=context)
+    _expect_exact_keys(
+        payload,
+        context=context,
+        required={
+            "schema_version", "kind", "semantic_patch_contract_version", "state",
+            "summary", "prior_plan_item_dispositions", "base_round_number",
+            "base_state_identity", "operations",
+        },
+    )
+    schema_version = _expect_int(payload["schema_version"], context=f"{context}.schema_version")
+    if schema_version != PLAN_REVISION_PATCH_SCHEMA_VERSION:
+        raise AgentLoopError(f"{context}.schema_version must be 1.")
+    if payload["kind"] != PLAN_REVISION_PATCH_KIND:
+        raise AgentLoopError(f"{context}.kind must be `{PLAN_REVISION_PATCH_KIND}`.")
+    contract_version = _expect_int(
+        payload["semantic_patch_contract_version"],
+        context=f"{context}.semantic_patch_contract_version",
+    )
+    if contract_version != SEMANTIC_PATCH_CONTRACT_VERSION:
+        raise AgentLoopError(f"{context}.semantic_patch_contract_version must be 1.")
+    state = _expect_non_empty_string(payload["state"], context=f"{context}.state")
+    if state != "blocking":
+        raise AgentLoopError(f"{context}.state must be `blocking`.")
+    summary = _expect_non_empty_string(payload["summary"], context=f"{context}.summary")
+    dispositions = _expect_disposition_list(
+        payload["prior_plan_item_dispositions"],
+        context=f"{context}.prior_plan_item_dispositions",
+        reviewer="coder",
+        allowed_same_status="same-plan",
+        is_plan_review=True,
+    )
+    round_number = _expect_int(payload["base_round_number"], context=f"{context}.base_round_number")
+    if round_number < 0:
+        raise AgentLoopError(f"{context}.base_round_number must be non-negative.")
+    identity = _expect_non_empty_string(payload["base_state_identity"], context=f"{context}.base_state_identity")
+    if not _PLAN_REVISION_PATCH_IDENTITY_RE.fullmatch(identity):
+        raise AgentLoopError(f"{context}.base_state_identity must be a lowercase 64-hex identity.")
+    operations_payload = payload["operations"]
+    if not isinstance(operations_payload, list) or not operations_payload:
+        raise AgentLoopError(f"{context}.operations must be a non-empty JSON array.")
+    if len(operations_payload) > RISK_MATRIX_MAX_CHANGES * 2:
+        raise AgentLoopError(f"{context}.operations exceeds the bounded operation limit.")
+    operations = tuple(
+        _parse_plan_revision_patch_operation(item, context=f"{context}.operations[{index}]")
+        for index, item in enumerate(operations_payload)
+    )
+    return PlanRevisionPatch(
+        schema_version=schema_version,
+        kind=PLAN_REVISION_PATCH_KIND,
+        semantic_patch_contract_version=contract_version,
+        state=state,
+        summary=summary,
+        prior_plan_item_dispositions=dispositions,
+        base_round_number=round_number,
+        base_state_identity=identity,
+        operations=operations,
+    )
+
+
+def validate_structured_plan_revision_patch(text: str) -> PlanRevisionPatch | None:
+    """Validate a patch response with the normal plan-state footer."""
+    payload = _extract_structured_plan_revision_payload(text)
+    if payload is None:
+        return None
+    if payload.get("kind") != PLAN_REVISION_PATCH_KIND:
+        raise AgentLoopError(
+            f"Structured response kind mismatch: expected `{PLAN_REVISION_PATCH_KIND}`."
+        )
+    return parse_plan_revision_patch(payload)

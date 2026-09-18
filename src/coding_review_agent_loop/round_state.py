@@ -195,12 +195,56 @@ class PostedRoundMetadata:
     risk_test_matrix_identity: str | None = None
     risk_test_matrix_boundary_digest: str | None = None
     risk_test_matrix_diagnostic: str | None = None
+    # Semantic planning provenance is prospective and optional so historical
+    # round records retain their exact legacy encoding.  When populated, the
+    # canonical sidecar is the authenticated full-state source for restart;
+    # raw patches remain provenance and are never treated as canonical state.
+    response_form: str | None = None
+    base_round_number: int | None = None
+    base_state_identity: str | None = None
+    aggregate_plan_identity: str | None = None
+    raw_patch_provenance: dict | None = None
+    assembled_plan_sidecar: dict | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
         if self.execution_strategy_contract_version not in (None, 1):
             raise ValueError("invalid execution strategy contract version")
+        if self.response_form is not None and self.response_form not in {
+            "semantic-patch-v1", "legacy-full-state", "fresh-plan-state"
+        }:
+            raise ValueError("invalid planning response form")
+        if self.base_round_number is not None and (
+            isinstance(self.base_round_number, bool) or self.base_round_number < 0
+        ):
+            raise ValueError("invalid semantic base round number")
+        for identity_name, identity in (
+            ("base_state_identity", self.base_state_identity),
+            ("aggregate_plan_identity", self.aggregate_plan_identity),
+        ):
+            if identity is not None and (
+                not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity)
+            ):
+                raise ValueError(f"invalid {identity_name}")
+        if self.raw_patch_provenance is not None and not isinstance(self.raw_patch_provenance, dict):
+            raise ValueError("invalid raw semantic patch provenance")
+        if self.assembled_plan_sidecar is not None and not isinstance(self.assembled_plan_sidecar, dict):
+            raise ValueError("invalid assembled plan sidecar")
+        if self.assembled_plan_sidecar is not None:
+            from .plan_assembly import decode_assembled_plan_sidecar
+
+            try:
+                sidecar = decode_assembled_plan_sidecar(self.assembled_plan_sidecar)
+            except AgentLoopError as exc:
+                raise ValueError("invalid assembled plan sidecar") from exc
+            if self.response_form is not None and sidecar.response_form != self.response_form:
+                raise ValueError("semantic response form does not match assembled sidecar")
+            if (
+                self.aggregate_plan_identity is not None
+                and sidecar.aggregate_identity != self.aggregate_plan_identity
+            ):
+                raise ValueError("semantic aggregate identity does not match assembled sidecar")
         if (
             self.execution_strategy_identity is not None
             and not isinstance(self.execution_strategy_identity, dict)
@@ -231,6 +275,16 @@ class PostedRoundMetadata:
             )
         ):
             object.__setattr__(self, "scheduler_metadata_status", "valid")
+
+    @property
+    def aggregate_identity(self) -> str | None:
+        """Compatibility alias for the semantic assembled-plan identity."""
+        return self.aggregate_plan_identity
+
+    @property
+    def raw_patch(self) -> dict | None:
+        """Compatibility alias for raw semantic patch provenance."""
+        return self.raw_patch_provenance
 
 
 @dataclass(frozen=True)
@@ -1434,6 +1488,22 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             if metadata.local_test_evidence is not None else None
         ),
     }
+    semantic_values = {
+        "response_form": metadata.response_form,
+        "base_round_number": metadata.base_round_number,
+        "base_state_identity": metadata.base_state_identity,
+        "aggregate_plan_identity": metadata.aggregate_plan_identity,
+        "raw_patch_provenance": metadata.raw_patch_provenance,
+        "assembled_plan_sidecar": metadata.assembled_plan_sidecar,
+    }
+    if any(value not in (None, (), []) for value in semantic_values.values()):
+        payload.update(
+            {
+                key: value
+                for key, value in semantic_values.items()
+                if value not in (None, (), [])
+            }
+        )
     if metadata.result_mode == "answer":
         payload.update(
             {
@@ -1518,6 +1588,30 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 str(payload["raw_structured_coder_response"])
                 if payload.get("raw_structured_coder_response") is not None
                 else None
+            ),
+            response_form=(
+                str(payload["response_form"])
+                if payload.get("response_form") is not None else None
+            ),
+            base_round_number=(
+                int(payload["base_round_number"])
+                if payload.get("base_round_number") is not None else None
+            ),
+            base_state_identity=(
+                str(payload["base_state_identity"])
+                if payload.get("base_state_identity") is not None else None
+            ),
+            aggregate_plan_identity=(
+                str(payload["aggregate_plan_identity"])
+                if payload.get("aggregate_plan_identity") is not None else None
+            ),
+            raw_patch_provenance=(
+                payload.get("raw_patch_provenance")
+                if isinstance(payload.get("raw_patch_provenance"), dict) else None
+            ),
+            assembled_plan_sidecar=(
+                payload.get("assembled_plan_sidecar")
+                if isinstance(payload.get("assembled_plan_sidecar"), dict) else None
             ),
             approved_plan_hash=(
                 str(payload["approved_plan_hash"])

@@ -501,3 +501,33 @@ Architecture-context injection is bounded and advisory on the supported prompt
 paths, and fresh turns with an acquired architecture snapshot use the versioned
 architecture-impact assessment. Legacy records remain decodable without
 inventing a snapshot or assessment; source inspection remains required.
+
+## Semantic planning foundation
+
+Generation-1 planning remains the downstream wire contract. A semantic
+`plan_revision_patch` v1 is an intent-only input: the model may replace an
+approved field in the bounded allow-list or declare a complete matrix row
+operation, but it cannot write kinds, contract versions, audit entries,
+ordering, identities, sidecars, or protocol records.
+
+`plan_assembly.py` is the deterministic boundary. It authenticates the base
+round and aggregate identity, validates every operation before mutation, and
+applies row edits, retirements, splits, merges, and additions simultaneously.
+Split replacement is ordered, merge replacement uses the lowest source slot,
+and additions occupy declared final positions. Audit rows are derived in the
+fixed order add, change, retire, split, merge; row IDs are normalized
+lexically. A metadata-only transition over an empty matrix uses `matrix` as
+its complete-scope sentinel.
+
+The assembled object is emitted as the existing validated
+`StructuredPlanRevision`. Its canonical JSON sidecar and aggregate SHA-256
+identity are the restart authority; raw semantic patches are provenance only.
+The identity explicitly covers the full plan plus architecture, execution,
+matrix, closing, human-disposition, and typed-category data. Rendered
+Markdown remains a downstream presentation surface.
+
+This phase adds the codecs and durable metadata fields prospectively without
+activating model prompt negotiation. Historical full-state records therefore
+remain legacy-compatible and are not backfilled or silently upgraded. The
+later activation phase owns eligibility, prompt pinning, repair routing, and
+publication-time seeding.
