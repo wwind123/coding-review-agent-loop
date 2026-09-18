@@ -883,23 +883,28 @@ class ValidatedAgentResponse:
     acquisition_test_observations: tuple[object, ...] = ()
 
 
-def _response_identity_fields(result: AgentResult) -> dict[str, object]:
+def _response_identity_fields(
+    result: AgentResult | object,
+    *,
+    acquisition_result: AgentResult | object | None = None,
+) -> dict[str, object]:
+    acquisition = acquisition_result if acquisition_result is not None else result
     return {
-        "provider": result.provider,
-        "role": result.role,
-        "configured_model": result.configured_model,
-        "configured_effort": result.configured_effort,
-        "effort_source": result.effort_source,
-        "observed_model": result.observed_model,
-        "observed_effort": result.observed_effort,
-        "observation_provenance": result.observation_provenance,
+        "provider": getattr(result, "provider", None),
+        "role": getattr(result, "role", None),
+        "configured_model": getattr(result, "configured_model", None),
+        "configured_effort": getattr(result, "configured_effort", None),
+        "effort_source": getattr(result, "effort_source", None),
+        "observed_model": getattr(result, "observed_model", None),
+        "observed_effort": getattr(result, "observed_effort", None),
+        "observation_provenance": getattr(result, "observation_provenance", None),
         "acquisition_test_turn_id": getattr(
-            result, "test_turn_id", getattr(result, "acquisition_test_turn_id", None)
+            acquisition, "test_turn_id", getattr(acquisition, "acquisition_test_turn_id", None)
         ),
         "acquisition_test_observations": getattr(
-            result,
+            acquisition,
             "test_turn_observations",
-            getattr(result, "acquisition_test_observations", ()),
+            getattr(acquisition, "acquisition_test_observations", ()),
         ),
     }
 
@@ -2504,6 +2509,7 @@ def _attempt_claude_completion_recovery(
     role: str | None,
     label: str | None,
     timeout_seconds: float | None,
+    acquisition_result: AgentResult | None = None,
 ) -> _CompletionRecoveryOutcome:
     """One bounded ``claude --resume`` completion-recovery pass (#588).
 
@@ -2633,7 +2639,9 @@ def _attempt_claude_completion_recovery(
                     text=recovery_artifact, session_id=recovery_result.session_id,
                     marker_value=marker_value, usage=recovery_usage,
                     model_used=recovery_result.model_used,
-                    **_response_identity_fields(recovery_result),
+                    **_response_identity_fields(
+                        recovery_result, acquisition_result=acquisition_result
+                    ),
                     acquisition_outcome=accepted_outcome,
                     acquisition_returncode=recovery_result.returncode,
                 ),
@@ -2738,7 +2746,9 @@ def _attempt_claude_completion_recovery(
             marker_value=marker_value,
             usage=recovery_usage,
             model_used=recovery_result.model_used,
-            **_response_identity_fields(recovery_result),
+            **_response_identity_fields(
+                recovery_result, acquisition_result=acquisition_result
+            ),
         ),
         result=recovery_result,
         error="",
@@ -3368,6 +3378,7 @@ def _run_validated_agent(
                         role=role,
                         label=label,
                         timeout_seconds=timeout_seconds,
+                        acquisition_result=validation_acquisition,
                     )
                     if recovery_outcome.validated is not None:
                         return recovery_outcome.validated

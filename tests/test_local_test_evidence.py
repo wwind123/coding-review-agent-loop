@@ -14,7 +14,9 @@ import pytest
 
 from coding_review_agent_loop.local_test_evidence import (
     ENVIRONMENT_EXCLUSIONS,
+    BrokerProtocolError,
     EvidenceScope,
+    ExecutionReferenceRegistry,
     EnvironmentIdentityRegistry,
     LocalTestObservation,
     TestBrokerClient as BrokerClient,
@@ -33,6 +35,7 @@ from coding_review_agent_loop.local_test_evidence import (
     redact_test_command,
 )
 from coding_review_agent_loop.containment import open_confined_cwd
+from coding_review_agent_loop.runner import Runner
 import coding_review_agent_loop.local_test_evidence as evidence_module
 
 
@@ -179,6 +182,44 @@ def test_legacy_tests_run_uses_shell_parsing_and_marks_capture_limits(tmp_path):
     assert rows[2].outcome == "incomplete"
     assert all(row.provenance == "self-reported" for row in rows)
     assert all("capture" in " ".join(row.caveats) for row in rows[1:])
+
+
+def test_runner_rejects_execution_namespace_reuse_across_retained_turns(tmp_path, monkeypatch):
+    """A reused namespace cannot make an old selector valid in a new turn."""
+    monkeypatch.setattr(
+        evidence_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fixed-namespace"),
+    )
+    runner = Runner()
+
+    first_broker, first_turn = runner._start_test_broker(
+        cwd=tmp_path, role="coder", env=None
+    )
+    assert first_broker is not None
+    assert first_turn is not None
+    first_namespace = first_broker._execution_namespace
+    runner._finish_test_broker(first_broker, first_turn)
+
+    second_broker, second_turn = runner._start_test_broker(
+        cwd=tmp_path, role="coder", env=None
+    )
+
+    assert second_broker is None
+    assert second_turn is not None
+    assert second_turn != first_turn
+    assert runner._execution_reference_registry._namespaces == {first_namespace}
+    assert all(
+        observation.execution_ref is None
+        for observation in runner.current_test_turn_observations()
+    )
+
+
+def test_execution_reference_registry_rejects_duplicate_namespace():
+    registry = ExecutionReferenceRegistry()
+    registry.reserve_namespace("turn-a")
+    with pytest.raises(BrokerProtocolError, match="collides with a retained test turn"):
+        registry.reserve_namespace("turn-a")
 
 
 def test_environment_identity_uses_exact_exclusions_and_keeps_other_variables():

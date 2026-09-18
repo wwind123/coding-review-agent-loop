@@ -12,6 +12,7 @@ from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.comment_rendering import (
     _render_public_issue_implementation_comment,
     render_canonical_plan_state,
+    render_risk_test_matrix_section,
 )
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
@@ -53,6 +54,7 @@ from coding_review_agent_loop.memory import AgentMemoryContext
 import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
+    ValidatedAgentResponse,
     _advisory_issue_pr_provenance,
     _attach_round_metadata,
     _decode_round_metadata,
@@ -79,7 +81,10 @@ from coding_review_agent_loop.protocol import (
     validate_structured_plan_state,
     validate_structured_issue_implementation,
     risk_test_matrix_prompt_examples,
+    parse_risk_test_matrix,
+    risk_test_matrix_identity,
 )
+from coding_review_agent_loop.round_state import make_approved_plan_context
 
 
 def _fresh_child_route_fixture(disposition, *, handoff=None):
@@ -736,6 +741,329 @@ def _blocked_issue_implementation(pr_number: int = 77) -> str:
             }
         ],
     )
+
+
+def _implementation_matrix_context():
+    matrix = parse_risk_test_matrix(
+        {
+            "applicability": "applicable",
+            "rows": [{
+                "row_id": "implementation-derived-evidence",
+                "label": "Implementation evidence reaches the public handoff",
+                "entry_path_or_mode": "issue implementation",
+                "initial_state": "approved plan and new implementation PR",
+                "event": "the authenticated head is reconciled",
+                "expected_outcome": "canonical evidence is persisted",
+                "forbidden_side_effects": ["Do not lose the created PR."],
+                "proposed_test_level": "orchestrator",
+                "proposed_test_location": "tests/test_orchestrator_issue.py",
+                "applicability": "required",
+                "related_scope_item_ids": ["scope-orchestration-integration"],
+                "execution_owner": "one-shot",
+            }],
+            "important_exclusions": ["Planned tests are not evidence."],
+        }
+    )
+    approved_plan = (
+        "Approved implementation plan.\n\n"
+        + render_risk_test_matrix_section(matrix)
+    )
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        approved_plan,
+        source_locator="test approved implementation plan",
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    return approved_plan, context
+
+
+def _metadata_from_public_comment(body: str):
+    encoded = body.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+    return _decode_round_metadata(encoded)
+
+
+@pytest.mark.parametrize(
+    ("checkout_head", "expected_status"),
+    [("abc123", "missing"), ("checkout-mismatch", "missing")],
+)
+def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_authentication(
+    tmp_path, monkeypatch, checkout_head, expected_status
+):
+    approved_plan, plan_context = _implementation_matrix_context()
+    runner = FakeRunner(
+        claude_outputs=[structured_issue_implementation(pr_number=77)],
+        pr_payload={"body": "Fixes #56", "headRefOid": "abc123"},
+    )
+    config = make_config(tmp_path, coder="claude")
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+        human_requirements=(),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "resolve_canonical_pr_for_issue",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "sync_coder_base_before_implementation",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "preflight_managed_ci_creation",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "run_pr_loop",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head=checkout_head,
+            tracked_digest="tree-current",
+            complete=True,
+            stable=True,
+            status_clean=True,
+        ),
+    )
+
+    assert (
+        orchestrator_module._implement_approved_issue(
+            runner,
+            issue_number=56,
+            approved_plan=approved_plan,
+            config=config,
+            memory=None,
+            issue_context=issue_context,
+            coder_session_id=None,
+            usage_context=orchestrator_module._new_usage_context(config),
+            approved_plan_context=plan_context,
+        )
+        == 0
+    )
+
+    raw_comments = [
+        item["body"] for item in runner.pr_payload.get("comments", [])
+        if isinstance(item, dict) and isinstance(item.get("body"), str)
+    ] + [
+        item["body"] for item in runner.issue_comments
+        if isinstance(item, dict) and isinstance(item.get("body"), str)
+    ]
+    metadata = next(
+        _metadata_from_public_comment(comment)
+        for comment in raw_comments
+        if "AGENT_LOOP_META: " in comment
+        and _metadata_from_public_comment(comment).role == "coder"
+    )
+    assert metadata.risk_test_matrix_evidence is not None
+    assert metadata.risk_test_matrix_evidence["rows"][0]["status"] == expected_status
+    assert metadata.risk_test_matrix_diagnostics
+    assert any("AGENT_ISSUE_PR_HANDOFF" in comment for comment in runner.comments)
+    assert any(
+        "implementation-derived-evidence" in comment for comment in runner.comments
+    )
+
+
+def _semantic_issue_implementation_text(execution_ref: str) -> str:
+    raw = structured_issue_implementation(pr_number=77)
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["risk_test_matrix_claims"] = [{
+        "row_id": "implementation-derived-evidence",
+        "execution_refs": [execution_ref],
+        "test_identifiers": ["tests/test_orchestrator_issue.py::test_workflow"],
+        "test_locations": ["tests/test_orchestrator_issue.py"],
+        "workflow_path_claim": "The issue implementation handoff reached post-head derivation.",
+        "outcome_assertions": ["The selected managed observation passed."],
+        "forbidden_effect_assertions": ["The PR handoff was not discarded."],
+        "caveats": [],
+    }]
+    return json.dumps(payload) + raw[end:]
+
+
+def _workflow_observation(*, execution_ref: str, receipt_id: str, head: str):
+    return SimpleNamespace(
+        execution_ref=execution_ref,
+        receipt_id=receipt_id,
+        command=("python3", "-m", "pytest", "tests/test_orchestrator_issue.py", "-q"),
+        normalized_command="python3 -m pytest tests/test_orchestrator_issue.py -q",
+        outcome="passed",
+        provenance="parent-observed",
+        turn_id="coder-turn",
+        attribution={
+            "state": "current-head",
+            "head": head,
+            "tracked_digest": "tree-current",
+            "stable": True,
+            "untracked_input": False,
+            "caveats": [],
+        },
+        environment_state="not-compared",
+        superseded_by=None,
+        caveats=(),
+        wrapper_bootstrap="verified",
+        inner_exec="started",
+        suite_start="verified",
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status", "expected_diagnostic"),
+    [
+        ("success", "verified", None),
+        ("exhausted", "stale/unverified", "semantic-correction-exhausted"),
+        ("head-race", "stale/unverified", "head-changed-during-correction"),
+    ],
+)
+def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_pr(
+    tmp_path, monkeypatch, mode, expected_status, expected_diagnostic
+):
+    approved_plan, plan_context = _implementation_matrix_context()
+    wrong = _workflow_observation(
+        execution_ref="coder-turn:observation-1",
+        receipt_id="receipt-wrong-head",
+        head="old-head",
+    )
+    current = _workflow_observation(
+        execution_ref="coder-turn:observation-2",
+        receipt_id="receipt-current-head",
+        head="abc123",
+    )
+    initial_text = _semantic_issue_implementation_text(wrong.execution_ref)
+    corrected_text = _semantic_issue_implementation_text(current.execution_ref)
+    initial_parsed = validate_structured_issue_implementation(
+        initial_text,
+        delivered_risk_test_matrix_row_ids=("implementation-derived-evidence",),
+        execution_catalog=(wrong, current),
+    )
+    assert initial_parsed is not None
+    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "abc123"})
+    config = make_config(tmp_path, coder="claude")
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+        human_requirements=(),
+    )
+    coder_response = ValidatedAgentResponse(
+        text=initial_text,
+        session_id="coder-session",
+        marker_value=initial_parsed,
+        acquisition_test_turn_id="coder-turn",
+        acquisition_test_observations=(wrong, current),
+    )
+    run_pr_calls = []
+    monkeypatch.setattr(
+        orchestrator_module, "_run_validated_agent", lambda *_a, **_k: coder_response
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    )
+    real_get_pr_review_context = orchestrator_module.get_pr_review_context
+    review_context_calls = 0
+
+    def get_pr_review_context_with_optional_race(*args, **kwargs):
+        nonlocal review_context_calls
+        review_context_calls += 1
+        if mode == "head-race" and review_context_calls >= 2:
+            runner.pr_payload["headRefOid"] = "raced-head"
+        return real_get_pr_review_context(*args, **kwargs)
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "get_pr_review_context",
+        get_pr_review_context_with_optional_race,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "sync_coder_base_before_implementation",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "validate_assigned_head_advanced", lambda **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "run_pr_loop",
+        lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "reconcile_test_observations",
+        lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
+    )
+    snapshot_heads = iter(
+        ("abc123", "abc123") if mode != "head-race" else ("abc123", "raced-head")
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head=next(snapshot_heads),
+            tracked_digest="tree-current",
+            complete=True,
+            stable=True,
+            status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "run_agent_result",
+        lambda *_a, **_k: SimpleNamespace(
+            text=("not a structured response" if mode == "exhausted" else corrected_text)
+        ),
+    )
+    result = orchestrator_module._implement_approved_issue(
+        runner,
+        issue_number=56,
+        approved_plan=approved_plan,
+        config=config,
+        memory=None,
+        issue_context=issue_context,
+        coder_session_id=None,
+        usage_context=orchestrator_module._new_usage_context(config),
+        approved_plan_context=plan_context,
+    )
+
+    assert result == 0
+    assert run_pr_calls and run_pr_calls[0]["pr_number"] == 77
+    raw_comments = [
+        item["body"] for item in runner.pr_payload.get("comments", [])
+        if isinstance(item, dict) and isinstance(item.get("body"), str)
+    ]
+    metadata = _metadata_from_public_comment(
+        next(comment for comment in raw_comments if "AGENT_LOOP_META: " in comment)
+    )
+    evidence_row = metadata.risk_test_matrix_evidence["rows"][0]
+    assert evidence_row["status"] == expected_status
+    if expected_diagnostic is not None:
+        assert any(
+            item["code"] == expected_diagnostic
+            for item in metadata.risk_test_matrix_diagnostics
+        )
+    else:
+        assert any(
+            item["code"] == "wrong-head"
+            for item in metadata.risk_test_matrix_diagnostics
+        ) is False
 
 
 def _issue_context_with_blocked_requirement() -> IssueContext:
@@ -4827,6 +5155,39 @@ def test_issue_loop_direct_mode_legacy_search_resumes_and_backfills_canonical_re
     assert len(handoff_comments) == 1
     assert "Flow: issue-implementation" in handoff_comments[0]
     assert "PR #77" in handoff_comments[0]
+
+
+def test_rejected_legacy_evidence_response_resumes_same_pr_without_reimplementation(tmp_path):
+    """A legacy mappings-only response cannot hide a PR created by the coder."""
+    legacy = structured_issue_implementation(pr_number=77)
+    payload, end = json.JSONDecoder().raw_decode(legacy)
+    payload["risk_test_matrix_evidence"] = {
+        "matrix_identity": "not-authoritative",
+        "mappings": {"row-1": ["receipt-from-model"]},
+    }
+    rejected = json.dumps(payload) + legacy[end:]
+    runner = FakeRunner(claude_outputs=[rejected, rejected])
+    config = make_config(tmp_path, agent_max_retries=0)
+
+    with pytest.raises(AgentInvocationError):
+        run_issue_loop(runner, issue_number=56, config=config)
+    first_coder_calls = sum(
+        command[:1] == ["claude"] for command, _cwd in runner.commands
+    )
+
+    runner.open_prs_payload = [{"number": 77, "body": "Fixes #56"}]
+    runner.pr_payload["body"] = "Fixes #56"
+    runner.pr_commit_pages = _provenance_pages(
+        "Implement issue.\n\nAgent-Issue-Provenance: v1 "
+        "repo=owner/repo issue=56 flow=direct"
+    )
+    runner.codex_outputs = ["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"]
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+    assert first_coder_calls == 1
+    assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == first_coder_calls
+    assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    assert not any("PR #" in comment and "duplicate" in comment.lower() for comment in runner.comments)
 
 
 def test_issue_loop_direct_mode_incidental_open_pr_invokes_coder(tmp_path):

@@ -2065,6 +2065,24 @@ def test_m780_09_review_only_recovery_row_survives_coder_handoff_and_pr_reresume
     assert len(reviewer_prompts) == 2
     assert all("row-post-review-recovery" in prompt for prompt in reviewer_prompts)
     assert any("row-post-review-recovery" in comment for comment in runner.comments)
+    coder_metadata_comments = [
+        item["body"] for item in runner.pr_payload.get("comments", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("body"), str)
+        and "AGENT_LOOP_META: " in item["body"]
+        and orchestrator._decode_round_metadata(
+            item["body"].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+        ).role == "coder"
+    ]
+    assert coder_metadata_comments
+    coder_metadata = orchestrator._decode_round_metadata(
+        coder_metadata_comments[-1].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+    )
+    assert coder_metadata.risk_test_matrix_evidence is not None
+    assert coder_metadata.risk_test_matrix_evidence["rows"][0]["row_id"] == (
+        "row-post-review-recovery"
+    )
+    assert "execution_ref" not in coder_metadata_comments[-1]
 
 
 @pytest.mark.parametrize(

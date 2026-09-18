@@ -52,6 +52,49 @@ def _anchor_payload(anchor: str) -> dict[str, object]:
     return transport.decode_mapping(match.group("payload"))
 
 
+def test_derived_matrix_evidence_round_trip_is_durable_and_idempotent() -> None:
+    metadata = PostedRoundMetadata(
+        flow="pr",
+        role="coder",
+        agent="Claude",
+        round_number=2,
+        subject="head-2",
+        risk_test_matrix_evidence={
+            "contract_version": 1,
+            "matrix_identity": "matrix-identity",
+            "rows": [{
+                "row_id": "implementation-derived-evidence",
+                "status": "incomplete",
+                "test_identifiers": [],
+                "test_locations": [],
+                "workflow_path_claim": "The follow-up handoff was authenticated.",
+                "outcome_assertions": [],
+                "forbidden_effect_assertions": [],
+                "evidence_citations": [],
+                "caveats": ["No current-turn receipt was selected."],
+            }],
+        },
+        risk_test_matrix_diagnostics=(
+            {
+                "row_id": "implementation-derived-evidence",
+                "code": "missing-claim",
+                "message": "No semantic coverage claim was supplied.",
+            },
+        ),
+    )
+
+    encoded = _encode_round_metadata(metadata)
+    assert "execution_ref" not in encoded
+    decoded = _decode_round_metadata(encoded)
+    assert decoded.risk_test_matrix_evidence == metadata.risk_test_matrix_evidence
+    assert decoded.risk_test_matrix_diagnostics == metadata.risk_test_matrix_diagnostics
+    assert _encode_round_metadata(decoded) == encoded
+
+    first_body = _attach_round_metadata("derived handoff", metadata)
+    second_body = _attach_round_metadata("derived handoff", decoded)
+    assert first_body == second_body
+
+
 def _risk_test_matrix_marker_payload(
     *, row_count: int = 11, repetition: int = 40
 ) -> tuple[dict[str, object], str]:

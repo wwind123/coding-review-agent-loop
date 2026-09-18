@@ -46,6 +46,7 @@ from coding_review_agent_loop.managed_pr import ManagedPrHandoff
 from coding_review_agent_loop.runner import CommandResult, ExecutableIdentity, ExecutionObservation
 from coding_review_agent_loop.usage import RunUsageContext
 from coding_review_agent_loop.orchestrator import (
+    CompletionRecoveryPolicy,
     PostedRoundMetadata,
     ValidatedAgentResponse,
     _attach_round_metadata,
@@ -4183,6 +4184,53 @@ def test_coder_validation_keeps_acquisition_catalog_through_format_repair(tmp_pa
     assert response.acquisition_test_observations == (acquisition_observation,)
     assert len(seen_catalogs) >= 2
     assert all(catalog == (acquisition_observation,) for catalog in seen_catalogs)
+
+
+def test_claude_completion_recovery_keeps_original_acquisition_catalog(
+    tmp_path, monkeypatch
+):
+    original_observation = object()
+    recovery_observation = object()
+    original_result = AgentResult(
+        text="I'll wait for the background tests.",
+        session_id="claude-session",
+        test_turn_id="original-coder-turn",
+        test_turn_observations=(original_observation,),
+    )
+    recovery_text = structured_issue_implementation(pr_number=77)
+    recovery_result = AgentResult(
+        text=recovery_text,
+        session_id="claude-session",
+        test_turn_id="completion-recovery-turn",
+        test_turn_observations=(recovery_observation,),
+    )
+    runner = FakeRunner()
+    config = make_config(tmp_path, coder="claude")
+
+    def validate(text):
+        if text == recovery_text:
+            return validate_structured_issue_implementation(text)
+        raise AgentLoopError("response deferred to background work")
+
+    with patch.object(
+        orchestrator_module,
+        "run_agent_result",
+        side_effect=[original_result, recovery_result],
+    ):
+        response = _run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Finish the implementation.",
+            marker_description="structured issue implementation",
+            validate=validate,
+            role="coder",
+            completion_recovery=CompletionRecoveryPolicy(issue_number=56),
+        )
+
+    assert response.marker_value.pr_number == 77
+    assert response.acquisition_test_turn_id == "original-coder-turn"
+    assert response.acquisition_test_observations == (original_observation,)
 
 
 def test_claude_self_update_replay_recovers_valid_response_with_remaining_timeout(tmp_path):

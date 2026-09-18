@@ -1550,6 +1550,32 @@ class BrokerProtocolError(AgentLoopError):
     """A malformed, unauthenticated, or bounded-out broker request."""
 
 
+class ExecutionReferenceRegistry:
+    """Keep invocation-local execution namespaces unique for one runner.
+
+    A selector is ephemeral, but its authority remains live for as long as a
+    runner retains the corresponding turn catalog. Namespace registration is
+    therefore deliberately monotonic: a later broker cannot reuse a namespace
+    from an earlier turn, even after that broker has stopped and its journal
+    has been copied into the runner's retained observations.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._namespaces: set[str] = set()
+
+    def reserve_namespace(self, namespace: str) -> None:
+        namespace = str(namespace)
+        if not namespace or len(namespace.encode("utf-8", errors="replace")) > 256:
+            raise BrokerProtocolError("execution namespace is empty or oversized")
+        with self._lock:
+            if namespace in self._namespaces:
+                raise BrokerProtocolError(
+                    "execution namespace collides with a retained test turn"
+                )
+            self._namespaces.add(namespace)
+
+
 def _json_no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -1695,6 +1721,8 @@ class TestBrokerServer:
         *,
         root: Path,
         turn_id: str | None = None,
+        execution_namespace: str | None = None,
+        execution_reference_registry: ExecutionReferenceRegistry | None = None,
         timeout_ceiling: float = 1800,
         containment_policy: object | None = None,
         execute: Any | None = None,
@@ -1723,7 +1751,11 @@ class TestBrokerServer:
         self._receipts: dict[str, _ReplayReservation] = {}
         self._journal_lock = Lock()
         self._environment_registry = environment_registry or EnvironmentIdentityRegistry()
-        self._execution_namespace = uuid.uuid4().hex + uuid.uuid4().hex
+        self._execution_namespace = execution_namespace or (uuid.uuid4().hex + uuid.uuid4().hex)
+        self._execution_reference_registry = (
+            execution_reference_registry or ExecutionReferenceRegistry()
+        )
+        self._execution_reference_registry.reserve_namespace(self._execution_namespace)
         self._next_execution_ordinal = 0
         self._execution_refs: set[str] = set()
         self._parent_containment_handle: Any | None = None

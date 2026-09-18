@@ -39,6 +39,7 @@ from .test_runtime import (
 )
 from .local_test_evidence import (
     EvidenceScope,
+    ExecutionReferenceRegistry,
     TestBrokerServer,
     LocalTestObservation,
     EnvironmentIdentityRegistry,
@@ -772,6 +773,9 @@ class Runner:
         self._active_handles: dict[str, InvocationHandle] = {}
         self._active_test_brokers: dict[str, TestBrokerServer] = {}
         self._local_test_observations: list[LocalTestObservation] = []
+        # Selector namespaces are retained for the lifetime of this runner so
+        # an invocation-local handle can never collide with a prior live turn.
+        self._execution_reference_registry = ExecutionReferenceRegistry()
         self._latest_test_turn_id: str | None = None
         self._environment_registry = EnvironmentIdentityRegistry()
         self._containment_role = "coder"
@@ -859,6 +863,7 @@ class Runner:
             broker = TestBrokerServer(
                 root=cwd,
                 turn_id=turn_id,
+                execution_reference_registry=self._execution_reference_registry,
                 timeout_ceiling=ceiling,
                 containment_policy=self.containment_policy,
                 environment_registry=self._environment_registry,
