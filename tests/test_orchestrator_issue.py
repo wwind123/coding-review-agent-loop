@@ -787,15 +787,36 @@ def _metadata_from_public_comment(body: str):
 
 
 @pytest.mark.parametrize(
-    ("checkout_head", "expected_status"),
-    [("abc123", "missing"), ("checkout-mismatch", "missing")],
+    ("checkout_head", "expected_status", "expected_diagnostic"),
+    [
+        ("abc123", "verified", None),
+        ("checkout-mismatch", "stale/unverified", "checkout-head-mismatch"),
+    ],
 )
 def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_authentication(
-    tmp_path, monkeypatch, checkout_head, expected_status
+    tmp_path, monkeypatch, checkout_head, expected_status, expected_diagnostic
 ):
     approved_plan, plan_context = _implementation_matrix_context()
+    observation = _workflow_observation(
+        execution_ref="coder-turn:observation-1",
+        receipt_id="receipt-current-head",
+        head="abc123",
+    )
+    implementation_text = _semantic_issue_implementation_text(observation.execution_ref)
+    parsed = validate_structured_issue_implementation(
+        implementation_text,
+        delivered_risk_test_matrix_row_ids=("implementation-derived-evidence",),
+        execution_catalog=(observation,),
+    )
+    assert parsed is not None
+    coder_response = ValidatedAgentResponse(
+        text=implementation_text,
+        session_id=None,
+        marker_value=parsed,
+        acquisition_test_turn_id="coder-turn",
+        acquisition_test_observations=(observation,),
+    )
     runner = FakeRunner(
-        claude_outputs=[structured_issue_implementation(pr_number=77)],
         pr_payload={"body": "Fixes #56", "headRefOid": "abc123"},
     )
     config = make_config(tmp_path, coder="claude")
@@ -807,6 +828,13 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
         url="https://github.com/OWNER/REPO/issues/56",
         comments=(),
         human_requirements=(),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_run_validated_agent",
+        lambda *_args, **_kwargs: (
+            setattr(runner, "git_head", "abc123-agent-1") or coder_response
+        ),
     )
     monkeypatch.setattr(
         orchestrator_module,
@@ -839,6 +867,11 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
             status_clean=True,
         ),
     )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "reconcile_test_observations",
+        lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
+    )
 
     assert (
         orchestrator_module._implement_approved_issue(
@@ -870,7 +903,13 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
     )
     assert metadata.risk_test_matrix_evidence is not None
     assert metadata.risk_test_matrix_evidence["rows"][0]["status"] == expected_status
-    assert metadata.risk_test_matrix_diagnostics
+    if expected_diagnostic is None:
+        assert not metadata.risk_test_matrix_diagnostics
+    else:
+        assert any(
+            item["code"] == expected_diagnostic
+            for item in metadata.risk_test_matrix_diagnostics
+        )
     assert any("AGENT_ISSUE_PR_HANDOFF" in comment for comment in runner.comments)
     assert any(
         "implementation-derived-evidence" in comment for comment in runner.comments

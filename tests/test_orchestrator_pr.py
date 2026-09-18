@@ -47,6 +47,11 @@ from coding_review_agent_loop.issue_pr_handoff import (
 from coding_review_agent_loop.memory import AgentMemoryContext
 import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.migrations import MigrationValidationResult
+from coding_review_agent_loop.local_test_evidence import (
+    EnvironmentIdentity,
+    LocalTestObservation,
+    TreeAttribution,
+)
 from coding_review_agent_loop.managed_ci import (
     ManagedCiContract,
     ManagedCiOutcome,
@@ -2083,6 +2088,359 @@ def test_m780_09_review_only_recovery_row_survives_coder_handoff_and_pr_reresume
         "row-post-review-recovery"
     )
     assert "execution_ref" not in coder_metadata_comments[-1]
+
+
+def _followup_matrix_context():
+    matrix = parse_risk_test_matrix({
+        "applicability": "applicable",
+        "rows": [{
+            "row_id": "followup-derived-evidence",
+            "label": "Follow-up evidence reaches the authenticated PR head",
+            "entry_path_or_mode": "PR review repair round / coder_followup",
+            "initial_state": "blocking review on a predecessor head",
+            "event": "the coder follow-up is authenticated",
+            "expected_outcome": "canonical evidence is derived for the repaired head",
+            "forbidden_side_effects": ["Do not lose the follow-up PR handoff."],
+            "proposed_test_level": "orchestrator",
+            "proposed_test_location": "tests/test_orchestrator_pr.py",
+            "applicability": "required",
+            "related_scope_item_ids": ["scope-orchestration-integration"],
+            "execution_owner": "one-shot",
+        }],
+        "important_exclusions": ["Planned tests are not evidence."],
+    })
+    approved_plan = "Approved follow-up plan.\n\n" + render_risk_test_matrix_section(matrix)
+    identity = risk_test_matrix_identity(matrix)
+    return orchestrator.make_approved_plan_context(
+        approved_plan,
+        source_locator="test approved follow-up plan",
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+
+
+def _semantic_coder_followup_text(execution_ref: str) -> str:
+    raw = structured_coder_followup(
+        addressed_items=["item-1"],
+        summary="The follow-up was completed and the selected workflow was exercised.",
+    )
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["risk_test_matrix_claims"] = [{
+        "row_id": "followup-derived-evidence",
+        "execution_refs": [execution_ref],
+        "test_identifiers": ["tests/test_orchestrator_pr.py::test_followup_workflow"],
+        "test_locations": ["tests/test_orchestrator_pr.py"],
+        "workflow_path_claim": "The real PR follow-up caller reached post-head derivation.",
+        "outcome_assertions": ["The selected managed observation passed."],
+        "forbidden_effect_assertions": ["The PR handoff and review continuation were retained."],
+        "caveats": [],
+    }]
+    return json.dumps(payload) + raw[end:]
+
+
+def _followup_observation(
+    *, execution_ref: str, receipt_id: str, head: str, timestamp: str,
+    tracked_digest: str = "tree-current",
+):
+    return LocalTestObservation(
+        command=("python3", "-m", "pytest", "tests/test_orchestrator_pr.py", "-q"),
+        outcome="passed",
+        provenance="parent-observed",
+        receipt_id=receipt_id,
+        execution_ref=execution_ref,
+        turn_id="coder-turn",
+        timestamp=timestamp,
+        cwd="/tmp/followup-checkout",
+        normalized_command="python3 -m pytest tests/test_orchestrator_pr.py -q",
+        attribution=TreeAttribution(
+            state="current-head",
+            head=head,
+            tracked_digest=tracked_digest,
+            stable=True,
+        ),
+        environment_state="equivalent",
+        environment_identity=EnvironmentIdentity("followup-test", b"followup-test"),
+        wrapper_bootstrap="verified",
+        inner_exec="started",
+        suite_start="verified",
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status", "expected_diagnostic"),
+    [
+        ("success", "verified", "head-mismatch"),
+        ("exhausted", "stale/unverified", "semantic-correction-exhausted"),
+        ("head-race", "stale/unverified", "head-changed-during-correction"),
+    ],
+)
+def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
+    tmp_path, monkeypatch, mode, expected_status, expected_diagnostic
+):
+    plan_context = _followup_matrix_context()
+    wrong = _followup_observation(
+        execution_ref="coder-turn:observation-1",
+        receipt_id="receipt-wrong-head",
+        head="predecessor-head",
+        timestamp="2026-01-01T00:00:00Z",
+        tracked_digest="tree-predecessor",
+    )
+    current = _followup_observation(
+        execution_ref="coder-turn:observation-2",
+        receipt_id="receipt-current-head",
+        head="repaired-head",
+        timestamp="2026-01-01T00:00:01Z",
+    )
+    initial_text = _semantic_coder_followup_text(wrong.execution_ref)
+    corrected_text = _semantic_coder_followup_text(current.execution_ref)
+    parsed = validate_structured_coder_followup(
+        initial_text,
+        required_architecture_impact_contract=1,
+        delivered_risk_test_matrix=plan_context.risk_test_matrix_payload,
+        delivered_risk_test_matrix_identity=plan_context.risk_test_matrix_identity,
+        required_risk_test_matrix_contract=1,
+        delivered_risk_test_matrix_row_ids=("followup-derived-evidence",),
+        execution_catalog=(wrong, current),
+    )
+    assert parsed is not None
+    coder_response = ValidatedAgentResponse(
+        text=initial_text,
+        session_id="coder-session",
+        marker_value=parsed,
+        acquisition_test_turn_id="coder-turn",
+        acquisition_test_observations=(wrong, current),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="The follow-up path needs workflow coverage.",
+                blocking_items=["Exercise follow-up evidence derivation."],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="The follow-up evidence path is covered.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            ),
+        ],
+        pr_payload={"headRefOid": "predecessor-head"},
+        git_head="predecessor-head",
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
+    real_validated_agent = orchestrator._run_validated_agent
+
+    def fake_validated_agent(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = "repaired-head"
+            runner.git_head = "repaired-head"
+            return coder_response
+        return real_validated_agent(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
+    monkeypatch.setattr(
+        orchestrator,
+        "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head=runner.pr_payload["headRefOid"],
+            tracked_digest="tree-current",
+            complete=True,
+            stable=True,
+            status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_read_assigned_workdir_head",
+        lambda *_args, **_kwargs: runner.git_head,
+    )
+
+    real_run_agent_result = orchestrator.run_agent_result
+    real_get_pr_review_context = orchestrator.get_pr_review_context
+    race_pending = False
+
+    def get_pr_context(*args, **kwargs):
+        nonlocal race_pending
+        if mode == "head-race" and race_pending:
+            runner.pr_payload["headRefOid"] = "raced-head"
+            try:
+                return real_get_pr_review_context(*args, **kwargs)
+            finally:
+                runner.pr_payload["headRefOid"] = "repaired-head"
+                race_pending = False
+        return real_get_pr_review_context(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "get_pr_review_context", get_pr_context)
+
+    def fake_correction(*_args, **kwargs):
+        nonlocal race_pending
+        if kwargs.get("label") != "semantic-evidence-correction":
+            return real_run_agent_result(*_args, **kwargs)
+        if mode == "head-race":
+            race_pending = True
+        return SimpleNamespace(
+            text=("not a structured response" if mode == "exhausted" else corrected_text)
+        )
+
+    monkeypatch.setattr(orchestrator, "run_agent_result", fake_correction)
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=config,
+        approved_plan_context=plan_context,
+    ) == 0
+
+    coder_comments = [
+        item["body"] for item in runner.pr_payload["comments"]
+        if isinstance(item, dict)
+        and isinstance(item.get("body"), str)
+        and "AGENT_LOOP_META: " in item["body"]
+        and _decode_round_metadata(
+            item["body"].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+        ).role == "coder"
+    ]
+    assert coder_comments
+    metadata = _decode_round_metadata(
+        coder_comments[-1].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+    )
+    assert metadata.risk_test_matrix_evidence is not None
+    assert metadata.risk_test_matrix_evidence["rows"][0]["status"] == expected_status, (
+        metadata.risk_test_matrix_evidence,
+        metadata.risk_test_matrix_diagnostics,
+    )
+    assert any(
+        item["code"] == expected_diagnostic
+        for item in metadata.risk_test_matrix_diagnostics
+    ) if mode != "success" else not any(
+        item["code"] == expected_diagnostic
+        for item in metadata.risk_test_matrix_diagnostics
+    )
+    assert "execution_ref" not in coder_comments[-1]
+    assert any("follow-up" in comment.lower() for comment in runner.comments)
+    assert any("The follow-up evidence path is covered." in comment for comment in runner.comments)
+
+
+def test_run_pr_loop_replays_derived_followup_evidence_without_ephemeral_selectors(tmp_path):
+    plan_context = _followup_matrix_context()
+    carried_item = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="OpenAI Codex",
+        source_round=1,
+        text="Exercise follow-up evidence derivation.",
+        status="blocking",
+        source_status="blocking",
+    )
+    raw_coder = structured_coder_followup(
+        addressed_items=["item-1"],
+        summary="The follow-up was completed.",
+    )
+    parsed_coder = validate_structured_coder_followup(raw_coder)
+    assert parsed_coder is not None
+    evidence = {
+        "matrix_identity": plan_context.risk_test_matrix_identity,
+        "rows": [{
+            "row_id": "followup-derived-evidence",
+            "status": "verified",
+            "test_identifiers": ["tests/test_orchestrator_pr.py::test_followup_workflow"],
+            "test_locations": ["tests/test_orchestrator_pr.py"],
+            "workflow_path_claim": "The persisted follow-up reached the authenticated head.",
+            "outcome_assertions": ["The selected managed observation passed."],
+            "forbidden_effect_assertions": ["The PR handoff was retained."],
+            "evidence_citations": [{
+                "command": "python3 -m pytest tests/test_orchestrator_pr.py -q",
+                "receipt_id": "receipt-current-head",
+                "claim": "current-result",
+            }],
+            "caveats": [],
+        }],
+    }
+    coder_public = _render_public_coder_followup_comment(
+        parsed_coder,
+        agent="Claude",
+        prior_items=(carried_item,),
+    ) + (
+        "\n\n### Risk-test matrix evidence\n"
+        "- followup-derived-evidence: verified (receipt-current-head)"
+    )
+    coder_comment = _attach_round_metadata(
+        coder_public,
+        PostedRoundMetadata(
+            flow="pr",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject="abc123",
+            prior_items=(carried_item,),
+            raw_structured_coder_response=raw_coder,
+            risk_test_matrix_evidence=evidence,
+        ),
+    )
+    review_raw = structured_pr_review(
+        state="blocking",
+        summary="The persisted evidence needs one more review.",
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "Review the handoff."}
+        ],
+    )
+    review_comment = _attach_round_metadata(
+        review_raw,
+        PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject="abc123",
+            prior_items=(carried_item,),
+            dispositions=(
+                ReviewItemDisposition(
+                    "item-1", "OpenAI Codex", "blocking", "Review the handoff."
+                ),
+            ),
+            state="blocking",
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="The persisted evidence is available to the reviewer.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"}
+                ],
+            )
+        ],
+        pr_payload={
+            "headRefOid": "abc123",
+            "comments": [
+                {"author": {"login": "bot"}, "createdAt": "2026-06-01T00:00:00Z", "body": coder_comment},
+                {"author": {"login": "bot"}, "createdAt": "2026-06-01T00:01:00Z", "body": review_comment},
+            ],
+        },
+    )
+
+    assert run_pr_loop(
+        runner,
+        pr_number=77,
+        config=make_config(tmp_path, reviewer="codex"),
+        approved_plan_context=plan_context,
+    ) == 0
+
+    reviewer_prompt = next(
+        cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]
+    )
+    assert '"risk_test_matrix_evidence"' in reviewer_prompt
+    assert "receipt-current-head" in reviewer_prompt
+    assert "coder-turn:observation-2" not in reviewer_prompt
+    assert "coder-turn:observation-2" not in runner.pr_payload["comments"][0]["body"]
+    assert any(
+        "The persisted evidence is available to the reviewer." in comment
+        for comment in runner.comments
+    )
 
 
 @pytest.mark.parametrize(
