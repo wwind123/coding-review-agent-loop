@@ -1568,6 +1568,7 @@ def derive_risk_test_matrix_evidence(
     matrix: RiskTestMatrix | Mapping[str, object],
     claims: SemanticRiskCoverageClaims | Sequence[SemanticRiskCoverageClaim] | None,
     observations: Sequence[object],
+    execution_catalog: Sequence[object] | None = None,
     invocation_id: str | None = None,
     current_head: str | None = None,
     current_tree_digest: str | None = None,
@@ -1587,8 +1588,20 @@ def derive_risk_test_matrix_evidence(
     identity = expected_identity or risk_test_matrix_identity(parsed_matrix)
     if not re.fullmatch(r"[0-9a-f]{64}", identity):
         raise AgentLoopError("derived risk evidence matrix identity must be a SHA-256 digest")
+    # ``observations`` is the authoritative journal used to derive aggregate
+    # failure status.  Selector resolution is deliberately a separate input:
+    # a cumulative journal may retain observations from earlier coder turns,
+    # but a fresh semantic claim may select only the closed catalog for the
+    # current turn.  Keeping these inputs distinct prevents a historical
+    # execution_ref from becoming a valid citation merely because it remains
+    # inside the bounded journal.
+    selector_observations = (
+        tuple(execution_catalog)
+        if execution_catalog is not None
+        else tuple(observations)
+    )
     observation_by_ref: dict[str, object] = {}
-    for observation in observations:
+    for observation in selector_observations:
         execution_ref = _semantic_execution_ref(observation)
         if execution_ref is None:
             continue

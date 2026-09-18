@@ -207,6 +207,25 @@ def test_repair_preserves_matrix_evidence_status_and_caveats():
         check(source, changed)
 
 
+def test_fresh_coder_repair_may_remove_legacy_canonical_evidence():
+    source = {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "The implementation is complete.",
+        "pr_number": 77,
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "risk_test_matrix_evidence": {"matrix_identity": "a" * 64, "rows": []},
+    }
+    repaired = deepcopy(source)
+    repaired.pop("risk_test_matrix_evidence")
+
+    # Preservation keeps valid coder-owned facts, but does not force a fresh
+    # semantic repair to carry an orchestrator-owned legacy field forward.
+    check(source, repaired)
+
+
 def test_repair_preserves_architecture_impact_fields():
     source = {
         "kind": "task_result",

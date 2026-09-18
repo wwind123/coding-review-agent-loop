@@ -4077,7 +4077,10 @@ def _current_test_turn_observations(runner: Runner) -> tuple[object, ...]:
     observations = tuple(runner.local_test_observations())
     turn_id = getattr(runner, "latest_test_turn_id", None)
     if not turn_id:
-        return observations
+        # Without an authenticated current-turn identity there is no safe
+        # selector catalog.  Returning the cumulative journal here would let
+        # an old live execution_ref pass pre-authentication validation.
+        return ()
     return tuple(
         observation for observation in observations
         if getattr(observation, "turn_id", None) == turn_id
@@ -4176,8 +4179,20 @@ def _derive_authenticated_risk_evidence_for_coder(
     session_id: str | None = None,
     reauthenticate_head: Callable[[], str | None] | None = None,
     invocation_id: str | None = None,
+    _closed_execution_catalog: Sequence[object] | None = None,
+    _journal_observations: Sequence[object] | None = None,
+    _correction_attempted: bool = False,
 ) -> tuple[StructuredIssueImplementation | StructuredCoderFollowup, DerivedRiskEvidenceResult | None]:
-    """Attach canonical evidence only after the PR head is authenticated."""
+    """Attach canonical evidence only after the PR head is authenticated.
+
+    The broker catalog and the evidence journal have different trust roles.
+    The journal can retain bounded history for aggregate failure handling, but
+    semantic selectors must resolve only through the closed catalog belonging
+    to the response being acquired.  The private correction arguments make
+    that boundary stable across the one permitted post-authentication repair
+    continuation, whose own broker observations must not silently become
+    selectors for the original response.
+    """
     if approved_plan_context is None or not approved_plan_context.matrix_available:
         return parsed, None
     matrix_payload = approved_plan_context.risk_test_matrix_payload
@@ -4185,32 +4200,54 @@ def _derive_authenticated_risk_evidence_for_coder(
     if matrix_payload is None or identity is None:
         return parsed, None
     bound_invocation_id = invocation_id or runner.latest_test_turn_id
-    observations = tuple(runner.local_test_observations())
+    closed_catalog = (
+        tuple(_closed_execution_catalog)
+        if _closed_execution_catalog is not None
+        else _current_test_turn_observations(runner)
+    )
+    journal_observations = (
+        tuple(_journal_observations)
+        if _journal_observations is not None
+        else tuple(runner.local_test_observations())
+    )
     try:
         snapshot = stable_tracked_tree_snapshot(assigned_workdir)
     except Exception:
         snapshot = None
     reconciled = reconcile_test_observations(
-        observations,
+        journal_observations,
         current_head=head_sha,
         current_snapshot=snapshot,
         cwd=assigned_workdir,
+    )
+    reconciled_catalog = reconcile_test_observations(
+        closed_catalog,
+        current_head=head_sha,
+        current_snapshot=snapshot,
+        cwd=assigned_workdir,
+    )
+    # Authentication is conjunctive: the remote PR metadata and the assigned
+    # checkout must identify the same clean, stable tree.  In particular, a
+    # checkout that is merely newer than the pre-turn snapshot is not enough.
+    authenticated_checkout_head = snapshot.head if snapshot is not None else None
+    authenticated_tree_clean = bool(
+        snapshot is not None
+        and snapshot.complete
+        and snapshot.stable is True
+        and snapshot.status_clean is True
+        and authenticated_checkout_head is not None
+        and authenticated_checkout_head == head_sha
     )
     result = derive_risk_test_matrix_evidence(
         matrix=matrix_payload,
         claims=parsed.risk_test_matrix_claims,
         observations=reconciled.observations,
+        execution_catalog=reconciled_catalog.observations,
         invocation_id=bound_invocation_id,
         current_head=head_sha,
         current_tree_digest=(snapshot.tracked_digest if snapshot is not None else None),
-        authenticated_checkout_head=(snapshot.head if snapshot is not None else None),
-        authenticated_tree_clean=(
-            snapshot is not None
-            and snapshot.complete
-            and snapshot.stable is True
-            and snapshot.status_clean is True
-            and snapshot.head == head_sha
-        ),
+        authenticated_checkout_head=authenticated_checkout_head,
+        authenticated_tree_clean=authenticated_tree_clean,
         predecessor_head=predecessor_head,
         expected_identity=identity,
     )
@@ -4219,8 +4256,18 @@ def _derive_authenticated_risk_evidence_for_coder(
         if diagnostic.code != "missing-claim"
         and diagnostic.code != "unsuperseded-journal-failure"
     )
-    if actionable and config is not None and session_id and reauthenticate_head is not None:
-        catalog = _current_test_turn_observations(runner)
+    if (
+        actionable
+        and not _correction_attempted
+        and config is not None
+        and session_id
+        and reauthenticate_head is not None
+    ):
+        # Keep the original response's closed catalog even though the
+        # correction invocation itself gets a fresh broker turn.  A repair
+        # response may correct selectors, but it cannot mint new execution
+        # authority or turn an unrelated correction observation into evidence.
+        catalog = closed_catalog
         prompt = _post_auth_correction_prompt(
             parsed,
             matrix_row_ids=approved_plan_context.risk_test_matrix_expected_row_ids,
@@ -4252,7 +4299,7 @@ def _derive_authenticated_risk_evidence_for_coder(
         if corrected is not None:
             corrected_head = reauthenticate_head()
             if corrected_head == head_sha:
-                return _derive_authenticated_risk_evidence_for_coder(
+                corrected_parsed, corrected_result = _derive_authenticated_risk_evidence_for_coder(
                     corrected,
                     approved_plan_context=approved_plan_context,
                     runner=runner,
@@ -4260,7 +4307,29 @@ def _derive_authenticated_risk_evidence_for_coder(
                     head_sha=head_sha,
                     predecessor_head=predecessor_head,
                     invocation_id=bound_invocation_id,
+                    _closed_execution_catalog=closed_catalog,
+                    _journal_observations=journal_observations,
+                    _correction_attempted=True,
                 )
+                if corrected_result is not None and any(
+                    diagnostic.code not in {"missing-claim", "unsuperseded-journal-failure"}
+                    for diagnostic in corrected_result.diagnostics
+                ):
+                    exhausted = PostAuthClaimDiagnostic(
+                        actionable[0].row_id if actionable else "risk-test-matrix",
+                        "semantic-correction-exhausted",
+                        "The bounded semantic correction did not produce fully admissible post-authentication claims.",
+                    )
+                    corrected_result = dataclasses_replace(
+                        corrected_result,
+                        diagnostics=tuple((*corrected_result.diagnostics, exhausted)),
+                    )
+                    corrected_parsed = dataclasses_replace(
+                        corrected_parsed,
+                        risk_test_matrix_evidence=corrected_result.evidence,
+                        risk_test_matrix_diagnostics=corrected_result.diagnostics,
+                    )
+                return corrected_parsed, corrected_result
             if corrected_head is not None:
                 raced_parsed, raced_result = _derive_authenticated_risk_evidence_for_coder(
                     corrected,
@@ -4270,10 +4339,32 @@ def _derive_authenticated_risk_evidence_for_coder(
                     head_sha=corrected_head,
                     predecessor_head=predecessor_head,
                     invocation_id=bound_invocation_id,
+                    _closed_execution_catalog=closed_catalog,
+                    _journal_observations=journal_observations,
+                    _correction_attempted=True,
                 )
                 if raced_result is not None:
+                    # A remote-head race terminates correction.  Even if the
+                    # assigned checkout happened to move with the remote
+                    # between the two reads, claims acquired before the race
+                    # cannot be promoted to verified evidence for that new
+                    # head in this handoff.
+                    raced_rows = tuple(
+                        dataclasses_replace(
+                            row,
+                            status=("stale/unverified" if row.status == "verified" else row.status),
+                            evidence_citations=(),
+                            caveats=tuple((*row.caveats, "head changed during bounded semantic correction")),
+                        )
+                        for row in raced_result.evidence.rows
+                    )
+                    raced_evidence = dataclasses_replace(
+                        raced_result.evidence,
+                        rows=raced_rows,
+                    )
                     raced_result = dataclasses_replace(
                         raced_result,
+                        evidence=raced_evidence,
                         diagnostics=tuple((*raced_result.diagnostics, PostAuthClaimDiagnostic(
                             actionable[0].row_id if actionable else "risk-test-matrix",
                             "head-changed-during-correction",
