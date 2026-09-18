@@ -49,6 +49,7 @@ from coding_review_agent_loop.protocol import (
     parse_agent_unavailable,
     parse_approved_followups,
     parse_human_requirements_acknowledgement,
+    parse_historical_structured_issue_implementation,
     parse_pr_review,
     parse_plan_item_dispositions,
     parse_plan_review,
@@ -2302,6 +2303,21 @@ def test_fresh_coder_contract_rejects_model_authored_canonical_matrix_evidence(k
     )
     with pytest.raises(AgentLoopError, match="risk_test_matrix_evidence"):
         validator(text)
+
+
+def test_historical_issue_implementation_parser_keeps_accepted_canonical_evidence_readable():
+    payload = _issue_implementation_text(pr_number=77)
+    raw, end = json.JSONDecoder().raw_decode(payload.lstrip())
+    raw["risk_test_matrix_evidence"] = {
+        "matrix_identity": "a" * 64,
+        "rows": [],
+    }
+    historical = json.dumps(raw) + payload.lstrip()[end:]
+
+    parsed = parse_historical_structured_issue_implementation(historical)
+
+    assert parsed is not None
+    assert parsed.risk_test_matrix_evidence is not None
 
 
 def test_validate_structured_coder_followup_accepts_exact_test_observation_shape():

@@ -28,6 +28,8 @@ from .protocol import (
     parse_plan_review,
     parse_pr_review,
     parse_human_requirements_acknowledgement,
+    parse_historical_structured_coder_followup,
+    parse_historical_structured_issue_implementation,
     validate_human_requirements_acknowledgement,
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
@@ -534,7 +536,7 @@ def _reconcile_human_requirements_ack_item(
     structured_implementation: StructuredIssueImplementation | None = None
     structured_followup: StructuredCoderFollowup | None = None
     try:
-        structured_implementation = validate_structured_issue_implementation(coder_output)
+        structured_implementation = parse_historical_structured_issue_implementation(coder_output)
     except IssueImplementationConflictError as exc:
         structured_implementation = exc.payload
     except AgentLoopError:
@@ -542,7 +544,7 @@ def _reconcile_human_requirements_ack_item(
 
     if structured_implementation is None:
         try:
-            structured_followup = validate_structured_coder_followup(coder_output)
+            structured_followup = parse_historical_structured_coder_followup(coder_output)
         except AgentLoopError:
             structured_followup = None
 

@@ -131,6 +131,8 @@ def test_derived_matrix_evidence_is_complete_and_selector_citations_are_tool_own
         invocation_id="turn-current",
         current_head="head-current",
         current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
 
@@ -167,6 +169,8 @@ def test_derived_matrix_evidence_preserves_unsuperseded_failure_caveat() -> None
         invocation_id="turn-current",
         current_head="head-current",
         current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
 
@@ -208,6 +212,48 @@ def test_derived_matrix_evidence_rejects_a_matching_tree_from_the_wrong_checkout
     assert any(diagnostic.code == "checkout-head-mismatch" for diagnostic in result.diagnostics)
 
 
+def test_derived_matrix_evidence_requires_explicit_post_authentication_proof() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(
+        execution_ref="invocation:observation-1",
+        receipt_id="receipt-1",
+    )
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_risk_test_matrix.py::test_ordinary",),
+        workflow_path_claim="The workflow path ran.",
+        outcome_assertions=("The selected test passed.",),
+        forbidden_effect_assertions=("No stale head was merged.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert result.evidence.rows[0].status == "stale/unverified"
+    assert any(diagnostic.code == "checkout-head-mismatch" for diagnostic in result.diagnostics)
+    assert any(diagnostic.code == "checkout-tree-unavailable" for diagnostic in result.diagnostics)
+
+
+def test_current_turn_catalog_filters_a_misbehaving_cumulative_provider() -> None:
+    old = SimpleNamespace(turn_id="turn-old", execution_ref="old:observation-1")
+    current = SimpleNamespace(turn_id="turn-current", execution_ref="current:observation-1")
+    runner = SimpleNamespace(
+        latest_test_turn_id="turn-current",
+        current_test_turn_observations=lambda: (old, current),
+    )
+
+    assert orchestrator_module._current_test_turn_observations(runner) == (current,)
+
+
 def test_derived_matrix_evidence_cannot_resolve_a_cross_turn_selector_from_the_journal() -> None:
     matrix = parse_risk_test_matrix(_matrix())
     old_observation = _derived_observation(
@@ -235,6 +281,8 @@ def test_derived_matrix_evidence_cannot_resolve_a_cross_turn_selector_from_the_j
         invocation_id="turn-current",
         current_head="head-current",
         current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
 

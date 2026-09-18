@@ -4071,19 +4071,23 @@ def _validate_issue_implementation_response(
 
 def _current_test_turn_observations(runner: Runner) -> tuple[object, ...]:
     """Return the closed invocation-local catalog, never the cumulative journal."""
+    turn_id = getattr(runner, "latest_test_turn_id", None)
+    if not isinstance(turn_id, str) or not turn_id:
+        return ()
     current = getattr(runner, "current_test_turn_observations", None)
     if callable(current):
-        return tuple(current())
-    observations = tuple(runner.local_test_observations())
-    turn_id = getattr(runner, "latest_test_turn_id", None)
-    if not turn_id:
-        # Without an authenticated current-turn identity there is no safe
-        # selector catalog.  Returning the cumulative journal here would let
-        # an old live execution_ref pass pre-authentication validation.
-        return ()
+        observations = tuple(current())
+    else:
+        observations = tuple(runner.local_test_observations())
+
+    def observation_turn_id(observation: object) -> object:
+        if isinstance(observation, Mapping):
+            return observation.get("turn_id")
+        return getattr(observation, "turn_id", None)
+
     return tuple(
         observation for observation in observations
-        if getattr(observation, "turn_id", None) == turn_id
+        if observation_turn_id(observation) == turn_id
     )
 
 
@@ -4179,6 +4183,7 @@ def _derive_authenticated_risk_evidence_for_coder(
     session_id: str | None = None,
     reauthenticate_head: Callable[[], str | None] | None = None,
     invocation_id: str | None = None,
+    assigned_worktree_head: str | None = None,
     _closed_execution_catalog: Sequence[object] | None = None,
     _journal_observations: Sequence[object] | None = None,
     _correction_attempted: bool = False,
@@ -4237,6 +4242,10 @@ def _derive_authenticated_risk_evidence_for_coder(
         and snapshot.status_clean is True
         and authenticated_checkout_head is not None
         and authenticated_checkout_head == head_sha
+        and (
+            assigned_worktree_head is None
+            or assigned_worktree_head == authenticated_checkout_head
+        )
     )
     result = derive_risk_test_matrix_evidence(
         matrix=matrix_payload,
@@ -16945,6 +16954,13 @@ def run_pr_loop(
                 unresolved_items,
                 current_head_sha=updated_pr_context.metadata.head_sha,
             )
+            # Reconcile the coder's assigned checkout with the freshly fetched
+            # PR head before deriving any canonical evidence. The builder also
+            # takes an independent stable snapshot, so a mismatch is retained
+            # as non-verified evidence rather than discarding the PR handoff.
+            assigned_worktree_head_after_followup = _read_assigned_workdir_head(
+                runner, config
+            )
             if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                 derived_followup, _followup_derived_risk_evidence = (
                     _derive_authenticated_risk_evidence_for_coder(
@@ -16956,6 +16972,7 @@ def run_pr_loop(
                         predecessor_head=pr_metadata.head_sha,
                         config=config,
                         session_id=coder_response.session_id,
+                        assigned_worktree_head=assigned_worktree_head_after_followup,
                         reauthenticate_head=lambda: get_pr_review_context(
                             runner, config=config, pr_number=pr_number
                         ).metadata.head_sha,

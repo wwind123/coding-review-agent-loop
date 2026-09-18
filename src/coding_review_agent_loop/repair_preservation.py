@@ -509,6 +509,13 @@ def validate_repair_preservation(
                     == source["risk_test_matrix_evidence"],
                     "risk_test_matrix_evidence",
                 )
+        elif "risk_test_matrix_evidence" in target:
+            # A fresh repair may remove a legacy canonical field that was
+            # present in its source, but it may never synthesize that field
+            # when the source did not contain it.
+            raise AgentLoopError(
+                "repair cannot invent risk_test_matrix_evidence for a fresh coder response"
+            )
 
     if source["kind"] == "coder_followup":
         allowed_item_ids = (

@@ -226,6 +226,25 @@ def test_fresh_coder_repair_may_remove_legacy_canonical_evidence():
     check(source, repaired)
 
 
+def test_fresh_coder_repair_cannot_invent_canonical_evidence():
+    source = {
+        "schema_version": 1,
+        "kind": "coder_followup",
+        "state": "blocking",
+        "summary": "The implementation is complete.",
+        "addressed_items": [],
+        "remaining_items": [],
+    }
+    target = deepcopy(source)
+    target["risk_test_matrix_evidence"] = {
+        "matrix_identity": "a" * 64,
+        "rows": [],
+    }
+
+    with pytest.raises(AgentLoopError, match="cannot invent risk_test_matrix_evidence"):
+        check(source, target)
+
+
 def test_repair_preserves_architecture_impact_fields():
     source = {
         "kind": "task_result",

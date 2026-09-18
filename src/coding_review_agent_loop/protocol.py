@@ -1641,17 +1641,17 @@ def derive_risk_test_matrix_evidence(
                 )
             selected_refs.add(execution_ref)
     diagnostics: list[PostAuthClaimDiagnostic] = []
-    head_binding_requested = (
-        authenticated_checkout_head is not None
-        or authenticated_tree_clean is not None
-        or predecessor_head is not None
-    )
-    checkout_head_mismatch = head_binding_requested and (
+    # A canonical evidence builder is a post-authentication operation. Keep
+    # these parameters optional for historical/unit callers, but never let an
+    # omitted authentication proof upgrade a selected receipt to ``verified``.
+    # Matching the receipt's recorded tree is insufficient when the assigned
+    # checkout is on another commit.
+    checkout_head_mismatch = (
         current_head is None
         or authenticated_checkout_head != current_head
         or (predecessor_head is not None and authenticated_checkout_head == predecessor_head)
     )
-    checkout_tree_unavailable = head_binding_requested and authenticated_tree_clean is not True
+    checkout_tree_unavailable = authenticated_tree_clean is not True
     unsuperseded_failures = [
         observation for observation in observations
         if _observation_value(observation, "provenance") == "parent-observed"
