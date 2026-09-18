@@ -648,6 +648,10 @@ def reconcile_test_observations(
 
     # Compare live observations with the clean eventual tree at handoff. This
     # lets a stable pre-commit test become attributable after the coder commits.
+    snapshot_head_matches = (
+        current_head is None
+        or current_snapshot is not None and current_snapshot.head == current_head
+    )
     if (
         current_snapshot is not None
         and current_snapshot.complete
@@ -661,7 +665,13 @@ def reconcile_test_observations(
             attribution = row.attribution
             if attribution.stable is not True or not attribution.tracked_digest:
                 continue
-            if attribution.tracked_digest == current_snapshot.tracked_digest:
+            if not snapshot_head_matches:
+                rows[index] = replace(
+                    row,
+                    attribution=replace(attribution, state="stale"),
+                    caveats=(*row.caveats, "assigned checkout HEAD differs from the authenticated PR head"),
+                )
+            elif attribution.tracked_digest == current_snapshot.tracked_digest:
                 state = (
                     "untracked-input-unverified"
                     if attribution.untracked_input

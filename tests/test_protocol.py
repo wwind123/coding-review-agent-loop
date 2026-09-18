@@ -2275,6 +2275,35 @@ def test_semantic_matrix_claims_use_current_turn_execution_refs_only():
         )
 
 
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_fresh_coder_contract_rejects_model_authored_canonical_matrix_evidence(kind):
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "state": "blocking",
+        "summary": "The implementation is complete.",
+        "human_requirement_dispositions": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "risk_test_matrix_evidence": {
+            "matrix_identity": "a" * 64,
+            "rows": [],
+        },
+    }
+    if kind == "issue_implementation":
+        payload["pr_number"] = 77
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+
+    validator = (
+        validate_structured_issue_implementation
+        if kind == "issue_implementation"
+        else validate_structured_coder_followup
+    )
+    with pytest.raises(AgentLoopError, match="risk_test_matrix_evidence"):
+        validator(text)
+
+
 def test_validate_structured_coder_followup_accepts_exact_test_observation_shape():
     payload = json.dumps({
         "schema_version": 1, "kind": "coder_followup", "state": "blocking",

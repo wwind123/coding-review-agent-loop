@@ -931,6 +931,17 @@ class Runner:
         with self._active_procs_lock:
             return tuple(self._local_test_observations)
 
+    def current_test_turn_observations(self) -> tuple[LocalTestObservation, ...]:
+        """Return only the closed catalog for the latest coder/repair turn."""
+        turn_id = self._latest_test_turn_id
+        if turn_id is None:
+            return ()
+        return tuple(
+            observation
+            for observation in self.local_test_observations()
+            if observation.turn_id == turn_id
+        )
+
     @property
     def latest_test_turn_id(self) -> str | None:
         """Authenticated identity of the most recent coder/repair turn."""

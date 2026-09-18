@@ -2033,22 +2033,6 @@ def test_m780_09_review_only_recovery_row_survives_coder_handoff_and_pr_reresume
         addressed_items=["item-1"],
         summary="The implementation was repaired; the orchestration row remains unverified.",
     )
-    coder_payload, coder_end = json.JSONDecoder().raw_decode(coder_output.lstrip())
-    coder_payload["risk_test_matrix_evidence"] = {
-        "matrix_identity": identity,
-        "rows": [{
-            "row_id": "row-post-review-recovery",
-            "status": "missing",
-            "test_identifiers": [],
-            "test_locations": [],
-            "workflow_path_claim": "The intended post-review recovery branch was not exercised by this handoff.",
-            "outcome_assertions": [],
-            "forbidden_effect_assertions": [],
-            "evidence_citations": [],
-            "caveats": ["No orchestration receipt was available."],
-        }],
-    }
-    coder_output = json.dumps(coder_payload) + coder_output.lstrip()[coder_end:]
     runner = FakeRunner(
         claude_outputs=[coder_output],
         codex_outputs=[
@@ -2080,7 +2064,7 @@ def test_m780_09_review_only_recovery_row_survives_coder_handoff_and_pr_reresume
     assert "row-post-review-recovery" in coder_prompt
     assert len(reviewer_prompts) == 2
     assert all("row-post-review-recovery" in prompt for prompt in reviewer_prompts)
-    assert any("No orchestration receipt was available." in comment for comment in runner.comments)
+    assert any("row-post-review-recovery" in comment for comment in runner.comments)
 
 
 @pytest.mark.parametrize(

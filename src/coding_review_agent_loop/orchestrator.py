@@ -264,6 +264,7 @@ from .protocol import (
     StructuredCoderFollowup,
     StructuredIssueImplementation,
     DerivedRiskEvidenceResult,
+    PostAuthClaimDiagnostic,
     StructuredPlanState,
     StructuredPlanRevision,
     PlanRevisionPatch,
@@ -288,6 +289,8 @@ from .protocol import (
     validate_structured_coder_followup,
     validate_structured_human_requirements_acknowledgement,
     validate_structured_issue_implementation,
+    parse_historical_structured_coder_followup,
+    parse_historical_structured_issue_implementation,
     validate_structured_plan_state,
     validate_structured_plan_revision,
     validate_structured_plan_revision_patch,
@@ -4066,6 +4069,101 @@ def _validate_issue_implementation_response(
     return parsed
 
 
+def _current_test_turn_observations(runner: Runner) -> tuple[object, ...]:
+    """Return the closed invocation-local catalog, never the cumulative journal."""
+    current = getattr(runner, "current_test_turn_observations", None)
+    if callable(current):
+        return tuple(current())
+    observations = tuple(runner.local_test_observations())
+    turn_id = getattr(runner, "latest_test_turn_id", None)
+    if not turn_id:
+        return observations
+    return tuple(
+        observation for observation in observations
+        if getattr(observation, "turn_id", None) == turn_id
+    )
+
+
+def _safe_execution_handle_catalog(observations: Sequence[object]) -> tuple[dict[str, object], ...]:
+    """Project correction context without exposing receipt authority."""
+    catalog: list[dict[str, object]] = []
+    for observation in observations:
+        execution_ref = getattr(observation, "execution_ref", None)
+        if not isinstance(execution_ref, str) or not execution_ref:
+            continue
+        attribution = getattr(observation, "attribution", None)
+        if isinstance(attribution, Mapping):
+            attribution_state = attribution.get("state")
+        else:
+            attribution_state = getattr(attribution, "state", None)
+        caveats = getattr(observation, "caveats", ())
+        catalog.append({
+            "execution_ref": execution_ref,
+            "outcome": getattr(observation, "outcome", "unknown"),
+            "provenance": getattr(observation, "provenance", "unknown"),
+            "attribution_state": attribution_state or "unknown",
+            "caveats": [str(item) for item in tuple(caveats)[:4]],
+        })
+    return tuple(catalog)
+
+
+def _post_auth_correction_prompt(
+    parsed: StructuredIssueImplementation | StructuredCoderFollowup,
+    *,
+    matrix_row_ids: Sequence[str],
+    diagnostics: Sequence[PostAuthClaimDiagnostic],
+    execution_catalog: Sequence[Mapping[str, object]],
+) -> str:
+    return (
+        "The orchestrator authenticated the PR, then found a bounded semantic "
+        "coverage defect. This is a claims-only correction in the same coder "
+        "session; do not change code, PR identity, reviewer-item classifications, "
+        "human-requirement fields, summary, or any other coder-owned fact. Return "
+        "the same structured response kind and correct only "
+        "`risk_test_matrix_claims`. Do not emit canonical evidence, matrix "
+        "identities, canonical rows, receipt IDs, citations, mappings, statuses, "
+        "or envelope bookkeeping. Use only approved row IDs and handles in the "
+        "closed catalog below; a missing claim is allowed when no admissible "
+        "execution exists.\n\n"
+        f"Response kind: {parsed.kind}\n"
+        f"Approved enforceable row IDs: {json.dumps(list(matrix_row_ids))}\n"
+        f"Post-authentication diagnostics: {json.dumps([item.to_payload() for item in diagnostics])}\n"
+        f"Closed execution-handle catalog: {json.dumps(list(execution_catalog))}\n"
+    )
+
+
+def _parse_fresh_correction_claims(
+    text: str,
+    original: StructuredIssueImplementation | StructuredCoderFollowup,
+    *,
+    row_ids: Sequence[str],
+    execution_catalog: Sequence[object],
+) -> StructuredIssueImplementation | StructuredCoderFollowup | None:
+    if isinstance(original, StructuredIssueImplementation):
+        candidate = validate_structured_issue_implementation(
+            text,
+            delivered_risk_test_matrix_row_ids=row_ids,
+            execution_catalog=execution_catalog,
+        )
+    else:
+        candidate = validate_structured_coder_followup(
+            text,
+            delivered_risk_test_matrix_row_ids=row_ids,
+            execution_catalog=execution_catalog,
+        )
+    if candidate is None or candidate.kind != original.kind:
+        return None
+    # The correction continuation is not a second coder handoff. Preserve all
+    # coder-owned facts from the authenticated response and accept only its
+    # newly validated semantic claim set.
+    return dataclasses_replace(
+        original,
+        risk_test_matrix_claims=candidate.risk_test_matrix_claims,
+        risk_test_matrix_evidence=None,
+        risk_test_matrix_diagnostics=(),
+    )
+
+
 def _derive_authenticated_risk_evidence_for_coder(
     parsed: StructuredIssueImplementation | StructuredCoderFollowup,
     *,
@@ -4073,6 +4171,11 @@ def _derive_authenticated_risk_evidence_for_coder(
     runner: Runner,
     assigned_workdir: Path,
     head_sha: str | None,
+    predecessor_head: str | None = None,
+    config: AgentLoopConfig | None = None,
+    session_id: str | None = None,
+    reauthenticate_head: Callable[[], str | None] | None = None,
+    invocation_id: str | None = None,
 ) -> tuple[StructuredIssueImplementation | StructuredCoderFollowup, DerivedRiskEvidenceResult | None]:
     """Attach canonical evidence only after the PR head is authenticated."""
     if approved_plan_context is None or not approved_plan_context.matrix_available:
@@ -4081,6 +4184,7 @@ def _derive_authenticated_risk_evidence_for_coder(
     identity = approved_plan_context.risk_test_matrix_identity
     if matrix_payload is None or identity is None:
         return parsed, None
+    bound_invocation_id = invocation_id or runner.latest_test_turn_id
     observations = tuple(runner.local_test_observations())
     try:
         snapshot = stable_tracked_tree_snapshot(assigned_workdir)
@@ -4096,30 +4200,101 @@ def _derive_authenticated_risk_evidence_for_coder(
         matrix=matrix_payload,
         claims=parsed.risk_test_matrix_claims,
         observations=reconciled.observations,
-        invocation_id=runner.latest_test_turn_id,
+        invocation_id=bound_invocation_id,
         current_head=head_sha,
         current_tree_digest=(snapshot.tracked_digest if snapshot is not None else None),
+        authenticated_checkout_head=(snapshot.head if snapshot is not None else None),
+        authenticated_tree_clean=(
+            snapshot is not None
+            and snapshot.complete
+            and snapshot.stable is True
+            and snapshot.status_clean is True
+            and snapshot.head == head_sha
+        ),
+        predecessor_head=predecessor_head,
         expected_identity=identity,
     )
-    # Historical responses may still carry a canonical evidence object. It is
-    # never used for identity, status, ordering, mappings, or citations, but
-    # its bounded caveat prose remains useful as explicitly non-authoritative
-    # context while the fresh builder emits the real row status.
-    if parsed.risk_test_matrix_evidence is not None and parsed.risk_test_matrix_claims is None:
-        legacy_caveats = {
-            row.row_id: row.caveats
-            for row in parsed.risk_test_matrix_evidence.rows
-        }
-        derived_rows = tuple(
-            dataclasses_replace(
-                row,
-                caveats=tuple(dict.fromkeys((*row.caveats, *legacy_caveats.get(row.row_id, ())))),
+    actionable = tuple(
+        diagnostic for diagnostic in result.diagnostics
+        if diagnostic.code != "missing-claim"
+        and diagnostic.code != "unsuperseded-journal-failure"
+    )
+    if actionable and config is not None and session_id and reauthenticate_head is not None:
+        catalog = _current_test_turn_observations(runner)
+        prompt = _post_auth_correction_prompt(
+            parsed,
+            matrix_row_ids=approved_plan_context.risk_test_matrix_expected_row_ids,
+            diagnostics=actionable,
+            execution_catalog=_safe_execution_handle_catalog(catalog),
+        )
+        try:
+            correction_result = run_agent_result(
+                runner,
+                agent=config.coder,
+                config=config,
+                prompt=prompt,
+                session_id=session_id,
+                role="coder",
+                label="semantic-evidence-correction",
+                timeout_seconds=config.coder_test_command_timeout_seconds,
             )
-            for row in result.evidence.rows
+            corrected = _parse_fresh_correction_claims(
+                correction_result.text,
+                parsed,
+                row_ids=approved_plan_context.risk_test_matrix_expected_row_ids,
+                execution_catalog=catalog,
+            )
+        except Exception as exc:
+            corrected = None
+            correction_error = f"semantic correction unavailable: {type(exc).__name__}"
+        else:
+            correction_error = None
+        if corrected is not None:
+            corrected_head = reauthenticate_head()
+            if corrected_head == head_sha:
+                return _derive_authenticated_risk_evidence_for_coder(
+                    corrected,
+                    approved_plan_context=approved_plan_context,
+                    runner=runner,
+                    assigned_workdir=assigned_workdir,
+                    head_sha=head_sha,
+                    predecessor_head=predecessor_head,
+                    invocation_id=bound_invocation_id,
+                )
+            if corrected_head is not None:
+                raced_parsed, raced_result = _derive_authenticated_risk_evidence_for_coder(
+                    corrected,
+                    approved_plan_context=approved_plan_context,
+                    runner=runner,
+                    assigned_workdir=assigned_workdir,
+                    head_sha=corrected_head,
+                    predecessor_head=predecessor_head,
+                    invocation_id=bound_invocation_id,
+                )
+                if raced_result is not None:
+                    raced_result = dataclasses_replace(
+                        raced_result,
+                        diagnostics=tuple((*raced_result.diagnostics, PostAuthClaimDiagnostic(
+                            actionable[0].row_id if actionable else "risk-test-matrix",
+                            "head-changed-during-correction",
+                            "The authenticated PR head changed during semantic correction; evidence was rebuilt for the new head.",
+                        ))),
+                    )
+                    raced_parsed = dataclasses_replace(
+                        raced_parsed,
+                        risk_test_matrix_evidence=raced_result.evidence,
+                        risk_test_matrix_diagnostics=raced_result.diagnostics,
+                    )
+                return raced_parsed, raced_result
+            correction_error = "semantic correction was discarded because the authenticated PR head changed"
+        diagnostic = PostAuthClaimDiagnostic(
+            actionable[0].row_id if actionable else "risk-test-matrix",
+            "semantic-correction-exhausted",
+            correction_error or "The bounded semantic correction did not produce a valid claim set.",
         )
         result = dataclasses_replace(
             result,
-            evidence=dataclasses_replace(result.evidence, rows=derived_rows),
+            diagnostics=tuple((*result.diagnostics, diagnostic)),
         )
     return dataclasses_replace(
         parsed,
@@ -7246,8 +7421,8 @@ def _implement_approved_issue(
             require_risk_test_matrix_contract=(
                 approved_plan_context is not None and approved_plan_context.matrix_available
             ),
-            authoritative_test_observations=runner.local_test_observations(),
-            execution_catalog=runner.local_test_observations(),
+            authoritative_test_observations=_current_test_turn_observations(runner),
+            execution_catalog=_current_test_turn_observations(runner),
             delivered_risk_test_matrix_row_ids=(
                 approved_plan_context.risk_test_matrix_expected_row_ids
                 if approved_plan_context is not None and approved_plan_context.matrix_available
@@ -7462,6 +7637,11 @@ def _implement_approved_issue(
         runner=runner,
         assigned_workdir=active_workdir(implementation_config),
         head_sha=initial_pr_context.metadata.head_sha,
+        config=implementation_config,
+        session_id=coder_response.session_id,
+        reauthenticate_head=lambda: get_pr_review_context(
+            runner, config=implementation_config, pr_number=pr_number
+        ).metadata.head_sha,
     )
     initial_local_test_evidence = runner.render_local_test_evidence(
         current_head=initial_pr_context.metadata.head_sha,
@@ -10419,6 +10599,11 @@ def run_issue_loop(
             runner=runner,
             assigned_workdir=active_workdir(config),
             head_sha=initial_pr_metadata.head_sha,
+            config=config,
+            session_id=coder_response.session_id,
+            reauthenticate_head=lambda: get_pr_review_context(
+                runner, config=config, pr_number=pr_number
+            ).metadata.head_sha,
         )
         initial_local_test_evidence = runner.render_local_test_evidence(
             current_head=initial_pr_metadata.head_sha,
@@ -10675,7 +10860,7 @@ def _coder_followup_review_context(
     summary = _extract_structured_coder_summary(text)
     tests = _extract_structured_coder_tests_run(text)
     try:
-        parsed = validate_structured_coder_followup(text)
+        parsed = parse_historical_structured_coder_followup(text)
     except AgentLoopError:
         parsed = None
     payload: dict[str, object] = {
@@ -10734,14 +10919,14 @@ def _extract_structured_coder_summary(text: str | None) -> str | None:
         return None
     try:
         try:
-            implementation = validate_structured_issue_implementation(text)
+            implementation = parse_historical_structured_issue_implementation(text)
         except IssueImplementationConflictError as exc:
             implementation = exc.payload
         except AgentLoopError:
             implementation = None
         if isinstance(implementation, StructuredIssueImplementation):
             return implementation.summary
-        parsed = validate_structured_coder_followup(text)
+        parsed = parse_historical_structured_coder_followup(text)
         return parsed.summary if parsed else None
     except AgentLoopError:
         return None
@@ -10752,14 +10937,14 @@ def _extract_structured_coder_tests_run(text: str | None) -> tuple[str, ...] | N
         return None
     try:
         try:
-            implementation = validate_structured_issue_implementation(text)
+            implementation = parse_historical_structured_issue_implementation(text)
         except IssueImplementationConflictError as exc:
             implementation = exc.payload
         except AgentLoopError:
             implementation = None
         if isinstance(implementation, StructuredIssueImplementation):
             return implementation.tests_run
-        parsed = validate_structured_coder_followup(text)
+        parsed = parse_historical_structured_coder_followup(text)
         return parsed.tests_run if parsed else None
     except AgentLoopError:
         return None
@@ -16590,8 +16775,8 @@ def run_pr_loop(
                         1 if approved_plan_context is not None and approved_plan_context.matrix_available
                         else 0
                     ),
-                    authoritative_test_observations=runner.local_test_observations(),
-                    execution_catalog=runner.local_test_observations(),
+                    authoritative_test_observations=_current_test_turn_observations(runner),
+                    execution_catalog=_current_test_turn_observations(runner),
                     delivered_risk_test_matrix_row_ids=(
                         approved_plan_context.risk_test_matrix_expected_row_ids
                         if approved_plan_context is not None and approved_plan_context.matrix_available
@@ -16677,6 +16862,12 @@ def run_pr_loop(
                         runner=runner,
                         assigned_workdir=active_workdir(config),
                         head_sha=updated_pr_context.metadata.head_sha,
+                        predecessor_head=pr_metadata.head_sha,
+                        config=config,
+                        session_id=coder_response.session_id,
+                        reauthenticate_head=lambda: get_pr_review_context(
+                            runner, config=config, pr_number=pr_number
+                        ).metadata.head_sha,
                     )
                 )
                 coder_response = dataclasses_replace(

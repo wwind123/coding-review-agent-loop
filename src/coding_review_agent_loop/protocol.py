@@ -1571,6 +1571,9 @@ def derive_risk_test_matrix_evidence(
     invocation_id: str | None = None,
     current_head: str | None = None,
     current_tree_digest: str | None = None,
+    authenticated_checkout_head: str | None = None,
+    authenticated_tree_clean: bool | None = None,
+    predecessor_head: str | None = None,
     expected_identity: str | None = None,
 ) -> DerivedRiskEvidenceResult:
     """Derive canonical evidence from trusted matrix/journal/head inputs.
@@ -1625,6 +1628,17 @@ def derive_risk_test_matrix_evidence(
                 )
             selected_refs.add(execution_ref)
     diagnostics: list[PostAuthClaimDiagnostic] = []
+    head_binding_requested = (
+        authenticated_checkout_head is not None
+        or authenticated_tree_clean is not None
+        or predecessor_head is not None
+    )
+    checkout_head_mismatch = head_binding_requested and (
+        current_head is None
+        or authenticated_checkout_head != current_head
+        or (predecessor_head is not None and authenticated_checkout_head == predecessor_head)
+    )
+    checkout_tree_unavailable = head_binding_requested and authenticated_tree_clean is not True
     unsuperseded_failures = [
         observation for observation in observations
         if _observation_value(observation, "provenance") == "parent-observed"
@@ -1666,6 +1680,18 @@ def derive_risk_test_matrix_evidence(
                         f"Execution selector `{execution_ref}` was not bound to the current invocation.",
                     ))
                 attribution = _observation_attribution(observation)
+                if checkout_head_mismatch:
+                    valid_selected = False
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "checkout-head-mismatch",
+                        "The assigned checkout was not authenticated at the exact current PR head.",
+                    ))
+                if checkout_tree_unavailable:
+                    valid_selected = False
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "checkout-tree-unavailable",
+                        "The assigned checkout was not authenticated as a stable clean tracked tree.",
+                    ))
                 if current_head is not None and attribution.get("head") not in {None, current_head}:
                     valid_selected = False
                     diagnostics.append(PostAuthClaimDiagnostic(
@@ -4322,6 +4348,7 @@ def validate_structured_coder_followup(
     authoritative_test_observations: Sequence[object] | None = None,
     delivered_risk_test_matrix_row_ids: Sequence[str] | None = None,
     execution_catalog: Sequence[object] | None = None,
+    allow_historical_canonical_evidence: bool = False,
 ) -> StructuredCoderFollowup | None:
     payload = _extract_structured_coder_followup_payload(text)
     if payload is None:
@@ -4330,6 +4357,18 @@ def validate_structured_coder_followup(
     kind = payload.get("kind")
     if isinstance(kind, str) and kind != "coder_followup":
         raise AgentLoopError("Structured response kind mismatch: expected `coder_followup`.")
+    optional_fields = {
+        "addressed_item_notes",
+        "remaining_item_notes",
+        "tests_run",
+        "test_observations",
+        "risk_test_matrix_claims",
+        "disputed_items",
+        "dispute_evidence",
+        "architecture_impact",
+    }
+    if allow_historical_canonical_evidence:
+        optional_fields.add("risk_test_matrix_evidence")
     _expect_exact_keys(
         payload,
         context="coder_followup",
@@ -4343,17 +4382,7 @@ def validate_structured_coder_followup(
             "human_requirements",
             "human_requirement_dispositions",
         },
-        optional={
-            "addressed_item_notes",
-            "remaining_item_notes",
-            "tests_run",
-            "test_observations",
-            "risk_test_matrix_claims",
-            "risk_test_matrix_evidence",
-            "disputed_items",
-            "dispute_evidence",
-            "architecture_impact",
-        },
+        optional=optional_fields,
     )
     human_requirements_payload = _expect_object(
         payload["human_requirements"],
@@ -4391,7 +4420,7 @@ def validate_structured_coder_followup(
             execution_catalog=execution_catalog,
         )
     risk_evidence = None
-    if "risk_test_matrix_evidence" in payload:
+    if allow_historical_canonical_evidence and "risk_test_matrix_evidence" in payload:
         risk_evidence = parse_risk_test_matrix_evidence(
             payload["risk_test_matrix_evidence"],
             matrix=delivered_risk_test_matrix,
@@ -4501,6 +4530,7 @@ def validate_structured_issue_implementation(
     authoritative_test_observations: Sequence[object] | None = None,
     delivered_risk_test_matrix_row_ids: Sequence[str] | None = None,
     execution_catalog: Sequence[object] | None = None,
+    allow_historical_canonical_evidence: bool = False,
 ) -> StructuredIssueImplementation | None:
     """Parse and validate the strict issue-implementation result envelope.
 
@@ -4516,6 +4546,12 @@ def validate_structured_issue_implementation(
         raise AgentLoopError(
             "Structured response kind mismatch: expected `issue_implementation`."
         )
+    optional_fields = {
+        "tests_run", "test_observations", "architecture_impact",
+        "risk_test_matrix_claims",
+    }
+    if allow_historical_canonical_evidence:
+        optional_fields.add("risk_test_matrix_evidence")
     _expect_exact_keys(
         payload,
         context="issue_implementation",
@@ -4528,10 +4564,7 @@ def validate_structured_issue_implementation(
             "human_requirements",
             "human_requirement_dispositions",
         },
-        optional={
-            "tests_run", "test_observations", "architecture_impact",
-            "risk_test_matrix_claims", "risk_test_matrix_evidence",
-        },
+        optional=optional_fields,
     )
     state = _expect_non_empty_string(payload["state"], context="issue_implementation.state")
     if state != "blocking":
@@ -4583,7 +4616,7 @@ def validate_structured_issue_implementation(
             execution_catalog=execution_catalog,
         )
     risk_evidence = None
-    if "risk_test_matrix_evidence" in payload:
+    if allow_historical_canonical_evidence and "risk_test_matrix_evidence" in payload:
         risk_evidence = parse_risk_test_matrix_evidence(
             payload["risk_test_matrix_evidence"],
             matrix=delivered_risk_test_matrix,
@@ -4637,6 +4670,26 @@ def validate_structured_issue_implementation(
     ):
         raise IssueImplementationConflictError(parsed)
     return parsed
+
+
+def parse_historical_structured_coder_followup(
+    text: str,
+    **kwargs: object,
+) -> StructuredCoderFollowup | None:
+    """Read an already-persisted follow-up without making it a fresh contract."""
+    return validate_structured_coder_followup(
+        text, allow_historical_canonical_evidence=True, **kwargs
+    )
+
+
+def parse_historical_structured_issue_implementation(
+    text: str,
+    **kwargs: object,
+) -> StructuredIssueImplementation | None:
+    """Read an already-persisted implementation without making it a fresh contract."""
+    return validate_structured_issue_implementation(
+        text, allow_historical_canonical_evidence=True, **kwargs
+    )
 
 
 def validate_structured_task_result(

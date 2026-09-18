@@ -174,6 +174,38 @@ def test_derived_matrix_evidence_preserves_unsuperseded_failure_caveat() -> None
     assert any(diagnostic.code == "unsuperseded-journal-failure" for diagnostic in result.diagnostics)
 
 
+def test_derived_matrix_evidence_rejects_a_matching_tree_from_the_wrong_checkout_head() -> None:
+    matrix = parse_risk_test_matrix(_matrix())
+    observation = _derived_observation(
+        execution_ref="invocation:observation-1",
+        receipt_id="receipt-1",
+    )
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_protocol.py::test_ordinary",),
+        workflow_path_claim="The workflow path ran.",
+        outcome_assertions=("The selected test passed.",),
+        forbidden_effect_assertions=("No stale head was merged.",),
+    ),))
+
+    result = derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=(observation,),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-other",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+    assert result.evidence.rows[0].status == "stale/unverified"
+    assert any(diagnostic.code == "checkout-head-mismatch" for diagnostic in result.diagnostics)
+
+
 def test_m780_01_matrix_is_bounded_and_rendered_from_structured_payload() -> None:
     matrix = parse_risk_test_matrix(_matrix())
     changes = (RiskTestMatrixChange("change", ("row-ordinary",), "Clarified the recovery outcome."),)
