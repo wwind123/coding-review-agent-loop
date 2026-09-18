@@ -78,6 +78,7 @@ from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
     validate_structured_plan_state,
     validate_structured_issue_implementation,
+    risk_test_matrix_prompt_examples,
 )
 
 
@@ -1482,28 +1483,41 @@ def test_exhausted_plan_validation_persists_from_the_planning_orchestration_path
     assert "not persisted" not in str(error.value)
 
 
-@pytest.mark.parametrize("missing_contract", ["execution", "matrix"])
+@pytest.mark.parametrize(
+    ("missing_contract", "agent_max_retries", "expected_planner_calls"),
+    [
+        ("execution", 0, 1),
+        ("matrix", 0, 1),
+        ("execution", 1, 2),
+        ("matrix", 1, 1),
+        ("matrix-malformed", 0, 1),
+        ("matrix-malformed", 1, 1),
+    ],
+)
 def test_exhausted_fresh_contract_integrity_persists_validation_diagnostic(
-    tmp_path, missing_contract
+    tmp_path, missing_contract, agent_max_retries, expected_planner_calls
 ):
     payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
     if missing_contract == "execution":
         payload.pop("execution_recommendation")
         expected_diagnostic = "execution_recommendation"
-    else:
+    elif missing_contract == "matrix":
         payload.pop("risk_test_matrix")
         payload.pop("risk_test_matrix_changes")
         payload.pop("risk_test_matrix_contract_version")
         expected_diagnostic = "risk_test_matrix"
+    else:
+        payload["risk_test_matrix"].pop("important_exclusions")
+        expected_diagnostic = "important_exclusions"
     candidate = (
         json.dumps(payload)
         + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     )
     runner = _PlanDiagnosticRunner(issue_number=56)
-    runner.claude_outputs = [candidate]
+    runner.claude_outputs = [candidate] * expected_planner_calls
     config = make_config(
         tmp_path,
-        agent_max_retries=0,
+        agent_max_retries=agent_max_retries,
         execution_strategy_contract_required=True,
     )
 
@@ -1515,6 +1529,8 @@ def test_exhausted_fresh_contract_integrity_persists_validation_diagnostic(
     assert expected_diagnostic in exhaustion.diagnostic
     assert exhaustion.candidate_digest == hashlib.sha256(candidate.encode()).hexdigest()
     assert len(runner.diagnostic_posts) == 1
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]) == expected_planner_calls
+    assert error.value.failure_category == "fresh-contract-integrity"
 
 
 def test_invalid_terminal_plan_repair_replaces_persisted_candidate_provenance(
@@ -2463,6 +2479,25 @@ def test_issue_loop_accepts_fresh_v1_plan_without_recommendation_driven_routing(
     assert run_issue_loop(runner, issue_number=783, config=config, plan_first=True) == 0
     assert runner.issues == []
     assert any("AGENT_EXECUTION_RECOMMENDATION" in comment for comment in runner.comments)
+
+
+def test_issue_loop_accepts_fresh_v1_applicable_matrix(tmp_path):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    payload["risk_test_matrix"] = risk_test_matrix_prompt_examples()["applicable"]
+    candidate = json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    runner = _FakeRunner(
+        claude_outputs=[candidate],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = make_config(
+        tmp_path,
+        coder="claude",
+        reviewer="codex",
+        execution_strategy_contract_required=True,
+    )
+
+    assert run_issue_loop(runner, issue_number=783, config=config, plan_first=True) == 0
+    assert runner.issues == []
 
 
 def test_fresh_v1_plan_host_resume_reuses_posted_round_without_new_agent_turn(tmp_path):

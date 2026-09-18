@@ -848,6 +848,31 @@ RISK_MATRIX_MAX_FIELD_BYTES = 1_024
 RISK_MATRIX_MAX_PAYLOAD_BYTES = 96_000
 RISK_MATRIX_APPLICABILITY = frozenset({"applicable", "not-applicable"})
 RISK_MATRIX_CHANGE_OPERATIONS = frozenset({"add", "change", "retire", "split", "merge"})
+# These ordered tuples are the wire contract used by both strict parsing and
+# agent-facing schema guidance. Keep the optional rationale separate so prompt
+# examples can show the exact accepted shape without weakening validation.
+RISK_TEST_MATRIX_REQUIRED_KEYS = (
+    "applicability",
+    "rows",
+    "important_exclusions",
+)
+RISK_TEST_MATRIX_OPTIONAL_KEYS = ("not_applicable_rationale",)
+RISK_TEST_MATRIX_ROW_KEYS = (
+    "row_id",
+    "label",
+    "entry_path_or_mode",
+    "initial_state",
+    "event",
+    "expected_outcome",
+    "forbidden_side_effects",
+    "proposed_test_level",
+    "proposed_test_location",
+    "applicability",
+    "related_scope_item_ids",
+    "execution_owner",
+)
+RISK_TEST_MATRIX_CHANGE_KEYS = ("operation", "row_ids", "rationale")
+RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS = ("changes",)
 RISK_MATRIX_OWNER_NAMES = frozenset({"one-shot", "retained-parent", "final-integration"})
 RISK_MATRIX_EVIDENCE_STATUSES = frozenset(
     {
@@ -971,8 +996,8 @@ def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix")
     _expect_exact_keys(
         payload,
         context=context,
-        required={"applicability", "rows", "important_exclusions"},
-        optional={"not_applicable_rationale"},
+        required=set(RISK_TEST_MATRIX_REQUIRED_KEYS),
+        optional=set(RISK_TEST_MATRIX_OPTIONAL_KEYS),
     )
     applicability = _risk_bounded_string(payload["applicability"], context=f"{context}.applicability", max_bytes=64)
     if applicability not in RISK_MATRIX_APPLICABILITY:
@@ -990,12 +1015,7 @@ def _parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix")
         _expect_exact_keys(
             row,
             context=row_context,
-            required={
-                "row_id", "label", "entry_path_or_mode", "initial_state", "event",
-                "expected_outcome", "forbidden_side_effects", "proposed_test_level",
-                "proposed_test_location", "applicability", "related_scope_item_ids",
-                "execution_owner",
-            },
+            required=set(RISK_TEST_MATRIX_ROW_KEYS),
         )
         row_id = _validate_risk_row_id(row["row_id"], context=f"{row_context}.row_id")
         if row_id in seen:
@@ -1064,7 +1084,7 @@ def parse_risk_test_matrix(value: object, *, context: str = "risk_test_matrix") 
 
 def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_matrix_changes") -> tuple[RiskTestMatrixChange, ...]:
     if isinstance(value, dict):
-        _expect_exact_keys(value, context=context, required={"changes"})
+        _expect_exact_keys(value, context=context, required=set(RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS))
         value = value["changes"]
     if isinstance(value, tuple):
         value = list(value)
@@ -1076,7 +1096,7 @@ def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_
     for index, raw_change in enumerate(value):
         change_context = f"{context}[{index}]"
         change = _expect_object(raw_change, context=change_context)
-        _expect_exact_keys(change, context=change_context, required={"operation", "row_ids", "rationale"})
+        _expect_exact_keys(change, context=change_context, required=set(RISK_TEST_MATRIX_CHANGE_KEYS))
         operation = _risk_bounded_string(change["operation"], context=f"{change_context}.operation", max_bytes=32)
         if operation not in RISK_MATRIX_CHANGE_OPERATIONS:
             raise AgentLoopError(f"{change_context}.operation is invalid.")
@@ -1095,6 +1115,46 @@ def _parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_
 
 def parse_risk_test_matrix_changes(value: object, *, context: str = "risk_test_matrix_changes") -> tuple[RiskTestMatrixChange, ...]:
     return _parse_risk_test_matrix_changes(value, context=context)
+
+
+def risk_test_matrix_prompt_examples() -> dict[str, object]:
+    """Return minimal fresh-matrix payloads accepted by the strict parser.
+
+    Prompt layers use these fresh objects instead of copying a second schema
+    literal. Tests parse the returned examples so a prompt contract change
+    cannot silently diverge from the validator.
+    """
+    return {
+        "applicable": {
+            "applicability": "applicable",
+            "rows": [{
+                "row_id": "fresh-row",
+                "label": "Fresh workflow row",
+                "entry_path_or_mode": "issue plan-first / fresh plan_state",
+                "initial_state": "No canonical plan exists.",
+                "event": "The planner emits the applicable scenario.",
+                "expected_outcome": "Strict validation accepts the response.",
+                "forbidden_side_effects": ["Do not omit the scenario."],
+                "proposed_test_level": "protocol unit",
+                "proposed_test_location": "tests/test_protocol.py",
+                "applicability": "required",
+                "related_scope_item_ids": ["scope-1"],
+                "execution_owner": "one-shot",
+            }],
+            "important_exclusions": ["Planned tests are not evidence."],
+        },
+        "not_applicable": {
+            "applicability": "not-applicable",
+            "rows": [],
+            "important_exclusions": [],
+            "not_applicable_rationale": "This narrow change has no meaningful transition surface.",
+        },
+        "changes": [{
+            "operation": "change",
+            "row_ids": ["fresh-row"],
+            "rationale": "The current revision changes the scenario semantics.",
+        }],
+    }
 
 
 def risk_test_matrix_identity(

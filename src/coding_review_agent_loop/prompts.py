@@ -44,6 +44,12 @@ from .protocol import (
     UnresolvedReviewItem,
     discuss_round_synthesis_payload,
     is_failed_discuss_response,
+    RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS,
+    RISK_TEST_MATRIX_CHANGE_KEYS,
+    RISK_TEST_MATRIX_OPTIONAL_KEYS,
+    RISK_TEST_MATRIX_REQUIRED_KEYS,
+    RISK_TEST_MATRIX_ROW_KEYS,
+    risk_test_matrix_prompt_examples,
 )
 from .protocol_markers import sanitize_historical_text
 from .workdirs import agent_workdir
@@ -1951,26 +1957,38 @@ matrix generation gate. Do not add `risk_test_matrix_contract_version`,
 Only an explicitly fresh generation-1 planning lifecycle may introduce those
 fields, and the validator rejects an unsolicited matrix here.
 """
-    return execution_guidance + """
+    return execution_guidance + _risk_test_matrix_contract_guidance()
+
+
+def _risk_test_matrix_contract_guidance() -> str:
+    examples = risk_test_matrix_prompt_examples()
+    required = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_REQUIRED_KEYS)
+    optional = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_OPTIONAL_KEYS)
+    row_keys = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_ROW_KEYS)
+    change_keys = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_CHANGE_KEYS)
+    container_keys = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS)
+    return f"""
 Risk-based mode and transition matrix contract:
 For work involving multiple execution modes, lifecycle states, persistence or
 restart, authorization boundaries, or recovery/failure paths, also include
 `risk_test_matrix_contract_version`: `1`, `risk_test_matrix`, and
 `risk_test_matrix_changes`. The matrix must be bounded and must be either an
 `applicable` object with meaningful rows or a `not-applicable` object with a
-non-empty proportionate rationale. Each applicable row has a stable matrix-only
-`row_id`, label, entry path/mode, initial state, event, expected outcome,
-forbidden side effects, proposed test level/location, applicability, related
-scope-item IDs, and exactly one execution owner. Row `applicability` is
-`applicable`, `required`, or `not-applicable`; row-level `not-applicable`
-scenarios are excluded from coder evidence obligations. Include important
-exclusions.
-Do not use reviewer finding IDs such as `reviewer-id` for matrix rows. Planned tests
-are proposals, not evidence that tests exist or pass. Before approval, make
-corrections visible in `risk_test_matrix_changes` with add/change/retire/split/
-merge operations and rationales; after approval, substantive changes require
-the normal newly reviewed plan workflow. Narrow local changes may use the
-non-empty not-applicable rationale.
+non-empty proportionate rationale.
+
+The matrix object requires exactly {required}; it may also contain only
+{optional}. Each row object requires exactly {row_keys}. Each audit entry in
+`risk_test_matrix_changes` requires exactly {change_keys}; the changes value is
+an array (or the exact wrapper object {{{container_keys}}}). Row
+`applicability` is `applicable`, `required`, or `not-applicable`; row-level
+`not-applicable` scenarios are excluded from coder evidence obligations.
+Include important exclusions and do not use reviewer finding IDs such as
+`reviewer-id` for matrix rows. Planned tests are proposals, not evidence that
+tests exist or pass. Before approval, make corrections visible in
+`risk_test_matrix_changes` with add/change/retire/split/merge operations and
+rationales; after approval, substantive changes require the normal newly
+reviewed plan workflow. Narrow local changes may use the non-empty
+`not_applicable_rationale`.
 
 On a plan revision, `risk_test_matrix_changes` is the audit for the current
 revision only: describe exactly the semantic diff from the immediately prior
@@ -1987,6 +2005,21 @@ existing precise `change`, `split`, or `merge` entry that already covers this
 complete union satisfies the matrix-level requirement; do not duplicate it.
 Add separate precise row add/change/retire/split/merge entries only for row
 transitions not already covered by that complete-scope entry.
+
+Minimal validator-accepted applicable matrix example:
+```json
+{json.dumps(examples["applicable"], indent=2)}
+```
+
+Minimal validator-accepted not-applicable matrix example:
+```json
+{json.dumps(examples["not_applicable"], indent=2)}
+```
+
+Minimal validator-accepted `risk_test_matrix_changes` example:
+```json
+{json.dumps(examples["changes"], indent=2)}
+```
 """
 
 

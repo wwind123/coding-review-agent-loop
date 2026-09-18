@@ -35,6 +35,12 @@ from .protocol import (
     parse_execution_recommendation_payload,
     parse_risk_test_matrix,
     parse_risk_test_matrix_changes,
+    RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS,
+    RISK_TEST_MATRIX_CHANGE_KEYS,
+    RISK_TEST_MATRIX_OPTIONAL_KEYS,
+    RISK_TEST_MATRIX_REQUIRED_KEYS,
+    RISK_TEST_MATRIX_ROW_KEYS,
+    risk_test_matrix_prompt_examples,
 )
 from .errors import FreshContractIntegrityError
 
@@ -1195,6 +1201,7 @@ class RepairAttemptResult:
     log_path: Path | None
     fallback_planned: bool
     validation_result: object | None = None
+    integrity_contract: Literal["execution_recommendation", "risk_test_matrix"] | None = None
 
 
 _KNOWN_ERROR_RE = re.compile(
@@ -1224,6 +1231,40 @@ def _sanitize_diagnostic(text: str, *, config: AgentLoopConfig | None = None) ->
     selected = matching[-1:] if matching else lines[-20:]
     encoded = "\n".join(selected).encode("utf-8")[-4096:]
     return encoded.decode("utf-8", errors="ignore")
+
+
+def _risk_test_matrix_repair_guidance() -> str:
+    examples = risk_test_matrix_prompt_examples()
+    required = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_REQUIRED_KEYS)
+    optional = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_OPTIONAL_KEYS)
+    row_keys = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_ROW_KEYS)
+    change_keys = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_CHANGE_KEYS)
+    container_keys = ", ".join(f"`{key}`" for key in RISK_TEST_MATRIX_CHANGE_CONTAINER_KEYS)
+    return f"""
+Exact fresh risk-test-matrix schema (copied from the strict validator):
+- Matrix keys: exactly {required}; optional only {optional}.
+- Row keys: exactly {row_keys}.
+- Audit-entry keys: exactly {change_keys}; `risk_test_matrix_changes` is an
+  array or the exact wrapper object {{{container_keys}}}.
+- A not-applicable matrix has no rows and requires a non-empty
+  `not_applicable_rationale`; an applicable matrix requires at least one
+  applicable or required row.
+
+Validator-accepted applicable matrix example:
+```json
+{json.dumps(examples["applicable"], indent=2)}
+```
+
+Validator-accepted not-applicable matrix example:
+```json
+{json.dumps(examples["not_applicable"], indent=2)}
+```
+
+Validator-accepted audit example:
+```json
+{json.dumps(examples["changes"], indent=2)}
+```
+"""
 
 
 def _build_repair_prompt(
@@ -1296,8 +1337,9 @@ def _build_repair_prompt(
     matrix_contract_instruction = (
         "This is a fresh generation-1 planning response. Preserve the complete "
         "risk_test_matrix_contract_version, risk_test_matrix, and "
-        "risk_test_matrix_changes fields exactly; do not invent, omit, or weaken "
+        "risk_test_matrix_changes fields exactly. Do not invent, omit, or weaken "
         "matrix scenarios.\n"
+        + _risk_test_matrix_repair_guidance()
         if require_risk_test_matrix_contract else ""
     )
     legacy_matrix_instruction = (

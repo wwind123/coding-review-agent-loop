@@ -2280,6 +2280,7 @@ def _run_structured_repair(
                         diagnostic=str(exc),
                         log_path=None,
                         fallback_planned=False,
+                        integrity_contract="execution_recommendation",
                     )
                 ]
     if repair_kwargs.get("require_risk_test_matrix_contract"):
@@ -2301,6 +2302,7 @@ def _run_structured_repair(
                         diagnostic=str(exc),
                         log_path=None,
                         fallback_planned=False,
+                        integrity_contract="risk_test_matrix",
                     )
                 ]
     if attempt_repair is not _ORIGINAL_ATTEMPT_REPAIR:
@@ -3652,14 +3654,19 @@ def _run_validated_agent(
                         and terminal_repair.outcome == "fresh_contract_integrity"
                     ):
                         # A fresh planning response with no mechanically
-                        # recoverable recommendation must get a new planner
-                        # invocation. It is not safe for the repair model to
-                        # synthesize topology. The original structured
-                        # validator rejection remains the authoritative
-                        # candidate and diagnostic for terminal persistence.
-                        should_retry = True
+                        # recoverable contract must not be repaired by
+                        # synthesis. Execution-recommendation integrity keeps
+                        # its established planner replay, while a risk-matrix
+                        # integrity failure is deterministic and fail-fast.
+                        # The original structured validator rejection remains
+                        # authoritative for terminal diagnostic persistence.
+                        should_retry = terminal_repair.integrity_contract == "execution_recommendation"
                         last_failure_category = "fresh-contract-integrity"
-                        last_classification_text = "fresh planning contract requires a new planner turn"
+                        last_classification_text = (
+                            "fresh planning execution recommendation requires a new planner turn"
+                            if terminal_repair.integrity_contract == "execution_recommendation"
+                            else "fresh planning risk-test-matrix contract is not mechanically recoverable"
+                        )
                     elif terminal_repair is not None:
                         repaired_exhaustion = _capture_terminal_plan_repair_rejection(
                             terminal_repair,
