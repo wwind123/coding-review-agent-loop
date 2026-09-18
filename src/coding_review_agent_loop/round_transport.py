@@ -46,6 +46,11 @@ _RISK_TEST_MATRIX_SECTION_BOUNDARY_RE = re.compile(
 # Spill reviewer checkpoints first: they are often the largest metadata field
 # and are required to safely resume a provisional parallel-review round.
 _SPILL_FIELDS = (
+    # Semantic planning authority is structured JSON rather than visible
+    # prose.  Keep these in the durable spill set so large authenticated
+    # sidecars remain lossless when the anchor reaches GitHub's body limit.
+    "assembled_plan_sidecar",
+    "raw_patch_provenance",
     "canonical_reviewer_response",
     "raw_structured_coder_response",
     "canonical_plan",
@@ -630,13 +635,28 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
         current_anchor = render_anchor(payload)
         if len(current_anchor) <= MAX_GITHUB_BODY_CHARS:
             break
-        value = payload.get(field)
-        if not isinstance(value, str):
+        if field not in payload:
             continue
-        packed = zlib.compress(value.encode(), 9)
+        value = payload.get(field)
+        if isinstance(value, str):
+            raw_value = value.encode("utf-8")
+            value_encoding = "text"
+        elif isinstance(value, (dict, list, tuple, int, float, bool)):
+            try:
+                raw_value = json.dumps(
+                    value, separators=(",", ":"), sort_keys=True, ensure_ascii=False
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise AgentLoopError(
+                    f"Round metadata field {field} is not JSON-serializable."
+                ) from exc
+            value_encoding = "json"
+        else:
+            continue
+        packed = zlib.compress(raw_value, 9)
         if len(packed) > _MAX_COMPRESSED:
             raise AgentLoopError(f"Round metadata field {field} is too large to spill safely.")
-        raw_digest = hashlib.sha256(value.encode()).hexdigest()
+        raw_digest = hashlib.sha256(raw_value).hexdigest()
         packed_digest = hashlib.sha256(packed).hexdigest()
         encoded_packed = _b64(packed)
         chunks = [
@@ -649,6 +669,7 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
             "parts": len(chunks),
             "sha256": raw_digest,
             "spill": packed_digest,
+            "encoding": value_encoding,
         }
         trial = dict(payload)
         trial[field] = reference
@@ -664,10 +685,11 @@ def prepare_round_comment(body: str | TrustedBody) -> tuple[TrustedBody, ...]:
                         "spill": packed_digest,
                         "field": field,
                         "index": index,
-                        "count": len(chunks),
-                        "sha256": raw_digest,
-                        "data": chunk,
-                    }
+                    "count": len(chunks),
+                    "sha256": raw_digest,
+                    "data": chunk,
+                    "encoding": value_encoding,
+                }
                 )
             )
 
@@ -746,6 +768,7 @@ def hydrate_mapping(
                 or int(item.get("count", -1)) != count
                 or str(item.get("sha256")) != str(ref["sha256"])
                 or str(item.get("spill")) != str(ref["spill"])
+                or str(item.get("encoding", "text")) != str(ref.get("encoding", "text"))
                 for item in ordered
             ):
                 raise ValueError("inconsistent parts")
@@ -755,7 +778,13 @@ def hydrate_mapping(
             raw = _decompress_bounded(packed)
             if hashlib.sha256(raw).hexdigest() != str(ref["sha256"]):
                 raise ValueError("corrupt payload")
-            result[field] = raw.decode("utf-8")
+            encoding = str(ref.get("encoding", "text"))
+            if encoding == "text":
+                result[field] = raw.decode("utf-8")
+            elif encoding == "json":
+                result[field] = json.loads(raw.decode("utf-8"))
+            else:
+                raise ValueError("unknown payload encoding")
         except (KeyError, TypeError, UnicodeDecodeError, ValueError, zlib.error):
             missing.add(field)
             result[field] = None

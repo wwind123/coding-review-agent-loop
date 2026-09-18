@@ -65,6 +65,7 @@ from .protocol import (
     parse_risk_test_matrix_changes,
     risk_test_matrix_identity,
     sanitize_risk_test_matrix,
+    parse_plan_revision_patch,
 )
 from .review_scheduling import ReviewSchedulingContract, SCHEDULER_PHASES
 from .unresolved_items import _apply_unresolved_item_dispositions
@@ -195,12 +196,62 @@ class PostedRoundMetadata:
     risk_test_matrix_identity: str | None = None
     risk_test_matrix_boundary_digest: str | None = None
     risk_test_matrix_diagnostic: str | None = None
+    # Semantic planning provenance is prospective and optional so historical
+    # round records retain their exact legacy encoding.  When populated, the
+    # canonical sidecar is the authenticated full-state source for restart;
+    # raw patches remain provenance and are never treated as canonical state.
+    response_form: str | None = None
+    base_round_number: int | None = None
+    base_state_identity: str | None = None
+    aggregate_plan_identity: str | None = None
+    raw_patch_provenance: dict | None = None
+    assembled_plan_sidecar: dict | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
         if self.execution_strategy_contract_version not in (None, 1):
             raise ValueError("invalid execution strategy contract version")
+        if self.response_form is not None and (
+            not isinstance(self.response_form, str)
+            or self.response_form not in {
+            "semantic-patch-v1", "legacy-full-state", "fresh-plan-state"
+            }
+        ):
+            raise ValueError("invalid planning response form")
+        if self.base_round_number is not None and (
+            isinstance(self.base_round_number, bool)
+            or not isinstance(self.base_round_number, int)
+            or self.base_round_number < 0
+        ):
+            raise ValueError("invalid semantic base round number")
+        for identity_name, identity in (
+            ("base_state_identity", self.base_state_identity),
+            ("aggregate_plan_identity", self.aggregate_plan_identity),
+        ):
+            if identity is not None and (
+                not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity)
+            ):
+                raise ValueError(f"invalid {identity_name}")
+        if self.raw_patch_provenance is not None and not isinstance(self.raw_patch_provenance, dict):
+            raise ValueError("invalid raw semantic patch provenance")
+        if self.assembled_plan_sidecar is not None and not isinstance(self.assembled_plan_sidecar, dict):
+            raise ValueError("invalid assembled plan sidecar")
+        if self.assembled_plan_sidecar is not None:
+            from .plan_assembly import decode_assembled_plan_sidecar
+
+            try:
+                sidecar = decode_assembled_plan_sidecar(self.assembled_plan_sidecar)
+            except AgentLoopError as exc:
+                raise ValueError("invalid assembled plan sidecar") from exc
+            if self.response_form is not None and sidecar.response_form != self.response_form:
+                raise ValueError("semantic response form does not match assembled sidecar")
+            if (
+                self.aggregate_plan_identity is not None
+                and sidecar.aggregate_identity != self.aggregate_plan_identity
+            ):
+                raise ValueError("semantic aggregate identity does not match assembled sidecar")
+        _validate_semantic_round_metadata(self)
         if (
             self.execution_strategy_identity is not None
             and not isinstance(self.execution_strategy_identity, dict)
@@ -231,6 +282,107 @@ class PostedRoundMetadata:
             )
         ):
             object.__setattr__(self, "scheduler_metadata_status", "valid")
+
+    @property
+    def aggregate_identity(self) -> str | None:
+        """Compatibility alias for the semantic assembled-plan identity."""
+        return self.aggregate_plan_identity
+
+    @property
+    def raw_patch(self) -> dict | None:
+        """Compatibility alias for raw semantic patch provenance."""
+        return self.raw_patch_provenance
+
+
+_SEMANTIC_METADATA_FIELDS = frozenset(
+    {
+        "response_form",
+        "base_round_number",
+        "base_state_identity",
+        "aggregate_plan_identity",
+        "raw_patch_provenance",
+        "assembled_plan_sidecar",
+    }
+)
+
+
+def _validate_semantic_round_metadata(metadata: PostedRoundMetadata) -> None:
+    """Validate the all-or-nothing semantic authority group.
+
+    Historical metadata has none of these fields and remains compatible. Once
+    any field is present, the record must identify one complete response form;
+    otherwise a restart could mistake a damaged semantic record for legacy
+    absence and silently fall back to weaker provenance.
+    """
+    values = {
+        "response_form": metadata.response_form,
+        "base_round_number": metadata.base_round_number,
+        "base_state_identity": metadata.base_state_identity,
+        "aggregate_plan_identity": metadata.aggregate_plan_identity,
+        "raw_patch_provenance": metadata.raw_patch_provenance,
+        "assembled_plan_sidecar": metadata.assembled_plan_sidecar,
+    }
+    if all(value is None for value in values.values()):
+        return
+    if metadata.response_form is None:
+        raise ValueError("semantic planning metadata is missing response form")
+    if metadata.response_form == "semantic-patch-v1" and any(
+        value is None for value in values.values()
+    ):
+        raise ValueError("semantic patch metadata is incomplete")
+    if metadata.response_form in {"legacy-full-state", "fresh-plan-state"}:
+        if metadata.aggregate_plan_identity is None or metadata.assembled_plan_sidecar is None:
+            raise ValueError("full-state semantic metadata is incomplete")
+        if metadata.base_round_number is not None or metadata.base_state_identity is not None:
+            raise ValueError("full-state semantic metadata must not carry a patch base")
+        if metadata.raw_patch_provenance is not None:
+            raise ValueError("full-state semantic metadata must not carry patch provenance")
+
+    from .plan_assembly import decode_assembled_plan_sidecar
+
+    assert metadata.response_form is not None
+    assert metadata.aggregate_plan_identity is not None
+    assert metadata.assembled_plan_sidecar is not None
+    try:
+        sidecar = decode_assembled_plan_sidecar(metadata.assembled_plan_sidecar)
+    except AgentLoopError as exc:
+        raise ValueError("invalid assembled plan sidecar") from exc
+    if sidecar.round_number != metadata.round_number:
+        raise ValueError("assembled plan sidecar round does not match metadata round")
+    if sidecar.response_form != metadata.response_form:
+        raise ValueError("semantic response form does not match assembled sidecar")
+    if sidecar.aggregate_identity != metadata.aggregate_plan_identity:
+        raise ValueError("semantic aggregate identity does not match assembled sidecar")
+    if sidecar.raw_patch != metadata.raw_patch_provenance:
+        raise ValueError("raw semantic patch does not match assembled sidecar")
+
+    expected_kind = (
+        "plan_state" if metadata.response_form == "fresh-plan-state" else "plan_revision"
+    )
+    if sidecar.canonical_json.get("kind") != expected_kind:
+        raise ValueError(
+            f"semantic response form {metadata.response_form} does not match canonical plan kind"
+        )
+
+    if metadata.response_form == "semantic-patch-v1":
+        assert metadata.raw_patch_provenance is not None
+        assert metadata.base_round_number is not None
+        assert metadata.base_state_identity is not None
+        try:
+            patch = parse_plan_revision_patch(metadata.raw_patch_provenance)
+        except AgentLoopError as exc:
+            raise ValueError("invalid semantic patch provenance") from exc
+        if patch.base_round_number != metadata.base_round_number:
+            raise ValueError("semantic base round does not match raw patch provenance")
+        if patch.base_state_identity != metadata.base_state_identity:
+            raise ValueError("semantic base identity does not match raw patch provenance")
+        if sidecar.raw_patch is None:
+            raise ValueError("semantic patch sidecar is missing raw patch provenance")
+    else:
+        # Full-state publication seeds an authenticated canonical base but is
+        # not a patch against an earlier base.
+        if sidecar.raw_patch is not None:
+            raise ValueError("full-state semantic metadata must not carry patch provenance")
 
 
 @dataclass(frozen=True)
@@ -1434,6 +1586,22 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             if metadata.local_test_evidence is not None else None
         ),
     }
+    semantic_values = {
+        "response_form": metadata.response_form,
+        "base_round_number": metadata.base_round_number,
+        "base_state_identity": metadata.base_state_identity,
+        "aggregate_plan_identity": metadata.aggregate_plan_identity,
+        "raw_patch_provenance": metadata.raw_patch_provenance,
+        "assembled_plan_sidecar": metadata.assembled_plan_sidecar,
+    }
+    if any(value not in (None, (), []) for value in semantic_values.values()):
+        payload.update(
+            {
+                key: value
+                for key, value in semantic_values.items()
+                if value not in (None, (), [])
+            }
+        )
     if metadata.result_mode == "answer":
         payload.update(
             {
@@ -1494,6 +1662,34 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
 
 def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
     try:
+        semantic_keys_present = _SEMANTIC_METADATA_FIELDS.intersection(payload)
+        if semantic_keys_present:
+            # Do not coerce malformed new authority to None: None is reserved
+            # for true legacy absence (or the explicitly absent patch-base
+            # fields of a full-state seed).
+            if "response_form" not in payload:
+                raise ValueError("semantic metadata is missing response_form")
+            for key in semantic_keys_present:
+                if payload[key] is None:
+                    raise ValueError(f"semantic metadata field {key} may not be null")
+            response_form = payload.get("response_form")
+            if response_form is not None and not isinstance(response_form, str):
+                raise ValueError("semantic response_form must be a string")
+            base_round = payload.get("base_round_number")
+            if base_round is not None and (
+                isinstance(base_round, bool) or not isinstance(base_round, int)
+            ):
+                raise ValueError("semantic base_round_number must be an integer")
+            for key in ("base_state_identity", "aggregate_plan_identity"):
+                identity = payload.get(key)
+                if identity is not None and not isinstance(identity, str):
+                    raise ValueError(f"semantic {key} must be a string")
+            raw_patch = payload.get("raw_patch_provenance")
+            if raw_patch is not None and not isinstance(raw_patch, dict):
+                raise ValueError("semantic raw_patch_provenance must be an object")
+            sidecar = payload.get("assembled_plan_sidecar")
+            if sidecar is not None and not isinstance(sidecar, dict):
+                raise ValueError("semantic assembled_plan_sidecar must be an object")
         return PostedRoundMetadata(
             flow=str(payload["flow"]),
             role=str(payload["role"]),
@@ -1518,6 +1714,30 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 str(payload["raw_structured_coder_response"])
                 if payload.get("raw_structured_coder_response") is not None
                 else None
+            ),
+            response_form=(
+                payload["response_form"]
+                if "response_form" in payload else None
+            ),
+            base_round_number=(
+                payload["base_round_number"]
+                if "base_round_number" in payload else None
+            ),
+            base_state_identity=(
+                payload["base_state_identity"]
+                if "base_state_identity" in payload else None
+            ),
+            aggregate_plan_identity=(
+                payload["aggregate_plan_identity"]
+                if "aggregate_plan_identity" in payload else None
+            ),
+            raw_patch_provenance=(
+                payload["raw_patch_provenance"]
+                if "raw_patch_provenance" in payload else None
+            ),
+            assembled_plan_sidecar=(
+                payload["assembled_plan_sidecar"]
+                if "assembled_plan_sidecar" in payload else None
             ),
             approved_plan_hash=(
                 str(payload["approved_plan_hash"])
@@ -1657,7 +1877,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             **_decode_scheduler_fields(payload),
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-        raise AgentLoopError("Invalid AGENT_LOOP_META payload.") from exc
+        raise AgentLoopError(f"Invalid AGENT_LOOP_META payload: {exc}") from exc
 
 
 def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:

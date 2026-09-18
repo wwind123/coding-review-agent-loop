@@ -704,6 +704,34 @@ def test_prepare_round_comment_spills_multiple_fields_in_fixed_order() -> None:
     assert list(dict.fromkeys(sidecar_fields)) == list(expected_fields)
 
 
+def test_prepare_round_comment_spills_and_restores_large_structured_semantic_fields() -> None:
+    payload = {
+        "assembled_plan_sidecar": {
+            "schema_version": 1,
+            "kind": "assembled_plan_sidecar",
+            "response_form": "semantic-patch-v1",
+            "round_number": 5,
+            "canonical_json": {"bulk": _random_text(55_000)},
+            "aggregate_identity": "a" * 64,
+            "raw_patch": {"operations": [{"decision": _random_text(18_000)}]},
+        },
+        "raw_patch_provenance": {
+            "schema_version": 1,
+            "kind": "plan_revision_patch",
+            "operations": [{"decision": _random_text(18_000)}],
+        },
+    }
+
+    prepared = transport.prepare_round_comment(_comment(payload))
+
+    anchor_payload = _anchor_payload(prepared[-1])
+    assert isinstance(anchor_payload["assembled_plan_sidecar"], dict)
+    assert isinstance(anchor_payload["raw_patch_provenance"], dict)
+    hydrated, missing = transport.hydrate_mapping(anchor_payload, prepared)
+    assert missing == set()
+    assert hydrated == payload
+
+
 def test_hydrate_mapping_reports_missing_duplicate_and_corrupt_sidecars() -> None:
     payload = {"canonical_reviewer_response": _random_text(46_000)}
     prepared = transport.prepare_round_comment(_comment(payload))
